@@ -196,6 +196,75 @@ def compute_recent_form(games, team_name, n=10):
     }
 
 
+def compute_team_defense(games, team_name):
+    """
+    Compute average points allowed per game for a team from their schedule.
+
+    Returns:
+        float: Avg points allowed, or None if no completed games for the team.
+    """
+    allowed = []
+    for g in games:
+        if g.get("home_team") == team_name:
+            allowed.append(g.get("away_score", 0))
+        elif g.get("away_team") == team_name:
+            allowed.append(g.get("home_score", 0))
+    if not allowed:
+        return None
+    return sum(allowed) / len(allowed)
+
+
+def build_team_defense_lookup(schedule_results, teams_dict):
+    """
+    Build a {team_display_name: avg_points_allowed} lookup from previously
+    fetched schedule data.
+
+    Parameters:
+        schedule_results (dict): {team_id: list_of_games} as produced by
+            get_team_schedule (one entry per team you've already fetched).
+        teams_dict (dict): ESPN teams keyed by displayName (id → name reverse).
+
+    Returns:
+        dict: {display_name: avg_points_allowed_per_game}
+    """
+    id_to_name = {info["id"]: name for name, info in teams_dict.items()}
+    lookup = {}
+    for team_id, games in schedule_results.items():
+        team_name = id_to_name.get(team_id)
+        if not team_name or not games:
+            continue
+        avg_allowed = compute_team_defense(games, team_name)
+        if avg_allowed is not None:
+            lookup[team_name] = avg_allowed
+    return lookup
+
+
+def annotate_opponent_strength(games, team_name, teams_dict):
+    """
+    Augment each game dict in-place with an 'opponent_win_pct' field
+    looked up from the ESPN teams dict. Falls back to 0.5 (average) when
+    the opponent can't be matched.
+
+    Parameters:
+        games (list): Game result dicts from get_team_schedule().
+        team_name (str): The team's own display name (to identify opponent).
+        teams_dict (dict): ESPN teams keyed by displayName.
+
+    Returns:
+        list: The same games list, with 'opponent_win_pct' added per entry.
+    """
+    for g in games:
+        if g.get("home_team") == team_name:
+            opp = g.get("away_team")
+        elif g.get("away_team") == team_name:
+            opp = g.get("home_team")
+        else:
+            opp = None
+        opp_info = find_team(teams_dict, opp) if opp else None
+        g["opponent_win_pct"] = opp_info.get("win_pct", 0.5) if opp_info else 0.5
+    return games
+
+
 def find_team(teams_dict, search_name):
     """
     Find a team in the ESPN teams dict by matching against the odds API team name.
@@ -307,6 +376,33 @@ def get_athlete_gamelog(sport, league, athlete_id):
     # Top-level labels (used by MLB and sometimes shared across categories)
     top_labels = data.get("labels", [])
 
+    # Top-level events dict carries opponent metadata keyed by event id.
+    top_events = data.get("events", {})
+    if not isinstance(top_events, dict):
+        top_events = {}
+
+    def _resolve_event(ev_or_id):
+        return ev_or_id if isinstance(ev_or_id, dict) else top_events.get(str(ev_or_id), {})
+
+    def _opponent_name(ev_or_id):
+        ev = _resolve_event(ev_or_id)
+        opp = ev.get("opponent") or {}
+        return opp.get("displayName") or opp.get("name") or None
+
+    def _is_home(ev_or_id):
+        """atVs == 'vs' means the player's team was at home; '@' means away."""
+        ev = _resolve_event(ev_or_id)
+        atvs = ev.get("atVs")
+        if atvs is None:
+            return None
+        return atvs.strip().lower() == "vs"
+
+    def _team_id(ev_or_id):
+        ev = _resolve_event(ev_or_id)
+        team = ev.get("team") or {}
+        tid = team.get("id")
+        return str(tid) if tid is not None else None
+
     # Format 1: seasonTypes -> categories -> events
     # NBA/NFL categories have their own labels.
     # MLB batter categories may NOT have labels — use top-level labels instead.
@@ -323,18 +419,24 @@ def get_athlete_gamelog(sport, league, athlete_id):
                 if len(stats_list) != len(labels):
                     continue
                 game_stats = _parse_stat_row(labels, stats_list)
+                eid_key = event.get("eventId") or event.get("id")
+                game_stats["opponent"] = _opponent_name(eid_key)
+                game_stats["is_home"] = _is_home(eid_key)
+                game_stats["team_id"] = _team_id(eid_key)
                 games.append(game_stats)
 
     if games:
         return games
 
     # Format 2: MLB top-level events dict (keyed by event ID)
-    events = data.get("events", {})
-    if top_labels and isinstance(events, dict):
-        for event_id, event in events.items():
+    if top_labels and top_events:
+        for event_id, event in top_events.items():
             stats_list = event.get("stats", [])
             if len(stats_list) == len(top_labels):
                 game_stats = _parse_stat_row(top_labels, stats_list)
+                game_stats["opponent"] = _opponent_name(event)
+                game_stats["is_home"] = _is_home(event)
+                game_stats["team_id"] = _team_id(event)
                 games.append(game_stats)
 
     return games
@@ -423,7 +525,13 @@ def get_pitcher_stats(league, athlete_id, season=None):
 
 
 def _parse_stat_row(labels, stats_list):
-    """Parse a row of stat values into a dict, converting strings to floats."""
+    """
+    Parse a row of stat values into a dict, converting strings to floats.
+
+    Handles ESPN's made-attempted format (e.g., "11-22" for FG made-attempted)
+    by extracting the made count (the left-hand number). Empty/DNP-like
+    markers ("", "-", "--") become 0.0.
+    """
     game_stats = {}
     for label, val in zip(labels, stats_list):
         try:
@@ -431,6 +539,11 @@ def _parse_stat_row(labels, stats_list):
                 game_stats[label] = float(val)
             elif val in ("", "-", "--"):
                 game_stats[label] = 0.0
+            elif isinstance(val, str) and "-" in val and not val.startswith("-"):
+                # Made-attempted format like "11-22" → use the made count.
+                # Only the first hyphen is treated as a separator.
+                made_part = val.split("-", 1)[0].strip()
+                game_stats[label] = float(made_part) if made_part else 0.0
             else:
                 game_stats[label] = float(val)
         except (ValueError, TypeError):
@@ -479,6 +592,9 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         "athlete_id": None,
         "stat_label": "",
         "values": [],
+        "opponents": [],
+        "home_aways": [],
+        "team_id": None,
         "found": False,
     }
 
@@ -513,8 +629,11 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
 
     result["stat_label"] = matched_label
 
-    # Extract values, handle pitcher_outs special case (IP * 3)
+    # Extract values + per-game opponent / home-away. Pitcher_outs special case (IP * 3).
     values = []
+    opponents = []
+    home_aways = []
+    team_id = None
     for game in gamelog[:n]:
         val = game.get(matched_label, 0.0)
         if prop_key == "pitcher_outs":
@@ -524,7 +643,15 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
             frac = round((val - whole) * 10)
             val = whole * 3 + frac
         values.append(val)
+        opponents.append(game.get("opponent"))
+        home_aways.append(game.get("is_home"))
+        # Capture the player's team id from the most recent game that has it.
+        if team_id is None and game.get("team_id"):
+            team_id = game.get("team_id")
 
     result["values"] = values
+    result["opponents"] = opponents
+    result["home_aways"] = home_aways
+    result["team_id"] = team_id
     result["found"] = len(values) > 0
     return result
