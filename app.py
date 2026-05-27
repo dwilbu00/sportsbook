@@ -102,16 +102,49 @@ MARKET_OPTIONS = {
 
 
 def load_config():
-    with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+    # Try to read config.json if present (local dev).
+    config = {}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        config = {}
+
+    # On Streamlit Cloud the filesystem is ephemeral, so prefer st.secrets
+    # for the API key when it's available.
+    try:
+        secret_key = st.secrets.get("odds_api_key", "")
+    except Exception:
+        secret_key = ""
+    if secret_key:
+        config["odds_api_key"] = secret_key
+
+    # Fall back to a key set in this session (wizard input on ephemeral hosts).
+    session_key = st.session_state.get("odds_api_key", "")
+    if session_key and not config.get("odds_api_key"):
+        config["odds_api_key"] = session_key
+
+    config.setdefault("odds_api_key", "")
+    return config
 
 
 def save_api_key(key):
-    """Save the API key to config.json."""
-    config = load_config()
-    config["odds_api_key"] = key
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=4)
+    """Save the API key to config.json (best-effort; may not persist on cloud)."""
+    try:
+        config = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r") as f:
+                config = json.load(f)
+        config["odds_api_key"] = key
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=4)
+    except OSError as e:
+        st.warning(
+            f"Couldn't save config.json ({e}). On Streamlit Cloud, set "
+            "`odds_api_key` under **Settings → Secrets** instead."
+        )
+    # Always keep it in the current session so the app works right now.
+    st.session_state["odds_api_key"] = key
 
 
 def needs_setup(config):
