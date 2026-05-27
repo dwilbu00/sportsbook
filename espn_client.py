@@ -73,47 +73,115 @@ def get_team_schedule(sport, league, team_id, season_year=None):
     """
     Fetch a team's schedule/results for a season.
 
+    Fetches BOTH the regular season (seasontype=2) and postseason
+    (seasontype=3) and merges the results. Without explicit seasontype,
+    ESPN's endpoint defaults to the league's *current* season type — e.g.,
+    during the NBA playoffs it returns only postseason games, leaving
+    non-playoff teams with empty schedules. Querying both types explicitly
+    fixes that.
+
     Returns:
-        list: List of game result dicts (most recent first)
+        list: List of completed game result dicts (most recent first, deduped)
     """
     url = f"{SITE_API}/{sport}/{league}/teams/{team_id}/schedule"
-    params = {}
-    if season_year:
-        params["season"] = season_year
-
-    resp = requests.get(url, params=params, timeout=TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-
     games = []
-    for event in data.get("events", []):
-        status_type = event.get("competitions", [{}])[0].get("status", {}).get("type", {})
-        if status_type.get("completed", False) is not True:
+    seen = set()
+    for seasontype in (2, 3):
+        params = {"seasontype": seasontype}
+        if season_year:
+            params["season"] = season_year
+        try:
+            resp = requests.get(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
             continue
 
-        competition = event.get("competitions", [{}])[0]
-        competitors = competition.get("competitors", [])
-        if len(competitors) < 2:
-            continue
+        for event in data.get("events", []):
+            status_type = event.get("competitions", [{}])[0].get("status", {}).get("type", {})
+            if status_type.get("completed", False) is not True:
+                continue
 
-        home_comp = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
-        away_comp = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+            competition = event.get("competitions", [{}])[0]
+            competitors = competition.get("competitors", [])
+            if len(competitors) < 2:
+                continue
 
-        home_score = int(home_comp.get("score", {}).get("value", home_comp.get("score", 0)))
-        away_score = int(away_comp.get("score", {}).get("value", away_comp.get("score", 0)))
+            home_comp = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+            away_comp = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
 
-        games.append({
-            "date": event.get("date", ""),
-            "home_team": home_comp.get("team", {}).get("displayName", ""),
-            "away_team": away_comp.get("team", {}).get("displayName", ""),
-            "home_score": home_score,
-            "away_score": away_score,
-            "total_score": home_score + away_score,
-        })
+            home_score = int(home_comp.get("score", {}).get("value", home_comp.get("score", 0)))
+            away_score = int(away_comp.get("score", {}).get("value", away_comp.get("score", 0)))
+
+            date = event.get("date", "")
+            home_name = home_comp.get("team", {}).get("displayName", "")
+            away_name = away_comp.get("team", {}).get("displayName", "")
+            key = (date, home_name, away_name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            games.append({
+                "date": date,
+                "home_team": home_name,
+                "away_team": away_name,
+                "home_score": home_score,
+                "away_score": away_score,
+                "total_score": home_score + away_score,
+            })
 
     # Sort by date descending (most recent first)
     games.sort(key=lambda g: g["date"], reverse=True)
     return games
+
+
+def get_team_pace_factor(sport, league, team_id, season_year=None, seasontype=2):
+    """
+    Fetch a team's pace factor (possessions per game proxy) from the
+    ESPN core stats API. Returns None when unavailable.
+
+    Endpoint: /v2/sports/{sport}/leagues/{league}/seasons/{year}/types/{type}/teams/{id}/statistics
+
+    Season-year inference (when not provided): for sports whose season spans
+    two calendar years (NBA/NHL Oct→Jun), ESPN labels the season by its end
+    year. We try the most likely candidate first, then fall back to the prior
+    year (e.g., during the offseason, before the new season begins).
+    """
+    if season_year is not None:
+        candidates = [season_year]
+    else:
+        now = datetime.now()
+        if now.month >= 10:
+            # Oct-Dec: new season has begun, end year is next calendar year
+            candidates = [now.year + 1, now.year]
+        else:
+            # Jan-Sep: either tail of last season or offseason. Try current
+            # year first (season ending this calendar year), then prior.
+            candidates = [now.year, now.year - 1]
+
+    for year in candidates:
+        url = (f"{CORE_API}/{sport}/leagues/{league}/seasons/{year}"
+               f"/types/{seasontype}/teams/{team_id}/statistics")
+        try:
+            resp = requests.get(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+
+        splits = data.get("splits", {})
+        if not isinstance(splits, dict):
+            continue
+        for cat in splits.get("categories", []):
+            for stat in cat.get("stats", []):
+                if stat.get("name") == "paceFactor":
+                    val = stat.get("value")
+                    try:
+                        if val is not None:
+                            return float(val)
+                    except (TypeError, ValueError):
+                        pass
+    return None
 
 
 def get_team_record_and_stats(sport, league, team_id):
@@ -403,6 +471,10 @@ def get_athlete_gamelog(sport, league, athlete_id):
         tid = team.get("id")
         return str(tid) if tid is not None else None
 
+    def _game_date(ev_or_id):
+        ev = _resolve_event(ev_or_id)
+        return ev.get("gameDate") or ev.get("date") or None
+
     # Format 1: seasonTypes -> categories -> events
     # NBA/NFL categories have their own labels.
     # MLB batter categories may NOT have labels — use top-level labels instead.
@@ -423,6 +495,7 @@ def get_athlete_gamelog(sport, league, athlete_id):
                 game_stats["opponent"] = _opponent_name(eid_key)
                 game_stats["is_home"] = _is_home(eid_key)
                 game_stats["team_id"] = _team_id(eid_key)
+                game_stats["game_date"] = _game_date(eid_key)
                 games.append(game_stats)
 
     if games:
@@ -437,6 +510,7 @@ def get_athlete_gamelog(sport, league, athlete_id):
                 game_stats["opponent"] = _opponent_name(event)
                 game_stats["is_home"] = _is_home(event)
                 game_stats["team_id"] = _team_id(event)
+                game_stats["game_date"] = _game_date(event)
                 games.append(game_stats)
 
     return games
@@ -633,6 +707,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
     values = []
     opponents = []
     home_aways = []
+    minutes = []  # raw MIN per game (used by safe-mode to filter DNPs)
     team_id = None
     for game in gamelog[:n]:
         val = game.get(matched_label, 0.0)
@@ -645,6 +720,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         values.append(val)
         opponents.append(game.get("opponent"))
         home_aways.append(game.get("is_home"))
+        minutes.append(game.get("MIN", 0.0) or 0.0)
         # Capture the player's team id from the most recent game that has it.
         if team_id is None and game.get("team_id"):
             team_id = game.get("team_id")
@@ -652,6 +728,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
     result["values"] = values
     result["opponents"] = opponents
     result["home_aways"] = home_aways
+    result["minutes"] = minutes
     result["team_id"] = team_id
     result["found"] = len(values) > 0
     return result

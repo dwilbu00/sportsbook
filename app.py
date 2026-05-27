@@ -78,16 +78,19 @@ SPORTS = {
         "key": "basketball_nba",
         "espn_sport": "basketball",
         "espn_league": "nba",
+        "recent_n_default": 10,
     },
     "MLB": {
         "key": "baseball_mlb",
         "espn_sport": "baseball",
         "espn_league": "mlb",
+        "recent_n_default": 20,
     },
     "NFL": {
         "key": "americanfootball_nfl",
         "espn_sport": "football",
         "espn_league": "nfl",
+        "recent_n_default": 8,
     },
 }
 
@@ -205,7 +208,14 @@ def fetch_team_schedule_cached(espn_sport, espn_league, team_id):
 
 
 @st.cache_data(ttl=3600)
-def fetch_player_history_cached(espn_sport, espn_league, player_name, prop_key, n):
+def fetch_player_history_cached(espn_sport, espn_league, player_name, prop_key, n,
+                                cache_version="v2-minutes"):
+    """
+    Cached player history. `cache_version` is a no-op arg whose value is
+    bumped whenever the upstream return shape changes (forces cache miss).
+    Note: must NOT start with underscore — Streamlit excludes _-prefixed
+    args from the cache key.
+    """
     return get_player_stat_history(espn_sport, espn_league, player_name, prop_key, n)
 
 
@@ -310,7 +320,28 @@ with st.sidebar:
 
     st.subheader("Analysis Settings")
     threshold = st.slider("Value threshold (%)", 1.0, 20.0, 5.0, 0.5, key="threshold")
-    recent_n = st.slider("Recent games window", 5, 30, 10, key="recent_n")
+    # Recent-games window is now hardcoded per sport (half-life weighting
+    # inside makes the upper bound effectively self-tuning).
+    recent_n = sport.get("recent_n_default", 10)
+    safe_mode = st.toggle(
+        "🛡️ Safe mode (player props)",
+        value=False,
+        key="safe_mode",
+        help=(
+            "OVER-only player props. Uses per-player weighted-quantile alt "
+            "lines (whole numbers, e.g. 'Points 8+') derived from each "
+            "player's recent-game distribution at the chosen confidence."
+        ),
+    )
+    if safe_mode:
+        safe_target = st.slider(
+            "Safe-mode confidence",
+            0.70, 0.99, 0.95, 0.01,
+            key="safe_target",
+            help="Target hit-rate at our suggested alt threshold.",
+        )
+    else:
+        safe_target = 0.95
 
     total_per_game = len(market_keys) + len(selected_props)
     remaining = get_remaining_credits()
@@ -650,7 +681,9 @@ if analyze_clicked:
             all_props.extend(analyze_player_props_value(prop_data, player_histories, threshold,
                                                         sport_key=sport["key"],
                                                         team_defense=team_defense,
-                                                        espn_teams=espn_teams))
+                                                        espn_teams=espn_teams,
+                                                        safe_mode=safe_mode,
+                                                        safe_target=safe_target))
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
@@ -785,35 +818,92 @@ if "analysis_results" in st.session_state:
 
     # Player Props results
     if all_props:
-        st.subheader("🏀 Player Props Analysis")
+        is_safe = any(c.get("safe_mode") for c in all_props)
+        header = "🛡️ Player Props Analysis (Safe Mode)" if is_safe else "🏀 Player Props Analysis"
+        st.subheader(header)
         value_props = [c for c in all_props if c["is_value"]]
         no_hist = [c for c in all_props if c.get("no_history")]
         other_props = [c for c in all_props if not c["is_value"] and not c.get("no_history")]
 
+        def _safe_label(c):
+            """Display bet as 'Points {N}+' instead of 'OVER 9.5' in safe mode."""
+            return f"{c['prop_label']} {c['safe_threshold']}+"
+
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
-            for c in sorted(value_props, key=lambda x: x["edge_pct"], reverse=True):
-                with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(5)
-                    cols[0].metric("Line", c["line"])
-                    cols[1].metric("Avg Stat", c["avg_stat"])
-                    cols[2].metric("Over Rate", f"{c['over_rate']}%")
-                    cols[3].metric("Direction", c["direction"])
-                    cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
-                    st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
+            # In safe mode rank by line_gap (book-line cushion); else by edge%.
+            sorted_props = sorted(value_props,
+                                  key=lambda x: x.get("line_gap", x["edge_pct"]),
+                                  reverse=True)
+            for c in sorted_props:
+                if c.get("safe_mode"):
+                    gap = c["line_gap"]
+                    if gap >= 0:
+                        tag = "✅ bet standard line"
+                        alt_advice = f"OVER {c['line']} is already safe (gap +{gap})"
+                    else:
+                        # Suggest the highest standard alt below safe threshold
+                        alt_line = c["safe_threshold"] - 0.5
+                        tag = "↘ alt line needed"
+                        alt_advice = f"find an OVER ≤ {alt_line} (gap {gap})"
+                    title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
+                             f"[{tag}]  book line: {c['line']}")
+                    with st.expander(title, expanded=(gap >= 0)):
+                        cols = st.columns(5)
+                        cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
+                        cols[1].metric(
+                            "Prob @ Suggested",
+                            f"{c['model_hit_at_safe']}%",
+                        )
+                        cols[2].metric(
+                            "Prob @ Book Line",
+                            f"{c['model_hit_at_line']}%",
+                        )
+                        cols[3].metric(
+                            "Δ (safe − book)",
+                            f"{c['model_delta']:+.2f}%",
+                        )
+                        cols[4].metric("Avg Stat", c["avg_stat"])
+                        st.caption(
+                            f"**Action:** {alt_advice}  |  Matchup: {c['matchup']}"
+                            f"  |  Book line: {c['line']}"
+                            f"  |  Over price at book line: {c['over_price']:+d}"
+                            f"  |  Target: {int(c['safe_target']*100)}%"
+                            f"  |  Raw quantile: {c['safe_alt_q']}"
+                            f"  |  {c['games_sampled']} games sampled"
+                        )
+                else:
+                    with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
+                        cols = st.columns(5)
+                        cols[0].metric("Line", c["line"])
+                        cols[1].metric("Avg Stat", c["avg_stat"])
+                        cols[2].metric("Over Rate", f"{c['over_rate']}%")
+                        cols[3].metric("Direction", c["direction"])
+                        cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
+                        st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
 
         if other_props:
             with st.expander(f"Other props ({len(other_props)})"):
                 rows = []
                 for c in other_props:
-                    rows.append({
-                        "Player": c["player"],
-                        "Prop": c["prop_label"],
-                        "Line": c["line"],
-                        "Avg": c["avg_stat"],
-                        "Direction": c["direction"],
-                        "Edge": f"{c['edge_pct']:+.2f}%",
-                    })
+                    if c.get("safe_mode"):
+                        rows.append({
+                            "Player": c["player"],
+                            "Suggested": f"{c['prop_label']} {c['safe_threshold']}+",
+                            "Prob @ Suggested": f"{c['model_hit_at_safe']}%",
+                            "Book Line": c["line"],
+                            "Prob @ Book": f"{c['model_hit_at_line']}%",
+                            "Δ": f"{c['model_delta']:+.2f}%",
+                        })
+                    else:
+                        rows.append({
+                            "Player": c["player"],
+                            "Prop": c["prop_label"],
+                            "Line": c["line"],
+                            "Avg": c["avg_stat"],
+                            "Direction": c["direction"],
+                            "Edge": f"{c['edge_pct']:+.2f}%",
+                        })
                 st.table(rows)
 
         if no_hist:

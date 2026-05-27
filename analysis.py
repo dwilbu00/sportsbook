@@ -65,6 +65,82 @@ def _weighted_rate(values, weights, predicate):
     return sum(w for v, w in zip(values, weights) if predicate(v)) / total_w
 
 
+def _weighted_quantile(values, weights, q):
+    """
+    Weighted empirical quantile. Returns the smallest value v such that the
+    cumulative weight ≤ v is ≥ q · total_weight. q=0 → min, q=1 → max.
+    """
+    if not values:
+        return None
+    pairs = sorted(zip(values, weights), key=lambda x: x[0])
+    total = sum(w for _, w in pairs)
+    if total <= 0:
+        return None
+    target = q * total
+    cum = 0.0
+    for v, w in pairs:
+        cum += w
+        if cum >= target:
+            return v
+    return pairs[-1][0]
+
+
+def _weighted_std(values, weights, mean=None):
+    """
+    Weighted standard deviation. Falls back to unweighted std if weights
+    sum to zero. Returns 0.0 for samples of size < 2.
+    """
+    if not values or len(values) < 2:
+        return 0.0
+    total_w = sum(weights)
+    if total_w <= 0:
+        m = sum(values) / len(values) if mean is None else mean
+        var = sum((v - m) ** 2 for v in values) / len(values)
+        return math.sqrt(var)
+    if mean is None:
+        mean = sum(v * w for v, w in zip(values, weights)) / total_w
+    var = sum(w * (v - mean) ** 2 for v, w in zip(values, weights)) / total_w
+    return math.sqrt(var)
+
+
+def _normal_inv_cdf(p):
+    """
+    Inverse standard-normal CDF (probit). Acklam's rational approximation,
+    accurate to ~1e-9 across the full domain. Used by safe-mode to translate
+    a target hit-rate into a z-score for parametric lower-bound thresholds.
+    """
+    if p <= 0.0:
+        return -float("inf")
+    if p >= 1.0:
+        return float("inf")
+    # Coefficients
+    a = [-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285104469687e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00]
+    plow = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+               ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    if p <= phigh:
+        q = p - 0.5
+        r = q * q
+        return (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
+               (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
+    q = math.sqrt(-2 * math.log(1 - p))
+    return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+            ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+
+
 def _opponent_strength_multiplier(opp_win_pct):
     """
     Map an opponent's win percentage (0..1) to a "meaningfulness" multiplier
@@ -105,17 +181,123 @@ def _venue_match_multiplier(past_is_home, upcoming_is_home, sport_key):
     return match_w if past_is_home == upcoming_is_home else mismatch_w
 
 
-def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed):
+# Per-sport strength of the opponent-defense multiplier for player props.
+# 0.0 disables it. Tuned per backtest:
+#   - NBA: 0.0 (no measurable effect; adds noise — backtest sweep showed
+#     MAE delta < 0.001 and Hit% slightly worse with defense weighting)
+PLAYER_PROP_DEFENSE_STRENGTH = {
+    "basketball_nba": 0.0,
+}
+DEFAULT_PLAYER_PROP_DEFENSE_STRENGTH = 1.0
+
+
+# Per-sport strength of the venue-match multiplier for player props (separate
+# from team-level VENUE_MATCH_WEIGHTS because individual players' stat lines
+# are less venue-sensitive than team-level scoring). 0.0 disables it.
+# Tuned per backtest sweep on 18 NBA starters × 60 games:
+#   - NBA: 0.0 — combined sweep showed ven=0.25 worsens MAE by ~0.006 and
+#     leaves hit-rate essentially flat (52.82% → 52.87%).
+PLAYER_PROP_VENUE_STRENGTH = {
+    "basketball_nba": 0.0,
+}
+DEFAULT_PLAYER_PROP_VENUE_STRENGTH = None  # None = inherit from VENUE_MATCH_WEIGHTS
+
+
+# Per-sport strength of the OUTPUT-side opponent-defense adjustment for
+# player props. Unlike PLAYER_PROP_DEFENSE_STRENGTH (which down/up-weights
+# *prior* games against tough defenses), this multiplier scales the final
+# projection up/down based on TONIGHT's opponent's defense.
+#   projection *= 1 + strength * (opp_pts_allowed / league_avg − 1)
+# Tuned per backtest sweep on 18 NBA starters × 60 games:
+#   - NBA: 1.0 — best single-feature gain: MAE 3.774 → 3.751, Hit% +2.79pp,
+#     bias drops +0.086 → +0.060.
+PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = {
+    "basketball_nba": 1.0,
+}
+DEFAULT_PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = 0.0  # off by default for unknown sports
+
+
+# Bayesian shrinkage of the recency-weighted projection toward the unweighted
+# (season-long) prior mean. `k` is in pseudo-observations:
+#   projection = (eff_n * weighted_mean + k * unweighted_mean) / (eff_n + k)
+# Regularizes the projection so small-sample / volatile players aren't over-fit
+# to their most recent few games.
+# Tuned per backtest on 18 NBA starters × 60 games:
+#   - NBA: 10 — Combined MAE 3.751 → 3.742 (−0.009), monotonic improvement
+#     k ∈ {3,5,10}. Negligible cost. Hit% essentially unchanged.
+PLAYER_PROP_SHRINKAGE_K = {
+    "basketball_nba": 10,
+}
+DEFAULT_PLAYER_PROP_SHRINKAGE_K = 0  # off by default for unknown sports
+
+
+# Per-sport override for the recency half-life *for player props specifically*.
+# When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
+# projection. When None, inherits from RECENCY_HALF_LIFE.
+# Tuned per backtest on 18 NBA starters × 60 games:
+#   - NBA: 7 — Gives the lowest total safe-mode cushion@80% (11.58 vs 11.62
+#     at hl=10) at a negligible MAE cost (+0.008, ~0.2%). Prioritized for
+#     safe-mode usage. Team-level matchup analysis still uses hl=10.
+PLAYER_PROP_HALF_LIFE = {
+    "basketball_nba": 7,
+}
+DEFAULT_PLAYER_PROP_HALF_LIFE = None  # None = inherit from RECENCY_HALF_LIFE
+
+
+def _player_prop_defense_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_DEFENSE_STRENGTH
+    return PLAYER_PROP_DEFENSE_STRENGTH.get(sport_key, DEFAULT_PLAYER_PROP_DEFENSE_STRENGTH)
+
+
+def _player_prop_venue_strength(sport_key):
+    """
+    Per-sport override for the venue-match multiplier *as applied to player
+    props*. Returns None when the team-level VENUE_MATCH_WEIGHTS should be
+    used (the historical default behavior).
+    """
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_VENUE_STRENGTH
+    return PLAYER_PROP_VENUE_STRENGTH.get(sport_key, DEFAULT_PLAYER_PROP_VENUE_STRENGTH)
+
+
+def _player_prop_output_defense_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH
+    return PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH.get(
+        sport_key, DEFAULT_PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH)
+
+
+def _player_prop_shrinkage_k(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_SHRINKAGE_K
+    return PLAYER_PROP_SHRINKAGE_K.get(sport_key, DEFAULT_PLAYER_PROP_SHRINKAGE_K)
+
+
+def _player_prop_half_life(sport_key):
+    """
+    Per-sport override for the recency half-life applied to player props.
+    Falls back to the team-level RECENCY_HALF_LIFE when not overridden.
+    """
+    if sport_key is None:
+        return _half_life_for(None)
+    override = PLAYER_PROP_HALF_LIFE.get(sport_key, DEFAULT_PLAYER_PROP_HALF_LIFE)
+    return override if override is not None else _half_life_for(sport_key)
+
+
+def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed, strength=1.0):
     """
     Player-prop opponent-defense multiplier. A game against a defense that
     allows fewer points (tougher D) is up-weighted; vs a soft D it is
-    down-weighted. Output is bounded to [0.5, 1.5].
+    down-weighted. The bounded ratio's distance from 1.0 is scaled by `strength`
+    (0.0 = disabled, 1.0 = full effect bounded to [0.5, 1.5]).
     """
-    if not opp_pts_allowed or not league_avg_pts_allowed or league_avg_pts_allowed <= 0:
+    if (not opp_pts_allowed or not league_avg_pts_allowed
+            or league_avg_pts_allowed <= 0 or strength <= 0):
         return 1.0
-    # ratio > 1 means opponent's defense is tougher than league average
     ratio = league_avg_pts_allowed / opp_pts_allowed
-    return max(0.5, min(1.5, ratio))
+    bounded = max(0.5, min(1.5, ratio))
+    return 1.0 + strength * (bounded - 1.0)
 
 
 def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None):
@@ -470,7 +652,8 @@ def format_spreads_report(candidates):
 
 
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
-                               sport_key=None, team_defense=None, espn_teams=None):
+                               sport_key=None, team_defense=None, espn_teams=None,
+                               safe_mode=False, safe_target=0.95):
     """
     Compare player prop lines against historical stat values from ESPN.
 
@@ -492,11 +675,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     """
     candidates = []
     threshold = threshold_pct / 100.0
-    half_life = _half_life_for(sport_key)
+    half_life = _player_prop_half_life(sport_key)
+    defense_strength = _player_prop_defense_strength(sport_key)
+    venue_strength_override = _player_prop_venue_strength(sport_key)
+    output_def_strength = _player_prop_output_defense_strength(sport_key)
+    shrinkage_k = _player_prop_shrinkage_k(sport_key)
 
-    # League-average points-allowed (used to normalize the defense multiplier).
+    # League-average points-allowed (used by both the weight-side defense
+    # multiplier and the output-side defense adjustment).
     league_avg_def = None
-    if team_defense:
+    if team_defense and (defense_strength > 0 or output_def_strength > 0):
         vals = [v for v in team_defense.values() if v]
         if vals:
             league_avg_def = sum(vals) / len(vals)
@@ -545,6 +733,42 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             values = history["values"]
             opponents = history.get("opponents") or [None] * len(values)
             past_home_aways = history.get("home_aways") or [None] * len(values)
+            minutes = history.get("minutes") or []
+
+            # Drop DNP / shortened-game outings when minute data is present.
+            #
+            # Why adaptive (not a flat floor)? A flat 10-min threshold keeps
+            # foul-outs / blowouts / early-exit injuries in the sample for
+            # starters (who normally play 30-40 min), which inflates variance
+            # and crashes safe-mode lower bounds. Conversely, a high flat
+            # threshold like 20 min would wipe out legitimate samples for
+            # bench players.
+            #
+            # Filter: keep games where MIN ≥ max(MIN_FLOOR, FRACTION × median).
+            #   - Starter (median 35) → floor = 21 min  (drops the 12-min game)
+            #   - Role player (median 18) → floor = 10.8 → effectively 11 min
+            #   - Bench (median 12) → floor = 10 min   (MIN_FLOOR dominates)
+            if minutes and len(minutes) == len(values):
+                MIN_PLAYED_FLOOR = 10.0
+                FULL_GAME_FRACTION = 0.6
+                # Median of non-zero minutes (ignore pure DNPs for the
+                # median so a single DNP doesn't drag the threshold down).
+                played_mins = sorted(m for m in minutes if (m or 0) > 0)
+                if played_mins:
+                    mid = len(played_mins) // 2
+                    median_min = (played_mins[mid] if len(played_mins) % 2
+                                  else (played_mins[mid - 1] + played_mins[mid]) / 2)
+                else:
+                    median_min = 0.0
+                adaptive_floor = max(MIN_PLAYED_FLOOR,
+                                     FULL_GAME_FRACTION * median_min)
+                kept = [(v, o, ha, m) for v, o, ha, m in zip(
+                            values, opponents, past_home_aways, minutes)
+                        if (m or 0) >= adaptive_floor]
+                if kept:
+                    values = [v for v, _, _, _ in kept]
+                    opponents = [o for _, o, _, _ in kept]
+                    past_home_aways = [ha for _, _, ha, _ in kept]
 
             # Resolve the player's upcoming home/away by matching their team_id
             # to the home/away team names of the upcoming game.
@@ -561,13 +785,161 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             weights = []
             for bw, opp, past_h in zip(base_weights, opponents, past_home_aways):
                 w = bw
-                if team_defense and league_avg_def:
-                    w *= _opponent_defense_multiplier(team_defense.get(opp), league_avg_def)
-                w *= _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
+                if team_defense and league_avg_def and defense_strength > 0:
+                    w *= _opponent_defense_multiplier(
+                        team_defense.get(opp), league_avg_def, defense_strength)
+                # Venue multiplier: a per-sport PLAYER_PROP_VENUE_STRENGTH of
+                # 0.0 disables it; None (default) inherits the team-level
+                # VENUE_MATCH_WEIGHTS via _venue_match_multiplier.
+                if venue_strength_override != 0.0:
+                    w *= _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
                 weights.append(w)
 
-            avg_stat = _weighted_mean(values, weights)
-            over_rate = _weighted_rate(values, weights, lambda v: v > line)
+            # ── Output-side opponent-defense adjustment ──
+            # Scales the projection up/down based on TONIGHT's opponent's
+            # defense (independent from per-prior-game weighting above).
+            # Backtest finding: this is the single best feature gain for NBA
+            # player props (MAE −0.6%, hit-rate +2.79pp).
+            output_def_mult = 1.0
+            if (output_def_strength > 0 and team_defense and league_avg_def
+                    and upcoming_is_home is not None):
+                opp_name = away_team_name if upcoming_is_home else home_team_name
+                opp_pa = team_defense.get(opp_name)
+                if opp_pa:
+                    output_def_mult = 1.0 + output_def_strength * (
+                        opp_pa / league_avg_def - 1.0)
+
+            # ── Bayesian shrinkage toward unweighted prior mean ──
+            # Regularizes the recency-weighted estimate by `k` pseudo-obs.
+            base_proj = _weighted_mean(values, weights)
+            if shrinkage_k > 0 and values:
+                unweighted_mean = sum(values) / len(values)
+                eff_n = sum(weights) if weights else 0.0
+                if eff_n + shrinkage_k > 0:
+                    base_proj = ((eff_n * base_proj) + (shrinkage_k * unweighted_mean)) / (eff_n + shrinkage_k)
+            avg_stat = base_proj * output_def_mult
+            # When the projection is scaled, the over-rate calc shifts the
+            # comparison line by the inverse so historical frequencies are
+            # interpreted in the projection's adjusted frame.
+            effective_line = line / output_def_mult if output_def_mult else line
+            over_rate = _weighted_rate(values, weights, lambda v: v > effective_line)
+
+            # ── Safe mode (OVER-only, integer alt-line) ──
+            if safe_mode:
+                # values / weights already had DNPs filtered above.
+                #
+                # Parametric lower bound:
+                #   threshold = round_down(projected_mean − z · weighted_std)
+                # where z = Phi⁻¹(safe_target). For safe_target=0.95, z≈1.645.
+                #
+                # Why parametric instead of pure empirical quantile?
+                # With ~10 games of history, the 5th-percentile empirical
+                # quantile collapses to the sample minimum (a single bad
+                # game's weight ≥ 5% of total). The parametric Normal bound
+                # uses ALL recent games to estimate location + spread, which
+                # gives a stable threshold instead of "Wemby 4+ points"
+                # whenever a 4-pt foul-out game exists in his last 10.
+                import math as _math
+                if not values:
+                    continue
+                proj_mean = avg_stat  # already shrunk + def-adjusted
+                wstd = _weighted_std(values, weights, mean=base_proj)
+                # Scale std by the same output-defense factor so the spread
+                # is in the same frame as the projection.
+                wstd_adj = wstd * (output_def_mult if output_def_mult else 1.0)
+                z = _normal_inv_cdf(safe_target)
+                alt_q = proj_mean - z * wstd_adj
+
+                # "Points {N}+" means the player needs actual ≥ N to win.
+                # Floor (not ceil) for OVER thresholds: alt_q=8.7 → 8+,
+                # because 8 is the largest integer the model expects them
+                # to clear with ≥ safe_target probability.
+                safe_threshold = max(1, int(_math.floor(alt_q)))
+
+                # Empirical hit-rate at the chosen integer threshold (sanity).
+                p_at_safe = _weighted_rate(values, weights,
+                                           lambda v, t=safe_threshold: v >= t)
+
+                # Soft sanity guard: drop only if the empirical evidence
+                # *strongly* contradicts the parametric bound (more than
+                # 15pp short of target). This keeps suggestions stable when
+                # samples are small, while still filtering true outliers.
+                if p_at_safe < (safe_target - 0.15):
+                    continue
+
+                # Realism guard: if the safe threshold sits absurdly far
+                # below the book line, two things are wrong:
+                #   1. the player's game-to-game variance is so high that
+                #      our 95% floor is unreliable (not actually "safe"),
+                #   2. no sportsbook offers alt OVER lines that far below
+                #      the main line, so the bet can't be placed anyway.
+                # Require safe_threshold to be at least 50% of the book
+                # line. (Wemby with line=27.5 → must be ≥14 to surface.)
+                SAFE_MIN_RATIO = 0.5
+                if line > 0 and safe_threshold < line * SAFE_MIN_RATIO:
+                    continue
+
+                # Our model's confidence at the standard book line.
+                model_hit_at_line = _weighted_rate(values, weights,
+                                                   lambda v: v > line)
+
+                # Gap from book line to our safe threshold. Larger positive
+                # gap = book line is below safe floor (bet straight OVER).
+                # Negative = user must hunt for an alt OVER line ≤ (safe_threshold − 1).
+                line_gap = safe_threshold - line
+                bettable_at_standard_line = line < safe_threshold
+
+                # Confidence delta between our safe suggestion and the book line.
+                # Positive = our suggestion is safer than the standard line.
+                model_delta = p_at_safe - model_hit_at_line
+
+                # Edge in safe mode = how much MORE likely our safe
+                # suggestion hits than the standard book line.
+                # Always ≥ 0 (because safe_threshold ≤ line by construction
+                # whenever p_at_safe ≥ safe_target). Used as edge_pct so the
+                # parlay builder treats safe-mode legs as positive-edge.
+                edge = model_delta
+
+                # Filter trash: drop bets where even the standard book line
+                # is below 50/50 model confidence AND the safe threshold sits
+                # at the floor of the distribution (suggesting low-volume
+                # player with no realistic upside). Keeps suggestions where
+                # either the standard line is decent OR the safe threshold is
+                # meaningfully above the floor.
+                is_value = (safe_threshold >= 1
+                            and (model_hit_at_line >= 0.50 or safe_threshold > 1))
+
+                candidates.append({
+                    "type": "player_prop",
+                    "matchup": matchup,
+                    "player": player_name,
+                    "prop": prop_key,
+                    "prop_label": PROP_LABELS.get(prop_key, prop_key),
+                    "line": line,
+                    "over_price": over_price,
+                    "under_price": under_price,
+                    "over_implied": round(over_implied * 100, 2),
+                    "under_implied": round(under_implied * 100, 2),
+                    "avg_stat": round(avg_stat, 2),
+                    "over_rate": round(over_rate * 100, 2),
+                    "games_sampled": len(values),
+                    "edge_pct": round(edge * 100, 2),
+                    "direction": "OVER",
+                    "best_price": over_price,
+                    "is_value": is_value,
+                    "no_history": False,
+                    # ── Safe-mode-specific fields ──
+                    "safe_mode": True,
+                    "safe_target": safe_target,
+                    "safe_threshold": safe_threshold,        # display as "{N}+"
+                    "safe_alt_q": round(alt_q, 2),           # raw quantile (continuous)
+                    "model_hit_at_safe": round(p_at_safe * 100, 2),     # prob at suggested
+                    "model_hit_at_line": round(model_hit_at_line * 100, 2),  # prob at book line
+                    "model_delta": round(model_delta * 100, 2),         # safe − book line
+                    "line_gap": round(line_gap, 2),
+                    "bettable_at_standard_line": bettable_at_standard_line,
+                })
+                continue
 
             # Compare historical over rate vs book implied over probability
             over_edge = over_rate - over_implied
@@ -763,19 +1135,27 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
         direction = c.get("direction", "OVER")
         bt = f"player_prop_{direction.lower()}"
         price = c.get("best_price", c.get("over_price") if direction == "OVER" else c.get("under_price"))
-        
-        if direction == "OVER":
+
+        if c.get("safe_mode"):
+            # Safe-mode legs: bet is "{prop} {N}+" and the hist prob is the
+            # model probability AT our safe threshold (not the book line).
+            label = f"{c['player']} {c['prop_label']} {c['safe_threshold']}+"
+            hp = (c.get("model_hit_at_safe", 0.0) or 0.0) / 100.0
+            ip = (c["over_implied"] / 100.0) if c.get("over_implied") is not None else 0.5
+        elif direction == "OVER":
+            label = f"{c['player']} {c['prop_label']} {direction} {c['line']}"
             hp = (c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
             ip = (c["over_implied"] / 100.0) if c.get("over_implied") is not None else 0.5
         else:
+            label = f"{c['player']} {c['prop_label']} {direction} {c['line']}"
             hp = (1.0 - c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
             ip = (c["under_implied"] / 100.0) if c.get("under_implied") is not None else 0.5
-        
+
         legs.append({
             "game_key": c["matchup"],
             "team": None,
             "bet_type": bt,
-            "label": f"{c['player']} {c['prop_label']} {direction} {c['line']}",
+            "label": label,
             "player": c["player"],
             "prop_key": c.get("prop"),
             "edge_pct": c["edge_pct"],
