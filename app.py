@@ -112,8 +112,13 @@ def load_config():
 
     # On Streamlit Cloud the filesystem is ephemeral, so prefer st.secrets
     # for the API key when it's available.
+    secret_key = ""
     try:
-        secret_key = st.secrets.get("odds_api_key", "")
+        for name in ("odds_api_key", "ODDS_API_KEY"):
+            val = st.secrets.get(name, "")
+            if val:
+                secret_key = val
+                break
     except Exception:
         secret_key = ""
     if secret_key:
