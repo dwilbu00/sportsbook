@@ -1,0 +1,652 @@
+"""
+Self-updating Platt recalibration for player-prop probabilities.
+
+What it does
+------------
+1. Logs every published over-probability the analyzer produces to a JSONL
+   prediction log (`cache/predictions/prediction_log.jsonl`).
+2. Resolves outcomes for past-dated log entries against cached ESPN gamelogs
+   (idempotent: marks entries with `actual`, `outcome`, `resolved=True`).
+3. Fits a per-(sport, prop) Platt sigmoid mapping raw model probability to a
+   recalibrated probability, using only resolved entries as training data.
+4. Saves the fit to `calibration/recalibration_<sport>.json`.
+5. On app launch, auto-refits when enough new resolved entries exist since the
+   last fit (and not more often than every `MIN_REFIT_INTERVAL_HOURS`).
+
+Platt math
+----------
+Recalibrated probability p_cal = sigmoid(a * logit(p_raw) + b)
+where (a, b) are fit by Newton-Raphson on cross-entropy loss over
+holdout (raw_prob, outcome) pairs.
+
+Schema for recalibration_<sport>.json
+-------------------------------------
+{
+  "sport_key": "basketball_nba",
+  "fit_timestamp": "2026-05-29T12:34:56Z",
+  "props": {
+    "player_points": {"a": 0.91, "b": -0.18, "n_fit": 412},
+    ...
+  }
+}
+"""
+import json
+import math
+import os
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
+PRED_DIR = os.path.join(CACHE_DIR, "predictions")
+LOG_PATH = os.path.join(PRED_DIR, "prediction_log.jsonl")
+CALIB_DIR = os.path.join(SCRIPT_DIR, "calibration")
+
+MIN_FIT_SAMPLES = 50          # below this, skip Platt fit for a prop
+MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
+MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
+MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
+
+_lock = threading.Lock()
+_refit_done_this_session = set()   # {sport_key} — already refit in this process
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Path / file helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def recalibration_path(sport_key):
+    return os.path.join(CALIB_DIR, f"recalibration_{sport_key}.json")
+
+
+def _ensure_dirs():
+    os.makedirs(PRED_DIR, exist_ok=True)
+    os.makedirs(CALIB_DIR, exist_ok=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+
+def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
+                   projected=None, direction=None):
+    """Append one prediction row to the JSONL log. Best-effort, never raises."""
+    if not sport_key or not prop_key or not player or game_date is None:
+        return
+    if raw_prob is None or not (0.0 <= raw_prob <= 1.0):
+        return
+    _ensure_dirs()
+    row = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "sport_key": sport_key,
+        "prop_key": prop_key,
+        "player": player,
+        "game_date": str(game_date)[:10],  # YYYY-MM-DD
+        "line": float(line),
+        "raw_prob": float(raw_prob),
+        "projected": float(projected) if projected is not None else None,
+        "direction": direction,
+        "resolved": False,
+        "actual": None,
+        "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
+    }
+    try:
+        with _lock:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def _read_log():
+    if not os.path.exists(LOG_PATH):
+        return []
+    rows = []
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return rows
+
+
+def _rewrite_log(rows):
+    with _lock:
+        tmp = LOG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp, LOG_PATH)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outcome resolution against ESPN gamelogs
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Sport → (espn_sport, espn_league)
+SPORT_ESPN_MAP = {
+    "basketball_nba":       ("basketball", "nba"),
+    "baseball_mlb":         ("baseball",   "mlb"),
+    "americanfootball_nfl": ("football",   "nfl"),
+    "icehockey_nhl":        ("hockey",     "nhl"),
+}
+
+
+def _stat_label(prop_key, gamelog):
+    """Resolve stat label for a prop, sniffed from a sample game."""
+    try:
+        from espn_client import PROP_STAT_MAP
+    except Exception:
+        return None
+    for label in PROP_STAT_MAP.get(prop_key, []):
+        if any(label in g for g in gamelog):
+            return label
+    return None
+
+
+def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
+    """
+    Walk the log, find unresolved entries for this sport whose game_date is
+    in the past, and fill in actual + outcome from cached ESPN gamelogs.
+    Caps per-launch resolution by `max_to_resolve` to bound ESPN cost.
+    Returns the number of newly resolved entries.
+    """
+    pair = SPORT_ESPN_MAP.get(sport_key)
+    if not pair:
+        return 0
+    try:
+        from espn_cache import cached_athlete_id, cached_gamelog
+    except Exception:
+        return 0
+
+    espn_sport, espn_league = pair
+    rows = _read_log()
+    if not rows:
+        return 0
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    # group unresolved rows for this sport by player
+    by_player = defaultdict(list)
+    for r in rows:
+        if r.get("sport_key") != sport_key:
+            continue
+        if r.get("resolved"):
+            continue
+        if (r.get("game_date") or "") >= today:
+            continue  # game hasn't happened yet
+        by_player[r["player"]].append(r)
+
+    if not by_player:
+        return 0
+
+    resolved_count = 0
+    for player, p_rows in by_player.items():
+        if resolved_count >= max_to_resolve:
+            break
+        try:
+            aid = cached_athlete_id(espn_sport, espn_league, player)
+            if not aid:
+                continue
+            gamelog = cached_gamelog(espn_sport, espn_league, aid)
+            if not gamelog:
+                continue
+        except Exception:
+            continue
+
+        date_idx = {}
+        for i, g in enumerate(gamelog):
+            d = (g.get("game_date") or "")[:10]
+            if d and d not in date_idx:
+                date_idx[d] = i
+
+        for r in p_rows:
+            stat_label = _stat_label(r["prop_key"], gamelog)
+            if not stat_label:
+                continue
+            d = r["game_date"]
+            idx = date_idx.get(d)
+            if idx is None:
+                # ±1 day fallback for timezone slippage
+                for delta in (-1, 1):
+                    try:
+                        dt = datetime.fromisoformat(d) + timedelta(days=delta)
+                        alt = dt.date().isoformat()
+                    except Exception:
+                        continue
+                    if alt in date_idx:
+                        idx = date_idx[alt]
+                        break
+            if idx is None:
+                continue
+            actual = gamelog[idx].get(stat_label)
+            if actual is None:
+                continue
+            try:
+                actual = float(actual)
+            except (TypeError, ValueError):
+                continue
+            line = float(r["line"])
+            if actual == line:
+                outcome = None  # push
+            else:
+                outcome = 1 if actual > line else 0
+            r["actual"] = actual
+            r["outcome"] = outcome
+            r["resolved"] = True
+            resolved_count += 1
+            if resolved_count >= max_to_resolve:
+                break
+
+    if resolved_count:
+        _rewrite_log(rows)
+    return resolved_count
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Platt scaling
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EPS = 1e-6
+
+
+def _sigmoid(x):
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _logit(p):
+    p = min(max(p, _EPS), 1.0 - _EPS)
+    return math.log(p / (1.0 - p))
+
+
+def fit_platt(raw_probs, outcomes, max_iter=100, tol=1e-7):
+    """
+    Fit Platt sigmoid: p_cal = sigmoid(a * logit(p_raw) + b).
+    Returns (a, b) or None if not fittable.
+
+    Uses Newton-Raphson on cross-entropy loss with mild L2 regularization
+    on (a-1, b) to keep parameters from blowing up on small samples.
+    """
+    pairs = [(rp, o) for rp, o in zip(raw_probs, outcomes)
+             if rp is not None and o is not None and o in (0, 1)]
+    if len(pairs) < MIN_FIT_SAMPLES:
+        return None
+
+    xs = [_logit(rp) for rp, _ in pairs]
+    ys = [o for _, o in pairs]
+    n = len(xs)
+
+    # Smoothed targets per Platt's recipe (avoids 0/1 boundary issues)
+    n_pos = sum(ys)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return None
+    hi = (n_pos + 1.0) / (n_pos + 2.0)
+    lo = 1.0 / (n_neg + 2.0)
+    targets = [hi if y == 1 else lo for y in ys]
+
+    a, b = 1.0, 0.0
+    lam = 1.0 / n  # tiny L2 (~ ridge) toward (1, 0)
+
+    for _ in range(max_iter):
+        # gradient + hessian
+        g_a = g_b = 0.0
+        h_aa = h_ab = h_bb = 0.0
+        for x, t in zip(xs, targets):
+            z = a * x + b
+            p = _sigmoid(z)
+            err = p - t
+            g_a += err * x
+            g_b += err
+            w = p * (1.0 - p)
+            h_aa += w * x * x
+            h_ab += w * x
+            h_bb += w
+        # regularization toward (1, 0)
+        g_a += lam * (a - 1.0)
+        g_b += lam * b
+        h_aa += lam
+        h_bb += lam
+
+        det = h_aa * h_bb - h_ab * h_ab
+        if abs(det) < 1e-12:
+            break
+        # solve 2x2 system H * delta = g
+        d_a = (h_bb * g_a - h_ab * g_b) / det
+        d_b = (-h_ab * g_a + h_aa * g_b) / det
+
+        a_new = a - d_a
+        b_new = b - d_b
+
+        if abs(d_a) < tol and abs(d_b) < tol:
+            a, b = a_new, b_new
+            break
+        a, b = a_new, b_new
+
+    # Sanity: clamp wild fits
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return None
+    if a <= 0.2:
+        # a≈0 means "raw prob has ~no signal vs outcomes" — applying it would
+        # squash every prediction to a constant ~base-rate. Treat as no fit
+        # and let the raw probability pass through unchanged. (User keeps
+        # whatever edge the underlying model had; doesn't get artificially
+        # zeroed by Platt.)
+        return None
+    if abs(a) > 10 or abs(b) > 10:
+        return None
+    return (a, b)
+
+
+def apply_platt(raw_prob, a, b):
+    """Apply Platt sigmoid; returns recalibrated probability."""
+    if raw_prob is None:
+        return None
+    if a is None or b is None:
+        return raw_prob
+    return _sigmoid(a * _logit(raw_prob) + b)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistence + load
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_recalibration(sport_key, per_prop_params, meta=None):
+    _ensure_dirs()
+    blob = {
+        "sport_key": sport_key,
+        "fit_timestamp": datetime.now(timezone.utc).isoformat(),
+        "props": per_prop_params,
+    }
+    if meta:
+        blob["meta"] = meta
+    tmp = recalibration_path(sport_key) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+    os.replace(tmp, recalibration_path(sport_key))
+
+
+_LOAD_CACHE = {}  # sport_key -> (mtime, blob)
+
+
+def load_recalibration(sport_key):
+    """Return {prop_key: {"a": ..., "b": ..., "n_fit": ...}} or {}."""
+    path = recalibration_path(sport_key)
+    if not os.path.exists(path):
+        return {}
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    cached = _LOAD_CACHE.get(sport_key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return {}
+    props = blob.get("props", {}) or {}
+    _LOAD_CACHE[sport_key] = (mtime, props)
+    return props
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Refit (resolve + fit + save) and gated auto-refit
+# ──────────────────────────────────────────────────────────────────────────────
+
+def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNCH):
+    """Resolve pending outcomes, then refit Platt for every prop with enough
+    resolved entries. Returns dict {prop_key: (a, b, n_fit)}."""
+    newly_resolved = 0
+    if resolve_first:
+        newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
+
+    rows = _read_log()
+    by_prop_raw = defaultdict(list)
+    by_prop_y = defaultdict(list)
+    for r in rows:
+        if r.get("sport_key") != sport_key:
+            continue
+        if not r.get("resolved"):
+            continue
+        o = r.get("outcome")
+        if o not in (0, 1):
+            continue
+        by_prop_raw[r["prop_key"]].append(float(r["raw_prob"]))
+        by_prop_y[r["prop_key"]].append(int(o))
+
+    fits = {}
+    per_prop_params = {}
+    for prop_key, raws in by_prop_raw.items():
+        ys = by_prop_y[prop_key]
+        result = fit_platt(raws, ys)
+        if result is None:
+            continue
+        a, b = result
+        fits[prop_key] = (a, b, len(raws))
+        per_prop_params[prop_key] = {
+            "a": round(a, 5),
+            "b": round(b, 5),
+            "n_fit": len(raws),
+        }
+
+    if per_prop_params:
+        save_recalibration(sport_key, per_prop_params,
+                           meta={"newly_resolved_this_run": newly_resolved})
+        _LOAD_CACHE.pop(sport_key, None)
+    return fits
+
+
+def _count_resolved_since(sport_key, since_ts):
+    """How many resolved entries exist (used to gate refit)."""
+    rows = _read_log()
+    cutoff = since_ts or 0
+    n = 0
+    for r in rows:
+        if r.get("sport_key") != sport_key:
+            continue
+        if not r.get("resolved"):
+            continue
+        try:
+            ts = datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0
+        if ts > cutoff:
+            n += 1
+    return n
+
+
+def maybe_auto_refit(sport_key):
+    """
+    Called by analysis.py on first prop analysis per (process, sport).
+    Refits only if:
+      * never refit this session
+      * AND (no calibration file yet) OR (file > MIN_REFIT_INTERVAL_HOURS old
+        AND >=MIN_NEW_FOR_REFIT new resolved entries since last fit)
+    Best-effort; never raises.
+    """
+    if sport_key in _refit_done_this_session:
+        return
+    _refit_done_this_session.add(sport_key)
+
+    try:
+        path = recalibration_path(sport_key)
+        do_refit = False
+        last_fit_ts = 0.0
+        if not os.path.exists(path):
+            do_refit = True
+        else:
+            try:
+                last_fit_ts = os.path.getmtime(path)
+            except OSError:
+                last_fit_ts = 0.0
+            age_hours = (time.time() - last_fit_ts) / 3600.0
+            if age_hours >= MIN_REFIT_INTERVAL_HOURS:
+                new_n = _count_resolved_since(sport_key, last_fit_ts)
+                if new_n >= MIN_NEW_FOR_REFIT:
+                    do_refit = True
+        if do_refit:
+            refit_sport(sport_key)
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bootstrap from existing book-line cache
+# ──────────────────────────────────────────────────────────────────────────────
+
+def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_props):
+    """
+    Use existing odds-cache snapshots + ESPN gamelogs to fit Platt with the
+    *current production* analysis pipeline (no need for new predictions to
+    accumulate first). Calls book_line_calibration's machinery to produce
+    (raw_prob, outcome) pairs, then fits Platt per prop.
+
+    Returns dict {prop_key: (a, b, n_fit)} actually fit & saved.
+    """
+    from book_line_calibration import (
+        harvest_book_lines, join_book_lines_to_actuals,
+        project_and_empirical, _team_defense_lookup, VARIANT_PRESETS,
+    )
+    from backtest import _resolve_params
+    from calibration_loader import (
+        load_calibration as _load_cal,
+        apply_calibration_with_warmup, count_current_season_games,
+    )
+
+    book_lines = harvest_book_lines(sport_key, target_props)
+    if not book_lines:
+        return {}
+    enriched = join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        return {}
+
+    # Use the "all" preset (matches what production resolves to in most cases)
+    params = _resolve_params(VARIANT_PRESETS["all"], sport_key)
+    team_defense = league_avg_def = None
+    if params.get("opp_defense_strength", 0.0) > 0:
+        team_defense, _, league_avg_def = _team_defense_lookup(espn_sport, espn_league)
+
+    cal = _load_cal(sport_key) or {}
+
+    by_prop_raw = defaultdict(list)
+    by_prop_y = defaultdict(list)
+
+    for obs in enriched:
+        projected, emp = project_and_empirical(obs, params, sport_key,
+                                                team_defense, league_avg_def)
+        if projected is None or emp is None:
+            continue
+        prop_cfg = cal.get(obs["prop_key"]) or {}
+        raw = emp
+        if prop_cfg.get("method"):
+            curr_games = len(obs.get("prior_games") or [])
+            p_cal = apply_calibration_with_warmup(
+                prop_cfg, projected, obs["line"], curr_games,
+                empirical_over=emp,
+            )
+            if p_cal is not None:
+                raw = max(0.0, min(1.0, p_cal))
+        actual = obs["actual"]
+        line = obs["line"]
+        if actual == line:
+            continue
+        y = 1 if actual > line else 0
+        by_prop_raw[obs["prop_key"]].append(raw)
+        by_prop_y[obs["prop_key"]].append(y)
+
+    fits = {}
+    per_prop_params = {}
+    for prop_key, raws in by_prop_raw.items():
+        ys = by_prop_y[prop_key]
+        result = fit_platt(raws, ys)
+        if result is None:
+            continue
+        a, b = result
+        fits[prop_key] = (a, b, len(raws))
+        per_prop_params[prop_key] = {
+            "a": round(a, 5),
+            "b": round(b, 5),
+            "n_fit": len(raws),
+            "source": "book_line_cache_seed",
+        }
+
+    if per_prop_params:
+        save_recalibration(sport_key, per_prop_params,
+                           meta={"source": "book_line_cache_seed"})
+        _LOAD_CACHE.pop(sport_key, None)
+    return fits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI: seed / refit / inspect
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _main_cli():
+    import argparse
+    from backtest import SPORT_MAP
+    from book_line_calibration import PROPS_BY_SPORT
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--seed", action="store_true",
+                   help="Bootstrap Platt fit from existing book-line cache "
+                        "(no waiting for new predictions to accumulate).")
+    p.add_argument("--refit", action="store_true",
+                   help="Resolve pending outcomes and refit Platt from the "
+                        "prediction log.")
+    p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
+    p.add_argument("--show", action="store_true",
+                   help="Print current recalibration params for the sport.")
+    args = p.parse_args()
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
+    target_props = PROPS_BY_SPORT.get(args.sport, [])
+
+    if args.seed:
+        print(f"Seeding Platt fit for {sport_key} from cached book lines...")
+        fits = seed_from_book_line_cache(args.sport, espn_sport, espn_league,
+                                         sport_key, target_props)
+        if not fits:
+            print("  Nothing fit — not enough cached lines + outcomes.")
+        else:
+            for prop_key, (a, b, n) in sorted(fits.items()):
+                print(f"  {prop_key:<22} a={a:+.4f} b={b:+.4f}  n={n}")
+            print(f"  Saved: {recalibration_path(sport_key)}")
+
+    if args.refit:
+        print(f"Refitting from prediction log for {sport_key}...")
+        fits = refit_sport(sport_key)
+        if not fits:
+            print("  No prop had enough resolved entries to fit.")
+        else:
+            for prop_key, (a, b, n) in sorted(fits.items()):
+                print(f"  {prop_key:<22} a={a:+.4f} b={b:+.4f}  n={n}")
+            print(f"  Saved: {recalibration_path(sport_key)}")
+
+    if args.show or not (args.seed or args.refit):
+        params = load_recalibration(sport_key)
+        if not params:
+            print(f"(no recalibration_{sport_key}.json yet)")
+        else:
+            print(f"Current Platt params for {sport_key}:")
+            for prop_key, cfg in sorted(params.items()):
+                print(f"  {prop_key:<22} a={cfg.get('a'):+.4f} "
+                      f"b={cfg.get('b'):+.4f}  n_fit={cfg.get('n_fit')}")
+
+
+if __name__ == "__main__":
+    _main_cli()

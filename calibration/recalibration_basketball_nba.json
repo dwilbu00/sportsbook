@@ -1,0 +1,21 @@
+{
+  "sport_key": "basketball_nba",
+  "fit_timestamp": "2026-05-29T14:11:59.361153+00:00",
+  "props": {
+    "player_rebounds": {
+      "a": 0.43773,
+      "b": -0.14581,
+      "n_fit": 317,
+      "source": "book_line_cache_seed"
+    },
+    "player_assists": {
+      "a": 0.35185,
+      "b": -0.18899,
+      "n_fit": 262,
+      "source": "book_line_cache_seed"
+    }
+  },
+  "meta": {
+    "source": "book_line_cache_seed"
+  }
+}

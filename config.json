@@ -1,0 +1,24 @@
+{
+    "odds_api_key": "04005bf6618cc9a8a9de9cdfdaea4b02",
+    "default_sport": "basketball_nba",
+    "value_threshold_pct": 5.0,
+    "recent_games_window": 10,
+    "bookmakers": [],
+    "sports": {
+        "basketball_nba": {
+            "odds_api_sport": "basketball_nba",
+            "espn_sport": "basketball",
+            "espn_league": "nba"
+        },
+        "baseball_mlb": {
+            "odds_api_sport": "baseball_mlb",
+            "espn_sport": "baseball",
+            "espn_league": "mlb"
+        },
+        "americanfootball_nfl": {
+            "odds_api_sport": "americanfootball_nfl",
+            "espn_sport": "football",
+            "espn_league": "nfl"
+        }
+    }
+}

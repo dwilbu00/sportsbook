@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor swap files
+.*.swp
+.*.swo
+
+# Streamlit secrets (only the example is committed)
+.streamlit/secrets.toml
+
+# Runtime caches and logs (populated by the app at run time, not source)
+cache/

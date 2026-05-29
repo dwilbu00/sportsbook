@@ -5,8 +5,11 @@ Launch with:  streamlit run app.py
 """
 
 import streamlit as st
+import json
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -14,6 +17,32 @@ from zoneinfo import ZoneInfo
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+
+# ── Auto-shutdown when browser disconnects ──
+SHUTDOWN_TIMEOUT = 30  # seconds after last session disconnects
+
+if "shutdown_watchdog_started" not in st.session_state:
+    st.session_state.shutdown_watchdog_started = True
+
+    def _shutdown_watchdog():
+        """Monitor active sessions and exit when all browsers disconnect."""
+        from streamlit.runtime import get_instance
+        idle_since = None
+        while True:
+            time.sleep(5)
+            runtime = get_instance()
+            if runtime is None:
+                continue
+            active = runtime._session_mgr.list_active_sessions()
+            if not active:
+                if idle_since is None:
+                    idle_since = time.time()
+                elif time.time() - idle_since >= SHUTDOWN_TIMEOUT:
+                    os._exit(0)
+            else:
+                idle_since = None
+
+    threading.Thread(target=_shutdown_watchdog, daemon=True).start()
 
 from odds_client import (
     get_upcoming_events,
@@ -30,6 +59,8 @@ from espn_client import (
     get_team_schedule,
     compute_recent_form,
     find_team,
+    annotate_opponent_strength,
+    build_team_defense_lookup,
     get_player_stat_history,
 )
 from analysis import (
@@ -40,21 +71,26 @@ from analysis import (
     generate_parlays,
 )
 
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+
 SPORTS = {
     "NBA": {
         "key": "basketball_nba",
         "espn_sport": "basketball",
         "espn_league": "nba",
+        "recent_n_default": 10,
     },
     "MLB": {
         "key": "baseball_mlb",
         "espn_sport": "baseball",
         "espn_league": "mlb",
+        "recent_n_default": 20,
     },
     "NFL": {
         "key": "americanfootball_nfl",
         "espn_sport": "football",
         "espn_league": "nfl",
+        "recent_n_default": 8,
     },
 }
 
@@ -65,12 +101,89 @@ MARKET_OPTIONS = {
 }
 
 
-def get_api_key():
-    """Get API key from Streamlit secrets."""
-    try:
-        return st.secrets["ODDS_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        return None
+def load_config():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+
+def save_api_key(key):
+    """Save the API key to config.json."""
+    config = load_config()
+    config["odds_api_key"] = key
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=4)
+
+
+def needs_setup(config):
+    """Check if the API key needs to be configured."""
+    key = config.get("odds_api_key", "")
+    return not key or key == "YOUR_API_KEY_HERE"
+
+
+def show_setup_wizard():
+    """Display a first-run setup wizard to help the user get an API key."""
+    st.markdown("## 👋 Welcome to Sportsbook Value Finder!")
+    st.markdown(
+        "This app compares sportsbook odds against historical stats "
+        "to find value betting opportunities. To get started, you'll "
+        "need a **free API key** from The Odds API."
+    )
+
+    st.divider()
+
+    st.markdown("### Get your free API key in 3 steps:")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("#### Step 1")
+        st.markdown("Click the link below to open The Odds API signup page")
+        st.link_button(
+            "🔑 Get Free API Key",
+            "https://the-odds-api.com/#get-access",
+            use_container_width=True,
+        )
+    with col2:
+        st.markdown("#### Step 2")
+        st.markdown(
+            'Choose the **Starter (FREE)** plan — 500 credits/month. '
+            "Enter your email and you'll receive your API key instantly."
+        )
+    with col3:
+        st.markdown("#### Step 3")
+        st.markdown(
+            "Check your email for the API key, then paste it below and click Save."
+        )
+
+    st.divider()
+
+    st.markdown("### Enter your API key")
+    new_key = st.text_input(
+        "API Key",
+        placeholder="Paste your API key here...",
+        help="The key will be saved locally in config.json. It never leaves your computer.",
+    )
+
+    if st.button("💾 Save API Key", type="primary", use_container_width=True):
+        if new_key and len(new_key) > 10 and new_key != "YOUR_API_KEY_HERE":
+            save_api_key(new_key)
+            st.success("API key saved! The app will now reload...")
+            st.balloons()
+            st.rerun()
+        else:
+            st.error("Please enter a valid API key.")
+
+    st.divider()
+    with st.expander("ℹ️ About credits & costs"):
+        st.markdown(
+            """
+            - The **free plan** gives you **500 credits/month** (resets on the 1st)
+            - Listing upcoming games: **FREE** (0 credits)
+            - Each market (moneyline, spreads, totals): **1 credit per call**
+            - Each player prop market: **1 credit per game**
+            - This app **caches results for 10 minutes** to avoid wasting credits
+            - Example: analyzing 3 games with moneyline + spreads = **6 credits**
+            """
+        )
 
 
 @st.cache_data(ttl=3600)
@@ -95,7 +208,14 @@ def fetch_team_schedule_cached(espn_sport, espn_league, team_id):
 
 
 @st.cache_data(ttl=3600)
-def fetch_player_history_cached(espn_sport, espn_league, player_name, prop_key, n):
+def fetch_player_history_cached(espn_sport, espn_league, player_name, prop_key, n,
+                                cache_version="v2-minutes"):
+    """
+    Cached player history. `cache_version` is a no-op arg whose value is
+    bumped whenever the upstream return shape changes (forces cache miss).
+    Note: must NOT start with underscore — Streamlit excludes _-prefixed
+    args from the cache key.
+    """
     return get_player_stat_history(espn_sport, espn_league, player_name, prop_key, n)
 
 
@@ -145,13 +265,16 @@ def render_value_badge(edge_pct):
 st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layout="wide")
 
 # ──────────────────────────────────────────────────────────
-#  API Key from secrets
+#  First-run setup check
 # ──────────────────────────────────────────────────────────
-api_key = get_api_key()
-if not api_key:
+config = load_config()
+
+if needs_setup(config):
     st.title("🎯 Sportsbook Value Finder")
-    st.error("API key not configured. Add `ODDS_API_KEY` to your Streamlit secrets.")
+    show_setup_wizard()
     st.stop()
+
+api_key = config["odds_api_key"]
 
 st.title("🎯 Sportsbook Value Finder")
 st.caption("Compare book odds vs historical stats to find value")
@@ -197,7 +320,28 @@ with st.sidebar:
 
     st.subheader("Analysis Settings")
     threshold = st.slider("Value threshold (%)", 1.0, 20.0, 5.0, 0.5, key="threshold")
-    recent_n = st.slider("Recent games window", 5, 30, 10, key="recent_n")
+    # Recent-games window is now hardcoded per sport (half-life weighting
+    # inside makes the upper bound effectively self-tuning).
+    recent_n = sport.get("recent_n_default", 10)
+    safe_mode = st.toggle(
+        "🛡️ Safe mode (player props)",
+        value=False,
+        key="safe_mode",
+        help=(
+            "OVER-only player props. Uses per-player weighted-quantile alt "
+            "lines (whole numbers, e.g. 'Points 8+') derived from each "
+            "player's recent-game distribution at the chosen confidence."
+        ),
+    )
+    if safe_mode:
+        safe_target = st.slider(
+            "Safe-mode confidence",
+            0.70, 0.99, 0.95, 0.01,
+            key="safe_target",
+            help="Target hit-rate at our suggested alt threshold.",
+        )
+    else:
+        safe_target = 0.95
 
     total_per_game = len(market_keys) + len(selected_props)
     remaining = get_remaining_credits()
@@ -207,7 +351,17 @@ with st.sidebar:
     st.info(credit_info)
 
     st.divider()
-    st.caption(f"API Key: ...{api_key[-6:]}")
+    with st.expander("🔑 API Key"):
+        st.caption(f"Key: ...{api_key[-6:]}")
+        new_key = st.text_input("Change API Key", type="password", label_visibility="collapsed",
+                                placeholder="Enter new key...")
+        if st.button("Update Key"):
+            if new_key and len(new_key) > 10:
+                save_api_key(new_key)
+                st.success("Key updated!")
+                st.rerun()
+            else:
+                st.error("Invalid key")
 
 # ──────────────────────────────────────────────────────────
 #  Main — Game Selection
@@ -245,7 +399,8 @@ if not selected_game_labels:
     st.stop()
 
 # Calculate actual credit cost (accounting for cached data)
-bookmakers_param = None
+bookmakers_list = config.get("bookmakers", [])
+bookmakers_param = bookmakers_list if bookmakers_list else None
 actual_cost = 0
 for gl in selected_game_labels:
     ev = game_options[gl]
@@ -360,7 +515,7 @@ if analyze_clicked:
     all_props = []
     warnings = []
 
-    bookmakers_str = ""
+    bookmakers_str = ",".join(config.get("bookmakers", [])) if config.get("bookmakers") else ""
 
     progress.progress(10, text="Getting game odds...")
 
@@ -427,6 +582,10 @@ if analyze_clicked:
             except Exception:
                 schedule_results[tid] = []
 
+        # Build a per-team avg-points-allowed lookup so the player-prop analyzer
+        # can apply an opponent-defense weighting to historical games.
+        team_defense = build_team_defense_lookup(schedule_results, espn_teams)
+
         progress.progress(50, text="Getting player props...")
 
         # ── Phase 2: Parse prop data and fire off ALL player history lookups ──
@@ -472,6 +631,13 @@ if analyze_clicked:
                 home_games = schedule_results.get(home_espn["id"], [])
                 away_games = schedule_results.get(away_espn["id"], [])
 
+                home_recent = home_games[:recent_n]
+                away_recent = away_games[:recent_n]
+                # Annotate each recent game with opponent_win_pct for
+                # opponent-strength weighting in the analyzers.
+                annotate_opponent_strength(home_recent, home_espn["display_name"], espn_teams)
+                annotate_opponent_strength(away_recent, away_espn["display_name"], espn_teams)
+
                 home_stats = {
                     "season": {
                         "record": home_espn["record"],
@@ -480,7 +646,7 @@ if analyze_clicked:
                         "win_pct": home_espn["win_pct"],
                     },
                     "recent": compute_recent_form(home_games, home_espn["display_name"], n=recent_n),
-                    "recent_games": home_games[:recent_n],
+                    "recent_games": home_recent,
                 }
                 away_stats = {
                     "season": {
@@ -490,15 +656,15 @@ if analyze_clicked:
                         "win_pct": away_espn["win_pct"],
                     },
                     "recent": compute_recent_form(away_games, away_espn["display_name"], n=recent_n),
-                    "recent_games": away_games[:recent_n],
+                    "recent_games": away_recent,
                 }
 
                 if "h2h" in market_keys:
-                    all_ml.extend(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold))
+                    all_ml.extend(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
                 if "spreads" in market_keys:
-                    all_spreads.extend(analyze_spreads_value(game_odds, home_stats, away_stats, threshold))
+                    all_spreads.extend(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
                 if "totals" in market_keys:
-                    all_totals.extend(analyze_totals_value(game_odds, home_stats, away_stats, threshold))
+                    all_totals.extend(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
 
         # Player props analysis
         if eid in parsed_props:
@@ -512,7 +678,13 @@ if analyze_clicked:
                         (player_name, prop_key),
                         {"player": player_name, "found": False, "values": []},
                     )
-            all_props.extend(analyze_player_props_value(prop_data, player_histories, threshold))
+            all_props.extend(analyze_player_props_value(prop_data, player_histories, threshold,
+                                                        sport_key=sport["key"],
+                                                        team_defense=team_defense,
+                                                        espn_teams=espn_teams,
+                                                        safe_mode=safe_mode,
+                                                        safe_target=safe_target,
+                                                        team_schedules=schedule_results))
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
@@ -647,35 +819,92 @@ if "analysis_results" in st.session_state:
 
     # Player Props results
     if all_props:
-        st.subheader("🏀 Player Props Analysis")
+        is_safe = any(c.get("safe_mode") for c in all_props)
+        header = "🛡️ Player Props Analysis (Safe Mode)" if is_safe else "🏀 Player Props Analysis"
+        st.subheader(header)
         value_props = [c for c in all_props if c["is_value"]]
         no_hist = [c for c in all_props if c.get("no_history")]
         other_props = [c for c in all_props if not c["is_value"] and not c.get("no_history")]
 
+        def _safe_label(c):
+            """Display bet as 'Points {N}+' instead of 'OVER 9.5' in safe mode."""
+            return f"{c['prop_label']} {c['safe_threshold']}+"
+
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
-            for c in sorted(value_props, key=lambda x: x["edge_pct"], reverse=True):
-                with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(5)
-                    cols[0].metric("Line", c["line"])
-                    cols[1].metric("Avg Stat", c["avg_stat"])
-                    cols[2].metric("Over Rate", f"{c['over_rate']}%")
-                    cols[3].metric("Direction", c["direction"])
-                    cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
-                    st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
+            # In safe mode rank by line_gap (book-line cushion); else by edge%.
+            sorted_props = sorted(value_props,
+                                  key=lambda x: x.get("line_gap", x["edge_pct"]),
+                                  reverse=True)
+            for c in sorted_props:
+                if c.get("safe_mode"):
+                    gap = c["line_gap"]
+                    if gap >= 0:
+                        tag = "✅ bet standard line"
+                        alt_advice = f"OVER {c['line']} is already safe (gap +{gap})"
+                    else:
+                        # Suggest the highest standard alt below safe threshold
+                        alt_line = c["safe_threshold"] - 0.5
+                        tag = "↘ alt line needed"
+                        alt_advice = f"find an OVER ≤ {alt_line} (gap {gap})"
+                    title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
+                             f"[{tag}]  book line: {c['line']}")
+                    with st.expander(title, expanded=(gap >= 0)):
+                        cols = st.columns(5)
+                        cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
+                        cols[1].metric(
+                            "Prob @ Suggested",
+                            f"{c['model_hit_at_safe']}%",
+                        )
+                        cols[2].metric(
+                            "Prob @ Book Line",
+                            f"{c['model_hit_at_line']}%",
+                        )
+                        cols[3].metric(
+                            "Δ (safe − book)",
+                            f"{c['model_delta']:+.2f}%",
+                        )
+                        cols[4].metric("Avg Stat", c["avg_stat"])
+                        st.caption(
+                            f"**Action:** {alt_advice}  |  Matchup: {c['matchup']}"
+                            f"  |  Book line: {c['line']}"
+                            f"  |  Over price at book line: {c['over_price']:+d}"
+                            f"  |  Target: {int(c['safe_target']*100)}%"
+                            f"  |  Raw quantile: {c['safe_alt_q']}"
+                            f"  |  {c['games_sampled']} games sampled"
+                        )
+                else:
+                    with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
+                        cols = st.columns(5)
+                        cols[0].metric("Line", c["line"])
+                        cols[1].metric("Avg Stat", c["avg_stat"])
+                        cols[2].metric("Over Rate", f"{c['over_rate']}%")
+                        cols[3].metric("Direction", c["direction"])
+                        cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
+                        st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
 
         if other_props:
             with st.expander(f"Other props ({len(other_props)})"):
                 rows = []
                 for c in other_props:
-                    rows.append({
-                        "Player": c["player"],
-                        "Prop": c["prop_label"],
-                        "Line": c["line"],
-                        "Avg": c["avg_stat"],
-                        "Direction": c["direction"],
-                        "Edge": f"{c['edge_pct']:+.2f}%",
-                    })
+                    if c.get("safe_mode"):
+                        rows.append({
+                            "Player": c["player"],
+                            "Suggested": f"{c['prop_label']} {c['safe_threshold']}+",
+                            "Prob @ Suggested": f"{c['model_hit_at_safe']}%",
+                            "Book Line": c["line"],
+                            "Prob @ Book": f"{c['model_hit_at_line']}%",
+                            "Δ": f"{c['model_delta']:+.2f}%",
+                        })
+                    else:
+                        rows.append({
+                            "Player": c["player"],
+                            "Prop": c["prop_label"],
+                            "Line": c["line"],
+                            "Avg": c["avg_stat"],
+                            "Direction": c["direction"],
+                            "Edge": f"{c['edge_pct']:+.2f}%",
+                        })
                 st.table(rows)
 
         if no_hist:

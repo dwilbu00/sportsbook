@@ -355,6 +355,8 @@ def parse_player_props(game_data):
         "game_id": game_data["id"],
         "home_team": game_data["home_team"],
         "away_team": game_data["away_team"],
+        "commence_time": game_data.get("commence_time"),
+        "sport_key": game_data.get("sport_key"),
         "props": {},
     }
 

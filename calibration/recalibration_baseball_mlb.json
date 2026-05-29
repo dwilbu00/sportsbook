@@ -1,0 +1,15 @@
+{
+  "sport_key": "baseball_mlb",
+  "fit_timestamp": "2026-05-29T14:12:06.432213+00:00",
+  "props": {
+    "batter_hits": {
+      "a": 0.36903,
+      "b": 0.24759,
+      "n_fit": 659,
+      "source": "book_line_cache_seed"
+    }
+  },
+  "meta": {
+    "source": "book_line_cache_seed"
+  }
+}
