@@ -706,8 +706,8 @@ if "parlay_results" in st.session_state:
     elif display == "sa_value":
         mode_label = "⚡ Aggressive Alt Lines"
         caption_text = "Alt-line legs already clear your confidence threshold, so ranked purely by DK payout — picks the bets that pay the most."
-    elif effective_mode == "safe":  # regular analysis + Alt-line button
-        mode_label = "🎯 Alt Lines"
+    elif effective_mode == "safe":  # regular analysis + Safe button
+        mode_label = "🛡️ Safe"
         caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"
     else:  # regular analysis + Value button
         mode_label = "🎰 Value"
