@@ -1273,10 +1273,18 @@ if "analysis_results" in st.session_state:
 
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
-            # In safe mode rank by line_gap (book-line cushion); else by edge%.
-            sorted_props = sorted(value_props,
-                                  key=lambda x: x.get("line_gap", x["edge_pct"]),
-                                  reverse=True)
+
+            # Compute alt-EV for safe-mode bets: (p × decimal_odds) − 1, per $1.
+            # Falls back to line_gap when no alt price was fetched.
+            def _safe_sort_key(c):
+                if c.get("safe_mode") and c.get("safe_alt_price") is not None:
+                    p = (c.get("model_hit_at_safe") or 0) / 100.0
+                    dec = american_to_decimal(c["safe_alt_price"])
+                    c["alt_ev"] = p * dec - 1.0
+                    return c["alt_ev"]
+                return c.get("line_gap", c["edge_pct"]) / 100.0
+
+            sorted_props = sorted(value_props, key=_safe_sort_key, reverse=True)
             for c in sorted_props:
                 if c.get("safe_mode"):
                     gap = c["line_gap"]
@@ -1288,8 +1296,11 @@ if "analysis_results" in st.session_state:
                         alt_line = c["safe_threshold"] - 0.5
                         tag = "↘ alt line needed"
                         alt_advice = f"find an OVER ≤ {alt_line} (gap {gap})"
+                    ev_str = ""
+                    if c.get("alt_ev") is not None:
+                        ev_str = f"  EV: {c['alt_ev']*100:+.1f}%  |"
                     title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
-                             f"[{tag}]  book line: {c['line']}")
+                             f"[{tag}]{ev_str}  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
                         cols = st.columns(6)
                         cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
