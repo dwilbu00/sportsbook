@@ -451,43 +451,85 @@ if (parlay_clicked or safe_clicked) and "analysis_results" in st.session_state:
 if "parlay_results" in st.session_state:
     parlays = st.session_state["parlay_results"]
     mode = st.session_state.get("parlay_mode", "value")
-    mode_label = "🛡️ Safe" if mode == "safe" else "🎰 Value"
+    # The analysis layer may upgrade mode="value" to "safe_value" when the
+    # underlying props are safe-mode candidates. Use the per-parlay `mode`
+    # field if present.
+    sample = next((parlays[s] for s in [3, 4, 5] if s in parlays), None)
+    effective_mode = (sample or {}).get("mode", mode)
+
+    if effective_mode == "safe":
+        mode_label = "🛡️ Safe"
+        caption_text = "Prioritizing highest probability of hitting with positive edge"
+    elif effective_mode == "safe_value":
+        mode_label = "🎯 Aggressive Safe"
+        caption_text = "Safe-mode legs ranked by how close their suggested threshold sits to the book line (or above it) — more aggressive than Safe Parlays, still grounded in the model's high-confidence thresholds."
+    else:
+        mode_label = "🎰 Value"
+        caption_text = "Prioritizing best edge value with sport-specific correlation analysis"
+
     st.divider()
     st.subheader(f"{mode_label} Parlays")
-    if mode == "safe":
-        st.caption("Prioritizing highest probability of hitting with positive edge")
-    else:
-        st.caption("Prioritizing best edge value with sport-specific correlation analysis")
+    st.caption(caption_text)
 
     if parlays:
         for size in [3, 4, 5]:
             if size not in parlays:
                 continue
             p = parlays[size]
+            # Expander headline
+            if effective_mode == "safe":
+                headline = f"Hit Prob: {p['combined_hist_prob']}%"
+            elif effective_mode == "safe_value":
+                gap = p.get("avg_line_gap")
+                gap_str = f"{gap:+.2f}" if gap is not None else "n/a"
+                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  Avg gap to book line: {gap_str}"
+            else:
+                headline = f"Combined Edge: +{p['parlay_edge_pct']}%"
+
             with st.expander(
-                f"{'⭐' * size}  Best {size}-Leg Parlay  —  "
-                + (f"Hit Prob: {p['combined_hist_prob']}%" if mode == "safe"
-                   else f"Combined Edge: +{p['parlay_edge_pct']}%"),
+                f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
                 expanded=(size == 3),
             ):
                 for i, leg in enumerate(p["legs"], 1):
                     prob_pct = min(round(leg["hist_prob"] * 100, 2), 99.99)
-                    if mode == "safe":
+                    price_str = (f"  ({leg['odds_price']:+d})"
+                                 if leg.get("odds_price") else "")
+
+                    if effective_mode == "safe":
                         st.markdown(
                             f"**Leg {i}:** {leg['label']}  —  "
                             f"Prob: {prob_pct}%  |  Δ vs book line: +{leg['edge_pct']}%"
-                            + (f"  ({leg['odds_price']:+d})" if leg.get('odds_price') else "")
+                            + price_str
                         )
+                    elif effective_mode == "safe_value":
+                        if leg.get("safe_mode"):
+                            gap = leg.get("line_gap", 0.0)
+                            gap_icon = "🚀" if gap >= 0 else "📍"
+                            st.markdown(
+                                f"**Leg {i}:** {gap_icon} {leg['label']}  —  "
+                                f"Prob: {prob_pct}%  |  "
+                                f"Book line: {leg.get('book_line')}  |  "
+                                f"Suggested: {leg.get('safe_threshold')}+  |  "
+                                f"Gap: {gap:+.2f}"
+                                + price_str
+                            )
+                        else:
+                            # Non-safe leg (ML / spread / total)
+                            st.markdown(
+                                f"**Leg {i}:** {leg['label']}  —  "
+                                f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
+                                + price_str
+                            )
                     else:
                         edge_icon = "🔥" if leg["edge_pct"] >= 10 else "✅" if leg["edge_pct"] >= 5 else "📊"
                         st.markdown(
                             f"**Leg {i}:** {edge_icon} {leg['label']}  —  "
                             f"Edge: +{leg['edge_pct']}%"
-                            + (f"  ({leg['odds_price']:+d})" if leg.get('odds_price') else "")
+                            + price_str
                         )
 
                 st.divider()
-                if mode == "safe":
+                if effective_mode == "safe":
                     cols = st.columns(3)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
@@ -499,6 +541,26 @@ if "parlay_results" in st.session_state:
                         "Hit Prob (no correlation)",
                         f"{p['combined_hist_prob_indep']}%",
                         help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
+                    )
+                elif effective_mode == "safe_value":
+                    cols = st.columns(4)
+                    cols[0].metric("Legs", size)
+                    cols[1].metric(
+                        "Hit Probability",
+                        f"{p['combined_hist_prob']}%",
+                        help="Joint probability all legs hit at their suggested thresholds, adjusted for sport-specific correlations.",
+                    )
+                    avg_gap = p.get("avg_line_gap")
+                    cols[2].metric(
+                        "Avg Gap to Book Line",
+                        f"{avg_gap:+.2f}" if avg_gap is not None else "n/a",
+                        help="Average of (suggested threshold − book line) across the safe-mode legs. 0 = right at the book line; positive = the model expects a result above the book line; negative = a safer threshold below the book line.",
+                    )
+                    total_gap = p.get("total_line_gap")
+                    cols[3].metric(
+                        "Total Gap",
+                        f"{total_gap:+.2f}" if total_gap is not None else "n/a",
+                        help="Sum of per-leg gaps to the book line. Higher = more aggressive parlay.",
                     )
                 else:
                     cols = st.columns(4)

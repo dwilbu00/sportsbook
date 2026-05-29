@@ -1435,7 +1435,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             hp = (1.0 - c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
             ip = (c["under_implied"] / 100.0) if c.get("under_implied") is not None else 0.5
 
-        legs.append({
+        leg = {
             "game_key": c["matchup"],
             "team": None,
             "bet_type": bt,
@@ -1446,7 +1446,16 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "odds_price": price,
             "hist_prob": hp,
             "implied_prob": ip,
-        })
+        }
+        if c.get("safe_mode"):
+            # Extra fields used by the "value parlays in safe mode" ranker / UI.
+            leg["safe_mode"] = True
+            leg["safe_threshold"] = c.get("safe_threshold")
+            leg["book_line"] = c.get("line")
+            leg["line_gap"] = c.get("line_gap", 0.0)
+            leg["model_hit_at_safe"] = c.get("model_hit_at_safe")
+            leg["model_hit_at_line"] = c.get("model_hit_at_line")
+        legs.append(leg)
     
     return legs
 
@@ -1745,6 +1754,20 @@ def _score_parlay(legs, sport_key, mode="value"):
         # Still consider edge but weighted much less
         total_edge = sum(leg["edge_pct"] for leg in legs) * 0.1
         return prob_score + total_edge + correlation_score + usage_penalty
+    elif mode == "safe_value":
+        # "Value parlays" built from safe-mode candidates.
+        # Rank by aggressiveness: prefer legs whose safe threshold sits AT or
+        # ABOVE the book line (line_gap ≥ 0), with hit probability as a
+        # tiebreaker. Non-safe legs (ML/spread/totals) fall back to edge_pct.
+        gap_sum = 0.0
+        nonsafe_edge_sum = 0.0
+        for leg in legs:
+            if leg.get("safe_mode"):
+                gap_sum += leg.get("line_gap", 0.0)
+            else:
+                nonsafe_edge_sum += leg["edge_pct"]
+        prob_score = combined_hist * 100
+        return (gap_sum * 10) + nonsafe_edge_sum + prob_score + correlation_score + usage_penalty
     else:
         # Prioritize edge value
         total_edge = sum(leg["edge_pct"] for leg in legs)
@@ -1773,10 +1796,29 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     
     if len(legs) < 3:
         return {}
-    
+
+    # If the user asked for "value" parlays but the underlying analysis was run
+    # in safe mode (props carry safe_mode=True), edge_pct is `model_delta`
+    # (uplift of safe threshold vs book line) and `implied_prob` is at the book
+    # line — these can't be used like a normal value edge. Switch to a
+    # dedicated "safe_value" ranker that prefers safe legs whose threshold is
+    # closest to (or above) the book line.
+    has_safe_legs = any(leg.get("safe_mode") for leg in legs)
+    effective_mode = mode
+    if mode == "value" and has_safe_legs:
+        effective_mode = "safe_value"
+
     # Sort and take top candidates to limit combinatorics
-    if mode == "safe":
+    if effective_mode == "safe":
         legs.sort(key=lambda x: x["hist_prob"], reverse=True)
+    elif effective_mode == "safe_value":
+        # Primary: line_gap (safe legs only; 0 for non-safe legs as a neutral
+        # floor); Secondary: hist_prob. Both descending.
+        legs.sort(
+            key=lambda x: (x.get("line_gap", 0.0) if x.get("safe_mode") else 0.0,
+                           x["hist_prob"]),
+            reverse=True,
+        )
     else:
         legs.sort(key=lambda x: x["edge_pct"], reverse=True)
     candidates = legs[:25]  # Cap at 25 to keep combos manageable
@@ -1809,7 +1851,7 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             if has_conflict:
                 continue
 
-            h_score = _score_parlay(combo_list, sport_key, mode)
+            h_score = _score_parlay(combo_list, sport_key, effective_mode)
             tiebreak += 1
             if len(top_heap) < RERANK_TOP_K:
                 heapq.heappush(top_heap, (h_score, tiebreak, combo_list))
@@ -1839,8 +1881,20 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 seed=42 + size,
             )
 
-            if mode == "safe":
+            if effective_mode == "safe":
                 score = joint * 1000 + combined_edge * 0.1
+            elif effective_mode == "safe_value":
+                gap_sum = sum(
+                    leg.get("line_gap", 0.0)
+                    for leg in combo_list
+                    if leg.get("safe_mode")
+                )
+                nonsafe_edge_sum = sum(
+                    leg["edge_pct"]
+                    for leg in combo_list
+                    if not leg.get("safe_mode")
+                )
+                score = (gap_sum * 10) + nonsafe_edge_sum + joint * 100
             else:
                 score = combined_edge + (joint - combined_implied) * 100
 
@@ -1856,21 +1910,30 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             for leg in best_parlay:
                 combined_hist_indep *= leg["hist_prob"]
 
-            # In safe mode, `combined_edge` is a sum of model_delta values
-            # (uplift of safe threshold vs book line per leg), and
-            # `parlay_edge_pct` would compare joint-prob-at-safe-thresholds to
-            # combined-book-implied-at-book-lines — apples to oranges. Suppress
-            # those misleading numbers.
-            if mode == "safe":
+            # In safe / safe_value modes, `combined_edge` is a sum of
+            # model_delta values (uplift of safe threshold vs book line per
+            # leg), and `parlay_edge_pct` would compare joint-prob-at-safe-
+            # thresholds to combined-book-implied-at-book-lines — apples to
+            # oranges. Suppress those misleading numbers.
+            if effective_mode in ("safe", "safe_value"):
                 combined_edge_out = None
                 parlay_edge_out = None
             else:
                 combined_edge_out = round(best_combined_edge, 2)
                 parlay_edge_out = round((best_joint - best_combined_implied) * 100, 2)
 
+            # Gap stats for the safe_value display (avg/total line gap across
+            # safe legs only).
+            safe_gaps = [leg.get("line_gap", 0.0)
+                         for leg in best_parlay if leg.get("safe_mode")]
+            total_line_gap = round(sum(safe_gaps), 2) if safe_gaps else None
+            avg_line_gap = (round(sum(safe_gaps) / len(safe_gaps), 2)
+                            if safe_gaps else None)
+
             results[size] = {
                 "legs": best_parlay,
                 "score": best_score,
+                "mode": effective_mode,
                 "combined_edge": combined_edge_out,
                 "combined_hist_prob": round(best_joint * 100, 2),
                 "combined_hist_prob_indep": round(combined_hist_indep * 100, 2),
@@ -1879,6 +1942,8 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 "correlation_adjustment_pct": round(
                     (best_joint - combined_hist_indep) * 100, 2
                 ),
+                "total_line_gap": total_line_gap,
+                "avg_line_gap": avg_line_gap,
             }
 
     return results
