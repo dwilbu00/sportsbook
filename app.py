@@ -538,7 +538,7 @@ with st.sidebar:
     if safe_mode:
         safe_target_pct = st.slider(
             "Alt-lines confidence",
-            70, 99, 95, 1,
+            70, 99, 80, 1,
             key="safe_target_pct",
             format="%d%%",
             help="Target hit-rate at our suggested alt threshold.",
@@ -1070,17 +1070,17 @@ if analyze_clicked:
     # bets so only spreads/totals whose model hit-probability clears the
     # threshold are flagged as value.
     if safe_mode:
-        # Round the model's hit probability to the nearest 10% (75.53→80,
-        # 72.49→70) and compare against the slider directly.
-        def _round10(p):
-            return int(p / 10 + 0.5) * 10
+        # Round the model's hit probability to the nearest whole percent
+        # (79.96→80) and compare against the slider directly.
+        def _round1(p):
+            return int(p + 0.5)
         target_pct = safe_target * 100
         for c in all_spreads:
-            c["is_value"] = _round10(c.get("cover_rate", 0)) >= target_pct
+            c["is_value"] = _round1(c.get("cover_rate", 0)) >= target_pct
         for c in all_totals:
             ohr = c.get("over_hit_rate", 0)
-            c["is_over_value"] = _round10(ohr) >= target_pct
-            c["is_under_value"] = _round10(100 - ohr) >= target_pct
+            c["is_over_value"] = _round1(ohr) >= target_pct
+            c["is_under_value"] = _round1(100 - ohr) >= target_pct
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
