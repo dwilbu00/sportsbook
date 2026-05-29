@@ -1251,6 +1251,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "model_delta": round(model_delta * 100, 2),         # safe − book line
                     "line_gap": round(line_gap, 2),
                     "bettable_at_standard_line": bettable_at_standard_line,
+                    "_values": list(values),
+                    "_weights": list(weights),
                 })
                 continue
 
@@ -1324,6 +1326,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "no_history": False,
                 "calibration": calibration_meta,
                 "recalibration": recal_meta,
+                "_values": list(values),
+                "_weights": list(weights),
             })
 
     return candidates

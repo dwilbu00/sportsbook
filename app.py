@@ -167,6 +167,28 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
     return alt_credits_used, warnings, removed_no_alt
 
 
+def _prop_prob_fn(candidate, direction="over"):
+    """Return a callable (line) → percent hit probability for a player-prop
+    candidate, using its stored historical values + recency weights. Returns
+    None if the candidate lacks stored values."""
+    values = candidate.get("_values")
+    weights = candidate.get("_weights")
+    if not values or not weights:
+        return None
+    total_w = sum(weights)
+    if total_w == 0:
+        return None
+
+    def _fn(line):
+        if direction == "over":
+            hit = sum(w for v, w in zip(values, weights) if v > line)
+        else:
+            hit = sum(w for v, w in zip(values, weights) if v < line)
+        return 100.0 * hit / total_w
+
+    return _fn
+
+
 def _dk_payout_strs(american_price, stake=10):
     """Return (value_str, delta_str) for a single-bet DK Payout metric.
     Value is the total payout in the box (e.g. '$11.82'); delta below the
@@ -178,11 +200,13 @@ def _dk_payout_strs(american_price, stake=10):
     return f"${total_payout:.2f}", f"on ${stake:.0f} ({american_price:+d})"
 
 
-def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal"):
+def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
     """Render a compact alt-line ladder near a target line. If `direction` is
     'over', show OVER price column; if 'under', show UNDER; if 'both', show both.
     `line_style`: 'decimal' (e.g. 24.5), 'spread' (signed, e.g. -3.5), or
-    'threshold' (player-prop N+ form, e.g. 2.5 → '3+')."""
+    'threshold' (player-prop N+ form, e.g. 2.5 → '3+').
+    `prob_fn`: optional callable (line) → percentage (0–100) that adds a
+    'Prob @ Line' column between Price and Payout (single-direction tables only)."""
     import math
     if not ladder:
         return
@@ -214,6 +238,9 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
                 row["OVER Payout"] = _payout(op)
             else:
                 row["Price"] = f"{op:+d}" if op is not None else "—"
+                if prob_fn is not None:
+                    p = prob_fn(entry["line"])
+                    row["Prob @ Line"] = f"{p:.1f}%" if p is not None else "—"
                 row["Payout on $10"] = _payout(op)
         if direction in ("under", "both"):
             up = entry.get("under_price")
@@ -222,6 +249,9 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
                 row["UNDER Payout"] = _payout(up)
             else:
                 row["Price"] = f"{up:+d}" if up is not None else "—"
+                if prob_fn is not None:
+                    p = prob_fn(entry["line"])
+                    row["Prob @ Line"] = f"{p:.1f}%" if p is not None else "—"
                 row["Payout on $10"] = _payout(up)
         rows.append(row)
     st.caption(f"**{title}**")
@@ -1297,7 +1327,8 @@ if "analysis_results" in st.session_state:
                             _render_alt_ladder(c["alt_ladder"], direction="over",
                                                title=f"Alt lines for {c['player']} ({c['prop_label']})",
                                                around_line=c["safe_threshold"] - 0.5,
-                                               line_style="threshold")
+                                               line_style="threshold",
+                                               prob_fn=_prop_prob_fn(c, "over"))
                 else:
                     hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
                     bet_price = (c.get("over_price") if c["direction"] == "OVER"
@@ -1326,7 +1357,8 @@ if "analysis_results" in st.session_state:
                             _render_alt_ladder(c["alt_ladder"], direction="over",
                                                title=f"Alt lines for {c['player']} ({c['prop_label']}) — OVER",
                                                around_line=c["line"],
-                                               line_style="threshold")
+                                               line_style="threshold",
+                                               prob_fn=_prop_prob_fn(c, "over"))
 
         if other_props:
             with st.expander(f"Other props ({len(other_props)})"):
