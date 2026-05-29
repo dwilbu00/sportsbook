@@ -76,10 +76,19 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
     needed_alts = {}
     prop_alt_map = PLAYER_PROP_ALTS_BY_SPORT.get(sport_key, {})
     for c in all_props:
-        if c.get("event_id") and (c.get("is_value") or c.get("safe_mode")):
-            alt_key = prop_alt_map.get(c.get("prop"))
-            if alt_key:
-                needed_alts.setdefault(c["event_id"], set()).add(alt_key)
+        # DK only offers OVER alt lines for player props, so skip UNDER value
+        # bets (safe-mode props are always implicitly OVER thresholds).
+        if not c.get("event_id"):
+            continue
+        if c.get("safe_mode"):
+            pass  # always include — safe-mode needs alt prices to be bettable
+        elif c.get("is_value") and c.get("direction") == "OVER":
+            pass
+        else:
+            continue
+        alt_key = prop_alt_map.get(c.get("prop"))
+        if alt_key:
+            needed_alts.setdefault(c["event_id"], set()).add(alt_key)
     for c in all_spreads:
         if c.get("event_id") and c.get("is_value"):
             needed_alts.setdefault(c["event_id"], set()).add(TEAM_ALT_MARKETS["spreads"])
@@ -1169,13 +1178,9 @@ if "analysis_results" in st.session_state:
                 if c.get("is_under_value"):
                     payout_price = c.get("under_price")
                     payout_label = "DK Payout (UNDER)"
-                    alt_dir = "under"
-                    alt_ladder = c.get("alt_ladder_under")
                 else:
                     payout_price = c.get("over_price")
                     payout_label = "DK Payout (OVER)"
-                    alt_dir = "over"
-                    alt_ladder = c.get("alt_ladder_over")
                 p_val, p_delta = _dk_payout_strs(payout_price)
                 cols = st.columns(5)
                 cols[0].metric("Line", c["line"])
@@ -1184,10 +1189,21 @@ if "analysis_results" in st.session_state:
                 cols[3].metric("Over Hit Rate", f"{c['over_hit_rate']}%")
                 cols[4].metric(payout_label, p_val, delta=p_delta, delta_color="off",
                                help="American odds and profit on a $10 bet at DraftKings.")
-                if fetch_alt_lines and alt_ladder:
-                    _render_alt_ladder(alt_ladder, direction="over",
-                                       title=f"Alt totals ({alt_dir.upper()})",
-                                       around_line=c["line"])
+                # Merge OVER and UNDER alt ladders by line so the table shows
+                # both prices side-by-side.
+                if fetch_alt_lines:
+                    over_l = c.get("alt_ladder_over") or []
+                    under_l = c.get("alt_ladder_under") or []
+                    if over_l or under_l:
+                        merged = {}
+                        for e in over_l:
+                            merged.setdefault(e["line"], {})["over_price"] = e.get("price")
+                        for e in under_l:
+                            merged.setdefault(e["line"], {})["under_price"] = e.get("price")
+                        combined = [{"line": ln, **vals} for ln, vals in sorted(merged.items())]
+                        _render_alt_ladder(combined, direction="both",
+                                           title="Alt totals",
+                                           around_line=c["line"])
 
     # Player Props results
     if all_props:
@@ -1255,7 +1271,7 @@ if "analysis_results" in st.session_state:
                             f"  |  Line gap: {c['line_gap']:+.2f}"
                         )
                         if fetch_alt_lines and c.get("alt_ladder"):
-                            _render_alt_ladder(c["alt_ladder"], direction="both",
+                            _render_alt_ladder(c["alt_ladder"], direction="over",
                                                title=f"Alt lines for {c['player']} ({c['prop_label']})",
                                                around_line=c["safe_threshold"] - 0.5)
                 else:
@@ -1281,9 +1297,10 @@ if "analysis_results" in st.session_state:
                             f"  |  Predicted line: {c['avg_stat']}"
                             f"  |  Line gap: {line_gap:+.2f}"
                         )
-                        if fetch_alt_lines and c.get("alt_ladder"):
-                            _render_alt_ladder(c["alt_ladder"], direction="both",
-                                               title=f"Alt lines for {c['player']} ({c['prop_label']})",
+                        # DK only offers OVER alt lines for player props.
+                        if fetch_alt_lines and c["direction"] == "OVER" and c.get("alt_ladder"):
+                            _render_alt_ladder(c["alt_ladder"], direction="over",
+                                               title=f"Alt lines for {c['player']} ({c['prop_label']}) — OVER",
                                                around_line=c["line"])
 
         if other_props:
