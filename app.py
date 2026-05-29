@@ -652,7 +652,7 @@ with col_analyze:
 with col_parlay:
     parlay_clicked = st.button("🎰 Value Parlays", width='stretch')
 with col_safe:
-    safe_clicked = st.button("🎯 Alt-line Parlays", width='stretch')
+    safe_clicked = st.button("🛡️ Safe Parlays", width='stretch')
 
 # Clear stale parlays as soon as a new Analyze is requested so they don't
 # render below this point before the analysis block runs.
