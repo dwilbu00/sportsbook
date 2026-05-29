@@ -7,7 +7,27 @@ import heapq
 import math
 import random
 
-from odds_client import PROP_LABELS
+from odds_client import PROP_LABELS, american_to_decimal
+
+
+def _decimal_to_american(decimal_odds):
+    """Convert decimal odds to American odds (rounded to nearest integer)."""
+    if decimal_odds is None or decimal_odds <= 1.0:
+        return 0
+    if decimal_odds >= 2.0:
+        return int(round((decimal_odds - 1.0) * 100))
+    return int(round(-100.0 / (decimal_odds - 1.0)))
+
+
+def _consensus_price_for_line(items, line, line_key):
+    """Pick a representative price for entries matching `line` (median)."""
+    if not items or line is None:
+        return None
+    matching = [o["price"] for o in items if o.get(line_key) == line]
+    if not matching:
+        return None
+    sorted_prices = sorted(matching)
+    return sorted_prices[len(sorted_prices) // 2]
 from calibration_loader import (
     load_calibration,
     apply_calibration_with_warmup,
@@ -636,6 +656,10 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
     diff = projected_total - consensus_line
 
+    # Prices for the consensus line, picked from each side's odds list.
+    over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
+    under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
+
     candidates.append({
         "type": "total_over",
         "matchup": f"{game_odds['away_team']} @ {game_odds['home_team']}",
@@ -647,6 +671,8 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         "away_avg_scored": round(away_avg_scored, 2),
         "is_over_value": diff > 0 and over_hit_rate > 0.5 + threshold,
         "is_under_value": diff < 0 and (1 - over_hit_rate) > 0.5 + threshold,
+        "over_price": over_price,
+        "under_price": under_price,
     })
 
     return candidates
@@ -740,7 +766,7 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
     candidates = []
     games_sampled = min(len(home_stats["margins"]), len(away_stats["margins"]))
 
-    def _add_candidate(team_name, opponent, is_home, spread, cover_prob, team_avg_margin):
+    def _add_candidate(team_name, opponent, is_home, spread, cover_prob, team_avg_margin, price):
         edge = cover_prob - 0.50
         candidates.append({
             "type": "spread",
@@ -755,20 +781,25 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             "is_value": edge >= threshold,
             "pred_game_margin": round(pred_margin, 2),
             "pred_game_std": round(pred_std, 2),
+            "price": price,
         })
 
     if home_spread is not None:
         # Home covers iff actual_margin + home_spread > 0  ⇔  margin > -home_spread.
         # P(margin > -home_spread) = Φ((pred_margin + home_spread) / pred_std)
         home_cover_prob = _norm_cdf((pred_margin + home_spread) / pred_std)
+        home_price = _consensus_price_for_line(
+            game_odds["spreads"].get(home_team, []), home_spread, "spread")
         _add_candidate(home_team, away_team, True, home_spread,
-                       home_cover_prob, home_stats["mean"])
+                       home_cover_prob, home_stats["mean"], home_price)
     if away_spread is not None:
         # Away covers iff -actual_margin + away_spread > 0  ⇔  margin < away_spread.
         # P(margin < away_spread) = Φ((away_spread - pred_margin) / pred_std)
         away_cover_prob = _norm_cdf((away_spread - pred_margin) / pred_std)
+        away_price = _consensus_price_for_line(
+            game_odds["spreads"].get(away_team, []), away_spread, "spread")
         _add_candidate(away_team, home_team, False, away_spread,
-                       away_cover_prob, away_stats["mean"])
+                       away_cover_prob, away_stats["mean"], away_price)
 
     return candidates
 
@@ -1415,7 +1446,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "player": None,
             "prop_key": None,
             "edge_pct": c["edge_pct"],
-            "odds_price": None,
+            "odds_price": c.get("price"),
             "hist_prob": c["cover_rate"] / 100.0,
             "implied_prob": 0.50,
         })
@@ -1430,7 +1461,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "player": None,
                 "prop_key": None,
                 "edge_pct": c["over_hit_rate"] - 50.0,
-                "odds_price": None,
+                "odds_price": c.get("over_price"),
                 "hist_prob": c["over_hit_rate"] / 100.0,
                 "implied_prob": 0.50,
             })
@@ -1443,7 +1474,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "player": None,
                 "prop_key": None,
                 "edge_pct": (100.0 - c["over_hit_rate"]) - 50.0,
-                "odds_price": None,
+                "odds_price": c.get("under_price"),
                 "hist_prob": (100.0 - c["over_hit_rate"]) / 100.0,
                 "implied_prob": 0.50,
             })
@@ -1965,6 +1996,30 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             avg_line_gap = (round(sum(safe_gaps) / len(safe_gaps), 2)
                             if safe_gaps else None)
 
+            # Parlay payout: product of each leg's decimal odds. Legs missing a
+            # price (rare — primarily older totals/spreads from cached data)
+            # are treated as -110 (decimal 1.909), which is the standard US
+            # spread/total price. `payout_uses_default` flags when this fallback
+            # was applied so the UI can warn.
+            decimal_product = 1.0
+            payout_uses_default = False
+            for leg in best_parlay:
+                price = leg.get("odds_price")
+                if price is None:
+                    decimal_product *= american_to_decimal(-110)
+                    payout_uses_default = True
+                else:
+                    decimal_product *= american_to_decimal(price)
+            parlay_decimal = round(decimal_product, 3)
+            parlay_american = _decimal_to_american(decimal_product)
+            payout_per_10 = round((decimal_product - 1.0) * 10, 2)
+
+            # Same-game parlay: 2+ legs in the same matchup. DK (and other
+            # books) apply proprietary correlation adjustments to SGPs so the
+            # actual book payout will differ from the naive multiplied price.
+            game_keys = [leg.get("game_key") for leg in best_parlay]
+            has_sgp = len(game_keys) != len(set(game_keys))
+
             results[size] = {
                 "legs": best_parlay,
                 "score": best_score,
@@ -1979,6 +2034,12 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 ),
                 "total_line_gap": total_line_gap,
                 "avg_line_gap": avg_line_gap,
+                # ── Book payout (computed client-side from leg prices) ──
+                "parlay_decimal_odds": parlay_decimal,
+                "parlay_american_odds": parlay_american,
+                "payout_per_10": payout_per_10,
+                "payout_uses_default_price": payout_uses_default,
+                "has_sgp": has_sgp,
             }
 
     return results

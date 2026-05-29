@@ -456,16 +456,36 @@ if "parlay_results" in st.session_state:
     # field if present.
     sample = next((parlays[s] for s in [3, 4, 5] if s in parlays), None)
     effective_mode = (sample or {}).get("mode", mode)
+    # `has_safe_legs` tells us the underlying analysis was run in safe mode.
+    # When False, both Safe and Value parlay buttons share the same display
+    # style ("regular") with consistent labels and metrics.
+    has_safe_legs = any(
+        leg.get("safe_mode") for leg in (sample or {}).get("legs", [])
+    )
 
-    if effective_mode == "safe":
+    # Determine display style independent of button:
+    #   - "sa_safe":  safe-mode analysis + Safe Parlays
+    #   - "sa_value": safe-mode analysis + Value Parlays (auto-upgraded to safe_value)
+    #   - "regular":  regular analysis (either button)
+    if has_safe_legs and effective_mode == "safe":
+        display = "sa_safe"
+    elif effective_mode == "safe_value":
+        display = "sa_value"
+    else:
+        display = "regular"
+
+    if display == "sa_safe":
         mode_label = "🛡️ Safe"
         caption_text = "Prioritizing highest probability of hitting with positive edge"
-    elif effective_mode == "safe_value":
+    elif display == "sa_value":
         mode_label = "🎯 Aggressive Safe"
         caption_text = "Safe-mode legs ranked by how close their suggested threshold sits to the book line (or above it) — more aggressive than Safe Parlays, still grounded in the model's high-confidence thresholds."
-    else:
+    elif effective_mode == "safe":  # regular analysis + Safe button
+        mode_label = "🛡️ Safe"
+        caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"
+    else:  # regular analysis + Value button
         mode_label = "🎰 Value"
-        caption_text = "Prioritizing best edge value with sport-specific correlation analysis"
+        caption_text = "Prioritizing best parlay edge over the book with sport-specific correlation analysis"
 
     st.divider()
     st.subheader(f"{mode_label} Parlays")
@@ -477,14 +497,15 @@ if "parlay_results" in st.session_state:
                 continue
             p = parlays[size]
             # Expander headline
-            if effective_mode == "safe":
+            if display == "sa_safe":
                 headline = f"Hit Prob: {p['combined_hist_prob']}%"
-            elif effective_mode == "safe_value":
+            elif display == "sa_value":
                 gap = p.get("avg_line_gap")
                 gap_str = f"{gap:+.2f}" if gap is not None else "n/a"
                 headline = f"Hit Prob: {p['combined_hist_prob']}%  |  Avg gap to book line: {gap_str}"
-            else:
-                headline = f"Combined Edge: +{p['parlay_edge_pct']}%"
+            else:  # regular
+                headline = (f"Hit Prob: {p['combined_hist_prob']}%  |  "
+                            f"Parlay Edge: {p['parlay_edge_pct']:+.2f}%")
 
             with st.expander(
                 f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
@@ -495,13 +516,13 @@ if "parlay_results" in st.session_state:
                     price_str = (f"  ({leg['odds_price']:+d})"
                                  if leg.get("odds_price") else "")
 
-                    if effective_mode == "safe":
+                    if display == "sa_safe":
                         st.markdown(
                             f"**Leg {i}:** {leg['label']}  —  "
                             f"Prob: {prob_pct}%  |  Δ vs book line: +{leg['edge_pct']}%"
                             + price_str
                         )
-                    elif effective_mode == "safe_value":
+                    elif display == "sa_value":
                         if leg.get("safe_mode"):
                             gap = leg.get("line_gap", 0.0)
                             gap_icon = "🚀" if gap >= 0 else "📍"
@@ -520,17 +541,28 @@ if "parlay_results" in st.session_state:
                                 f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
                                 + price_str
                             )
-                    else:
-                        edge_icon = "🔥" if leg["edge_pct"] >= 10 else "✅" if leg["edge_pct"] >= 5 else "📊"
+                    else:  # regular
                         st.markdown(
-                            f"**Leg {i}:** {edge_icon} {leg['label']}  —  "
-                            f"Edge: +{leg['edge_pct']}%"
+                            f"**Leg {i}:** {leg['label']}  —  "
+                            f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
                             + price_str
                         )
 
                 st.divider()
-                if effective_mode == "safe":
-                    cols = st.columns(3)
+                # ── Book payout metrics (shown for every display style) ──
+                american_str = (f"{p['parlay_american_odds']:+d}"
+                                if p.get("parlay_american_odds") is not None else "n/a")
+                payout_help = (
+                    "Estimated DK payout from multiplying each leg's decimal odds. "
+                    "Standard cross-game parlays should match DK's slip exactly. "
+                    + ("⚠️ Same-game parlay: DK applies a correlation discount, so the actual slip will pay less than this. "
+                       if p.get("has_sgp") else "")
+                    + ("Spread/total legs without a captured price were assumed -110."
+                       if p.get("payout_uses_default_price") else "")
+                ).strip()
+
+                if display == "sa_safe":
+                    cols = st.columns(4)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
@@ -542,8 +574,15 @@ if "parlay_results" in st.session_state:
                         f"{p['combined_hist_prob_indep']}%",
                         help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
                     )
-                elif effective_mode == "safe_value":
-                    cols = st.columns(4)
+                    cols[3].metric(
+                        "DK Payout",
+                        american_str,
+                        delta=f"${p.get('payout_per_10', 0):.2f} on $10",
+                        delta_color="off",
+                        help=payout_help,
+                    )
+                elif display == "sa_value":
+                    cols = st.columns(5)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
@@ -562,12 +601,49 @@ if "parlay_results" in st.session_state:
                         f"{total_gap:+.2f}" if total_gap is not None else "n/a",
                         help="Sum of per-leg gaps to the book line. Higher = more aggressive parlay.",
                     )
-                else:
-                    cols = st.columns(4)
+                    cols[4].metric(
+                        "DK Payout",
+                        american_str,
+                        delta=f"${p.get('payout_per_10', 0):.2f} on $10",
+                        delta_color="off",
+                        help=payout_help,
+                    )
+                else:  # regular analysis (either button)
+                    cols = st.columns(5)
                     cols[0].metric("Legs", size)
-                    cols[1].metric("Hit Probability", f"{p['combined_hist_prob']}%")
-                    cols[2].metric("Sum of Edges", f"+{p['combined_edge']}%")
-                    cols[3].metric("Parlay Edge", f"+{p['parlay_edge_pct']}%")
+                    cols[1].metric(
+                        "Hit Probability",
+                        f"{p['combined_hist_prob']}%",
+                        help="Joint probability all legs hit, adjusted for sport-specific correlations between legs.",
+                    )
+                    cols[2].metric(
+                        "Hit Prob (no correlation)",
+                        f"{p['combined_hist_prob_indep']}%",
+                        help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
+                    )
+                    cols[3].metric(
+                        "Parlay Edge",
+                        f"{p['parlay_edge_pct']:+.2f}%",
+                        help="Joint hit probability minus the book's combined implied probability — the model's expected edge over the book on the full parlay.",
+                    )
+                    cols[4].metric(
+                        "DK Payout",
+                        american_str,
+                        delta=f"${p.get('payout_per_10', 0):.2f} on $10",
+                        delta_color="off",
+                        help=payout_help,
+                    )
+
+                if p.get("has_sgp"):
+                    st.caption(
+                        "⚠️ Same-game parlay — DK applies a correlation discount; "
+                        "the actual slip will pay less than the listed DK Payout."
+                    )
+                if p.get("payout_uses_default_price"):
+                    st.caption(
+                        "ℹ️ One or more spread/total legs had no captured price; "
+                        "payout assumes -110 for those legs."
+                    )
     else:
         st.info("Not enough positive-edge bets to build parlays. Try selecting more games or markets.")
 
