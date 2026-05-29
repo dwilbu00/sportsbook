@@ -328,6 +328,31 @@ PLAYER_PROPS_BY_SPORT = {
     "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts"],
 }
 
+# Mapping of standard player prop market keys → their alt-line market key on
+# The Odds API. Entries with no known alt market are omitted (e.g. anytime TD
+# is a yes/no with no line).
+PLAYER_PROP_ALTS_BY_SPORT = {
+    "basketball_nba": {
+        "player_points": "player_points_alternate",
+        "player_assists": "player_assists_alternate",
+        "player_rebounds": "player_rebounds_alternate",
+    },
+    "americanfootball_nfl": {
+        "player_rush_yds": "player_rush_yds_alternate",
+        "player_pass_yds": "player_pass_yds_alternate",
+    },
+    "baseball_mlb": {
+        "batter_hits": "batter_hits_alternate",
+        "pitcher_strikeouts": "pitcher_strikeouts_alternate",
+    },
+}
+
+# Team-level alternate markets (per event, regardless of sport).
+TEAM_ALT_MARKETS = {
+    "spreads": "alternate_spreads",
+    "totals": "alternate_totals",
+}
+
 PROP_LABELS = {
     "player_points": "Points",
     "player_assists": "Assists",
@@ -407,4 +432,85 @@ def parse_player_props(game_data):
                     "under_implied": american_to_implied_prob(under_price),
                 }
 
+    return result
+
+
+def parse_alt_player_props(game_data):
+    """
+    Parse alternate player prop odds from an event odds response.
+
+    Each prop has many lines per player (e.g. Points 5.5 / 6.5 / 7.5 / ...).
+    Returns:
+        dict keyed by (player_name, base_prop_key) → list of entries
+              [{"line": float, "over_price": int|None, "under_price": int|None}, ...]
+        sorted by line ascending.
+    """
+    grouped = {}  # (player, base_prop) -> {line: {"over_price": ..., "under_price": ...}}
+
+    for bookmaker in game_data.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            mkey = market.get("key", "")
+            if not mkey.endswith("_alternate"):
+                continue
+            base_prop = mkey[: -len("_alternate")]
+            for outcome in market.get("outcomes", []):
+                player = outcome.get("description") or outcome.get("name")
+                point = outcome.get("point")
+                price = outcome.get("price")
+                side = outcome.get("name")  # "Over" / "Under"
+                if not player or point is None or price is None:
+                    continue
+                key = (player, base_prop)
+                if key not in grouped:
+                    grouped[key] = {}
+                if point not in grouped[key]:
+                    grouped[key][point] = {"line": point, "over_price": None, "under_price": None}
+                if side == "Over":
+                    grouped[key][point]["over_price"] = price
+                elif side == "Under":
+                    grouped[key][point]["under_price"] = price
+
+    return {
+        k: sorted(v.values(), key=lambda e: e["line"])
+        for k, v in grouped.items()
+    }
+
+
+def parse_alt_team_lines(game_data):
+    """
+    Parse alternate spreads/totals from an event odds response.
+
+    Returns:
+        {
+          "spreads": {team_name: [{"line": float, "price": int}, ...]},
+          "totals":  {"Over": [...], "Under": [...]},
+        }
+        with each list sorted by line ascending.
+    """
+    result = {"spreads": {}, "totals": {"Over": [], "Under": []}}
+
+    for bookmaker in game_data.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            mkey = market.get("key", "")
+            if mkey == "alternate_spreads":
+                for outcome in market.get("outcomes", []):
+                    team = outcome.get("name")
+                    point = outcome.get("point")
+                    price = outcome.get("price")
+                    if team is None or point is None or price is None:
+                        continue
+                    result["spreads"].setdefault(team, []).append({"line": point, "price": price})
+            elif mkey == "alternate_totals":
+                for outcome in market.get("outcomes", []):
+                    label = outcome.get("name")  # "Over" / "Under"
+                    point = outcome.get("point")
+                    price = outcome.get("price")
+                    if label not in ("Over", "Under") or point is None or price is None:
+                        continue
+                    result["totals"][label].append({"line": point, "price": price})
+
+    for team in result["spreads"]:
+        result["spreads"][team].sort(key=lambda e: e["line"])
+    result["totals"]["Over"].sort(key=lambda e: e["line"])
+    result["totals"]["Under"].sort(key=lambda e: e["line"])
     return result

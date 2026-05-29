@@ -1521,6 +1521,13 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             leg["line_gap"] = c.get("line_gap", 0.0)
             leg["model_hit_at_safe"] = c.get("model_hit_at_safe")
             leg["model_hit_at_line"] = c.get("model_hit_at_line")
+            # If an alt-line price was fetched for the suggested safe
+            # threshold, prefer it over the book-line price for parlay payout
+            # calculation. The book-line price was over_price for the standard
+            # line, not the threshold we're actually betting.
+            if c.get("safe_alt_price") is not None:
+                leg["odds_price"] = c["safe_alt_price"]
+                leg["safe_alt_line"] = c.get("safe_alt_line")
         legs.append(leg)
     
     return legs

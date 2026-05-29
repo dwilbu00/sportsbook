@@ -49,11 +49,54 @@ from odds_client import (
     get_event_odds,
     parse_game_odds,
     parse_player_props,
+    parse_alt_player_props,
+    parse_alt_team_lines,
     get_remaining_credits,
     is_event_cached,
+    american_to_decimal,
     PLAYER_PROPS_BY_SPORT,
+    PLAYER_PROP_ALTS_BY_SPORT,
+    TEAM_ALT_MARKETS,
     PROP_LABELS,
 )
+
+
+def _dk_payout_strs(american_price):
+    """Return (value_str, delta_str) for a single-bet DK Payout metric."""
+    if american_price is None:
+        return "n/a", ""
+    dec = american_to_decimal(american_price)
+    profit = (dec - 1.0) * 10
+    return f"{american_price:+d}", f"${profit:.2f} on $10"
+
+
+def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3):
+    """Render a compact alt-line ladder near a target line. If `direction` is
+    'over', show OVER price column; if 'under', show UNDER; if 'both', show both."""
+    if not ladder:
+        return
+    # Filter to lines near the target (±n_around steps) if a target is given.
+    if around_line is not None:
+        sorted_l = sorted(ladder, key=lambda e: abs(e["line"] - around_line))
+        ladder = sorted(sorted_l[: 2 * n_around + 1], key=lambda e: e["line"])
+    rows = []
+    for entry in ladder:
+        row = {"Line": f"{entry['line']:+g}" if "spread" in title.lower() else entry["line"]}
+        if direction in ("over", "both"):
+            op = entry.get("over_price")
+            if op is None and "price" in entry:  # spreads/totals use flat 'price'
+                op = entry["price"]
+            row["OVER" if direction == "both" else "Price"] = (
+                f"{op:+d}" if op is not None else "—"
+            )
+        if direction in ("under", "both"):
+            up = entry.get("under_price")
+            row["UNDER" if direction == "both" else "Price"] = (
+                f"{up:+d}" if up is not None else "—"
+            )
+        rows.append(row)
+    st.caption(f"**{title}**")
+    st.dataframe(rows, hide_index=True, use_container_width=False)
 from espn_client import (
     get_all_teams,
     get_team_schedule,
@@ -342,6 +385,19 @@ with st.sidebar:
         )
     else:
         safe_target = 0.95
+
+    fetch_alt_lines = st.toggle(
+        "📋 Fetch alt-line prices",
+        value=True,
+        key="fetch_alt_lines",
+        help=(
+            "After the main analysis, pull alternate-line prices only for "
+            "events that produced a value bet. Lets the UI show real DK "
+            "prices at suggested alt lines and lets safe-mode parlay payouts "
+            "use the actual alt-line price. Costs ~1 extra credit per "
+            "(value-bet event × alt market) — typically a small add-on."
+        ),
+    )
 
     total_per_game = len(market_keys) + len(selected_props)
     remaining = get_remaining_credits()
@@ -811,12 +867,17 @@ if analyze_clicked:
                     "recent_games": away_recent,
                 }
 
+                def _tag_event(cands):
+                    for c in cands:
+                        c["event_id"] = eid
+                    return cands
+
                 if "h2h" in market_keys:
-                    all_ml.extend(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
+                    all_ml.extend(_tag_event(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"])))
                 if "spreads" in market_keys:
-                    all_spreads.extend(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
+                    all_spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"])))
                 if "totals" in market_keys:
-                    all_totals.extend(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"]))
+                    all_totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"])))
 
         # Player props analysis
         if eid in parsed_props:
@@ -830,13 +891,94 @@ if analyze_clicked:
                         (player_name, prop_key),
                         {"player": player_name, "found": False, "values": []},
                     )
-            all_props.extend(analyze_player_props_value(prop_data, player_histories, threshold,
-                                                        sport_key=sport["key"],
-                                                        team_defense=team_defense,
-                                                        espn_teams=espn_teams,
-                                                        safe_mode=safe_mode,
-                                                        safe_target=safe_target,
-                                                        team_schedules=schedule_results))
+            new_props = analyze_player_props_value(prop_data, player_histories, threshold,
+                                                  sport_key=sport["key"],
+                                                  team_defense=team_defense,
+                                                  espn_teams=espn_teams,
+                                                  safe_mode=safe_mode,
+                                                  safe_target=safe_target,
+                                                  team_schedules=schedule_results)
+            for c in new_props:
+                c["event_id"] = eid
+            all_props.extend(new_props)
+
+    # ── Phase 4: Conditional alt-line fetch for value-bet events ──
+    alt_data_by_event = {}  # event_id → {"props": {(player, prop): [alts]}, "team": {...}}
+    alt_credits_used = 0
+    if fetch_alt_lines:
+        # Build {event_id: set of alt market keys we need} based on value bets.
+        needed_alts = {}
+        prop_alt_map = PLAYER_PROP_ALTS_BY_SPORT.get(sport["key"], {})
+        for c in all_props:
+            if c.get("event_id") and (c.get("is_value") or c.get("safe_mode")):
+                alt_key = prop_alt_map.get(c.get("prop"))
+                if alt_key:
+                    needed_alts.setdefault(c["event_id"], set()).add(alt_key)
+        for c in all_spreads:
+            if c.get("event_id") and c.get("is_value"):
+                needed_alts.setdefault(c["event_id"], set()).add(TEAM_ALT_MARKETS["spreads"])
+        for c in all_totals:
+            if c.get("event_id") and (c.get("is_over_value") or c.get("is_under_value")):
+                needed_alts.setdefault(c["event_id"], set()).add(TEAM_ALT_MARKETS["totals"])
+
+        if needed_alts:
+            progress.progress(90, text=f"Pulling alt-line prices for {len(needed_alts)} event(s)...")
+            bookmakers = bookmakers_str.split(",") if bookmakers_str else None
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                alt_futures = {}
+                for eid, alt_market_set in needed_alts.items():
+                    alt_markets_str = ",".join(sorted(alt_market_set))
+                    # Estimate credits (will be 0 if cached). We don't have an
+                    # exact pre-call cached check for alt markets here, so just
+                    # add the worst-case to the credit tally.
+                    alt_credits_used += len(alt_market_set)
+                    alt_futures[eid] = pool.submit(
+                        get_event_odds, api_key, sport["key"], eid,
+                        markets=alt_markets_str, bookmakers=bookmakers,
+                    )
+                for eid, fut in alt_futures.items():
+                    try:
+                        raw = fut.result()
+                        alt_data_by_event[eid] = {
+                            "props": parse_alt_player_props(raw),
+                            "team": parse_alt_team_lines(raw),
+                        }
+                    except Exception as e:
+                        warnings.append(f"Failed to fetch alt lines for event {eid}: {e}")
+
+            # Attach alt prices to safe-mode prop candidates so parlay payouts
+            # use the actual DK price at the suggested threshold.
+            for c in all_props:
+                if not c.get("safe_mode") or not c.get("event_id"):
+                    continue
+                event_alts = alt_data_by_event.get(c["event_id"], {}).get("props", {})
+                ladder = event_alts.get((c["player"], c["prop"]), [])
+                # safe_threshold = the integer threshold (e.g. 7 for "Points 7+").
+                # The corresponding OVER line is safe_threshold - 0.5 (e.g. OVER 6.5).
+                target_line = c["safe_threshold"] - 0.5
+                match = next((e for e in ladder if e["line"] == target_line), None)
+                if match and match.get("over_price") is not None:
+                    c["safe_alt_price"] = match["over_price"]
+                    c["safe_alt_line"] = match["line"]
+                # Stash the ladder so the UI can show nearby alts too.
+                if ladder:
+                    c["alt_ladder"] = ladder
+
+            # Attach alt ladders to other value bets for display.
+            for c in all_spreads:
+                if c.get("is_value") and c.get("event_id") in alt_data_by_event:
+                    c["alt_ladder"] = alt_data_by_event[c["event_id"]]["team"]["spreads"].get(c["team"], [])
+            for c in all_totals:
+                if (c.get("is_over_value") or c.get("is_under_value")) and c.get("event_id") in alt_data_by_event:
+                    team_alts = alt_data_by_event[c["event_id"]]["team"]["totals"]
+                    c["alt_ladder_over"] = team_alts.get("Over", [])
+                    c["alt_ladder_under"] = team_alts.get("Under", [])
+            for c in all_props:
+                if c.get("is_value") and not c.get("safe_mode") and c.get("event_id"):
+                    event_alts = alt_data_by_event.get(c["event_id"], {}).get("props", {})
+                    ladder = event_alts.get((c["player"], c["prop"]), [])
+                    if ladder:
+                        c["alt_ladder"] = ladder
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
@@ -852,7 +994,9 @@ if analyze_clicked:
         "all_props": all_props,
         "sport_key": sport["key"],
         "total_games": total_games,
-        "total_cost": actual_cost,
+        "total_cost": actual_cost + alt_credits_used,
+        "alt_credits": alt_credits_used,
+        "alt_data": alt_data_by_event,
     }
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
@@ -905,11 +1049,14 @@ if "analysis_results" in st.session_state:
             st.success(f"**{len(value_ml)} value bet(s) found!**")
             for c in sorted(value_ml, key=lambda x: x["edge_pct"], reverse=True):
                 with st.expander(f"🔥 {c['team']} ({c['home_away']}) vs {c['opponent']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(4)
+                    cols = st.columns(5)
                     cols[0].metric("Book Implied", f"{c['book_implied_prob']}%")
                     cols[1].metric("Season Win%", f"{c['season_win_pct']}%")
                     cols[2].metric("Recent Win%", f"{c['recent_win_pct']}%")
                     cols[3].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d} at {c['best_book']}")
+                    p_val, p_delta = _dk_payout_strs(c.get("best_price"))
+                    cols[4].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
+                                   help="American odds and profit on a $10 bet at DraftKings.")
 
         if other_ml:
             with st.expander(f"Other matchups ({len(other_ml)})"):
@@ -934,11 +1081,18 @@ if "analysis_results" in st.session_state:
             st.success(f"**{len(value_sp)} spread value bet(s) found!**")
             for c in sorted(value_sp, key=lambda x: x["edge_pct"], reverse=True):
                 with st.expander(f"🔥 {c['team']} {c['spread']:+.2f} ({c['home_away']})  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(4)
+                    cols = st.columns(5)
                     cols[0].metric("Spread", f"{c['spread']:+.2f}")
                     cols[1].metric("Avg Margin", f"{c['avg_margin']:+.2f}")
                     cols[2].metric("Cover Rate", f"{c['cover_rate']}%")
                     cols[3].metric("Edge", f"+{c['edge_pct']}%")
+                    p_val, p_delta = _dk_payout_strs(c.get("price"))
+                    cols[4].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
+                                   help="American odds and profit on a $10 bet at DraftKings.")
+                    if c.get("alt_ladder"):
+                        _render_alt_ladder(c["alt_ladder"], direction="over",
+                                           title=f"Alt spreads for {c['team']}",
+                                           around_line=c["spread"])
 
         if other_sp:
             with st.expander(f"Other spreads ({len(other_sp)})"):
@@ -963,11 +1117,30 @@ if "analysis_results" in st.session_state:
                 flag = " 🔥 UNDER VALUE"
 
             with st.expander(f"{c['matchup']}  —  Line: {c['line']}{flag}"):
-                cols = st.columns(4)
+                # Show the payout for whichever side is flagged value (default
+                # to OVER if neither, so the metric is informative).
+                if c.get("is_under_value"):
+                    payout_price = c.get("under_price")
+                    payout_label = "DK Payout (UNDER)"
+                    alt_dir = "under"
+                    alt_ladder = c.get("alt_ladder_under")
+                else:
+                    payout_price = c.get("over_price")
+                    payout_label = "DK Payout (OVER)"
+                    alt_dir = "over"
+                    alt_ladder = c.get("alt_ladder_over")
+                p_val, p_delta = _dk_payout_strs(payout_price)
+                cols = st.columns(5)
                 cols[0].metric("Line", c["line"])
                 cols[1].metric("Projected Total", c["projected_total"])
                 cols[2].metric("Diff from Line", f"{c['diff_from_line']:+.2f}")
                 cols[3].metric("Over Hit Rate", f"{c['over_hit_rate']}%")
+                cols[4].metric(payout_label, p_val, delta=p_delta, delta_color="off",
+                               help="American odds and profit on a $10 bet at DraftKings.")
+                if alt_ladder:
+                    _render_alt_ladder(alt_ladder, direction="over",
+                                       title=f"Alt totals ({alt_dir.upper()})",
+                                       around_line=c["line"])
 
     # Player Props results
     if all_props:
@@ -1002,7 +1175,7 @@ if "analysis_results" in st.session_state:
                     title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
                              f"[{tag}]  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
-                        cols = st.columns(5)
+                        cols = st.columns(6)
                         cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
                         cols[1].metric(
                             "Prob @ Suggested",
@@ -1017,6 +1190,18 @@ if "analysis_results" in st.session_state:
                             f"{c['model_delta']:+.2f}%",
                         )
                         cols[4].metric("Avg Stat", c["avg_stat"])
+                        # Prefer real alt-line price when we fetched alts; fall
+                        # back to the book-line price with a caveat.
+                        if c.get("safe_alt_price") is not None:
+                            p_val, p_delta = _dk_payout_strs(c["safe_alt_price"])
+                            payout_label = f"DK Payout (OVER {c['safe_alt_line']})"
+                            payout_help = f"Actual DraftKings price for OVER {c['safe_alt_line']} (≡ {c['prop_label']} {c['safe_threshold']}+)."
+                        else:
+                            p_val, p_delta = _dk_payout_strs(c.get("over_price"))
+                            payout_label = "DK Payout (book line)"
+                            payout_help = "Payout for the OVER at the standard book line. Alt-line fetch is disabled or no alt was offered at the suggested threshold — DK's actual alt price will differ."
+                        cols[5].metric(payout_label, p_val, delta=p_delta,
+                                       delta_color="off", help=payout_help)
                         st.caption(
                             f"**Action:** {alt_advice}  |  Matchup: {c['matchup']}"
                             f"  |  Book line: {c['line']}"
@@ -1025,16 +1210,31 @@ if "analysis_results" in st.session_state:
                             f"  |  Raw quantile: {c['safe_alt_q']}"
                             f"  |  {c['games_sampled']} games sampled"
                         )
+                        if c.get("alt_ladder"):
+                            _render_alt_ladder(c["alt_ladder"], direction="both",
+                                               title=f"Alt lines for {c['player']} ({c['prop_label']})",
+                                               around_line=c["safe_threshold"] - 0.5)
                 else:
                     hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
+                    bet_price = (c.get("over_price") if c["direction"] == "OVER"
+                                 else c.get("under_price"))
                     with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                        cols = st.columns(5)
+                        cols = st.columns(6)
                         cols[0].metric("Line", c["line"])
                         cols[1].metric("Avg Stat", c["avg_stat"])
                         cols[2].metric(f"{c['direction']} Hit Prob", f"{hit_prob}%")
                         cols[3].metric("Direction", c["direction"])
                         cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
+                        p_val, p_delta = _dk_payout_strs(bet_price)
+                        cols[5].metric(
+                            f"DK Payout ({c['direction']})", p_val, delta=p_delta, delta_color="off",
+                            help=f"Payout for the {c['direction']} at the book line on DraftKings.",
+                        )
                         st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
+                        if c.get("alt_ladder"):
+                            _render_alt_ladder(c["alt_ladder"], direction="both",
+                                               title=f"Alt lines for {c['player']} ({c['prop_label']})",
+                                               around_line=c["line"])
 
         if other_props:
             with st.expander(f"Other props ({len(other_props)})"):
