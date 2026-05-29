@@ -1457,6 +1457,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
     for c in all_spreads:
         if c["edge_pct"] <= 0 or c.get("games_sampled", 0) < 5:
             continue
+        # Respect explicit is_value flag — safe-mode rewrites this to enforce
+        # the alt-lines confidence threshold for spreads.
+        if c.get("is_value") is False:
+            continue
         game_key = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         legs.append({
             "game_key": game_key,

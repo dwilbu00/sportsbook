@@ -1064,14 +1064,17 @@ if analyze_clicked:
     # bets so only spreads/totals whose model hit-probability clears the
     # threshold are flagged as value.
     if safe_mode:
-        import math as _math
-        conf_pct = _math.ceil(safe_target * 10) * 10  # ceil to nearest 10%: 75→80, 95→100
+        # Round the model's hit probability to the nearest 10% (75.53→80,
+        # 72.49→70) and compare against the slider directly.
+        def _round10(p):
+            return int(p / 10 + 0.5) * 10
+        target_pct = safe_target * 100
         for c in all_spreads:
-            c["is_value"] = c.get("cover_rate", 0) >= conf_pct
+            c["is_value"] = _round10(c.get("cover_rate", 0)) >= target_pct
         for c in all_totals:
             ohr = c.get("over_hit_rate", 0)
-            c["is_over_value"] = ohr >= conf_pct
-            c["is_under_value"] = (100 - ohr) >= conf_pct
+            c["is_over_value"] = _round10(ohr) >= target_pct
+            c["is_under_value"] = _round10(100 - ohr) >= target_pct
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
