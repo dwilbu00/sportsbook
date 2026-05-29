@@ -874,11 +874,12 @@ if "analysis_results" in st.session_state:
                             f"  |  {c['games_sampled']} games sampled"
                         )
                 else:
+                    hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
                     with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
                         cols = st.columns(5)
                         cols[0].metric("Line", c["line"])
                         cols[1].metric("Avg Stat", c["avg_stat"])
-                        cols[2].metric("Over Rate", f"{c['over_rate']}%")
+                        cols[2].metric(f"{c['direction']} Hit Prob", f"{hit_prob}%")
                         cols[3].metric("Direction", c["direction"])
                         cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
                         st.caption(f"Matchup: {c['matchup']}  |  Over: {c['over_price']:+d} ({c['over_implied']}%)  |  Under: {c['under_price']:+d} ({c['under_implied']}%)  |  {c['games_sampled']} games sampled")
@@ -897,12 +898,14 @@ if "analysis_results" in st.session_state:
                             "Δ": f"{c['model_delta']:+.2f}%",
                         })
                     else:
+                        hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
                         rows.append({
                             "Player": c["player"],
                             "Prop": c["prop_label"],
                             "Line": c["line"],
                             "Avg": c["avg_stat"],
                             "Direction": c["direction"],
+                            "Hit Prob": f"{hit_prob}%",
                             "Edge": f"{c['edge_pct']:+.2f}%",
                         })
                 st.table(rows)
