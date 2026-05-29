@@ -557,6 +557,7 @@ if not selected_game_labels:
 # Calculate actual credit cost (accounting for cached data)
 bookmakers_list = config.get("bookmakers", [])
 bookmakers_param = bookmakers_list if bookmakers_list else None
+bookmakers_str = ",".join(bookmakers_list) if bookmakers_list else ""
 actual_cost = 0
 for gl in selected_game_labels:
     ev = game_options[gl]
@@ -825,8 +826,6 @@ if analyze_clicked:
     all_totals = []
     all_props = []
     warnings = []
-
-    bookmakers_str = ",".join(config.get("bookmakers", [])) if config.get("bookmakers") else ""
 
     progress.progress(10, text="Getting game odds...")
 
