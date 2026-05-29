@@ -3,7 +3,7 @@
     "default_sport": "basketball_nba",
     "value_threshold_pct": 5.0,
     "recent_games_window": 10,
-    "bookmakers": [],
+    "bookmakers": ["draftkings"],
     "sports": {
         "basketball_nba": {
             "odds_api_sport": "basketball_nba",

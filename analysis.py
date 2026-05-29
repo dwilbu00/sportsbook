@@ -654,12 +654,15 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
 def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None):
     """
-    Compare spread lines against historical scoring margins.
+    Compare spread lines against historical scoring margins, using a JOINT
+    distribution of the predicted game margin (home perspective).
 
-    For each team, calculates:
-    - Average margin of victory/defeat from recent games
-    - Historical cover rate against the given spread
-    - Flags value where historical cover rate significantly exceeds implied ~50%
+    For each team, the model estimates the weighted mean and weighted std of
+    that team's recent margins. The game's actual margin is then approximated
+    as Normal(home_mean − away_mean, sqrt(home_var + away_var)) under
+    independence. Cover probabilities are derived from this joint distribution,
+    so home_cover_prob + away_cover_prob ≈ 1 (zero-sum, vig aside) — only one
+    side can be a value bet in a given matchup.
 
     Parameters:
         game_odds (dict): Parsed game odds from odds_client.parse_game_odds()
@@ -668,28 +671,16 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         threshold_pct (float): Minimum edge to flag as value
 
     Returns:
-        list: Value candidates for spread bets
+        list: Value candidates for spread bets (at most one will be is_value=True per game)
     """
-    candidates = []
     threshold = threshold_pct / 100.0
     half_life = _half_life_for(sport_key)
 
     home_team = game_odds["home_team"]
     away_team = game_odds["away_team"]
 
-    for team_name, stats, is_home in [
-        (home_team, home_team_stats, True),
-        (away_team, away_team_stats, False),
-    ]:
-        spread_odds = game_odds["spreads"].get(team_name, [])
-        if not spread_odds:
-            continue
-
-        # Get the consensus spread (most common line)
-        spreads = [o["spread"] for o in spread_odds]
-        consensus_spread = max(set(spreads), key=spreads.count) if spreads else 0
-
-        # Calculate margin from recent games (most-recent first ordering preserved).
+    # ── Per-team weighted margin distributions ──────────────────────────────
+    def _team_margin_stats(team_name, stats, is_home):
         recent_games = stats.get("recent_games", [])
         margins = []
         past_is_home_list = []
@@ -705,35 +696,79 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             margins.append(margin)
 
         if not margins:
-            continue
+            return None
 
-        # Apply recency and venue-match weighting (opp_strength removed via backtest).
-        # A team "covers" if their margin > the negative of their spread
-        # e.g., favored by 5 (spread = -5): need to win by more than 5
-        # e.g., underdog by 5 (spread = +5): can lose by less than 5 or win
         base_weights = _recency_weights(len(margins), half_life)
         weights = [
             bw * _venue_match_multiplier(past_h, is_home, sport_key)
             for bw, past_h in zip(base_weights, past_is_home_list)
         ]
-        avg_margin = _weighted_mean(margins, weights)
-        cover_rate = _weighted_rate(margins, weights, lambda m: m + consensus_spread > 0)
+        mean = _weighted_mean(margins, weights)
+        std = _weighted_std(margins, weights, mean=mean)
+        return {"margins": margins, "weights": weights, "mean": mean, "std": std}
 
-        # Book implies ~50% cover rate (vig aside). Value = historical cover rate - 0.50
-        edge = cover_rate - 0.50
+    home_stats = _team_margin_stats(home_team, home_team_stats, True)
+    away_stats = _team_margin_stats(away_team, away_team_stats, False)
 
+    # ── Consensus spread per team ───────────────────────────────────────────
+    def _consensus_spread(team):
+        spread_odds = game_odds["spreads"].get(team, [])
+        if not spread_odds:
+            return None
+        spreads = [o["spread"] for o in spread_odds]
+        return max(set(spreads), key=spreads.count)
+
+    home_spread = _consensus_spread(home_team)
+    away_spread = _consensus_spread(away_team)
+
+    # ── Joint margin distribution (home perspective) ────────────────────────
+    # If we have stats for both teams, build the joint estimate. Otherwise we
+    # cannot compute a meaningful cover probability for either side and skip
+    # the matchup entirely (better than recommending both halves of a bet on
+    # half the information).
+    if not home_stats or not away_stats:
+        return []
+
+    pred_margin = home_stats["mean"] - away_stats["mean"]
+    # Floor each team's std at 1.0 point to avoid degenerate certainty when a
+    # team has very few recent games or unusually flat margins.
+    home_var = max(home_stats["std"], 1.0) ** 2
+    away_var = max(away_stats["std"], 1.0) ** 2
+    pred_std = math.sqrt(home_var + away_var)
+
+    # ── Build candidate per team using the joint cover probability ──────────
+    candidates = []
+    games_sampled = min(len(home_stats["margins"]), len(away_stats["margins"]))
+
+    def _add_candidate(team_name, opponent, is_home, spread, cover_prob, team_avg_margin):
+        edge = cover_prob - 0.50
         candidates.append({
             "type": "spread",
             "team": team_name,
-            "opponent": away_team if is_home else home_team,
+            "opponent": opponent,
             "home_away": "HOME" if is_home else "AWAY",
-            "spread": consensus_spread,
-            "avg_margin": round(avg_margin, 2),
-            "cover_rate": round(cover_rate * 100, 2),
-            "games_sampled": len(margins),
+            "spread": spread,
+            "avg_margin": round(team_avg_margin, 2),
+            "cover_rate": round(cover_prob * 100, 2),
+            "games_sampled": games_sampled,
             "edge_pct": round(edge * 100, 2),
             "is_value": edge >= threshold,
+            "pred_game_margin": round(pred_margin, 2),
+            "pred_game_std": round(pred_std, 2),
         })
+
+    if home_spread is not None:
+        # Home covers iff actual_margin + home_spread > 0  ⇔  margin > -home_spread.
+        # P(margin > -home_spread) = Φ((pred_margin + home_spread) / pred_std)
+        home_cover_prob = _norm_cdf((pred_margin + home_spread) / pred_std)
+        _add_candidate(home_team, away_team, True, home_spread,
+                       home_cover_prob, home_stats["mean"])
+    if away_spread is not None:
+        # Away covers iff -actual_margin + away_spread > 0  ⇔  margin < away_spread.
+        # P(margin < away_spread) = Φ((away_spread - pred_margin) / pred_std)
+        away_cover_prob = _norm_cdf((away_spread - pred_margin) / pred_std)
+        _add_candidate(away_team, home_team, False, away_spread,
+                       away_cover_prob, away_stats["mean"])
 
     return candidates
 
