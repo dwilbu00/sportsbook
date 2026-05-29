@@ -1,0 +1,742 @@
+"""
+Book-line calibration analysis.
+
+Joins cached sportsbook odds snapshots (`cache/*.json`) to ESPN player
+gamelogs, finds the actual stat the player produced in each game, and
+evaluates three probabilistic forecasters at the real book line:
+
+    A) empirical    — weighted fraction of prior games > line (current method)
+    B) resid_normal — bias-correct projection, then Φ((projected+μ_r − L)/σ_r)
+    C) resid_ecdf   — bias-correct projection, then 1 − F_r(L − (projected+μ_r))
+
+Residual stats (μ_r, σ_r, F_r) are fit from a chronological HOLDOUT split
+to avoid leakage: the earliest 50% of observations build calibration, the
+later 50% are scored.
+
+Usage:
+    python book_line_calibration.py --sport nba
+    python book_line_calibration.py --sport mlb --variants recency,all
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import sys
+from collections import defaultdict
+
+from analysis import (
+    _norm_cdf, _half_life_for, _recency_weights, _weighted_rate,
+    _weighted_std, _normal_inv_cdf,
+)
+from backtest import (
+    cached_gamelog, cached_athlete_id,
+    SPORT_MAP, VARIANT_PRESETS, _empirical_cdf, _brier, _logloss, _hit_rate,
+    _resolve_params, opp_defense_mult, venue_mult,
+    _team_defense_lookup, _resolve_opp_pts_allowed,
+    _per_player_stats, _shrunk,
+)
+from espn_client import PROP_STAT_MAP
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ODDS_CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
+
+
+PROPS_BY_SPORT = {
+    "nba":  ["player_points", "player_rebounds", "player_assists"],
+    "mlb":  ["pitcher_strikeouts", "batter_hits"],
+    "nfl":  ["player_pass_yds", "player_rush_yds"],
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Step 1: harvest book lines from cached odds snapshots
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_prop_market(market_key):
+    return market_key.startswith(("player_", "pitcher_", "batter_"))
+
+
+def harvest_book_lines(sport_key, target_props):
+    """
+    Walk cache/*.json and return a list of dicts:
+      {sport_key, commence_time, game_date, home_team, away_team,
+       player, prop_key, line, over_price, under_price}
+    Picks the consensus (median) line across books per (player, prop, game).
+    """
+    raw = []  # (game_date, sport, home, away, player, prop, side, line, price)
+    for path in sorted(glob.glob(os.path.join(ODDS_CACHE_DIR, "*.json"))):
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        data = doc.get("data", doc) if isinstance(doc, dict) else doc
+        if not isinstance(data, dict):
+            continue
+        if data.get("sport_key") != sport_key:
+            continue
+        ct = data.get("commence_time")
+        if not ct:
+            continue
+        date = ct[:10]
+        home = data.get("home_team")
+        away = data.get("away_team")
+        for book in data.get("bookmakers", []) or []:
+            for mkt in book.get("markets", []) or []:
+                mk = mkt.get("key", "")
+                if mk not in target_props:
+                    continue
+                for o in mkt.get("outcomes", []) or []:
+                    player = o.get("description")
+                    side = o.get("name")  # "Over" / "Under"
+                    point = o.get("point")
+                    price = o.get("price")
+                    if not (player and side and point is not None):
+                        continue
+                    raw.append((date, sport_key, home, away,
+                                player, mk, side, point, price))
+
+    # Consolidate to one row per (player, prop, game): use the consensus line
+    # (median across books) and the best price per side.
+    by_key = defaultdict(lambda: {"lines": [], "over_prices": [], "under_prices": [],
+                                  "home": None, "away": None})
+    for date, sport, home, away, player, mk, side, point, price in raw:
+        key = (date, sport, player, mk)
+        cell = by_key[key]
+        cell["home"] = home
+        cell["away"] = away
+        cell["lines"].append(point)
+        if side.lower() == "over" and price is not None:
+            cell["over_prices"].append(price)
+        elif side.lower() == "under" and price is not None:
+            cell["under_prices"].append(price)
+
+    out = []
+    for (date, sport, player, mk), cell in by_key.items():
+        if not cell["lines"]:
+            continue
+        # Consensus line = mode/median of book lines (most books agree)
+        lines_sorted = sorted(cell["lines"])
+        consensus = lines_sorted[len(lines_sorted) // 2]
+        out.append({
+            "sport_key": sport,
+            "game_date": date,
+            "home_team": cell["home"],
+            "away_team": cell["away"],
+            "player": player,
+            "prop_key": mk,
+            "line": consensus,
+            "over_price": max(cell["over_prices"]) if cell["over_prices"] else None,
+            "under_price": max(cell["under_prices"]) if cell["under_prices"] else None,
+        })
+    out.sort(key=lambda r: (r["game_date"], r["player"], r["prop_key"]))
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Step 2: join each book line to the player's actual stat in that game
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _stat_label_for(prop_key, gamelog):
+    for label in PROP_STAT_MAP.get(prop_key, []):
+        if any(label in g for g in gamelog):
+            return label
+    return None
+
+
+def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
+    """
+    For each book line, resolve the player's athlete_id, pull their gamelog,
+    locate the game on `game_date`, and attach `actual` + `prior_games`.
+    Returns a list of enriched dicts (skipping unjoinable rows).
+    """
+    # Group by player so we only fetch each gamelog once
+    by_player = defaultdict(list)
+    for row in book_lines:
+        by_player[row["player"]].append(row)
+
+    enriched = []
+    skipped_no_player = 0
+    skipped_no_game = 0
+
+    for player, rows in by_player.items():
+        aid = cached_athlete_id(espn_sport, espn_league, player)
+        if not aid:
+            skipped_no_player += len(rows)
+            continue
+        gamelog = cached_gamelog(espn_sport, espn_league, aid)
+        if not gamelog:
+            skipped_no_player += len(rows)
+            continue
+        gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
+
+        # Build a date → game-index lookup
+        date_idx = {}
+        for i, g in enumerate(gamelog):
+            d = (g.get("game_date") or "")[:10]
+            if d and d not in date_idx:
+                date_idx[d] = i
+
+        for row in rows:
+            stat_label = _stat_label_for(row["prop_key"], gamelog)
+            if not stat_label:
+                continue
+            # ESPN game_date is UTC-ish; the book commence_time is also UTC,
+            # so date-only match is usually accurate. Also try ±1 day in case
+            # of timezone slippage.
+            d = row["game_date"]
+            idx = date_idx.get(d)
+            if idx is None:
+                from datetime import date as _date, timedelta
+                try:
+                    d0 = _date.fromisoformat(d)
+                    for delta in (-1, 1):
+                        alt = (d0 + timedelta(days=delta)).isoformat()
+                        if alt in date_idx:
+                            idx = date_idx[alt]
+                            break
+                except ValueError:
+                    pass
+            if idx is None:
+                skipped_no_game += 1
+                continue
+
+            test_game = gamelog[idx]
+            actual = test_game.get(stat_label)
+            if actual is None:
+                skipped_no_game += 1
+                continue
+            min_played = test_game.get("MIN", 0.0) or 0.0
+            if min_played and min_played < 10.0:
+                skipped_no_game += 1
+                continue
+
+            prior_games = gamelog[idx + 1:]
+            if len(prior_games) < 10:
+                skipped_no_game += 1
+                continue
+
+            enriched.append({
+                **row,
+                "stat_label": stat_label,
+                "actual": float(actual),
+                "test_game": test_game,
+                "prior_games": prior_games,
+            })
+
+    print(f"  joined {len(enriched)} (player, prop, game) observations; "
+          f"skipped {skipped_no_player} (no player resolved), "
+          f"{skipped_no_game} (no game/stat match).")
+    return enriched
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Step 3: produce projected stat + empirical_over for each observation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def project_and_empirical(obs, params, sport_key,
+                          team_defense=None, league_avg_def=None):
+    """
+    Mirrors backtest.run_player_props_backtest's per-obs projection logic,
+    but takes the line from the book instead of synthetic.
+
+    Returns (projected, empirical_over) or (None, None) if data is too thin.
+    """
+    prior_games = obs["prior_games"]
+    stat_label = obs["stat_label"]
+    line = obs["line"]
+    test_game = obs["test_game"]
+
+    prior_values = [g.get(stat_label, 0.0) for g in prior_games]
+    prior_minutes = [g.get("MIN", 0.0) for g in prior_games]
+    prior_home_aways = [g.get("is_home") for g in prior_games]
+    prior_opponents = [g.get("opponent") for g in prior_games]
+
+    if any(prior_minutes):
+        MIN_FLOOR = 10.0
+        kept = [(v, m, ha, opp) for v, m, ha, opp in zip(
+                    prior_values, prior_minutes,
+                    prior_home_aways, prior_opponents)
+                if (m or 0) >= MIN_FLOOR]
+        if kept:
+            prior_values = [v for v, _, _, _ in kept]
+            prior_minutes = [m for _, m, _, _ in kept]
+            prior_home_aways = [ha for _, _, ha, _ in kept]
+            prior_opponents = [opp for _, _, _, opp in kept]
+
+    if not prior_values:
+        return None, None
+
+    upcoming_is_home = test_game.get("is_home")
+
+    hl = params.get("half_life")
+    base_w = _recency_weights(len(prior_values), hl)
+    venue_s = params.get("venue_strength", 0.0)
+    def_s = params.get("opp_defense_strength", 0.0)
+
+    weights = []
+    for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
+        w = bw * venue_mult(ph, upcoming_is_home, venue_s)
+        if def_s > 0 and team_defense:
+            opp_pa = _resolve_opp_pts_allowed(opp, team_defense)
+            w *= opp_defense_mult(opp_pa, league_avg_def, def_s)
+        weights.append(w)
+
+    if sum(weights) <= 0:
+        return None, None
+
+    if params.get("use_minutes"):
+        rates = [v / m for v, m in zip(prior_values, prior_minutes) if m and m > 0]
+        rate_weights = [w for w, m in zip(weights, prior_minutes) if m and m > 0]
+        if rates and sum(rate_weights) > 0:
+            per_min_rate = sum(v * w for v, w in zip(rates, rate_weights)) / sum(rate_weights)
+            proj_min = sum(m * w for m, w in zip(prior_minutes, weights)) / sum(weights)
+            projected = per_min_rate * proj_min
+        else:
+            projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+    else:
+        projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+
+    # Empirical over-probability AT THE BOOK LINE
+    empirical_over = _weighted_rate(
+        prior_values, weights, lambda v: v > line)
+
+    return projected, empirical_over
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Step 4: forecaster comparison with chronological holdout
+# ──────────────────────────────────────────────────────────────────────────────
+
+def evaluate_calibration(per_prop_obs, prop_key, label, shrinkage_k=15):
+    """
+    per_prop_obs: list of dicts with keys:
+      player, projected, line, actual, empirical_over, game_date
+
+    Returns metrics for five forecasters: A (empirical), B (pooled Gaussian),
+    C (pooled ECDF), B* (per-player Gaussian + shrinkage), C* (per-player
+    ECDF + shrinkage).
+    """
+    rows = [r for r in per_prop_obs if r["actual"] != r["line"]]
+    if len(rows) < 20:
+        return None
+
+    rows.sort(key=lambda r: r["game_date"])
+    split = len(rows) // 2
+    train = rows[:split]
+    test = rows[split:]
+
+    # ── Pool stats (train only) ──
+    train_resid = [r["actual"] - r["projected"] for r in train]
+    mu_pool = sum(train_resid) / len(train_resid)
+    var_pool = sum((r - mu_pool) ** 2 for r in train_resid) / len(train_resid)
+    sigma_pool = math.sqrt(var_pool) if var_pool > 0 else 1e-6
+    sorted_pool = sorted(train_resid)
+
+    # ── Per-player stats (train only) ──
+    player_resid = {}
+    for r in train:
+        player_resid.setdefault(r["player"], []).append(r["actual"] - r["projected"])
+    player_stats = _per_player_stats(player_resid)
+    player_sorted = {p: sorted(rs) for p, rs in player_resid.items()}
+
+    pA, pB, pC, pBs, pCs, outcomes = [], [], [], [], [], []
+    for r in test:
+        o = 1 if r["actual"] > r["line"] else 0
+        outcomes.append(o)
+        pA.append(max(0.0, min(1.0, r["empirical_over"])))
+
+        # B (pooled Gaussian)
+        corrected_pool = r["projected"] + mu_pool
+        z = (corrected_pool - r["line"]) / sigma_pool if sigma_pool > 0 else 0.0
+        pB.append(_norm_cdf(z))
+
+        # C (pooled ECDF)
+        pC.append(1.0 - _empirical_cdf(sorted_pool, r["line"] - corrected_pool))
+
+        # B* per-player Gaussian + shrinkage
+        if r["player"] in player_stats:
+            n_p, mu_p, sigma_p = player_stats[r["player"]]
+            mu_s = _shrunk(mu_p, mu_pool, n_p, shrinkage_k)
+            sigma_s = _shrunk(sigma_p, sigma_pool, n_p, shrinkage_k)
+        else:
+            mu_s, sigma_s = mu_pool, sigma_pool
+        corrected_s = r["projected"] + mu_s
+        z_s = (corrected_s - r["line"]) / sigma_s if sigma_s > 0 else 0.0
+        pBs.append(_norm_cdf(z_s))
+
+        # C* per-player ECDF blended with pool by λ
+        if r["player"] in player_sorted:
+            n_p = len(player_sorted[r["player"]])
+            lam = n_p / (n_p + shrinkage_k)
+            f_player = _empirical_cdf(player_sorted[r["player"]],
+                                      r["line"] - corrected_s)
+            f_pool = _empirical_cdf(sorted_pool, r["line"] - corrected_s)
+            f_blend = lam * f_player + (1 - lam) * f_pool
+        else:
+            f_blend = _empirical_cdf(sorted_pool, r["line"] - corrected_s)
+        pCs.append(1.0 - f_blend)
+
+    return {
+        "n_test": len(test),
+        "n_train": len(train),
+        "mu_r": mu_pool,
+        "sigma_r": sigma_pool,
+        "n_players": len(player_stats),
+        "brier": (_brier(pA, outcomes), _brier(pB, outcomes), _brier(pBs, outcomes),
+                  _brier(pC, outcomes), _brier(pCs, outcomes)),
+        "hit":   (_hit_rate(pA, outcomes), _hit_rate(pB, outcomes), _hit_rate(pBs, outcomes),
+                  _hit_rate(pC, outcomes), _hit_rate(pCs, outcomes)),
+        "probs": {"A": pA, "B": pB, "B*": pBs, "C": pC, "C*": pCs},
+        "outcomes": outcomes,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Confidence-threshold "precision vs coverage" report
+# ──────────────────────────────────────────────────────────────────────────────
+
+def confidence_threshold_table(probs, outcomes, thresholds=(0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)):
+    """
+    For each threshold T, simulate "only bet when max(p, 1-p) >= T".
+    Picked side is OVER if p >= 0.5 else UNDER. Hit when picked side matches
+    the actual outcome (outcomes[i] == 1 means actual > line).
+    Returns list of (T, n_actionable, n_hits, hit_rate, pct_of_total).
+    """
+    total = len(outcomes)
+    rows = []
+    for T in thresholds:
+        n = 0
+        hits = 0
+        for p, o in zip(probs, outcomes):
+            conf = max(p, 1.0 - p)
+            if conf < T:
+                continue
+            n += 1
+            pick = 1 if p >= 0.5 else 0
+            if pick == o:
+                hits += 1
+        rate = (hits / n) if n else 0.0
+        cov = (n / total) if total else 0.0
+        rows.append((T, n, hits, rate, cov))
+    return rows
+
+
+def print_confidence_report(per_variant_prop_results):
+    """
+    per_variant_prop_results: dict (variant_name, prop_key) -> evaluate_calibration result
+    """
+    print("\n=== Confidence-threshold hit rates (per forecaster) ===")
+    print("'If we only bet when model confidence (max(p,1-p)) >= T, what % of the time")
+    print(" did the chosen side win?'  Holdout-only (no leakage).\n")
+
+    forecasters = ["A", "B", "B*", "C", "C*"]
+    header = (f"{'Variant':<10} {'Prop':<22} {'Fcst':<5} "
+              f"{'T':>5} {'N':>4} {'Hits':>5} {'Hit%':>6} {'Cov%':>6}")
+    print(header)
+    print("-" * len(header))
+
+    for (vname, prop_key), res in per_variant_prop_results.items():
+        outcomes = res["outcomes"]
+        for fcst in forecasters:
+            probs = res["probs"][fcst]
+            rows = confidence_threshold_table(probs, outcomes)
+            for T, n, hits, rate, cov in rows:
+                if n == 0:
+                    continue
+                print(f"{vname:<10} {prop_key:<22} {fcst:<5} "
+                      f"{T:>5.2f} {n:>4d} {hits:>5d} "
+                      f"{rate * 100:>5.1f}% {cov * 100:>5.1f}%")
+            print()
+
+
+def simulate_safe_mode(obs, params, sport_key, safe_target,
+                       team_defense=None, league_avg_def=None):
+    """
+    Replicate analysis.py's safe-mode pipeline for one (player, prop, game)
+    observation and report what the production code would have done.
+
+    Returns dict:
+      {
+        'eligible':       bool,   # passed both production guards
+        'filter_reason':  str|None,
+        'safe_threshold': int|None,
+        'p_at_safe':      float|None,    # model-claimed hit prob
+        'hit':            bool|None,     # actual >= safe_threshold
+        'line':           float,         # book line (reference)
+      }
+    """
+    prior_games = obs["prior_games"]
+    stat_label = obs["stat_label"]
+    line = obs["line"]
+    test_game = obs["test_game"]
+    actual = obs["actual"]
+
+    prior_values = [g.get(stat_label, 0.0) for g in prior_games]
+    prior_minutes = [g.get("MIN", 0.0) for g in prior_games]
+    prior_home_aways = [g.get("is_home") for g in prior_games]
+    prior_opponents = [g.get("opponent") for g in prior_games]
+
+    # Same DNP-floor filter as production safe-mode prep
+    if any(prior_minutes):
+        kept = [(v, m, ha, opp) for v, m, ha, opp in zip(
+                    prior_values, prior_minutes,
+                    prior_home_aways, prior_opponents)
+                if (m or 0) >= 10.0]
+        if kept:
+            prior_values = [v for v, _, _, _ in kept]
+            prior_minutes = [m for _, m, _, _ in kept]
+            prior_home_aways = [ha for _, _, ha, _ in kept]
+            prior_opponents = [opp for _, _, _, opp in kept]
+
+    if not prior_values:
+        return {"eligible": False, "filter_reason": "no_prior", "safe_threshold": None,
+                "p_at_safe": None, "hit": None, "line": line}
+
+    upcoming_is_home = test_game.get("is_home")
+
+    hl = params.get("half_life")
+    base_w = _recency_weights(len(prior_values), hl)
+    venue_s = params.get("venue_strength", 0.0)
+    def_s = params.get("opp_defense_strength", 0.0)
+    output_def_s = params.get("output_def_strength", 0.0)
+    shrinkage_k = params.get("shrinkage_k", 0) or 0
+
+    weights = []
+    for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
+        w = bw * venue_mult(ph, upcoming_is_home, venue_s)
+        if def_s > 0 and team_defense:
+            opp_pa = _resolve_opp_pts_allowed(opp, team_defense)
+            w *= opp_defense_mult(opp_pa, league_avg_def, def_s)
+        weights.append(w)
+
+    if sum(weights) <= 0:
+        return {"eligible": False, "filter_reason": "zero_weights", "safe_threshold": None,
+                "p_at_safe": None, "hit": None, "line": line}
+
+    # Output-defense multiplier (uses test_game's opponent)
+    output_def_mult = 1.0
+    opp_name = test_game.get("opponent")
+    if output_def_s > 0 and team_defense and league_avg_def and opp_name:
+        opp_pa = team_defense.get(opp_name)
+        if opp_pa:
+            output_def_mult = 1.0 + output_def_s * (
+                opp_pa / league_avg_def - 1.0)
+
+    # Bayesian shrinkage toward unweighted mean
+    base_proj = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+    if shrinkage_k > 0:
+        unweighted = sum(prior_values) / len(prior_values)
+        eff_n = sum(weights)
+        if eff_n + shrinkage_k > 0:
+            base_proj = ((eff_n * base_proj) + (shrinkage_k * unweighted)) / (eff_n + shrinkage_k)
+    avg_stat = base_proj * output_def_mult
+
+    # Parametric quantile floor (mirrors analysis.py exactly)
+    wstd = _weighted_std(prior_values, weights, mean=base_proj)
+    wstd_adj = wstd * (output_def_mult if output_def_mult else 1.0)
+    z = _normal_inv_cdf(safe_target)
+    alt_q = avg_stat - z * wstd_adj
+    safe_threshold = max(1, int(math.floor(alt_q)))
+
+    # Production sanity guard (mirrors analysis.py): drop if historical
+    # hit rate at the suggested threshold is more than 5pp below target.
+    p_at_safe = _weighted_rate(prior_values, weights,
+                               lambda v, t=safe_threshold: v >= t)
+    if p_at_safe < (safe_target - 0.05):
+        return {"eligible": False, "filter_reason": "p_at_safe<target-0.05",
+                "safe_threshold": safe_threshold, "p_at_safe": p_at_safe,
+                "hit": None, "line": line}
+
+    # Floor-collapse guard (mirrors analysis.py): reject "1+" type bets
+    # for safe_target > 0.80 — parametric Normal under-estimates variance
+    # for low-mean integer distributions and the forward hit rate is
+    # systematically below the claimed safe_target.
+    if safe_threshold <= 1 and safe_target > 0.80:
+        return {"eligible": False, "filter_reason": "floor_collapse",
+                "safe_threshold": safe_threshold, "p_at_safe": p_at_safe,
+                "hit": None, "line": line}
+
+    SAFE_MIN_RATIO = 0.5
+    if line > 0 and safe_threshold < line * SAFE_MIN_RATIO:
+        return {"eligible": False, "filter_reason": "threshold<50%_of_book",
+                "safe_threshold": safe_threshold, "p_at_safe": p_at_safe,
+                "hit": None, "line": line}
+
+    hit = float(actual) >= safe_threshold
+    return {"eligible": True, "filter_reason": None,
+            "safe_threshold": safe_threshold, "p_at_safe": p_at_safe,
+            "hit": hit, "line": line}
+
+
+def print_safe_mode_report(enriched, params, sport_key,
+                           team_defense=None, league_avg_def=None,
+                           targets=(0.85, 0.90, 0.95)):
+    """
+    For each safe_target, simulate production safe-mode on every observation,
+    then bucket eligible suggestions per prop and report actual hit rate.
+    """
+    print("\n=== Safe-mode actual hit rates (per prop, per safe_target) ===")
+    print("'If we'd bet the SAFE alt-line production would have suggested,")
+    print(" how often did the player actually clear that line?'\n")
+
+    by_prop = defaultdict(list)
+    for obs in enriched:
+        by_prop[obs["prop_key"]].append(obs)
+
+    header = (f"{'Prop':<22} {'Target':>7} {'Eligible':>8} {'Hits':>5} "
+              f"{'Hit%':>6} {'Filtered':>9} "
+              f"{'Avg gap':>8} {'Median th':>10}")
+    print(header)
+    print("-" * len(header))
+    for prop_key in sorted(by_prop.keys()):
+        rows = by_prop[prop_key]
+        for tgt in targets:
+            results = [simulate_safe_mode(o, params, sport_key, tgt,
+                                          team_defense, league_avg_def)
+                       for o in rows]
+            eligible = [r for r in results if r["eligible"]]
+            n_elig = len(eligible)
+            n_filt = len(results) - n_elig
+            if n_elig == 0:
+                print(f"{prop_key:<22} {tgt*100:>6.0f}% {n_elig:>8d} "
+                      f"{'—':>5} {'—':>6} {n_filt:>9d} {'—':>8} {'—':>10}")
+                continue
+            hits = sum(1 for r in eligible if r["hit"])
+            rate = hits / n_elig
+            gaps = [r["line"] - r["safe_threshold"] for r in eligible]
+            avg_gap = sum(gaps) / len(gaps)
+            ths = sorted(r["safe_threshold"] for r in eligible)
+            med_th = ths[len(ths) // 2]
+            print(f"{prop_key:<22} {tgt*100:>6.0f}% {n_elig:>8d} "
+                  f"{hits:>5d} {rate * 100:>5.1f}% {n_filt:>9d} "
+                  f"{avg_gap:>+8.2f} {med_th:>10d}")
+        print()
+
+    print("Eligible  = passed both production guards (p_at_safe ≥ target-0.05 AND")
+    print("            safe_threshold ≥ 50% of book line)")
+    print("Avg gap   = book_line − safe_threshold (positive = suggestion is below the line)")
+    print("Median th = median suggested alt-line across eligible obs")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
+    p.add_argument("--variants", default="recency,all",
+                   help="Comma-separated subset of " + ",".join(VARIANT_PRESETS.keys()))
+    p.add_argument("--confidence-report", action="store_true",
+                   help="Also print precision-vs-coverage table: hit-rate when "
+                        "model confidence is >= threshold (0.55, 0.60, ... 0.90).")
+    p.add_argument("--safe-mode-report", action="store_true",
+                   help="Also simulate production safe-mode (alt-line) suggestions "
+                        "and report actual hit rates per safe_target.")
+    p.add_argument("--safe-targets", default="0.85,0.90,0.95",
+                   help="Comma-separated safe_target values to evaluate.")
+    args = p.parse_args()
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
+    target_props = PROPS_BY_SPORT.get(args.sport, [])
+    if not target_props:
+        print(f"No default prop list for {args.sport}; edit PROPS_BY_SPORT.")
+        sys.exit(1)
+
+    print(f"\n=== Harvesting cached book lines for {sport_key} "
+          f"({', '.join(target_props)}) ===")
+    book_lines = harvest_book_lines(sport_key, target_props)
+    print(f"  found {len(book_lines)} unique (player, prop, game) book lines")
+    if not book_lines:
+        print("Nothing to evaluate. Run the live tool first to populate cache.")
+        sys.exit(0)
+
+    by_prop = defaultdict(int)
+    for r in book_lines:
+        by_prop[r["prop_key"]] += 1
+    for k, v in sorted(by_prop.items()):
+        print(f"    {k}: {v}")
+
+    print(f"\n=== Joining to ESPN gamelogs (using {espn_sport}/{espn_league}) ===")
+    enriched = join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("No observations could be joined to actuals.")
+        sys.exit(0)
+
+    # Optional team-defense lookup if any variant uses it
+    variant_names = [v.strip() for v in args.variants.split(",") if v.strip()]
+    variants = {n: _resolve_params(VARIANT_PRESETS[n], sport_key) for n in variant_names}
+    team_defense, league_avg_def = {}, None
+    if any(v.get("opp_defense_strength", 0.0) > 0 for v in variants.values()):
+        print("\n=== Building team-defense lookup for one variant ===")
+        team_defense, _, league_avg_def = _team_defense_lookup(espn_sport, espn_league)
+
+    print("\n=== Evaluating forecasters at REAL book lines ===")
+    print()
+    header = (f"{'Variant':<10} {'Prop':<22} {'N_tr':>4} {'N_te':>4} {'#pl':>4}  "
+              f"{'μ_r':>7} {'σ_r':>6}  "
+              f"{'BrA':>6} {'BrB':>6} {'BrB*':>6} {'BrC':>6} {'BrC*':>6}  "
+              f"{'HitA':>5} {'HitB':>5} {'HitB*':>5} {'HitC':>5} {'HitC*':>5}")
+    print(header); print("-" * len(header))
+
+    per_variant_prop_results = {}
+    for vname, params in variants.items():
+        per_prop_obs = defaultdict(list)
+        for obs in enriched:
+            projected, emp = project_and_empirical(obs, params, sport_key,
+                                                   team_defense, league_avg_def)
+            if projected is None:
+                continue
+            per_prop_obs[obs["prop_key"]].append({
+                "player": obs["player"],
+                "projected": projected,
+                "line": obs["line"],
+                "actual": obs["actual"],
+                "empirical_over": emp,
+                "game_date": obs["game_date"],
+            })
+
+        for prop_key in sorted(per_prop_obs.keys()):
+            res = evaluate_calibration(per_prop_obs[prop_key], prop_key, prop_key)
+            if not res:
+                continue
+            per_variant_prop_results[(vname, prop_key)] = res
+            brA, brB, brBs, brC, brCs = res["brier"]
+            hA, hB, hBs, hC, hCs = res["hit"]
+            print(f"{vname:<10} {prop_key:<22} {res['n_train']:>4} {res['n_test']:>4} "
+                  f"{res['n_players']:>4}  "
+                  f"{res['mu_r']:>+7.3f} {res['sigma_r']:>6.3f}  "
+                  f"{brA:>6.4f} {brB:>6.4f} {brBs:>6.4f} {brC:>6.4f} {brCs:>6.4f}  "
+                  f"{hA:>4.1f}% {hB:>4.1f}% {hBs:>4.1f}% {hC:>4.1f}% {hCs:>4.1f}%")
+
+    print()
+    print("A  = empirical (weighted prior-game fraction > line) — current production method")
+    print("B  = pooled Gaussian residual model")
+    print("C  = pooled empirical residual CDF")
+    print("B* = per-player Gaussian residual model, shrunk toward pool by λ=n/(n+15)")
+    print("C* = per-player empirical residual CDF, mixture-blended with pool by same λ")
+    print()
+    print("Calibration fit on chronologically earliest half; scoring on later half (no leakage).")
+
+    if args.confidence_report and per_variant_prop_results:
+        print_confidence_report(per_variant_prop_results)
+
+    if args.safe_mode_report:
+        try:
+            targets = tuple(float(t.strip()) for t in args.safe_targets.split(",") if t.strip())
+        except ValueError:
+            targets = (0.85, 0.90, 0.95)
+        # Use the "all" variant params (the production default-ish settings)
+        sm_params = _resolve_params(VARIANT_PRESETS["all"], sport_key)
+        sm_team_def = team_defense if team_defense else {}
+        sm_league_avg = league_avg_def
+        if sm_params.get("output_def_strength", 0.0) > 0 and not sm_team_def:
+            print("\n=== Building team-defense lookup for safe-mode sim ===")
+            sm_team_def, _, sm_league_avg = _team_defense_lookup(espn_sport, espn_league)
+        print_safe_mode_report(enriched, sm_params, sport_key,
+                               sm_team_def, sm_league_avg, targets=targets)
+
+
+if __name__ == "__main__":
+    main()
