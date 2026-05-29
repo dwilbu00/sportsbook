@@ -697,7 +697,7 @@ if "parlay_results" in st.session_state:
         caption_text = "Prioritizing highest probability of hitting with positive edge"
     elif display == "sa_value":
         mode_label = "🎯 Aggressive Safe"
-        caption_text = "Safe-mode legs ranked by alt-EV (hit probability × actual DK alt-line payout − 1) — picks the bets that pay the most relative to how often they hit."
+        caption_text = "Safe-mode legs already clear your confidence threshold, so ranked purely by DK payout — picks the bets that pay the most."
     elif effective_mode == "safe":  # regular analysis + Safe button
         mode_label = "🛡️ Safe"
         caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"
@@ -714,18 +714,20 @@ if "parlay_results" in st.session_state:
             if size not in parlays:
                 continue
             p = parlays[size]
+            # DK payout (total return on $10) shown in headline + metric.
+            total_payout = (p.get("payout_per_10", 0) or 0) + 10
+            payout_label_str = f"${total_payout:.2f}"
+
             # Expander headline
             if display == "sa_safe":
-                headline = f"Hit Prob: {p['combined_hist_prob']}%"
+                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  DK Payout: {payout_label_str}"
             elif display == "sa_value":
-                gap = p.get("avg_line_gap")
-                gap_str = f"{gap:+.2f}" if gap is not None else "n/a"
-                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  Avg gap to book line: {gap_str}"
+                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  DK Payout: {payout_label_str}"
             else:  # regular
                 pe = p.get("parlay_edge_pct")
                 pe_str = f"{pe:+.2f}%" if pe is not None else "n/a"
                 headline = (f"Hit Prob: {p['combined_hist_prob']}%  |  "
-                            f"Parlay Edge: {pe_str}")
+                            f"Parlay Edge: {pe_str}  |  DK Payout: {payout_label_str}")
 
             with st.expander(
                 f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
@@ -770,8 +772,6 @@ if "parlay_results" in st.session_state:
 
                 st.divider()
                 # ── Book payout metrics (shown for every display style) ──
-                american_str = (f"{p['parlay_american_odds']:+d}"
-                                if p.get("parlay_american_odds") is not None else "n/a")
                 payout_help = (
                     "Estimated DK payout from multiplying each leg's decimal odds. "
                     "Standard cross-game parlays should match DK's slip exactly. "
@@ -780,6 +780,10 @@ if "parlay_results" in st.session_state:
                     + ("Spread/total legs without a captured price were assumed -110."
                        if p.get("payout_uses_default_price") else "")
                 ).strip()
+
+                # Same DK Payout format as value bets: $X.XX in box, "on $10 (+XXX)" below.
+                payout_delta = (f"on $10 ({p['parlay_american_odds']:+d})"
+                                if p.get("parlay_american_odds") is not None else "on $10")
 
                 if display == "sa_safe":
                     cols = st.columns(4)
@@ -796,35 +800,23 @@ if "parlay_results" in st.session_state:
                     )
                     cols[3].metric(
                         "DK Payout",
-                        american_str,
-                        delta=f"$10 pays ${p.get('payout_per_10', 0) + 10:.2f}",
+                        payout_label_str,
+                        delta=payout_delta,
                         delta_color="off",
                         help=payout_help,
                     )
                 elif display == "sa_value":
-                    cols = st.columns(5)
+                    cols = st.columns(3)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit at their suggested thresholds, adjusted for sport-specific correlations.",
                     )
-                    avg_gap = p.get("avg_line_gap")
                     cols[2].metric(
-                        "Avg Gap to Book Line",
-                        f"{avg_gap:+.2f}" if avg_gap is not None else "n/a",
-                        help="Average of (suggested threshold − book line) across the safe-mode legs. 0 = right at the book line; positive = the model expects a result above the book line; negative = a safer threshold below the book line.",
-                    )
-                    total_gap = p.get("total_line_gap")
-                    cols[3].metric(
-                        "Total Gap",
-                        f"{total_gap:+.2f}" if total_gap is not None else "n/a",
-                        help="Sum of per-leg gaps to the book line. Higher = more aggressive parlay.",
-                    )
-                    cols[4].metric(
                         "DK Payout",
-                        american_str,
-                        delta=f"$10 pays ${p.get('payout_per_10', 0) + 10:.2f}",
+                        payout_label_str,
+                        delta=payout_delta,
                         delta_color="off",
                         help=payout_help,
                     )
@@ -849,8 +841,8 @@ if "parlay_results" in st.session_state:
                     )
                     cols[4].metric(
                         "DK Payout",
-                        american_str,
-                        delta=f"$10 pays ${p.get('payout_per_10', 0) + 10:.2f}",
+                        payout_label_str,
+                        delta=payout_delta,
                         delta_color="off",
                         help=payout_help,
                     )
@@ -1274,14 +1266,15 @@ if "analysis_results" in st.session_state:
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
 
-            # Compute alt-EV for safe-mode bets: (p × decimal_odds) − 1, per $1.
-            # Falls back to line_gap when no alt price was fetched.
+            # Safe-mode bets already pass the confidence filter, so rank
+            # them purely by decimal payout (best price first). Stash
+            # alt_payout on the candidate so the title can show it.
+            # Non-safe bets fall back to edge_pct.
             def _safe_sort_key(c):
                 if c.get("safe_mode") and c.get("safe_alt_price") is not None:
-                    p = (c.get("model_hit_at_safe") or 0) / 100.0
                     dec = american_to_decimal(c["safe_alt_price"])
-                    c["alt_ev"] = p * dec - 1.0
-                    return c["alt_ev"]
+                    c["alt_payout"] = dec
+                    return dec
                 return c.get("line_gap", c["edge_pct"]) / 100.0
 
             sorted_props = sorted(value_props, key=_safe_sort_key, reverse=True)
@@ -1296,11 +1289,11 @@ if "analysis_results" in st.session_state:
                         alt_line = c["safe_threshold"] - 0.5
                         tag = "↘ alt line needed"
                         alt_advice = f"find an OVER ≤ {alt_line} (gap {gap})"
-                    ev_str = ""
-                    if c.get("alt_ev") is not None:
-                        ev_str = f"  EV: {c['alt_ev']*100:+.1f}%  |"
+                    payout_str = ""
+                    if c.get("alt_payout") is not None:
+                        payout_str = f"  Pays: ${c['alt_payout']*10:.2f}  |"
                     title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
-                             f"[{tag}]{ev_str}  book line: {c['line']}")
+                             f"[{tag}]{payout_str}  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
                         cols = st.columns(6)
                         cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")

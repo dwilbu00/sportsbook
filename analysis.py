@@ -1849,19 +1849,14 @@ def _score_parlay(legs, sport_key, mode="value"):
         return prob_score + total_edge + correlation_score + usage_penalty
     elif mode == "safe_value":
         # "Value parlays" built from safe-mode candidates.
-        # Rank by total alt-EV across legs:
-        #   leg_ev = hist_prob × decimal(odds_price) − 1
-        # For safe-mode legs odds_price is the real DK alt-line price when
-        # available, so this is true expected value at the suggested
-        # threshold. Non-safe legs fall back to edge_pct/100.
-        ev_sum = 0.0
+        # The confidence filter (safe_target) already guarantees every leg
+        # is above the user's hit-probability threshold, so we just maximize
+        # combined payout — product of decimal odds across legs.
+        payout_product = 1.0
         for leg in legs:
             price = leg.get("odds_price")
-            if price is None:
-                ev_sum += leg.get("edge_pct", 0.0) / 100.0
-            else:
-                ev_sum += leg["hist_prob"] * american_to_decimal(price) - 1.0
-        return (ev_sum * 100) + correlation_score + usage_penalty
+            payout_product *= american_to_decimal(price) if price is not None else 1.91
+        return (payout_product * 100) + correlation_score + usage_penalty
     else:
         # Prioritize edge value
         total_edge = sum(leg["edge_pct"] for leg in legs)
@@ -1906,14 +1901,12 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     if effective_mode == "safe":
         legs.sort(key=lambda x: x["hist_prob"], reverse=True)
     elif effective_mode == "safe_value":
-        # Rank legs by alt-EV: hist_prob × decimal(odds_price) − 1.
-        # Falls back to edge_pct/100 if no odds price is available.
-        def _leg_ev(x):
-            price = x.get("odds_price")
-            if price is None:
-                return x.get("edge_pct", 0.0) / 100.0
-            return x["hist_prob"] * american_to_decimal(price) - 1.0
-        legs.sort(key=_leg_ev, reverse=True)
+        # Confidence filter already guarantees each leg is above target prob,
+        # so rank legs purely by decimal payout (best price first).
+        legs.sort(
+            key=lambda x: american_to_decimal(x["odds_price"]) if x.get("odds_price") is not None else 1.91,
+            reverse=True,
+        )
     else:
         legs.sort(key=lambda x: x["edge_pct"], reverse=True)
     candidates = legs[:25]  # Cap at 25 to keep combos manageable
