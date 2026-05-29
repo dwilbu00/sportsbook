@@ -96,7 +96,7 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
             )
         rows.append(row)
     st.caption(f"**{title}**")
-    st.dataframe(rows, hide_index=True, use_container_width=False)
+    st.dataframe(rows, hide_index=True, width='content')
 from espn_client import (
     get_all_teams,
     get_team_schedule,
@@ -183,7 +183,7 @@ def show_setup_wizard():
         st.link_button(
             "🔑 Get Free API Key",
             "https://the-odds-api.com/#get-access",
-            use_container_width=True,
+            width='stretch',
         )
     with col2:
         st.markdown("#### Step 2")
@@ -206,7 +206,7 @@ def show_setup_wizard():
         help="The key will be saved locally in config.json. It never leaves your computer.",
     )
 
-    if st.button("💾 Save API Key", type="primary", use_container_width=True):
+    if st.button("💾 Save API Key", type="primary", width='stretch'):
         if new_key and len(new_key) > 10 and new_key != "YOUR_API_KEY_HERE":
             save_api_key(new_key)
             st.success("API key saved! The app will now reload...")
@@ -484,11 +484,11 @@ st.caption("  |  ".join(credit_parts))
 # ──────────────────────────────────────────────────────────
 col_analyze, col_parlay, col_safe = st.columns(3)
 with col_analyze:
-    analyze_clicked = st.button("🔍 Analyze", type="primary", use_container_width=True)
+    analyze_clicked = st.button("🔍 Analyze", type="primary", width='stretch')
 with col_parlay:
-    parlay_clicked = st.button("🎰 Value Parlays", use_container_width=True)
+    parlay_clicked = st.button("🎰 Value Parlays", width='stretch')
 with col_safe:
-    safe_clicked = st.button("🛡️ Safe Parlays", use_container_width=True)
+    safe_clicked = st.button("🛡️ Safe Parlays", width='stretch')
 
 # ── Generate Parlays ──
 if (parlay_clicked or safe_clicked) and "analysis_results" in st.session_state:
@@ -560,8 +560,10 @@ if "parlay_results" in st.session_state:
                 gap_str = f"{gap:+.2f}" if gap is not None else "n/a"
                 headline = f"Hit Prob: {p['combined_hist_prob']}%  |  Avg gap to book line: {gap_str}"
             else:  # regular
+                pe = p.get("parlay_edge_pct")
+                pe_str = f"{pe:+.2f}%" if pe is not None else "n/a"
                 headline = (f"Hit Prob: {p['combined_hist_prob']}%  |  "
-                            f"Parlay Edge: {p['parlay_edge_pct']:+.2f}%")
+                            f"Parlay Edge: {pe_str}")
 
             with st.expander(
                 f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
@@ -677,9 +679,10 @@ if "parlay_results" in st.session_state:
                         f"{p['combined_hist_prob_indep']}%",
                         help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
                     )
+                    pe = p.get("parlay_edge_pct")
                     cols[3].metric(
                         "Parlay Edge",
-                        f"{p['parlay_edge_pct']:+.2f}%",
+                        f"{pe:+.2f}%" if pe is not None else "n/a",
                         help="Joint hit probability minus the book's combined implied probability — the model's expected edge over the book on the full parlay.",
                     )
                     cols[4].metric(

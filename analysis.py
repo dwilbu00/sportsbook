@@ -1983,12 +1983,15 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             for leg in best_parlay:
                 combined_hist_indep *= leg["hist_prob"]
 
-            # In safe / safe_value modes, `combined_edge` is a sum of
-            # model_delta values (uplift of safe threshold vs book line per
-            # leg), and `parlay_edge_pct` would compare joint-prob-at-safe-
-            # thresholds to combined-book-implied-at-book-lines — apples to
-            # oranges. Suppress those misleading numbers.
-            if effective_mode in ("safe", "safe_value"):
+            # When the parlay contains ANY safe-mode leg, `combined_edge`
+            # (sum of per-leg edge_pct, which is model_delta for safe legs)
+            # and `parlay_edge_pct` (joint-vs-combined-implied where the
+            # implied side is the BOOK LINE, not the safe threshold) compare
+            # quantities at different lines — apples to oranges. Suppress them
+            # only in that case. Regular analysis + Safe Parlays button still
+            # produces meaningful values here.
+            has_safe = any(leg.get("safe_mode") for leg in best_parlay)
+            if has_safe:
                 combined_edge_out = None
                 parlay_edge_out = None
             else:
