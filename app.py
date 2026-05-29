@@ -697,7 +697,7 @@ if "parlay_results" in st.session_state:
         caption_text = "Prioritizing highest probability of hitting with positive edge"
     elif display == "sa_value":
         mode_label = "🎯 Aggressive Safe"
-        caption_text = "Safe-mode legs ranked by how close their suggested threshold sits to the book line (or above it) — more aggressive than Safe Parlays, still grounded in the model's high-confidence thresholds."
+        caption_text = "Safe-mode legs ranked by alt-EV (hit probability × actual DK alt-line payout − 1) — picks the bets that pay the most relative to how often they hit."
     elif effective_mode == "safe":  # regular analysis + Safe button
         mode_label = "🛡️ Safe"
         caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"

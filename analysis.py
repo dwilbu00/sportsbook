@@ -1849,18 +1849,19 @@ def _score_parlay(legs, sport_key, mode="value"):
         return prob_score + total_edge + correlation_score + usage_penalty
     elif mode == "safe_value":
         # "Value parlays" built from safe-mode candidates.
-        # Rank by aggressiveness: prefer legs whose safe threshold sits AT or
-        # ABOVE the book line (line_gap ≥ 0), with hit probability as a
-        # tiebreaker. Non-safe legs (ML/spread/totals) fall back to edge_pct.
-        gap_sum = 0.0
-        nonsafe_edge_sum = 0.0
+        # Rank by total alt-EV across legs:
+        #   leg_ev = hist_prob × decimal(odds_price) − 1
+        # For safe-mode legs odds_price is the real DK alt-line price when
+        # available, so this is true expected value at the suggested
+        # threshold. Non-safe legs fall back to edge_pct/100.
+        ev_sum = 0.0
         for leg in legs:
-            if leg.get("safe_mode"):
-                gap_sum += leg.get("line_gap", 0.0)
+            price = leg.get("odds_price")
+            if price is None:
+                ev_sum += leg.get("edge_pct", 0.0) / 100.0
             else:
-                nonsafe_edge_sum += leg["edge_pct"]
-        prob_score = combined_hist * 100
-        return (gap_sum * 10) + nonsafe_edge_sum + prob_score + correlation_score + usage_penalty
+                ev_sum += leg["hist_prob"] * american_to_decimal(price) - 1.0
+        return (ev_sum * 100) + correlation_score + usage_penalty
     else:
         # Prioritize edge value
         total_edge = sum(leg["edge_pct"] for leg in legs)
@@ -1905,13 +1906,14 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     if effective_mode == "safe":
         legs.sort(key=lambda x: x["hist_prob"], reverse=True)
     elif effective_mode == "safe_value":
-        # Primary: line_gap (safe legs only; 0 for non-safe legs as a neutral
-        # floor); Secondary: hist_prob. Both descending.
-        legs.sort(
-            key=lambda x: (x.get("line_gap", 0.0) if x.get("safe_mode") else 0.0,
-                           x["hist_prob"]),
-            reverse=True,
-        )
+        # Rank legs by alt-EV: hist_prob × decimal(odds_price) − 1.
+        # Falls back to edge_pct/100 if no odds price is available.
+        def _leg_ev(x):
+            price = x.get("odds_price")
+            if price is None:
+                return x.get("edge_pct", 0.0) / 100.0
+            return x["hist_prob"] * american_to_decimal(price) - 1.0
+        legs.sort(key=_leg_ev, reverse=True)
     else:
         legs.sort(key=lambda x: x["edge_pct"], reverse=True)
     candidates = legs[:25]  # Cap at 25 to keep combos manageable
