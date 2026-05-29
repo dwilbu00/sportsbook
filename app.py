@@ -654,6 +654,12 @@ with col_parlay:
 with col_safe:
     safe_clicked = st.button("🎯 Alt-line Parlays", width='stretch')
 
+# Clear stale parlays as soon as a new Analyze is requested so they don't
+# render below this point before the analysis block runs.
+if analyze_clicked:
+    st.session_state.pop("parlay_results", None)
+    st.session_state.pop("parlay_mode", None)
+
 # ── Generate Parlays ──
 if (parlay_clicked or safe_clicked) and "analysis_results" in st.session_state:
     ar = st.session_state["analysis_results"]
