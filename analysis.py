@@ -1856,14 +1856,26 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             for leg in best_parlay:
                 combined_hist_indep *= leg["hist_prob"]
 
+            # In safe mode, `combined_edge` is a sum of model_delta values
+            # (uplift of safe threshold vs book line per leg), and
+            # `parlay_edge_pct` would compare joint-prob-at-safe-thresholds to
+            # combined-book-implied-at-book-lines — apples to oranges. Suppress
+            # those misleading numbers.
+            if mode == "safe":
+                combined_edge_out = None
+                parlay_edge_out = None
+            else:
+                combined_edge_out = round(best_combined_edge, 2)
+                parlay_edge_out = round((best_joint - best_combined_implied) * 100, 2)
+
             results[size] = {
                 "legs": best_parlay,
                 "score": best_score,
-                "combined_edge": round(best_combined_edge, 2),
+                "combined_edge": combined_edge_out,
                 "combined_hist_prob": round(best_joint * 100, 2),
                 "combined_hist_prob_indep": round(combined_hist_indep * 100, 2),
                 "combined_implied_prob": round(best_combined_implied * 100, 2),
-                "parlay_edge_pct": round((best_joint - best_combined_implied) * 100, 2),
+                "parlay_edge_pct": parlay_edge_out,
                 "correlation_adjustment_pct": round(
                     (best_joint - combined_hist_indep) * 100, 2
                 ),

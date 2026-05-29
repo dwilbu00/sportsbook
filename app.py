@@ -475,7 +475,7 @@ if "parlay_results" in st.session_state:
                     if mode == "safe":
                         st.markdown(
                             f"**Leg {i}:** {leg['label']}  —  "
-                            f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
+                            f"Prob: {prob_pct}%  |  Δ vs book line: +{leg['edge_pct']}%"
                             + (f"  ({leg['odds_price']:+d})" if leg.get('odds_price') else "")
                         )
                     else:
@@ -487,11 +487,25 @@ if "parlay_results" in st.session_state:
                         )
 
                 st.divider()
-                cols = st.columns(4)
-                cols[0].metric("Legs", size)
-                cols[1].metric("Hit Probability", f"{p['combined_hist_prob']}%")
-                cols[2].metric("Sum of Edges", f"+{p['combined_edge']}%")
-                cols[3].metric("Parlay Edge", f"+{p['parlay_edge_pct']}%")
+                if mode == "safe":
+                    cols = st.columns(3)
+                    cols[0].metric("Legs", size)
+                    cols[1].metric(
+                        "Hit Probability",
+                        f"{p['combined_hist_prob']}%",
+                        help="Joint probability all legs hit at their suggested safe thresholds, adjusted for sport-specific correlations between legs.",
+                    )
+                    cols[2].metric(
+                        "Hit Prob (no correlation)",
+                        f"{p['combined_hist_prob_indep']}%",
+                        help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
+                    )
+                else:
+                    cols = st.columns(4)
+                    cols[0].metric("Legs", size)
+                    cols[1].metric("Hit Probability", f"{p['combined_hist_prob']}%")
+                    cols[2].metric("Sum of Edges", f"+{p['combined_edge']}%")
+                    cols[3].metric("Parlay Edge", f"+{p['parlay_edge_pct']}%")
     else:
         st.info("Not enough positive-edge bets to build parlays. Try selecting more games or markets.")
 
