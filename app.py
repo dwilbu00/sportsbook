@@ -169,17 +169,21 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
 
 def _dk_payout_strs(american_price, stake=10):
     """Return (value_str, delta_str) for a single-bet DK Payout metric.
-    Delta is formatted as DK shows it: '$10 pays $20.00' (stake + profit)."""
+    Value is the total payout in the box (e.g. '$11.82'); delta below the
+    box is the stake context ('on $10 (+118)')."""
     if american_price is None:
         return "n/a", ""
     dec = american_to_decimal(american_price)
     total_payout = dec * stake
-    return f"{american_price:+d}", f"${stake:.0f} pays ${total_payout:.2f}"
+    return f"${total_payout:.2f}", f"on ${stake:.0f} ({american_price:+d})"
 
 
-def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3):
+def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal"):
     """Render a compact alt-line ladder near a target line. If `direction` is
-    'over', show OVER price column; if 'under', show UNDER; if 'both', show both."""
+    'over', show OVER price column; if 'under', show UNDER; if 'both', show both.
+    `line_style`: 'decimal' (e.g. 24.5), 'spread' (signed, e.g. -3.5), or
+    'threshold' (player-prop N+ form, e.g. 2.5 → '3+')."""
+    import math
     if not ladder:
         return
     # Filter to lines near the target (±n_around steps) if a target is given.
@@ -188,19 +192,37 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
         ladder = sorted(sorted_l[: 2 * n_around + 1], key=lambda e: e["line"])
     rows = []
     for entry in ladder:
-        row = {"Line": f"{entry['line']:+g}" if "spread" in title.lower() else entry["line"]}
+        if line_style == "spread":
+            line_str = f"{entry['line']:+g}"
+        elif line_style == "threshold":
+            line_str = f"{int(math.ceil(entry['line']))}+"
+        else:
+            line_str = entry["line"]
+        row = {"Line": line_str}
+
+        def _payout(price):
+            if price is None:
+                return "—"
+            return f"${american_to_decimal(price) * 10:.2f}"
+
         if direction in ("over", "both"):
             op = entry.get("over_price")
             if op is None and "price" in entry:  # spreads/totals use flat 'price'
                 op = entry["price"]
-            row["OVER" if direction == "both" else "Price"] = (
-                f"{op:+d}" if op is not None else "—"
-            )
+            if direction == "both":
+                row["OVER"] = f"{op:+d}" if op is not None else "—"
+                row["OVER Payout"] = _payout(op)
+            else:
+                row["Price"] = f"{op:+d}" if op is not None else "—"
+                row["Payout on $10"] = _payout(op)
         if direction in ("under", "both"):
             up = entry.get("under_price")
-            row["UNDER" if direction == "both" else "Price"] = (
-                f"{up:+d}" if up is not None else "—"
-            )
+            if direction == "both":
+                row["UNDER"] = f"{up:+d}" if up is not None else "—"
+                row["UNDER Payout"] = _payout(up)
+            else:
+                row["Price"] = f"{up:+d}" if up is not None else "—"
+                row["Payout on $10"] = _payout(up)
         rows.append(row)
     st.caption(f"**{title}**")
     st.dataframe(rows, hide_index=True, width='content')
@@ -1148,7 +1170,8 @@ if "analysis_results" in st.session_state:
                     if fetch_alt_lines and c.get("alt_ladder"):
                         _render_alt_ladder(c["alt_ladder"], direction="over",
                                            title=f"Alt spreads for {c['team']}",
-                                           around_line=c["spread"])
+                                           around_line=c["spread"],
+                                           line_style="spread")
 
         if other_sp:
             with st.expander(f"Other spreads ({len(other_sp)})"):
@@ -1273,7 +1296,8 @@ if "analysis_results" in st.session_state:
                         if fetch_alt_lines and c.get("alt_ladder"):
                             _render_alt_ladder(c["alt_ladder"], direction="over",
                                                title=f"Alt lines for {c['player']} ({c['prop_label']})",
-                                               around_line=c["safe_threshold"] - 0.5)
+                                               around_line=c["safe_threshold"] - 0.5,
+                                               line_style="threshold")
                 else:
                     hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
                     bet_price = (c.get("over_price") if c["direction"] == "OVER"
@@ -1301,7 +1325,8 @@ if "analysis_results" in st.session_state:
                         if fetch_alt_lines and c["direction"] == "OVER" and c.get("alt_ladder"):
                             _render_alt_ladder(c["alt_ladder"], direction="over",
                                                title=f"Alt lines for {c['player']} ({c['prop_label']}) — OVER",
-                                               around_line=c["line"])
+                                               around_line=c["line"],
+                                               line_style="threshold")
 
         if other_props:
             with st.expander(f"Other props ({len(other_props)})"):
