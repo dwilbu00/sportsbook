@@ -1972,17 +1972,14 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             if effective_mode == "safe":
                 score = joint * 1000 + combined_edge * 0.1
             elif effective_mode == "safe_value":
-                gap_sum = sum(
-                    leg.get("line_gap", 0.0)
-                    for leg in combo_list
-                    if leg.get("safe_mode")
-                )
-                nonsafe_edge_sum = sum(
-                    leg["edge_pct"]
-                    for leg in combo_list
-                    if not leg.get("safe_mode")
-                )
-                score = (gap_sum * 10) + nonsafe_edge_sum + joint * 100
+                # Confidence filter already guarantees each leg's hit prob,
+                # so re-rank purely by combined decimal payout (product of
+                # each leg's decimal odds).
+                payout_product = 1.0
+                for leg in combo_list:
+                    price = leg.get("odds_price")
+                    payout_product *= american_to_decimal(price) if price is not None else 1.91
+                score = payout_product * 100
             else:
                 score = combined_edge + (joint - combined_implied) * 100
 

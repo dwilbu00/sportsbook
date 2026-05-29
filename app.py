@@ -521,12 +521,12 @@ with st.sidebar:
     selected_props = [prop_labels[l] for l in selected_prop_labels]
 
     st.subheader("Analysis Settings")
-    threshold = st.slider("Value threshold (%)", 1.0, 20.0, 5.0, 0.5, key="threshold")
+    threshold = 5.0  # default value edge threshold for non-safe-mode analysis
     # Recent-games window is now hardcoded per sport (half-life weighting
     # inside makes the upper bound effectively self-tuning).
     recent_n = sport.get("recent_n_default", 10)
     safe_mode = st.toggle(
-        "🛡️ Safe mode (player props)",
+        "🎯 Alt lines (player props)",
         value=False,
         key="safe_mode",
         help=(
@@ -536,12 +536,14 @@ with st.sidebar:
         ),
     )
     if safe_mode:
-        safe_target = st.slider(
-            "Safe-mode confidence",
-            0.70, 0.99, 0.95, 0.01,
-            key="safe_target",
+        safe_target_pct = st.slider(
+            "Alt-lines confidence",
+            70, 99, 95, 1,
+            key="safe_target_pct",
+            format="%d%%",
             help="Target hit-rate at our suggested alt threshold.",
         )
+        safe_target = safe_target_pct / 100.0
     else:
         safe_target = 0.95
 
@@ -552,7 +554,7 @@ with st.sidebar:
         help=(
             "After the main analysis, pull alternate-line prices only for "
             "events that produced a value bet. Lets the UI show real DK "
-            "prices at suggested alt lines and lets safe-mode parlay payouts "
+            "prices at suggested alt lines and lets alt-line parlay payouts "
             "use the actual alt-line price. Costs ~1 extra credit per "
             "(value-bet event × alt market) — typically a small add-on. "
             "Toggling this ON while viewing an analysis pulls alts for the "
@@ -650,7 +652,7 @@ with col_analyze:
 with col_parlay:
     parlay_clicked = st.button("🎰 Value Parlays", width='stretch')
 with col_safe:
-    safe_clicked = st.button("🛡️ Safe Parlays", width='stretch')
+    safe_clicked = st.button("🎯 Alt-line Parlays", width='stretch')
 
 # ── Generate Parlays ──
 if (parlay_clicked or safe_clicked) and "analysis_results" in st.session_state:
@@ -693,13 +695,13 @@ if "parlay_results" in st.session_state:
         display = "regular"
 
     if display == "sa_safe":
-        mode_label = "🛡️ Safe"
+        mode_label = "🎯 Alt Lines"
         caption_text = "Prioritizing highest probability of hitting with positive edge"
     elif display == "sa_value":
-        mode_label = "🎯 Aggressive Safe"
-        caption_text = "Safe-mode legs already clear your confidence threshold, so ranked purely by DK payout — picks the bets that pay the most."
-    elif effective_mode == "safe":  # regular analysis + Safe button
-        mode_label = "🛡️ Safe"
+        mode_label = "⚡ Aggressive Alt Lines"
+        caption_text = "Alt-line legs already clear your confidence threshold, so ranked purely by DK payout — picks the bets that pay the most."
+    elif effective_mode == "safe":  # regular analysis + Alt-line button
+        mode_label = "🎯 Alt Lines"
         caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"
     else:  # regular analysis + Value button
         mode_label = "🎰 Value"
@@ -1096,7 +1098,7 @@ if "analysis_results" in st.session_state:
             st.warning(w)
         if removed_no_alt:
             st.warning(
-                f"Hid {removed_no_alt} safe-mode prop(s) with no DK alt line at the suggested threshold."
+                f"Hid {removed_no_alt} alt-line prop(s) with no DK alt at the suggested threshold."
             )
         # Clear cached parlays so they re-build using new alt prices.
         st.session_state.pop("parlay_results", None)
@@ -1253,7 +1255,7 @@ if "analysis_results" in st.session_state:
     # Player Props results
     if all_props:
         is_safe = any(c.get("safe_mode") for c in all_props)
-        header = "🛡️ Player Props Analysis (Safe Mode)" if is_safe else "🏀 Player Props Analysis"
+        header = "🎯 Player Props Analysis (Alt Lines)" if is_safe else "🏀 Player Props Analysis"
         st.subheader(header)
         value_props = [c for c in all_props if c["is_value"]]
         no_hist = [c for c in all_props if c.get("no_history")]
@@ -1292,7 +1294,7 @@ if "analysis_results" in st.session_state:
                     payout_str = ""
                     if c.get("alt_payout") is not None:
                         payout_str = f"  Pays: ${c['alt_payout']*10:.2f}  |"
-                    title = (f"🛡️ {c['player']} — {_safe_label(c)}  "
+                    title = (f"🎯 {c['player']} — {_safe_label(c)}  "
                              f"[{tag}]{payout_str}  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
                         cols = st.columns(6)
