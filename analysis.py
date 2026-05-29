@@ -1158,6 +1158,22 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 p_at_safe = _weighted_rate(values, weights,
                                            lambda v, t=safe_threshold: v >= t)
 
+                # Empirical refinement: the parametric Normal floor can be
+                # overly conservative when actual game-to-game spread is
+                # tighter than wstd suggests. Bump the threshold up while
+                # the empirical hit rate is still ≥ safe_target so the
+                # suggested alt line is as tight as the player's history
+                # actually supports.
+                while True:
+                    next_t = safe_threshold + 1
+                    p_next = _weighted_rate(values, weights,
+                                            lambda v, t=next_t: v >= t)
+                    if p_next >= safe_target:
+                        safe_threshold = next_t
+                        p_at_safe = p_next
+                    else:
+                        break
+
                 # Tight sanity guard: drop when historical hit rate at the
                 # suggested threshold is more than 5pp below safe_target.
                 # Was 15pp tolerance — measured to admit false positives
