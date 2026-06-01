@@ -8,8 +8,6 @@ import streamlit as st
 import json
 import os
 import sys
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -17,32 +15,6 @@ from zoneinfo import ZoneInfo
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-
-# ── Auto-shutdown when browser disconnects ──
-SHUTDOWN_TIMEOUT = 30  # seconds after last session disconnects
-
-if "shutdown_watchdog_started" not in st.session_state:
-    st.session_state.shutdown_watchdog_started = True
-
-    def _shutdown_watchdog():
-        """Monitor active sessions and exit when all browsers disconnect."""
-        from streamlit.runtime import get_instance
-        idle_since = None
-        while True:
-            time.sleep(5)
-            runtime = get_instance()
-            if runtime is None:
-                continue
-            active = runtime._session_mgr.list_active_sessions()
-            if not active:
-                if idle_since is None:
-                    idle_since = time.time()
-                elif time.time() - idle_since >= SHUTDOWN_TIMEOUT:
-                    os._exit(0)
-            else:
-                idle_since = None
-
-    threading.Thread(target=_shutdown_watchdog, daemon=True).start()
 
 from odds_client import (
     get_upcoming_events,
