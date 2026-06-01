@@ -65,7 +65,13 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
         if c.get("event_id") and c.get("is_value"):
             needed_alts.setdefault(c["event_id"], set()).add(TEAM_ALT_MARKETS["spreads"])
     for c in all_totals:
-        if c.get("event_id") and (c.get("is_over_value") or c.get("is_under_value")):
+        if not c.get("event_id"):
+            continue
+        # Pull alt totals when either side is flagged a value bet OR when a
+        # safe-mode OVER alt-line was suggested (the suggestion needs a real
+        # DK alt price at that line to be bettable).
+        if (c.get("is_over_value") or c.get("is_under_value")
+                or c.get("safe_mode")):
             needed_alts.setdefault(c["event_id"], set()).add(TEAM_ALT_MARKETS["totals"])
 
     alt_data_by_event = {}
@@ -112,10 +118,23 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
         if c.get("is_value") and c.get("event_id") in alt_data_by_event:
             c["alt_ladder"] = alt_data_by_event[c["event_id"]]["team"]["spreads"].get(c["team"], [])
     for c in all_totals:
-        if (c.get("is_over_value") or c.get("is_under_value")) and c.get("event_id") in alt_data_by_event:
+        need = c.get("is_over_value") or c.get("is_under_value") or c.get("safe_mode")
+        if need and c.get("event_id") in alt_data_by_event:
             team_alts = alt_data_by_event[c["event_id"]]["team"]["totals"]
             c["alt_ladder_over"] = team_alts.get("Over", [])
             c["alt_ladder_under"] = team_alts.get("Under", [])
+            # Safe-mode OVER suggestion: look up the actual DK alt price at
+            # our suggested half-point threshold so the UI / parlay payouts
+            # can use real prices instead of the standard book line.
+            if c.get("safe_mode") and c.get("safe_threshold") is not None:
+                target = c["safe_threshold"]
+                match = next(
+                    (e for e in c["alt_ladder_over"] if e["line"] == target),
+                    None,
+                )
+                if match is not None:
+                    c["safe_alt_price"] = match.get("price")
+                    c["safe_alt_line"] = match["line"]
     for c in all_props:
         if c.get("is_value") and not c.get("safe_mode") and c.get("event_id"):
             event_alts = alt_data_by_event.get(c["event_id"], {}).get("props", {})
@@ -498,7 +517,7 @@ with st.sidebar:
     # inside makes the upper bound effectively self-tuning).
     recent_n = sport.get("recent_n_default", 10)
     safe_mode = st.toggle(
-        "🎯 Alt lines (player props)",
+        "🎯 Alt lines",
         value=False,
         key="safe_mode",
         help=(
@@ -1012,7 +1031,11 @@ if analyze_clicked:
                 if "spreads" in market_keys:
                     all_spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"])))
                 if "totals" in market_keys:
-                    all_totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"])))
+                    all_totals.extend(_tag_event(analyze_totals_value(
+                        game_odds, home_stats, away_stats, threshold,
+                        sport_key=sport["key"],
+                        safe_mode=safe_mode, safe_target=safe_target,
+                    )))
 
         # Player props analysis
         if eid in parsed_props:
@@ -1083,7 +1106,11 @@ if analyze_clicked:
 # ON. The toggle separately controls whether ladders are *displayed*.
 if "analysis_results" in st.session_state:
     ar = st.session_state["analysis_results"]
-    need_alts = fetch_alt_lines or any(c.get("safe_mode") for c in ar.get("all_props", []))
+    need_alts = (
+        fetch_alt_lines
+        or any(c.get("safe_mode") for c in ar.get("all_props", []))
+        or any(c.get("safe_mode") for c in ar.get("all_totals", []))
+    )
     if need_alts and not ar.get("alts_applied"):
         with st.spinner("Pulling alt-line prices for value-bet events..."):
             alt_credits, alt_warnings, removed_no_alt = fetch_and_attach_alt_lines(
@@ -1206,8 +1233,62 @@ if "analysis_results" in st.session_state:
 
     # Totals results
     if all_totals:
-        st.subheader("📈 Over/Under Analysis")
+        is_safe_totals = any(c.get("safe_mode") for c in all_totals)
+        totals_header = "📈 Over/Under Analysis (Alt Lines)" if is_safe_totals else "📈 Over/Under Analysis"
+        st.subheader(totals_header)
         for c in all_totals:
+            # ── Safe-mode OVER alt-line panel (mirrors player-prop safe mode) ──
+            if c.get("safe_mode"):
+                gap = c.get("line_gap", 0.0)  # consensus_line − safe_threshold
+                bettable = c.get("bettable_at_standard_line")
+                if bettable:
+                    tag = "✅ bet standard line"
+                    alt_advice = (f"OVER {c['line']} is already safe "
+                                  f"(book line ≤ safe threshold)")
+                else:
+                    tag = "↘ alt line needed"
+                    alt_advice = (f"find an OVER ≤ {c['safe_threshold']} "
+                                  f"(book line {c['line']} sits above safe floor)")
+                payout_str = ""
+                if c.get("safe_alt_price") is not None:
+                    dec = american_to_decimal(c["safe_alt_price"])
+                    payout_str = f"  Pays: ${dec*10:.2f}  |"
+                title = (f"🎯 Total OVER {c['safe_threshold']}  —  {c['matchup']}  "
+                         f"[{tag}]{payout_str}  book line: {c['line']}")
+                with st.expander(title, expanded=bettable):
+                    cols = st.columns(6)
+                    cols[0].metric("Suggested", f"OVER {c['safe_threshold']}")
+                    cols[1].metric("Prob @ Suggested", f"{c['model_hit_at_safe']}%")
+                    cols[2].metric("Prob @ Book Line", f"{c['model_hit_at_line']}%")
+                    cols[3].metric("Δ (safe − book)", f"{c['model_delta']:+.2f}%")
+                    cols[4].metric("Projected Total", c["projected_total"])
+                    # Prefer real DK alt-line price when available; fall back
+                    # to book-line price with a caveat.
+                    if c.get("safe_alt_price") is not None:
+                        p_val, p_delta = _dk_payout_strs(c["safe_alt_price"])
+                        payout_label = f"DK Payout (OVER {c['safe_alt_line']})"
+                        payout_help = (f"Actual DraftKings price for OVER "
+                                       f"{c['safe_alt_line']}.")
+                    else:
+                        p_val, p_delta = _dk_payout_strs(c.get("over_price"))
+                        payout_label = "DK Payout (book line)"
+                        payout_help = ("Payout for the OVER at the standard "
+                                       "book line. No DK alt offered at the "
+                                       "suggested threshold — DK's actual alt "
+                                       "price (if listed) will differ.")
+                    cols[5].metric(payout_label, p_val, delta=p_delta,
+                                   delta_color="off", help=payout_help)
+                    st.caption(
+                        f"{alt_advice}  |  Line gap: {gap:+.2f}  "
+                        f"|  Samples: {c.get('games_sampled', 0)} games"
+                    )
+                    if fetch_alt_lines and c.get("alt_ladder_over"):
+                        _render_alt_ladder(c["alt_ladder_over"], direction="over",
+                                           title="Alt totals (OVER)",
+                                           around_line=c["safe_threshold"])
+                continue
+
+            # ── Standard (non-safe) totals display ──
             flag = ""
             if c.get("is_over_value"):
                 flag = " 🔥 OVER VALUE"

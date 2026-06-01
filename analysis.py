@@ -565,7 +565,8 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
     return candidates
 
 
-def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None):
+def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0,
+                         sport_key=None, safe_mode=False, safe_target=0.95):
     """
     Compare over/under lines against historical scoring averages.
 
@@ -574,6 +575,12 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         home_team_stats (dict): Home team stats
         away_team_stats (dict): Away team stats
         threshold_pct (float): Minimum edge to flag
+        safe_mode (bool): When True, also compute a "safe" OVER alt-line
+            threshold (mirrors the player-prop safe-mode workflow). The
+            suggested alt line is the largest half-point line at which the
+            parametric model + empirical history both clear `safe_target`.
+        safe_target (float): Target hit-rate (0–1) for the safe OVER
+            threshold (default 0.95).
 
     Returns:
         list: Value candidates for over/under
@@ -630,8 +637,12 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
     # Determine over/under probability from historical games (recency-,
     # opponent-strength-, and venue-match-weighted across both teams).
+    # Also capture the flat list of (total_score, weight) tuples so safe-mode
+    # can compute weighted std + empirical hit rates at alt thresholds.
     over_weight = 0.0
     total_weight = 0.0
+    total_values = []
+    total_weights = []
     for team_name, stats, upcoming_is_home in [
         (home_team, home_team_stats, True),
         (away_team, away_team_stats, False),
@@ -649,6 +660,8 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                 past_h = None
             w = bw * _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
             total_weight += w
+            total_values.append(g["total_score"])
+            total_weights.append(w)
             if g["total_score"] > consensus_line:
                 over_weight += w
 
@@ -660,7 +673,7 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
     under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
 
-    candidates.append({
+    candidate = {
         "type": "total_over",
         "matchup": f"{game_odds['away_team']} @ {game_odds['home_team']}",
         "line": consensus_line,
@@ -673,7 +686,71 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         "is_under_value": diff < 0 and (1 - over_hit_rate) > 0.5 + threshold,
         "over_price": over_price,
         "under_price": under_price,
-    })
+        "games_sampled": len(total_values),
+    }
+
+    # ── Safe-mode OVER alt-line suggestion ──
+    # Mirrors the player-prop safe-mode workflow: derive the largest
+    # half-point line at which the parametric Normal lower bound clears
+    # `safe_target`, then bump up empirically while the recent-history
+    # hit-rate also clears it. The UI / alt-line fetcher then looks up
+    # the real DK OVER price at that line.
+    if safe_mode and total_values and len(total_values) >= 2:
+        mean = _weighted_mean(total_values, total_weights)
+        std = _weighted_std(total_values, total_weights, mean=mean)
+        z = _normal_inv_cdf(safe_target)
+        alt_q = mean - z * std
+        # DK total alts run on .5 increments. Round DOWN to the nearest .5
+        # so the OVER threshold sits below the parametric floor.
+        safe_threshold = math.floor(alt_q * 2.0) / 2.0
+
+        # Empirical refinement: bump up by .5 while the recent-history hit
+        # rate at the next half-point still clears safe_target.
+        def _hit_rate(line):
+            return _weighted_rate(total_values, total_weights,
+                                  lambda v, t=line: v > t)
+
+        p_at_safe = _hit_rate(safe_threshold)
+        while True:
+            next_t = safe_threshold + 0.5
+            p_next = _hit_rate(next_t)
+            if p_next >= safe_target:
+                safe_threshold = next_t
+                p_at_safe = p_next
+            else:
+                break
+
+        model_hit_at_line = _hit_rate(consensus_line)
+        line_gap = consensus_line - safe_threshold  # positive = below book line
+        bettable_at_standard_line = consensus_line <= safe_threshold
+        model_delta = p_at_safe - model_hit_at_line
+
+        # Sanity guards:
+        #   - Drop if recent-history hit rate at the suggested line falls
+        #     more than 5pp below the user's confidence target.
+        #   - Drop absurdly low suggestions (>25% below the book line) —
+        #     DK won't list them and the parametric floor is unreliable at
+        #     that range anyway.
+        ok = (p_at_safe >= (safe_target - 0.05)
+              and safe_threshold > 0
+              and (consensus_line <= 0 or safe_threshold >= consensus_line * 0.75))
+
+        if ok:
+            candidate.update({
+                "safe_mode": True,
+                "safe_target": safe_target,
+                "safe_threshold": safe_threshold,
+                "safe_alt_q": round(alt_q, 2),
+                "model_hit_at_safe": round(p_at_safe * 100, 2),
+                "model_hit_at_line": round(model_hit_at_line * 100, 2),
+                "model_delta": round(model_delta * 100, 2),
+                "line_gap": round(line_gap, 2),
+                "bettable_at_standard_line": bettable_at_standard_line,
+                "_values": list(total_values),
+                "_weights": list(total_weights),
+            })
+
+    candidates.append(candidate)
 
     return candidates
 
