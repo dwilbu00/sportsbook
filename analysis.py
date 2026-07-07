@@ -30,9 +30,39 @@ def _consensus_price_for_line(items, line, line_key):
     return sorted_prices[len(sorted_prices) // 2]
 from calibration_loader import (
     load_calibration,
+    load_prob_shrink,
     apply_calibration_with_warmup,
     count_current_season_games,
 )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Probability-shrink calibration (fitted offline by backtest.py --mode odds
+#  --engine live --write-calibration). Corrects model overconfidence on team
+#  spread/total markets by pulling probabilities toward 0.5.
+# ──────────────────────────────────────────────────────────────────────────────
+_PROB_SHRINK_CACHE = {}
+
+
+def _shrink_factor(sport_key, market):
+    """Return the probability-shrink factor s in [0,1] for a team `market`
+    ('spreads'/'totals'). p' = 0.5 + s*(p-0.5) corrects model overconfidence.
+    Defaults to 1.0 (no shrink) when none is calibrated."""
+    if not sport_key:
+        return 1.0
+    if sport_key not in _PROB_SHRINK_CACHE:
+        try:
+            _PROB_SHRINK_CACHE[sport_key] = load_prob_shrink(sport_key) or {}
+        except Exception:
+            _PROB_SHRINK_CACHE[sport_key] = {}
+    s = _PROB_SHRINK_CACHE[sport_key].get(market)
+    return s if isinstance(s, (int, float)) and 0.0 <= s <= 1.0 else 1.0
+
+
+def _apply_shrink(p, sport_key, market):
+    """Pull probability p toward 0.5 by the calibrated shrink factor."""
+    s = _shrink_factor(sport_key, market)
+    return 0.5 + s * (p - 0.5) if s != 1.0 else p
 from prop_filter import filter_player_gamelog
 from recalibration import (
     load_recalibration,
@@ -666,6 +696,8 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                 over_weight += w
 
     over_hit_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
+    # Calibrated overconfidence correction: pull toward 0.5 (no-op when unset).
+    over_hit_rate = _apply_shrink(over_hit_rate, sport_key, "totals")
 
     diff = projected_total - consensus_line
 
@@ -844,6 +876,8 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
     games_sampled = min(len(home_stats["margins"]), len(away_stats["margins"]))
 
     def _add_candidate(team_name, opponent, is_home, spread, cover_prob, team_avg_margin, price):
+        # Calibrated overconfidence correction: pull toward 0.5 (no-op when unset).
+        cover_prob = _apply_shrink(cover_prob, sport_key, "spreads")
         edge = cover_prob - 0.50
         candidates.append({
             "type": "spread",

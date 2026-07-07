@@ -73,6 +73,31 @@ def load_calibration(sport_key):
     return blob.get("props", {})
 
 
+def _load_blob(sport_key):
+    """Load the raw calibration blob (all top-level keys), or {} if missing."""
+    path = calibration_path(sport_key)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def load_prob_shrink(sport_key):
+    """
+    Load per-market probability-shrink factors for team markets, e.g.:
+        {"spreads": 0.25, "totals": 0.0}
+    A factor s pulls the model probability toward 0.5: p' = 0.5 + s*(p-0.5),
+    correcting overconfidence. Returns {} (→ analyzers use 1.0 = no shrink) if
+    none configured. Failures are silent.
+    """
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("prob_shrink", {})
+
+
 def save_calibration(sport_key, props_cfg, meta=None):
     """Persist a calibration blob; creates calibration/ if needed."""
     os.makedirs(CALIBRATION_DIR, exist_ok=True)

@@ -2709,5 +2709,9 @@
     "games_per_player": 80,
     "warmup_games": 10,
     "n_players": 18
+  },
+  "prob_shrink": {
+    "spreads": 0.25,
+    "totals": 0.0
   }
 }
