@@ -43,8 +43,24 @@ from analysis import (
     _recency_weights,
     _weighted_mean,
     _weighted_rate,
+    _weighted_std,
     _half_life_for,
     _norm_cdf,
+    analyze_spreads_value,
+    analyze_totals_value,
+)
+from odds_client import (
+    american_to_decimal,
+    american_to_implied_prob,
+    devig_two_way,
+)
+from espn_client import get_pitcher_stats
+import historical_odds as hist_store
+from calibration_loader import (
+    save_market_blend,
+    save_prob_shrink,
+    load_calibration,
+    apply_calibration_with_warmup,
 )
 
 
@@ -486,6 +502,737 @@ def run_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
             _print_matchup_quantile_results(results)
 
 
+def _match_espn_name(espn_teams, api_name):
+    """Map an Odds-API team name to the ESPN displayName key (exact→ci→substring)."""
+    if not api_name:
+        return None
+    if api_name in espn_teams:
+        return api_name
+    low = api_name.lower()
+    for name in espn_teams:
+        if name.lower() == low:
+            return name
+    for name in espn_teams:
+        if low in name.lower() or name.lower() in low:
+            return name
+    return None
+
+
+def _build_odds_lookup(store, espn_teams):
+    """
+    Index a historical-odds store by (date10, espn_home, espn_away) using
+    ESPN-normalized team names so it can be joined to ESPN schedule games.
+    """
+    lookup = {}
+    unmatched = 0
+    for entry in store.get("games", {}).values():
+        eh = _match_espn_name(espn_teams, entry.get("home_team"))
+        ea = _match_espn_name(espn_teams, entry.get("away_team"))
+        if not eh or not ea:
+            unmatched += 1
+            continue
+        date10 = (entry.get("commence_time") or "")[:10]
+        lookup[(date10, eh, ea)] = entry
+    return lookup, unmatched
+
+
+def _lookup_game_odds(lookup, date10, home, away):
+    """Find a stored game by date (±1 day) and ESPN team names."""
+    for d in (date10, _shift_date(date10, -1), _shift_date(date10, 1)):
+        hit = lookup.get((d, home, away))
+        if hit:
+            return hit
+    return None
+
+
+def _shift_date(date10, days):
+    from datetime import date as _date, timedelta
+    try:
+        return (_date.fromisoformat(date10) + timedelta(days=days)).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+_SPORT_KEY_TO_CLI = {
+    "basketball_nba": "nba", "americanfootball_nfl": "nfl",
+    "baseball_mlb": "mlb", "icehockey_nhl": "nhl",
+}
+MARKETS = ("moneyline", "spreads", "totals")
+
+
+def _empty_market_bucket():
+    return {"n": 0, "model_brier": [], "market_brier": [], "correct": 0,
+            "bets": 0, "profit": 0.0, "blend": []}
+
+
+def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
+    """Update a market bucket with one observation (yes = the modelled side)."""
+    bucket["n"] += 1
+    bucket["model_brier"].append((model_p - outcome) ** 2)
+    bucket["market_brier"].append((market_p - outcome) ** 2)
+    if (1 if model_p > 0.5 else 0) == outcome:
+        bucket["correct"] += 1
+    bucket["blend"].append((model_p, market_p, outcome))
+    if price_yes is not None and model_p - market_p >= threshold:
+        bucket["bets"] += 1
+        bucket["profit"] += (american_to_decimal(price_yes) - 1) if outcome else -1
+    if price_no is not None and (1 - model_p) - (1 - market_p) >= threshold:
+        bucket["bets"] += 1
+        bucket["profit"] += (american_to_decimal(price_no) - 1) if not outcome else -1
+
+
+def _moneyline_market(entry):
+    """(fair_home_prob, home_price, away_price) from the stored moneyline."""
+    ml = entry.get("moneyline") or {}
+    h = (ml.get(entry.get("home_team")) or [None])[0]
+    a = (ml.get(entry.get("away_team")) or [None])[0]
+    if not h or not a:
+        return None
+    fair_home, _ = devig_two_way(h["implied_prob"], a["implied_prob"])
+    return fair_home, h["price"], a["price"]
+
+
+def _spread_market(entry):
+    """(home_spread, fair_home_cover_prob, home_price, away_price) or None."""
+    sp = entry.get("spreads") or {}
+    h = (sp.get(entry.get("home_team")) or [None])[0]
+    a = (sp.get(entry.get("away_team")) or [None])[0]
+    if not h or not a:
+        return None
+    fair_home, _ = devig_two_way(
+        american_to_implied_prob(h["price"]), american_to_implied_prob(a["price"]))
+    return h["spread"], fair_home, h["price"], a["price"]
+
+
+def _total_market(entry):
+    """(line, fair_over_prob, over_price, under_price) or None."""
+    tot = entry.get("totals") or {}
+    o = (tot.get("Over") or [None])[0]
+    u = (tot.get("Under") or [None])[0]
+    if not o or not u:
+        return None
+    fair_over, _ = devig_two_way(
+        american_to_implied_prob(o["price"]), american_to_implied_prob(u["price"]))
+    return o["line"], fair_over, o["price"], u["price"]
+
+
+def _best_blend_weight(obs, step=0.05):
+    """Return (best_w, best_brier, model_brier, market_brier) minimizing Brier."""
+    if not obs:
+        return None
+    n = len(obs)
+    best_w, best_brier = 1.0, float("inf")
+    w = 0.0
+    while w <= 1.0001:
+        brier = sum((w * pm + (1 - w) * mk - o) ** 2 for pm, mk, o in obs) / n
+        if brier < best_brier:
+            best_brier, best_w = brier, w
+        w += step
+    model_brier = sum((pm - o) ** 2 for pm, mk, o in obs) / n
+    market_brier = sum((mk - o) ** 2 for pm, mk, o in obs) / n
+    return round(best_w, 2), best_brier, model_brier, market_brier
+
+
+def _best_shrink(obs, step=0.05):
+    """Find the probability-shrink s in [0,1] minimizing Brier on the model's
+    own probabilities. obs = [(model_p, market_p, outcome), ...].
+    Returns (best_s, best_brier, raw_brier) or None."""
+    if not obs:
+        return None
+    n = len(obs)
+    raw_brier = sum((pm - o) ** 2 for pm, _, o in obs) / n
+    best_s, best_brier = 1.0, float("inf")
+    s = 0.0
+    while s <= 1.0001:
+        brier = sum((0.5 + s * (pm - 0.5) - o) ** 2 for pm, _, o in obs) / n
+        if brier < best_brier:
+            best_brier, best_s = brier, s
+        s += step
+    return round(best_s, 2), best_brier, raw_brier
+
+
+def _write_shrink_calibration(sport_key, results):
+    """Fit and persist the Brier-optimal probability shrink per team market
+    (from the 'live' variant) to calibration/<sport>.json."""
+    from datetime import datetime
+    variant = "live" if "live" in results else next(iter(results), None)
+    if not variant:
+        print("  [write-calibration] No variant to write.")
+        return
+    shrink = {}
+    for market in MARKETS:
+        res = _best_shrink(results[variant][market]["blend"])
+        if not res:
+            continue
+        best_s, best_brier, raw_brier = res
+        # Only persist when shrinking actually improves calibration.
+        if best_s < 1.0 and best_brier < raw_brier - 1e-9:
+            shrink[market] = round(best_s, 2)
+    if not shrink:
+        print("  [write-calibration] No market needed shrink; nothing written.")
+        return
+    save_prob_shrink(sport_key, shrink, meta={
+        "source": "odds backtest --engine live",
+        "fit_timestamp": datetime.utcnow().isoformat() + "Z",
+    })
+    print(f"\n  [write-calibration] Wrote prob_shrink to "
+          f"calibration/{sport_key}.json: {shrink}")
+
+
+def _inflate_samples(samples, weights, k):
+    """Re-spread samples around their weighted mean by factor k (k>1 widens the
+    distribution, fixing the variance compression from averaging two teams'
+    series). Mean is preserved, so point projections don't move."""
+    if not samples or abs(k - 1.0) < 1e-9:
+        return samples
+    mean = _weighted_mean(samples, weights) if weights else (sum(samples) / len(samples))
+    return [mean + k * (s - mean) for s in samples]
+
+
+def _live_stats(prior_games):
+    """Minimal stats dict accepted by analyze_spreads_value / analyze_totals_value.
+    Only 'recent_games' is used when a team has matching games (always true here);
+    the 'recent'/'season' fallbacks are present to avoid KeyErrors."""
+    return {
+        "recent_games": prior_games,
+        "recent": {"avg_scored": 0.0, "avg_allowed": 0.0, "win_pct": 0.0},
+        "season": {"win_pct": 0.0},
+    }
+
+
+def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport_key,
+                             matchup_features=None):
+    """Run the ACTUAL live analyzers and return the PURE-model (pre-blend)
+    probabilities: ((home_spread, P_home_cover), (total_line, P_over)). This
+    makes the backtest grade exactly what production computes — including the
+    MLB starter adjustment when ``matchup_features`` is supplied."""
+    stats_h, stats_a = _live_stats(home_prior), _live_stats(away_prior)
+    home_cover = total_over = None
+    for c in analyze_spreads_value(entry, stats_h, stats_a, threshold_pct, sport_key,
+                                   matchup_features=matchup_features):
+        if c["home_away"] == "HOME":
+            home_cover = (c["spread"], c["model_cover_rate"] / 100.0)
+    tot = analyze_totals_value(entry, stats_h, stats_a, threshold_pct, sport_key,
+                               matchup_features=matchup_features)
+    if tot:
+        total_over = (tot[0]["line"], tot[0]["model_over_hit_rate"] / 100.0)
+    return home_cover, total_over
+
+
+# Cache the MLB starter matchup-feature builder + per-season team index so the
+# odds backtest grades the same starter-adjusted model production runs, without
+# rebuilding the team index for every game.
+_MLB_TEAM_INDEX = {}
+
+
+def _mlb_matchup_features(home, away, date, sport_key):
+    """Build MLB starter/opponent matchup features for a historical game the
+    same way app.py does at run time. Returns None for non-MLB or when starters
+    can't be resolved (degrades to the team-only model, matching production)."""
+    if sport_key != "baseball_mlb" or not (home and away and date):
+        return None
+    try:
+        import mlb_starters
+        season = int(date[:4])
+        idx = _MLB_TEAM_INDEX.get(season)
+        if idx is None:
+            idx = mlb_starters.get_team_index(season)
+            _MLB_TEAM_INDEX[season] = idx
+        return mlb_starters.build_matchup_features(home, away, date, season,
+                                                   team_index=idx)
+    except Exception:
+        return None
+
+
+def _shrink_prob(p, s):
+    """Pull a probability toward 0.5 by factor s (s=1 unchanged, s=0 -> 0.5).
+    Fixes overconfidence: a model 'p' becomes 0.5 + s*(p-0.5)."""
+    return 0.5 + s * (p - 0.5)
+
+
+def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
+                      min_sample=5, season_year=None, threshold_pct=5.0,
+                      write_calibration=False, store_label="", variance_inflate=1.0,
+                      engine="live", prob_shrink=1.0):
+    """
+    Grade the model's moneyline / spread / total value flags against stored
+    historical closing lines: realized ROI, model-vs-market Brier, and the
+    optimal model⇄market blend weight per market. Requires a prior
+    `backfill_historical_odds.py` run.
+
+    With write_calibration=True, the best blend weight per market is written to
+    calibration/<sport>.json so the live analyzers blend the model toward the
+    de-vigged market line automatically.
+
+    NOTE: this measures ROI at the closing price and whether the model adds
+    information over the closing line. True closing-line value (CLV) — the gain
+    between your bet price and the close — needs a second, earlier snapshot per
+    game and is not computed here.
+    """
+    variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
+    threshold = threshold_pct / 100.0
+
+    store = hist_store.load_store(sport_key, store_label)
+    if not store.get("games"):
+        cli = _SPORT_KEY_TO_CLI.get(sport_key, sport_key)
+        lbl = f" --label {store_label}" if store_label else ""
+        print(f"\nNo historical odds stored for {sport_key}"
+              f"{f' (label={store_label})' if store_label else ''}.")
+        print(f"Run:  python backfill_historical_odds.py --sport {cli} "
+              f"--days 60 --max-credits 5000{lbl}")
+        return
+    if store_label:
+        print(f"\n[store-label: {store_label}] grading ROI at the "
+              f"{store.get('snapshot_time','labeled')} price, not the close.")
+
+    print(f"\n=== Loading {sport_key} team list ===")
+    espn_teams = get_all_teams(espn_sport, espn_league)
+    lookup, unmatched = _build_odds_lookup(store, espn_teams)
+    print(f"Stored games: {len(store['games'])} "
+          f"(bookmaker: {store.get('bookmaker','?')}); "
+          f"name-unmatched: {unmatched}")
+
+    print(f"\n=== Fetching schedules (cached) ===")
+    schedules = build_schedules(espn_sport, espn_league, espn_teams,
+                                season_year=season_year)
+    all_games = all_completed_games(schedules)
+    if limit and limit < len(all_games):
+        all_games = all_games[-limit:]
+
+    if engine == "live":
+        print("\n[engine: live] grading the exact production analyzers "
+              "(analyze_spreads_value / analyze_totals_value); variants ignored.")
+        variants = {"live": next(iter(variants.values()))}
+    else:
+        print(f"\n[engine: convolution] variance-inflate={variance_inflate} "
+              "(diagnostic model; not what production runs).")
+
+    results = {name: {m: _empty_market_bucket() for m in MARKETS}
+               for name in variants}
+
+    matched = 0
+    for game in all_games:
+        date = game.get("date")
+        home, away = game.get("home_team"), game.get("away_team")
+        if not (date and home and away):
+            continue
+        entry = _lookup_game_odds(lookup, date[:10], home, away)
+        if not entry:
+            continue
+        ml = _moneyline_market(entry)
+        sp = _spread_market(entry)
+        tot = _total_market(entry)
+        if not (ml or sp or tot):
+            continue
+
+        home_prior = prior_games_for(home, schedules, espn_teams, date, window)
+        away_prior = prior_games_for(away, schedules, espn_teams, date, window)
+        if len(home_prior) < min_sample or len(away_prior) < min_sample:
+            continue
+        annotate_opponent_strength(home_prior, home, espn_teams)
+        annotate_opponent_strength(away_prior, away, espn_teams)
+
+        actual_margin = game["home_score"] - game["away_score"]
+        actual_total = game.get("total_score") or (game["home_score"] + game["away_score"])
+        home_won = 1 if actual_margin > 0 else 0
+        matched += 1
+
+        # ── LIVE engine: grade the real production probabilities ──
+        if engine == "live":
+            r = results["live"]
+            matchup_features = _mlb_matchup_features(home, away, date[:10], sport_key)
+            mhc, mov = _live_spread_total_probs(
+                entry, home_prior, away_prior, threshold_pct, sport_key,
+                matchup_features=matchup_features)
+            if sp and mhc is not None:
+                home_spread, fair_cover, price_h, price_a = sp
+                model_spread, model_cover = mhc
+                if (abs(model_spread - home_spread) < 1e-9
+                        and abs(actual_margin + home_spread) > 1e-9):
+                    home_covers = 1 if (actual_margin + home_spread) > 0 else 0
+                    _grade(r["spreads"], _shrink_prob(model_cover, prob_shrink),
+                           fair_cover, home_covers, price_h, price_a, threshold)
+            if tot and mov is not None:
+                line, fair_over, price_o, price_u = tot
+                model_line, model_over = mov
+                if (abs(model_line - line) < 1e-9
+                        and abs(actual_total - line) > 1e-9):
+                    over_hit = 1 if actual_total > line else 0
+                    _grade(r["totals"], _shrink_prob(model_over, prob_shrink),
+                           fair_over, over_hit, price_o, price_u, threshold)
+            continue
+
+        for variant_name, params in variants.items():
+            proj = project_matchup(home, away, home_prior, away_prior, params)
+            if not proj:
+                continue
+            r = results[variant_name]
+            samples_w = proj.get("sample_weights") or []
+            margin_s = _inflate_samples(proj.get("margin_samples") or [],
+                                        samples_w, variance_inflate)
+            total_s = _inflate_samples(proj.get("total_samples") or [],
+                                       samples_w, variance_inflate)
+
+            # ── Moneyline ──
+            if ml:
+                fair_home, price_home, price_away = ml
+                _grade(r["moneyline"], proj["home_win_prob"], fair_home,
+                       home_won, price_home, price_away, threshold)
+
+            # ── Spread (home cover) ──
+            if sp and margin_s:
+                home_spread, fair_cover, price_h, price_a = sp
+                # Push: refund — skip grading this market for this game.
+                if abs(actual_margin + home_spread) > 1e-9:
+                    model_cover = _weighted_rate(
+                        margin_s, samples_w,
+                        lambda m, hs=home_spread: m > -hs)
+                    home_covers = 1 if (actual_margin + home_spread) > 0 else 0
+                    _grade(r["spreads"], model_cover, fair_cover,
+                           home_covers, price_h, price_a, threshold)
+
+            # ── Total (over) ──
+            if tot and total_s:
+                line, fair_over, price_o, price_u = tot
+                if abs(actual_total - line) > 1e-9:
+                    model_over = _weighted_rate(
+                        total_s, samples_w,
+                        lambda t, ln=line: t > ln)
+                    over_hit = 1 if actual_total > line else 0
+                    _grade(r["totals"], model_over, fair_over,
+                           over_hit, price_o, price_u, threshold)
+
+    print(f"\nMatched {matched} games to stored closing lines "
+          f"(threshold {threshold_pct:.1f}%).")
+    _print_odds_results(results)
+
+    if write_calibration:
+        if engine == "live":
+            if abs(prob_shrink - 1.0) > 1e-9:
+                print("  [write-calibration] Re-run with --prob-shrink 1.0 to fit "
+                      "shrink on raw model probabilities; skipping write.")
+            else:
+                _write_shrink_calibration(sport_key, results)
+        else:
+            _write_blend_calibration(sport_key, results)
+
+
+_RELIABILITY_EDGES = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.0001)
+
+
+def _reliability_rows(blend_obs, edges=_RELIABILITY_EDGES):
+    """From [(model_p, market_p, outcome), ...] build calibration rows for the
+    model's CHOSEN side: fold each obs to confidence = P(side the model leans),
+    then bin. Returns [(lo, hi, n, pred_mean, actual_rate), ...].
+
+    pred_mean ≈ actual_rate  =>  well-calibrated at that confidence level."""
+    folded = []  # (confidence, won)
+    for t in blend_obs:
+        p, o = t[0], t[-1]
+        if abs(p - 0.5) < 1e-9:
+            continue
+        if p > 0.5:
+            folded.append((p, o))
+        else:
+            folded.append((1.0 - p, 1 - o))
+    rows = []
+    for lo, hi in zip(edges, edges[1:]):
+        bucket = [(c, w) for c, w in folded if lo <= c < hi]
+        if not bucket:
+            continue
+        n = len(bucket)
+        pred = sum(c for c, _ in bucket) / n
+        actual = sum(w for _, w in bucket) / n
+        rows.append((lo, min(hi, 1.0), n, pred, actual))
+    return rows
+
+
+def _print_reliability(title, named_obs):
+    """named_obs: list of (label, blend_obs). Prints a confidence→accuracy
+    calibration table so you can see if e.g. 75-80% model picks win ~75-80%."""
+    print(f"\n{title}")
+    print("  (model's chosen side: a well-calibrated pred% should match actual%; "
+          "gap>0 = model underconfident, gap<0 = overconfident)")
+    hdr = f"  {'pick':<14} {'conf bin':<11} {'N':>5} {'pred%':>7} {'actual%':>8} {'gap':>7}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for label, obs in named_obs:
+        rows = _reliability_rows(obs)
+        if not rows:
+            print(f"  {label:<14} (no picks)")
+            continue
+        first = True
+        for lo, hi, n, pred, actual in rows:
+            tag = label if first else ""
+            first = False
+            gap = actual - pred
+            print(f"  {tag:<14} {lo*100:>2.0f}-{hi*100:<6.0f} {n:>5} "
+                  f"{pred*100:>6.1f} {actual*100:>7.1f} {gap*100:>+6.1f}")
+
+
+def _print_odds_results(results):
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else float("nan")
+
+    for market in MARKETS:
+        hdr = (f"[{market}]  {'variant':<14} {'N':>5} {'mdlBrier':>9} "
+               f"{'mktBrier':>9} {'dir%':>6} {'bets':>5} {'ROI%':>8} {'P/L(u)':>8}")
+        print("\n" + hdr)
+        print("-" * len(hdr))
+        for name, mr in results.items():
+            r = mr[market]
+            n = r["n"]
+            pad = " " * (len(f"[{market}]  "))
+            if not n:
+                print(f"{pad}{name:<14} {0:>5}  (no matched games)")
+                continue
+            acc = 100.0 * r["correct"] / n
+            bets = r["bets"]
+            roi = (100.0 * r["profit"] / bets) if bets else float("nan")
+            print(f"{pad}{name:<14} {n:>5} {_mean(r['model_brier']):>9.4f} "
+                  f"{_mean(r['market_brier']):>9.4f} {acc:>6.1f} {bets:>5} "
+                  f"{roi:>8.2f} {r['profit']:>8.2f}")
+
+    print("\nOptimal model⇄market blend (w = model weight, minimizing Brier):")
+    print(f"  {'market':<10} {'variant':<14} {'best w':>7} {'blendBrier':>11} "
+          f"{'vs model':>9} {'vs market':>10}")
+    for market in MARKETS:
+        for name, mr in results.items():
+            res = _best_blend_weight(mr[market]["blend"])
+            if not res:
+                continue
+            best_w, best_brier, model_brier, market_brier = res
+            print(f"  {market:<10} {name:<14} {best_w:>7.2f} {best_brier:>11.4f} "
+                  f"{model_brier - best_brier:>+9.4f} {market_brier - best_brier:>+10.4f}")
+    print("\n  (Lower Brier = better. 'dir%' = directional accuracy of the model "
+          "side. 'vs model'/'vs market'")
+    print("   = how much the blend beats each alone.) A best w < 1.0 means "
+          "blending toward the market")
+    print("   closing line improves accuracy. Use --write-calibration to save "
+          "these weights for live use.\n")
+
+    variant = "all" if "all" in results else next(iter(results), None)
+    if variant:
+        named = [(market, results[variant][market]["blend"]) for market in MARKETS]
+        _print_reliability(
+            f"Model calibration by confidence  (variant '{variant}')", named)
+
+
+def _write_blend_calibration(sport_key, results):
+    """Write the best blend weight per market (from the chosen variant) to
+    calibration/<sport>.json so the live analyzers consume it."""
+    from datetime import datetime
+    # Prefer the production-like 'all' variant; else the first available.
+    variant = "all" if "all" in results else next(iter(results), None)
+    if not variant:
+        print("  [write-calibration] No variants to write.")
+        return
+    blend = {}
+    for market in MARKETS:
+        res = _best_blend_weight(results[variant][market]["blend"])
+        if not res:
+            continue
+        best_w, best_brier, model_brier, market_brier = res
+        # Only persist a weight when blending actually helps over pure model.
+        if best_brier < model_brier - 1e-9:
+            blend[market] = {
+                "w": best_w,
+                "n": results[variant][market]["n"],
+                "blend_brier": round(best_brier, 5),
+                "model_brier": round(model_brier, 5),
+                "market_brier": round(market_brier, 5),
+            }
+    if not blend:
+        print("  [write-calibration] No market beat the pure model; nothing written.")
+        return
+    save_market_blend(sport_key, blend, meta={
+        "variant": variant,
+        "fit_timestamp": datetime.utcnow().isoformat() + "Z",
+    })
+    print(f"\n  [write-calibration] Wrote blend weights (variant '{variant}') "
+          f"to calibration/{sport_key}.json:")
+    for market, cfg in blend.items():
+        print(f"    {market:<10} w={cfg['w']:.2f}  (n={cfg['n']}, "
+              f"blendBrier={cfg['blend_brier']})")
+
+
+def _player_stat_series(espn_sport, espn_league, name, prop_key):
+    """
+    Return a player's dated per-game stat values for a prop as a sorted list of
+    (game_date_iso, value). Empty if the player can't be resolved or the source
+    lacks dated per-game data (e.g. ESPN MLB pitcher splits have no game dates).
+    """
+    aid = cached_athlete_id(espn_sport, espn_league, name)
+    if not aid:
+        return []
+    gamelog = cached_gamelog(espn_sport, espn_league, aid) or []
+    if not gamelog and espn_sport == "baseball" and prop_key in (
+            "pitcher_outs", "pitcher_strikeouts", "pitcher_earned_runs"):
+        # Splits-based fallback — note: these rows carry NO game_date, so they
+        # cannot be matched to a specific dated book line below.
+        gamelog = get_pitcher_stats(espn_league, aid) or []
+    label = _stat_label_for(prop_key, gamelog)
+    if not label:
+        return []
+    out = []
+    for g in gamelog:
+        d = g.get("game_date")
+        val = g.get(label)
+        if not d or val is None:
+            continue
+        if prop_key == "pitcher_outs":
+            whole = int(val)
+            frac = round((val - whole) * 10)
+            val = whole * 3 + frac
+        out.append((d, float(val)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _props_p_over(prop_cfg, proj, line, vals, wts, emp_over):
+    """Model P(stat > line): production calibration if available, else Gaussian."""
+    if prop_cfg:
+        p = apply_calibration_with_warmup(
+            prop_cfg, proj, line, current_season_games=len(vals),
+            empirical_over=emp_over)
+        if p is not None:
+            return max(0.0, min(1.0, p))
+    sigma = _weighted_std(vals, wts, proj)
+    if sigma and sigma > 0:
+        return _norm_cdf((proj - line) / sigma)
+    return emp_over
+
+
+def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
+                            min_prior=5, half_life=None, threshold_pct=5.0,
+                            store_label=""):
+    """
+    Grade the model's player-prop value flags against stored historical closing
+    lines (from backfill_historical_odds.py --props ...). For each captured
+    book line we recompute the model's P(over) from the player's prior games,
+    compare it to the de-vigged closing line, and measure ROI + model-vs-market
+    Brier + the optimal model⇄market blend, per prop market.
+    """
+    threshold = threshold_pct / 100.0
+    store = hist_store.load_store(sport_key, store_label)
+    games = store.get("games", {})
+    if not games:
+        cli = _SPORT_KEY_TO_CLI.get(sport_key, sport_key)
+        lbl = f" --label {store_label}" if store_label else ""
+        print(f"\nNo historical odds stored for {sport_key}"
+              f"{f' (label={store_label})' if store_label else ''}. Run "
+              f"backfill_historical_odds.py --sport {cli} --props {','.join(props)}{lbl} ...")
+        return
+    if store_label:
+        print(f"\n[store-label: {store_label}] grading ROI at the "
+              f"{store.get('snapshot_time','labeled')} price, not the close.")
+
+    calibration = load_calibration(sport_key)
+    hl = half_life or _half_life_for(sport_key)
+    results = {prop: _empty_market_bucket() for prop in props}
+    series_cache = {}
+    no_actual = {prop: 0 for prop in props}
+    no_series = {prop: 0 for prop in props}
+
+    def series(player, prop):
+        k = (player, prop)
+        if k not in series_cache:
+            series_cache[k] = _player_stat_series(espn_sport, espn_league, player, prop)
+        return series_cache[k]
+
+    print(f"\n=== Props odds backtest: {sport_key} {props} ===")
+    print(f"Stored games: {len(games)} (bookmaker: {store.get('bookmaker','?')})")
+
+    for entry in games.values():
+        gdate = entry.get("commence_time")
+        if not gdate:
+            continue
+        d10 = gdate[:10]
+        eprops = entry.get("props") or {}
+        for prop in props:
+            market = eprops.get(prop) or {}
+            for player, info in market.items():
+                line = info.get("line")
+                over_imp = info.get("over_implied")
+                under_imp = info.get("under_implied")
+                over_price = info.get("over_price")
+                under_price = info.get("under_price")
+                if line is None or over_imp is None or under_imp is None:
+                    continue
+                ser = series(player, prop)
+                if not ser:
+                    no_series[prop] += 1
+                    continue
+                actual = None
+                prior = []
+                for dt, val in ser:
+                    if dt[:10] == d10:
+                        actual = val
+                    elif dt < gdate:
+                        prior.append(val)
+                if actual is None or len(prior) < min_prior:
+                    no_actual[prop] += 1
+                    continue
+                if abs(actual - line) < 1e-9:
+                    continue  # push — refund
+                wts = _recency_weights(len(prior), hl)
+                proj = _weighted_mean(prior, wts)
+                emp_over = _weighted_rate(prior, wts, lambda v, ln=line: v > ln)
+                p_model = _props_p_over(calibration.get(prop), proj, line,
+                                        prior, wts, emp_over)
+                fair_over, _ = devig_two_way(over_imp, under_imp)
+                outcome = 1 if actual > line else 0
+                _grade(results[prop], p_model, fair_over, outcome,
+                       over_price, under_price, threshold)
+
+    # Diagnostics on coverage
+    print("\nCoverage (why lines were dropped):")
+    for prop in props:
+        print(f"  {prop:<18} graded={results[prop]['n']:>5}  "
+              f"no_dated_series={no_series[prop]:>5}  "
+              f"no_actual/min_prior={no_actual[prop]:>5}")
+
+    _print_props_odds_results(results, threshold_pct)
+
+
+def _print_props_odds_results(results, threshold_pct):
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else float("nan")
+
+    hdr = (f"{'prop':<18} {'N':>5} {'mdlBrier':>9} {'mktBrier':>9} {'dir%':>6} "
+           f"{'bets':>5} {'ROI%':>8} {'P/L(u)':>8}")
+    print("\n" + hdr)
+    print("-" * len(hdr))
+    for prop, r in results.items():
+        n = r["n"]
+        if not n:
+            print(f"{prop:<18} {0:>5}  (no gradeable lines)")
+            continue
+        acc = 100.0 * r["correct"] / n
+        bets = r["bets"]
+        roi = (100.0 * r["profit"] / bets) if bets else float("nan")
+        print(f"{prop:<18} {n:>5} {_mean(r['model_brier']):>9.4f} "
+              f"{_mean(r['market_brier']):>9.4f} {acc:>6.1f} {bets:>5} "
+              f"{roi:>8.2f} {r['profit']:>8.2f}")
+
+    print("\nOptimal model⇄market blend (w = model weight, minimizing Brier):")
+    print(f"  {'prop':<18} {'best w':>7} {'blendBrier':>11} {'vs model':>9} {'vs market':>10}")
+    for prop, r in results.items():
+        res = _best_blend_weight(r["blend"])
+        if not res:
+            continue
+        best_w, best_brier, model_brier, market_brier = res
+        print(f"  {prop:<18} {best_w:>7.2f} {best_brier:>11.4f} "
+              f"{model_brier - best_brier:>+9.4f} {market_brier - best_brier:>+10.4f}")
+    print("\n  ROI = profit per 1u bet on flags where model edge over the de-vigged "
+          "line ≥ threshold.")
+    print("  Positive ROI with model Brier ≤ market Brier = a real prop edge.\n")
+
+    _print_reliability(
+        "Model calibration by confidence",
+        [(prop, r["blend"]) for prop, r in results.items()])
+
+
 def _print_matchup_quantile_sweep_summary(results, safe_target=0.80):
     """
     Compact sweep summary for matchup quantile mode. For each bet type,
@@ -845,6 +1592,7 @@ PROP_LABELS_SHORT = {
     "pitcher_strikeouts": "K",
     "pitcher_outs": "IPx3",
     "batter_strikeouts": "BK",
+    "pitcher_earned_runs": "ER",
     "player_pass_yds": "PaYd",
     "player_rush_yds": "RuYd",
     "player_anytime_td": "TD",
@@ -2266,8 +3014,17 @@ def _print_props_sweep_results(results, props, top_k=10, safe_target=0.80):
 
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
-    p.add_argument("--mode", choices=["matchup", "props"], default="matchup",
-                   help="matchup = team-level projections; props = player-prop projections")
+    p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
+                   default="matchup",
+                   help="matchup = team-level projections; props = player-prop "
+                        "projections; odds = grade team markets vs stored closing "
+                        "lines; props-odds = grade player props vs stored closing "
+                        "lines (ROI + model⇄market blend)")
+    p.add_argument("--threshold", type=float, default=5.0,
+                   help="(odds mode) Min edge %% over the de-vigged market to place a bet.")
+    p.add_argument("--write-calibration", action="store_true",
+                   help="(odds mode) Save the best model⇄market blend weight per "
+                        "market to calibration/<sport>.json for live use.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -2303,6 +3060,27 @@ def main():
                         "compare empirical vs residual-Normal vs residual-ECDF "
                         "probabilistic forecasters with Brier/log-loss/hit-rate. "
                         "Use --calibrate=sweep to also sweep shrinkage k.")
+    p.add_argument("--store-label", default="",
+                   help="(odds/props-odds) Grade against a labeled historical "
+                        "store, e.g. 'morning' -> baseball_mlb__morning.json. "
+                        "Default '' uses the closing store. Use this to measure "
+                        "ROI at the before-noon price you actually bet.")
+    p.add_argument("--engine", choices=["live", "convolution"], default="live",
+                   help="(odds mode) 'live' (default) grades the exact production "
+                        "analyzers (analyze_spreads_value/analyze_totals_value) so "
+                        "calibration matches reality. 'convolution' uses the older "
+                        "diagnostic model that understated variance (pair with "
+                        "--variance-inflate to reconcile it to live).")
+    p.add_argument("--variance-inflate", type=float, default=1.0,
+                   help="(odds mode, convolution engine) Widen the diagnostic "
+                        "model's outcome distribution by this factor (1.0 = off). "
+                        "k≈2.0 reproduces the live engine's variance.")
+    p.add_argument("--prob-shrink", type=float, default=1.0,
+                   help="(odds mode, live engine) Pull model spread/total "
+                        "probabilities toward 0.5 by this factor (1.0 = off, "
+                        "0.5 = halve the edge). Fixes overconfidence; sweep and "
+                        "watch the calibration table to find the value that "
+                        "flattens it.")
     p.add_argument("--cross-season", choices=["strict", "all"], default="strict",
                    help="(props mode) 'strict' (default) keeps only current-season "
                         "prior games per test observation; 'all' uses the full "
@@ -2337,7 +3115,26 @@ def main():
         print(f"#  Variants: {variant_names}")
     print(f"{'#'*60}")
 
-    if args.mode == "matchup":
+    if args.mode == "props-odds":
+        props = ([x.strip() for x in args.props.split(",") if x.strip()]
+                 if args.props else DEFAULT_PROPS.get(args.sport, []))
+        if not props:
+            print(f"No props for sport={args.sport}. Use --props.")
+            sys.exit(1)
+        run_props_odds_backtest(args.sport, espn_sport, espn_league, sport_key,
+                                props=props, min_prior=args.min_sample,
+                                threshold_pct=args.threshold,
+                                store_label=args.store_label)
+    elif args.mode == "odds":
+        run_odds_backtest(sport_key, espn_sport, espn_league,
+                          limit=args.limit, window=args.window, variants=variants,
+                          min_sample=args.min_sample, season_year=args.season,
+                          threshold_pct=args.threshold,
+                          write_calibration=args.write_calibration,
+                          store_label=args.store_label,
+                          variance_inflate=args.variance_inflate,
+                          engine=args.engine, prob_shrink=args.prob_shrink)
+    elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
                      min_sample=args.min_sample, season_year=args.season,

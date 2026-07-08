@@ -85,10 +85,104 @@ def _load_blob(sport_key):
         return {}
 
 
+def save_calibration(sport_key, props_cfg, meta=None, merge_props=True):
+    """Persist a calibration blob; creates calibration/ if needed.
+
+    Starts from the existing blob so a props refit preserves every other
+    top-level block (market_blend, starter_adjustment, prob_shrink, ...).
+    By default merges props into any existing props dict rather than
+    replacing it, so a partial refit (e.g. only pitcher_outs) does not wipe
+    already-calibrated props. Meta is merged shallowly for the same reason.
+    """
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob["fit_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    existing_props = blob.get("props")
+    if merge_props and isinstance(existing_props, dict):
+        existing_props.update(props_cfg)
+        blob["props"] = existing_props
+    else:
+        blob["props"] = props_cfg
+    if meta:
+        existing_meta = blob.get("meta")
+        if isinstance(existing_meta, dict):
+            existing_meta.update(meta)
+            blob["meta"] = existing_meta
+        else:
+            blob["meta"] = meta
+    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
+def load_market_blend(sport_key):
+    """
+    Load per-market model⇄market blend weights for team markets, e.g.:
+        {"moneyline": {"w": 0.6, ...}, "spreads": {...}, "totals": {...}}
+    Returns {} if none are configured. Failures are silent.
+    """
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("market_blend", {})
+
+
+def save_market_blend(sport_key, blend, meta=None):
+    """
+    Persist per-market blend weights into calibration/<sport>.json, preserving
+    the existing 'props' calibration block.
+    """
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["market_blend"] = blend
+    if meta:
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            blob["meta"]["market_blend"] = meta
+        else:
+            blob["meta"] = {"market_blend": meta}
+    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
+def load_starter_adjustment(sport_key):
+    """
+    Load MLB starter/opponent adjustment weights (Phase 1), e.g.:
+        {"moneyline": 0.35, "totals": 0.6, "run_scale": 1.0}
+    These are logit-space weights applied to the normalized starter_edge /
+    combined run-suppression features from mlb_starters.py. Returns {} when
+    none configured (→ analyzers apply no adjustment). Failures are silent.
+
+    NOTE: default weights are conservative priors; they should be re-fit from
+    graded outcomes via backtest, like market_blend / prob_shrink.
+    """
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("starter_adjustment", {})
+
+
+def save_starter_adjustment(sport_key, adj, meta=None):
+    """Persist starter-adjustment weights, preserving other calibration blocks."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["starter_adjustment"] = adj
+    if meta:
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            blob["meta"]["starter_adjustment"] = meta
+        else:
+            blob["meta"] = {"starter_adjustment": meta}
+    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
 def load_prob_shrink(sport_key):
     """
     Load per-market probability-shrink factors for team markets, e.g.:
-        {"spreads": 0.25, "totals": 0.0}
+        {"spreads": 0.6, "totals": 0.5}
     A factor s pulls the model probability toward 0.5: p' = 0.5 + s*(p-0.5),
     correcting overconfidence. Returns {} (→ analyzers use 1.0 = no shrink) if
     none configured. Failures are silent.
@@ -98,16 +192,22 @@ def load_prob_shrink(sport_key):
     return _load_blob(sport_key).get("prob_shrink", {})
 
 
-def save_calibration(sport_key, props_cfg, meta=None):
-    """Persist a calibration blob; creates calibration/ if needed."""
+def save_prob_shrink(sport_key, shrink, meta=None):
+    """
+    Persist per-market probability-shrink factors into calibration/<sport>.json,
+    preserving the existing 'props' and 'market_blend' blocks.
+    """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = {
-        "sport_key": sport_key,
-        "fit_timestamp": datetime.utcnow().isoformat() + "Z",
-        "props": props_cfg,
-    }
+    blob = _load_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["prob_shrink"] = shrink
     if meta:
-        blob["meta"] = meta
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            blob["meta"]["prob_shrink"] = meta
+        else:
+            blob["meta"] = {"prob_shrink": meta}
     with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 

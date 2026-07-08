@@ -645,6 +645,7 @@ PROP_STAT_MAP = {
     "pitcher_strikeouts": ["K", "SO"],
     "pitcher_outs": ["IP"],  # innings pitched * 3 = outs
     "batter_strikeouts": ["K", "SO"],
+    "pitcher_earned_runs": ["ER"],
 }
 
 
@@ -690,7 +691,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
 
     # For MLB pitchers, the gamelog endpoint returns empty.
     # Fall back to the splits-based pitcher stats.
-    is_pitcher_prop = prop_key in ("pitcher_strikeouts", "pitcher_outs")
+    is_pitcher_prop = prop_key in ("pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs")
     if not gamelog and sport == "baseball":
         gamelog = get_pitcher_stats(league, athlete["id"])
         # Also try for batter props if gamelog was empty (unlikely but safe)

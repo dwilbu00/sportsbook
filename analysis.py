@@ -7,7 +7,12 @@ import heapq
 import math
 import random
 
-from odds_client import PROP_LABELS, american_to_decimal
+from odds_client import (
+    PROP_LABELS,
+    american_to_decimal,
+    american_to_implied_prob,
+    devig_two_way,
+)
 
 
 def _decimal_to_american(decimal_odds):
@@ -30,22 +35,114 @@ def _consensus_price_for_line(items, line, line_key):
     return sorted_prices[len(sorted_prices) // 2]
 from calibration_loader import (
     load_calibration,
+    load_market_blend,
     load_prob_shrink,
+    load_starter_adjustment,
     apply_calibration_with_warmup,
     count_current_season_games,
+)
+from prop_filter import filter_player_gamelog
+from recalibration import (
+    load_recalibration,
+    apply_platt,
+    log_prediction,
+    maybe_auto_refit,
 )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Probability-shrink calibration (fitted offline by backtest.py --mode odds
-#  --engine live --write-calibration). Corrects model overconfidence on team
-#  spread/total markets by pulling probabilities toward 0.5.
+#  Model⇄market blend weights (fitted offline by backtest.py --mode odds)
 # ──────────────────────────────────────────────────────────────────────────────
+_MARKET_BLEND_CACHE = {}
 _PROB_SHRINK_CACHE = {}
+_STARTER_ADJ_CACHE = {}
+
+# Conservative default starter/opponent adjustment weights. Used only when no
+# calibrated block exists. Documented PRIORS to be re-fit from graded outcomes.
+#   moneyline : logit multiplier on starter_edge      (Phase 1)
+#   spreads   : runs of margin per unit starter_edge    (Phase 1)
+#   totals    : logit multiplier on run-shift          (Phase 1)
+#   run_scale : runs suppressed per unit starter excess (Phase 1)
+#   props     : fraction of the raw matchup multiplier applied to props (Phase 2)
+#   bullpen   : runs per unit combined bullpen excess   (Phase 3)
+#   bvp       : batter-vs-pitcher prior weight          (Phase 4, default OFF)
+_STARTER_ADJ_DEFAULTS = {
+    "moneyline": 0.35, "spreads": 0.0, "totals": 0.6, "run_scale": 1.0,
+    "props": 0.5, "bullpen": 0.5, "bvp": 0.0,
+}
+
+# MLB league baselines used as log5-style denominators for the props matchup
+# multiplier. Priors (not fitted); refresh occasionally.
+_MLB_LEAGUE = {"k_pct": 0.222, "ops": 0.711, "pitcher_xwoba": 0.315}
+
+
+def _mlb_prop_matchup_mult(prop_key, upcoming_is_home, matchup_features, weight):
+    """
+    Bounded projection multiplier for an MLB player prop based on the
+    starter/opponent matchup (Phase 2). 1.0 = no change.
+
+    Pitcher props scale by the OPPOSING lineup's quality vs the starter's hand;
+    batter props scale by the OPPOSING starter's quality. `weight` (0..1) is the
+    calibratable fraction of the raw log5-style ratio to apply.
+    """
+    if not matchup_features or upcoming_is_home is None or not weight:
+        return 1.0
+    side = "home" if upcoming_is_home else "away"
+    opp_side = "away" if upcoming_is_home else "home"
+    raw = 1.0
+
+    if prop_key in ("pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs"):
+        sd = matchup_features.get(side) or {}
+        opp = sd.get("opp_offense_vs_hand")
+        if not opp:
+            return 1.0
+        if prop_key == "pitcher_strikeouts" and opp.get("k_pct"):
+            raw = opp["k_pct"] / _MLB_LEAGUE["k_pct"]           # whiff-prone lineup → more Ks
+        elif opp.get("ops"):
+            r = opp["ops"] / _MLB_LEAGUE["ops"]
+            # Better opposing offense → more earned runs, fewer outs recorded.
+            raw = r if prop_key == "pitcher_earned_runs" else (2.0 - r)
+    elif prop_key in ("batter_hits", "batter_strikeouts"):
+        opp_sd = matchup_features.get(opp_side) or {}
+        stp = opp_sd.get("starter")
+        if not stp:
+            return 1.0
+        if prop_key == "batter_hits" and stp.get("xwoba"):
+            raw = stp["xwoba"] / _MLB_LEAGUE["pitcher_xwoba"]   # tough P (low xwOBA) → fewer hits
+        elif prop_key == "batter_strikeouts" and stp.get("k_pct"):
+            raw = stp["k_pct"] / _MLB_LEAGUE["k_pct"]           # high-K pitcher → more batter Ks
+
+    mult = 1.0 + weight * (raw - 1.0)
+    return max(0.7, min(1.4, mult))
+
+
+def _starter_adjustment(sport_key, key):
+    """Return the calibrated (or default-prior) starter-adjustment weight for
+    `key` in ('moneyline','spreads','totals','run_scale','bullpen','props').
+    Returns 0.0 when disabled."""
+    if not sport_key:
+        return 0.0
+    if sport_key not in _STARTER_ADJ_CACHE:
+        try:
+            _STARTER_ADJ_CACHE[sport_key] = load_starter_adjustment(sport_key) or {}
+        except Exception:
+            _STARTER_ADJ_CACHE[sport_key] = {}
+    cfg = _STARTER_ADJ_CACHE[sport_key]
+    val = cfg.get(key, _STARTER_ADJ_DEFAULTS.get(key, 0.0) if cfg.get("enabled", True) else 0.0)
+    return val if isinstance(val, (int, float)) else 0.0
+
+
+def _apply_starter_logit(p, edge, weight):
+    """Shift probability p in logit space by weight*edge, bounded to [.02,.98].
+    edge>0 favors the team; weight is the (calibratable) logit multiplier."""
+    if not weight or edge is None or p <= 0 or p >= 1:
+        return p
+    lg = math.log(p / (1 - p)) + weight * edge
+    return max(0.02, min(0.98, 1.0 / (1.0 + math.exp(-lg))))
 
 
 def _shrink_factor(sport_key, market):
-    """Return the probability-shrink factor s in [0,1] for a team `market`
+    """Return the probability-shrink factor s in (0,1] for a team `market`
     ('spreads'/'totals'). p' = 0.5 + s*(p-0.5) corrects model overconfidence.
     Defaults to 1.0 (no shrink) when none is calibrated."""
     if not sport_key:
@@ -63,13 +160,27 @@ def _apply_shrink(p, sport_key, market):
     """Pull probability p toward 0.5 by the calibrated shrink factor."""
     s = _shrink_factor(sport_key, market)
     return 0.5 + s * (p - 0.5) if s != 1.0 else p
-from prop_filter import filter_player_gamelog
-from recalibration import (
-    load_recalibration,
-    apply_platt,
-    log_prediction,
-    maybe_auto_refit,
-)
+
+
+def _blend_weight(sport_key, market):
+    """
+    Return the model weight w in [0,1] for blending the model probability with
+    the de-vigged market probability for `market` ('moneyline'/'spreads'/
+    'totals'). Defaults to 1.0 (pure model = original behavior) when no
+    calibrated weight exists.
+    """
+    if not sport_key:
+        return 1.0
+    if sport_key not in _MARKET_BLEND_CACHE:
+        try:
+            _MARKET_BLEND_CACHE[sport_key] = load_market_blend(sport_key) or {}
+        except Exception:
+            _MARKET_BLEND_CACHE[sport_key] = {}
+    cfg = _MARKET_BLEND_CACHE[sport_key].get(market)
+    if not cfg:
+        return 1.0
+    w = cfg.get("w")
+    return w if isinstance(w, (int, float)) and 0.0 <= w <= 1.0 else 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -505,7 +616,7 @@ def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed, streng
     return 1.0 + strength * (bounded - 1.0)
 
 
-def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None):
+def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare moneyline implied probabilities against historical win rates.
 
@@ -524,6 +635,15 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
 
     home_team = game_odds["home_team"]
     away_team = game_odds["away_team"]
+
+    # Consensus implied probability per team (used for de-vigging the market
+    # when blending the model toward the closing line).
+    avg_implied_by_team = {}
+    for tn in (home_team, away_team):
+        lst = game_odds["moneyline"].get(tn, [])
+        if lst:
+            avg_implied_by_team[tn] = sum(o["implied_prob"] for o in lst) / len(lst)
+    blend_w = _blend_weight(sport_key, "moneyline")
 
     for team_name, stats in [(home_team, home_team_stats), (away_team, away_team_stats)]:
         ml_odds = game_odds["moneyline"].get(team_name, [])
@@ -569,11 +689,31 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
         # Weight recent form more heavily (60/40)
         hist_prob = (0.4 * season_wp) + (0.6 * recent_wp)
 
-        edge = hist_prob - avg_implied
+        # Phase 1: nudge the model probability by the starter/opponent edge
+        # (probable SP quality via xERA + opposing lineup vs handedness).
+        # starter_edge is home-favorable when positive; flip sign for the away
+        # team. Weight is calibratable (default = conservative prior).
+        if matchup_features and matchup_features.get("starter_edge") is not None:
+            sa_w = _starter_adjustment(sport_key, "moneyline")
+            sign = 1.0 if team_name == home_team else -1.0
+            hist_prob = _apply_starter_logit(
+                hist_prob, sign * matchup_features["starter_edge"], sa_w)
+
+        # Blend the model probability toward the de-vigged market closing line
+        # using the offline-fitted weight (w=1.0 → pure model = original).
+        final_prob = hist_prob
+        opp = away_team if team_name == home_team else home_team
+        if (blend_w < 1.0 and team_name in avg_implied_by_team
+                and opp in avg_implied_by_team):
+            fair_team, _ = devig_two_way(avg_implied_by_team[team_name],
+                                         avg_implied_by_team[opp])
+            final_prob = blend_w * hist_prob + (1.0 - blend_w) * fair_team
+
+        edge = final_prob - avg_implied
 
         best_odds = max(ml_odds, key=lambda o: o["implied_prob"] if o["price"] > 0 else -o["price"])
         worst_book_prob = min(o["implied_prob"] for o in ml_odds)
-        best_edge = hist_prob - worst_book_prob
+        best_edge = final_prob - worst_book_prob
 
         result = {
             "type": "moneyline",
@@ -584,6 +724,7 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "season_win_pct": round(season_wp * 100, 2),
             "recent_win_pct": round(recent_wp * 100, 2),
             "hist_prob": round(hist_prob * 100, 2),
+            "blended_prob": round(final_prob * 100, 2),
             "edge_pct": round(edge * 100, 2),
             "best_edge_pct": round(best_edge * 100, 2),
             "best_book": min(ml_odds, key=lambda o: o["implied_prob"])["book"],
@@ -595,8 +736,7 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
     return candidates
 
 
-def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0,
-                         sport_key=None, safe_mode=False, safe_target=0.95):
+def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare over/under lines against historical scoring averages.
 
@@ -605,12 +745,6 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         home_team_stats (dict): Home team stats
         away_team_stats (dict): Away team stats
         threshold_pct (float): Minimum edge to flag
-        safe_mode (bool): When True, also compute a "safe" OVER alt-line
-            threshold (mirrors the player-prop safe-mode workflow). The
-            suggested alt line is the largest half-point line at which the
-            parametric model + empirical history both clear `safe_target`.
-        safe_target (float): Target hit-rate (0–1) for the safe OVER
-            threshold (default 0.95).
 
     Returns:
         list: Value candidates for over/under
@@ -665,14 +799,32 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     projected_from_defense = home_avg_allowed + away_avg_allowed
     projected_total = (projected_from_offense + projected_from_defense) / 2
 
+    # Phase 1: shift the projected total by combined starter quality. Better
+    # probable starters (run_suppression > 1 via xERA) suppress scoring, so a
+    # strong pair pulls the total down (and vice versa). run_scale = runs
+    # suppressed per unit of combined excess (calibratable prior).
+    starter_total_shift = 0.0
+    if matchup_features:
+        excess = 0.0            # combined starter run-suppression excess
+        bullpen_excess = 0.0    # combined bullpen run-suppression excess (Phase 3)
+        for side in ("home", "away"):
+            sd = matchup_features.get(side)
+            if not sd:
+                continue
+            if sd.get("starter"):
+                excess += (sd["starter"].get("run_suppression", 1.0) - 1.0)
+            if sd.get("bullpen"):
+                bullpen_excess += (sd["bullpen"].get("bullpen_suppression", 1.0) - 1.0)
+        run_scale = _starter_adjustment(sport_key, "run_scale")
+        bullpen_w = _starter_adjustment(sport_key, "bullpen")
+        # Better arms (suppression > 1) pull the projected total DOWN.
+        starter_total_shift = -(run_scale * excess) - (bullpen_w * bullpen_excess)
+        projected_total += starter_total_shift
+
     # Determine over/under probability from historical games (recency-,
     # opponent-strength-, and venue-match-weighted across both teams).
-    # Also capture the flat list of (total_score, weight) tuples so safe-mode
-    # can compute weighted std + empirical hit rates at alt thresholds.
     over_weight = 0.0
     total_weight = 0.0
-    total_values = []
-    total_weights = []
     for team_name, stats, upcoming_is_home in [
         (home_team, home_team_stats, True),
         (away_team, away_team_stats, False),
@@ -690,14 +842,17 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                 past_h = None
             w = bw * _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
             total_weight += w
-            total_values.append(g["total_score"])
-            total_weights.append(w)
             if g["total_score"] > consensus_line:
                 over_weight += w
 
-    over_hit_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
-    # Calibrated overconfidence correction: pull toward 0.5 (no-op when unset).
-    over_hit_rate = _apply_shrink(over_hit_rate, sport_key, "totals")
+    model_over_hit_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
+
+    # Phase 1: nudge the over probability the same direction as the starter
+    # total shift (strong starters → lower over rate). Logit-space, calibratable.
+    if matchup_features and starter_total_shift != 0.0:
+        model_over_hit_rate = _apply_starter_logit(
+            model_over_hit_rate, starter_total_shift,
+            _starter_adjustment(sport_key, "totals"))
 
     diff = projected_total - consensus_line
 
@@ -705,12 +860,24 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
     under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
 
-    candidate = {
+    # Blend the model over-rate toward the de-vigged market over probability
+    # using the offline-fitted weight (w=1.0 → pure model = original).
+    # Calibrated overconfidence correction: pull the model probability toward
+    # 0.5 before any market blend (no-op when no shrink is configured).
+    over_hit_rate = _apply_shrink(model_over_hit_rate, sport_key, "totals")
+    blend_w = _blend_weight(sport_key, "totals")
+    if blend_w < 1.0 and over_price is not None and under_price is not None:
+        fair_over, _ = devig_two_way(american_to_implied_prob(over_price),
+                                     american_to_implied_prob(under_price))
+        over_hit_rate = blend_w * over_hit_rate + (1.0 - blend_w) * fair_over
+
+    candidates.append({
         "type": "total_over",
         "matchup": f"{game_odds['away_team']} @ {game_odds['home_team']}",
         "line": consensus_line,
         "projected_total": round(projected_total, 2),
         "diff_from_line": round(diff, 2),
+        "model_over_hit_rate": round(model_over_hit_rate * 100, 2),
         "over_hit_rate": round(over_hit_rate * 100, 2),
         "home_avg_scored": round(home_avg_scored, 2),
         "away_avg_scored": round(away_avg_scored, 2),
@@ -718,76 +885,12 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         "is_under_value": diff < 0 and (1 - over_hit_rate) > 0.5 + threshold,
         "over_price": over_price,
         "under_price": under_price,
-        "games_sampled": len(total_values),
-    }
-
-    # ── Safe-mode OVER alt-line suggestion ──
-    # Mirrors the player-prop safe-mode workflow: derive the largest
-    # half-point line at which the parametric Normal lower bound clears
-    # `safe_target`, then bump up empirically while the recent-history
-    # hit-rate also clears it. The UI / alt-line fetcher then looks up
-    # the real DK OVER price at that line.
-    if safe_mode and total_values and len(total_values) >= 2:
-        mean = _weighted_mean(total_values, total_weights)
-        std = _weighted_std(total_values, total_weights, mean=mean)
-        z = _normal_inv_cdf(safe_target)
-        alt_q = mean - z * std
-        # DK total alts run on .5 increments. Round DOWN to the nearest .5
-        # so the OVER threshold sits below the parametric floor.
-        safe_threshold = math.floor(alt_q * 2.0) / 2.0
-
-        # Empirical refinement: bump up by .5 while the recent-history hit
-        # rate at the next half-point still clears safe_target.
-        def _hit_rate(line):
-            return _weighted_rate(total_values, total_weights,
-                                  lambda v, t=line: v > t)
-
-        p_at_safe = _hit_rate(safe_threshold)
-        while True:
-            next_t = safe_threshold + 0.5
-            p_next = _hit_rate(next_t)
-            if p_next >= safe_target:
-                safe_threshold = next_t
-                p_at_safe = p_next
-            else:
-                break
-
-        model_hit_at_line = _hit_rate(consensus_line)
-        line_gap = consensus_line - safe_threshold  # positive = below book line
-        bettable_at_standard_line = consensus_line <= safe_threshold
-        model_delta = p_at_safe - model_hit_at_line
-
-        # Sanity guards:
-        #   - Drop if recent-history hit rate at the suggested line falls
-        #     more than 5pp below the user's confidence target.
-        #   - Drop absurdly low suggestions (>25% below the book line) —
-        #     DK won't list them and the parametric floor is unreliable at
-        #     that range anyway.
-        ok = (p_at_safe >= (safe_target - 0.05)
-              and safe_threshold > 0
-              and (consensus_line <= 0 or safe_threshold >= consensus_line * 0.75))
-
-        if ok:
-            candidate.update({
-                "safe_mode": True,
-                "safe_target": safe_target,
-                "safe_threshold": safe_threshold,
-                "safe_alt_q": round(alt_q, 2),
-                "model_hit_at_safe": round(p_at_safe * 100, 2),
-                "model_hit_at_line": round(model_hit_at_line * 100, 2),
-                "model_delta": round(model_delta * 100, 2),
-                "line_gap": round(line_gap, 2),
-                "bettable_at_standard_line": bettable_at_standard_line,
-                "_values": list(total_values),
-                "_weights": list(total_weights),
-            })
-
-    candidates.append(candidate)
+    })
 
     return candidates
 
 
-def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None):
+def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare spread lines against historical scoring margins, using a JOINT
     distribution of the predicted game margin (home perspective).
@@ -865,6 +968,13 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         return []
 
     pred_margin = home_stats["mean"] - away_stats["mean"]
+    # Phase 1: shift the predicted margin by the (innings-weighted) starter
+    # edge. Positive edge = home's effective run-prevention is better, so the
+    # home margin rises. `spreads` weight = runs of margin per unit edge
+    # (calibratable; 0 = original starter-blind behavior).
+    if matchup_features and matchup_features.get("starter_edge") is not None:
+        pred_margin += (_starter_adjustment(sport_key, "spreads")
+                        * matchup_features["starter_edge"])
     # Floor each team's std at 1.0 point to avoid degenerate certainty when a
     # team has very few recent games or unusually flat margins.
     home_var = max(home_stats["std"], 1.0) ** 2
@@ -875,9 +985,31 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
     candidates = []
     games_sampled = min(len(home_stats["margins"]), len(away_stats["margins"]))
 
-    def _add_candidate(team_name, opponent, is_home, spread, cover_prob, team_avg_margin, price):
-        # Calibrated overconfidence correction: pull toward 0.5 (no-op when unset).
-        cover_prob = _apply_shrink(cover_prob, sport_key, "spreads")
+    home_price = _consensus_price_for_line(
+        game_odds["spreads"].get(home_team, []), home_spread, "spread") \
+        if home_spread is not None else None
+    away_price = _consensus_price_for_line(
+        game_odds["spreads"].get(away_team, []), away_spread, "spread") \
+        if away_spread is not None else None
+
+    # De-vigged market P(home covers), used to blend the model toward the line.
+    blend_w = _blend_weight(sport_key, "spreads")
+    market_home_cover = None
+    if blend_w < 1.0 and home_price is not None and away_price is not None:
+        market_home_cover, _ = devig_two_way(
+            american_to_implied_prob(home_price),
+            american_to_implied_prob(away_price))
+
+    def _blend(model_cover, market_cover):
+        # Calibrated overconfidence correction first (no-op when unset), then
+        # the optional model⇄market blend.
+        shrunk = _apply_shrink(model_cover, sport_key, "spreads")
+        if market_cover is None:
+            return shrunk
+        return blend_w * shrunk + (1.0 - blend_w) * market_cover
+
+    def _add_candidate(team_name, opponent, is_home, spread, model_cover,
+                       cover_prob, team_avg_margin, price):
         edge = cover_prob - 0.50
         candidates.append({
             "type": "spread",
@@ -886,6 +1018,7 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             "home_away": "HOME" if is_home else "AWAY",
             "spread": spread,
             "avg_margin": round(team_avg_margin, 2),
+            "model_cover_rate": round(model_cover * 100, 2),
             "cover_rate": round(cover_prob * 100, 2),
             "games_sampled": games_sampled,
             "edge_pct": round(edge * 100, 2),
@@ -899,18 +1032,18 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         # Home covers iff actual_margin + home_spread > 0  ⇔  margin > -home_spread.
         # P(margin > -home_spread) = Φ((pred_margin + home_spread) / pred_std)
         home_cover_prob = _norm_cdf((pred_margin + home_spread) / pred_std)
-        home_price = _consensus_price_for_line(
-            game_odds["spreads"].get(home_team, []), home_spread, "spread")
-        _add_candidate(home_team, away_team, True, home_spread,
-                       home_cover_prob, home_stats["mean"], home_price)
+        _add_candidate(home_team, away_team, True, home_spread, home_cover_prob,
+                       _blend(home_cover_prob, market_home_cover),
+                       home_stats["mean"], home_price)
     if away_spread is not None:
         # Away covers iff -actual_margin + away_spread > 0  ⇔  margin < away_spread.
         # P(margin < away_spread) = Φ((away_spread - pred_margin) / pred_std)
         away_cover_prob = _norm_cdf((away_spread - pred_margin) / pred_std)
-        away_price = _consensus_price_for_line(
-            game_odds["spreads"].get(away_team, []), away_spread, "spread")
-        _add_candidate(away_team, home_team, False, away_spread,
-                       away_cover_prob, away_stats["mean"], away_price)
+        market_away_cover = (1.0 - market_home_cover
+                             if market_home_cover is not None else None)
+        _add_candidate(away_team, home_team, False, away_spread, away_cover_prob,
+                       _blend(away_cover_prob, market_away_cover),
+                       away_stats["mean"], away_price)
 
     return candidates
 
@@ -986,7 +1119,7 @@ def format_spreads_report(candidates):
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
-                               team_schedules=None):
+                               team_schedules=None, matchup_features=None):
     """
     Compare player prop lines against historical stat values from ESPN.
 
@@ -1200,11 +1333,22 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 eff_n = sum(weights) if weights else 0.0
                 if eff_n + shrinkage_k > 0:
                     base_proj = ((eff_n * base_proj) + (shrinkage_k * unweighted_mean)) / (eff_n + shrinkage_k)
-            avg_stat = base_proj * output_def_mult
+            # ── MLB starter/opponent matchup multiplier (Phase 2) ──
+            # Scales the projection by the log5-style matchup (opposing lineup
+            # for pitcher props; opposing starter for batter props). No-op for
+            # other sports or when features/weight are absent.
+            matchup_mult = 1.0
+            if sport_key == "baseball_mlb" and matchup_features:
+                matchup_mult = _mlb_prop_matchup_mult(
+                    prop_key, upcoming_is_home, matchup_features,
+                    _starter_adjustment(sport_key, "props"))
+            combined_mult = output_def_mult * matchup_mult
+
+            avg_stat = base_proj * combined_mult
             # When the projection is scaled, the over-rate calc shifts the
             # comparison line by the inverse so historical frequencies are
             # interpreted in the projection's adjusted frame.
-            effective_line = line / output_def_mult if output_def_mult else line
+            effective_line = line / combined_mult if combined_mult else line
             empirical_over = _weighted_rate(values, weights, lambda v: v > effective_line)
             over_rate = empirical_over
 
@@ -1253,9 +1397,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     continue
                 proj_mean = avg_stat  # already shrunk + def-adjusted
                 wstd = _weighted_std(values, weights, mean=base_proj)
-                # Scale std by the same output-defense factor so the spread
-                # is in the same frame as the projection.
-                wstd_adj = wstd * (output_def_mult if output_def_mult else 1.0)
+                # Scale std by the same projection factor (output-defense ×
+                # MLB matchup) so the spread is in the projection's frame.
+                wstd_adj = wstd * (combined_mult if combined_mult else 1.0)
                 z = _normal_inv_cdf(safe_target)
                 alt_q = proj_mean - z * wstd_adj
 

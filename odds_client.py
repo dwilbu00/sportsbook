@@ -7,6 +7,7 @@ Includes file-based caching to avoid redundant API calls.
 import hashlib
 import json
 import os
+import random
 import time
 
 import requests
@@ -74,6 +75,43 @@ def _write_cache(cache_path, data):
         json.dump({"cached_at": time.time(), "data": data}, f)
 
 
+def _get_with_retry(url, params, timeout=30, max_retries=5, backoff_base=1.5):
+    """
+    GET a URL with automatic retry + exponential backoff on rate-limit (429)
+    and transient server (5xx) errors.
+
+    When many events are analyzed at once the concurrent requests can trip The
+    Odds API rate limiter (HTTP 429). Rather than failing the whole analysis,
+    we back off and retry the individual request, which also self-throttles the
+    burst of parallel calls.
+
+    Returns the final ``requests.Response`` (the caller should still invoke
+    ``raise_for_status()`` so existing error handling / cache fallbacks run).
+    """
+    resp = None
+    for attempt in range(max_retries + 1):
+        resp = requests.get(url, params=params, timeout=timeout)
+        is_retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
+        if is_retryable and attempt < max_retries:
+            # Honor the server's Retry-After hint when present, otherwise use
+            # exponential backoff with a little jitter to de-sync parallel calls.
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else (
+                    backoff_base ** attempt + random.uniform(0, 0.5)
+                )
+            except (TypeError, ValueError):
+                delay = backoff_base ** attempt + random.uniform(0, 0.5)
+            print(
+                f"  [Odds API] HTTP {resp.status_code} — retrying in "
+                f"{delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(delay)
+            continue
+        return resp
+    return resp
+
+
 def get_upcoming_events(api_key, sport):
     """
     Fetch upcoming events for a sport (FREE - no credit cost).
@@ -91,7 +129,7 @@ def get_upcoming_events(api_key, sport):
     url = f"{BASE_URL}/sports/{sport}/events"
     params = {"apiKey": api_key}
 
-    resp = requests.get(url, params=params, timeout=30)
+    resp = _get_with_retry(url, params)
     resp.raise_for_status()
 
     global _remaining_credits
@@ -139,7 +177,7 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h", bookma
         params["bookmakers"] = ",".join(bookmakers)
 
     try:
-        resp = requests.get(url, params=params, timeout=30)
+        resp = _get_with_retry(url, params)
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
         # Fall back to expired cache if credits exhausted (401/429)
@@ -193,7 +231,7 @@ def get_upcoming_odds(api_key, sport, regions="us", markets="h2h,spreads,totals"
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
 
-    resp = requests.get(url, params=params, timeout=30)
+    resp = _get_with_retry(url, params)
     resp.raise_for_status()
 
     global _remaining_credits
@@ -205,6 +243,200 @@ def get_upcoming_odds(api_key, sport, regions="us", markets="h2h,spreads,totals"
     data = resp.json()
     _write_cache(cache_path, data)
     return data
+
+
+# ─── Historical odds (paid plan) ──────────────────────────────────────────
+#
+# Historical snapshots are IMMUTABLE — the odds at a past timestamp never
+# change — so they are cached permanently (no TTL) rather than for 1 hour.
+# Cost: events = 1 credit; odds/event-odds = 10 x markets x regions.
+# The response is wrapped in {timestamp, previous_timestamp, next_timestamp,
+# data}; we unwrap `data` so the existing parse_* helpers work unchanged, and
+# return the snapshot timestamp alongside it.
+
+HISTORICAL_BASE_URL = f"{BASE_URL}/historical"
+
+
+def _normalize_snapshot_date(date):
+    """
+    Coerce a timestamp to the full ISO8601 form the historical API requires
+    (YYYY-MM-DDTHH:MM:SSZ). ESPN commence times omit seconds (e.g.
+    '2026-06-28T00:40Z'), which the API rejects with HTTP 422. Returns the
+    input unchanged if it doesn't look like a date-time.
+    """
+    import re
+    if not date:
+        return date
+    d = date.strip()
+    if d.endswith("Z"):
+        d = d[:-1]
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?", d)
+    if not m:
+        return date
+    return f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4) or '00'}Z"
+
+
+def _read_cache_permanent(cache_path):
+    """Read cached data with no expiry. Used for immutable historical snapshots."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r") as f:
+            cached = json.load(f)
+        return cached.get("data")
+    except (json.JSONDecodeError, KeyError, OSError):
+        return None
+
+
+def _update_credits_from_headers(resp, label):
+    """Record remaining credits and print the cost of the last call."""
+    global _remaining_credits
+    cost = resp.headers.get("x-requests-last", "?")
+    remaining = resp.headers.get("x-requests-remaining", "?")
+    if remaining != "?":
+        _remaining_credits = int(remaining)
+    print(f"  [Odds API] {label} cost: {cost} credit(s). Remaining: {remaining}")
+
+
+def get_historical_events(api_key, sport, date, regions=None):
+    """
+    List events as they appeared at a past timestamp (cost: 1 credit).
+    Use this to discover historical event IDs for get_historical_event_odds().
+
+    Parameters:
+        date (str): ISO8601 snapshot timestamp, e.g. '2023-11-29T22:45:00Z'.
+                    The API returns the closest snapshot at or before `date`.
+
+    Returns:
+        tuple: (events_list, snapshot_timestamp). Empty list if none found.
+    """
+    date = _normalize_snapshot_date(date)
+    cache_path = _cache_key("hist_events", sport, date)
+    cached = _read_cache_permanent(cache_path)
+    if cached is not None:
+        return cached.get("data", []), cached.get("timestamp")
+
+    url = f"{HISTORICAL_BASE_URL}/sports/{sport}/events"
+    params = {"apiKey": api_key, "date": date}
+
+    resp = _get_with_retry(url, params)
+    resp.raise_for_status()
+    _update_credits_from_headers(resp, "Historical events")
+
+    body = resp.json()
+    snapshot = {"data": body.get("data", []), "timestamp": body.get("timestamp")}
+    _write_cache(cache_path, snapshot)
+    return snapshot["data"], snapshot["timestamp"]
+
+
+def get_historical_odds(api_key, sport, date, regions="us",
+                        markets="h2h,spreads,totals", bookmakers=None):
+    """
+    Fetch a featured-market (h2h/spreads/totals) odds snapshot at a past
+    timestamp. Cost: 10 x markets x regions.
+
+    To approximate the CLOSING LINE, pass date = the game's commence_time;
+    the API returns the latest snapshot at or before that moment.
+
+    Returns:
+        tuple: (games_list, snapshot_timestamp). Each game matches the live
+               /odds schema, so parse_game_odds() works unchanged.
+    """
+    date = _normalize_snapshot_date(date)
+    books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
+    cache_path = _cache_key("hist_odds", sport, date, regions, markets, books_key)
+    cached = _read_cache_permanent(cache_path)
+    if cached is not None:
+        return cached.get("data", []), cached.get("timestamp")
+
+    url = f"{HISTORICAL_BASE_URL}/sports/{sport}/odds"
+    params = {
+        "apiKey": api_key,
+        "date": date,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": "american",
+    }
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)
+
+    resp = _get_with_retry(url, params)
+    resp.raise_for_status()
+    _update_credits_from_headers(resp, "Historical odds")
+
+    body = resp.json()
+    snapshot = {"data": body.get("data", []), "timestamp": body.get("timestamp")}
+    _write_cache(cache_path, snapshot)
+    return snapshot["data"], snapshot["timestamp"]
+
+
+def get_historical_event_odds(api_key, sport, event_id, date, regions="us",
+                              markets="h2h", bookmakers=None):
+    """
+    Fetch a single event's odds snapshot at a past timestamp, including
+    additional markets (player props, alternate lines). Available for
+    additional markets after 2023-05-03. Cost: 10 x markets x regions.
+
+    Returns:
+        tuple: (game_dict_or_None, snapshot_timestamp). The game dict matches
+               the live event-odds schema, so parse_player_props() and
+               parse_game_odds() work unchanged. Returns (None, None) if the
+               event had expired (HTTP 404) at the requested timestamp.
+    """
+    date = _normalize_snapshot_date(date)
+    books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
+    cache_path = _cache_key("hist_event_odds", sport, event_id, date, regions,
+                            markets, books_key)
+    cached = _read_cache_permanent(cache_path)
+    if cached is not None:
+        return cached.get("data"), cached.get("timestamp")
+
+    url = f"{HISTORICAL_BASE_URL}/sports/{sport}/events/{event_id}/odds"
+    params = {
+        "apiKey": api_key,
+        "date": date,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": "american",
+    }
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)
+
+    try:
+        resp = _get_with_retry(url, params)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        # Event had expired (completed/cancelled) at this timestamp.
+        if resp.status_code == 404:
+            snapshot = {"data": None, "timestamp": None}
+            _write_cache(cache_path, snapshot)
+            return None, None
+        raise
+
+    _update_credits_from_headers(resp, "Historical event odds")
+
+    body = resp.json()
+    snapshot = {"data": body.get("data"), "timestamp": body.get("timestamp")}
+    _write_cache(cache_path, snapshot)
+    return snapshot["data"], snapshot["timestamp"]
+
+
+def devig_two_way(implied_a, implied_b):
+    """
+    Remove the bookmaker margin (vig) from a two-outcome market by normalizing
+    the raw implied probabilities so they sum to 1.
+
+    The live american_to_implied_prob() keeps the vig in, so raw two-sided
+    probabilities sum to >1 and any edge computed against them is biased low.
+    Use this to turn closing-line prices into a true market probability.
+
+    Returns:
+        tuple: (fair_prob_a, fair_prob_b). Returns (0.5, 0.5) on degenerate input.
+    """
+    total = implied_a + implied_b
+    if total <= 0:
+        return 0.5, 0.5
+    return implied_a / total, implied_b / total
 
 
 def get_remaining_credits():
@@ -325,7 +557,7 @@ def consensus_odds(team_odds_list):
 PLAYER_PROPS_BY_SPORT = {
     "basketball_nba": ["player_points", "player_assists", "player_rebounds"],
     "americanfootball_nfl": ["player_anytime_td", "player_rush_yds", "player_pass_yds"],
-    "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts"],
+    "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts", "pitcher_earned_runs"],
 }
 
 # Mapping of standard player prop market keys → their alt-line market key on
@@ -364,6 +596,7 @@ PROP_LABELS = {
     "pitcher_strikeouts": "Pitcher Strikeouts",
     "pitcher_outs": "Pitcher Outs",
     "batter_strikeouts": "Batter Strikeouts",
+    "pitcher_earned_runs": "Pitcher Earned Runs",
 }
 
 
