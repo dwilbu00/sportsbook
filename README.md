@@ -1,67 +1,314 @@
 # 🎯 Sportsbook Value Finder
 
-Compare sportsbook odds against historical ESPN statistics to find value betting opportunities — with a model that's careful about what it claims.
+Sportsbook Value Finder is a probability engine for finding mispriced sportsbook lines. It compares live odds against a layered forecasting model built from ESPN history, sportsbook market data, MLB Statcast-style expected metrics, NFL EPA, calibration files, and outcome feedback loops.
 
-## Features
-- **Moneyline, Spreads, Over/Under** analysis for NBA, NFL, and MLB
-- **Player Props** analysis (Points, Assists, Rebounds, TDs, Hits, Strikeouts, etc.)
-- **Safe Mode** — picks lower alt-lines the model believes will hit with high confidence
-- **Value & Safe Parlay Builder** that accounts for how legs move together (no double-counting correlated outcomes)
-- **Parallel processing** for fast multi-game analysis
-- **Credit-aware caching** to minimize API usage
-- **Self-learning calibration** — the model gets more accurate the more you use it
+Use the live application here: **https://sbvaluefinder.streamlit.app/**
 
-## How the model thinks (in plain English)
+This is **not** a simple “last 5 games average” app. The model now uses a full stack of statistical tools to estimate outcomes, correct its own bias, reject bad samples, and understand when legs in a parlay are mathematically connected.
 
-### 1. It only learns from "normal" games
-A star player having a 10-minute foul-out night or returning from injury is going to ruin a prediction. So the model **ignores** games that look unreliable:
-- Games where the player barely played (well below their usual minutes)
-- The game right before a multi-game absence (likely they got hurt mid-game)
-- Games during and right after a break in their schedule (injury, suspension, etc.)
-- The first game they played after returning from a break (still ramping up)
+```text
+Live odds + ESPN history + sport-specific advanced metrics
+        │
+        ▼
+Reliability filters → weighted projections → matchup adjustments
+        │
+        ▼
+Residual calibration + Platt recalibration + market blending
+        │
+        ▼
+Value bets, safe alt-lines, and correlation-aware parlays
+```
 
-On top of that, predictions are **paused** for a player until they've put together a solid streak of normal games (about 8 for NBA, 6 for MLB, 4 for NFL). No streak = no prediction. This eliminates the "I just bet $50 on a player who played 10 minutes" disasters.
+## What it analyzes
 
-### 2. It blends with last season early in a new season
-Early in a season we don't have enough current-year games to be confident. So the model **blends current-season data with last season's** until you have ~10 current-season games for the player. The weight shifts toward the current season as the year progresses, so by mid-season the prior year doesn't matter anymore.
+- **Moneyline, spread, and total markets** for NBA, NFL, and MLB
+- **Player props** across points, rebounds, assists, passing yards, rushing yards, touchdowns, pitcher strikeouts, pitcher outs, earned runs, batter hits, and more
+- **Alternate lines** for safer threshold-style props such as `8+ points` or `4+ strikeouts`
+- **Value parlays and safe parlays** using a joint-probability model instead of naïvely multiplying every leg together
+- **Live sportsbook prices** converted into implied probabilities, de-vigged where both sides are available
 
-### 3. It corrects for its own overconfidence (and keeps improving)
-A raw model that says "80% likely" often only hits 65% of the time in the real world. So we apply a **calibration correction** that's fit on actual past bets vs. actual outcomes. When the app says "75%", it really means ~75%.
+## The mathematical stack
 
-What makes this special: **the calibration updates automatically** as you use the app. Every prediction gets logged, every game's outcome eventually gets resolved against ESPN's stats, and every so often the calibration re-fits itself with the new data. The longer you use it, the sharper it gets.
+| Layer | What it does | Why it matters |
+|---|---|---|
+| Implied probability conversion | Converts American odds into decimal odds and book-implied probabilities | Puts every sportsbook line on the same probability scale |
+| De-vigging | Removes two-sided sportsbook hold from moneyline, spread, and total markets | Compares the model against a fairer market baseline instead of the book’s padded number |
+| Exponential recency weighting | Applies sport-specific half-lives so newer games matter more than older games | Captures current form without throwing away useful history |
+| Venue weighting | Up-weights past games played in the same home/away context | Accounts for home court, road splits, and venue-sensitive performance |
+| Weighted means, rates, variance, and quantiles | Computes projections, hit rates, volatility, and lower-bound alt-lines from weighted samples | Keeps all downstream probabilities tied to the same evidence base |
+| Bayesian shrinkage | Pulls noisy player projections back toward the broader season mean with pseudo-observations | Prevents small hot streaks from becoming overconfident predictions |
+| Normal probability models | Uses standard normal CDF / inverse CDF to turn projected margins and stat distributions into probabilities | Converts “projected by 3.2” into “covers 58.7% of the time” |
+| Empirical ECDF residuals | Uses observed residual distributions rather than assuming everything is perfectly normal | Handles skewed and fat-tailed player-stat behavior |
+| Brier-optimized probability shrink | Pulls team-market probabilities toward 50/50 when backtests show overconfidence | Makes confident outputs harder to earn |
+| Model-market blending | Blends the internal model with de-vigged market probability using fitted weights | Respects the wisdom of the market while still surfacing edges |
+| Platt scaling | Fits `sigmoid(a * logit(p_raw) + b)` on resolved predictions | Recalibrates raw model probabilities so “70%” means closer to 70% in practice |
+| Gaussian copula parlays | Estimates joint parlay hit probability with correlated Bernoulli legs | Avoids pretending related legs are independent |
+| Cholesky simulation | Builds positive-definite correlation matrices and Monte Carlo samples joint outcomes | Lets the parlay engine price interaction risk instead of ignoring it |
+| Chronological holdout backtests | Fits and scores using time-ordered historical observations | Reduces leakage and makes validation closer to live use |
 
-### 4. Safe Mode picks bets it can actually back up
-"Safe Mode" answers a different question: instead of "is this over/under a good bet?" it asks "what's an alt-line I'm 90% sure this player will clear?" Then it suggests something like "Steph Curry **8+ points**" when the book line is 27.5.
+## How predictions are built
 
-To avoid lying about confidence, Safe Mode has guards:
-- The historical hit rate at that suggested line must be within 5 points of the claimed confidence (so a "90% pick" really hit 85%+ historically).
-- It refuses to make a "high-confidence" claim when the bet collapses to "did the player do the thing at all?" (e.g., 1+ assist). Those low bars look safe but are actually noisy.
-- The suggested line has to be at least 50% of the book line (no useless "Wemby 2+ points" suggestions).
+### 1. Odds become fair probabilities
 
-### 5. Parlays know that some legs aren't independent
-Naive parlay math assumes each leg is a coin flip independent of the others. That's wrong: if LeBron has a huge game, both his points OVER and his teammate's rebounds OVER are more likely to hit together. We use a **correlation model** so the joint probability isn't artificially inflated.
+Every line starts as a sportsbook price. The app converts American odds into implied probability, then de-vigs two-sided markets when both sides are present.
 
-## What this gets you
-- **NBA points and rebounds** in Safe Mode hit their target within 1–3 points (e.g., 90% target → 91% actual).
-- **NBA assists** stays calibrated at 85–90% target after rejecting "1+" floor bets.
-- **MLB pitcher strikeouts** uses a fallback data source when ESPN's main gamelog is empty.
-- Bad bets ("ignore this player, they just got back from injury") get filtered out automatically rather than tricking you.
+Example:
+
+```text
+Book line → implied probability → de-vigged market probability → model comparison
+```
+
+That means the edge calculation is not just “the model likes it.” It is:
+
+```text
+edge = calibrated_model_probability - market_implied_probability
+```
+
+### 2. Recent performance is weighted, not blindly averaged
+
+The model uses exponential decay by sport. A game `half_life` games ago contributes about half as much as the most recent game.
+
+- NBA team form defaults around a 10-game half-life
+- NBA player props can use tighter prop-specific half-lives such as 7 games
+- NFL uses shorter half-lives because each game carries more signal
+- MLB uses tuned baseball-specific decay for team and prop markets
+
+The result is a smoother projection than “last 5” but more responsive than full-season averages.
+
+### 3. Bad samples are removed before the model trusts them
+
+The player-prop engine rejects games that distort a player’s true baseline:
+
+- Low-minute games below a median-based threshold
+- The game immediately before a multi-game absence, which may indicate an in-game injury
+- First game back after a layoff, when ramp-up minutes are unreliable
+- Short current streaks after a break, injury, suspension, or role disruption
+
+Predictions are paused until the player has rebuilt a clean streak of valid games. The goal is to avoid recommending a player who technically has history but is not currently in a stable usage pattern.
+
+### 4. Team markets use a shared margin distribution
+
+Moneyline and spread calculations now come from the same home-perspective margin model:
+
+```text
+margin ~ Normal(predicted_margin, predicted_std)
+
+P(home wins)   = P(margin > 0)
+P(home covers) = P(margin > -spread)
+```
+
+That keeps the model internally coherent. At a zero spread, the home moneyline probability and home spread-cover probability line up instead of contradicting each other.
+
+### 5. Totals combine offense, defense, starters, bullpens, and market calibration
+
+Totals start from weighted team scoring and allowed scoring, then apply sport-specific matchup signals where available. For MLB, the model can adjust totals based on probable starters, expected pitcher quality, and bullpen run suppression.
+
+After that, fitted probability shrink and optional market blending correct overconfidence before a total is labeled as value.
+
+## Sport-specific advanced modeling
+
+### MLB: starter, bullpen, Statcast, and handedness features
+
+The MLB layer is no longer just historical scores. It uses MLB Stats API and Baseball Savant-style expected metrics to build matchup features:
+
+- Probable starting pitchers for each side
+- Starter handedness
+- ERA fallback plus **xERA / xwOBA** when available
+- Strikeout and walk rates
+- Average innings per start to weight starter vs. bullpen influence
+- Team bullpen run-suppression index
+- Opposing lineup quality vs. left- or right-handed pitching
+- Bounded starter edge using a `tanh` transform
+- Calibrated starter weights for moneyline, spreads, totals, run scaling, and bullpen effects
+
+The model separates feature generation from feature strength. Raw starter and bullpen features are built first; calibration files decide how much those features are allowed to move a prediction.
+
+### NFL: EPA-based team strength
+
+The NFL layer uses **Expected Points Added per play** from nflverse play-by-play data. EPA is more predictive than raw yards or final scores because it measures the value of each play in game context.
+
+The NFL feature engine includes:
+
+- Offensive EPA/play
+- Defensive EPA/play
+- Net EPA edge between teams
+- Prior-season shrinkage early in the season until current plays stabilize
+- Leakage-safe as-of-date ratings for backtests
+- OLS-fitted margin weights from historical games
+- Probability shrink for moneyline, spread, and total markets
+
+In other words: the NFL side is using play-level efficiency, not just scoreboard outcomes.
+
+### NBA: calibrated prop distributions and opponent-defense adjustment
+
+NBA props combine usage-stability filters with calibrated residual distributions:
+
+- Points, rebounds, and assists have prop-specific calibration files
+- Opponent defensive environment can scale projections
+- Residual Gaussian and ECDF methods are selected by Brier score
+- Early-season output blends current-season calibration with a prior-season warmup distribution
+- Platt recalibration is available for props with enough resolved prediction history
+
+## Player props are calibrated twice
+
+Player-prop probability starts with a weighted historical hit rate, but the app does not stop there.
+
+### Residual calibration
+
+The calibration file stores how far actual outcomes usually land from the projected stat:
+
+```text
+residual = actual_stat - projected_stat
+```
+
+Depending on the prop, the runtime model can use:
+
+- **Method A:** empirical weighted hit rate
+- **Method B:** pooled Gaussian residual model
+- **Method C:** empirical residual CDF
+
+The best method is selected per prop using chronological holdout scoring.
+
+### Warmup blending
+
+Early in a season, current-year samples are thin. The model blends current-season calibration with prior-season warmup calibration:
+
+```text
+w = min(current_season_games / warmup_games, 1)
+p = w * p_current + (1 - w) * p_warmup
+```
+
+As a player accumulates current-season games, the prior-season influence naturally fades out.
+
+### Self-updating Platt recalibration
+
+Every published prop prediction can be logged, resolved later against ESPN outcomes, and used to refit a Platt sigmoid:
+
+```text
+p_calibrated = sigmoid(a * logit(p_raw) + b)
+```
+
+The fit uses cross-entropy loss, Newton-Raphson optimization, mild L2 regularization, and minimum-sample guards. This gives the app a feedback loop: the more predictions it resolves, the better calibrated its probabilities can become.
+
+## Safe Mode: conservative alt-line math
+
+Safe Mode answers a different question than standard value betting.
+
+Instead of asking:
+
+```text
+Is Over 27.5 a good price?
+```
+
+it asks:
+
+```text
+What alternate threshold is this player likely to clear with high confidence?
+```
+
+The model computes a lower confidence bound:
+
+```text
+safe_threshold ≈ projected_mean - z * weighted_std
+```
+
+Then it tightens or rejects the threshold using empirical hit-rate guards:
+
+- The historical hit rate at the suggested threshold must be within 5 percentage points of the target confidence
+- Low-information `1+` style props are rejected at high confidence targets
+- Suggested thresholds must remain realistic relative to the main book line
+- Alternate-line prices are fetched when available so the safe pick is actually bettable
+
+This is why Safe Mode can suggest something like `Curry 8+ points` while refusing fake-safe lines that only look good because the threshold collapsed too far.
+
+## Parlays use joint probability instead of naïve multiplication
+
+Most simple parlay calculators multiply leg probabilities:
+
+```text
+P(parlay) = P(leg1) * P(leg2) * P(leg3)
+```
+
+That is only valid if every leg is independent. Sports bets are often not independent.
+
+Examples:
+
+- NBA player points over and game total over are positively related
+- Pitcher strikeouts over and game total under are positively related
+- Player points over and game total under can fight each other
+- Multiple prop overs in the same game can be constrained by usage and possessions
+
+This app builds a sport-aware correlation matrix, repairs it if needed so it can be simulated, then estimates joint probability using a Gaussian copula Monte Carlo engine.
+
+The parlay output includes both:
+
+- Independent combined probability
+- Correlation-adjusted combined probability
+
+That makes the parlay builder much harder to fool with same-game correlation traps.
+
+## Backtesting and calibration workflow
+
+The repository includes scripts for testing and refitting the model:
+
+- `backtest.py` — team-market projection and odds-history evaluation
+- `backtest_props.py` — player-prop sweeps, safe-mode tests, and calibration capture
+- `book_line_calibration.py` — joins cached book lines to actual player outcomes
+- `refit_calibration.py` — writes per-sport prop calibration files
+- `recalibration.py` — resolves logged predictions and refits Platt scaling
+- `backtest_starters.py` — fits MLB starter/bullpen adjustment weights
+- `backtest_nfl_epa.py` — fits NFL EPA margin weights
+- `savant_history.py` — leakage-safe historical Statcast feature cache for MLB backtests
+
+Validation focuses on metrics that punish overconfidence:
+
+- Brier score
+- Log loss
+- Hit rate
+- MAE / RMSE for point projections
+- Chronological holdout performance
+- Out-of-sample safe-line hit rates
+
+## Why the process is hard to fake
+
+The app has several built-in defenses against impressive-looking but fragile predictions:
+
+- It rejects unstable player histories before projecting
+- It shrinks probabilities when backtests show overconfidence
+- It blends with the market when the market is empirically stronger
+- It keeps moneyline and spread probabilities mathematically coherent
+- It uses residual distributions instead of assuming every prop is normally distributed
+- It avoids leakage in historical backtests by using only information available before the game
+- It resolves real predictions and recalibrates from actual outcomes
+- It penalizes correlated parlays instead of multiplying probabilities blindly
 
 ## Setup
 
 ### Streamlit Cloud
-1. Fork/clone this repo to your GitHub account
-2. Go to [share.streamlit.io](https://share.streamlit.io) and deploy the app
-3. In the app settings, add your secret:
+
+1. Fork or clone this repo to your GitHub account.
+2. Deploy the app at [share.streamlit.io](https://share.streamlit.io).
+3. Add your Odds API key in Streamlit secrets:
+
    ```toml
    ODDS_API_KEY = "your_api_key_here"
    ```
-4. Get a free API key at [the-odds-api.com](https://the-odds-api.com/#get-access) (500 credits/month)
+
+4. Get an API key from [the-odds-api.com](https://the-odds-api.com/#get-access).
 
 ### Local
-1. `pip install -r requirements.txt`
-2. Create `.streamlit/secrets.toml`:
-   ```toml
-   ODDS_API_KEY = "your_api_key_here"
-   ```
-3. `streamlit run app.py`
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+For local secrets, create `.streamlit/secrets.toml`:
+
+```toml
+ODDS_API_KEY = "your_api_key_here"
+```
+
+## Practical note
+
+This project produces calibrated probability estimates, not guarantees. Odds move, data feeds can be incomplete, players get hurt, books shade markets, and variance is real. The goal is to make the decision process mathematically honest, transparent, and harder to fool.
