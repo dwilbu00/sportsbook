@@ -46,6 +46,7 @@ from analysis import (
     _weighted_std,
     _half_life_for,
     _norm_cdf,
+    analyze_moneyline_value,
     analyze_spreads_value,
     analyze_totals_value,
 )
@@ -703,11 +704,16 @@ def _live_stats(prior_games):
 def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport_key,
                              matchup_features=None):
     """Run the ACTUAL live analyzers and return the PURE-model (pre-blend)
-    probabilities: ((home_spread, P_home_cover), (total_line, P_over)). This
-    makes the backtest grade exactly what production computes — including the
-    MLB starter adjustment when ``matchup_features`` is supplied."""
+    probabilities: (home_win_prob, (home_spread, P_home_cover),
+    (total_line, P_over)). This makes the backtest grade exactly what
+    production computes — including the MLB starter adjustment when
+    ``matchup_features`` is supplied."""
     stats_h, stats_a = _live_stats(home_prior), _live_stats(away_prior)
-    home_cover = total_over = None
+    home_win = home_cover = total_over = None
+    for c in analyze_moneyline_value(entry, stats_h, stats_a, threshold_pct, sport_key,
+                                     matchup_features=matchup_features):
+        if c["home_away"] == "HOME":
+            home_win = c["model_prob"] / 100.0
     for c in analyze_spreads_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                    matchup_features=matchup_features):
         if c["home_away"] == "HOME":
@@ -716,7 +722,7 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
                                matchup_features=matchup_features)
     if tot:
         total_over = (tot[0]["line"], tot[0]["model_over_hit_rate"] / 100.0)
-    return home_cover, total_over
+    return home_win, home_cover, total_over
 
 
 # Cache the MLB starter matchup-feature builder + per-season team index so the
@@ -748,6 +754,16 @@ def _shrink_prob(p, s):
     """Pull a probability toward 0.5 by factor s (s=1 unchanged, s=0 -> 0.5).
     Fixes overconfidence: a model 'p' becomes 0.5 + s*(p-0.5)."""
     return 0.5 + s * (p - 0.5)
+
+
+def _parse_seasons(spec):
+    """Parse a --seasons spec into a sorted list of ints. Accepts a comma list
+    ('2023,2024,2025'), an inclusive range ('2023-2025'), or a single year."""
+    spec = str(spec).strip()
+    if "-" in spec and "," not in spec:
+        lo, hi = spec.split("-", 1)
+        return list(range(int(lo), int(hi) + 1))
+    return sorted({int(x) for x in spec.split(",") if x.strip()})
 
 
 def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
@@ -793,8 +809,19 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
           f"name-unmatched: {unmatched}")
 
     print(f"\n=== Fetching schedules (cached) ===")
-    schedules = build_schedules(espn_sport, espn_league, espn_teams,
-                                season_year=season_year)
+    # season_year may be a single year (int/None) or an iterable of years. When
+    # several years are given we fetch each season's schedule and merge them so
+    # the fit can pool multiple seasons (e.g. NFL, whose ~200 games/season are
+    # too thin to fit a stable per-market shrink alone).
+    if isinstance(season_year, (list, tuple, set)):
+        seasons_list = list(season_year)
+    else:
+        seasons_list = [season_year]
+    schedules = {}
+    for sy in seasons_list:
+        sched = build_schedules(espn_sport, espn_league, espn_teams, season_year=sy)
+        for tid, games in sched.items():
+            schedules.setdefault(tid, []).extend(games)
     all_games = all_completed_games(schedules)
     if limit and limit < len(all_games):
         all_games = all_games[-limit:]
@@ -841,9 +868,13 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         if engine == "live":
             r = results["live"]
             matchup_features = _mlb_matchup_features(home, away, date[:10], sport_key)
-            mhc, mov = _live_spread_total_probs(
+            mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features)
+            if ml and mwin is not None:
+                fair_home, price_home, price_away = ml
+                _grade(r["moneyline"], _shrink_prob(mwin, prob_shrink),
+                       fair_home, home_won, price_home, price_away, threshold)
             if sp and mhc is not None:
                 home_spread, fair_cover, price_h, price_a = sp
                 model_spread, model_cover = mhc
@@ -3028,6 +3059,10 @@ def main():
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
+    p.add_argument("--seasons", default=None,
+                   help="(odds mode) Multiple ESPN season years to POOL for one fit: "
+                        "comma list '2023,2024,2025' or range '2023-2025'. Overrides "
+                        "--season. Use when a single season is too thin to fit shrink.")
     p.add_argument("--limit", type=int, default=200, help="Max games to backtest (most recent N)")
     p.add_argument("--window", type=int, default=10, help="Max prior games to use per team")
     p.add_argument("--min-sample", type=int, default=5, help="Skip games where either team has fewer prior games than this")
@@ -3126,9 +3161,10 @@ def main():
                                 threshold_pct=args.threshold,
                                 store_label=args.store_label)
     elif args.mode == "odds":
+        odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         run_odds_backtest(sport_key, espn_sport, espn_league,
                           limit=args.limit, window=args.window, variants=variants,
-                          min_sample=args.min_sample, season_year=args.season,
+                          min_sample=args.min_sample, season_year=odds_seasons,
                           threshold_pct=args.threshold,
                           write_calibration=args.write_calibration,
                           store_label=args.store_label,

@@ -196,12 +196,23 @@ def save_prob_shrink(sport_key, shrink, meta=None):
     """
     Persist per-market probability-shrink factors into calibration/<sport>.json,
     preserving the existing 'props' and 'market_blend' blocks.
+
+    The per-market shrink factors are MERGED into any existing prob_shrink block
+    so a partial fit (e.g. a moneyline-only run whose ESPN schedule can't grade
+    the currently-stored spread/total games) updates only the markets it fit and
+    leaves the others intact, instead of wiping them.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
     blob = _load_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
-    blob["prob_shrink"] = shrink
+    existing = blob.get("prob_shrink")
+    if isinstance(existing, dict):
+        merged = dict(existing)
+        merged.update(shrink)
+        blob["prob_shrink"] = merged
+    else:
+        blob["prob_shrink"] = shrink
     if meta:
         blob.setdefault("meta", {})
         if isinstance(blob["meta"], dict):

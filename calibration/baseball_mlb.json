@@ -3559,7 +3559,7 @@
     "n_players": 18,
     "prob_shrink": {
       "source": "odds backtest --engine live",
-      "fit_timestamp": "2026-07-08T16:22:05.680672Z"
+      "fit_timestamp": "2026-07-09T17:59:05.051267Z"
     },
     "starter_adjustment": {
       "source": "backtest_starters:2021,2022,2023,2024",
@@ -3569,17 +3569,18 @@
   },
   "prob_shrink": {
     "spreads": 0.25,
-    "totals": 0.1
+    "totals": 0.1,
+    "moneyline": 0.3
   },
   "starter_adjustment": {
     "enabled": true,
-    "moneyline": 1.905,
+    "moneyline": 1.896,
     "totals": 0.392,
     "run_scale": 2.169,
     "props": 0.0,
     "bullpen": 1.115,
     "bvp": 0.0,
     "_note": "moneyline/spreads/run_scale/bullpen/totals fit from 2021,2022,2023,2024 (7915 games, 7911 w/ bullpen); moneyline & spreads use the innings-weighted edge; props/bvp still 0.",
-    "spreads": 5.353
+    "spreads": 5.261
   }
 }

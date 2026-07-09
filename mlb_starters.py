@@ -478,6 +478,16 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None):
         # in proportion to how deep he goes; the bullpen covers the rest. Falls
         # back to starter-quality-only when avg_ip or bullpen are unavailable
         # (so the signal degrades gracefully, matching the backtest fit).
+        def _off_factor(side):
+            # Offense the side's staff faces = opposing lineup's OPS vs this
+            # starter's hand, relative to league. >1 = tougher offense. Neutral
+            # 1.0 when the split is unavailable. Mirrors the fit's offense factor
+            # (which uses savant xwOBAcon); both are ~1.0-centered multipliers.
+            split = (result.get(side) or {}).get("opp_offense_vs_hand")
+            if not split or not split.get("ops"):
+                return 1.0
+            return max(0.5, min(2.0, split["ops"] / LEAGUE_AVG["ops"]))
+
         def _eff(side):
             q = quality[side]
             sp = q.get("run_suppression", 1.0)
@@ -485,8 +495,11 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None):
             avg_ip = q.get("avg_ip")
             if pen and avg_ip:
                 w = max(0.30, min(0.85, avg_ip / 9.0))
-                return w * sp + (1.0 - w) * pen.get("bullpen_suppression", 1.0)
-            return sp
+                base = w * sp + (1.0 - w) * pen.get("bullpen_suppression", 1.0)
+            else:
+                base = sp
+            # Two-sided: degrade run-prevention by the offense faced.
+            return base / _off_factor(side)
         # Positive => home better than away. tanh keeps it bounded; magnitude of
         # effect is applied by the (calibratable) weight in the analyzer.
         result["starter_edge"] = _tanh(_eff("home") - _eff("away"))

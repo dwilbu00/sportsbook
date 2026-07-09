@@ -616,6 +616,63 @@ def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed, streng
     return 1.0 + strength * (bounded - 1.0)
 
 
+def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
+                    matchup_features=None):
+    """Shared home-perspective game-margin distribution used by BOTH the
+    moneyline and spread analyzers so they stay coherent: ML win prob and spread
+    cover prob both derive from the same Normal(pred_margin, pred_std).
+
+    Returns (pred_margin, pred_std, home_stats, away_stats) or None when either
+    team lacks usable recent games.
+    """
+    half_life = _half_life_for(sport_key)
+    home_team = game_odds["home_team"]
+    away_team = game_odds["away_team"]
+
+    def _team_margin_stats(team_name, stats, is_home):
+        recent_games = stats.get("recent_games", [])
+        margins = []
+        past_is_home_list = []
+        for game in recent_games:
+            if game["home_team"] == team_name:
+                margin = game["home_score"] - game["away_score"]
+                past_is_home_list.append(True)
+            elif game["away_team"] == team_name:
+                margin = game["away_score"] - game["home_score"]
+                past_is_home_list.append(False)
+            else:
+                continue
+            margins.append(margin)
+        if not margins:
+            return None
+        base_weights = _recency_weights(len(margins), half_life)
+        weights = [
+            bw * _venue_match_multiplier(past_h, is_home, sport_key)
+            for bw, past_h in zip(base_weights, past_is_home_list)
+        ]
+        mean = _weighted_mean(margins, weights)
+        std = _weighted_std(margins, weights, mean=mean)
+        return {"margins": margins, "weights": weights, "mean": mean, "std": std}
+
+    home_stats = _team_margin_stats(home_team, home_team_stats, True)
+    away_stats = _team_margin_stats(away_team, away_team_stats, False)
+    if not home_stats or not away_stats:
+        return None
+
+    pred_margin = home_stats["mean"] - away_stats["mean"]
+    # Phase 1: shift the predicted margin by the (innings-weighted, two-sided)
+    # starter edge. Positive edge = home's effective run-prevention is better, so
+    # the home margin rises. This single shift feeds BOTH ML and spreads.
+    if matchup_features and matchup_features.get("starter_edge") is not None:
+        pred_margin += (_starter_adjustment(sport_key, "spreads")
+                        * matchup_features["starter_edge"])
+    # Floor each team's std at 1.0 to avoid degenerate certainty on thin samples.
+    home_var = max(home_stats["std"], 1.0) ** 2
+    away_var = max(away_stats["std"], 1.0) ** 2
+    pred_std = math.sqrt(home_var + away_var)
+    return pred_margin, pred_std, home_stats, away_stats
+
+
 def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare moneyline implied probabilities against historical win rates.
@@ -645,6 +702,21 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             avg_implied_by_team[tn] = sum(o["implied_prob"] for o in lst) / len(lst)
     blend_w = _blend_weight(sport_key, "moneyline")
 
+    # ── Shared margin model (coherent with analyze_spreads_value) ───────────
+    # ML and spreads now derive from ONE predicted-margin distribution:
+    #   P(home win) = P(margin > 0) = Φ(pred_margin / pred_std)
+    # At spread 0 the ML home-win prob equals the spread cover prob, so the two
+    # markets can never disagree. The starter/opponent edge already shifts the
+    # margin inside _predict_margin(), so no separate ML starter logit is needed.
+    margin = _predict_margin(game_odds, home_team_stats, away_team_stats,
+                             sport_key, matchup_features)
+    model_win_by_team = {}
+    if margin is not None:
+        pred_margin, pred_std, _, _ = margin
+        home_win = _norm_cdf(pred_margin / pred_std)
+        model_win_by_team[home_team] = home_win
+        model_win_by_team[away_team] = 1.0 - home_win
+
     for team_name, stats in [(home_team, home_team_stats), (away_team, away_team_stats)]:
         ml_odds = game_odds["moneyline"].get(team_name, [])
         if not ml_odds:
@@ -653,13 +725,10 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
         # Average implied probability across all books
         avg_implied = sum(o["implied_prob"] for o in ml_odds) / len(ml_odds)
 
-        # Historical probability: weighted blend of season and recent form.
-        # Replace the flat recent win% with an exponentially-weighted win rate
-        # built from recent_games (newest first) so streaks/slumps matter more.
+        # Informational win-rate context (recency-weighted). Still surfaced in
+        # the UI, but no longer the source of the model probability.
         season_wp = stats["season"]["win_pct"]
         flat_recent_wp = stats["recent"]["win_pct"]
-
-        # Whether this team is playing the upcoming game at home.
         upcoming_is_home = (team_name == home_team)
 
         recent_games = stats.get("recent_games", [])
@@ -674,9 +743,6 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                 past_is_home_list.append(False)
 
         if wins_for_team:
-            # opp_strength was removed: backtest on 1,153 NBA + 2,350 MLB games
-            # showed it contributes zero signal at team level (balanced schedules
-            # mean opponent_win_pct averages out across the season).
             base_weights = _recency_weights(len(wins_for_team), half_life)
             weights = [
                 bw * _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
@@ -686,32 +752,33 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
         else:
             recent_wp = flat_recent_wp
 
-        # Weight recent form more heavily (60/40)
-        hist_prob = (0.4 * season_wp) + (0.6 * recent_wp)
+        # Model win probability from the shared margin distribution. Fall back to
+        # the recency-weighted win% blend (+ starter logit) only when the margin
+        # model is unavailable because a team lacks usable recent games.
+        if team_name in model_win_by_team:
+            model_prob = model_win_by_team[team_name]
+        else:
+            model_prob = (0.4 * season_wp) + (0.6 * recent_wp)
+            if matchup_features and matchup_features.get("starter_edge") is not None:
+                sign = 1.0 if team_name == home_team else -1.0
+                model_prob = _apply_starter_logit(
+                    model_prob, sign * matchup_features["starter_edge"],
+                    _starter_adjustment(sport_key, "moneyline"))
 
-        # Phase 1: nudge the model probability by the starter/opponent edge
-        # (probable SP quality via xERA + opposing lineup vs handedness).
-        # starter_edge is home-favorable when positive; flip sign for the away
-        # team. Weight is calibratable (default = conservative prior).
-        if matchup_features and matchup_features.get("starter_edge") is not None:
-            sa_w = _starter_adjustment(sport_key, "moneyline")
-            sign = 1.0 if team_name == home_team else -1.0
-            hist_prob = _apply_starter_logit(
-                hist_prob, sign * matchup_features["starter_edge"], sa_w)
-
-        # Blend the model probability toward the de-vigged market closing line
-        # using the offline-fitted weight (w=1.0 → pure model = original).
-        final_prob = hist_prob
+        # Calibrated overconfidence correction (no-op until an ML shrink is fit
+        # from backfilled h2h history), then optional model⇄market blend toward
+        # the de-vigged closing line (blend_w=1.0 → pure model).
+        shrunk = _apply_shrink(model_prob, sport_key, "moneyline")
+        final_prob = shrunk
         opp = away_team if team_name == home_team else home_team
         if (blend_w < 1.0 and team_name in avg_implied_by_team
                 and opp in avg_implied_by_team):
             fair_team, _ = devig_two_way(avg_implied_by_team[team_name],
                                          avg_implied_by_team[opp])
-            final_prob = blend_w * hist_prob + (1.0 - blend_w) * fair_team
+            final_prob = blend_w * shrunk + (1.0 - blend_w) * fair_team
 
         edge = final_prob - avg_implied
 
-        best_odds = max(ml_odds, key=lambda o: o["implied_prob"] if o["price"] > 0 else -o["price"])
         worst_book_prob = min(o["implied_prob"] for o in ml_odds)
         best_edge = final_prob - worst_book_prob
 
@@ -723,7 +790,10 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "book_implied_prob": round(avg_implied * 100, 2),
             "season_win_pct": round(season_wp * 100, 2),
             "recent_win_pct": round(recent_wp * 100, 2),
-            "hist_prob": round(hist_prob * 100, 2),
+            # model_prob = pure shared-margin win prob (graded by the backtest);
+            # hist_prob mirrors it for backward-compatible UI display.
+            "model_prob": round(model_prob * 100, 2),
+            "hist_prob": round(model_prob * 100, 2),
             "blended_prob": round(final_prob * 100, 2),
             "edge_pct": round(edge * 100, 2),
             "best_edge_pct": round(best_edge * 100, 2),
@@ -912,41 +982,21 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         list: Value candidates for spread bets (at most one will be is_value=True per game)
     """
     threshold = threshold_pct / 100.0
-    half_life = _half_life_for(sport_key)
 
     home_team = game_odds["home_team"]
     away_team = game_odds["away_team"]
 
-    # ── Per-team weighted margin distributions ──────────────────────────────
-    def _team_margin_stats(team_name, stats, is_home):
-        recent_games = stats.get("recent_games", [])
-        margins = []
-        past_is_home_list = []
-        for game in recent_games:
-            if game["home_team"] == team_name:
-                margin = game["home_score"] - game["away_score"]
-                past_is_home_list.append(True)
-            elif game["away_team"] == team_name:
-                margin = game["away_score"] - game["home_score"]
-                past_is_home_list.append(False)
-            else:
-                continue
-            margins.append(margin)
-
-        if not margins:
-            return None
-
-        base_weights = _recency_weights(len(margins), half_life)
-        weights = [
-            bw * _venue_match_multiplier(past_h, is_home, sport_key)
-            for bw, past_h in zip(base_weights, past_is_home_list)
-        ]
-        mean = _weighted_mean(margins, weights)
-        std = _weighted_std(margins, weights, mean=mean)
-        return {"margins": margins, "weights": weights, "mean": mean, "std": std}
-
-    home_stats = _team_margin_stats(home_team, home_team_stats, True)
-    away_stats = _team_margin_stats(away_team, away_team_stats, False)
+    # ── Shared predicted-margin distribution (coherent with moneyline) ──────
+    # Both markets derive from the SAME _predict_margin() output, so at spread 0
+    # the spread cover prob equals the ML home-win prob — they cannot disagree.
+    margin = _predict_margin(game_odds, home_team_stats, away_team_stats,
+                             sport_key, matchup_features)
+    # If we lack usable recent games for either side we cannot compute a
+    # meaningful cover probability, so skip the matchup entirely (better than
+    # recommending both halves of a bet on half the information).
+    if margin is None:
+        return []
+    pred_margin, pred_std, home_stats, away_stats = margin
 
     # ── Consensus spread per team ───────────────────────────────────────────
     def _consensus_spread(team):
@@ -958,28 +1008,6 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
 
     home_spread = _consensus_spread(home_team)
     away_spread = _consensus_spread(away_team)
-
-    # ── Joint margin distribution (home perspective) ────────────────────────
-    # If we have stats for both teams, build the joint estimate. Otherwise we
-    # cannot compute a meaningful cover probability for either side and skip
-    # the matchup entirely (better than recommending both halves of a bet on
-    # half the information).
-    if not home_stats or not away_stats:
-        return []
-
-    pred_margin = home_stats["mean"] - away_stats["mean"]
-    # Phase 1: shift the predicted margin by the (innings-weighted) starter
-    # edge. Positive edge = home's effective run-prevention is better, so the
-    # home margin rises. `spreads` weight = runs of margin per unit edge
-    # (calibratable; 0 = original starter-blind behavior).
-    if matchup_features and matchup_features.get("starter_edge") is not None:
-        pred_margin += (_starter_adjustment(sport_key, "spreads")
-                        * matchup_features["starter_edge"])
-    # Floor each team's std at 1.0 point to avoid degenerate certainty when a
-    # team has very few recent games or unusually flat margins.
-    home_var = max(home_stats["std"], 1.0) ** 2
-    away_var = max(away_stats["std"], 1.0) ** 2
-    pred_std = math.sqrt(home_var + away_var)
 
     # ── Build candidate per team using the joint cover probability ──────────
     candidates = []

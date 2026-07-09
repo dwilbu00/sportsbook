@@ -184,6 +184,15 @@ def build_dataset(games, season):
     sp_idx = build_pitcher_index(rows)
     ip_idx = _ip_index(season)  # as-of avg innings/start per starter
 
+    # Two-sided edge: as-of offense a lineup PRODUCES vs a pitcher's hand, so a
+    # starter's effective run-prevention is degraded by the offense he faces.
+    off_idx = _offense_index(rows)
+    sp_hand = {}
+    for r in rows:
+        p, ph = str(r.get("pitcher")), r.get("p_throws")
+        if p and ph and p not in sp_hand:
+            sp_hand[p] = ph
+
     out = []
     for g in games:
         hx = sp_idx.asof_mean(str(g["home_sp"]), g["date"])
@@ -213,6 +222,22 @@ def build_dataset(games, season):
         h_ip = h_outs / 3.0 if h_outs is not None else None
         a_ip = a_outs / 3.0 if a_outs is not None else None
 
+        # Offense faced by each staff (home staff faces the away lineup vs the
+        # home starter's hand, and vice versa). Factor >1 = tougher-than-league
+        # offense. Defaults to 1.0 (neutral) when as-of data is missing.
+        h_off = a_off = 1.0
+        if gt:
+            ha, aa = gt
+            hh, ah = sp_hand.get(str(g["home_sp"])), sp_hand.get(str(g["away_sp"]))
+            if hh:
+                ov = off_idx.asof_mean(f"{aa}|{hh}", g["date"])
+                if ov:
+                    h_off = max(0.5, min(2.0, ov / league_xwoba))
+            if ah:
+                ov = off_idx.asof_mean(f"{ha}|{ah}", g["date"])
+                if ov:
+                    a_off = max(0.5, min(2.0, ov / league_xwoba))
+
         out.append({
             "starter_edge": math.tanh(h_rs - a_rs),
             "combined_excess": (h_rs - 1.0) + (a_rs - 1.0),
@@ -223,6 +248,7 @@ def build_dataset(games, season):
             "h_sp_sup": h_rs, "a_sp_sup": a_rs,
             "h_bp_sup": h_bs, "a_bp_sup": a_bs,
             "h_ip": h_ip, "a_ip": a_ip,
+            "h_off_faced": h_off, "a_off_faced": a_off,
             "margin": g.get("margin"),
         })
     return out, league_xwoba
@@ -293,19 +319,26 @@ def build_pooled_dataset(seasons):
 
 
 def _eff_edge(d):
-    """Innings-weighted effective run-prevention edge (home − away), tanh-bounded.
+    """Innings-weighted, two-sided effective run-prevention edge (home − away),
+    tanh-bounded.
 
     Mirrors mlb_starters.build_matchup_features._eff exactly: a starter's
-    quality counts in proportion to how deep he goes, bullpen covers the rest;
-    falls back to starter-quality-only when bullpen or innings are missing.
+    quality counts in proportion to how deep he goes, the bullpen covers the
+    rest, and the blend is then divided by the offense factor of the lineup the
+    staff faces (pitcher-vs-lineup, both directions). Falls back to
+    starter-quality-only when bullpen/innings are missing, and to a neutral 1.0
+    offense factor when lineup data is missing.
     """
-    def eff(sp, bp, ip):
+    def eff(sp, bp, ip, off):
         if bp and ip:
             w = max(0.30, min(0.85, ip / 9.0))
-            return w * sp + (1.0 - w) * bp
-        return sp
-    return math.tanh(eff(d["h_sp_sup"], d.get("h_bp_sup"), d.get("h_ip"))
-                     - eff(d["a_sp_sup"], d.get("a_bp_sup"), d.get("a_ip")))
+            base = w * sp + (1.0 - w) * bp
+        else:
+            base = sp
+        return base / (off or 1.0)
+    return math.tanh(
+        eff(d["h_sp_sup"], d.get("h_bp_sup"), d.get("h_ip"), d.get("h_off_faced", 1.0))
+        - eff(d["a_sp_sup"], d.get("a_bp_sup"), d.get("a_ip"), d.get("a_off_faced", 1.0)))
 
 
 def fit(seasons, do_save=False):
@@ -541,6 +574,87 @@ def _parse_seasons(spec):
     return sorted(out)
 
 
+def _offense_index(rows):
+    """As-of index of the xwOBAcon a team's hitters PRODUCED, keyed by
+    'team|opposingPitcherHand', for the two-sided (pitcher-vs-lineup) edge."""
+    from backtest_props import AsOfIndex
+    idx = AsOfIndex()
+    for r in rows:
+        x = r.get("xwoba")
+        if x is None:
+            continue
+        bt, ph = r.get("batting_team"), r.get("p_throws")
+        if not bt or not ph:
+            continue
+        idx.add(f"{bt}|{ph}", r["game_date"], x)
+    return idx
+
+
+def test_two_sided(seasons):
+    """A/B: does folding the OPPOSING lineup's as-of xwOBAcon-vs-hand into the
+    starter edge (pitcher-vs-lineup, both directions) beat the current
+    pitcher-only edge at predicting the game margin? Leakage-safe, no save.
+
+    Two-sided effective prevention per team = starter_suppression divided by the
+    offense factor of the lineup that starter faces (offense factor >1 = the
+    opposing hitters are better than league vs that hand, so prevention drops).
+    """
+    from backtest_props import build_pitcher_index
+    base_edges, two_edges, margins = [], [], []
+    for s in seasons:
+        games = get_season_games(s)
+        s0, s1 = _season_bounds(s)
+        rows = sh.load_days(s0, s1)
+        if not rows:
+            continue
+        vals = [r["xwoba"] for r in rows if r["xwoba"] is not None]
+        league = sum(vals) / len(vals)
+        sp_idx = build_pitcher_index(rows)
+        off_idx = _offense_index(rows)
+        _, _, game_teams = _bullpen_features(rows, s)
+        hands = {}
+        for r in rows:
+            p, ph = str(r.get("pitcher")), r.get("p_throws")
+            if p and ph and p not in hands:
+                hands[p] = ph
+        for g in games:
+            if g.get("margin") is None:
+                continue
+            hsp, asp = str(g["home_sp"]), str(g["away_sp"])
+            hx = sp_idx.asof_mean(hsp, g["date"])
+            ax = sp_idx.asof_mean(asp, g["date"])
+            if hx is None or ax is None:
+                continue
+            gt = game_teams.get((g["date"], hsp, asp))
+            hh, ah = hands.get(hsp), hands.get(asp)
+            if not gt or not hh or not ah:
+                continue
+            home_abbr, away_abbr = gt
+            off_away = off_idx.asof_mean(f"{away_abbr}|{hh}", g["date"])
+            off_home = off_idx.asof_mean(f"{home_abbr}|{ah}", g["date"])
+            if off_away is None or off_home is None:
+                continue
+            h_rs = max(0.5, min(2.0, league / hx))
+            a_rs = max(0.5, min(2.0, league / ax))
+            off_a = off_away / league   # away lineup offense factor
+            off_h = off_home / league   # home lineup offense factor
+            base_edges.append(math.tanh(h_rs - a_rs))
+            two_edges.append(math.tanh((h_rs / off_a) - (a_rs / off_h)))
+            margins.append(g["margin"])
+    n = len(margins)
+    print(f"\n=== two-sided (pitcher-vs-lineup) edge A/B — {','.join(map(str, seasons))} "
+          f"({n} games w/ offense data) ===")
+    if n < 200:
+        print("Not enough games with as-of offense data to judge.")
+        return
+    cb, ct = _pearson(base_edges, margins), _pearson(two_edges, margins)
+    print(f"corr w/ margin:  pitcher-only {cb:+.4f}  ->  two-sided {ct:+.4f}"
+          f"   (delta {ct - cb:+.4f})")
+    print("Higher |corr| = the edge tracks real margins better. A meaningful "
+          "gain justifies wiring the lineup side into fit + live; a flat/negative "
+          "delta means keep the pitcher-only edge (like the props matchup).")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True,
@@ -551,6 +665,9 @@ if __name__ == "__main__":
     ap.add_argument("--test-ip", action="store_true",
                     help="A/B test innings-weighted starter/bullpen blend "
                          "(ML, spreads, totals); reports metrics, no save")
+    ap.add_argument("--test-2sided", action="store_true",
+                    help="A/B test the two-sided (pitcher-vs-lineup) edge vs "
+                         "the pitcher-only edge; reports metrics, no save")
     args = ap.parse_args()
 
     seasons = _parse_seasons(args.season)
@@ -562,5 +679,7 @@ if __name__ == "__main__":
             get_season_games(s)
     if args.test_ip:
         test_innings_weighting(seasons)
+    elif args.test_2sided:
+        test_two_sided(seasons)
     else:
         fit(seasons, do_save=args.save)

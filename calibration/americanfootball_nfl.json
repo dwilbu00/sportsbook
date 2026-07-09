@@ -1169,6 +1169,15 @@
     "warmup_season": 2024,
     "games_per_player": 80,
     "warmup_games": 10,
-    "n_players": 16
+    "n_players": 16,
+    "prob_shrink": {
+      "source": "odds backtest --engine live",
+      "fit_timestamp": "2026-07-09T18:13:36.548239Z"
+    }
+  },
+  "prob_shrink": {
+    "moneyline": 0.8,
+    "spreads": 0.05,
+    "totals": 0.0
   }
 }
