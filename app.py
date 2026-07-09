@@ -501,10 +501,11 @@ with st.sidebar:
     sport = SPORTS[sport_label]
 
     st.subheader("Markets")
+    if "markets" not in st.session_state:
+        st.session_state["markets"] = ["Moneyline"]
     selected_markets = st.multiselect(
         "Select markets",
         list(MARKET_OPTIONS.keys()),
-        default=["Moneyline"],
         key="markets",
     )
     market_keys = [MARKET_OPTIONS[m] for m in selected_markets]
