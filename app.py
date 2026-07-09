@@ -1004,6 +1004,19 @@ if analyze_clicked:
                     home, away, game_date, int(game_date[:4]))
             except Exception as e:
                 warnings.append(f"Starter features unavailable for {away} @ {home}: {e}")
+        elif sport["key"] == "americanfootball_nfl":
+            # NFL EPA edge (net EPA/play, season-to-date) — feeds ML + spreads
+            # via the same generic starter_edge margin hook. Degrades to None.
+            try:
+                import nfl_epa
+                game_date = event.get("commence_time", "")[:10]
+                season = nfl_epa.season_for_date(game_date)
+                # Prefer the committed precomputed ratings (no runtime download).
+                ratings = nfl_epa.live_ratings(season)
+                matchup_features = nfl_epa.build_matchup_features(
+                    home, away, game_date, season, team_ratings=ratings)
+            except Exception as e:
+                warnings.append(f"EPA features unavailable for {away} @ {home}: {e}")
 
         # Team market analysis
         if eid in odds_results:

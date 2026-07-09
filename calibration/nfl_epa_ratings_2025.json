@@ -1,0 +1,166 @@
+{
+  "season": 2025,
+  "generated": "2026-07-09T18:44:03.721595Z",
+  "ratings": {
+    "HOU": {
+      "off_epa": -0.01153,
+      "def_epa": -0.10865,
+      "net_epa": 0.09712
+    },
+    "SF": {
+      "off_epa": 0.08988,
+      "def_epa": 0.06613,
+      "net_epa": 0.02374
+    },
+    "ARI": {
+      "off_epa": -0.01528,
+      "def_epa": 0.08684,
+      "net_epa": -0.10212
+    },
+    "LAC": {
+      "off_epa": -0.01506,
+      "def_epa": -0.07586,
+      "net_epa": 0.0608
+    },
+    "MIN": {
+      "off_epa": -0.09368,
+      "def_epa": -0.08549,
+      "net_epa": -0.00819
+    },
+    "DEN": {
+      "off_epa": 0.03737,
+      "def_epa": -0.06002,
+      "net_epa": 0.09739
+    },
+    "KC": {
+      "off_epa": 0.04301,
+      "def_epa": -0.00654,
+      "net_epa": 0.04954
+    },
+    "TB": {
+      "off_epa": 0.00247,
+      "def_epa": 0.01284,
+      "net_epa": -0.01038
+    },
+    "LV": {
+      "off_epa": -0.19231,
+      "def_epa": 0.02778,
+      "net_epa": -0.22009
+    },
+    "SEA": {
+      "off_epa": 0.03938,
+      "def_epa": -0.11114,
+      "net_epa": 0.15053
+    },
+    "NE": {
+      "off_epa": 0.15706,
+      "def_epa": -0.04105,
+      "net_epa": 0.19811
+    },
+    "ATL": {
+      "off_epa": -0.00761,
+      "def_epa": 0.00942,
+      "net_epa": -0.01703
+    },
+    "BAL": {
+      "off_epa": 0.03696,
+      "def_epa": 0.02253,
+      "net_epa": 0.01443
+    },
+    "LA": {
+      "off_epa": 0.14911,
+      "def_epa": -0.06722,
+      "net_epa": 0.21633
+    },
+    "GB": {
+      "off_epa": 0.12412,
+      "def_epa": 0.04258,
+      "net_epa": 0.08153
+    },
+    "IND": {
+      "off_epa": 0.08028,
+      "def_epa": 0.01601,
+      "net_epa": 0.06426
+    },
+    "CIN": {
+      "off_epa": 0.01128,
+      "def_epa": 0.12384,
+      "net_epa": -0.11256
+    },
+    "DET": {
+      "off_epa": 0.07209,
+      "def_epa": 0.01095,
+      "net_epa": 0.06115
+    },
+    "NO": {
+      "off_epa": -0.07858,
+      "def_epa": -0.04845,
+      "net_epa": -0.03013
+    },
+    "BUF": {
+      "off_epa": 0.13989,
+      "def_epa": -0.00849,
+      "net_epa": 0.14838
+    },
+    "TEN": {
+      "off_epa": -0.14843,
+      "def_epa": 0.10389,
+      "net_epa": -0.25232
+    },
+    "DAL": {
+      "off_epa": 0.11103,
+      "def_epa": 0.16233,
+      "net_epa": -0.0513
+    },
+    "PIT": {
+      "off_epa": 0.02768,
+      "def_epa": 0.02274,
+      "net_epa": 0.00494
+    },
+    "WAS": {
+      "off_epa": 0.03389,
+      "def_epa": 0.15216,
+      "net_epa": -0.11828
+    },
+    "CAR": {
+      "off_epa": -0.02719,
+      "def_epa": 0.06,
+      "net_epa": -0.0872
+    },
+    "NYG": {
+      "off_epa": 0.04432,
+      "def_epa": 0.09955,
+      "net_epa": -0.05523
+    },
+    "JAX": {
+      "off_epa": 0.03704,
+      "def_epa": -0.07989,
+      "net_epa": 0.11693
+    },
+    "CHI": {
+      "off_epa": 0.07565,
+      "def_epa": 0.03578,
+      "net_epa": 0.03986
+    },
+    "NYJ": {
+      "off_epa": -0.12406,
+      "def_epa": 0.14693,
+      "net_epa": -0.27099
+    },
+    "CLE": {
+      "off_epa": -0.1771,
+      "def_epa": -0.08509,
+      "net_epa": -0.09201
+    },
+    "PHI": {
+      "off_epa": 0.03335,
+      "def_epa": -0.05008,
+      "net_epa": 0.08342
+    },
+    "MIA": {
+      "off_epa": -0.02205,
+      "def_epa": 0.08553,
+      "net_epa": -0.10757
+    }
+  }
+}

@@ -750,6 +750,34 @@ def _mlb_matchup_features(home, away, date, sport_key):
         return None
 
 
+def _nfl_matchup_features(home, away, date, sport_key):
+    """Build NFL EPA matchup features for a historical game, leakage-safe: the
+    EPA ratings use only plays from games strictly BEFORE `date`, matching what
+    production would have known. Returns None for non-NFL or unresolved teams
+    (degrades to the team-only model)."""
+    if sport_key != "americanfootball_nfl" or not (home and away and date):
+        return None
+    try:
+        import nfl_epa
+        season = nfl_epa.season_for_date(date)
+        ratings = nfl_epa.team_epa(season, as_of_date=date)
+        return nfl_epa.build_matchup_features(home, away, date, season,
+                                              team_ratings=ratings)
+    except Exception:
+        return None
+
+
+def _matchup_features_for(home, away, date, sport_key):
+    """Dispatch to the per-sport historical matchup-feature builder used by the
+    odds backtest's live engine, so it grades the same feature-enhanced model
+    production runs."""
+    if sport_key == "baseball_mlb":
+        return _mlb_matchup_features(home, away, date, sport_key)
+    if sport_key == "americanfootball_nfl":
+        return _nfl_matchup_features(home, away, date, sport_key)
+    return None
+
+
 def _shrink_prob(p, s):
     """Pull a probability toward 0.5 by factor s (s=1 unchanged, s=0 -> 0.5).
     Fixes overconfidence: a model 'p' becomes 0.5 + s*(p-0.5)."""
@@ -867,7 +895,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         # ── LIVE engine: grade the real production probabilities ──
         if engine == "live":
             r = results["live"]
-            matchup_features = _mlb_matchup_features(home, away, date[:10], sport_key)
+            matchup_features = _matchup_features_for(home, away, date[:10], sport_key)
             mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features)

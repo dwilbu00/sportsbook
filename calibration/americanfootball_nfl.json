@@ -1172,12 +1172,21 @@
     "n_players": 16,
     "prob_shrink": {
       "source": "odds backtest --engine live",
-      "fit_timestamp": "2026-07-09T18:13:36.548239Z"
+      "fit_timestamp": "2026-07-09T18:32:37.302254Z"
+    },
+    "starter_adjustment": {
+      "source": "backtest_nfl_epa.py --seasons 2023-2025",
+      "corr": 0.3818,
+      "games": 768
     }
   },
   "prob_shrink": {
-    "moneyline": 0.8,
-    "spreads": 0.05,
+    "moneyline": 0.65,
+    "spreads": 0.1,
     "totals": 0.0
+  },
+  "starter_adjustment": {
+    "enabled": true,
+    "spreads": 32.293
   }
 }
