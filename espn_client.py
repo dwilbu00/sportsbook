@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports"
+STANDINGS_API = "https://site.api.espn.com/apis/v2/sports"
 CORE_API = "https://sports.core.api.espn.com/v2/sports"
 
 # Common timeout for all ESPN requests
@@ -65,6 +66,57 @@ def get_all_teams(sport, league):
             "losses": losses,
             "win_pct": wins / (wins + losses) if (wins + losses) > 0 else 0.0,
         }
+
+    # ESPN's league-wide teams endpoint no longer includes records. Merge the
+    # official regular-season records from the standings endpoint, which
+    # returns every team in one additional request. Retain the values parsed
+    # above as a fallback if standings are temporarily unavailable.
+    standings_url = f"{STANDINGS_API}/{sport}/{league}/standings"
+    try:
+        standings_resp = requests.get(standings_url, timeout=TIMEOUT)
+        standings_resp.raise_for_status()
+        standings_data = standings_resp.json()
+    except (requests.RequestException, ValueError):
+        return teams
+
+    teams_by_id = {info["id"]: info for info in teams.values() if info.get("id")}
+    groups = [standings_data]
+    while groups:
+        group = groups.pop()
+        groups.extend(group.get("children", []))
+        entries = group.get("standings", {}).get("entries", [])
+        for entry in entries:
+            team_id = entry.get("team", {}).get("id")
+            team_info = teams_by_id.get(team_id)
+            if not team_info:
+                continue
+
+            stats = {
+                stat.get("name"): stat.get("value")
+                for stat in entry.get("stats", [])
+                if stat.get("name")
+            }
+            try:
+                wins = int(stats.get("wins", 0))
+                losses = int(stats.get("losses", 0))
+                ties = int(stats.get("ties", 0))
+            except (TypeError, ValueError):
+                continue
+
+            games = wins + losses + ties
+            if games <= 0:
+                continue
+
+            win_pct = stats.get("winPercent")
+            if not isinstance(win_pct, (int, float)):
+                win_pct = (wins + 0.5 * ties) / games
+
+            team_info["record"] = (
+                f"{wins}-{losses}-{ties}" if ties else f"{wins}-{losses}"
+            )
+            team_info["wins"] = wins
+            team_info["losses"] = losses
+            team_info["win_pct"] = win_pct
 
     return teams
 

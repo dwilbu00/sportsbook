@@ -1704,7 +1704,7 @@ def format_totals_report(candidates):
 def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
     """
     Convert all analysis results into a uniform leg format for parlay building.
-    Only include legs with positive edge.
+    Only include legs that passed their analyzer's value recommendation filter.
     
     Each leg dict has:
         game_key: str (e.g., "Team A @ Team B" or matchup)
@@ -1721,7 +1721,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
     legs = []
     
     for c in all_ml:
-        if c["edge_pct"] <= 0:
+        if not c.get("is_value") or c["edge_pct"] <= 0:
             continue
         game_key = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         legs.append({
@@ -1738,11 +1738,9 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
         })
     
     for c in all_spreads:
-        if c["edge_pct"] <= 0 or c.get("games_sampled", 0) < 5:
-            continue
-        # Respect explicit is_value flag — safe-mode rewrites this to enforce
-        # the alt-lines confidence threshold for spreads.
-        if c.get("is_value") is False:
+        # Safe mode rewrites is_value to enforce its confidence threshold.
+        if (not c.get("is_value") or c["edge_pct"] <= 0
+                or c.get("games_sampled", 0) < 5):
             continue
         game_key = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         legs.append({
@@ -1787,7 +1785,8 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             })
     
     for c in all_props:
-        if c.get("no_history") or c["edge_pct"] <= 0 or c.get("games_sampled", 0) < 5:
+        if (not c.get("is_value") or c.get("no_history")
+                or c["edge_pct"] <= 0 or c.get("games_sampled", 0) < 5):
             continue
         direction = c.get("direction", "OVER")
         bt = f"player_prop_{direction.lower()}"
