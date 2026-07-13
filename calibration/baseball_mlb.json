@@ -3565,6 +3565,40 @@
       "source": "backtest_starters:2021,2022,2023,2024",
       "fit": true,
       "n_games": 7915
+    },
+    "prop_matchup_holdout": {
+      "source": "backtest_props chronological 2024 split",
+      "evaluated_at": "2026-07-13",
+      "fit_window": "before 2024-07-01",
+      "holdout_window": "2024-07-01 through 2024-09-30",
+      "metric": "MAE",
+      "results": {
+        "batter_hits": {
+          "fit_n": 7448,
+          "holdout_n": 8041,
+          "selected_weight": 0.0,
+          "baseline_mae": 0.71344,
+          "selected_mae": 0.71344
+        },
+        "pitcher_outs": {
+          "fit_n": 2681,
+          "holdout_n": 3736,
+          "selected_weight": 0.0,
+          "baseline_mae": 2.62015,
+          "selected_mae": 2.62015
+        },
+        "pitcher_earned_runs": {
+          "fit_n": 2656,
+          "holdout_n": 3725,
+          "selected_weight": 0.0,
+          "baseline_mae": 1.26869,
+          "selected_mae": 1.26869
+        },
+        "pitcher_strikeouts": {
+          "selected_weight": 0.0,
+          "status": "not fitted: Statcast contact cache does not contain an as-of lineup strikeout-rate signal"
+        }
+      }
     }
   },
   "prob_shrink": {
@@ -3580,7 +3614,7 @@
     "props": 0.0,
     "bullpen": 1.115,
     "bvp": 0.0,
-    "_note": "moneyline/spreads/run_scale/bullpen/totals fit from 2021,2022,2023,2024 (7915 games, 7911 w/ bullpen); moneyline & spreads use the innings-weighted edge; props/bvp still 0.",
+    "_note": "moneyline/spreads/run_scale/bullpen/totals fit from 2021,2022,2023,2024 (7915 games, 7911 w/ bullpen); props remain 0 after a chronological 2024 holdout selected no matchup adjustment for batter hits, pitcher outs, or earned runs; pitcher strikeouts lacked a leakage-safe as-of K-rate signal.",
     "spreads": 5.261
   }
 }

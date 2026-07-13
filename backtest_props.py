@@ -22,8 +22,9 @@ weight transfers to runtime:
     as-of features, so the exact same clamp/shape/weight semantics apply.
 
 For each candidate weight w we recompute adjusted_proj = base_proj * mult(w)
-and score projection accuracy (MAE / RMSE of actual − adjusted_proj). The w
-that minimises pooled error is the projection-accuracy-optimal `props` weight.
+and score projection accuracy (MAE / RMSE of actual − adjusted_proj). Weight
+selection uses the earlier observations and must still improve MAE on a later
+chronological holdout before a nonzero `props` weight can be saved.
 
 LEAKAGE-SAFE MATCHUP COVERAGE (what we can build from Statcast contact data):
   * batter_hits          → opposing STARTER as-of xwOBAcon  (EXACT runtime
@@ -359,7 +360,7 @@ def build_pitcher_obs(prop_key, seasons, league_by_season, hands_by_season,
                                 "ops": analysis._MLB_LEAGUE["ops"] * ratio,
                                 "k_pct": None}}}
                     if feat is not None:
-                        obs.append((base, actual, is_home, feat))
+                        obs.append((base, actual, is_home, feat, date))
                 # prepend newest for most-recent-first ordering
                 vals.insert(0, actual)
         if verbose:
@@ -404,7 +405,7 @@ def build_batter_obs(prop_key, seasons, pitcher_index_by_season, top_n,
                             opp_side = "away" if is_home else "home"
                             feat = {opp_side: {"starter": {"xwoba": sx}}}
                     if feat is not None:
-                        obs.append((base, actual, is_home, feat))
+                        obs.append((base, actual, is_home, feat, date))
                 vals.insert(0, actual)
         if verbose:
             print(f"  {prop_key} {season}: pooled {len(obs)} obs so far")
@@ -429,7 +430,7 @@ def _score(obs, prop_key, weight):
     if not obs:
         return None, None
     se = ae = 0.0
-    for base, actual, is_home, feat in obs:
+    for base, actual, is_home, feat, *_ in obs:
         mult = analysis._mlb_prop_matchup_mult(prop_key, is_home, feat, weight)
         adj = base * mult
         d = actual - adj
@@ -457,7 +458,7 @@ def _signal_corr(obs, prop_key):
     projection residual (actual − base). Confirms the signal points the right
     way before we trust the weight."""
     raws, resids = [], []
-    for base, actual, is_home, feat in obs:
+    for base, actual, is_home, feat, *_ in obs:
         m1 = analysis._mlb_prop_matchup_mult(prop_key, is_home, feat, 1.0)
         raws.append(m1 - 1.0)
         resids.append(actual - base)
@@ -466,6 +467,11 @@ def _signal_corr(obs, prop_key):
 
 def fit(seasons, props, top_n=120, do_save=False):
     seasons_str = ",".join(str(s) for s in seasons)
+    # Multiple seasons: fit on all earlier seasons and hold out the latest one.
+    # One season: use a July 1 boundary, matching the regular-season first/second
+    # half split used for the committed 2024 validation.
+    holdout_start = (f"{max(seasons)}-01-01" if len(seasons) > 1
+                     else f"{seasons[0]}-07-01")
 
     # Preload per-season Statcast rows once, then build as-of indices (prefix
     # sums) so each matchup lookup is O(log n) instead of a full-season scan.
@@ -501,53 +507,85 @@ def fit(seasons, props, top_n=120, do_save=False):
         else:
             obs = build_batter_obs(prop_key, seasons,
                                    pitcher_index_by_season, top_n)
-        if len(obs) < 100:
-            print(f"  [skip] {prop_key}: only {len(obs)} usable obs.")
+        train_obs = [o for o in obs if len(o) > 4 and o[4] < holdout_start]
+        holdout_obs = [o for o in obs if len(o) > 4 and o[4] >= holdout_start]
+        if len(train_obs) < 100 or len(holdout_obs) < 100:
+            print(f"  [skip] {prop_key}: train={len(train_obs)}, "
+                  f"holdout={len(holdout_obs)} (need 100 each).")
             continue
-        corr = _signal_corr(obs, prop_key)
-        scores = {w: _score(obs, prop_key, w) for w in WEIGHT_GRID}
-        per_prop[prop_key] = {"obs": len(obs), "corr": corr, "scores": scores}
+        corr = _signal_corr(train_obs, prop_key)
+        train_scores = {w: _score(train_obs, prop_key, w) for w in WEIGHT_GRID}
+        holdout_scores = {w: _score(holdout_obs, prop_key, w) for w in WEIGHT_GRID}
+        per_prop[prop_key] = {
+            "train_n": len(train_obs),
+            "holdout_n": len(holdout_obs),
+            "corr": corr,
+            "train_scores": train_scores,
+            "holdout_scores": holdout_scores,
+        }
 
     if not per_prop:
         print("\nNo props produced a usable fit.")
         return
 
     # ── report ──
-    print(f"\n=== props matchup fit — {seasons_str} ===")
-    print(f"{'prop':<22}{'n':>7}{'sig_corr':>10}  MAE by weight "
+    print(f"\n=== props matchup chronological fit — {seasons_str} ===")
+    print(f"holdout starts {holdout_start}")
+    print(f"{'prop':<22}{'fit':>7}{'test':>7}{'sig_corr':>10}  FIT MAE by weight "
           f"(0 / .25 / .5 / .75 / 1)")
-    best_w_votes = Counter()
-    pooled_mae = defaultdict(lambda: [0.0, 0])  # w -> [sum(mae*n), sum(n)]
+    pooled_train = defaultdict(lambda: [0.0, 0])
+    pooled_holdout = defaultdict(lambda: [0.0, 0])
     for prop_key, r in per_prop.items():
-        maes = [r["scores"][w][0] for w in WEIGHT_GRID]
+        maes = [r["train_scores"][w][0] for w in WEIGHT_GRID]
         base_mae = maes[0]
-        best_w = min(WEIGHT_GRID, key=lambda w: r["scores"][w][0])
-        best_w_votes[best_w] += 1
+        best_w = min(WEIGHT_GRID, key=lambda w: r["train_scores"][w][0])
         mae_str = " / ".join(f"{m:.3f}" for m in maes)
-        gain = (base_mae - r["scores"][best_w][0]) / base_mae * 100 if base_mae else 0
-        print(f"{prop_key:<22}{r['obs']:>7}{r['corr']:>+10.3f}  {mae_str}")
-        print(f"{'':22}{'':7}{'':10}  best w={best_w} "
-              f"({'MAE −' + format(gain, '.2f') + '%' if gain > 0 else 'no gain'})")
+        fit_gain = ((base_mae - r["train_scores"][best_w][0]) / base_mae * 100
+                    if base_mae else 0)
+        holdout_base = r["holdout_scores"][0.0][0]
+        holdout_selected = r["holdout_scores"][best_w][0]
+        holdout_gain = ((holdout_base - holdout_selected) / holdout_base * 100
+                        if holdout_base else 0)
+        print(f"{prop_key:<22}{r['train_n']:>7}{r['holdout_n']:>7}"
+              f"{r['corr']:>+10.3f}  {mae_str}")
+        print(f"{'':46}  selected w={best_w}; fit MAE {fit_gain:+.2f}%; "
+              f"holdout {holdout_base:.3f} → {holdout_selected:.3f} "
+              f"({holdout_gain:+.2f}%)")
         for w in WEIGHT_GRID:
-            pooled_mae[w][0] += r["scores"][w][0] * r["obs"]
-            pooled_mae[w][1] += r["obs"]
+            pooled_train[w][0] += r["train_scores"][w][0] * r["train_n"]
+            pooled_train[w][1] += r["train_n"]
+            pooled_holdout[w][0] += r["holdout_scores"][w][0] * r["holdout_n"]
+            pooled_holdout[w][1] += r["holdout_n"]
 
-    pooled = {w: pooled_mae[w][0] / pooled_mae[w][1] for w in WEIGHT_GRID}
-    chosen = min(WEIGHT_GRID, key=lambda w: pooled[w])
-    base_pooled = pooled[0.0]
-    gain = (base_pooled - pooled[chosen]) / base_pooled * 100 if base_pooled else 0
-    print(f"\npooled MAE: " + " / ".join(f"{pooled[w]:.3f}" for w in WEIGHT_GRID))
-    print(f"chosen props weight = {chosen} "
-          f"({'pooled MAE −' + format(gain, '.2f') + '%' if gain > 0 else 'no net gain → 0.0'})")
-    if gain <= 0:
+    pooled_fit = {w: pooled_train[w][0] / pooled_train[w][1] for w in WEIGHT_GRID}
+    pooled_test = {w: pooled_holdout[w][0] / pooled_holdout[w][1] for w in WEIGHT_GRID}
+    chosen = min(WEIGHT_GRID, key=lambda w: pooled_fit[w])
+    fit_gain = ((pooled_fit[0.0] - pooled_fit[chosen]) / pooled_fit[0.0] * 100
+                if pooled_fit[0.0] else 0)
+    holdout_gain = ((pooled_test[0.0] - pooled_test[chosen]) / pooled_test[0.0] * 100
+                    if pooled_test[0.0] else 0)
+    all_props_improve = all(
+        r["holdout_scores"][chosen][0] < r["holdout_scores"][0.0][0]
+        for r in per_prop.values()
+    ) if chosen != 0.0 else False
+    print("\npooled FIT MAE: " + " / ".join(f"{pooled_fit[w]:.3f}" for w in WEIGHT_GRID))
+    print("pooled HOLDOUT MAE: " + " / ".join(f"{pooled_test[w]:.3f}" for w in WEIGHT_GRID))
+    print(f"fit-selected props weight = {chosen}; fit gain={fit_gain:+.2f}%; "
+          f"holdout gain={holdout_gain:+.2f}%; "
+          f"every prop improved={all_props_improve}")
+    if (chosen == 0.0 or fit_gain <= 0 or holdout_gain <= 0
+            or not all_props_improve):
+        print("nonzero shared weight did not improve fit, pooled holdout, and "
+              "every prop holdout → keeping 0.0")
         chosen = 0.0
 
     if do_save:
         cur = load_starter_adjustment("baseball_mlb") or {}
         cur["props"] = round(float(chosen), 3)
         methodB = [p for p in per_prop if _prop_method(p) == "B"]
-        note = (f"props weight {chosen} fit from {seasons_str} "
-                f"(batter/pitcher matchup MAE); ")
+        note = (f"props weight {chosen} fit from {seasons_str}; chronological "
+                f"holdout starts {holdout_start} (fit gain {fit_gain:+.2f}%, "
+                f"holdout gain {holdout_gain:+.2f}%); ")
         if methodB:
             note += (f"WARNING: re-fit residual_* for {','.join(methodB)} "
                      f"(method B) before trusting — fit at mult=1.")
@@ -556,7 +594,8 @@ def fit(seasons, props, top_n=120, do_save=False):
         cur["_note"] = note
         save_starter_adjustment("baseball_mlb", cur,
                                 meta={"source": f"backtest_props:{seasons_str}",
-                                      "fit": True})
+                                      "fit": True,
+                                      "holdout_start": holdout_start})
         print(f"\nsaved starter_adjustment.props = {chosen}")
         if methodB:
             print("NOTE:", note)

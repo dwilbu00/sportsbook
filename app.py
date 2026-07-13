@@ -26,6 +26,7 @@ from odds_client import (
     get_remaining_credits,
     is_event_cached,
     american_to_decimal,
+    american_to_implied_prob,
     PLAYER_PROPS_BY_SPORT,
     PLAYER_PROP_ALTS_BY_SPORT,
     TEAM_ALT_MARKETS,
@@ -37,9 +38,10 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
     """Pull alternate-line prices for the events that produced value bets
     in `ar` (the cached analysis_results dict) and mutate `ar` in place so
     safe-mode props get real alt prices, ladders are attached for display,
-    and safe-mode props without an actual DK alt line are filtered out.
+    and safe-mode props without an actual DK alt line or enough price-adjusted
+    edge are filtered out.
 
-    Returns (alt_credits_used, warnings, removed_no_alt).
+    Returns (alt_credits_used, warnings, removed_no_alt, removed_no_value).
     """
     all_props = ar["all_props"]
     all_spreads = ar["all_spreads"]
@@ -72,7 +74,13 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
     alt_credits_used = 0
     warnings = []
     if not needed_alts:
-        return alt_credits_used, warnings, 0
+        # A safe prop whose market has no Odds API alternate-market mapping
+        # (currently including pitcher outs) cannot be price-verified, so do
+        # not surface it as a value recommendation.
+        removed_no_alt = sum(1 for c in all_props if c.get("safe_mode"))
+        ar["all_props"] = [c for c in all_props if not c.get("safe_mode")]
+        ar["alts_applied"] = True
+        return alt_credits_used, warnings, removed_no_alt, 0
 
     bookmakers = bookmakers_str.split(",") if bookmakers_str else None
     with ThreadPoolExecutor(max_workers=10) as pool:
@@ -105,6 +113,17 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
         if match and match.get("over_price") is not None:
             c["safe_alt_price"] = match["over_price"]
             c["safe_alt_line"] = match["line"]
+            model_prob = c.get("model_hit_at_safe", 0.0) / 100.0
+            implied_prob = american_to_implied_prob(match["over_price"])
+            edge = model_prob - implied_prob
+            expected_roi = model_prob * american_to_decimal(match["over_price"]) - 1.0
+            c["safe_alt_implied"] = round(implied_prob * 100, 2)
+            c["safe_alt_edge_pct"] = round(edge * 100, 2)
+            c["edge_pct"] = round(edge * 100, 2)
+            c["expected_roi_pct"] = round(expected_roi * 100, 2)
+            c["best_price"] = match["over_price"]
+            c["value_pending"] = False
+            c["is_value"] = edge >= (ar.get("threshold_pct", 5.0) / 100.0)
         if ladder:
             c["alt_ladder"] = ladder
 
@@ -123,12 +142,17 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
             if ladder:
                 c["alt_ladder"] = ladder
 
-    # Filter out safe-mode props without an actual DK alt line.
+    # Filter out safe-mode props without an actual DK alt line or without the
+    # same minimum model-vs-price edge required by standard recommendations.
     removed_no_alt = 0
+    removed_no_value = 0
     filtered_props = []
     for c in all_props:
         if c.get("safe_mode") and c.get("safe_alt_price") is None:
             removed_no_alt += 1
+            continue
+        if c.get("safe_mode") and not c.get("is_value"):
+            removed_no_value += 1
             continue
         filtered_props.append(c)
     ar["all_props"] = filtered_props
@@ -136,7 +160,7 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
     ar["alt_credits"] = ar.get("alt_credits", 0) + alt_credits_used
     ar["total_cost"] = ar.get("total_cost", 0) + alt_credits_used
     ar["alts_applied"] = True
-    return alt_credits_used, warnings, removed_no_alt
+    return alt_credits_used, warnings, removed_no_alt, removed_no_value
 
 
 def _prop_prob_fn(candidate, direction="over"):
@@ -177,8 +201,8 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
     'over', show OVER price column; if 'under', show UNDER; if 'both', show both.
     `line_style`: 'decimal' (e.g. 24.5), 'spread' (signed, e.g. -3.5), or
     'threshold' (player-prop N+ form, e.g. 2.5 → '3+').
-    `prob_fn`: optional callable (line) → percentage (0–100) that adds a
-    'Prob @ Line' column between Price and Payout (single-direction tables only)."""
+    `prob_fn`: optional callable (line) → weighted historical percentage (0–100)
+    that adds a history column (single-direction tables only)."""
     import math
     if not ladder:
         return
@@ -212,7 +236,7 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
                 row["Price"] = f"{op:+d}" if op is not None else "—"
                 if prob_fn is not None:
                     p = prob_fn(entry["line"])
-                    row["Prob @ Line"] = f"{p:.1f}%" if p is not None else "—"
+                    row["Historical @ Line"] = f"{p:.1f}%" if p is not None else "—"
                 row["Payout on $10"] = _payout(op)
         if direction in ("under", "both"):
             up = entry.get("under_price")
@@ -223,7 +247,7 @@ def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_
                 row["Price"] = f"{up:+d}" if up is not None else "—"
                 if prob_fn is not None:
                     p = prob_fn(entry["line"])
-                    row["Prob @ Line"] = f"{p:.1f}%" if p is not None else "—"
+                    row["Historical @ Line"] = f"{p:.1f}%" if p is not None else "—"
                 row["Payout on $10"] = _payout(up)
         rows.append(row)
     st.caption(f"**{title}**")
@@ -433,6 +457,203 @@ def render_value_badge(edge_pct):
         st.markdown(f":red[{edge_pct}%]")
 
 
+def render_model_guide():
+    """Render model definitions and committed chronological-backtest results."""
+    st.title("📘 Model Guide & Performance")
+    st.caption(
+        "How recommendations are calculated, what each number means, and the "
+        "validation evidence currently committed with the production model."
+    )
+
+    st.warning(
+        "Backtests estimate historical performance; they do not guarantee future "
+        "results. Sportsbook prices, injuries, lineups, and player roles can change "
+        "after an analysis is run."
+    )
+
+    overview_tab, performance_tab, safe_tab, mlb_tab = st.tabs([
+        "How predictions work",
+        "Backtest performance",
+        "Safe Mode",
+        "MLB xStats",
+    ])
+
+    with overview_tab:
+        st.subheader("The four numbers to compare on every recommendation")
+        st.markdown(
+            """
+            - **Model probability** — the calibrated probability that this exact bet wins.
+            - **Book implied probability** — the break-even probability encoded by the offered American price, including vig.
+            - **Edge** — `model probability − book implied probability`, measured in percentage points.
+            - **Expected ROI** — `model probability × decimal odds − 1`; the modeled average profit or loss per dollar staked.
+
+            A positive edge is necessary for a value recommendation. The standard
+            recommendation threshold is **+5 percentage points**. A high hit probability
+            alone is not value if the price is too expensive, and a high projected average
+            does not by itself determine the chance of clearing a line.
+            """
+        )
+        st.info(
+            "Projected average is the center of the modeled stat distribution—not a "
+            "guaranteed result and not the same thing as hit probability. A 1.2-hit "
+            "average can still produce a meaningful probability of 2+ hits because the "
+            "full discrete game-to-game distribution determines the bet."
+        )
+        st.markdown(
+            """
+            **Team markets** use recency- and venue-weighted scoring/margin histories,
+            coherent Normal margin distributions, probability shrinkage, and sport-specific
+            matchup features. **Player props** add reliability filtering, residual-distribution
+            calibration, warmup blending, and—when enough resolved live predictions exist—
+            Platt recalibration. **Parlays** estimate a joint probability with a Gaussian
+            copula rather than blindly multiplying independent probabilities.
+            """
+        )
+
+    calibration_blobs = {}
+    sport_names = {
+        "baseball_mlb": "MLB",
+        "basketball_nba": "NBA",
+        "americanfootball_nfl": "NFL",
+    }
+    for sport_key, sport_name in sport_names.items():
+        path = os.path.join(SCRIPT_DIR, "calibration", f"{sport_key}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                calibration_blobs[sport_key] = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            calibration_blobs[sport_key] = {}
+
+    with performance_tab:
+        st.subheader("Player-prop chronological calibration scores")
+        st.markdown(
+            "Each prop's probability method and tuning variant were selected by fitting "
+            "the earlier 50% of observations and scoring the later 50%. Accuracy is the "
+            "percentage of later-period outcomes for which the model put the correct side above "
+            "50%. Brier score evaluates the probability itself (lower is better; 0.25 is "
+            "the uninformative score for a balanced 50/50 forecast). Because that later "
+            "period also selected the production variant, these are model-selection "
+            "scores—not an untouched final deployment audit."
+        )
+        prop_rows = []
+        for sport_key, sport_name in sport_names.items():
+            blob = calibration_blobs.get(sport_key, {})
+            fit_date = (blob.get("fit_timestamp") or "")[:10] or "Not recorded"
+            for prop_key, cfg in (blob.get("props") or {}).items():
+                prop_rows.append({
+                    "Sport": sport_name,
+                    "Prediction": PROP_LABELS.get(prop_key, prop_key.replace("_", " ").title()),
+                    "Chronological accuracy": (
+                        f"{cfg['fit_hit_pct']:.2f}%"
+                        if cfg.get("fit_hit_pct") is not None else "Not exported"
+                    ),
+                    "Chronological Brier": (
+                        f"{cfg['fit_brier']:.4f}"
+                        if cfg.get("fit_brier") is not None else "Not exported"
+                    ),
+                    "Probability method": cfg.get("method", "—"),
+                    "Full fit observations": cfg.get("n_obs", "—"),
+                    "Calibration date": fit_date,
+                })
+        if prop_rows:
+            st.dataframe(prop_rows, hide_index=True, width="stretch")
+        else:
+            st.info("No committed player-prop calibration summaries were found.")
+
+        st.subheader("Team-market validation status")
+        team_rows = []
+        market_labels = {
+            "moneyline": "Moneyline",
+            "spreads": "Spread",
+            "totals": "Total",
+        }
+        for sport_key, sport_name in sport_names.items():
+            blob = calibration_blobs.get(sport_key, {})
+            shrink = blob.get("prob_shrink") or {}
+            source = ((blob.get("meta") or {}).get("prob_shrink") or {}).get("source")
+            for market_key, market_label in market_labels.items():
+                team_rows.append({
+                    "Sport": sport_name,
+                    "Prediction": market_label,
+                    "Backtest calibration": source or "No committed odds-fit metadata",
+                    "Probability shrink": shrink.get(market_key, "Not fitted"),
+                    "Published holdout accuracy": "Not exported",
+                })
+        st.dataframe(team_rows, hide_index=True, width="stretch")
+        st.caption(
+            "The team-market calibration files currently persist fitted shrink weights but "
+            "not the complete scored holdout report. The app says ‘Not exported’ rather "
+            "than presenting an unsupported accuracy percentage."
+        )
+
+    with safe_tab:
+        st.subheader("Safe Mode uses confidence and price—neither one overrides the other")
+        st.markdown(
+            """
+            1. Filter unreliable or post-layoff player histories.
+            2. Build the same adjusted projection used by standard player props.
+            3. Apply the same residual, early-season warmup, and Platt probability calibration.
+            4. Find the highest integer threshold whose calibrated model probability reaches the selected confidence target.
+            5. Require the weighted historical hit rate to be within 5 percentage points of that target.
+            6. Fetch the exact DraftKings alternate-line price.
+            7. Recommend the bet only when `model probability − actual alt-price implied probability ≥ 5 percentage points`.
+
+            High-confidence `1+` floors are rejected above an 80% target, and thresholds
+            that collapse below half the standard book line are rejected. Value Parlays
+            rank price-verified legs by correlation-adjusted expected return; Safe Parlays
+            prioritize joint hit probability among those same positive-edge legs.
+            """
+        )
+
+    with mlb_tab:
+        st.subheader("MLB expected-stat and matchup features")
+        st.markdown(
+            "xERA/xwOBA, starter quality, handedness splits, lineup quality, and bullpen "
+            "suppression are active inputs for MLB team markets. Player-prop matchup "
+            "effects are separately gated because a useful baseball feature can still "
+            "make a specific prop projection worse."
+        )
+        holdout = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})
+                   .get("prop_matchup_holdout") or {})
+        holdout_rows = []
+        for prop_key, result in (holdout.get("results") or {}).items():
+            if result.get("status"):
+                holdout_rows.append({
+                    "Prediction": PROP_LABELS.get(prop_key, prop_key),
+                    "Fit observations": "—",
+                    "Holdout observations": "—",
+                    "Selected weight": result.get("selected_weight", 0.0),
+                    "Holdout MAE": "Not tested",
+                    "Decision": result["status"],
+                })
+                continue
+            baseline = result.get("baseline_mae")
+            selected = result.get("selected_mae")
+            holdout_rows.append({
+                "Prediction": PROP_LABELS.get(prop_key, prop_key),
+                "Fit observations": result.get("fit_n", "—"),
+                "Holdout observations": result.get("holdout_n", "—"),
+                "Selected weight": result.get("selected_weight", 0.0),
+                "Holdout MAE": (
+                    f"{baseline:.5f} → {selected:.5f}"
+                    if baseline is not None and selected is not None else "Not exported"
+                ),
+                "Decision": "Disabled—training selected no matchup adjustment",
+            })
+        if holdout_rows:
+            st.dataframe(holdout_rows, hide_index=True, width="stretch")
+            st.caption(
+                f"Source: {holdout.get('source', 'committed calibration metadata')}; "
+                f"holdout: {holdout.get('holdout_window', 'not recorded')}."
+            )
+        st.info(
+            "Current result: the player-prop matchup weight remains **0.0**. Batter hits, "
+            "pitcher outs, and earned runs did not improve on the chronological test. "
+            "Pitcher strikeouts remain disabled because the historical contact cache "
+            "cannot reproduce the live lineup K-rate feature without leakage or guessing."
+        )
+
+
 # ──────────────────────────────────────────────────────────
 #  Page Config
 # ──────────────────────────────────────────────────────────
@@ -442,6 +663,17 @@ st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layou
 #  First-run setup check
 # ──────────────────────────────────────────────────────────
 config = load_config()
+
+with st.sidebar:
+    app_page = st.radio(
+        "Navigate",
+        ["🎯 Value Finder", "📘 Model Guide & Performance"],
+        key="app_page",
+    )
+
+if app_page == "📘 Model Guide & Performance":
+    render_model_guide()
+    st.stop()
 
 if needs_setup(config):
     st.title("🎯 Sportsbook Value Finder")
@@ -503,9 +735,11 @@ with st.sidebar:
         value=False,
         key="safe_mode",
         help=(
-            "OVER-only player props. Uses per-player weighted-quantile alt "
-            "lines (whole numbers, e.g. 'Points 8+') derived from each "
-            "player's recent-game distribution at the chosen confidence."
+            "OVER-only player props. Uses calibrated per-player lower bounds "
+            "(whole numbers, e.g. 'Points 8+') derived from each player's "
+            "weighted recent-game distribution at the chosen confidence. "
+            "The exact alt price is fetched automatically; a pick is shown only "
+            "when it also clears the normal value-edge threshold at that price."
         ),
     )
     if safe_mode:
@@ -532,6 +766,8 @@ with st.sidebar:
             "(value-bet event × alt market) — typically a small add-on. "
             "Toggling this ON while viewing an analysis pulls alts for the "
             "current results without re-running the full analysis."
+            " Safe Mode always fetches its suggested alt prices regardless of "
+            "this display toggle."
         ),
     )
 
@@ -678,7 +914,7 @@ if "parlay_results" in st.session_state:
         caption_text = "Prioritizing highest probability of hitting with positive edge"
     elif display == "sa_value":
         mode_label = "⚡ Aggressive Alt Lines"
-        caption_text = "Alt-line legs already clear your confidence threshold, so ranked purely by DK payout — picks the bets that pay the most."
+        caption_text = "Confidence-qualified, price-verified alt-line legs ranked by correlation-adjusted expected return."
     elif effective_mode == "safe":  # regular analysis + Safe button
         mode_label = "🛡️ Safe"
         caption_text = "Prioritizing highest joint probability of hitting across positive-edge legs"
@@ -700,15 +936,12 @@ if "parlay_results" in st.session_state:
             payout_label_str = f"${total_payout:.2f}"
 
             # Expander headline
-            if display == "sa_safe":
-                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  DK Payout: {payout_label_str}"
-            elif display == "sa_value":
-                headline = f"Hit Prob: {p['combined_hist_prob']}%  |  DK Payout: {payout_label_str}"
-            else:  # regular
-                pe = p.get("parlay_edge_pct")
-                pe_str = f"{pe:+.2f}%" if pe is not None else "n/a"
-                headline = (f"Hit Prob: {p['combined_hist_prob']}%  |  "
-                            f"Parlay Edge: {pe_str}  |  DK Payout: {payout_label_str}")
+            pe = p.get("parlay_edge_pct")
+            pe_str = f"{pe:+.2f}%" if pe is not None else "n/a"
+            headline = (f"Hit Prob: {p['combined_hist_prob']}%  |  "
+                        f"Parlay Edge: {pe_str}  |  "
+                        f"Expected ROI: {p.get('expected_roi_pct', 0):+.2f}%  |  "
+                        f"DK Payout: {payout_label_str}")
 
             with st.expander(
                 f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
@@ -718,11 +951,15 @@ if "parlay_results" in st.session_state:
                     prob_pct = min(round(leg["hist_prob"] * 100, 2), 99.99)
                     price_str = (f"  ({leg['odds_price']:+d})"
                                  if leg.get("odds_price") else "")
+                    leg_ev = (leg["hist_prob"] * american_to_decimal(leg["odds_price"]) - 1.0) * 100 \
+                        if leg.get("odds_price") is not None else None
+                    leg_ev_str = f"  |  Expected ROI: {leg_ev:+.2f}%" if leg_ev is not None else ""
 
                     if display == "sa_safe":
                         st.markdown(
                             f"**Leg {i}:** {leg['label']}  —  "
-                            f"Prob: {prob_pct}%  |  Δ vs book line: +{leg['edge_pct']}%"
+                            f"Prob: {prob_pct}%  |  Edge: {leg['edge_pct']:+.2f}%"
+                            + leg_ev_str
                             + price_str
                         )
                     elif display == "sa_value":
@@ -734,20 +971,23 @@ if "parlay_results" in st.session_state:
                                 f"Prob: {prob_pct}%  |  "
                                 f"Book line: {leg.get('book_line')}  |  "
                                 f"Suggested: {leg.get('safe_threshold')}+  |  "
-                                f"Gap: {gap:+.2f}"
+                                f"Edge: {leg['edge_pct']:+.2f}%"
+                                + leg_ev_str
                                 + price_str
                             )
                         else:
                             # Non-safe leg (ML / spread / total)
                             st.markdown(
                                 f"**Leg {i}:** {leg['label']}  —  "
-                                f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
+                                f"Prob: {prob_pct}%  |  Edge: {leg['edge_pct']:+.2f}%"
+                                + leg_ev_str
                                 + price_str
                             )
                     else:  # regular
                         st.markdown(
                             f"**Leg {i}:** {leg['label']}  —  "
-                            f"Prob: {prob_pct}%  |  Edge: +{leg['edge_pct']}%"
+                            f"Prob: {prob_pct}%  |  Edge: {leg['edge_pct']:+.2f}%"
+                            + leg_ev_str
                             + price_str
                         )
 
@@ -767,19 +1007,22 @@ if "parlay_results" in st.session_state:
                                 if p.get("parlay_american_odds") is not None else "on $10")
 
                 if display == "sa_safe":
-                    cols = st.columns(4)
+                    cols = st.columns(7)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit at their suggested safe thresholds, adjusted for sport-specific correlations between legs.",
                     )
-                    cols[2].metric(
+                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[3].metric("Parlay Edge", f"{p['parlay_edge_pct']:+.2f}%")
+                    cols[4].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
+                    cols[5].metric(
                         "Hit Prob (no correlation)",
                         f"{p['combined_hist_prob_indep']}%",
                         help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
                     )
-                    cols[3].metric(
+                    cols[6].metric(
                         "DK Payout",
                         payout_label_str,
                         delta=payout_delta,
@@ -787,14 +1030,17 @@ if "parlay_results" in st.session_state:
                         help=payout_help,
                     )
                 elif display == "sa_value":
-                    cols = st.columns(3)
+                    cols = st.columns(6)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit at their suggested thresholds, adjusted for sport-specific correlations.",
                     )
-                    cols[2].metric(
+                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[3].metric("Parlay Edge", f"{p['parlay_edge_pct']:+.2f}%")
+                    cols[4].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
+                    cols[5].metric(
                         "DK Payout",
                         payout_label_str,
                         delta=payout_delta,
@@ -802,25 +1048,26 @@ if "parlay_results" in st.session_state:
                         help=payout_help,
                     )
                 else:  # regular analysis (either button)
-                    cols = st.columns(5)
+                    cols = st.columns(7)
                     cols[0].metric("Legs", size)
                     cols[1].metric(
                         "Hit Probability",
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit, adjusted for sport-specific correlations between legs.",
                     )
-                    cols[2].metric(
+                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[3].metric(
                         "Hit Prob (no correlation)",
                         f"{p['combined_hist_prob_indep']}%",
                         help="Naive product of each leg's probability, assuming legs are independent. Compare against Hit Probability to see how much correlation between legs helps or hurts.",
                     )
-                    pe = p.get("parlay_edge_pct")
-                    cols[3].metric(
+                    cols[4].metric(
                         "Parlay Edge",
                         f"{pe:+.2f}%" if pe is not None else "n/a",
                         help="Joint hit probability minus the book's combined implied probability — the model's expected edge over the book on the full parlay.",
                     )
-                    cols[4].metric(
+                    cols[5].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
+                    cols[6].metric(
                         "DK Payout",
                         payout_label_str,
                         delta=payout_delta,
@@ -1076,11 +1323,14 @@ if analyze_clicked:
             return int(p + 0.5)
         target_pct = safe_target * 100
         for c in all_spreads:
-            c["is_value"] = _round1(c.get("cover_rate", 0)) >= target_pct
+            c["is_value"] = (c.get("is_value", False)
+                             and _round1(c.get("cover_rate", 0)) >= target_pct)
         for c in all_totals:
             ohr = c.get("over_hit_rate", 0)
-            c["is_over_value"] = _round1(ohr) >= target_pct
-            c["is_under_value"] = _round1(100 - ohr) >= target_pct
+            c["is_over_value"] = (c.get("is_over_value", False)
+                                  and _round1(ohr) >= target_pct)
+            c["is_under_value"] = (c.get("is_under_value", False)
+                                   and _round1(100 - ohr) >= target_pct)
 
     # Show any warnings that occurred during parallel fetches
     for w in warnings:
@@ -1101,6 +1351,7 @@ if analyze_clicked:
         "alt_credits": 0,
         "alt_data": {},
         "alts_applied": False,
+        "threshold_pct": threshold,
     }
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
@@ -1114,7 +1365,7 @@ if "analysis_results" in st.session_state:
     need_alts = fetch_alt_lines or any(c.get("safe_mode") for c in ar.get("all_props", []))
     if need_alts and not ar.get("alts_applied"):
         with st.spinner("Pulling alt-line prices for value-bet events..."):
-            alt_credits, alt_warnings, removed_no_alt = fetch_and_attach_alt_lines(
+            alt_credits, alt_warnings, removed_no_alt, removed_no_value = fetch_and_attach_alt_lines(
                 ar, api_key, ar["sport_key"], bookmakers_str
             )
         for w in alt_warnings:
@@ -1122,6 +1373,11 @@ if "analysis_results" in st.session_state:
         if removed_no_alt:
             st.warning(
                 f"Hid {removed_no_alt} alt-line prop(s) with no DK alt at the suggested threshold."
+            )
+        if removed_no_value:
+            st.info(
+                f"Hid {removed_no_value} alt-line prop(s) whose model edge was below "
+                f"the {ar.get('threshold_pct', 5.0):g}% minimum at the actual DK price."
             )
         # Clear cached parlays so they re-build using new alt prices.
         st.session_state.pop("parlay_results", None)
@@ -1173,14 +1429,17 @@ if "analysis_results" in st.session_state:
         if value_ml:
             st.success(f"**{len(value_ml)} value bet(s) found!**")
             for c in sorted(value_ml, key=lambda x: x["edge_pct"], reverse=True):
-                with st.expander(f"🔥 {c['team']} ({c['home_away']}) vs {c['opponent']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(5)
-                    cols[0].metric("Book Implied", f"{c['book_implied_prob']}%")
-                    cols[1].metric("Season Win%", f"{c['season_win_pct']}%")
-                    cols[2].metric("Recent Win%", f"{c['recent_win_pct']}%")
-                    cols[3].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d} at {c['best_book']}")
+                with st.expander(f"🔥 {c['team']} ({c['home_away']}) vs {c['opponent']}  —  Best edge: +{c['best_edge_pct']}%", expanded=True):
+                    cols = st.columns(7)
+                    cols[0].metric("Model Probability", f"{c['blended_prob']}%")
+                    cols[1].metric("Book Implied", f"{c['best_book_implied_prob']}%")
+                    cols[2].metric("Edge", f"{c['best_edge_pct']:+.2f}%",
+                                   delta=f"{c['best_price']:+d} at {c['best_book']}")
+                    cols[3].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
+                    cols[4].metric("Season Win%", f"{c['season_win_pct']}%")
+                    cols[5].metric("Recent Win%", f"{c['recent_win_pct']}%")
                     p_val, p_delta = _dk_payout_strs(c.get("best_price"))
-                    cols[4].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
+                    cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
                                    help="American odds and profit on a $10 bet at DraftKings.")
 
         if other_ml:
@@ -1191,8 +1450,9 @@ if "analysis_results" in st.session_state:
                         "Team": c["team"],
                         "Home/Away": c["home_away"],
                         "Book Implied": f"{c['book_implied_prob']}%",
-                        "Historical": f"{c['hist_prob']}%",
+                        "Model Probability": f"{c.get('blended_prob', c['hist_prob'])}%",
                         "Edge": f"{c['edge_pct']:+.2f}%",
+                        "Expected ROI": f"{c.get('expected_roi_pct', 0):+.2f}%",
                     })
                 st.table(rows)
 
@@ -1206,13 +1466,15 @@ if "analysis_results" in st.session_state:
             st.success(f"**{len(value_sp)} spread value bet(s) found!**")
             for c in sorted(value_sp, key=lambda x: x["edge_pct"], reverse=True):
                 with st.expander(f"🔥 {c['team']} {c['spread']:+.2f} ({c['home_away']})  —  Edge: +{c['edge_pct']}%", expanded=True):
-                    cols = st.columns(5)
+                    cols = st.columns(7)
                     cols[0].metric("Spread", f"{c['spread']:+.2f}")
-                    cols[1].metric("Avg Margin", f"{c['avg_margin']:+.2f}")
-                    cols[2].metric("Cover Rate", f"{c['cover_rate']}%")
-                    cols[3].metric("Edge", f"+{c['edge_pct']}%")
+                    cols[1].metric("Model Probability", f"{c['cover_rate']}%")
+                    cols[2].metric("Book Implied", f"{c['implied_prob']}%")
+                    cols[3].metric("Edge", f"{c['edge_pct']:+.2f}%")
+                    cols[4].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
+                    cols[5].metric("Projected Margin", f"{c['pred_game_margin']:+.2f}")
                     p_val, p_delta = _dk_payout_strs(c.get("price"))
-                    cols[4].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
+                    cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
                                    help="American odds and profit on a $10 bet at DraftKings.")
                     if fetch_alt_lines and c.get("alt_ladder"):
                         _render_alt_ladder(c["alt_ladder"], direction="over",
@@ -1227,8 +1489,11 @@ if "analysis_results" in st.session_state:
                     rows.append({
                         "Team": c["team"],
                         "Spread": f"{c['spread']:+.2f}",
-                        "Cover Rate": f"{c['cover_rate']}%",
+                        "Model Probability": f"{c['cover_rate']}%",
+                        "Book Implied": f"{c.get('implied_prob', 50.0)}%",
                         "Edge": f"{c['edge_pct']:+.2f}%",
+                        "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
+                                         if c.get("expected_roi_pct") is not None else "n/a"),
                     })
                 st.table(rows)
 
@@ -1246,19 +1511,33 @@ if "analysis_results" in st.session_state:
                 # Show the payout for whichever side is flagged value (default
                 # to OVER if neither, so the metric is informative).
                 if c.get("is_under_value"):
+                    side = "UNDER"
                     payout_price = c.get("under_price")
                     payout_label = "DK Payout (UNDER)"
+                    model_probability = 100.0 - c["over_hit_rate"]
+                    implied_probability = c.get("under_implied", 50.0)
+                    edge_pct = c.get("under_edge_pct", model_probability - implied_probability)
+                    expected_roi = c.get("under_expected_roi_pct")
                 else:
+                    side = "OVER"
                     payout_price = c.get("over_price")
                     payout_label = "DK Payout (OVER)"
+                    model_probability = c["over_hit_rate"]
+                    implied_probability = c.get("over_implied", 50.0)
+                    edge_pct = c.get("over_edge_pct", model_probability - implied_probability)
+                    expected_roi = c.get("over_expected_roi_pct")
                 p_val, p_delta = _dk_payout_strs(payout_price)
-                cols = st.columns(5)
+                cols = st.columns(7)
                 cols[0].metric("Line", c["line"])
                 cols[1].metric("Projected Total", c["projected_total"])
-                cols[2].metric("Diff from Line", f"{c['diff_from_line']:+.2f}")
-                cols[3].metric("Over Hit Rate", f"{c['over_hit_rate']}%")
-                cols[4].metric(payout_label, p_val, delta=p_delta, delta_color="off",
+                cols[2].metric(f"Model Probability ({side})", f"{model_probability:.2f}%")
+                cols[3].metric("Book Implied", f"{implied_probability:.2f}%")
+                cols[4].metric("Edge", f"{edge_pct:+.2f}%")
+                cols[5].metric("Expected ROI", (f"{expected_roi:+.2f}%"
+                                                 if expected_roi is not None else "n/a"))
+                cols[6].metric(payout_label, p_val, delta=p_delta, delta_color="off",
                                help="American odds and profit on a $10 bet at DraftKings.")
+                st.caption(f"Projected total minus book line: {c['diff_from_line']:+.2f}")
                 # Merge OVER and UNDER alt ladders by line so the table shows
                 # both prices side-by-side.
                 if fetch_alt_lines:
@@ -1291,16 +1570,14 @@ if "analysis_results" in st.session_state:
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
 
-            # Safe-mode bets already pass the confidence filter, so rank
-            # them purely by decimal payout (best price first). Stash
-            # alt_payout on the candidate so the title can show it.
-            # Non-safe bets fall back to edge_pct.
+            # Safe-mode bets pass both the confidence and actual-price value
+            # filters. Rank them by expected return, not by long payout alone.
             def _safe_sort_key(c):
                 if c.get("safe_mode") and c.get("safe_alt_price") is not None:
                     dec = american_to_decimal(c["safe_alt_price"])
                     c["alt_payout"] = dec
-                    return dec
-                return c.get("line_gap", c["edge_pct"]) / 100.0
+                    return c.get("expected_roi_pct", float("-inf"))
+                return c.get("expected_roi_pct", c["edge_pct"])
 
             sorted_props = sorted(value_props, key=_safe_sort_key, reverse=True)
             for c in sorted_props:
@@ -1318,23 +1595,25 @@ if "analysis_results" in st.session_state:
                     if c.get("alt_payout") is not None:
                         payout_str = f"  Pays: ${c['alt_payout']*10:.2f}  |"
                     title = (f"🎯 {c['player']} — {_safe_label(c)}  "
-                             f"[{tag}]{payout_str}  book line: {c['line']}")
+                             f"[{tag}]  Edge: {c['edge_pct']:+.2f}%  |{payout_str}  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
-                        cols = st.columns(6)
+                        cols = st.columns(8)
                         cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
                         cols[1].metric(
-                            "Prob @ Suggested",
+                            "Model Probability",
                             f"{c['model_hit_at_safe']}%",
                         )
                         cols[2].metric(
-                            "Prob @ Book Line",
-                            f"{c['model_hit_at_line']}%",
+                            "Book Implied",
+                            f"{c['safe_alt_implied']}%",
                         )
                         cols[3].metric(
-                            "Δ (safe − book)",
-                            f"{c['model_delta']:+.2f}%",
+                            "Edge",
+                            f"{c['edge_pct']:+.2f}%",
                         )
-                        cols[4].metric("Avg Stat", c["avg_stat"])
+                        cols[4].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
+                        cols[5].metric("Projected Average", c["avg_stat"])
+                        cols[6].metric("Weighted History", f"{c['historical_hit_at_safe']}%")
                         # Prefer real alt-line price when we fetched alts; fall
                         # back to the book-line price with a caveat.
                         if c.get("safe_alt_price") is not None:
@@ -1345,11 +1624,12 @@ if "analysis_results" in st.session_state:
                             p_val, p_delta = _dk_payout_strs(c.get("over_price"))
                             payout_label = "DK Payout (book line)"
                             payout_help = "Payout for the OVER at the standard book line. Alt-line fetch is disabled or no alt was offered at the suggested threshold — DK's actual alt price will differ."
-                        cols[5].metric(payout_label, p_val, delta=p_delta,
+                        cols[7].metric(payout_label, p_val, delta=p_delta,
                                        delta_color="off", help=payout_help)
                         st.caption(
                             f"Matchup: {c['matchup']}"
-                            f"  |  Predicted line: {c['avg_stat']}"
+                            f"  |  Projected average: {c['avg_stat']}"
+                            f"  |  Model probability at book line: {c['model_hit_at_line']}%"
                             f"  |  Line gap: {c['line_gap']:+.2f}"
                         )
                         if fetch_alt_lines and c.get("alt_ladder"):
@@ -1360,17 +1640,21 @@ if "analysis_results" in st.session_state:
                                                prob_fn=_prop_prob_fn(c, "over"))
                 else:
                     hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
+                    implied_prob = (c["over_implied"] if c["direction"] == "OVER"
+                                    else c["under_implied"])
                     bet_price = (c.get("over_price") if c["direction"] == "OVER"
                                  else c.get("under_price"))
                     with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
-                        cols = st.columns(6)
+                        cols = st.columns(8)
                         cols[0].metric("Line", c["line"])
-                        cols[1].metric("Avg Stat", c["avg_stat"])
-                        cols[2].metric(f"{c['direction']} Hit Prob", f"{hit_prob}%")
-                        cols[3].metric("Direction", c["direction"])
-                        cols[4].metric("Edge", f"+{c['edge_pct']}%", delta=f"{c['best_price']:+d}")
+                        cols[1].metric("Projected Average", c["avg_stat"])
+                        cols[2].metric("Model Probability", f"{hit_prob}%")
+                        cols[3].metric("Book Implied", f"{implied_prob}%")
+                        cols[4].metric("Edge", f"{c['edge_pct']:+.2f}%")
+                        cols[5].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
+                        cols[6].metric("Direction", c["direction"])
                         p_val, p_delta = _dk_payout_strs(bet_price)
-                        cols[5].metric(
+                        cols[7].metric(
                             f"DK Payout ({c['direction']})", p_val, delta=p_delta, delta_color="off",
                             help=f"Payout for the {c['direction']} at the book line on DraftKings.",
                         )
@@ -1378,7 +1662,7 @@ if "analysis_results" in st.session_state:
                         st.caption(
                             f"Matchup: {c['matchup']}"
                             f"  |  Book line: {c['line']}"
-                            f"  |  Predicted line: {c['avg_stat']}"
+                            f"  |  Projected average: {c['avg_stat']}"
                             f"  |  Line gap: {line_gap:+.2f}"
                         )
                         # DK only offers OVER alt lines for player props.
@@ -1400,7 +1684,10 @@ if "analysis_results" in st.session_state:
                             "Prob @ Suggested": f"{c['model_hit_at_safe']}%",
                             "Book Line": c["line"],
                             "Prob @ Book": f"{c['model_hit_at_line']}%",
-                            "Δ": f"{c['model_delta']:+.2f}%",
+                            "Book Implied": f"{c.get('safe_alt_implied', 0)}%",
+                            "Edge": f"{c['edge_pct']:+.2f}%",
+                            "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
+                                             if c.get("expected_roi_pct") is not None else "n/a"),
                         })
                     else:
                         hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
@@ -1408,10 +1695,14 @@ if "analysis_results" in st.session_state:
                             "Player": c["player"],
                             "Prop": c["prop_label"],
                             "Line": c["line"],
-                            "Avg": c["avg_stat"],
+                            "Projected Average": c["avg_stat"],
                             "Direction": c["direction"],
-                            "Hit Prob": f"{hit_prob}%",
+                            "Model Probability": f"{hit_prob}%",
+                            "Book Implied": (f"{c['over_implied']}%" if c["direction"] == "OVER"
+                                             else f"{c['under_implied']}%"),
                             "Edge": f"{c['edge_pct']:+.2f}%",
+                            "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
+                                             if c.get("expected_roi_pct") is not None else "n/a"),
                         })
                 st.table(rows)
 

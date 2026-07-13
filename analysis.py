@@ -33,6 +33,13 @@ def _consensus_price_for_line(items, line, line_key):
         return None
     sorted_prices = sorted(matching)
     return sorted_prices[len(sorted_prices) // 2]
+
+
+def _expected_roi(probability, american_price):
+    """Expected profit per dollar staked, or None when no price is available."""
+    if american_price is None:
+        return None
+    return probability * american_to_decimal(american_price) - 1.0
 from calibration_loader import (
     load_calibration,
     load_market_blend,
@@ -779,8 +786,9 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
 
         edge = final_prob - avg_implied
 
-        worst_book_prob = min(o["implied_prob"] for o in ml_odds)
-        best_edge = final_prob - worst_book_prob
+        best_offer = min(ml_odds, key=lambda o: o["implied_prob"])
+        best_book_prob = best_offer["implied_prob"]
+        best_edge = final_prob - best_book_prob
 
         result = {
             "type": "moneyline",
@@ -797,8 +805,10 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "blended_prob": round(final_prob * 100, 2),
             "edge_pct": round(edge * 100, 2),
             "best_edge_pct": round(best_edge * 100, 2),
-            "best_book": min(ml_odds, key=lambda o: o["implied_prob"])["book"],
-            "best_price": min(ml_odds, key=lambda o: o["implied_prob"])["price"],
+            "best_book_implied_prob": round(best_book_prob * 100, 2),
+            "best_book": best_offer["book"],
+            "best_price": best_offer["price"],
+            "expected_roi_pct": round(_expected_roi(final_prob, best_offer["price"]) * 100, 2),
             "is_value": edge >= threshold,
         }
         candidates.append(result)
@@ -941,6 +951,14 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                                      american_to_implied_prob(under_price))
         over_hit_rate = blend_w * over_hit_rate + (1.0 - blend_w) * fair_over
 
+    over_implied = (american_to_implied_prob(over_price)
+                    if over_price is not None else 0.50)
+    under_implied = (american_to_implied_prob(under_price)
+                     if under_price is not None else 0.50)
+    over_edge = over_hit_rate - over_implied
+    under_hit_rate = 1.0 - over_hit_rate
+    under_edge = under_hit_rate - under_implied
+
     candidates.append({
         "type": "total_over",
         "matchup": f"{game_odds['away_team']} @ {game_odds['home_team']}",
@@ -949,10 +967,18 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         "diff_from_line": round(diff, 2),
         "model_over_hit_rate": round(model_over_hit_rate * 100, 2),
         "over_hit_rate": round(over_hit_rate * 100, 2),
+        "over_implied": round(over_implied * 100, 2),
+        "under_implied": round(under_implied * 100, 2),
+        "over_edge_pct": round(over_edge * 100, 2),
+        "under_edge_pct": round(under_edge * 100, 2),
+        "over_expected_roi_pct": (round(_expected_roi(over_hit_rate, over_price) * 100, 2)
+                                   if over_price is not None else None),
+        "under_expected_roi_pct": (round(_expected_roi(under_hit_rate, under_price) * 100, 2)
+                                    if under_price is not None else None),
         "home_avg_scored": round(home_avg_scored, 2),
         "away_avg_scored": round(away_avg_scored, 2),
-        "is_over_value": diff > 0 and over_hit_rate > 0.5 + threshold,
-        "is_under_value": diff < 0 and (1 - over_hit_rate) > 0.5 + threshold,
+        "is_over_value": diff > 0 and over_edge >= threshold,
+        "is_under_value": diff < 0 and under_edge >= threshold,
         "over_price": over_price,
         "under_price": under_price,
     })
@@ -1038,7 +1064,9 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
 
     def _add_candidate(team_name, opponent, is_home, spread, model_cover,
                        cover_prob, team_avg_margin, price):
-        edge = cover_prob - 0.50
+        implied_prob = (american_to_implied_prob(price)
+                        if price is not None else 0.50)
+        edge = cover_prob - implied_prob
         candidates.append({
             "type": "spread",
             "team": team_name,
@@ -1048,8 +1076,11 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             "avg_margin": round(team_avg_margin, 2),
             "model_cover_rate": round(model_cover * 100, 2),
             "cover_rate": round(cover_prob * 100, 2),
+            "implied_prob": round(implied_prob * 100, 2),
             "games_sampled": games_sampled,
             "edge_pct": round(edge * 100, 2),
+            "expected_roi_pct": (round(_expected_roi(cover_prob, price) * 100, 2)
+                                  if price is not None else None),
             "is_value": edge >= threshold,
             "pred_game_margin": round(pred_margin, 2),
             "pred_game_std": round(pred_std, 2),
@@ -1386,9 +1417,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # Early-season players (few current-season games) blend with the
             # prior-season warmup distribution.
             calibration_meta = None
+            calibration_game_dates = history.get("game_dates") or []
+            curr_games = count_current_season_games(calibration_game_dates, sport_key)
             if prop_calib_cfg and prop_calib_cfg.get("method"):
-                game_dates = history.get("game_dates") or []
-                curr_games = count_current_season_games(game_dates, sport_key)
                 p_cal = apply_calibration_with_warmup(
                     prop_calib_cfg, avg_stat, line, curr_games,
                     empirical_over=empirical_over,
@@ -1404,6 +1435,35 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         "blend_weight": round(blend_w, 3),
                         "empirical_over": round(empirical_over * 100, 2),
                     }
+
+            # ── Platt recalibration (self-updating) ──
+            # Apply the same final calibration layer before either standard or
+            # Safe Mode branches. Safe Mode previously exited before this step,
+            # so its displayed confidence did not have parity with standard props.
+            raw_over_rate = over_rate
+            recal_cfg = recalibration.get(prop_key) if recalibration else None
+
+            def _apply_final_recalibration(probability):
+                if not recal_cfg or recal_cfg.get("a") is None:
+                    return probability
+                adjusted = apply_platt(
+                    probability,
+                    recal_cfg.get("a"),
+                    recal_cfg.get("b"),
+                )
+                if adjusted is None:
+                    return probability
+                return max(0.0, min(1.0, adjusted))
+
+            over_rate = _apply_final_recalibration(over_rate)
+            recal_meta = None
+            if over_rate != raw_over_rate:
+                recal_meta = {
+                    "a": recal_cfg.get("a"),
+                    "b": recal_cfg.get("b"),
+                    "n_fit": recal_cfg.get("n_fit"),
+                    "raw_prob": round(raw_over_rate * 100, 2),
+                }
 
             # ── Safe mode (OVER-only, integer alt-line) ──
             if safe_mode:
@@ -1437,25 +1497,62 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 # to clear with ≥ safe_target probability.
                 safe_threshold = max(1, int(_math.floor(alt_q)))
 
-                # Empirical hit-rate at the chosen integer threshold (sanity).
-                p_at_safe = _weighted_rate(values, weights,
-                                           lambda v, t=safe_threshold: v >= t)
+                def _probability_at_threshold(threshold_value):
+                    """Return (historical, final model) P(actual >= threshold)."""
+                    historical = _weighted_rate(
+                        values, weights,
+                        lambda v, t=threshold_value: v >= t,
+                    )
+                    threshold_line = threshold_value - 0.5
+                    effective_threshold_line = (
+                        threshold_line / combined_mult if combined_mult else threshold_line
+                    )
+                    empirical_adjusted = _weighted_rate(
+                        values, weights,
+                        lambda v, t=effective_threshold_line: v > t,
+                    )
+                    raw_probability = empirical_adjusted
+                    if prop_calib_cfg and prop_calib_cfg.get("method"):
+                        calibrated = apply_calibration_with_warmup(
+                            prop_calib_cfg,
+                            avg_stat,
+                            threshold_line,
+                            curr_games,
+                            empirical_over=empirical_adjusted,
+                        )
+                        if calibrated is not None:
+                            raw_probability = max(0.0, min(1.0, calibrated))
+                    return historical, _apply_final_recalibration(raw_probability)
 
-                # Empirical refinement: the parametric Normal floor can be
-                # overly conservative when actual game-to-game spread is
-                # tighter than wstd suggests. Bump the threshold up while
-                # the empirical hit rate is still ≥ safe_target so the
-                # suggested alt line is as tight as the player's history
-                # actually supports.
-                while True:
+                historical_at_safe, p_at_safe = _probability_at_threshold(safe_threshold)
+
+                # Tighten or relax the parametric starting threshold using the
+                # same residual + warmup + Platt probability stack that standard
+                # props use. This keeps the displayed target tied to the actual
+                # production probability rather than a separate empirical-only
+                # calculation.
+                while p_at_safe < safe_target and safe_threshold > 1:
+                    safe_threshold -= 1
+                    historical_at_safe, p_at_safe = _probability_at_threshold(safe_threshold)
+                # Cap tightening at the largest adjusted outcome in the sample.
+                # Production Platt slopes are positive, but this also prevents a
+                # malformed future recalibration from making the loop unbounded.
+                max_safe_threshold = max(
+                    1,
+                    int(_math.ceil(max(values) * (combined_mult or 1.0))),
+                )
+                while safe_threshold < max_safe_threshold:
                     next_t = safe_threshold + 1
-                    p_next = _weighted_rate(values, weights,
-                                            lambda v, t=next_t: v >= t)
+                    historical_next, p_next = _probability_at_threshold(next_t)
                     if p_next >= safe_target:
                         safe_threshold = next_t
                         p_at_safe = p_next
+                        historical_at_safe = historical_next
                     else:
                         break
+
+                if p_at_safe < safe_target:
+                    continue
 
                 # Tight sanity guard: drop when historical hit rate at the
                 # suggested threshold is more than 5pp below safe_target.
@@ -1464,7 +1561,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 # batter_hits @ 85% claimed but actually hit 69%). The
                 # 5pp band keeps out-of-sample hit rate within ~5pp of
                 # the user-visible safe_target.
-                if p_at_safe < (safe_target - 0.05):
+                if historical_at_safe < (safe_target - 0.05):
                     continue
 
                 # Floor-collapse guard: when safe_threshold is 1 (or 0), the
@@ -1491,9 +1588,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 if line > 0 and safe_threshold < line * SAFE_MIN_RATIO:
                     continue
 
-                # Our model's confidence at the standard book line.
-                model_hit_at_line = _weighted_rate(values, weights,
-                                                   lambda v: v > line)
+                # Our model's final calibrated confidence at the standard line.
+                model_hit_at_line = over_rate
 
                 # Gap from book line to our safe threshold. Larger positive
                 # gap = book line is below safe floor (bet straight OVER).
@@ -1504,22 +1600,6 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 # Confidence delta between our safe suggestion and the book line.
                 # Positive = our suggestion is safer than the standard line.
                 model_delta = p_at_safe - model_hit_at_line
-
-                # Edge in safe mode = how much MORE likely our safe
-                # suggestion hits than the standard book line.
-                # Always ≥ 0 (because safe_threshold ≤ line by construction
-                # whenever p_at_safe ≥ safe_target). Used as edge_pct so the
-                # parlay builder treats safe-mode legs as positive-edge.
-                edge = model_delta
-
-                # Filter trash: drop bets where even the standard book line
-                # is below 50/50 model confidence AND the safe threshold sits
-                # at the floor of the distribution (suggesting low-volume
-                # player with no realistic upside). Keeps suggestions where
-                # either the standard line is decent OR the safe threshold is
-                # meaningfully above the floor.
-                is_value = (safe_threshold >= 1
-                            and (model_hit_at_line >= 0.50 or safe_threshold > 1))
 
                 candidates.append({
                     "type": "player_prop",
@@ -1535,10 +1615,15 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "avg_stat": round(avg_stat, 2),
                     "over_rate": round(over_rate * 100, 2),
                     "games_sampled": len(values),
-                    "edge_pct": round(edge * 100, 2),
+                    # Price/edge/EV are intentionally pending until the exact
+                    # alternate line is fetched. Comparing this probability to
+                    # the standard book-line price would mix different bets.
+                    "edge_pct": 0.0,
+                    "expected_roi_pct": None,
                     "direction": "OVER",
                     "best_price": over_price,
-                    "is_value": is_value,
+                    "is_value": False,
+                    "value_pending": True,
                     "no_history": False,
                     # ── Safe-mode-specific fields ──
                     "safe_mode": True,
@@ -1546,34 +1631,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "safe_threshold": safe_threshold,        # display as "{N}+"
                     "safe_alt_q": round(alt_q, 2),           # raw quantile (continuous)
                     "model_hit_at_safe": round(p_at_safe * 100, 2),     # prob at suggested
+                    "historical_hit_at_safe": round(historical_at_safe * 100, 2),
                     "model_hit_at_line": round(model_hit_at_line * 100, 2),  # prob at book line
                     "model_delta": round(model_delta * 100, 2),         # safe − book line
                     "line_gap": round(line_gap, 2),
                     "bettable_at_standard_line": bettable_at_standard_line,
+                    "calibration": calibration_meta,
+                    "recalibration": recal_meta,
                     "_values": list(values),
                     "_weights": list(weights),
                 })
                 continue
-
-            # ── Platt recalibration (self-updating) ──
-            # Stretch/shrink the over-rate so its calibration matches reality.
-            # Fit from a JSONL log of past predictions + ESPN outcomes; auto-
-            # refit gated by maybe_auto_refit() above.
-            raw_over_rate = over_rate
-            recal_cfg = recalibration.get(prop_key) if recalibration else None
-            recal_meta = None
-            if recal_cfg and recal_cfg.get("a") is not None:
-                p_recal = apply_platt(over_rate,
-                                      recal_cfg.get("a"),
-                                      recal_cfg.get("b"))
-                if p_recal is not None:
-                    over_rate = max(0.0, min(1.0, p_recal))
-                    recal_meta = {
-                        "a": recal_cfg.get("a"),
-                        "b": recal_cfg.get("b"),
-                        "n_fit": recal_cfg.get("n_fit"),
-                        "raw_prob": round(raw_over_rate * 100, 2),
-                    }
 
             # Compare historical over rate vs book implied over probability
             over_edge = over_rate - over_implied
@@ -1588,6 +1656,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 direction = "UNDER"
                 edge = under_edge
                 best_price = under_price
+
+            expected_roi = _expected_roi(
+                over_rate if direction == "OVER" else under_rate,
+                best_price,
+            )
 
             # Log the published probability so future refits learn from it.
             # We log the *raw* (pre-Platt) probability — that's what Platt
@@ -1621,6 +1694,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "edge_pct": round(edge * 100, 2),
                 "direction": direction,
                 "best_price": best_price,
+                "expected_roi_pct": (round(expected_roi * 100, 2)
+                                      if expected_roi is not None else None),
                 "is_value": edge >= threshold,
                 "no_history": False,
                 "calibration": calibration_meta,
@@ -1731,10 +1806,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "label": f"{c['team']} ML ({c['home_away']})",
             "player": None,
             "prop_key": None,
-            "edge_pct": c["edge_pct"],
+            "edge_pct": c.get("best_edge_pct", c["edge_pct"]),
             "odds_price": c.get("best_price"),
-            "hist_prob": c["hist_prob"] / 100.0,
-            "implied_prob": c["book_implied_prob"] / 100.0,
+            "hist_prob": c.get("blended_prob", c["hist_prob"]) / 100.0,
+            "implied_prob": c.get("best_book_implied_prob", c["book_implied_prob"]) / 100.0,
         })
     
     for c in all_spreads:
@@ -1753,7 +1828,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "edge_pct": c["edge_pct"],
             "odds_price": c.get("price"),
             "hist_prob": c["cover_rate"] / 100.0,
-            "implied_prob": 0.50,
+            "implied_prob": c.get("implied_prob", 50.0) / 100.0,
         })
     
     for c in all_totals:
@@ -1765,10 +1840,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "label": f"OVER {c['line']} ({c['matchup']})",
                 "player": None,
                 "prop_key": None,
-                "edge_pct": c["over_hit_rate"] - 50.0,
+                "edge_pct": c.get("over_edge_pct", c["over_hit_rate"] - 50.0),
                 "odds_price": c.get("over_price"),
                 "hist_prob": c["over_hit_rate"] / 100.0,
-                "implied_prob": 0.50,
+                "implied_prob": c.get("over_implied", 50.0) / 100.0,
             })
         if c.get("is_under_value"):
             legs.append({
@@ -1778,10 +1853,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "label": f"UNDER {c['line']} ({c['matchup']})",
                 "player": None,
                 "prop_key": None,
-                "edge_pct": (100.0 - c["over_hit_rate"]) - 50.0,
+                "edge_pct": c.get("under_edge_pct", (100.0 - c["over_hit_rate"]) - 50.0),
                 "odds_price": c.get("under_price"),
                 "hist_prob": (100.0 - c["over_hit_rate"]) / 100.0,
-                "implied_prob": 0.50,
+                "implied_prob": c.get("under_implied", 50.0) / 100.0,
             })
     
     for c in all_props:
@@ -1797,7 +1872,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             # model probability AT our safe threshold (not the book line).
             label = f"{c['player']} {c['prop_label']} {c['safe_threshold']}+"
             hp = (c.get("model_hit_at_safe", 0.0) or 0.0) / 100.0
-            ip = (c["over_implied"] / 100.0) if c.get("over_implied") is not None else 0.5
+            ip = (c.get("safe_alt_implied") or 0.0) / 100.0
+            price = c.get("safe_alt_price")
+            if price is None or ip <= 0:
+                continue
         elif direction == "OVER":
             label = f"{c['player']} {c['prop_label']} {direction} {c['line']}"
             hp = (c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
@@ -1834,6 +1912,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             if c.get("safe_alt_price") is not None:
                 leg["odds_price"] = c["safe_alt_price"]
                 leg["safe_alt_line"] = c.get("safe_alt_line")
+                leg["expected_roi_pct"] = c.get("expected_roi_pct")
         legs.append(leg)
     
     return legs
@@ -2135,14 +2214,15 @@ def _score_parlay(legs, sport_key, mode="value"):
         return prob_score + total_edge + correlation_score + usage_penalty
     elif mode == "safe_value":
         # "Value parlays" built from safe-mode candidates.
-        # The confidence filter (safe_target) already guarantees every leg
-        # is above the user's hit-probability threshold, so we just maximize
-        # combined payout — product of decimal odds across legs.
+        # Every alt leg has an exact fetched price, so maximize estimated return
+        # rather than payout alone. A long price is not value unless the modeled
+        # probability is high enough to compensate for it.
         payout_product = 1.0
         for leg in legs:
             price = leg.get("odds_price")
             payout_product *= american_to_decimal(price) if price is not None else 1.91
-        return (payout_product * 100) + correlation_score + usage_penalty
+        expected_roi = combined_hist * payout_product - 1.0
+        return (expected_roi * 100) + correlation_score + usage_penalty
     else:
         # Prioritize edge value
         total_edge = sum(leg["edge_pct"] for leg in legs)
@@ -2172,12 +2252,9 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     if len(legs) < 3:
         return {}
 
-    # If the user asked for "value" parlays but the underlying analysis was run
-    # in safe mode (props carry safe_mode=True), edge_pct is `model_delta`
-    # (uplift of safe threshold vs book line) and `implied_prob` is at the book
-    # line — these can't be used like a normal value edge. Switch to a
-    # dedicated "safe_value" ranker that prefers safe legs whose threshold is
-    # closest to (or above) the book line.
+    # If the underlying analysis was run in safe mode, use a dedicated value
+    # ranker. Safe legs are price-verified before they reach this function, so
+    # it can maximize expected return at the exact alternate-line prices.
     has_safe_legs = any(leg.get("safe_mode") for leg in legs)
     effective_mode = mode
     if mode == "value" and has_safe_legs:
@@ -2187,10 +2264,13 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     if effective_mode == "safe":
         legs.sort(key=lambda x: x["hist_prob"], reverse=True)
     elif effective_mode == "safe_value":
-        # Confidence filter already guarantees each leg is above target prob,
-        # so rank legs purely by decimal payout (best price first).
+        # Prefer legs with the strongest single-bet expected return at their
+        # exact fetched alt-line price.
         legs.sort(
-            key=lambda x: american_to_decimal(x["odds_price"]) if x.get("odds_price") is not None else 1.91,
+            key=lambda x: (
+                x["hist_prob"] * american_to_decimal(x["odds_price"]) - 1.0
+                if x.get("odds_price") is not None else float("-inf")
+            ),
             reverse=True,
         )
     else:
@@ -2258,14 +2338,13 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             if effective_mode == "safe":
                 score = joint * 1000 + combined_edge * 0.1
             elif effective_mode == "safe_value":
-                # Confidence filter already guarantees each leg's hit prob,
-                # so re-rank purely by combined decimal payout (product of
-                # each leg's decimal odds).
+                # Re-rank by correlation-adjusted expected return at the exact
+                # fetched price for every leg.
                 payout_product = 1.0
                 for leg in combo_list:
                     price = leg.get("odds_price")
                     payout_product *= american_to_decimal(price) if price is not None else 1.91
-                score = payout_product * 100
+                score = (joint * payout_product - 1.0) * 100
             else:
                 score = combined_edge + (joint - combined_implied) * 100
 
@@ -2281,20 +2360,10 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             for leg in best_parlay:
                 combined_hist_indep *= leg["hist_prob"]
 
-            # When the parlay contains ANY safe-mode leg, `combined_edge`
-            # (sum of per-leg edge_pct, which is model_delta for safe legs)
-            # and `parlay_edge_pct` (joint-vs-combined-implied where the
-            # implied side is the BOOK LINE, not the safe threshold) compare
-            # quantities at different lines — apples to oranges. Suppress them
-            # only in that case. Regular analysis + Safe Parlays button still
-            # produces meaningful values here.
-            has_safe = any(leg.get("safe_mode") for leg in best_parlay)
-            if has_safe:
-                combined_edge_out = None
-                parlay_edge_out = None
-            else:
-                combined_edge_out = round(best_combined_edge, 2)
-                parlay_edge_out = round((best_joint - best_combined_implied) * 100, 2)
+            # Safe-mode legs now carry implied probability from the exact alt
+            # price, so these comparisons are at the same line for every leg.
+            combined_edge_out = round(best_combined_edge, 2)
+            parlay_edge_out = round((best_joint - best_combined_implied) * 100, 2)
 
             # Gap stats for the safe_value display (avg/total line gap across
             # safe legs only).
@@ -2321,6 +2390,12 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
             parlay_decimal = round(decimal_product, 3)
             parlay_american = _decimal_to_american(decimal_product)
             payout_per_10 = round((decimal_product - 1.0) * 10, 2)
+            expected_roi_pct = round((best_joint * decimal_product - 1.0) * 100, 2)
+
+            # A Value Parlay must still be value after the copula correlation
+            # adjustment and the actual leg prices are combined.
+            if effective_mode in ("value", "safe_value") and expected_roi_pct <= 0:
+                continue
 
             # Same-game parlay: 2+ legs in the same matchup. DK (and other
             # books) apply proprietary correlation adjustments to SGPs so the
@@ -2337,6 +2412,7 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 "combined_hist_prob_indep": round(combined_hist_indep * 100, 2),
                 "combined_implied_prob": round(best_combined_implied * 100, 2),
                 "parlay_edge_pct": parlay_edge_out,
+                "expected_roi_pct": expected_roi_pct,
                 "correlation_adjustment_pct": round(
                     (best_joint - combined_hist_indep) * 100, 2
                 ),

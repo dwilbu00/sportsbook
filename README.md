@@ -214,12 +214,26 @@ safe_threshold ≈ projected_mean - z * weighted_std
 
 Then it tightens or rejects the threshold using empirical hit-rate guards:
 
+- The same residual, warmup, and Platt calibration stack used by standard props is applied at the suggested threshold
 - The historical hit rate at the suggested threshold must be within 5 percentage points of the target confidence
 - Low-information `1+` style props are rejected at high confidence targets
 - Suggested thresholds must remain realistic relative to the main book line
-- Alternate-line prices are fetched when available so the safe pick is actually bettable
+- The exact alternate-line price is fetched before the pick can be recommended
+- The calibrated model probability must beat that exact price's implied probability by at least 5 percentage points
 
 This is why Safe Mode can suggest something like `Curry 8+ points` while refusing fake-safe lines that only look good because the threshold collapsed too far.
+
+## Built-in model guide and performance report
+
+Open **Model Guide & Performance** from the app sidebar to see the production definitions and the evidence behind them in one place:
+
+- Model probability, book implied probability, edge, and expected ROI formulas
+- Per-prop chronological model-selection accuracy and Brier score loaded from the committed calibration files
+- Team-market backtest/calibration status, with unavailable metrics labeled instead of guessed
+- Safe Mode's full confidence-and-price decision pipeline
+- MLB xStats holdout decisions and observation counts
+
+The MLB prop-matchup test is deliberately conservative. A chronological 2024 split selected a weight of `0.0` for batter hits, pitcher outs, and pitcher earned runs; the player-prop adjustment therefore remains disabled. Pitcher strikeout matchup weighting also remains disabled until the historical cache can reproduce the live lineup strikeout-rate signal without leakage. xERA/xwOBA, starter, handedness, and bullpen features remain active where their team-market backtests support them.
 
 ## Parlays use joint probability instead of naïve multiplication
 
@@ -251,8 +265,8 @@ That makes the parlay builder much harder to fool with same-game correlation tra
 
 The repository includes scripts for testing and refitting the model:
 
-- `backtest.py` — team-market projection and odds-history evaluation
-- `backtest_props.py` — player-prop sweeps, safe-mode tests, and calibration capture
+- `backtest.py` — team-market projection, player-prop sweeps, Safe Mode tests, and odds-history evaluation
+- `backtest_props.py` — chronological MLB xStats/matchup-weight fit and holdout gate
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
