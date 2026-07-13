@@ -556,13 +556,18 @@ DEFAULT_PLAYER_PROP_SHRINKAGE_K = 0  # off by default for unknown sports
 
 # Per-sport override for the recency half-life *for player props specifically*.
 # When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
-# projection. When None, inherits from RECENCY_HALF_LIFE.
+# projection. Zero disables exponential decay; None inherits from
+# RECENCY_HALF_LIFE.
+# MLB chronological 2024 holdout (20-game live window): no decay improved
+# batter hits, batter strikeouts, and pitcher earned runs. Pitcher strikeouts
+# and outs retain their separately calibrated half_lives from baseball_mlb.json.
 # Tuned per backtest on 18 NBA starters × 60 games:
 #   - NBA: 7 — Gives the lowest total safe-mode cushion@80% (11.58 vs 11.62
 #     at hl=10) at a negligible MAE cost (+0.008, ~0.2%). Prioritized for
 #     safe-mode usage. Team-level matchup analysis still uses hl=10.
 PLAYER_PROP_HALF_LIFE = {
     "basketball_nba": 7,
+    "baseball_mlb": 0,
 }
 DEFAULT_PLAYER_PROP_HALF_LIFE = None  # None = inherit from RECENCY_HALF_LIFE
 
@@ -1218,8 +1223,12 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
 
     def _knob(prop_key, name, default):
         cfg = calibration.get(prop_key) if calibration else None
-        if cfg and name in cfg and cfg[name] is not None:
-            return cfg[name]
+        if cfg and name in cfg:
+            value = cfg[name]
+            # In calibration JSON, half_life=null explicitly means equal
+            # weighting. Other null knobs continue to mean "use the default."
+            if value is not None or name == "half_life":
+                return value
         return default
 
     default_half_life = _player_prop_half_life(sport_key)
@@ -1315,8 +1324,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             team_schedule = None
             if team_schedules and player_team_id:
                 team_schedule = team_schedules.get(str(player_team_id))
+            # Half-life historically also set the healthy-game streak floor.
+            # Removing MLB decay should change weighting only, not make a
+            # previously-untrusted player eligible three games sooner. Preserve
+            # the former MLB hl=7 threshold (8 games) for no-decay props;
+            # calibrated pitcher half-lives continue to set their own floors.
+            reliability_min_streak = None
+            if sport_key == "baseball_mlb" and not half_life:
+                reliability_min_streak = 8
             filt = filter_player_gamelog(
-                synthetic, team_schedule, sport_key, half_life=half_life)
+                synthetic, team_schedule, sport_key, half_life=half_life,
+                min_streak=reliability_min_streak)
 
             if filt["skip_prediction"]:
                 candidates.append({

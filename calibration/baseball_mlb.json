@@ -3599,6 +3599,100 @@
           "status": "not fitted: Statcast contact cache does not contain an as-of lineup strikeout-rate signal"
         }
       }
+    },
+    "prop_recency_holdout": {
+      "source": "chronological 2024 StatsAPI game logs using the live 20-game window",
+      "evaluated_at": "2026-07-13",
+      "fit_window": "before 2024-07-01",
+      "holdout_window": "2024-07-01 through 2024-09-30",
+      "metric": "MAE",
+      "results": {
+        "batter_hits": {
+          "fit_n": 8715,
+          "holdout_n": 8480,
+          "half_life": 7,
+          "decay_mae": 0.74764,
+          "no_decay_mae": 0.74088,
+          "selected": "No decay"
+        },
+        "batter_strikeouts": {
+          "fit_n": 8715,
+          "holdout_n": 8480,
+          "half_life": 7,
+          "decay_mae": 0.70741,
+          "no_decay_mae": 0.70162,
+          "selected": "No decay"
+        },
+        "pitcher_strikeouts": {
+          "fit_n": 2681,
+          "holdout_n": 3736,
+          "half_life": 20,
+          "decay_mae": 1.51928,
+          "no_decay_mae": 1.52557,
+          "selected": "20-game half-life"
+        },
+        "pitcher_outs": {
+          "fit_n": 2681,
+          "holdout_n": 3736,
+          "half_life": 15,
+          "decay_mae": 2.60154,
+          "no_decay_mae": 2.65548,
+          "selected": "15-game half-life"
+        },
+        "pitcher_earned_runs": {
+          "fit_n": 2681,
+          "holdout_n": 3736,
+          "half_life": 7,
+          "decay_mae": 1.26709,
+          "no_decay_mae": 1.26394,
+          "selected": "No decay"
+        }
+      }
+    },
+    "rolling_player_form_holdout": {
+      "source": "Baseball Savant player-services/roll chronological 2024 as-of features",
+      "evaluated_at": "2026-07-13",
+      "fit_window": "before 2024-07-01",
+      "holdout_window": "2024-07-01 through 2024-09-30",
+      "metric": "MAE",
+      "results": {
+        "batter_hits": {
+          "signal": "50-PA xBA × average AB/game",
+          "fit_n": 7815,
+          "holdout_n": 8480,
+          "candidate_weight": 0.5,
+          "baseline_mae": 0.71386,
+          "candidate_mae": 0.71512,
+          "selected_weight": 0.0
+        },
+        "pitcher_strikeouts": {
+          "signal": "100-PA K% × average BF/start",
+          "fit_n": 1573,
+          "holdout_n": 2866,
+          "candidate_weight": 0.0,
+          "baseline_mae": 1.4812,
+          "candidate_mae": 1.4812,
+          "selected_weight": 0.0
+        },
+        "pitcher_outs": {
+          "signal": "100-PA xwOBA trend",
+          "fit_n": 701,
+          "holdout_n": 2221,
+          "candidate_weight": 0.0,
+          "baseline_mae": 2.78154,
+          "candidate_mae": 2.78154,
+          "selected_weight": 0.0
+        },
+        "pitcher_earned_runs": {
+          "signal": "100-PA xwOBA trend",
+          "fit_n": 701,
+          "holdout_n": 2221,
+          "candidate_weight": 0.25,
+          "baseline_mae": 1.35935,
+          "candidate_mae": 1.36062,
+          "selected_weight": 0.0
+        }
+      }
     }
   },
   "prob_shrink": {

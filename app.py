@@ -653,6 +653,58 @@ def render_model_guide():
             "cannot reproduce the live lineup K-rate feature without leakage or guessing."
         )
 
+        recency = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})
+                   .get("prop_recency_holdout") or {})
+        recency_rows = []
+        for prop_key, result in (recency.get("results") or {}).items():
+            decay_mae = result.get("decay_mae")
+            no_decay_mae = result.get("no_decay_mae")
+            recency_rows.append({
+                "Prediction": PROP_LABELS.get(prop_key, prop_key),
+                "Holdout observations": result.get("holdout_n", "—"),
+                "Decay MAE": f"{decay_mae:.5f}" if decay_mae is not None else "—",
+                "No-decay MAE": (
+                    f"{no_decay_mae:.5f}" if no_decay_mae is not None else "—"
+                ),
+                "Production choice": result.get("selected", "—"),
+            })
+        if recency_rows:
+            st.subheader("MLB player-prop recency validation")
+            st.dataframe(recency_rows, hide_index=True, width="stretch")
+            st.caption(
+                "MLB props use equal weights inside the live 20-game window by default. "
+                "Pitcher strikeouts and pitcher outs retain their calibrated decay because "
+                "removing it made the later-period error worse. MLB team-market recency is "
+                "calibrated separately."
+            )
+
+        rolling = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})
+                   .get("rolling_player_form_holdout") or {})
+        rolling_rows = []
+        for prop_key, result in (rolling.get("results") or {}).items():
+            baseline = result.get("baseline_mae")
+            candidate = result.get("candidate_mae")
+            rolling_rows.append({
+                "Prediction": PROP_LABELS.get(prop_key, prop_key),
+                "Rolling signal": result.get("signal", "—"),
+                "Holdout observations": result.get("holdout_n", "—"),
+                "Candidate weight": result.get("candidate_weight", 0.0),
+                "Holdout MAE": (
+                    f"{baseline:.5f} → {candidate:.5f}"
+                    if baseline is not None and candidate is not None else "—"
+                ),
+                "Production weight": result.get("selected_weight", 0.0),
+            })
+        if rolling_rows:
+            st.subheader("Savant rolling player-form validation")
+            st.dataframe(rolling_rows, hide_index=True, width="stretch")
+            st.caption(
+                "The exact Baseball Savant Rolling Selection service was evaluated as-of "
+                "each game: 50-PA rolling xBA for hitters and 100-PA rolling K%/xwOBA for "
+                "pitchers. A signal is enabled only if the weight selected on the earlier "
+                "period also improves the later holdout. None currently pass that gate."
+            )
+
 
 # ──────────────────────────────────────────────────────────
 #  Page Config
@@ -727,8 +779,8 @@ with st.sidebar:
 
     st.subheader("Analysis Settings")
     threshold = 5.0  # default value edge threshold for non-safe-mode analysis
-    # Recent-games window is now hardcoded per sport (half-life weighting
-    # inside makes the upper bound effectively self-tuning).
+    # Recent-games window is hardcoded per sport. Per-prop calibration decides
+    # whether games inside the window are equally or exponentially weighted.
     recent_n = sport.get("recent_n_default", 10)
     safe_mode = st.toggle(
         "🎯 Alt lines (player props)",

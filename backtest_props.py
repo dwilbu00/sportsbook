@@ -283,7 +283,7 @@ def _half_life(prop_key):
             return cfg["half_life"]
     except Exception:
         pass
-    return analysis._half_life_for("baseball_mlb")
+    return analysis._player_prop_half_life("baseball_mlb")
 
 
 # ── player universes ─────────────────────────────────────────────────────────
