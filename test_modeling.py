@@ -1,5 +1,6 @@
 """Focused regression tests for sportsbook model correctness boundaries."""
 
+import math
 import os
 import tempfile
 import unittest
@@ -204,6 +205,28 @@ class ExpectedRunsTests(unittest.TestCase):
         self.assertGreater(underdog_cover, 0.5)
         self.assertAlmostEqual(favorite_cover + underdog_cover, 1.0)
 
+    def test_zero_dispersion_matches_poisson_run_line(self):
+        poisson = mlb_starters.poisson_margin_probability(
+            5.1, 3.8, -1.5)
+        negative_binomial = (
+            mlb_starters.negative_binomial_margin_probability(
+                5.1, 3.8, -1.5, 0.0)
+        )
+        self.assertAlmostEqual(poisson, negative_binomial)
+
+    def test_negative_binomial_run_lines_are_complementary(self):
+        favorite_cover = (
+            mlb_starters.negative_binomial_margin_probability(
+                4.5, 4.5, -1.5, 0.2)
+        )
+        underdog_cover = (
+            mlb_starters.negative_binomial_margin_probability(
+                4.5, 4.5, 1.5, 0.2)
+        )
+        self.assertLess(favorite_cover, 0.5)
+        self.assertGreater(underdog_cover, 0.5)
+        self.assertAlmostEqual(favorite_cover + underdog_cover, 1.0)
+
     def test_challenger_maps_each_offense_to_opposing_staff(self):
         row = {
             "h_sp_sup": 0.9,
@@ -221,6 +244,56 @@ class ExpectedRunsTests(unittest.TestCase):
             row, model)
         self.assertAlmostEqual(home_runs, 4.0 * 1.2 / 1.1)
         self.assertAlmostEqual(away_runs, 4.0 * 0.8 / 0.9)
+
+    def test_park_and_opposing_bullpen_workload_adjust_expected_runs(self):
+        row = {
+            "home_team": "TST",
+            "h_sp_sup": 1.0,
+            "a_sp_sup": 1.0,
+            "h_off_faced": 1.0,
+            "a_off_faced": 1.0,
+            "h_bp_workload": 75.0,
+            "a_bp_workload": 150.0,
+        }
+        model = {
+            "home_base_runs": 4.0,
+            "away_base_runs": 4.0,
+            "offense_weight": 1.0,
+            "pitching_weight": 1.0,
+            "park_factors": {"TST": 1.1},
+            "park_strength": 1.0,
+            "fatigue_weight": 0.2,
+            "workload_center": 100.0,
+        }
+        home_runs, away_runs = backtest_starters.project_expected_runs(
+            row, model)
+        self.assertAlmostEqual(home_runs, 4.0 * 1.1 * math.exp(0.1))
+        self.assertAlmostEqual(away_runs, 4.0 * 1.1 * math.exp(-0.05))
+
+    @patch("backtest_props.season_schedule")
+    def test_bullpen_workload_uses_only_prior_relief_pitches(self, schedule):
+        schedule.return_value = {
+            "2024-04-01": [{
+                "home_abbr": "HME", "away_abbr": "AWY",
+                "home_sp": 10, "away_sp": 20,
+            }],
+            "2024-04-02": [{
+                "home_abbr": "AWY", "away_abbr": "HME",
+                "home_sp": 20, "away_sp": 10,
+            }],
+        }
+        rows = [
+            # AWY pitches while HME bats. Only pitcher 21 is a reliever.
+            {"game_date": "2024-04-01", "batting_team": "HME",
+             "pitcher": "20"},
+            {"game_date": "2024-04-01", "batting_team": "HME",
+             "pitcher": "21"},
+            {"game_date": "2024-04-01", "batting_team": "HME",
+             "pitcher": "21"},
+        ]
+        workload = backtest_starters._bullpen_workload_features(rows, 2024)
+        self.assertEqual(workload[("2024-04-01", "AWY")], 0.0)
+        self.assertEqual(workload[("2024-04-02", "AWY")], 2.0)
 
 
 class AsOfReliabilityTests(unittest.TestCase):

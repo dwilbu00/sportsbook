@@ -262,6 +262,54 @@ def poisson_margin_probability(home_runs, away_runs, home_spread,
     )
 
 
+def negative_binomial_margin_probability(home_runs, away_runs, home_spread,
+                                         dispersion, max_runs=30):
+    """Return a run-line probability with overdispersed team run totals.
+
+    ``dispersion`` uses ``variance = mean + dispersion * mean**2``. A value of
+    zero is exactly the independent-Poisson model, while positive values allow
+    the heavier score tails seen in baseball. The dispersion is fitted only on
+    pre-holdout games by ``backtest_starters.py``.
+    """
+    try:
+        home_runs = float(home_runs)
+        away_runs = float(away_runs)
+        home_spread = float(home_spread)
+        dispersion = float(dispersion)
+        max_runs = int(max_runs)
+    except (TypeError, ValueError):
+        return None
+    if (home_runs <= 0 or away_runs <= 0 or dispersion < 0
+            or max_runs < 1):
+        return None
+    if dispersion == 0:
+        return poisson_margin_probability(
+            home_runs, away_runs, home_spread, max_runs)
+
+    def probabilities(expected):
+        size = 1.0 / dispersion
+        success_probability = size / (size + expected)
+        failure_probability = 1.0 - success_probability
+        values = [success_probability ** size]
+        for score in range(1, max_runs + 1):
+            values.append(
+                values[-1]
+                * (score - 1.0 + size) / score
+                * failure_probability
+            )
+        values[-1] += max(0.0, 1.0 - sum(values))
+        return values
+
+    home_prob = probabilities(home_runs)
+    away_prob = probabilities(away_runs)
+    return sum(
+        hp * ap
+        for home_score, hp in enumerate(home_prob)
+        for away_score, ap in enumerate(away_prob)
+        if home_score + home_spread > away_score
+    )
+
+
 def get_team_index(season):
     """Return {normalized_name: {'id', 'name', 'abbr'}} for all 30 MLB teams."""
     cache = f"team_index_{season}"

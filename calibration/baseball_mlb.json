@@ -3831,6 +3831,7 @@
     "enabled": false,
     "pythagorean_exponent": 1.83,
     "score_distribution": "independent_poisson",
+    "validation_timestamp": "2026-07-14",
     "fit_window": "2024-03-20 through 2024-06-30",
     "holdout_window": "2024-07-01 through 2024-10-05",
     "train_n": 916,
@@ -3862,7 +3863,70 @@
         "challenger": 0.2226
       }
     },
-    "decision": "disabled: passed one chronological season; require another season plus park-factor and bullpen-availability ablations before live use"
+    "validation_summary": [
+      {
+        "Holdout": "Late 2023 (independent)",
+        "Train games": 892,
+        "Holdout games": 1131,
+        "ML current": 0.2472,
+        "ML challenger": 0.2473,
+        "Margin current": 4.887,
+        "Margin challenger": 4.434,
+        "-1.5 current": 0.2405,
+        "-1.5 challenger": 0.2289,
+        "Base gate": "FAIL"
+      },
+      {
+        "Holdout": "Late 2024 (2024 only)",
+        "Train games": 916,
+        "Holdout games": 1061,
+        "ML current": 0.2489,
+        "ML challenger": 0.2463,
+        "Margin current": 4.861,
+        "Margin challenger": 4.402,
+        "-1.5 current": 0.241,
+        "-1.5 challenger": 0.2226,
+        "Base gate": "PASS"
+      },
+      {
+        "Holdout": "Late 2024 (+ full 2023)",
+        "Train games": 2939,
+        "Holdout games": 1061,
+        "ML current": 0.2489,
+        "ML challenger": 0.246,
+        "Margin current": 4.861,
+        "Margin challenger": 4.392,
+        "-1.5 current": 0.241,
+        "-1.5 challenger": 0.2212,
+        "Base gate": "PASS"
+      }
+    ],
+    "extension_validation": [
+      {
+        "Holdout": "Late 2023 (independent)",
+        "Park residual": "FAIL",
+        "3-day bullpen workload": "FAIL",
+        "Negative-binomial run line": "FAIL"
+      },
+      {
+        "Holdout": "Late 2024 (2024 only)",
+        "Park residual": "FAIL",
+        "3-day bullpen workload": "FAIL",
+        "Negative-binomial run line": "FAIL"
+      },
+      {
+        "Holdout": "Late 2024 (+ full 2023)",
+        "Park residual": "PASS",
+        "3-day bullpen workload": "FAIL",
+        "Negative-binomial run line": "FAIL"
+      }
+    ],
+    "validation_thresholds": {
+      "minimum_probability_gain": 0.001,
+      "minimum_score_nll_gain": 0.001,
+      "minimum_run_rmse_gain": 0.005
+    },
+    "decision": "The independent 2023 base gate narrowly failed moneyline Brier; park effects passed only with full prior-season history, while bullpen workload and negative-binomial run-line probabilities did not produce stable, meaningful holdout gains."
   },
   "lineup_adjustment": {
     "enabled": true,

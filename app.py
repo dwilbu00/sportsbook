@@ -842,11 +842,21 @@ def render_model_guide():
                     **(expected_holdout.get("home_minus_1_5_brier") or {}),
                 },
             ], hide_index=True, width="stretch")
+            validation_summary = expected_runs.get("validation_summary") or []
+            if validation_summary:
+                st.caption("Chronological base-model validation by fit history")
+                st.dataframe(
+                    validation_summary, hide_index=True, width="stretch")
+            extension_validation = (
+                expected_runs.get("extension_validation") or [])
+            if extension_validation:
+                st.caption("Incremental feature and score-distribution gates")
+                st.dataframe(
+                    extension_validation, hide_index=True, width="stretch")
             st.warning(
-                "The 1.83 Pythagorean challenger passed its first chronological "
-                "2024 holdout but remains **disabled**. It needs another season "
-                "and separate park-factor and bullpen-availability tests before "
-                "it can replace the live margin model."
+                "The 1.83 Pythagorean challenger remains **disabled**. "
+                + expected_runs.get(
+                    "decision", "More chronological validation is required.")
             )
         prop_fit = ((mlb_meta.get("starter_adjustment") or {}).get("props") or {})
         holdout = (prop_fit if prop_fit.get("results")

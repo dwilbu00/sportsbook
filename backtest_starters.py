@@ -18,13 +18,18 @@ Usage:
     python backtest_starters.py --season 2024 --fetch      # slow one-time pull
     python backtest_starters.py --season 2024              # fit (days cached)
     python backtest_starters.py --season 2024 --save       # fit + write weights
-    python backtest_starters.py --season 2024 --test-runs  # expected-runs challenger
+    # Expected-runs challenger plus park/workload/NB holdout validations:
+    python backtest_starters.py --season 2024 --test-runs
+    # Add a prior full season to the pre-2024 holdout fit:
+    python backtest_starters.py --season 2023,2024 --test-runs
 
 Caveats (documented, not hidden):
   * Uses the *probable* starter from the schedule (≈ actual; late scratches
     are rare but unmodeled).
   * As-of pitcher quality uses xwOBAcon (contact), a slightly different measure
     than the live season xERA index; both are Savant x-stats and correlated.
+  * Historical park factors use the home-team abbreviation as a venue proxy;
+    rare neutral-site games are not identified in the cached schedule shape.
   * The isolated logistic coefficient can overlap with signal team form already
     captures, so treat the fitted moneyline weight as a mild upper bound and
     keep it bounded.
@@ -32,6 +37,7 @@ Caveats (documented, not hidden):
 
 import argparse
 from collections import defaultdict
+from datetime import date, timedelta
 import json
 import math
 import os
@@ -169,6 +175,64 @@ def _bullpen_features(rows, season):
     return idx, league_bp, game_teams
 
 
+def _bullpen_workload_features(rows, season):
+    """Return each team's pregame, prior-three-day relief workload.
+
+    Statcast contains one row per pitch, so this uses actual relief pitches
+    rather than games played or a schedule proxy. Yesterday's pitches count
+    most, then decay over the preceding two days. Every probable starter listed
+    for a team/date is excluded, which keeps doubleheaders from misclassifying
+    one of that day's starters as a reliever.
+
+    Values are raw weighted pitch totals. The model centers them using only its
+    pre-holdout training rows, avoiding leakage from the holdout workload
+    distribution.
+    """
+    from backtest_props import season_schedule
+
+    schedule = season_schedule(season)
+    batting_opponent = {}
+    starters = defaultdict(set)
+    team_dates = set()
+    for game_date, games in schedule.items():
+        for game in games:
+            home = game.get("home_abbr")
+            away = game.get("away_abbr")
+            if not home or not away:
+                continue
+            batting_opponent[(game_date, home)] = away
+            batting_opponent[(game_date, away)] = home
+            team_dates.add((game_date, home))
+            team_dates.add((game_date, away))
+            if game.get("home_sp"):
+                starters[(game_date, home)].add(str(game["home_sp"]))
+            if game.get("away_sp"):
+                starters[(game_date, away)].add(str(game["away_sp"]))
+
+    relief_pitches = defaultdict(int)
+    for row in rows:
+        game_date = row.get("game_date")
+        pitching_team = batting_opponent.get(
+            (game_date, row.get("batting_team")))
+        pitcher = str(row.get("pitcher"))
+        if (not pitching_team or not row.get("pitcher")
+                or pitcher in starters[(game_date, pitching_team)]):
+            continue
+        relief_pitches[(game_date, pitching_team)] += 1
+
+    raw_workload = {}
+    day_weights = (1.0, 0.6, 0.3)
+    for game_date, team in team_dates:
+        current = date.fromisoformat(game_date)
+        raw_workload[(game_date, team)] = sum(
+            weight * relief_pitches[
+                ((current - timedelta(days=days_ago)).isoformat(), team)
+            ]
+            for days_ago, weight in enumerate(day_weights, start=1)
+        )
+    return raw_workload
+
+
 def _ip_index(season):
     """As-of average innings/start per starter, from cached pitcher gameLogs.
 
@@ -220,6 +284,7 @@ def build_dataset(games, season):
     league_xwoba = sum(league_vals) / len(league_vals)
 
     bp_idx, league_bp, game_teams = _bullpen_features(rows, season)
+    bp_workload = _bullpen_workload_features(rows, season)
 
     # As-of starter index (prefix sums) — identical result to
     # sh.asof_pitcher_xwoba but O(log n) instead of a full scan per game.
@@ -249,6 +314,7 @@ def build_dataset(games, season):
         h_bs = a_bs = None
         bullpen_excess = None
         gt = game_teams.get((g["date"], str(g["home_sp"]), str(g["away_sp"])))
+        h_bp_workload = a_bp_workload = None
         if gt and league_bp:
             ha, aa = gt
             h_bp = bp_idx.asof_mean(ha, g["date"])
@@ -257,6 +323,8 @@ def build_dataset(games, season):
                 h_bs = max(0.5, min(2.0, league_bp / h_bp))
                 a_bs = max(0.5, min(2.0, league_bp / a_bp))
                 bullpen_excess = (h_bs - 1.0) + (a_bs - 1.0)
+            h_bp_workload = bp_workload.get((g["date"], ha))
+            a_bp_workload = bp_workload.get((g["date"], aa))
 
         # As-of average innings/start (min 3 prior starts), None if unknown.
         h_outs = ip_idx.asof_mean(str(g["home_sp"]), g["date"], min_bbe=3)
@@ -297,6 +365,8 @@ def build_dataset(games, season):
             # extra raw fields for the innings-weighting A/B (fit() ignores them)
             "h_sp_sup": h_rs, "a_sp_sup": a_rs,
             "h_bp_sup": h_bs, "a_bp_sup": a_bs,
+            "h_bp_workload": h_bp_workload,
+            "a_bp_workload": a_bp_workload,
             "h_ip": h_ip, "a_ip": a_ip,
             "h_off_faced": h_off, "a_off_faced": a_off,
             "margin": g.get("margin"),
@@ -517,6 +587,9 @@ def fit(seasons, do_save=False):
 
 
 EXPECTED_RUN_WEIGHT_GRID = tuple(i / 4.0 for i in range(7))
+MIN_HOLDOUT_PROBABILITY_GAIN = 0.001
+MIN_HOLDOUT_NLL_GAIN = 0.001
+MIN_HOLDOUT_RMSE_GAIN = 0.005
 
 
 def _expected_run_multipliers(row, offense_weight, pitching_weight):
@@ -583,7 +656,126 @@ def project_expected_runs(row, model):
         model["home_base_runs"], home_mult, 1.0)
     away_runs = mlb_starters.expected_runs_from_factors(
         model["away_base_runs"], away_mult, 1.0)
-    return home_runs, away_runs
+
+    park_factors = model.get("park_factors") or {}
+    park_strength = model.get("park_strength", 0.0)
+    raw_park = park_factors.get(row.get("home_team"), 1.0)
+    park_multiplier = 1.0 + park_strength * (raw_park - 1.0)
+
+    fatigue_weight = model.get("fatigue_weight", 0.0)
+    # The home offense faces the away bullpen and vice versa.
+    workload_center = model.get("workload_center")
+    if workload_center:
+        away_fatigue = max(-1.0, min(
+            2.0, (row.get("a_bp_workload") or 0.0) / workload_center - 1.0))
+        home_fatigue = max(-1.0, min(
+            2.0, (row.get("h_bp_workload") or 0.0) / workload_center - 1.0))
+    else:
+        away_fatigue = home_fatigue = 0.0
+    home_runs *= park_multiplier * math.exp(fatigue_weight * away_fatigue)
+    away_runs *= park_multiplier * math.exp(fatigue_weight * home_fatigue)
+    return (max(0.5, min(12.0, home_runs)),
+            max(0.5, min(12.0, away_runs)))
+
+
+def _poisson_score_nll(actual, expected):
+    expected = max(1e-9, expected)
+    return expected - actual * math.log(expected) + math.lgamma(actual + 1.0)
+
+
+def _negative_binomial_score_nll(actual, expected, dispersion):
+    """Negative log likelihood under variance=mean+dispersion*mean^2."""
+    if dispersion <= 0:
+        return _poisson_score_nll(actual, expected)
+    size = 1.0 / dispersion
+    success_probability = size / (size + expected)
+    log_probability = (
+        math.lgamma(actual + size)
+        - math.lgamma(size)
+        - math.lgamma(actual + 1.0)
+        + size * math.log(success_probability)
+        + actual * math.log1p(-success_probability)
+    )
+    return -log_probability
+
+
+def _score_nll(rows, model, distribution="poisson", dispersion=0.0):
+    losses = []
+    for row in rows:
+        home_expected, away_expected = project_expected_runs(row, model)
+        for actual, expected in (
+                (row["home_runs"], home_expected),
+                (row["away_runs"], away_expected)):
+            if distribution == "negative_binomial":
+                losses.append(_negative_binomial_score_nll(
+                    actual, expected, dispersion))
+            else:
+                losses.append(_poisson_score_nll(actual, expected))
+    return sum(losses) / len(losses)
+
+
+def _raw_park_factors(rows, model):
+    """Fit home-venue run multipliers from pre-holdout score residuals."""
+    totals = defaultdict(lambda: [0.0, 0.0, 0])
+    for row in rows:
+        home_expected, away_expected = project_expected_runs(row, model)
+        bucket = totals[row["home_team"]]
+        bucket[0] += row["home_runs"] + row["away_runs"]
+        bucket[1] += home_expected + away_expected
+        bucket[2] += 1
+    return {
+        team: max(0.75, min(1.25, actual / expected))
+        for team, (actual, expected, games) in totals.items()
+        if games >= 20 and expected > 0
+    }
+
+
+def fit_expected_run_extensions(rows, base_model, use_park=False,
+                                use_fatigue=False):
+    """Fit optional park and three-day bullpen-workload terms on train only."""
+    park_factors = _raw_park_factors(rows, base_model) if use_park else {}
+    park_grid = [step / 10.0 for step in range(11)] if use_park else [0.0]
+    workloads = [
+        row.get(f"{side}_bp_workload")
+        for row in rows
+        for side in ("h", "a")
+        if row.get(f"{side}_bp_workload") is not None
+    ] if use_fatigue else []
+    workload_center = (
+        sum(workloads) / len(workloads) if workloads else None
+    )
+    fatigue_grid = (
+        [step / 20.0 for step in range(-5, 11)]
+        if workload_center else [0.0]
+    )
+    best = None
+    for park_strength in park_grid:
+        for fatigue_weight in fatigue_grid:
+            candidate = dict(base_model)
+            candidate.update({
+                "park_factors": park_factors,
+                "park_strength": park_strength,
+                "fatigue_weight": fatigue_weight,
+                "workload_center": workload_center,
+            })
+            loss = _score_nll(rows, candidate)
+            if best is None or loss < best[0]:
+                best = (loss, candidate)
+    best[1]["train_poisson_nll"] = best[0]
+    return best[1]
+
+
+def fit_negative_binomial_dispersion(rows, model):
+    """Fit score overdispersion on pre-holdout games only."""
+    best = None
+    for step in range(51):
+        dispersion = step / 100.0
+        loss = _score_nll(
+            rows, model, distribution="negative_binomial",
+            dispersion=dispersion)
+        if best is None or loss < best[1]:
+            best = (dispersion, loss)
+    return best
 
 
 def _fit_probability_shrink(probabilities, outcomes):
@@ -620,6 +812,74 @@ def _margin_metrics(predictions, outcomes):
         "mae": sum(abs(pred - actual)
                    for pred, actual in zip(predictions, outcomes)) / len(outcomes),
         "rmse": rmse(predictions, outcomes),
+    }
+
+
+def _challenger_variant_metrics(train, holdout, model,
+                                distribution="poisson", dispersion=0.0):
+    """Fit probability shrink on train and grade one challenger on holdout."""
+    train_ml = []
+    train_spread = []
+    train_win = []
+    train_cover = []
+    probability_function = (
+        mlb_starters.negative_binomial_margin_probability
+        if distribution == "negative_binomial"
+        else mlb_starters.poisson_margin_probability
+    )
+    for row in train:
+        home_runs, away_runs = project_expected_runs(row, model)
+        train_ml.append(mlb_starters.pythagorean_win_probability(
+            home_runs, away_runs))
+        if distribution == "negative_binomial":
+            spread_probability = probability_function(
+                home_runs, away_runs, -1.5, dispersion)
+        else:
+            spread_probability = probability_function(
+                home_runs, away_runs, -1.5)
+        train_spread.append(spread_probability)
+        train_win.append(row["home_win"])
+        train_cover.append(1 if row["margin"] > 1.5 else 0)
+    ml_shrink = _fit_probability_shrink(train_ml, train_win)
+    spread_shrink = _fit_probability_shrink(train_spread, train_cover)
+
+    holdout_ml = []
+    holdout_spread = []
+    expected_margin = []
+    expected_total = []
+    actual_win = []
+    actual_cover = []
+    actual_margin = []
+    actual_total = []
+    for row in holdout:
+        home_runs, away_runs = project_expected_runs(row, model)
+        ml_probability = mlb_starters.pythagorean_win_probability(
+            home_runs, away_runs)
+        if distribution == "negative_binomial":
+            spread_probability = probability_function(
+                home_runs, away_runs, -1.5, dispersion)
+        else:
+            spread_probability = probability_function(
+                home_runs, away_runs, -1.5)
+        holdout_ml.append(0.5 + ml_shrink * (ml_probability - 0.5))
+        holdout_spread.append(
+            0.5 + spread_shrink * (spread_probability - 0.5))
+        expected_margin.append(home_runs - away_runs)
+        expected_total.append(home_runs + away_runs)
+        actual_win.append(row["home_win"])
+        actual_cover.append(1 if row["margin"] > 1.5 else 0)
+        actual_margin.append(row["margin"])
+        actual_total.append(row["total_runs"])
+    return {
+        "ml_shrink": ml_shrink,
+        "spread_shrink": spread_shrink,
+        "ml": _probability_metrics(holdout_ml, actual_win),
+        "spread": _probability_metrics(holdout_spread, actual_cover),
+        "margin": _margin_metrics(expected_margin, actual_margin),
+        "total_rmse": rmse(expected_total, actual_total),
+        "score_nll": _score_nll(
+            holdout, model, distribution=distribution,
+            dispersion=dispersion),
     }
 
 
@@ -775,6 +1035,58 @@ def test_expected_runs_challenger(seasons, holdout_start=None):
     challenger_margin_metrics = _margin_metrics(
         challenger_margins, actual_margin)
 
+    # Validation extensions. Every parameter below is fitted on `train`; only
+    # the untouched chronological comparison window is used for these scores.
+    base_variant = _challenger_variant_metrics(train, comparison, model)
+    park_model = fit_expected_run_extensions(
+        train, model, use_park=True)
+    fatigue_model = fit_expected_run_extensions(
+        train, model, use_fatigue=True)
+    combined_model = fit_expected_run_extensions(
+        train, model, use_park=True, use_fatigue=True)
+    park_variant = _challenger_variant_metrics(
+        train, comparison, park_model)
+    fatigue_variant = _challenger_variant_metrics(
+        train, comparison, fatigue_model)
+    combined_variant = _challenger_variant_metrics(
+        train, comparison, combined_model)
+    dispersion, train_nb_nll = fit_negative_binomial_dispersion(train, model)
+    nb_variant = _challenger_variant_metrics(
+        train, comparison, model,
+        distribution="negative_binomial", dispersion=dispersion)
+
+    park_passed = (
+        park_model["park_strength"] > 0
+        and base_variant["score_nll"] - park_variant["score_nll"]
+        >= MIN_HOLDOUT_NLL_GAIN
+        and base_variant["total_rmse"] - park_variant["total_rmse"]
+        >= MIN_HOLDOUT_RMSE_GAIN
+        and park_variant["spread"]["brier"]
+        <= base_variant["spread"]["brier"]
+    )
+    fatigue_passed = (
+        fatigue_model["fatigue_weight"] > 0
+        and base_variant["score_nll"] - fatigue_variant["score_nll"]
+        >= MIN_HOLDOUT_NLL_GAIN
+        and (
+            base_variant["ml"]["brier"]
+            - fatigue_variant["ml"]["brier"]
+            >= MIN_HOLDOUT_PROBABILITY_GAIN
+            or base_variant["spread"]["brier"]
+            - fatigue_variant["spread"]["brier"]
+            >= MIN_HOLDOUT_PROBABILITY_GAIN
+        )
+    )
+    nb_passed = (
+        dispersion > 0
+        and base_variant["spread"]["brier"]
+        - nb_variant["spread"]["brier"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+        and base_variant["spread"]["log_loss"]
+        - nb_variant["spread"]["log_loss"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+    )
+
     passed = (
         challenger_ml_metrics["brier"]
         < min(current_ml_metrics["brier"], null_ml_metrics["brier"])
@@ -816,10 +1128,48 @@ def test_expected_runs_challenger(seasons, holdout_start=None):
           f"{null_spread_metrics['brier']:.4f}")
     print(f"  challenger home -1.5 Brier: "
           f"{challenger_spread_metrics['brier']:.4f}")
+    print("\nOUT-OF-SAMPLE FEATURE / DISTRIBUTION VALIDATIONS")
+    print("  variant          score NLL  total RMSE  margin RMSE  "
+          "ML Brier  -1.5 Brier")
+
+    def print_variant(label, metrics):
+        print(f"  {label:<16} {metrics['score_nll']:.4f}     "
+              f"{metrics['total_rmse']:.3f}       "
+              f"{metrics['margin']['rmse']:.3f}       "
+              f"{metrics['ml']['brier']:.4f}    "
+              f"{metrics['spread']['brier']:.4f}")
+
+    print_variant("base Poisson", base_variant)
+    print_variant("+ park", park_variant)
+    print_variant("+ BP workload", fatigue_variant)
+    print_variant("+ park + BP", combined_variant)
+    print_variant("negative binom", nb_variant)
+    park_values = list(park_model["park_factors"].values())
+    park_range = (
+        f"{min(park_values):.3f}..{max(park_values):.3f}"
+        if park_values else "n/a"
+    )
+    workload_coverage = sum(
+        row.get("h_bp_workload") is not None
+        and row.get("a_bp_workload") is not None
+        for row in comparison
+    )
+    print(f"  park: train-only raw range={park_range}, "
+          f"selected strength={park_model['park_strength']:.2f} — "
+          f"{'PASS' if park_passed else 'NO INCREMENTAL PASS'}")
+    print(f"  bullpen workload: {workload_coverage}/{len(comparison)} holdout games, "
+          f"selected coefficient={fatigue_model['fatigue_weight']:+.2f} — "
+          f"{'PASS' if fatigue_passed else 'NO INCREMENTAL PASS'}")
+    print(f"  negative binomial: train dispersion={dispersion:.2f}, "
+          f"train score NLL={train_nb_nll:.4f}, holdout -1.5 logloss "
+          f"{base_variant['spread']['log_loss']:.4f} -> "
+          f"{nb_variant['spread']['log_loss']:.4f} — "
+          f"{'PASS' if nb_passed else 'NO RUN-LINE PASS'}")
     print("\nDECISION: " + (
-        "PASS challenger gate; validate additional seasons before live use."
+        "BASE PASS for this holdout; extension gates are reported separately. "
+        "No live settings changed."
         if passed else
-        "KEEP OFF; challenger did not beat current ML, margin, and spread gates."
+        "BASE FAIL for this holdout; keep off. No live settings changed."
     ))
     return {
         "model": model,
@@ -836,6 +1186,28 @@ def test_expected_runs_challenger(seasons, holdout_start=None):
         "null_spread": null_spread_metrics,
         "current_spread": current_spread_metrics,
         "challenger_spread": challenger_spread_metrics,
+        "extensions": {
+            "base": base_variant,
+            "park": {
+                "strength": park_model["park_strength"],
+                "metrics": park_variant,
+                "passed": park_passed,
+            },
+            "bullpen_workload": {
+                "coefficient": fatigue_model["fatigue_weight"],
+                "coverage": workload_coverage,
+                "metrics": fatigue_variant,
+                "passed": fatigue_passed,
+            },
+            "combined": combined_variant,
+            "negative_binomial": {
+                "dispersion": dispersion,
+                "metrics": nb_variant,
+                "passed": nb_passed,
+            },
+        },
+        "all_extensions_passed": (
+            park_passed and fatigue_passed and nb_passed),
         "passed": passed,
     }
 

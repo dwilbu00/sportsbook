@@ -142,9 +142,27 @@ expected runs through an independent-Poisson score distribution.
 The initial July 1 through October 5, 2024 holdout improved moneyline Brier
 score (`0.2489` current → `0.2463` challenger), winner accuracy (`52.12%` →
 `56.64%`), margin RMSE (`4.861` → `4.402`), and home `-1.5` Brier score
-(`0.2410` → `0.2226`). It also beat training-period base-rate forecasts on all
-three gates. The challenger remains disabled until another season and the
-incremental park-factor and bullpen-availability features are validated.
+(`0.2410` → `0.2226`). A second independent 2023 holdout still improved margin
+RMSE (`4.887` → `4.434`) and home `-1.5` Brier (`0.2405` → `0.2289`), but it
+narrowly missed the moneyline gate (`0.2472` current vs. `0.2473` challenger).
+Adding all of 2023 to the pre-2024 fit strengthened the 2024 results to `0.2460`
+moneyline Brier, `4.392` margin RMSE, and `0.2212` home `-1.5` Brier.
+
+The same chronological runs separately test three additions:
+
+- Home-team/park residual factors fitted only before the holdout. They improve
+  the 2024 holdout only when a full prior season is available; the single-season
+  2023 and 2024 fits fail.
+- Actual bullpen relief-pitch workload over the prior three days (decayed by
+  recency). Its holdout gains are below the minimum practical thresholds.
+- A fitted negative-binomial score distribution. It models score variance much
+  better than Poisson, but does not improve run-line Brier and log loss by the
+  required `0.001` in any holdout.
+
+These tests use the free MLB Stats API and Baseball Savant cache, not Odds API
+credits. Because the independent 2023 base gate failed and the extensions are
+not stable across holdouts, the challenger and all three additions remain
+**disabled for live picks**.
 
 ### NFL: EPA-based team strength
 
