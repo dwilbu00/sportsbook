@@ -64,33 +64,41 @@ _MARKET_BLEND_CACHE = {}
 _PROB_SHRINK_CACHE = {}
 _STARTER_ADJ_CACHE = {}
 
-# Conservative default starter/opponent adjustment weights. Used only when no
-# calibrated block exists. Documented PRIORS to be re-fit from graded outcomes.
-#   moneyline : logit multiplier on starter_edge      (Phase 1)
-#   spreads   : runs of margin per unit starter_edge    (Phase 1)
-#   totals    : logit multiplier on run-shift          (Phase 1)
-#   run_scale : runs suppressed per unit starter excess (Phase 1)
-#   props     : fraction of the raw matchup multiplier applied to props (Phase 2)
-#   bullpen   : runs per unit combined bullpen excess   (Phase 3)
-#   bvp       : batter-vs-pitcher prior weight          (Phase 4, default OFF)
-_STARTER_ADJ_DEFAULTS = {
-    "moneyline": 0.35, "spreads": 0.0, "totals": 0.6, "run_scale": 1.0,
-    "props": 0.5, "bullpen": 0.5, "bvp": 0.0,
-}
-
 # MLB league baselines used as log5-style denominators for the props matchup
 # multiplier. Priors (not fitted); refresh occasionally.
-_MLB_LEAGUE = {"k_pct": 0.222, "ops": 0.711, "pitcher_xwoba": 0.315}
+_MLB_LEAGUE = {
+    "k_pct": 0.222,
+    "ba": 0.243,
+    "ops": 0.711,
+}
 
 
-def _mlb_prop_matchup_mult(prop_key, upcoming_is_home, matchup_features, weight):
+def _log5_rate(player_rate, opponent_rate, league_rate):
+    """Combine two binary-event rates relative to their league environment."""
+    if player_rate is None or opponent_rate is None or league_rate is None:
+        return None
+    clamp = lambda value: max(0.001, min(0.999, float(value)))
+    player_rate, opponent_rate, league_rate = map(
+        clamp, (player_rate, opponent_rate, league_rate))
+    odds = ((player_rate / (1.0 - player_rate))
+            * (opponent_rate / (1.0 - opponent_rate))
+            / (league_rate / (1.0 - league_rate)))
+    return odds / (1.0 + odds)
+
+
+def _mlb_prop_matchup_mult(prop_key, upcoming_is_home, matchup_features, weight,
+                           player_context=None):
     """
     Bounded projection multiplier for an MLB player prop based on the
     starter/opponent matchup (Phase 2). 1.0 = no change.
 
     Pitcher props scale by the OPPOSING lineup's quality vs the starter's hand;
-    batter props scale by the OPPOSING starter's quality. `weight` (0..1) is the
-    calibratable fraction of the raw log5-style ratio to apply.
+    batter props scale by the OPPOSING starter's quality. When recent batter
+    exposure is available, hits and strikeouts use a true log5 rate for the
+    projected starter's workload and a neutral rate for the remaining bullpen
+    workload. `weight` (0..1) is the calibratable fraction of the raw ratio to
+    apply. Bullpen prop rates stay neutral until an as-of history can validate
+    them without leakage.
     """
     if not matchup_features or upcoming_is_home is None or not weight:
         return 1.0
@@ -114,19 +122,50 @@ def _mlb_prop_matchup_mult(prop_key, upcoming_is_home, matchup_features, weight)
         stp = opp_sd.get("starter")
         if not stp:
             return 1.0
-        if prop_key == "batter_hits" and stp.get("xwoba"):
-            raw = stp["xwoba"] / _MLB_LEAGUE["pitcher_xwoba"]   # tough P (low xwOBA) → fewer hits
-        elif prop_key == "batter_strikeouts" and stp.get("k_pct"):
-            raw = stp["k_pct"] / _MLB_LEAGUE["k_pct"]           # high-K pitcher → more batter Ks
+        context = player_context or {}
+        base_projection = context.get("base_projection")
+        exposure = context.get("expected_exposure")
+        if base_projection and exposure:
+            batter_rate = base_projection / exposure
+            avg_ip = stp.get("avg_ip")
+            starter_share = max(0.10, min(0.80, (avg_ip or 5.5) / 9.0))
+            if prop_key == "batter_strikeouts":
+                league_rate = _MLB_LEAGUE["k_pct"]
+                starter_k_pct = stp.get("k_pct")
+                if stp.get("bf") is not None and stp["bf"] < 50:
+                    starter_k_pct = None
+                starter_rate = _log5_rate(
+                    batter_rate, starter_k_pct, league_rate)
+                bullpen_rate = _log5_rate(
+                    batter_rate, league_rate, league_rate)
+            else:
+                league_rate = _MLB_LEAGUE["ba"]
+                starter_rate = _log5_rate(
+                    batter_rate, stp.get("xba"), league_rate)
+                bullpen_rate = _log5_rate(
+                    batter_rate, league_rate, league_rate)
+            if starter_rate is not None and bullpen_rate is not None:
+                matchup_rate = (starter_share * starter_rate
+                                + (1.0 - starter_share) * bullpen_rate)
+                raw = exposure * matchup_rate / base_projection
+        elif prop_key == "batter_hits" and stp.get("xba"):
+            raw = stp["xba"] / _MLB_LEAGUE["ba"]
+        elif (prop_key == "batter_strikeouts" and stp.get("k_pct")
+              and (stp.get("bf") is None or stp["bf"] >= 50)):
+            raw = stp["k_pct"] / _MLB_LEAGUE["k_pct"]
 
     mult = 1.0 + weight * (raw - 1.0)
     return max(0.7, min(1.4, mult))
 
 
-def _starter_adjustment(sport_key, key):
+def _starter_adjustment(sport_key, key, prop_key=None):
     """Return the calibrated (or default-prior) starter-adjustment weight for
-    `key` in ('moneyline','spreads','totals','run_scale','bullpen','props').
-    Returns 0.0 when disabled."""
+    `key` in ('moneyline','spreads','run_scale','bullpen','props').
+    `props` may be either a legacy shared number or a per-prop mapping.
+
+    Missing or malformed calibration always fails closed to 0.0. An unavailable
+    fit must never silently turn an unvalidated matchup prior on in production.
+    """
     if not sport_key:
         return 0.0
     if sport_key not in _STARTER_ADJ_CACHE:
@@ -135,7 +174,11 @@ def _starter_adjustment(sport_key, key):
         except Exception:
             _STARTER_ADJ_CACHE[sport_key] = {}
     cfg = _STARTER_ADJ_CACHE[sport_key]
-    val = cfg.get(key, _STARTER_ADJ_DEFAULTS.get(key, 0.0) if cfg.get("enabled", True) else 0.0)
+    if not cfg or cfg.get("enabled") is False:
+        return 0.0
+    val = cfg.get(key)
+    if key == "props" and isinstance(val, dict):
+        val = val.get(prop_key)
     return val if isinstance(val, (int, float)) else 0.0
 
 
@@ -906,10 +949,14 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         starter_total_shift = -(run_scale * excess) - (bullpen_w * bullpen_excess)
         projected_total += starter_total_shift
 
-    # Determine over/under probability from historical games (recency-,
-    # opponent-strength-, and venue-match-weighted across both teams).
+    # Build the historical total-score spread around the projection. The same
+    # projected_total used for display is the mean of the probability model;
+    # this prevents the displayed projection and value probability from moving
+    # in opposite directions through separate starter adjustments.
     over_weight = 0.0
     total_weight = 0.0
+    historical_totals = []
+    historical_total_weights = []
     for team_name, stats, upcoming_is_home in [
         (home_team, home_team_stats, True),
         (away_team, away_team_stats, False),
@@ -927,17 +974,18 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                 past_h = None
             w = bw * _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
             total_weight += w
+            historical_totals.append(g["total_score"])
+            historical_total_weights.append(w)
             if g["total_score"] > consensus_line:
                 over_weight += w
 
-    model_over_hit_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
-
-    # Phase 1: nudge the over probability the same direction as the starter
-    # total shift (strong starters → lower over rate). Logit-space, calibratable.
-    if matchup_features and starter_total_shift != 0.0:
-        model_over_hit_rate = _apply_starter_logit(
-            model_over_hit_rate, starter_total_shift,
-            _starter_adjustment(sport_key, "totals"))
+    empirical_over_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
+    total_std = _weighted_std(historical_totals, historical_total_weights)
+    if total_std > 0:
+        z = (consensus_line - projected_total) / total_std
+        model_over_hit_rate = 1.0 - _norm_cdf(z)
+    else:
+        model_over_hit_rate = empirical_over_rate
 
     diff = projected_total - consensus_line
 
@@ -1308,6 +1356,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             past_home_aways = history.get("home_aways") or [None] * len(values)
             minutes = history.get("minutes") or [None] * len(values)
             game_dates = history.get("game_dates") or [None] * len(values)
+            plate_appearances = (history.get("plate_appearances")
+                                 or [None] * len(values))
+            at_bats = history.get("at_bats") or [None] * len(values)
             player_team_id = history.get("team_id")
 
             # ── Reliability filter ──
@@ -1317,9 +1368,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # when their last actual game was excluded (still injured /
             # ramping up) or their last game had limited minutes.
             synthetic = [
-                {"game_date": gd, "MIN": m, "_value": v, "_opp": o, "_ha": ha}
-                for v, o, ha, m, gd in zip(
-                    values, opponents, past_home_aways, minutes, game_dates)
+                {"game_date": gd, "MIN": m, "_value": v, "_opp": o,
+                 "_ha": ha, "_pa": pa, "_ab": ab}
+                for v, o, ha, m, gd, pa, ab in zip(
+                    values, opponents, past_home_aways, minutes, game_dates,
+                    plate_appearances, at_bats)
             ]
             team_schedule = None
             if team_schedules and player_team_id:
@@ -1363,10 +1416,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             values = [g["_value"] for g in eligible]
             opponents = [g["_opp"] for g in eligible]
             past_home_aways = [g["_ha"] for g in eligible]
+            plate_appearances = [g.get("_pa") for g in eligible]
+            at_bats = [g.get("_ab") for g in eligible]
 
             # Resolve the player's upcoming home/away by matching their team_id
             # to the home/away team names of the upcoming game.
             upcoming_is_home = None
+            player_team_name = None
             if player_team_id and id_to_name:
                 player_team_name = id_to_name.get(str(player_team_id))
                 if player_team_name == home_team_name:
@@ -1416,9 +1472,26 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # other sports or when features/weight are absent.
             matchup_mult = 1.0
             if sport_key == "baseball_mlb" and matchup_features:
+                player_context = None
+                exposures = (plate_appearances if prop_key == "batter_strikeouts"
+                             else at_bats if prop_key == "batter_hits" else None)
+                if exposures:
+                    valid = [(value, weight) for value, weight in zip(exposures, weights)
+                             if isinstance(value, (int, float)) and value > 0]
+                    if valid:
+                        expected_exposure = _weighted_mean(
+                            [value for value, _ in valid],
+                            [weight for _, weight in valid],
+                        )
+                        if expected_exposure > 0 and base_proj > 0:
+                            player_context = {
+                                "base_projection": base_proj,
+                                "expected_exposure": expected_exposure,
+                            }
                 matchup_mult = _mlb_prop_matchup_mult(
                     prop_key, upcoming_is_home, matchup_features,
-                    _starter_adjustment(sport_key, "props"))
+                    _starter_adjustment(sport_key, "props", prop_key),
+                    player_context=player_context)
             combined_mult = output_def_mult * matchup_mult
 
             avg_stat = base_proj * combined_mult
@@ -1623,6 +1696,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "type": "player_prop",
                     "matchup": matchup,
                     "player": player_name,
+                    "team": player_team_name,
                     "prop": prop_key,
                     "prop_label": PROP_LABELS.get(prop_key, prop_key),
                     "line": line,
@@ -1699,6 +1773,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "type": "player_prop",
                 "matchup": matchup,
                 "player": player_name,
+                "team": player_team_name,
                 "prop": prop_key,
                 "prop_label": PROP_LABELS.get(prop_key, prop_key),
                 "line": line,
@@ -1905,7 +1980,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
 
         leg = {
             "game_key": c["matchup"],
-            "team": None,
+            "team": c.get("team"),
             "bet_type": bt,
             "label": label,
             "player": c["player"],
@@ -1989,7 +2064,8 @@ def _pair_correlation(leg_a, leg_b, sport_key):
         return 0.0
 
     if sport_key == "basketball_nba":
-        if "player_prop_over" in ta and "player_prop_over" in tb:
+        if ("player_prop_over" in ta and "player_prop_over" in tb
+                and leg_a.get("team") and leg_a.get("team") == leg_b.get("team")):
             return -0.20  # shared possession / usage cap
         if (ta == "total_under" and "player_prop_over" in tb and
                 leg_b.get("prop_key") == "player_points"):
@@ -2003,16 +2079,20 @@ def _pair_correlation(leg_a, leg_b, sport_key):
         if (tb == "total_over" and "player_prop_over" in ta and
                 leg_a.get("prop_key") == "player_points"):
             return 0.30
-        if ta == "moneyline" and "player_prop_over" in tb:
+        if (ta == "moneyline" and "player_prop_over" in tb
+                and leg_a.get("team") == leg_b.get("team")):
             return 0.15
-        if tb == "moneyline" and "player_prop_over" in ta:
+        if (tb == "moneyline" and "player_prop_over" in ta
+                and leg_b.get("team") == leg_a.get("team")):
             return 0.15
 
     elif sport_key == "americanfootball_nfl":
         if (ta == "moneyline" and "player_prop_over" in tb and
+                leg_a.get("team") == leg_b.get("team") and
                 leg_b.get("prop_key") == "player_pass_yds"):
             return 0.30
         if (tb == "moneyline" and "player_prop_over" in ta and
+                leg_b.get("team") == leg_a.get("team") and
                 leg_a.get("prop_key") == "player_pass_yds"):
             return 0.30
         if ("player_prop_over" in ta and leg_a.get("prop_key") == "player_rush_yds"
@@ -2027,7 +2107,8 @@ def _pair_correlation(leg_a, leg_b, sport_key):
         if ("player_prop_over" in tb and leg_b.get("prop_key") == "player_pass_yds"
                 and ta == "total_over"):
             return 0.25
-        if "player_prop_over" in ta and "player_prop_over" in tb:
+        if ("player_prop_over" in ta and "player_prop_over" in tb
+                and leg_a.get("team") and leg_a.get("team") == leg_b.get("team")):
             return -0.10
 
     elif sport_key == "baseball_mlb":
@@ -2044,9 +2125,11 @@ def _pair_correlation(leg_a, leg_b, sport_key):
                 and ta == "total_over"):
             return -0.30
         if (ta == "moneyline" and "player_prop_over" in tb and
+                leg_a.get("team") == leg_b.get("team") and
                 leg_b.get("prop_key") == "batter_hits"):
             return 0.25
         if (tb == "moneyline" and "player_prop_over" in ta and
+                leg_b.get("team") == leg_a.get("team") and
                 leg_a.get("prop_key") == "batter_hits"):
             return 0.25
 
@@ -2075,125 +2158,23 @@ def _copula_joint_hit_prob(legs, sport_key, n_samples=5000, seed=42):
 
 def _correlation_penalty(leg_a, leg_b, sport_key):
     """
-    Return a correlation penalty (negative = bad combo, positive = good synergy).
-    Used as a cheap heuristic to score parlay candidates during enumeration;
-    the final winner is re-ranked using the exact Gaussian copula joint prob.
-
-    Returns a float:
-        negative values = legs work against each other
-        0 = neutral
-        positive values = legs complement each other (positively correlated)
+    Cheap enumeration score derived from the same correlation used by the
+    Gaussian copula. Keeping one rule source prevents candidate selection and
+    final probability ranking from assigning opposite signs to the same pair.
     """
-    same_game = leg_a["game_key"] == leg_b["game_key"]
-    ta = leg_a["bet_type"]
-    tb = leg_b["bet_type"]
-    
-    # Cross-game parlays are preferred (less priced in by books)
-    if not same_game:
-        # Small bonus for cross-game diversification
+    if leg_a["game_key"] != leg_b["game_key"]:
         return 0.5
-    
-    # ── Same-game correlation rules ──
-    
-    # NBA-specific
-    if sport_key == "basketball_nba":
-        # Two player prop overs from same team = negative (usage cap)
-        if "player_prop_over" in ta and "player_prop_over" in tb:
-            # Same team check: if both players are in the same matchup, 
-            # they might be on same team. We can't tell for sure from matchup alone,
-            # but penalize same-game multi-prop overs
-            return -2.0
-        
-        # Game total under + player points over = negative
-        if (ta == "total_under" and "player_prop_over" in tb and 
-            leg_b.get("prop_key") == "player_points"):
-            return -3.0
-        if (tb == "total_under" and "player_prop_over" in ta and 
-            leg_a.get("prop_key") == "player_points"):
-            return -3.0
-        
-        # Game total over + player points over = positive
-        if (ta == "total_over" and "player_prop_over" in tb and 
-            leg_b.get("prop_key") == "player_points"):
-            return 1.5
-        if (tb == "total_over" and "player_prop_over" in ta and 
-            leg_a.get("prop_key") == "player_points"):
-            return 1.5
-        
-        # Team ML + player prop over for same team = positive
-        if ta == "moneyline" and "player_prop_over" in tb:
-            return 1.0
-        if tb == "moneyline" and "player_prop_over" in ta:
-            return 1.0
-    
-    # NFL-specific
-    elif sport_key == "americanfootball_nfl":
-        # QB passing yards over + team ML = strong positive
-        if (ta == "moneyline" and "player_prop_over" in tb and 
-            leg_b.get("prop_key") == "player_pass_yds"):
-            return 2.0
-        if (tb == "moneyline" and "player_prop_over" in ta and 
-            leg_a.get("prop_key") == "player_pass_yds"):
-            return 2.0
-        
-        # RB rushing yards over + game under = negative
-        if ("player_prop_over" in ta and leg_a.get("prop_key") == "player_rush_yds" 
-            and tb == "total_under"):
-            return -2.0
-        if ("player_prop_over" in tb and leg_b.get("prop_key") == "player_rush_yds" 
-            and ta == "total_under"):
-            return -2.0
-        
-        # QB passing yards over + game over = positive
-        if ("player_prop_over" in ta and leg_a.get("prop_key") == "player_pass_yds" 
-            and tb == "total_over"):
-            return 1.5
-        if ("player_prop_over" in tb and leg_b.get("prop_key") == "player_pass_yds" 
-            and ta == "total_over"):
-            return 1.5
-        
-        # Multiple player prop overs same game = slight negative (usage)
-        if "player_prop_over" in ta and "player_prop_over" in tb:
-            return -1.0
-    
-    # MLB-specific
-    elif sport_key == "baseball_mlb":
-        # Pitcher K's over + game under = positive (dominant pitching)
-        if ("player_prop_over" in ta and leg_a.get("prop_key") == "pitcher_strikeouts" 
-            and tb == "total_under"):
-            return 2.0
-        if ("player_prop_over" in tb and leg_b.get("prop_key") == "pitcher_strikeouts" 
-            and ta == "total_under"):
-            return 2.0
-        
-        # Pitcher K's over + game over = negative
-        if ("player_prop_over" in ta and leg_a.get("prop_key") == "pitcher_strikeouts" 
-            and tb == "total_over"):
-            return -2.0
-        if ("player_prop_over" in tb and leg_b.get("prop_key") == "pitcher_strikeouts" 
-            and ta == "total_over"):
-            return -2.0
-        
-        # Batter hits over + team ML = positive
-        if (ta == "moneyline" and "player_prop_over" in tb and 
-            leg_b.get("prop_key") == "batter_hits"):
-            return 1.5
-        if (tb == "moneyline" and "player_prop_over" in ta and 
-            leg_a.get("prop_key") == "batter_hits"):
-            return 1.5
-    
-    # Default same-game slight penalty (less diversification)
-    return -0.5
+    return 5.0 * _pair_correlation(leg_a, leg_b, sport_key)
 
 
 def _same_team_prop_count(legs):
-    """Count how many player prop overs are from the same game (proxy for same team)."""
-    game_prop_counts = {}
+    """Count player-prop overs sharing an identified team in the same game."""
+    team_prop_counts = {}
     for leg in legs:
-        if "player_prop_over" in leg["bet_type"]:
-            gk = leg["game_key"]
-            game_prop_counts[gk] = game_prop_counts.get(gk, 0) + 1
-    return max(game_prop_counts.values()) if game_prop_counts else 0
+        if "player_prop_over" in leg["bet_type"] and leg.get("team"):
+            key = (leg["game_key"], leg["team"])
+            team_prop_counts[key] = team_prop_counts.get(key, 0) + 1
+    return max(team_prop_counts.values()) if team_prop_counts else 0
 
 
 def _score_parlay(legs, sport_key, mode="value"):

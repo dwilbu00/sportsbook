@@ -172,7 +172,12 @@ def save_starter_adjustment(sport_key, adj, meta=None):
     if meta:
         blob.setdefault("meta", {})
         if isinstance(blob["meta"], dict):
-            blob["meta"]["starter_adjustment"] = meta
+            existing = blob["meta"].get("starter_adjustment")
+            if isinstance(existing, dict):
+                existing.update(meta)
+                blob["meta"]["starter_adjustment"] = existing
+            else:
+                blob["meta"]["starter_adjustment"] = meta
         else:
             blob["meta"] = {"starter_adjustment": meta}
     with open(calibration_path(sport_key), "w", encoding="utf-8") as f:

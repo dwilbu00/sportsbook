@@ -88,7 +88,7 @@ def resolve_min_streak(half_life, override=None):
 def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
                           pre_layoff_n=PRE_LAYOFF_N,
                           min_floor=MIN_PLAYED_FLOOR, min_fraction=MIN_FRACTION,
-                          min_streak=None):
+                          min_streak=None, as_of_date=None):
     """
     Apply the streak-based reliability filter.
 
@@ -113,6 +113,10 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
         sport-independent streak threshold).
     half_life: int or None. Used to derive min_streak when min_streak is None.
     min_streak: optional explicit override; otherwise computed from half_life.
+    as_of_date: optional ISO date/timestamp for historical simulations. Games
+        and schedule entries on or after this date are removed before any
+        median, layoff, or streak calculation so future events cannot change
+        an earlier prediction's eligibility.
     """
     threshold = resolve_min_streak(half_life, override=min_streak)
 
@@ -129,6 +133,19 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
         "median_min": 0.0,
         "min_threshold": None,
     }
+    if as_of_date:
+        cutoff = str(as_of_date)[:10]
+        gamelog = [
+            g for g in gamelog
+            if g.get("game_date") and str(g["game_date"])[:10] < cutoff
+        ]
+        if team_schedule:
+            team_schedule = [
+                s for s in team_schedule
+                if (s.get("date") or s.get("gameDate") or s.get("game_date"))
+                and str(s.get("date") or s.get("gameDate")
+                        or s.get("game_date"))[:10] < cutoff
+            ]
     if not gamelog:
         return empty_result
 

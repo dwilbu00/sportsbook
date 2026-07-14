@@ -3562,9 +3562,80 @@
       "fit_timestamp": "2026-07-09T17:59:05.051267Z"
     },
     "starter_adjustment": {
-      "source": "backtest_starters:2021,2022,2023,2024",
-      "fit": true,
-      "n_games": 7915
+      "team_markets": {
+        "source": "backtest_starters:2021,2022,2023,2024",
+        "fit": true,
+        "n_games": 7915
+      },
+      "props": {
+        "source": "backtest_props:2024",
+        "fit": true,
+        "holdout_start": "2024-07-01",
+        "holdout_window": "2024-07-01 through season end",
+        "metric": "MAE",
+        "recent_n": 20,
+        "rolling_validation_folds": 2,
+        "results": {
+          "batter_hits": {
+            "fit_n": 7360,
+            "holdout_n": 7968,
+            "signal_correlation": 0.032089,
+            "candidate_weight": 0.5,
+            "selected_weight": 0.0,
+            "baseline_mae": 0.74033,
+            "candidate_mae": 0.739907,
+            "selected_mae": 0.74033,
+            "rolling_folds": [
+              {
+                "start": "2024-07-24",
+                "n": 3051,
+                "fit_weight": 0.5,
+                "baseline_mae": 0.7420026220911151,
+                "candidate_mae": 0.7422930190705019,
+                "gain_pct": -0.03913692091389406
+              },
+              {
+                "start": "2024-08-27",
+                "n": 3116,
+                "fit_weight": 0.5,
+                "baseline_mae": 0.7360077021822857,
+                "candidate_mae": 0.7352310515950228,
+                "gain_pct": 0.10552207333702586
+              }
+            ],
+            "decision": "disabled: candidate failed at least one validation gate"
+          },
+          "batter_strikeouts": {
+            "fit_n": 6887,
+            "holdout_n": 7924,
+            "signal_correlation": 0.086718,
+            "candidate_weight": 0.5,
+            "selected_weight": 0.5,
+            "baseline_mae": 0.702663,
+            "candidate_mae": 0.700423,
+            "selected_mae": 0.700423,
+            "rolling_folds": [
+              {
+                "start": "2024-07-26",
+                "n": 3007,
+                "fit_weight": 0.5,
+                "baseline_mae": 0.6944795477219816,
+                "candidate_mae": 0.6923272192278269,
+                "gain_pct": 0.30991963711742476
+              },
+              {
+                "start": "2024-08-28",
+                "n": 2984,
+                "fit_weight": 0.5,
+                "baseline_mae": 0.7058981233243957,
+                "candidate_mae": 0.703224036890055,
+                "gain_pct": 0.3788204481614513
+              }
+            ],
+            "decision": "enabled: passed holdout and both rolling folds"
+          }
+        }
+      }
     },
     "prop_matchup_holdout": {
       "source": "backtest_props chronological 2024 split",
@@ -3657,7 +3728,7 @@
       "metric": "MAE",
       "results": {
         "batter_hits": {
-          "signal": "50-PA xBA × average AB/game",
+          "signal": "50-PA xBA \u00d7 average AB/game",
           "fit_n": 7815,
           "holdout_n": 8480,
           "candidate_weight": 0.5,
@@ -3666,7 +3737,7 @@
           "selected_weight": 0.0
         },
         "pitcher_strikeouts": {
-          "signal": "100-PA K% × average BF/start",
+          "signal": "100-PA K% \u00d7 average BF/start",
           "fit_n": 1573,
           "holdout_n": 2866,
           "candidate_weight": 0.0,
@@ -3703,12 +3774,17 @@
   "starter_adjustment": {
     "enabled": true,
     "moneyline": 1.896,
-    "totals": 0.392,
     "run_scale": 2.169,
-    "props": 0.0,
+    "props": {
+      "batter_hits": 0.0,
+      "batter_strikeouts": 0.5,
+      "pitcher_strikeouts": 0.0,
+      "pitcher_outs": 0.0,
+      "pitcher_earned_runs": 0.0
+    },
     "bullpen": 1.115,
     "bvp": 0.0,
-    "_note": "moneyline/spreads/run_scale/bullpen/totals fit from 2021,2022,2023,2024 (7915 games, 7911 w/ bullpen); props remain 0 after a chronological 2024 holdout selected no matchup adjustment for batter hits, pitcher outs, or earned runs; pitcher strikeouts lacked a leakage-safe as-of K-rate signal.",
+    "_note": "per-prop weights fit from 2024; chronological holdout starts 2024-07-01; live recent window =20; two rolling validation folds required; selected {'batter_hits': 0.0, 'batter_strikeouts': 0.5, 'pitcher_strikeouts': 0.0, 'pitcher_outs': 0.0, 'pitcher_earned_runs': 0.0}. method-A props read empirical over-rate at shifted line (safe).",
     "spreads": 5.261
   }
 }

@@ -618,52 +618,100 @@ def parse_player_props(game_data):
         "props": {},
     }
 
+    # Keep complete two-sided offers by bookmaker and line. Standard lines can
+    # differ across books, so combining an Over from one line with an Under
+    # from another would produce a fictitious market and an invalid de-vig.
+    grouped = {}
+    side_prices = {}
     for bookmaker in game_data.get("bookmakers", []):
+        book_title = bookmaker.get("title") or bookmaker.get("key") or "Unknown"
         for market in bookmaker.get("markets", []):
             market_key = market["key"]
             if market_key not in PROP_LABELS:
                 continue
 
-            if market_key not in result["props"]:
-                result["props"][market_key] = {}
-
-            # Group outcomes by player description
+            # Group outcomes by player AND line inside each book. A malformed
+            # or alternate-like payload can contain multiple points in one
+            # market; those sides must never be paired across lines.
             players = {}
             for outcome in market.get("outcomes", []):
                 player = outcome.get("description")
                 if not player:
                     continue
-                if player not in players:
-                    players[player] = {}
-                side = outcome["name"]  # "Over" or "Under"
-                players[player][side] = outcome
-
-            for player, sides in players.items():
-                # Skip if already recorded from an earlier bookmaker
-                if player in result["props"][market_key]:
+                side = outcome.get("name")
+                if side not in ("Over", "Under"):
                     continue
+                line = (0.5 if market_key == "player_anytime_td"
+                        else outcome.get("point"))
+                price = outcome.get("price")
+                if line is None or price is None:
+                    continue
+                side_prices.setdefault(market_key, {}).setdefault(
+                    player, {}).setdefault(line, {}).setdefault(side, []).append({
+                        "book": book_title,
+                        "price": price,
+                    })
+                players.setdefault((player, line), {})[side] = outcome
 
+            for (player, line), sides in players.items():
                 if "Over" not in sides or "Under" not in sides:
                     continue
 
                 over = sides["Over"]
                 under = sides["Under"]
 
-                if market_key == "player_anytime_td":
-                    line = 0.5
-                else:
-                    line = over.get("point", under.get("point", 0))
-
                 over_price = over["price"]
                 under_price = under["price"]
 
-                result["props"][market_key][player] = {
-                    "line": line,
-                    "over_price": over_price,
-                    "under_price": under_price,
-                    "over_implied": american_to_implied_prob(over_price),
-                    "under_implied": american_to_implied_prob(under_price),
-                }
+                grouped.setdefault(market_key, {}).setdefault(
+                    player, {}).setdefault(line, []).append({
+                        "book": book_title,
+                        "over_price": over_price,
+                        "under_price": under_price,
+                    })
+
+    for market_key, by_player in grouped.items():
+        result["props"][market_key] = {}
+        for player, by_line in by_player.items():
+            # Use the modal line as the consensus standard line. On a tie,
+            # prefer the line nearest the median of the offered lines.
+            lines = sorted(by_line)
+            median_line = lines[len(lines) // 2]
+            line = max(
+                lines,
+                key=lambda value: (len(by_line[value]),
+                                   -abs(float(value) - float(median_line))),
+            )
+            offers = by_line[line]
+            fair_pairs = []
+            for offer in offers:
+                raw_over = american_to_implied_prob(offer["over_price"])
+                raw_under = american_to_implied_prob(offer["under_price"])
+                fair_pairs.append(devig_two_way(raw_over, raw_under))
+
+            fair_over = sum(pair[0] for pair in fair_pairs) / len(fair_pairs)
+            fair_under = 1.0 - fair_over
+            executable = side_prices[market_key][player][line]
+            best_over = max(
+                executable["Over"], key=lambda offer: offer["price"])
+            best_under = max(
+                executable["Under"], key=lambda offer: offer["price"])
+            result["props"][market_key][player] = {
+                "line": line,
+                "over_price": best_over["price"],
+                "under_price": best_under["price"],
+                "over_book": best_over["book"],
+                "under_book": best_under["book"],
+                # Edge is measured against the consensus fair probability;
+                # expected ROI still uses the best executable side price.
+                "over_implied": fair_over,
+                "under_implied": fair_under,
+                "offers": offers,
+                "books_sampled": len(offers),
+                "over_prices_sampled": len(executable["Over"]),
+                "under_prices_sampled": len(executable["Under"]),
+                "market_implied_method": "two_way_devig_consensus",
+            }
 
     return result
 
@@ -699,9 +747,13 @@ def parse_alt_player_props(game_data):
                 if point not in grouped[key]:
                     grouped[key][point] = {"line": point, "over_price": None, "under_price": None}
                 if side == "Over":
-                    grouped[key][point]["over_price"] = price
+                    previous = grouped[key][point]["over_price"]
+                    grouped[key][point]["over_price"] = (
+                        price if previous is None else max(previous, price))
                 elif side == "Under":
-                    grouped[key][point]["under_price"] = price
+                    previous = grouped[key][point]["under_price"]
+                    grouped[key][point]["under_price"] = (
+                        price if previous is None else max(previous, price))
 
     return {
         k: sorted(v.values(), key=lambda e: e["line"])

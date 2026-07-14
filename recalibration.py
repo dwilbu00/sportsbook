@@ -45,6 +45,7 @@ LOG_PATH = os.path.join(PRED_DIR, "prediction_log.jsonl")
 CALIB_DIR = os.path.join(SCRIPT_DIR, "calibration")
 
 MIN_FIT_SAMPLES = 50          # below this, skip Platt fit for a prop
+MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
 MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
 MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
@@ -359,6 +360,102 @@ def apply_platt(raw_prob, a, b):
     return _sigmoid(a * _logit(raw_prob) + b)
 
 
+def _probability_scores(probabilities, outcomes):
+    """Return (Brier, log loss) for binary probability forecasts."""
+    if not probabilities:
+        return None, None
+    brier = sum((p - y) ** 2 for p, y in zip(probabilities, outcomes)) / len(outcomes)
+    log_loss = -sum(
+        y * math.log(min(max(p, _EPS), 1.0 - _EPS))
+        + (1 - y) * math.log(min(max(1.0 - p, _EPS), 1.0 - _EPS))
+        for p, y in zip(probabilities, outcomes)
+    ) / len(outcomes)
+    return brier, log_loss
+
+
+def fit_platt_chronological(records):
+    """
+    Validate Platt scaling on two expanding-window chronological folds before
+    fitting the final parameters on all observations. `records` contains
+    (date_or_timestamp, raw_probability, outcome).
+
+    Returns a parameter/metric dict, or None when the calibrated probabilities
+    do not improve both Brier score and log loss in every untouched later fold.
+    Rows sharing a date always stay in the same side of a boundary.
+    """
+    rows = sorted(
+        (str(date), float(raw), int(outcome))
+        for date, raw, outcome in records
+        if raw is not None and outcome in (0, 1)
+    )
+    if len(rows) < MIN_FIT_SAMPLES + 2 * MIN_VALIDATION_SAMPLES:
+        return None
+
+    cut1 = rows[int(len(rows) * 0.6)][0]
+    cut2 = rows[int(len(rows) * 0.8)][0]
+    if cut1 == cut2:
+        return None
+    folds = [
+        ([row for row in rows if row[0] < cut1],
+         [row for row in rows if cut1 <= row[0] < cut2]),
+        ([row for row in rows if row[0] < cut2],
+         [row for row in rows if row[0] >= cut2]),
+    ]
+    validation_folds = []
+    score_totals = [0.0, 0.0, 0.0, 0.0]
+    validation_n = 0
+    for train, holdout in folds:
+        if (len(train) < MIN_FIT_SAMPLES
+                or len(holdout) < MIN_VALIDATION_SAMPLES):
+            return None
+        fit = fit_platt([row[1] for row in train], [row[2] for row in train])
+        if fit is None:
+            return None
+        a, b = fit
+        holdout_raw = [row[1] for row in holdout]
+        holdout_y = [row[2] for row in holdout]
+        holdout_cal = [apply_platt(raw, a, b) for raw in holdout_raw]
+        raw_brier, raw_log_loss = _probability_scores(holdout_raw, holdout_y)
+        cal_brier, cal_log_loss = _probability_scores(holdout_cal, holdout_y)
+        if cal_brier >= raw_brier or cal_log_loss >= raw_log_loss:
+            return None
+        n_holdout = len(holdout)
+        for i, score in enumerate((raw_brier, cal_brier,
+                                   raw_log_loss, cal_log_loss)):
+            score_totals[i] += score * n_holdout
+        validation_n += n_holdout
+        validation_folds.append({
+            "holdout_start": holdout[0][0],
+            "n_validation": n_holdout,
+            "raw_brier": raw_brier,
+            "calibrated_brier": cal_brier,
+            "raw_log_loss": raw_log_loss,
+            "calibrated_log_loss": cal_log_loss,
+        })
+
+    raw_brier, cal_brier, raw_log_loss, cal_log_loss = (
+        total / validation_n for total in score_totals)
+
+    final_fit = fit_platt([row[1] for row in rows], [row[2] for row in rows])
+    if final_fit is None:
+        return None
+    final_a, final_b = final_fit
+    return {
+        "a": final_a,
+        "b": final_b,
+        "n_fit": len(rows),
+        "n_validation": validation_n,
+        "n_validation_folds": len(validation_folds),
+        "holdout_start": validation_folds[0]["holdout_start"],
+        "holdout_raw_brier": raw_brier,
+        "holdout_calibrated_brier": cal_brier,
+        "holdout_raw_log_loss": raw_log_loss,
+        "holdout_calibrated_log_loss": cal_log_loss,
+        "validation_folds": validation_folds,
+        "validated": True,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Persistence + load
 # ──────────────────────────────────────────────────────────────────────────────
@@ -398,7 +495,14 @@ def load_recalibration(sport_key):
             blob = json.load(f)
     except Exception:
         return {}
-    props = blob.get("props", {}) or {}
+    # Legacy fits were trained and evaluated on the same rows. Keep them on
+    # disk for provenance, but do not apply them until a chronological holdout
+    # has demonstrated that recalibration improves unseen probabilities.
+    props = {
+        prop_key: cfg
+        for prop_key, cfg in (blob.get("props", {}) or {}).items()
+        if cfg.get("validated") is True
+    }
     _LOAD_CACHE[sport_key] = (mtime, props)
     return props
 
@@ -415,8 +519,10 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
         newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
 
     rows = _read_log()
-    by_prop_raw = defaultdict(list)
-    by_prop_y = defaultdict(list)
+    # Repeated app launches can log the same published player/game/line more
+    # than once. Keep the latest version of each forecast so frequently viewed
+    # games do not receive accidental extra weight in calibration.
+    unique_rows = {}
     for r in rows:
         if r.get("sport_key") != sport_key:
             continue
@@ -425,22 +531,42 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
         o = r.get("outcome")
         if o not in (0, 1):
             continue
-        by_prop_raw[r["prop_key"]].append(float(r["raw_prob"]))
-        by_prop_y[r["prop_key"]].append(int(o))
+        identity = (
+            r.get("prop_key"), r.get("player"), r.get("game_date"),
+            r.get("line"),
+        )
+        unique_rows[identity] = r
+
+    by_prop_records = defaultdict(list)
+    for r in unique_rows.values():
+        o = r["outcome"]
+        order_key = r.get("game_date") or r.get("ts") or ""
+        by_prop_records[r["prop_key"]].append(
+            (order_key, float(r["raw_prob"]), int(o)))
 
     fits = {}
     per_prop_params = {}
-    for prop_key, raws in by_prop_raw.items():
-        ys = by_prop_y[prop_key]
-        result = fit_platt(raws, ys)
+    for prop_key, records in by_prop_records.items():
+        result = fit_platt_chronological(records)
         if result is None:
             continue
-        a, b = result
-        fits[prop_key] = (a, b, len(raws))
+        a, b = result["a"], result["b"]
+        fits[prop_key] = (a, b, result["n_fit"])
         per_prop_params[prop_key] = {
             "a": round(a, 5),
             "b": round(b, 5),
-            "n_fit": len(raws),
+            "n_fit": result["n_fit"],
+            "n_validation": result["n_validation"],
+            "n_validation_folds": result["n_validation_folds"],
+            "holdout_start": result["holdout_start"],
+            "holdout_raw_brier": round(result["holdout_raw_brier"], 6),
+            "holdout_calibrated_brier": round(
+                result["holdout_calibrated_brier"], 6),
+            "holdout_raw_log_loss": round(result["holdout_raw_log_loss"], 6),
+            "holdout_calibrated_log_loss": round(
+                result["holdout_calibrated_log_loss"], 6),
+            "validation_folds": result["validation_folds"],
+            "validated": True,
         }
 
     if per_prop_params:
@@ -542,8 +668,7 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
 
     cal = _load_cal(sport_key) or {}
 
-    by_prop_raw = defaultdict(list)
-    by_prop_y = defaultdict(list)
+    by_prop_records = defaultdict(list)
 
     for obs in enriched:
         projected, emp = project_and_empirical(obs, params, sport_key,
@@ -565,22 +690,32 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         if actual == line:
             continue
         y = 1 if actual > line else 0
-        by_prop_raw[obs["prop_key"]].append(raw)
-        by_prop_y[obs["prop_key"]].append(y)
+        by_prop_records[obs["prop_key"]].append(
+            (obs.get("game_date") or "", raw, y))
 
     fits = {}
     per_prop_params = {}
-    for prop_key, raws in by_prop_raw.items():
-        ys = by_prop_y[prop_key]
-        result = fit_platt(raws, ys)
+    for prop_key, records in by_prop_records.items():
+        result = fit_platt_chronological(records)
         if result is None:
             continue
-        a, b = result
-        fits[prop_key] = (a, b, len(raws))
+        a, b = result["a"], result["b"]
+        fits[prop_key] = (a, b, result["n_fit"])
         per_prop_params[prop_key] = {
             "a": round(a, 5),
             "b": round(b, 5),
-            "n_fit": len(raws),
+            "n_fit": result["n_fit"],
+            "n_validation": result["n_validation"],
+            "n_validation_folds": result["n_validation_folds"],
+            "holdout_start": result["holdout_start"],
+            "holdout_raw_brier": round(result["holdout_raw_brier"], 6),
+            "holdout_calibrated_brier": round(
+                result["holdout_calibrated_brier"], 6),
+            "holdout_raw_log_loss": round(result["holdout_raw_log_loss"], 6),
+            "holdout_calibrated_log_loss": round(
+                result["holdout_calibrated_log_loss"], 6),
+            "validation_folds": result["validation_folds"],
+            "validated": True,
             "source": "book_line_cache_seed",
         }
 

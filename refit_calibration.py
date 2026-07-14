@@ -18,6 +18,7 @@ Usage:
 import argparse
 import math
 import sys
+from datetime import datetime
 
 from backtest import (
     SPORT_MAP, DEFAULT_STARTERS, DEFAULT_PROPS, VARIANT_PRESETS,
@@ -25,6 +26,31 @@ from backtest import (
     run_player_props_backtest,
 )
 from calibration_loader import save_calibration
+
+
+def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
+    """Resolve a broad, data-driven MLB calibration pool from cached seasons."""
+    if not season:
+        season = datetime.utcnow().year
+    try:
+        import mlb_starters
+        from backtest_props import frequent_batter_ids, starter_ids
+
+        player_ids = (frequent_batter_ids([season], max_batters)
+                      + starter_ids([season])[:max_pitchers])
+        names = []
+        for start in range(0, len(player_ids), 50):
+            chunk = player_ids[start:start + 50]
+            data = mlb_starters._get(
+                "people", {"personIds": ",".join(map(str, chunk))})
+            names.extend(
+                person.get("fullName") for person in data.get("people", [])
+                if person.get("fullName")
+            )
+        return list(dict.fromkeys(names))
+    except Exception as exc:
+        print(f"  [warn] broad MLB player pool unavailable: {exc}")
+        return []
 
 
 def _parse_variant_name(name):
@@ -132,8 +158,19 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
 
 
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
-                games_per_player=80, warmup_games=10, shrinkage_k_default=0):
+                games_per_player=80, warmup_games=10, shrinkage_k_default=0,
+                mlb_max_batters=40, mlb_max_pitchers=30):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    if sport == "mlb" and season is None:
+        season = datetime.utcnow().year
+    if players is None and sport == "mlb":
+        players = _mlb_player_pool(
+            season, max_batters=mlb_max_batters,
+            max_pitchers=mlb_max_pitchers)
+        if not players:
+            print("No data-driven MLB player pool was available; aborting rather "
+                  "than fitting all MLB props from the small static fallback.")
+            sys.exit(1)
     players = players or DEFAULT_STARTERS.get(sport)
     props = props or DEFAULT_PROPS.get(sport)
     if not players or not props:
@@ -185,6 +222,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             continue
         cfg = _build_prop_cfg(winner, curr_results, prop_key, shrinkage_k_default)
         cfg["warmup_games"] = warmup_games
+        cfg["fit_season"] = season
 
         warm_winner = warmup_winners.get(prop_key)
         if warm_winner and warmup_results:
@@ -194,6 +232,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 "method": warm_winner["method"],
                 "variant_label": warm_winner["variant"],
                 "fit_brier": round(warm_winner["brier"], 4),
+                "fit_season": prior_season,
                 **warm_fit,
             }
         print(f"  [{prop_key}] method={cfg['method']} hl={cfg['half_life']} "
@@ -230,6 +269,10 @@ def main():
     p.add_argument("--shrinkage-k", type=int, default=0,
                    help="Bayesian shrinkage k written into the calibration file "
                         "(applied at runtime by analysis.py).")
+    p.add_argument("--mlb-max-batters", type=int, default=40,
+                   help="Data-driven MLB batter pool size when --players is omitted.")
+    p.add_argument("--mlb-max-pitchers", type=int, default=30,
+                   help="Data-driven MLB pitcher pool size when --players is omitted.")
     args = p.parse_args()
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None
@@ -239,7 +282,9 @@ def main():
                 players=players, props=props,
                 games_per_player=args.games_per_player,
                 warmup_games=args.warmup_games,
-                shrinkage_k_default=args.shrinkage_k)
+                shrinkage_k_default=args.shrinkage_k,
+                mlb_max_batters=args.mlb_max_batters,
+                mlb_max_pitchers=args.mlb_max_pitchers)
 
 
 if __name__ == "__main__":

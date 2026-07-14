@@ -729,6 +729,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         "opponents": [],
         "home_aways": [],
         "game_dates": [],
+        "plate_appearances": [],
+        "at_bats": [],
         "team_id": None,
         "found": False,
     }
@@ -770,6 +772,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
     home_aways = []
     minutes = []  # raw MIN per game (used by safe-mode to filter DNPs)
     game_dates = []  # ISO timestamp per game (used for current-season counting)
+    plate_appearances = []  # MLB batter exposure for PA-level matchup models
+    at_bats = []
     team_id = None
     for game in gamelog[:n]:
         val = game.get(matched_label, 0.0)
@@ -784,6 +788,14 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         home_aways.append(game.get("is_home"))
         minutes.append(game.get("MIN", 0.0) or 0.0)
         game_dates.append(game.get("game_date"))
+        ab = game.get("AB")
+        pa = game.get("PA")
+        if pa is None and ab is not None:
+            pa = ((ab or 0.0) + (game.get("BB") or 0.0)
+                  + (game.get("HBP") or 0.0) + (game.get("SF") or 0.0)
+                  + (game.get("SH") or 0.0))
+        plate_appearances.append(pa)
+        at_bats.append(ab)
         # Capture the player's team id from the most recent game that has it.
         if team_id is None and game.get("team_id"):
             team_id = game.get("team_id")
@@ -793,6 +805,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
     result["home_aways"] = home_aways
     result["minutes"] = minutes
     result["game_dates"] = game_dates
+    result["plate_appearances"] = plate_appearances
+    result["at_bats"] = at_bats
     result["team_id"] = team_id
     result["found"] = len(values) > 0
     return result

@@ -25,13 +25,18 @@ import requests
 
 SAVANT_BASE = "https://baseballsavant.mlb.com"
 SAVANT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SportsbookValueFinder/1.0)"}
-# Bump SCHEMA_VERSION whenever the trimmed row shape changes so stale-schema
-# day caches are ignored and re-fetched (v2 added the individual `batter` id).
-SCHEMA_VERSION = 2
+# Bump SCHEMA_VERSION whenever the trimmed row shape changes. v4 stores xBA on
+# an at-bat basis: batted-ball xBA plus zeroes for strikeouts, while excluding
+# walks/HBP/sacrifices. Raw contact-only xBA (v3) is intentionally not a fallback
+# because comparing its BABIP-like denominator with batter hits/AB is invalid.
+SCHEMA_VERSION = 4
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "cache", f"statcast_days_v{SCHEMA_VERSION}")
+LEGACY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "cache", "statcast_days_v2")
 
-# Minimum batted balls before an as-of xwOBAcon estimate is considered usable.
+# Minimum prior events before an as-of estimate is usable (batted balls for
+# xwOBAcon, official at-bats for xBA).
 MIN_BBE = 40
 
 
@@ -43,13 +48,29 @@ def _day_path(day):
     return os.path.join(CACHE_DIR, f"{day}.json")
 
 
+def _at_bat_xba(row):
+    """Return expected hits for an official at-bat, else None."""
+    event = row.get("events")
+    if event in ("strikeout", "strikeout_double_play"):
+        return 0.0
+    if event in ("walk", "intent_walk", "hit_by_pitch", "sac_fly",
+                 "sac_bunt", "catcher_interf"):
+        return None
+    value = row.get("estimated_ba_using_speedangle")
+    try:
+        return float(value) if value not in ("", "null", None) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_statcast_day(day, force=False):
     """
     Fetch (and permanently cache) all pitches for a single ``day`` (YYYY-MM-DD).
 
     Returns a list of trimmed dict rows:
-        {game_date, pitcher, p_throws, batting_team, stand, xwoba}
-    where xwoba is a float for batted balls, else None.
+        {game_date, pitcher, p_throws, batting_team, stand, xwoba, xba}
+    xwOBA is populated for batted balls. xBA is populated once per official
+    at-bat (including 0.0 for strikeouts), otherwise None.
     """
     _ensure_dir()
     path = _day_path(day)
@@ -80,6 +101,7 @@ def fetch_statcast_day(day, force=False):
             xw = float(xw) if xw not in ("", "null", None) else None
         except ValueError:
             xw = None
+        xb = _at_bat_xba(r)
         topbot = r.get("inning_topbot")
         # The batting team is the AWAY team in the top half, HOME in the bottom.
         batting_team = r.get("away_team") if topbot == "Top" else r.get("home_team")
@@ -91,6 +113,7 @@ def fetch_statcast_day(day, force=False):
             "batting_team": batting_team,
             "stand": r.get("stand"),
             "xwoba": xw,
+            "xba": xb,
         })
     with open(path, "w") as f:
         json.dump(trimmed, f)
@@ -124,6 +147,9 @@ def load_days(start, end):
     day = d0
     while day <= d1:
         p = _day_path(day.isoformat())
+        if not os.path.exists(p):
+            legacy = os.path.join(LEGACY_CACHE_DIR, f"{day.isoformat()}.json")
+            p = legacy if os.path.exists(legacy) else p
         if os.path.exists(p):
             with open(p, "r") as f:
                 out.extend(json.load(f))

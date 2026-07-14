@@ -413,19 +413,6 @@ def fit(seasons, do_save=False):
         bp_feat_rmse = rmse([p - bullpen_w * e for p, e in zip(starter_pred, bexc)],
                             bp_tot)
 
-    # ── Totals logit weight: does the combined run-shift predict over/under? ──
-    # Leakage-safe reference = the pooled mean total (no betting line needed).
-    # The fitted coefficient is logits-per-run, exactly what _apply_starter_logit
-    # multiplies the (run-unit) starter_total_shift by at runtime.
-    mean_tot = sum(tot) / len(tot)
-    shift = [-(run_scale_c * d["combined_excess"])
-             - (bullpen_w * (d.get("bullpen_excess") or 0.0)) for d in data]
-    over = [1 if d["total_runs"] > mean_tot else 0 for d in data]
-    b_tot, a_tot = fit_logistic_1d(shift, over)
-    totals_w = max(0.0, min(3.0, b_tot))
-    base_tot_brier = brier([sum(over) / len(over)] * len(over), over)
-    feat_tot_brier = brier([_sigmoid(a_tot + b_tot * s) for s in shift], over)
-
     print(f"\n=== starter_adjustment fit — {seasons_str} ({len(data)} games) ===")
     print(f"league xwOBAcon baseline: {league_xwoba:.3f}")
     print(f"moneyline weight (logit coef on innings-wtd edge): {b_ml:.3f} "
@@ -450,28 +437,29 @@ def fit(seasons, do_save=False):
               f"({'BETTER' if bp_feat_rmse < bp_base_rmse else 'no gain'})")
     else:
         print("bullpen weight: not enough as-of relief data to fit.")
-    print(f"totals weight (logit per run of combined shift): {b_tot:.3f} "
-          f"-> clamped {totals_w:.3f}")
-    print(f"  Over/under Brier (vs pooled mean {mean_tot:.2f}): "
-          f"baseline {base_tot_brier:.4f} -> with-shift {feat_tot_brier:.4f} "
-          f"({'BETTER' if feat_tot_brier < base_tot_brier else 'no gain'})")
-
     if do_save:
         cur = load_starter_adjustment("baseball_mlb") or {}
         cur.update({"moneyline": round(ml_weight, 3),
                     "spreads": round(spreads_w, 3),
                     "run_scale": round(run_scale_c, 3),
-                    "bullpen": round(bullpen_w, 3),
-                    "totals": round(totals_w, 3)})
-        cur["_note"] = (f"moneyline/spreads/run_scale/bullpen/totals fit from "
+                    "bullpen": round(bullpen_w, 3)})
+        # The run_scale/bullpen shift is already applied to projected_total,
+        # which is now the probability distribution's mean. A second totals
+        # logit coefficient would double-count the same starter signal.
+        cur.pop("totals", None)
+        cur["_note"] = (f"moneyline/spreads/run_scale/bullpen fit from "
                         f"{seasons_str} ({len(data)} games, "
                         f"{len(bp_data)} w/ bullpen); moneyline & spreads use the "
-                        f"innings-weighted edge; props/bvp still 0.")
+                        f"innings-weighted edge; independently fitted prop "
+                        f"weights and bvp setting preserved.")
         save_starter_adjustment("baseball_mlb", cur,
-                                meta={"source": f"backtest_starters:{seasons_str}",
-                                      "fit": True, "n_games": len(data)})
+                                meta={"team_markets": {
+                                    "source": f"backtest_starters:{seasons_str}",
+                                    "fit": True,
+                                    "n_games": len(data),
+                                }})
         print("saved fitted weights "
-              "(moneyline, spreads, run_scale, bullpen, totals).")
+              "(moneyline, spreads, run_scale, bullpen).")
 
 
 def _pearson(xs, ys):

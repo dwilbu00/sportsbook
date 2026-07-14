@@ -116,7 +116,7 @@ def _get_savant_csv(path, params=None, max_retries=4, backoff_base=1.5):
     return list(csv.DictReader(io.StringIO(text)))
 
 
-def get_pitcher_expected_stats(season, min_bip=10):
+def get_pitcher_expected_stats(season, min_bip=40):
     """
     Baseball Savant expected (x) stats for all pitchers with >= ``min_bip``
     balls in play, keyed by str(player_id) (same MLBAM id as the Stats API).
@@ -124,7 +124,9 @@ def get_pitcher_expected_stats(season, min_bip=10):
     Returns {player_id: {'xera','xwoba','xba'}}. These are the luck-stripped
     "true" stats that set Savant apart from ESPN/traditional lines.
     """
-    cache = f"savant_xstats_pitcher_{season}_{min_bip}"
+    # v2 adds xBA to the cached row shape; do not let a pre-xBA daily cache
+    # silently disable the hit-specific matchup model.
+    cache = f"savant_xstats_pitcher_v2_{season}_{min_bip}"
     cached = _read_cache(cache, max_age=24 * 3600)  # refresh daily
     if cached is not None:
         return cached
@@ -296,6 +298,7 @@ def get_pitcher_quality(pitcher_id, season):
         "bb_pct": _safe_div(stat.get("baseOnBalls"), bf),
         "xera": None,
         "xwoba": None,
+        "xba": None,
     }
 
     # Prefer Savant expected stats (luck-stripped "true" quality) when the
@@ -307,6 +310,7 @@ def get_pitcher_quality(pitcher_id, season):
     if xstats:
         out["xera"] = xstats.get("xera")
         out["xwoba"] = xstats.get("xwoba")
+        out["xba"] = xstats.get("xba")
 
     # Run-suppression index vs league average (higher = better pitcher).
     # Uses xERA when available (removes BABIP/sequencing luck), else ERA.

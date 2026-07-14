@@ -609,12 +609,14 @@ def render_model_guide():
         st.subheader("MLB expected-stat and matchup features")
         st.markdown(
             "xERA/xwOBA, starter quality, handedness splits, lineup quality, and bullpen "
-            "suppression are active inputs for MLB team markets. Player-prop matchup "
-            "effects are separately gated because a useful baseball feature can still "
-            "make a specific prop projection worse."
+            "suppression are active inputs for MLB team markets. Batter props use "
+            "starter xBA or K rate at the starter's projected workload, with the "
+            "remaining bullpen exposure held neutral until it can be validated as-of."
         )
-        holdout = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})
-                   .get("prop_matchup_holdout") or {})
+        mlb_meta = calibration_blobs.get("baseball_mlb", {}).get("meta") or {}
+        prop_fit = ((mlb_meta.get("starter_adjustment") or {}).get("props") or {})
+        holdout = (prop_fit if prop_fit.get("results")
+                   else mlb_meta.get("prop_matchup_holdout") or {})
         holdout_rows = []
         for prop_key, result in (holdout.get("results") or {}).items():
             if result.get("status"):
@@ -638,7 +640,10 @@ def render_model_guide():
                     f"{baseline:.5f} → {selected:.5f}"
                     if baseline is not None and selected is not None else "Not exported"
                 ),
-                "Decision": "Disabled—training selected no matchup adjustment",
+                "Decision": result.get("decision") or (
+                    "Enabled" if result.get("selected_weight", 0.0) > 0
+                    else "Disabled"
+                ),
             })
         if holdout_rows:
             st.dataframe(holdout_rows, hide_index=True, width="stretch")
@@ -647,10 +652,10 @@ def render_model_guide():
                 f"holdout: {holdout.get('holdout_window', 'not recorded')}."
             )
         st.info(
-            "Current result: the player-prop matchup weight remains **0.0**. Batter hits, "
-            "pitcher outs, and earned runs did not improve on the chronological test. "
-            "Pitcher strikeouts remain disabled because the historical contact cache "
-            "cannot reproduce the live lineup K-rate feature without leakage or guessing."
+            "Current result: **batter strikeouts use a 0.5 starter-matchup weight** "
+            "after improving the main holdout and both rolling folds. Batter hits remain "
+            "at 0.0 because their xBA candidate regressed in one rolling fold. Pitcher "
+            "strikeouts, outs, and earned runs remain at 0.0."
         )
 
         recency = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})

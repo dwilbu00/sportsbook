@@ -1,5 +1,5 @@
 """
-Fit / validate the MLB player-prop matchup weight (`starter_adjustment.props`)
+Fit / validate per-prop MLB matchup weights (`starter_adjustment.props.<prop>`)
 from HISTORICAL outcomes — leakage-safe, no Odds API credits.
 
 This is the v2 companion to backtest_starters.py. Where that tool fits the
@@ -24,11 +24,14 @@ weight transfers to runtime:
 For each candidate weight w we recompute adjusted_proj = base_proj * mult(w)
 and score projection accuracy (MAE / RMSE of actual − adjusted_proj). Weight
 selection uses the earlier observations and must still improve MAE on a later
-chronological holdout before a nonzero `props` weight can be saved.
+chronological holdout and two expanding-window validation folds before a
+nonzero `props` weight can be saved.
 
 LEAKAGE-SAFE MATCHUP COVERAGE (what we can build from Statcast contact data):
-  * batter_hits          → opposing STARTER as-of xwOBAcon  (EXACT runtime
-                           mirror: runtime also uses the starter's xwoba)
+  * batter_hits          → opposing STARTER as-of xBA, combined at the AB level;
+                           retained at weight 0 unless a hit-specific holdout wins
+  * batter_strikeouts    → batter recent K/PA combined with opposing STARTER's
+                           as-of K/BF through the same log5 runtime function
   * pitcher_earned_runs  → opposing LINEUP as-of xwOBAcon vs hand, mapped to
     pitcher_outs           an OPS-equivalent ratio (runtime uses season OPS;
                            this is the leakage-safe contact-quality proxy)
@@ -44,8 +47,8 @@ Usage:
 
 Caveats (documented, not hidden):
   * Uses the schedule's probable starter (≈ actual; late scratches unmodeled).
-  * A single shared `props` weight is fit (matches the current runtime knob).
-    Per-prop diagnostics are printed so you can see which props carry the signal.
+  * Each prop gets its own weight. A weak hit signal can no longer disable a
+    useful strikeout signal, or vice versa.
   * Enabling props>0 for a Gaussian-residual prop (method "B", e.g.
     pitcher_strikeouts) also requires re-fitting that prop's residual_* block,
     since those stats were fit at mult=1. Method "A" props (batter_hits) read
@@ -73,16 +76,18 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 # prop_key -> (statsapi group, gameLog stat field)
 PROP_SPEC = {
     "batter_hits": ("hitting", "hits"),
+    "batter_strikeouts": ("hitting", "strikeOuts"),
     "pitcher_strikeouts": ("pitching", "strikeOuts"),
     "pitcher_outs": ("pitching", "outs"),
     "pitcher_earned_runs": ("pitching", "earnedRuns"),
 }
 PITCHER_PROPS = {"pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs"}
 
-DEFAULT_PROPS = ["batter_hits", "pitcher_outs", "pitcher_earned_runs",
-                 "pitcher_strikeouts"]
+DEFAULT_PROPS = ["batter_hits", "batter_strikeouts", "pitcher_outs",
+                 "pitcher_earned_runs", "pitcher_strikeouts"]
 WEIGHT_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
 MIN_PRIOR = 5          # prior games before an observation is usable
+LIVE_RECENT_N = 20     # app.py MLB recent_n_default; keep harness in parity
 GAMELOG_CACHE_AGE = 90 * 24 * 3600  # historical logs never change
 
 # StatsAPI abbreviation -> Savant abbreviation (only mismatch is the Athletics).
@@ -197,13 +202,53 @@ class AsOfIndex:
         return pref[i] / i
 
 
-def build_pitcher_index(rows):
-    """xwOBAcon a pitcher ALLOWED, keyed by str(pitcher_id)."""
+class AsOfPitcherKIndex:
+    """Leakage-safe pitcher K/BF and average innings/start prefix index."""
+
+    def __init__(self):
+        self._buckets = defaultdict(list)
+        self._built = {}
+
+    def add(self, pitcher_id, date, strikeouts, batters_faced, innings):
+        self._buckets[str(pitcher_id)].append(
+            (date, strikeouts, batters_faced, innings))
+
+    def _prep(self, pitcher_id):
+        key = str(pitcher_id)
+        if key in self._built:
+            return self._built[key]
+        rows = sorted(self._buckets.get(key, []))
+        dates = []
+        pref_k = [0.0]
+        pref_bf = [0.0]
+        pref_ip = [0.0]
+        for date, strikeouts, batters_faced, innings in rows:
+            dates.append(date)
+            pref_k.append(pref_k[-1] + strikeouts)
+            pref_bf.append(pref_bf[-1] + batters_faced)
+            pref_ip.append(pref_ip[-1] + innings)
+        self._built[key] = (dates, pref_k, pref_bf, pref_ip)
+        return self._built[key]
+
+    def asof(self, pitcher_id, as_of, min_bf=50):
+        dates, pref_k, pref_bf, pref_ip = self._prep(pitcher_id)
+        i = bisect.bisect_left(dates, as_of)
+        if i < 1 or pref_bf[i] < min_bf:
+            return None
+        return {
+            "k_pct": pref_k[i] / pref_bf[i],
+            "bf": pref_bf[i],
+            "avg_ip": pref_ip[i] / i,
+        }
+
+
+def build_pitcher_xba_index(rows):
+    """Expected BA a pitcher allowed, available in Statcast cache schema v3."""
     idx = AsOfIndex()
-    for r in rows:
-        x = r.get("xwoba")
-        if x is not None and r.get("pitcher") and r.get("game_date"):
-            idx.add(r["pitcher"], r["game_date"], x)
+    for row in rows:
+        xba = row.get("xba")
+        if xba is not None and row.get("pitcher") and row.get("game_date"):
+            idx.add(row["pitcher"], row["game_date"], xba)
     return idx
 
 
@@ -215,6 +260,22 @@ def build_team_hand_index(rows):
         if (x is not None and r.get("batting_team") and r.get("p_throws")
                 and r.get("game_date")):
             idx.add((r["batting_team"], r["p_throws"]), r["game_date"], x)
+    return idx
+
+
+def build_pitcher_k_index(season):
+    """Build as-of starter K rates from historical StatsAPI game logs."""
+    idx = AsOfPitcherKIndex()
+    for pitcher_id in starter_ids([season]):
+        for split in gamelog(pitcher_id, season, "pitching"):
+            date = split.get("date")
+            strikeouts = _stat_val(split, "strikeOuts")
+            batters_faced = _stat_val(split, "battersFaced")
+            innings = mlb_starters._parse_ip(
+                (split.get("stat") or {}).get("inningsPitched"))
+            if (date and strikeouts is not None and batters_faced
+                    and innings is not None):
+                idx.add(pitcher_id, date, strikeouts, batters_faced, innings)
     return idx
 
 
@@ -342,9 +403,11 @@ def build_pitcher_obs(prop_key, seasons, league_by_season, hands_by_season,
                 if actual is None or not date:
                     continue
                 if len(vals) >= MIN_PRIOR:
+                    recent_vals = vals[:LIVE_RECENT_N]
                     base = analysis._weighted_mean(
-                        vals, analysis._recency_weights(len(vals),
-                                                        _half_life(prop_key)))
+                        recent_vals,
+                        analysis._recency_weights(len(recent_vals),
+                                                  _half_life(prop_key)))
                     is_home = bool(sp.get("isHome"))
                     opp_id = name_id.get((sp.get("opponent") or {}).get("name"))
                     opp_abbr = id_abbr.get(opp_id)
@@ -368,45 +431,83 @@ def build_pitcher_obs(prop_key, seasons, league_by_season, hands_by_season,
     return obs
 
 
-def build_batter_obs(prop_key, seasons, pitcher_index_by_season, top_n,
-                     verbose=True):
+def build_batter_obs(prop_key, seasons, pitcher_xba_index_by_season,
+                     pitcher_k_index_by_season,
+                     top_n, verbose=True):
     """
     Observations for a batter prop. matchup feature = opposing STARTER's as-of
-    xwOBAcon (exact runtime mirror — runtime scales batter_hits by the starter's
-    xwoba). Opposing starter is resolved via the schedule for that date/team.
+    xBA (hits) or K/BF (strikeouts). Opposing starter is resolved via the
+    schedule for that date/team.
     """
     _, field = PROP_SPEC[prop_key]
     obs = []
     for season in seasons:
-        pitch_idx = pitcher_index_by_season[season]
+        pitcher_xba_idx = pitcher_xba_index_by_season[season]
+        pitcher_k_idx = pitcher_k_index_by_season[season]
         sched = season_schedule(season)
         _, name_id = _team_maps(season)
         for bid in frequent_batter_ids([season], top_n):
             splits = gamelog(bid, season, "hitting")
             splits = sorted(splits, key=lambda s: s.get("date", ""))
             vals = []
+            plate_appearances = []
+            at_bats = []
             for sp in splits:
                 actual = _stat_val(sp, field)
                 date = sp.get("date")
                 if actual is None or not date:
                     continue
                 if len(vals) >= MIN_PRIOR:
+                    recent_vals = vals[:LIVE_RECENT_N]
+                    recent_pa = plate_appearances[:LIVE_RECENT_N]
+                    recent_ab = at_bats[:LIVE_RECENT_N]
+                    recent_weights = analysis._recency_weights(
+                        len(recent_vals), _half_life(prop_key))
                     base = analysis._weighted_mean(
-                        vals, analysis._recency_weights(len(vals),
-                                                        _half_life(prop_key)))
+                        recent_vals, recent_weights)
                     is_home = bool(sp.get("isHome"))
                     team_id = name_id.get((sp.get("team") or {}).get("name"))
                     opp_sp = _opposing_starter(sched.get(date, []), team_id,
                                                is_home)
                     feat = None
+                    player_context = None
                     if base > 0 and opp_sp:
-                        sx = pitch_idx.asof_mean(str(opp_sp), date)
-                        if sx is not None:
+                        if prop_key == "batter_strikeouts":
+                            starter = pitcher_k_idx.asof(str(opp_sp), date)
+                        else:
+                            sxba = pitcher_xba_idx.asof_mean(str(opp_sp), date)
+                            workload = pitcher_k_idx.asof(str(opp_sp), date)
+                            starter = ({
+                                "xba": sxba,
+                                "avg_ip": ((workload or {}).get("avg_ip")
+                                           or 5.5),
+                            } if sxba is not None else None)
+                        if starter is not None:
                             opp_side = "away" if is_home else "home"
-                            feat = {opp_side: {"starter": {"xwoba": sx}}}
+                            feat = {opp_side: {"starter": starter}}
+                            if prop_key in ("batter_hits", "batter_strikeouts"):
+                                recent_exposure = (recent_ab if prop_key == "batter_hits"
+                                                   else recent_pa)
+                                valid_pa = [
+                                    (pa, weight) for pa, weight in zip(
+                                        recent_exposure, recent_weights)
+                                    if pa is not None and pa > 0
+                                ]
+                                if valid_pa:
+                                    expected_pa = analysis._weighted_mean(
+                                        [pa for pa, _ in valid_pa],
+                                        [weight for _, weight in valid_pa])
+                                    player_context = {
+                                        "base_projection": base,
+                                        "expected_exposure": expected_pa,
+                                    }
                     if feat is not None:
-                        obs.append((base, actual, is_home, feat, date))
+                        obs.append((base, actual, is_home, feat, date,
+                                    player_context))
                 vals.insert(0, actual)
+                plate_appearances.insert(
+                    0, _stat_val(sp, "plateAppearances"))
+                at_bats.insert(0, _stat_val(sp, "atBats"))
         if verbose:
             print(f"  {prop_key} {season}: pooled {len(obs)} obs so far")
     return obs
@@ -430,8 +531,12 @@ def _score(obs, prop_key, weight):
     if not obs:
         return None, None
     se = ae = 0.0
-    for base, actual, is_home, feat, *_ in obs:
-        mult = analysis._mlb_prop_matchup_mult(prop_key, is_home, feat, weight)
+    for row in obs:
+        base, actual, is_home, feat = row[:4]
+        player_context = row[5] if len(row) > 5 else None
+        mult = analysis._mlb_prop_matchup_mult(
+            prop_key, is_home, feat, weight,
+            player_context=player_context)
         adj = base * mult
         d = actual - adj
         ae += abs(d)
@@ -458,11 +563,58 @@ def _signal_corr(obs, prop_key):
     projection residual (actual − base). Confirms the signal points the right
     way before we trust the weight."""
     raws, resids = [], []
-    for base, actual, is_home, feat, *_ in obs:
-        m1 = analysis._mlb_prop_matchup_mult(prop_key, is_home, feat, 1.0)
+    for row in obs:
+        base, actual, is_home, feat = row[:4]
+        player_context = row[5] if len(row) > 5 else None
+        m1 = analysis._mlb_prop_matchup_mult(
+            prop_key, is_home, feat, 1.0,
+            player_context=player_context)
         raws.append(m1 - 1.0)
         resids.append(actual - base)
     return _pearson(raws, resids)
+
+
+def _rolling_splits(obs, min_fold_n=100):
+    """Two expanding-train chronological folds, keeping dates intact."""
+    rows = sorted(obs, key=lambda row: row[4])
+    if len(rows) < 3 * min_fold_n:
+        return []
+    cut1 = rows[int(len(rows) * 0.6)][4]
+    cut2 = rows[int(len(rows) * 0.8)][4]
+    if cut1 == cut2:
+        return []
+    folds = [
+        ([row for row in rows if row[4] < cut1],
+         [row for row in rows if cut1 <= row[4] < cut2]),
+        ([row for row in rows if row[4] < cut2],
+         [row for row in rows if row[4] >= cut2]),
+    ]
+    if any(len(train) < min_fold_n or len(test) < min_fold_n
+           for train, test in folds):
+        return []
+    return folds
+
+
+def _rolling_weight_validation(obs, prop_key, candidate_weight):
+    """Validate a fixed candidate while reporting each expanding fit's choice."""
+    results = []
+    for train, test in _rolling_splits(obs):
+        train_scores = {w: _score(train, prop_key, w) for w in WEIGHT_GRID}
+        fit_weight = min(
+            WEIGHT_GRID, key=lambda weight: train_scores[weight][0])
+        baseline_mae = _score(test, prop_key, 0.0)[0]
+        candidate_mae = _score(test, prop_key, candidate_weight)[0]
+        gain = ((baseline_mae - candidate_mae) / baseline_mae * 100
+                if baseline_mae else 0.0)
+        results.append({
+            "start": test[0][4],
+            "n": len(test),
+            "fit_weight": fit_weight,
+            "baseline_mae": baseline_mae,
+            "candidate_mae": candidate_mae,
+            "gain_pct": gain,
+        })
+    return results
 
 
 def fit(seasons, props, top_n=120, do_save=False):
@@ -476,7 +628,9 @@ def fit(seasons, props, top_n=120, do_save=False):
     # Preload per-season Statcast rows once, then build as-of indices (prefix
     # sums) so each matchup lookup is O(log n) instead of a full-season scan.
     league_by_season, hands_by_season = {}, {}
-    pitcher_index_by_season, team_index_by_season = {}, {}
+    pitcher_xba_index_by_season = {}
+    pitcher_k_index_by_season = {}
+    team_index_by_season = {}
     for s in seasons:
         s0, s1 = _season_bounds(s)
         rows = sh.load_days(s0, s1)
@@ -487,7 +641,8 @@ def fit(seasons, props, top_n=120, do_save=False):
         lv = [r["xwoba"] for r in rows if r["xwoba"] is not None]
         league_by_season[s] = sum(lv) / len(lv)
         hands_by_season[s] = _pitcher_hands(rows)
-        pitcher_index_by_season[s] = build_pitcher_index(rows)
+        pitcher_xba_index_by_season[s] = build_pitcher_xba_index(rows)
+        pitcher_k_index_by_season[s] = build_pitcher_k_index(s)
         team_index_by_season[s] = build_team_hand_index(rows)
 
     per_prop = {}
@@ -506,7 +661,8 @@ def fit(seasons, props, top_n=120, do_save=False):
                                     hands_by_season, team_index_by_season)
         else:
             obs = build_batter_obs(prop_key, seasons,
-                                   pitcher_index_by_season, top_n)
+                                   pitcher_xba_index_by_season,
+                                   pitcher_k_index_by_season, top_n)
         train_obs = [o for o in obs if len(o) > 4 and o[4] < holdout_start]
         holdout_obs = [o for o in obs if len(o) > 4 and o[4] >= holdout_start]
         if len(train_obs) < 100 or len(holdout_obs) < 100:
@@ -522,6 +678,7 @@ def fit(seasons, props, top_n=120, do_save=False):
             "corr": corr,
             "train_scores": train_scores,
             "holdout_scores": holdout_scores,
+            "observations": obs,
         }
 
     if not per_prop:
@@ -535,6 +692,8 @@ def fit(seasons, props, top_n=120, do_save=False):
           f"(0 / .25 / .5 / .75 / 1)")
     pooled_train = defaultdict(lambda: [0.0, 0])
     pooled_holdout = defaultdict(lambda: [0.0, 0])
+    selected_weights = {}
+    validation_results = {}
     for prop_key, r in per_prop.items():
         maes = [r["train_scores"][w][0] for w in WEIGHT_GRID]
         base_mae = maes[0]
@@ -546,11 +705,42 @@ def fit(seasons, props, top_n=120, do_save=False):
         holdout_selected = r["holdout_scores"][best_w][0]
         holdout_gain = ((holdout_base - holdout_selected) / holdout_base * 100
                         if holdout_base else 0)
+        rolling = _rolling_weight_validation(
+            r["observations"], prop_key, best_w)
+        rolling_passed = (len(rolling) == 2
+                          and all(fold["gain_pct"] > 0 for fold in rolling))
+        accepted_w = (best_w if best_w != 0.0 and fit_gain > 0
+                      and holdout_gain > 0 and r["corr"] > 0
+                      and rolling_passed else 0.0)
+        selected_weights[prop_key] = accepted_w
+        validation_results[prop_key] = {
+            "fit_n": r["train_n"],
+            "holdout_n": r["holdout_n"],
+            "signal_correlation": round(r["corr"], 6),
+            "candidate_weight": best_w,
+            "selected_weight": accepted_w,
+            "baseline_mae": round(holdout_base, 6),
+            "candidate_mae": round(holdout_selected, 6),
+            "selected_mae": round(
+                r["holdout_scores"][accepted_w][0], 6),
+            "rolling_folds": rolling,
+            "decision": ("enabled: passed holdout and both rolling folds"
+                         if accepted_w else
+                         "disabled: candidate failed at least one validation gate"),
+        }
         print(f"{prop_key:<22}{r['train_n']:>7}{r['holdout_n']:>7}"
               f"{r['corr']:>+10.3f}  {mae_str}")
-        print(f"{'':46}  selected w={best_w}; fit MAE {fit_gain:+.2f}%; "
+        print(f"{'':46}  fit w={best_w}; accepted w={accepted_w}; "
+              f"fit MAE {fit_gain:+.2f}%; "
               f"holdout {holdout_base:.3f} → {holdout_selected:.3f} "
               f"({holdout_gain:+.2f}%)")
+        if rolling:
+            print(f"{'':46}  rolling folds: " + "; ".join(
+                f"{fold['start']} n={fold['n']} train-w={fold['fit_weight']} "
+                f"candidate {fold['gain_pct']:+.2f}%"
+                for fold in rolling))
+        else:
+            print(f"{'':46}  rolling folds unavailable (weight rejected)")
         for w in WEIGHT_GRID:
             pooled_train[w][0] += r["train_scores"][w][0] * r["train_n"]
             pooled_train[w][1] += r["train_n"]
@@ -559,33 +749,25 @@ def fit(seasons, props, top_n=120, do_save=False):
 
     pooled_fit = {w: pooled_train[w][0] / pooled_train[w][1] for w in WEIGHT_GRID}
     pooled_test = {w: pooled_holdout[w][0] / pooled_holdout[w][1] for w in WEIGHT_GRID}
-    chosen = min(WEIGHT_GRID, key=lambda w: pooled_fit[w])
-    fit_gain = ((pooled_fit[0.0] - pooled_fit[chosen]) / pooled_fit[0.0] * 100
-                if pooled_fit[0.0] else 0)
-    holdout_gain = ((pooled_test[0.0] - pooled_test[chosen]) / pooled_test[0.0] * 100
-                    if pooled_test[0.0] else 0)
-    all_props_improve = all(
-        r["holdout_scores"][chosen][0] < r["holdout_scores"][0.0][0]
-        for r in per_prop.values()
-    ) if chosen != 0.0 else False
     print("\npooled FIT MAE: " + " / ".join(f"{pooled_fit[w]:.3f}" for w in WEIGHT_GRID))
     print("pooled HOLDOUT MAE: " + " / ".join(f"{pooled_test[w]:.3f}" for w in WEIGHT_GRID))
-    print(f"fit-selected props weight = {chosen}; fit gain={fit_gain:+.2f}%; "
-          f"holdout gain={holdout_gain:+.2f}%; "
-          f"every prop improved={all_props_improve}")
-    if (chosen == 0.0 or fit_gain <= 0 or holdout_gain <= 0
-            or not all_props_improve):
-        print("nonzero shared weight did not improve fit, pooled holdout, and "
-              "every prop holdout → keeping 0.0")
-        chosen = 0.0
+    print("accepted per-prop weights: " + ", ".join(
+        f"{prop}={weight}" for prop, weight in selected_weights.items()))
 
     if do_save:
         cur = load_starter_adjustment("baseball_mlb") or {}
-        cur["props"] = round(float(chosen), 3)
-        methodB = [p for p in per_prop if _prop_method(p) == "B"]
-        note = (f"props weight {chosen} fit from {seasons_str}; chronological "
-                f"holdout starts {holdout_start} (fit gain {fit_gain:+.2f}%, "
-                f"holdout gain {holdout_gain:+.2f}%); ")
+        prop_weights = {prop: 0.0 for prop in PROP_SPEC}
+        prop_weights.update({
+            prop: round(float(weight), 3)
+            for prop, weight in selected_weights.items()
+        })
+        cur["props"] = prop_weights
+        methodB = [p for p, weight in selected_weights.items()
+                   if weight and _prop_method(p) == "B"]
+        note = (f"per-prop weights fit from {seasons_str}; chronological "
+                f"holdout starts {holdout_start}; live recent window "
+                f"={LIVE_RECENT_N}; two rolling validation folds required; "
+                f"selected {prop_weights}. ")
         if methodB:
             note += (f"WARNING: re-fit residual_* for {','.join(methodB)} "
                      f"(method B) before trusting — fit at mult=1.")
@@ -593,12 +775,21 @@ def fit(seasons, props, top_n=120, do_save=False):
             note += "method-A props read empirical over-rate at shifted line (safe)."
         cur["_note"] = note
         save_starter_adjustment("baseball_mlb", cur,
-                                meta={"source": f"backtest_props:{seasons_str}",
-                                      "fit": True,
-                                      "holdout_start": holdout_start})
-        print(f"\nsaved starter_adjustment.props = {chosen}")
+                                meta={"props": {
+                                    "source": f"backtest_props:{seasons_str}",
+                                    "fit": True,
+                                    "holdout_start": holdout_start,
+                                    "holdout_window": (
+                                        f"{holdout_start} through season end"),
+                                    "metric": "MAE",
+                                    "recent_n": LIVE_RECENT_N,
+                                    "rolling_validation_folds": 2,
+                                    "results": validation_results,
+                                }})
+        print(f"\nsaved starter_adjustment.props = {prop_weights}")
         if methodB:
             print("NOTE:", note)
+    return selected_weights
 
 
 def _prop_method(prop_key):

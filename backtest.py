@@ -1639,7 +1639,8 @@ DEFAULT_STARTERS = {
 
 DEFAULT_PROPS = {
     "nba": ["player_points", "player_rebounds", "player_assists"],
-    "mlb": ["batter_hits", "pitcher_strikeouts"],
+    "mlb": ["batter_hits", "batter_strikeouts", "pitcher_strikeouts",
+            "pitcher_outs", "pitcher_earned_runs"],
     "nfl": ["player_pass_yds", "player_rush_yds", "player_anytime_td"],
 }
 
@@ -1879,12 +1880,11 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
         print("No player data resolved. Aborting.")
         return
 
-    # ── Reliability filter (streak-based: see prop_filter.py) ──
-    # Drops low-minutes games, the 1 game before a layoff, the 1st-back game
-    # after a layoff, and any games sitting inside a too-short consecutive
-    # run. All variants in the sweep are evaluated on the SAME filtered set
-    # using a sport-specific `min_streak` so Brier comparisons stay apples-
-    # to-apples. Production analysis.py applies the per-prop calibrated hl.
+    # ── Reliability filter inputs (streak-based: see prop_filter.py) ──
+    # Filtering is performed separately for every historical prediction below.
+    # Applying it once to the complete season would let future games extend an
+    # earlier streak or reveal a later layoff, changing what the model appeared
+    # to know on the original prediction date.
     from prop_filter import filter_player_gamelog
 
     sport_min_streak = SPORT_DEFAULT_MIN_STREAK.get(sport_key, 5)
@@ -1905,31 +1905,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     espn_sport, espn_league, tid, season_year=season_year)
             except Exception:
                 team_schedules_for_filter[tid] = []
-
-    filter_stats = {"low_min": 0, "pre_layoff": 0, "post_layoff": 0,
-                    "short_streak": 0}
-    filtered_player_data = {}
-    for name, gl in player_data.items():
-        # Use most-recent team_id (handles mid-season trades).
-        tid = next((g.get("team_id") for g in gl if g.get("team_id")), None)
-        sched = team_schedules_for_filter.get(str(tid)) if tid else None
-        filt = filter_player_gamelog(gl, sched, sport_key,
-                                     min_streak=sport_min_streak)
-        filter_stats["low_min"] += filt["n_excluded_low_min"]
-        filter_stats["pre_layoff"] += filt["n_excluded_pre_layoff"]
-        filter_stats["post_layoff"] += filt["n_excluded_post_layoff"]
-        filter_stats["short_streak"] += filt["n_excluded_short_streak"]
-        if not filt["eligible_games"]:
-            print(f"  [drop] {name}: 0 eligible games (curr_streak="
-                  f"{filt['current_streak']} < {sport_min_streak})")
-            continue
-        filtered_player_data[name] = filt["eligible_games"]
-    print(f"=== Reliability filter (min_streak={sport_min_streak}): dropped "
-          f"{filter_stats['low_min']} low-min, "
-          f"{filter_stats['pre_layoff']} pre-layoff, "
-          f"{filter_stats['post_layoff']} post-layoff, "
-          f"{filter_stats['short_streak']} short-streak games ===")
-    player_data = filtered_player_data
+    print(f"=== Reliability filter: as-of-date mode "
+          f"(min_streak={sport_min_streak}) ===")
 
     # Build team-defense lookup if any variant uses defense weighting OR
     # the output-side defense adjustment.
@@ -1974,6 +1951,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
 
     total_observations = 0
     skipped = 0
+    reliability_skips = defaultdict(int)
 
     for name, gamelog in player_data.items():
         test_slice = gamelog[:games_per_player]
@@ -1986,18 +1964,38 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 actual = test_game.get(stat_label)
                 if actual is None:
                     continue
-                # NOTE: the upstream reliability filter has already removed
-                # low-minutes and layoff-window games from `gamelog`, so we
-                # don't need a per-test min-played check here anymore.
                 prior_games = gamelog[i + 1:]
+                test_date = test_game.get("game_date")
 
                 # Strict-season policy: drop prior games from earlier seasons
                 # so we never project a player using stale (different team /
                 # role / coach) data. `all` keeps the old cross-season pool.
                 if cross_season == "strict":
-                    test_date = test_game.get("game_date")
                     prior_games = _filter_to_current_season(
                         prior_games, test_date, sport_key)
+
+                # Rebuild eligibility using only information available before
+                # this test game. In particular, the test game's minutes and
+                # any later layoff/streak continuation must not affect whether
+                # this prediction is graded.
+                tid = test_game.get("team_id") or next(
+                    (g.get("team_id") for g in prior_games if g.get("team_id")),
+                    None,
+                )
+                schedule = (team_schedules_for_filter.get(str(tid))
+                            if tid else None)
+                filt = filter_player_gamelog(
+                    prior_games,
+                    schedule,
+                    sport_key,
+                    min_streak=sport_min_streak,
+                    as_of_date=test_date,
+                )
+                if filt["skip_prediction"]:
+                    reliability_skips[filt["skip_reason"] or "unknown"] += 1
+                    skipped += 1
+                    continue
+                prior_games = filt["eligible_games"]
 
                 if len(prior_games) < min_sample:
                     skipped += 1
@@ -2009,7 +2007,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 prior_opponents = [g.get("opponent") for g in prior_games]
                 upcoming_is_home = test_game.get("is_home")
                 upcoming_opp = test_game.get("opponent")
-                upcoming_date = test_game.get("game_date")
+                upcoming_date = test_date
 
                 # Days of rest before the upcoming game. ESPN game_date is ISO
                 # like "2025-03-14T..."; subtract whole-date components.
@@ -2146,7 +2144,11 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     total_observations += 1
 
     print(f"\nProcessed {total_observations} (player, prop, game) observations")
-    print(f"Skipped {skipped} game-prop observations (insufficient prior history)")
+    print(f"Skipped {skipped} game-prop observations (eligibility, history, or data)")
+    if reliability_skips:
+        print("As-of reliability skips: " + ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(reliability_skips.items())))
 
     if sweep:
         _print_props_sweep_results(results, props, top_k=10, safe_target=safe_target)

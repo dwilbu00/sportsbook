@@ -4,6 +4,11 @@ Sportsbook Value Finder is a probability engine for finding mispriced sportsbook
 
 Use the live application here: **https://sbvaluefinder.streamlit.app/**
 
+> **Source of truth:** this `deploy` directory is the standalone Git repository
+> deployed to Streamlit Cloud. The similarly named scripts in its parent
+> `SPORTSBOOK_ODDS` directory are a legacy working copy; do not calibrate or
+> release from that copy.
+
 This is **not** a simple “last 5 games average” app. The model now uses a full stack of statistical tools to estimate outcomes, correct its own bias, reject bad samples, and understand when legs in a parlay are mathematically connected.
 
 ```text
@@ -22,10 +27,10 @@ Value bets, safe alt-lines, and correlation-aware parlays
 ## What it analyzes
 
 - **Moneyline, spread, and total markets** for NBA, NFL, and MLB
-- **Player props** across points, rebounds, assists, passing yards, rushing yards, touchdowns, pitcher strikeouts, pitcher outs, earned runs, batter hits, and more
+- **Player props** across points, rebounds, assists, passing yards, rushing yards, touchdowns, pitcher strikeouts, pitcher outs, earned runs, batter hits, batter strikeouts, and more
 - **Alternate lines** for safer threshold-style props such as `8+ points` or `4+ strikeouts`
 - **Value parlays and safe parlays** using a joint-probability model instead of naïvely multiplying every leg together
-- **Live sportsbook prices** converted into implied probabilities, de-vigged where both sides are available
+- **Live sportsbook prices** converted into implied probabilities, de-vigged from same-book/same-line pairs while retaining the best executable side prices
 
 ## The mathematical stack
 
@@ -114,12 +119,14 @@ The MLB layer is no longer just historical scores. It uses MLB Stats API and Bas
 - Probable starting pitchers for each side
 - Starter handedness
 - ERA fallback plus **xERA / xwOBA** when available
+- Pitcher xBA for batter-hit matchups, with strikeouts included in its at-bat denominator
 - Strikeout and walk rates
 - Average innings per start to weight starter vs. bullpen influence
 - Team bullpen run-suppression index
 - Opposing lineup quality vs. left- or right-handed pitching
 - Bounded starter edge using a `tanh` transform
-- Calibrated starter weights for moneyline, spreads, totals, run scaling, and bullpen effects
+- Calibrated starter weights for moneyline, spreads, total run scaling, and bullpen effects
+- Log5-style batter hit/K rates weighted by the starter's expected innings share
 
 The model separates feature generation from feature strength. Raw starter and bullpen features are built first; calibration files decide how much those features are allowed to move a prediction.
 
@@ -188,7 +195,7 @@ Every published prop prediction can be logged, resolved later against ESPN outco
 p_calibrated = sigmoid(a * logit(p_raw) + b)
 ```
 
-The fit uses cross-entropy loss, Newton-Raphson optimization, mild L2 regularization, and minimum-sample guards. This gives the app a feedback loop: the more predictions it resolves, the better calibrated its probabilities can become.
+The fit uses cross-entropy loss, Newton-Raphson optimization, mild L2 regularization, and minimum-sample guards. A mapping is enabled only if it improves both Brier score and log loss in two expanding-window chronological folds; repeated logs for the same player/game/line are de-duplicated. This gives the app a feedback loop without letting in-sample fit quality masquerade as validation.
 
 ## Safe Mode: conservative alt-line math
 
@@ -233,7 +240,7 @@ Open **Model Guide & Performance** from the app sidebar to see the production de
 - Safe Mode's full confidence-and-price decision pipeline
 - MLB xStats holdout decisions and observation counts
 
-The MLB prop-matchup test is deliberately conservative. A chronological 2024 split selected a weight of `0.0` for batter hits, pitcher outs, and pitcher earned runs; the player-prop adjustment therefore remains disabled. Pitcher strikeout matchup weighting also remains disabled until the historical cache can reproduce the live lineup strikeout-rate signal without leakage. xERA/xwOBA, starter, handedness, and bullpen features remain active where their team-market backtests support them.
+The MLB prop-matchup test is deliberately conservative. In the leakage-safe 2024 fit, starter K rate improved batter-strikeout MAE on the main holdout and both rolling folds, enabling a `0.5` weight. Starter xBA slightly improved the aggregate batter-hit holdout but regressed in one rolling fold, so batter hits remain at `0.0`. Pitcher strikeouts, outs, and earned runs also remain at `0.0` until their exact live signals pass the same gates.
 
 ## Parlays use joint probability instead of naïve multiplication
 
@@ -266,7 +273,7 @@ That makes the parlay builder much harder to fool with same-game correlation tra
 The repository includes scripts for testing and refitting the model:
 
 - `backtest.py` — team-market projection, player-prop sweeps, Safe Mode tests, and odds-history evaluation
-- `backtest_props.py` — chronological MLB xStats/matchup-weight fit and holdout gate
+- `backtest_props.py` — chronological MLB starter xBA/K matchup fit with holdout and rolling-fold gates
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
