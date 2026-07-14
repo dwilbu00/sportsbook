@@ -184,6 +184,30 @@ def save_starter_adjustment(sport_key, adj, meta=None):
         json.dump(blob, f, indent=2)
 
 
+def load_lineup_adjustment(sport_key):
+    """Load validated per-prop batting-order exposure adjustments."""
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("lineup_adjustment", {})
+
+
+def save_lineup_adjustment(sport_key, adjustment, meta=None):
+    """Persist batting-order exposure settings without replacing other fits."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["lineup_adjustment"] = adjustment
+    if meta:
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            blob["meta"]["lineup_adjustment"] = meta
+        else:
+            blob["meta"] = {"lineup_adjustment": meta}
+    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
 def load_prob_shrink(sport_key):
     """
     Load per-market probability-shrink factors for team markets, e.g.:

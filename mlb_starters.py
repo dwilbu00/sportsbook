@@ -79,12 +79,12 @@ def _write_cache(name, data):
         json.dump({"cached_at": time.time(), "data": data}, f)
 
 
-def _get(path, params=None, max_retries=4, backoff_base=1.5):
+def _get(path, params=None, max_retries=4, backoff_base=1.5, timeout=30):
     """GET the Stats API with retry+backoff on 429/5xx (see odds_client)."""
     url = f"{BASE_URL}/{path.lstrip('/')}"
     resp = None
     for attempt in range(max_retries + 1):
-        resp = requests.get(url, params=params or {}, timeout=30)
+        resp = requests.get(url, params=params or {}, timeout=timeout)
         retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
         if retryable and attempt < max_retries:
             delay = backoff_base ** attempt + random.uniform(0, 0.5)
@@ -247,6 +247,87 @@ def get_probable_starters(date):
                     }
     _write_cache(cache, out)
     return out
+
+
+def get_confirmed_lineup(home_team, away_team, date):
+    """Return announced batting orders for one game, or an empty context.
+
+    The Stats API exposes each side's players in batting-order sequence through
+    ``hydrate=lineups``. Results use a short cache because orders are commonly
+    posted or changed shortly before first pitch.
+    """
+    empty = {
+        "home_confirmed": False,
+        "away_confirmed": False,
+        "players": {},
+    }
+    cache = f"lineups_{date}"
+    data = _read_cache(cache, max_age=5 * 60)
+    if data is None:
+        data = _get("schedule", {
+            "sportId": 1, "date": date, "hydrate": "lineups",
+        })
+        _write_cache(cache, data)
+
+    target_home = _norm(home_team)
+    target_away = _norm(away_team)
+    for day in data.get("dates", []):
+        for game in day.get("games", []):
+            teams = game.get("teams", {})
+            game_home = _norm(
+                ((teams.get("home") or {}).get("team") or {}).get("name"))
+            game_away = _norm(
+                ((teams.get("away") or {}).get("team") or {}).get("name"))
+            if not (_names_match(target_home, game_home)
+                    and _names_match(target_away, game_away)):
+                continue
+
+            result = dict(empty)
+            result["players"] = _lineup_players(game)
+            for side in ("home", "away"):
+                result[f"{side}_confirmed"] = sum(
+                    player["side"] == side
+                    for player in result["players"].values()) == 9
+            return result
+    return empty
+
+
+def _lineup_players(game):
+    """Extract normalized player records from one hydrated schedule game."""
+    lineups = game.get("lineups") or {}
+    result = {}
+    for side in ("home", "away"):
+        players = (lineups.get(f"{side}Players") or [])[:9]
+        for slot, player in enumerate(players, 1):
+            name = player.get("fullName")
+            if not name:
+                continue
+            result[_norm(name)] = {
+                "player_id": player.get("id"),
+                "name": name,
+                "side": side,
+                "batting_order": slot,
+            }
+    return result
+
+
+def lineup_player_context(lineup, player_name):
+    """Return a confirmed player's lineup record, or None when not announced."""
+    if not lineup or not player_name:
+        return None
+    player = (lineup.get("players") or {}).get(_norm(player_name))
+    if not player or not lineup.get(f"{player.get('side')}_confirmed"):
+        return None
+    return dict(player)
+
+
+def _names_match(left, right):
+    """Tolerant normalized team-name comparison."""
+    if not left or not right:
+        return False
+    if left == right or left in right or right in left:
+        return True
+    return left.split()[-1] == right.split()[-1]
 
 
 def get_pitcher_quality(pitcher_id, season):

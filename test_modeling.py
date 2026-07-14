@@ -3,16 +3,18 @@
 import unittest
 
 import analysis
+import mlb_starters
 from backtest_props import _rolling_splits
 from odds_client import parse_player_props
 from prop_filter import filter_player_gamelog
-from recalibration import fit_platt_chronological
+from recalibration import fit_platt_chronological, summarize_prediction_rows
 from savant_history import _at_bat_xba
 
 
 class StarterAdjustmentTests(unittest.TestCase):
     def tearDown(self):
         analysis._STARTER_ADJ_CACHE.clear()
+        analysis._LINEUP_ADJ_CACHE.clear()
 
     def test_missing_calibration_fails_closed(self):
         analysis._STARTER_ADJ_CACHE["missing"] = {}
@@ -102,6 +104,58 @@ class StarterAdjustmentTests(unittest.TestCase):
         )
         self.assertGreater(multiplier, 1.0)
         self.assertLess(multiplier, 1.4)
+
+    def test_lineup_order_adjusts_hits_but_not_strikeouts(self):
+        analysis._LINEUP_ADJ_CACHE["baseball_mlb"] = {
+            "enabled": True,
+            "props": {"batter_hits": 0.75, "batter_strikeouts": 0.0},
+            "slot_expected_exposure": {
+                "batter_hits": {"1": 4.1, "9": 3.4},
+            },
+        }
+        context = {"expected_exposure": 3.6, "batting_order": 1}
+        self.assertGreater(
+            analysis._mlb_lineup_exposure_mult("batter_hits", context),
+            1.0,
+        )
+        self.assertEqual(
+            analysis._mlb_lineup_exposure_mult(
+                "batter_strikeouts", context),
+            1.0,
+        )
+        self.assertEqual(
+            analysis._mlb_lineup_exposure_mult(
+                "batter_hits", {"expected_exposure": 3.6}),
+            1.0,
+        )
+
+    def test_only_complete_announced_lineups_return_player_context(self):
+        game = {
+            "lineups": {
+                "homePlayers": [
+                    {"id": slot, "fullName": (
+                        "José Ramírez" if slot == 1 else f"Home Player {slot}")}
+                    for slot in range(1, 10)
+                ],
+                "awayPlayers": [
+                    {"id": 100 + slot, "fullName": f"Away Player {slot}"}
+                    for slot in range(1, 9)
+                ],
+            },
+        }
+        players = mlb_starters._lineup_players(game)
+        lineup = {
+            "home_confirmed": True,
+            "away_confirmed": False,
+            "players": players,
+        }
+        self.assertEqual(
+            mlb_starters.lineup_player_context(
+                lineup, "Jose Ramirez")["batting_order"],
+            1,
+        )
+        self.assertIsNone(
+            mlb_starters.lineup_player_context(lineup, "Away Player 1"))
 
 
 class AsOfReliabilityTests(unittest.TestCase):
@@ -256,6 +310,56 @@ class RecalibrationTests(unittest.TestCase):
                 {row[4] for row in holdout}))
             self.assertLess(max(row[4] for row in train),
                             min(row[4] for row in holdout))
+
+    def test_forward_summary_deduplicates_and_scores_direction(self):
+        rows = [
+            {
+                "ts": "2024-04-01T10:00:00Z",
+                "sport_key": "baseball_mlb",
+                "prop_key": "batter_hits",
+                "player": "Player One",
+                "game_date": "2024-04-01",
+                "line": 1.5,
+                "raw_prob": 0.7,
+                "direction": "OVER",
+                "resolved": False,
+                "outcome": None,
+            },
+            {
+                "ts": "2024-04-01T10:05:00Z",
+                "sport_key": "baseball_mlb",
+                "prop_key": "batter_hits",
+                "player": "Player One",
+                "game_date": "2024-04-01",
+                "line": 1.5,
+                "raw_prob": 0.8,
+                "final_prob": 0.9,
+                "direction": "OVER",
+                "price": 100,
+                "resolved": True,
+                "outcome": 1,
+            },
+            {
+                "ts": "2024-04-02T10:00:00Z",
+                "sport_key": "baseball_mlb",
+                "prop_key": "batter_hits",
+                "player": "Player Two",
+                "game_date": "2024-04-02",
+                "line": 0.5,
+                "raw_prob": 0.3,
+                "direction": "UNDER",
+                "price": -110,
+                "resolved": True,
+                "outcome": 0,
+            },
+        ]
+        summary = summarize_prediction_rows(rows)
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["resolved"], 2)
+        self.assertEqual(summary["direction_hit_rate"], 1.0)
+        self.assertAlmostEqual(summary["probability_brier"], 0.05)
+        self.assertEqual(summary["priced_resolved"], 2)
+        self.assertAlmostEqual(summary["realized_roi"], (1 + 10 / 11) / 2)
 
 
 class ParlayCorrelationTests(unittest.TestCase):

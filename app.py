@@ -560,6 +560,75 @@ def render_model_guide():
         else:
             st.info("No committed player-prop calibration summaries were found.")
 
+        st.subheader("Forward prediction tracking")
+        from recalibration import prediction_performance_summary
+        forward = prediction_performance_summary()
+        if forward["total"]:
+            hit_rate = forward.get("direction_hit_rate")
+            probability_brier = forward.get("probability_brier")
+            realized_roi = forward.get("realized_roi")
+            forward_cols = st.columns(5)
+            forward_cols[0].metric("Logged predictions", forward["total"])
+            forward_cols[1].metric("Resolved", forward["resolved"])
+            forward_cols[2].metric(
+                "Model-side hit rate",
+                f"{hit_rate * 100:.1f}%" if hit_rate is not None else "Not enough data",
+            )
+            forward_cols[3].metric(
+                "Probability Brier",
+                f"{probability_brier:.4f}"
+                if probability_brier is not None else "Not enough data",
+            )
+            forward_cols[4].metric(
+                "Model-side ROI",
+                f"{realized_roi * 100:+.1f}%"
+                if realized_roi is not None else "Awaiting priced results",
+            )
+            forward_rows = []
+            for row in forward["by_prop"]:
+                row_hit_rate = row.get("direction_hit_rate")
+                row_brier = row.get("probability_brier")
+                row_roi = row.get("realized_roi")
+                forward_rows.append({
+                    "Sport": sport_names.get(row["sport_key"], row["sport_key"]),
+                    "Prediction": PROP_LABELS.get(
+                        row["prop_key"],
+                        (row["prop_key"] or "Unknown").replace("_", " ").title(),
+                    ),
+                    "Logged": row["total"],
+                    "Resolved": row["resolved"],
+                    "Pending": row["pending"],
+                    "Pushes": row["pushes"],
+                    "Model-side hit rate": (
+                        f"{row_hit_rate * 100:.1f}%"
+                        if row_hit_rate is not None else "—"
+                    ),
+                    "Probability Brier": (
+                        f"{row_brier:.4f}" if row_brier is not None else "—"
+                    ),
+                    "Model-side ROI": (
+                        f"{row_roi * 100:+.1f}%" if row_roi is not None else "—"
+                    ),
+                    "Priced results": row["priced_resolved"],
+                })
+            st.dataframe(forward_rows, hide_index=True, width="stretch")
+            st.caption(
+                "Forward rows are real app predictions, deduplicated by "
+                "sport/player/date/prop/line. New rows score the final published "
+                "probability; legacy rows fall back to their pre-Platt raw "
+                "probability. ROI is shown only for newly logged rows that "
+                "retain the offered "
+                "price; older rows remain usable for hit-rate and Brier scoring. "
+                "Closing-line value is not available because closing prices are "
+                "not captured."
+            )
+        else:
+            st.info(
+                "No forward predictions have been logged yet. Predictions will "
+                "appear here after player-prop analyses are run and past games "
+                "are resolved."
+            )
+
         st.subheader("Team-market validation status")
         team_rows = []
         market_labels = {
@@ -572,11 +641,15 @@ def render_model_guide():
             shrink = blob.get("prob_shrink") or {}
             source = ((blob.get("meta") or {}).get("prob_shrink") or {}).get("source")
             for market_key, market_label in market_labels.items():
+                shrink_value = shrink.get(market_key)
                 team_rows.append({
                     "Sport": sport_name,
                     "Prediction": market_label,
                     "Backtest calibration": source or "No committed odds-fit metadata",
-                    "Probability shrink": shrink.get(market_key, "Not fitted"),
+                    "Probability shrink": (
+                        f"{shrink_value:.3f}"
+                        if isinstance(shrink_value, (int, float)) else "Not fitted"
+                    ),
                     "Published holdout accuracy": "Not exported",
                 })
         st.dataframe(team_rows, hide_index=True, width="stretch")
@@ -611,7 +684,11 @@ def render_model_guide():
             "xERA/xwOBA, starter quality, handedness splits, lineup quality, and bullpen "
             "suppression are active inputs for MLB team markets. Batter props use "
             "starter xBA or K rate at the starter's projected workload, with the "
-            "remaining bullpen exposure held neutral until it can be validated as-of."
+            "remaining bullpen exposure held neutral until it can be validated as-of. "
+            "When a complete batting order is announced, batter-hit projections also "
+            "blend recent at-bats with the expected at-bats for that lineup slot. The "
+            "same batting-order adjustment is disabled for batter strikeouts because "
+            "it did not improve forward validation."
         )
         mlb_meta = calibration_blobs.get("baseball_mlb", {}).get("meta") or {}
         prop_fit = ((mlb_meta.get("starter_adjustment") or {}).get("props") or {})
@@ -657,6 +734,19 @@ def render_model_guide():
             "at 0.0 because their xBA candidate regressed in one rolling fold. Pitcher "
             "strikeouts, outs, and earned runs remain at 0.0."
         )
+        lineup_fit = mlb_meta.get("lineup_adjustment") or {}
+        lineup_hits = (lineup_fit.get("results") or {}).get("batter_hits") or {}
+        if lineup_hits:
+            rolling_gains = ", ".join(
+                f"{fold.get('gain_pct', 0):+.3f}%"
+                for fold in lineup_hits.get("rolling_folds", []))
+            st.caption(
+                "Announced-lineup batter-hits validation: "
+                f"n={lineup_hits.get('holdout_n', '—')}; holdout MAE "
+                f"{lineup_hits.get('baseline_mae', 0):.6f} → "
+                f"{lineup_hits.get('selected_mae', 0):.6f}; "
+                f"rolling-fold gains {rolling_gains or 'not exported'}."
+            )
 
         recency = ((calibration_blobs.get("baseball_mlb", {}).get("meta") or {})
                    .get("prop_recency_holdout") or {})
@@ -1273,14 +1363,27 @@ if analyze_clicked:
         # features, built once per game and shared by team markets AND props.
         # Degrades to None (existing model) if anything is unavailable.
         matchup_features = None
+        confirmed_lineup = None
         if sport["key"] == "baseball_mlb":
+            import mlb_starters
+            game_date = event.get("commence_time", "")[:10]
             try:
-                import mlb_starters
-                game_date = event.get("commence_time", "")[:10]
+                commence = datetime.fromisoformat(
+                    event["commence_time"].replace("Z", "+00:00"))
+                game_date = commence.astimezone(
+                    ZoneInfo("America/New_York")).date().isoformat()
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+            try:
                 matchup_features = mlb_starters.build_matchup_features(
                     home, away, game_date, int(game_date[:4]))
             except Exception as e:
                 warnings.append(f"Starter features unavailable for {away} @ {home}: {e}")
+            try:
+                confirmed_lineup = mlb_starters.get_confirmed_lineup(
+                    home, away, game_date)
+            except Exception as e:
+                warnings.append(f"Lineup data unavailable for {away} @ {home}: {e}")
         elif sport["key"] == "americanfootball_nfl":
             # NFL EPA edge (net EPA/play, season-to-date) — feeds ML + spreads
             # via the same generic starter_edge margin hook. Degrades to None.
@@ -1353,10 +1456,16 @@ if analyze_clicked:
                 for player_name in players:
                     if player_name not in player_histories:
                         player_histories[player_name] = {}
-                    player_histories[player_name][prop_key] = prop_history_results.get(
+                    history = dict(prop_history_results.get(
                         (player_name, prop_key),
                         {"player": player_name, "found": False, "values": []},
-                    )
+                    ))
+                    if confirmed_lineup:
+                        lineup_context = mlb_starters.lineup_player_context(
+                            confirmed_lineup, player_name)
+                        if lineup_context:
+                            history["batting_order"] = lineup_context["batting_order"]
+                    player_histories[player_name][prop_key] = history
             new_props = analyze_player_props_value(prop_data, player_histories, threshold,
                                                   sport_key=sport["key"],
                                                   team_defense=team_defense,

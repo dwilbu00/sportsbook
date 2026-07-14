@@ -45,6 +45,7 @@ from calibration_loader import (
     load_market_blend,
     load_prob_shrink,
     load_starter_adjustment,
+    load_lineup_adjustment,
     apply_calibration_with_warmup,
     count_current_season_games,
 )
@@ -63,6 +64,7 @@ from recalibration import (
 _MARKET_BLEND_CACHE = {}
 _PROB_SHRINK_CACHE = {}
 _STARTER_ADJ_CACHE = {}
+_LINEUP_ADJ_CACHE = {}
 
 # MLB league baselines used as log5-style denominators for the props matchup
 # multiplier. Priors (not fitted); refresh occasionally.
@@ -156,6 +158,51 @@ def _mlb_prop_matchup_mult(prop_key, upcoming_is_home, matchup_features, weight,
 
     mult = 1.0 + weight * (raw - 1.0)
     return max(0.7, min(1.4, mult))
+
+
+def _lineup_exposure_mult(expected_exposure, batting_order, weight,
+                          slot_expected_exposure):
+    """Blend recent opportunity with a batting-slot expectation."""
+    if not expected_exposure or not batting_order or not weight:
+        return 1.0
+    try:
+        slot_exposure = float(slot_expected_exposure[str(int(batting_order))])
+        expected_exposure = float(expected_exposure)
+        weight = float(weight)
+    except (KeyError, TypeError, ValueError):
+        return 1.0
+    if expected_exposure <= 0 or slot_exposure <= 0:
+        return 1.0
+    adjusted_exposure = (expected_exposure
+                         + weight * (slot_exposure - expected_exposure))
+    return max(0.8, min(1.2, adjusted_exposure / expected_exposure))
+
+
+def _mlb_lineup_exposure_mult(prop_key, player_context):
+    """Return the validated batting-order multiplier, failing closed to 1.0."""
+    if prop_key != "batter_hits" or not player_context:
+        return 1.0
+    sport_key = "baseball_mlb"
+    if sport_key not in _LINEUP_ADJ_CACHE:
+        try:
+            _LINEUP_ADJ_CACHE[sport_key] = load_lineup_adjustment(sport_key) or {}
+        except Exception:
+            _LINEUP_ADJ_CACHE[sport_key] = {}
+    cfg = _LINEUP_ADJ_CACHE[sport_key]
+    if not cfg or cfg.get("enabled") is False:
+        return 1.0
+    weights = cfg.get("props") or {}
+    slot_exposure = ((cfg.get("slot_expected_exposure") or {})
+                     .get(prop_key) or {})
+    weight = weights.get(prop_key)
+    if not isinstance(weight, (int, float)):
+        return 1.0
+    return _lineup_exposure_mult(
+        player_context.get("expected_exposure"),
+        player_context.get("batting_order"),
+        weight,
+        slot_exposure,
+    )
 
 
 def _starter_adjustment(sport_key, key, prop_key=None):
@@ -1326,6 +1373,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             under_implied = odds_info["under_implied"]
             over_price = odds_info["over_price"]
             under_price = odds_info["under_price"]
+            over_book = odds_info.get("over_book")
+            under_book = odds_info.get("under_book")
 
             history = player_histories.get(player_name, {}).get(prop_key)
             if not history or not history.get("found") or not history.get("values"):
@@ -1471,7 +1520,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # for pitcher props; opposing starter for batter props). No-op for
             # other sports or when features/weight are absent.
             matchup_mult = 1.0
-            if sport_key == "baseball_mlb" and matchup_features:
+            lineup_mult = 1.0
+            if sport_key == "baseball_mlb":
                 player_context = None
                 exposures = (plate_appearances if prop_key == "batter_strikeouts"
                              else at_bats if prop_key == "batter_hits" else None)
@@ -1488,11 +1538,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                 "base_projection": base_proj,
                                 "expected_exposure": expected_exposure,
                             }
-                matchup_mult = _mlb_prop_matchup_mult(
-                    prop_key, upcoming_is_home, matchup_features,
-                    _starter_adjustment(sport_key, "props", prop_key),
-                    player_context=player_context)
-            combined_mult = output_def_mult * matchup_mult
+                batting_order = history.get("batting_order")
+                if batting_order and player_context:
+                    player_context["batting_order"] = batting_order
+                if matchup_features:
+                    matchup_mult = _mlb_prop_matchup_mult(
+                        prop_key, upcoming_is_home, matchup_features,
+                        _starter_adjustment(sport_key, "props", prop_key),
+                        player_context=player_context)
+                lineup_mult = _mlb_lineup_exposure_mult(
+                    prop_key, player_context)
+            combined_mult = output_def_mult * matchup_mult * lineup_mult
 
             avg_stat = base_proj * combined_mult
             # When the projection is scaled, the over-rate calc shifts the
@@ -1765,8 +1821,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     game_date=log_game_date,
                     line=line,
                     raw_prob=raw_over_rate,
+                    final_prob=over_rate,
                     projected=avg_stat,
                     direction=direction,
+                    price=best_price,
+                    book=over_book if direction == "OVER" else under_book,
                 )
 
             candidates.append({

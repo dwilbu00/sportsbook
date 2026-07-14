@@ -127,8 +127,9 @@ The MLB layer is no longer just historical scores. It uses MLB Stats API and Bas
 - Bounded starter edge using a `tanh` transform
 - Calibrated starter weights for moneyline, spreads, total run scaling, and bullpen effects
 - Log5-style batter hit/K rates weighted by the starter's expected innings share
+- Confirmed batting-order exposure for batter-hit props, using expected at-bats by lineup slot
 
-The model separates feature generation from feature strength. Raw starter and bullpen features are built first; calibration files decide how much those features are allowed to move a prediction.
+The model separates feature generation from feature strength. Raw starter, bullpen, and lineup features are built first; calibration files decide how much those features are allowed to move a prediction. The announced-lineup adjustment runs only when a complete nine-player order is available. A 2024 chronological fit selected a 0.75 exposure blend for batter hits (holdout MAE improved 0.262%, with both later rolling folds improving); the equivalent batter-strikeout exposure signal failed forward validation and remains disabled.
 
 ### NFL: EPA-based team strength
 
@@ -196,6 +197,8 @@ p_calibrated = sigmoid(a * logit(p_raw) + b)
 ```
 
 The fit uses cross-entropy loss, Newton-Raphson optimization, mild L2 regularization, and minimum-sample guards. A mapping is enabled only if it improves both Brier score and log loss in two expanding-window chronological folds; repeated logs for the same player/game/line are de-duplicated. This gives the app a feedback loop without letting in-sample fit quality masquerade as validation.
+
+The Model Guide also reports forward-log status by sport and prop: resolved and pending counts, model-side hit rate, probability Brier score, and realized ROI when an offered price was captured. New rows retain both the raw pre-Platt and final published probabilities plus price/book; legacy rows remain usable through backward-compatible fallbacks. Closing-line value is not reported because the app does not currently capture closing prices.
 
 ## Safe Mode: conservative alt-line math
 
@@ -273,7 +276,7 @@ That makes the parlay builder much harder to fool with same-game correlation tra
 The repository includes scripts for testing and refitting the model:
 
 - `backtest.py` — team-market projection, player-prop sweeps, Safe Mode tests, and odds-history evaluation
-- `backtest_props.py` — chronological MLB starter xBA/K matchup fit with holdout and rolling-fold gates
+- `backtest_props.py` — chronological MLB starter xBA/K and batting-order exposure fits with holdout and rolling-fold gates
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling

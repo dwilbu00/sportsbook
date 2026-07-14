@@ -72,12 +72,23 @@ def _ensure_dirs():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
-                   projected=None, direction=None):
+                   projected=None, direction=None, price=None, book=None,
+                   final_prob=None):
     """Append one prediction row to the JSONL log. Best-effort, never raises."""
     if not sport_key or not prop_key or not player or game_date is None:
         return
-    if raw_prob is None or not (0.0 <= raw_prob <= 1.0):
+    try:
+        raw_prob = float(raw_prob)
+        line = float(line)
+        projected = float(projected) if projected is not None else None
+        final_prob = float(final_prob) if final_prob is not None else None
+        price = int(price) if price is not None else None
+    except (TypeError, ValueError):
         return
+    if not (0.0 <= raw_prob <= 1.0):
+        return
+    if final_prob is not None and not (0.0 <= final_prob <= 1.0):
+        final_prob = None
     _ensure_dirs()
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -85,10 +96,13 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "prop_key": prop_key,
         "player": player,
         "game_date": str(game_date)[:10],  # YYYY-MM-DD
-        "line": float(line),
-        "raw_prob": float(raw_prob),
-        "projected": float(projected) if projected is not None else None,
+        "line": line,
+        "raw_prob": raw_prob,
+        "final_prob": final_prob,
+        "projected": projected,
         "direction": direction,
+        "price": price,
+        "book": book,
         "resolved": False,
         "actual": None,
         "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
@@ -118,6 +132,114 @@ def _read_log():
     except OSError:
         return []
     return rows
+
+
+def summarize_prediction_rows(rows, sport_key=None):
+    """Summarize deduplicated forward predictions without making API calls."""
+    unique = {}
+    for row in rows:
+        if sport_key and row.get("sport_key") != sport_key:
+            continue
+        identity = (
+            row.get("sport_key"), row.get("prop_key"), row.get("player"),
+            row.get("game_date"), row.get("line"),
+        )
+        current = unique.get(identity)
+        if current and current.get("resolved") and not row.get("resolved"):
+            continue
+        unique[identity] = row
+    predictions = list(unique.values())
+
+    def metrics(group):
+        resolved = [row for row in group if row.get("resolved")]
+        graded = [row for row in resolved if row.get("outcome") in (0, 1)]
+        probabilities = []
+        outcomes = []
+        direction_hits = []
+        realized_returns = []
+        for row in graded:
+            try:
+                logged_probability = row.get("final_prob")
+                if logged_probability is None:
+                    logged_probability = row.get("raw_prob")
+                probability = float(logged_probability)
+            except (TypeError, ValueError):
+                probability = None
+            if probability is not None and 0.0 <= probability <= 1.0:
+                probabilities.append(probability)
+                outcomes.append(int(row["outcome"]))
+            direction = (row.get("direction") or "").upper()
+            if direction == "OVER":
+                direction_hits.append(row["outcome"] == 1)
+            elif direction == "UNDER":
+                direction_hits.append(row["outcome"] == 0)
+            else:
+                continue
+            try:
+                price = int(row.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if price == 0:
+                continue
+            won = direction_hits[-1]
+            profit = (price / 100.0 if price > 0 else 100.0 / -price)
+            realized_returns.append(profit if won else -1.0)
+        # A resolved push returns the stake. Include it in priced ROI even
+        # though it is excluded from binary probability scoring.
+        for row in resolved:
+            if row.get("outcome") is not None:
+                continue
+            if (row.get("direction") or "").upper() not in ("OVER", "UNDER"):
+                continue
+            try:
+                price = int(row.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if price:
+                realized_returns.append(0.0)
+        brier = (sum((p - y) ** 2 for p, y in zip(probabilities, outcomes))
+                 / len(outcomes) if outcomes else None)
+        return {
+            "total": len(group),
+            "resolved": len(resolved),
+            "pending": len(group) - len(resolved),
+            "pushes": len(resolved) - len(graded),
+            "graded": len(graded),
+            "direction_hit_rate": (
+                sum(direction_hits) / len(direction_hits)
+                if direction_hits else None
+            ),
+            "probability_brier": brier,
+            "priced_resolved": len(realized_returns),
+            "realized_roi": (
+                sum(realized_returns) / len(realized_returns)
+                if realized_returns else None
+            ),
+        }
+
+    summary = metrics(predictions)
+    groups = defaultdict(list)
+    for row in predictions:
+        groups[(row.get("sport_key"), row.get("prop_key"))].append(row)
+    summary["by_prop"] = [
+        {
+            "sport_key": key[0],
+            "prop_key": key[1],
+            **metrics(group),
+        }
+        for key, group in sorted(
+            groups.items(),
+            key=lambda item: tuple(str(value or "") for value in item[0]),
+        )
+    ]
+    summary["last_prediction_ts"] = max(
+        (row.get("ts") or "" for row in predictions), default="")
+    return summary
+
+
+def prediction_performance_summary(sport_key=None):
+    """Return current forward-log status and resolved forecast performance."""
+    return summarize_prediction_rows(_read_log(), sport_key=sport_key)
 
 
 def _rewrite_log(rows):

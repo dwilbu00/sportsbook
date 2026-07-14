@@ -3764,6 +3764,46 @@
           "selected_weight": 0.0
         }
       }
+    },
+    "lineup_adjustment": {
+      "source": "backtest_props:2024",
+      "fit": true,
+      "holdout_start": "2024-07-01",
+      "holdout_window": "2024-07-01 through season end",
+      "metric": "MAE",
+      "recent_n": 20,
+      "slot_exposure_source": "Average at-bats by batting slot among the 120 highest-volume 2024 batters",
+      "results": {
+        "batter_hits": {
+          "fit_n": 7123,
+          "holdout_n": 7737,
+          "candidate_weight": 0.75,
+          "selected_weight": 0.75,
+          "baseline_mae": 0.740862,
+          "candidate_mae": 0.738924,
+          "selected_mae": 0.738924,
+          "holdout_gain_pct": 0.261533,
+          "rolling_folds": [
+            {
+              "start": "2024-07-24",
+              "n": 2976,
+              "fit_weight": 0.75,
+              "baseline_mae": 0.7408098118279542,
+              "candidate_mae": 0.7388379561570977,
+              "gain_pct": 0.26617569575529637
+            },
+            {
+              "start": "2024-08-27",
+              "n": 2996,
+              "fit_weight": 0.75,
+              "baseline_mae": 0.7389519359145533,
+              "candidate_mae": 0.7367541427561493,
+              "gain_pct": 0.2974203126870496
+            }
+          ],
+          "decision": "enabled: passed holdout and both rolling folds"
+        }
+      }
     }
   },
   "prob_shrink": {
@@ -3786,5 +3826,26 @@
     "bvp": 0.0,
     "_note": "per-prop weights fit from 2024; chronological holdout starts 2024-07-01; live recent window =20; two rolling validation folds required; selected {'batter_hits': 0.0, 'batter_strikeouts': 0.5, 'pitcher_strikeouts': 0.0, 'pitcher_outs': 0.0, 'pitcher_earned_runs': 0.0}. method-A props read empirical over-rate at shifted line (safe).",
     "spreads": 5.261
+  },
+  "lineup_adjustment": {
+    "enabled": true,
+    "props": {
+      "batter_hits": 0.75,
+      "batter_strikeouts": 0.0
+    },
+    "slot_expected_exposure": {
+      "batter_hits": {
+        "1": 4.0602,
+        "2": 3.9427,
+        "3": 3.817,
+        "4": 3.7922,
+        "5": 3.703,
+        "6": 3.6185,
+        "7": 3.4869,
+        "8": 3.4076,
+        "9": 3.4635
+      }
+    },
+    "_note": "Announced batting order adjusts expected at-bats for batter hits only; strikeout exposure failed forward validation and remains disabled."
   }
 }

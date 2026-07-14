@@ -66,7 +66,9 @@ import mlb_starters
 import savant_history as sh
 from backtest_starters import _parse_seasons, _season_bounds, get_season_games
 from calibration_loader import (
+    load_lineup_adjustment,
     load_starter_adjustment,
+    save_lineup_adjustment,
     save_starter_adjustment,
     _load_blob,
 )
@@ -89,6 +91,14 @@ WEIGHT_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
 MIN_PRIOR = 5          # prior games before an observation is usable
 LIVE_RECENT_N = 20     # app.py MLB recent_n_default; keep harness in parity
 GAMELOG_CACHE_AGE = 90 * 24 * 3600  # historical logs never change
+
+# Average at-bats by announced batting slot among the 120 highest-volume 2024
+# batters. These describe opportunity, not the prop outcome being predicted.
+LINEUP_SLOT_EXPECTED_AB = {
+    "1": 4.0602, "2": 3.9427, "3": 3.8170,
+    "4": 3.7922, "5": 3.7030, "6": 3.6185,
+    "7": 3.4869, "8": 3.4076, "9": 3.4635,
+}
 
 # StatsAPI abbreviation -> Savant abbreviation (only mismatch is the Athletics).
 _ABBR_ALIAS = {"OAK": "ATH"}
@@ -157,6 +167,40 @@ def season_schedule(season):
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(path, "w") as f:
         json.dump(out, f)
+    return out
+
+
+def season_lineup_slots(season):
+    """Return {date: {player_id: batting_slot}} from announced lineups."""
+    path = os.path.join(CACHE_DIR, f"prop_lineups_{season}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+
+    s0, s1 = _season_bounds(season)
+    try:
+        data = mlb_starters._get("schedule", {
+            "sportId": 1,
+            "startDate": s0,
+            "endDate": s1,
+            "hydrate": "lineups",
+        }, timeout=120)
+    except Exception:
+        data = {"dates": []}
+    out = {}
+    for day in data.get("dates", []):
+        slots = {}
+        for game in day.get("games", []):
+            for player in mlb_starters._lineup_players(game).values():
+                player_id = player.get("player_id")
+                if player_id:
+                    slots[str(player_id)] = player["batting_order"]
+        if slots:
+            out[day.get("date")] = slots
+    if out:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(out, f)
     return out
 
 
@@ -445,6 +489,8 @@ def build_batter_obs(prop_key, seasons, pitcher_xba_index_by_season,
         pitcher_xba_idx = pitcher_xba_index_by_season[season]
         pitcher_k_idx = pitcher_k_index_by_season[season]
         sched = season_schedule(season)
+        lineup_slots = (season_lineup_slots(season)
+                        if prop_key == "batter_hits" else {})
         _, name_id = _team_maps(season)
         for bid in frequent_batter_ids([season], top_n):
             splits = gamelog(bid, season, "hitting")
@@ -501,6 +547,10 @@ def build_batter_obs(prop_key, seasons, pitcher_xba_index_by_season,
                                         "base_projection": base,
                                         "expected_exposure": expected_pa,
                                     }
+                                    batting_order = (lineup_slots.get(date) or {}).get(
+                                        str(bid))
+                                    if batting_order:
+                                        player_context["batting_order"] = batting_order
                     if feat is not None:
                         obs.append((base, actual, is_home, feat, date,
                                     player_context))
@@ -617,6 +667,46 @@ def _rolling_weight_validation(obs, prop_key, candidate_weight):
     return results
 
 
+def _score_lineup(obs, weight):
+    """MAE for batter-hit projections with a candidate lineup-order weight."""
+    if not obs:
+        return None
+    absolute_error = 0.0
+    for row in obs:
+        base, actual = row[:2]
+        context = row[5]
+        mult = analysis._lineup_exposure_mult(
+            context.get("expected_exposure"),
+            context.get("batting_order"),
+            weight,
+            LINEUP_SLOT_EXPECTED_AB,
+        )
+        absolute_error += abs(actual - base * mult)
+    return absolute_error / len(obs)
+
+
+def _rolling_lineup_validation(obs, candidate_weight):
+    """Run the same two expanding chronological folds for lineup exposure."""
+    results = []
+    for train, test in _rolling_splits(obs):
+        train_scores = {weight: _score_lineup(train, weight)
+                        for weight in WEIGHT_GRID}
+        fit_weight = min(WEIGHT_GRID, key=train_scores.get)
+        baseline_mae = _score_lineup(test, 0.0)
+        candidate_mae = _score_lineup(test, candidate_weight)
+        gain = ((baseline_mae - candidate_mae) / baseline_mae * 100
+                if baseline_mae else 0.0)
+        results.append({
+            "start": test[0][4],
+            "n": len(test),
+            "fit_weight": fit_weight,
+            "baseline_mae": baseline_mae,
+            "candidate_mae": candidate_mae,
+            "gain_pct": gain,
+        })
+    return results
+
+
 def fit(seasons, props, top_n=120, do_save=False):
     seasons_str = ",".join(str(s) for s in seasons)
     # Multiple seasons: fit on all earlier seasons and hold out the latest one.
@@ -684,6 +774,55 @@ def fit(seasons, props, top_n=120, do_save=False):
     if not per_prop:
         print("\nNo props produced a usable fit.")
         return
+
+    # Batting-order opportunity is a separate signal from starter quality.
+    # Fit it only for hits: strikeout exposure did not pass forward validation.
+    lineup_result = None
+    hits_result = per_prop.get("batter_hits")
+    if hits_result:
+        lineup_obs = [
+            row for row in hits_result["observations"]
+            if len(row) > 5 and row[5]
+            and row[5].get("batting_order")
+            and row[5].get("expected_exposure")
+        ]
+        lineup_train = [row for row in lineup_obs if row[4] < holdout_start]
+        lineup_holdout = [row for row in lineup_obs if row[4] >= holdout_start]
+        if len(lineup_train) >= 100 and len(lineup_holdout) >= 100:
+            train_scores = {
+                weight: _score_lineup(lineup_train, weight)
+                for weight in WEIGHT_GRID
+            }
+            holdout_scores = {
+                weight: _score_lineup(lineup_holdout, weight)
+                for weight in WEIGHT_GRID
+            }
+            best_weight = min(WEIGHT_GRID, key=train_scores.get)
+            baseline_mae = holdout_scores[0.0]
+            candidate_mae = holdout_scores[best_weight]
+            holdout_gain = ((baseline_mae - candidate_mae) / baseline_mae * 100
+                            if baseline_mae else 0.0)
+            rolling = _rolling_lineup_validation(lineup_obs, best_weight)
+            rolling_passed = (len(rolling) == 2
+                              and all(fold["gain_pct"] > 0 for fold in rolling))
+            accepted_weight = (best_weight if best_weight != 0.0
+                               and holdout_gain > 0 and rolling_passed else 0.0)
+            lineup_result = {
+                "fit_n": len(lineup_train),
+                "holdout_n": len(lineup_holdout),
+                "candidate_weight": best_weight,
+                "selected_weight": accepted_weight,
+                "baseline_mae": round(baseline_mae, 6),
+                "candidate_mae": round(candidate_mae, 6),
+                "selected_mae": round(holdout_scores[accepted_weight], 6),
+                "holdout_gain_pct": round(holdout_gain, 6),
+                "rolling_folds": rolling,
+                "decision": (
+                    "enabled: passed holdout and both rolling folds"
+                    if accepted_weight else
+                    "disabled: candidate failed at least one validation gate"
+                ),
+            }
 
     # ── report ──
     print(f"\n=== props matchup chronological fit — {seasons_str} ===")
@@ -753,10 +892,29 @@ def fit(seasons, props, top_n=120, do_save=False):
     print("pooled HOLDOUT MAE: " + " / ".join(f"{pooled_test[w]:.3f}" for w in WEIGHT_GRID))
     print("accepted per-prop weights: " + ", ".join(
         f"{prop}={weight}" for prop, weight in selected_weights.items()))
+    if lineup_result:
+        print("\n=== announced-lineup exposure fit — batter_hits ===")
+        print(f"fit n={lineup_result['fit_n']}; "
+              f"holdout n={lineup_result['holdout_n']}; "
+              f"candidate w={lineup_result['candidate_weight']}; "
+              f"accepted w={lineup_result['selected_weight']}")
+        print(f"holdout {lineup_result['baseline_mae']:.6f} → "
+              f"{lineup_result['candidate_mae']:.6f} "
+              f"({lineup_result['holdout_gain_pct']:+.3f}%)")
+        print("rolling folds: " + "; ".join(
+            f"{fold['start']} n={fold['n']} "
+            f"candidate {fold['gain_pct']:+.3f}%"
+            for fold in lineup_result["rolling_folds"]))
 
     if do_save:
         cur = load_starter_adjustment("baseball_mlb") or {}
-        prop_weights = {prop: 0.0 for prop in PROP_SPEC}
+        existing_prop_weights = cur.get("props")
+        if not isinstance(existing_prop_weights, dict):
+            existing_prop_weights = {}
+        prop_weights = {
+            prop: existing_prop_weights.get(prop, 0.0)
+            for prop in PROP_SPEC
+        }
         prop_weights.update({
             prop: round(float(weight), 3)
             for prop, weight in selected_weights.items()
@@ -774,6 +932,11 @@ def fit(seasons, props, top_n=120, do_save=False):
         else:
             note += "method-A props read empirical over-rate at shifted line (safe)."
         cur["_note"] = note
+        existing_results = (((_load_blob("baseball_mlb").get("meta") or {})
+                             .get("starter_adjustment") or {})
+                            .get("props") or {}).get("results") or {}
+        merged_results = dict(existing_results)
+        merged_results.update(validation_results)
         save_starter_adjustment("baseball_mlb", cur,
                                 meta={"props": {
                                     "source": f"backtest_props:{seasons_str}",
@@ -784,11 +947,47 @@ def fit(seasons, props, top_n=120, do_save=False):
                                     "metric": "MAE",
                                     "recent_n": LIVE_RECENT_N,
                                     "rolling_validation_folds": 2,
-                                    "results": validation_results,
+                                    "results": merged_results,
                                 }})
         print(f"\nsaved starter_adjustment.props = {prop_weights}")
         if methodB:
             print("NOTE:", note)
+        if lineup_result:
+            lineup_cfg = load_lineup_adjustment("baseball_mlb") or {}
+            lineup_cfg.update({
+                "enabled": True,
+                "props": {
+                    "batter_hits": lineup_result["selected_weight"],
+                    "batter_strikeouts": 0.0,
+                },
+                "slot_expected_exposure": {
+                    "batter_hits": LINEUP_SLOT_EXPECTED_AB,
+                },
+                "_note": (
+                    "Announced batting order adjusts expected at-bats for "
+                    "batter hits only; strikeout exposure failed forward "
+                    "validation and remains disabled."
+                ),
+            })
+            save_lineup_adjustment(
+                "baseball_mlb",
+                lineup_cfg,
+                meta={
+                    "source": f"backtest_props:{seasons_str}",
+                    "fit": True,
+                    "holdout_start": holdout_start,
+                    "holdout_window": f"{holdout_start} through season end",
+                    "metric": "MAE",
+                    "recent_n": LIVE_RECENT_N,
+                    "slot_exposure_source": (
+                        "Average at-bats by batting slot among the 120 "
+                        "highest-volume 2024 batters"
+                    ),
+                    "results": {"batter_hits": lineup_result},
+                },
+            )
+            print("saved lineup_adjustment.props = "
+                  f"{lineup_cfg['props']}")
     return selected_weights
 
 
