@@ -21,6 +21,7 @@ outcomes rather than guessed.
 import csv
 import io
 import json
+import math
 import os
 import random
 import time
@@ -47,6 +48,7 @@ LEAGUE_AVG = {
     "bb_pct": 0.082, # walks / batters faced
     "ops": 0.711,    # team OPS baseline
 }
+PYTHAGOREAN_EXPONENT = 1.83
 
 
 def _ensure_cache_dir():
@@ -181,6 +183,83 @@ def _safe_div(a, b):
         return a / b if b else None
     except (TypeError, ValueError):
         return None
+
+
+def expected_runs_from_factors(base_runs, offense_factor,
+                               staff_suppression, offense_weight=1.0,
+                               pitching_weight=1.0):
+    """Convert league-relative offense and run prevention into expected runs.
+
+    ``offense_factor`` and ``staff_suppression`` are centered on 1.0. A better
+    offense raises the expectation; better opposing run prevention lowers it.
+    The weights are fitted chronologically by ``backtest_starters.py`` rather
+    than selected in the live application.
+    """
+    try:
+        base_runs = float(base_runs)
+        offense_factor = float(offense_factor)
+        staff_suppression = float(staff_suppression)
+        offense_weight = float(offense_weight)
+        pitching_weight = float(pitching_weight)
+    except (TypeError, ValueError):
+        return None
+    if (base_runs <= 0 or offense_factor <= 0 or staff_suppression <= 0
+            or offense_weight < 0 or pitching_weight < 0):
+        return None
+    expected = (base_runs * offense_factor ** offense_weight
+                / staff_suppression ** pitching_weight)
+    # Protect the downstream score distribution from a pathological upstream
+    # feed while retaining a much wider range than normal MLB expectations.
+    return max(0.5, min(12.0, expected))
+
+
+def pythagorean_win_probability(runs_scored, runs_allowed,
+                                exponent=PYTHAGOREAN_EXPONENT):
+    """Return Bill James's modern-baseball Pythagorean win probability."""
+    try:
+        runs_scored = float(runs_scored)
+        runs_allowed = float(runs_allowed)
+        exponent = float(exponent)
+    except (TypeError, ValueError):
+        return None
+    if runs_scored <= 0 or runs_allowed <= 0 or exponent <= 0:
+        return None
+    scored_power = runs_scored ** exponent
+    return scored_power / (scored_power + runs_allowed ** exponent)
+
+
+def poisson_margin_probability(home_runs, away_runs, home_spread,
+                               max_runs=30):
+    """Return P(home score + spread > away score) from expected runs.
+
+    This is intended for MLB half-run spreads, which cannot push. Any tiny
+    probability above ``max_runs`` is folded into that terminal score bucket.
+    """
+    try:
+        home_runs = float(home_runs)
+        away_runs = float(away_runs)
+        home_spread = float(home_spread)
+        max_runs = int(max_runs)
+    except (TypeError, ValueError):
+        return None
+    if home_runs <= 0 or away_runs <= 0 or max_runs < 1:
+        return None
+
+    def probabilities(expected):
+        values = [math.exp(-expected)]
+        for score in range(1, max_runs + 1):
+            values.append(values[-1] * expected / score)
+        values[-1] += max(0.0, 1.0 - sum(values))
+        return values
+
+    home_prob = probabilities(home_runs)
+    away_prob = probabilities(away_runs)
+    return sum(
+        hp * ap
+        for home_score, hp in enumerate(home_prob)
+        for away_score, ap in enumerate(away_prob)
+        if home_score + home_spread > away_score
+    )
 
 
 def get_team_index(season):

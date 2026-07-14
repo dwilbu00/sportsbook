@@ -3827,6 +3827,43 @@
     "_note": "per-prop weights fit from 2024; chronological holdout starts 2024-07-01; live recent window =20; two rolling validation folds required; selected {'batter_hits': 0.0, 'batter_strikeouts': 0.5, 'pitcher_strikeouts': 0.0, 'pitcher_outs': 0.0, 'pitcher_earned_runs': 0.0}. method-A props read empirical over-rate at shifted line (safe).",
     "spreads": 5.261
   },
+  "expected_runs_challenger": {
+    "enabled": false,
+    "pythagorean_exponent": 1.83,
+    "score_distribution": "independent_poisson",
+    "fit_window": "2024-03-20 through 2024-06-30",
+    "holdout_window": "2024-07-01 through 2024-10-05",
+    "train_n": 916,
+    "holdout_n": 1061,
+    "offense_weight": 1.0,
+    "pitching_weight": 0.5,
+    "home_base_runs": 4.368,
+    "away_base_runs": 4.248,
+    "moneyline_shrink": 1.0,
+    "spread_shrink": 0.65,
+    "holdout": {
+      "moneyline_brier": {
+        "base_rate": 0.2518,
+        "current": 0.2489,
+        "challenger": 0.2463
+      },
+      "moneyline_accuracy": {
+        "current": 0.5212,
+        "challenger": 0.5664
+      },
+      "margin_rmse": {
+        "base_rate": 4.441,
+        "current": 4.861,
+        "challenger": 4.402
+      },
+      "home_minus_1_5_brier": {
+        "base_rate": 0.226,
+        "current": 0.241,
+        "challenger": 0.2226
+      }
+    },
+    "decision": "disabled: passed one chronological season; require another season plus park-factor and bullpen-availability ablations before live use"
+  },
   "lineup_adjustment": {
     "enabled": true,
     "props": {

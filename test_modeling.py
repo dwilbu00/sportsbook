@@ -9,6 +9,7 @@ from unittest.mock import patch
 import requests
 
 import analysis
+import backtest_starters
 import forward_tracker
 import mlb_starters
 import odds_client
@@ -170,6 +171,56 @@ class StarterAdjustmentTests(unittest.TestCase):
         )
         self.assertIsNone(
             mlb_starters.lineup_player_context(lineup, "Away Player 1"))
+
+
+class ExpectedRunsTests(unittest.TestCase):
+    def test_pythagorean_uses_modern_baseball_exponent(self):
+        probability = mlb_starters.pythagorean_win_probability(5.0, 4.0)
+        expected = 5.0 ** 1.83 / (5.0 ** 1.83 + 4.0 ** 1.83)
+        self.assertAlmostEqual(probability, expected)
+        self.assertAlmostEqual(
+            probability + mlb_starters.pythagorean_win_probability(4.0, 5.0),
+            1.0,
+        )
+
+    def test_expected_runs_respond_to_offense_and_run_prevention(self):
+        neutral = mlb_starters.expected_runs_from_factors(4.5, 1.0, 1.0)
+        self.assertEqual(neutral, 4.5)
+        self.assertGreater(
+            mlb_starters.expected_runs_from_factors(4.5, 1.2, 1.0),
+            neutral,
+        )
+        self.assertLess(
+            mlb_starters.expected_runs_from_factors(4.5, 1.0, 1.2),
+            neutral,
+        )
+
+    def test_run_line_probabilities_are_complementary(self):
+        favorite_cover = mlb_starters.poisson_margin_probability(
+            4.5, 4.5, -1.5)
+        underdog_cover = mlb_starters.poisson_margin_probability(
+            4.5, 4.5, 1.5)
+        self.assertLess(favorite_cover, 0.5)
+        self.assertGreater(underdog_cover, 0.5)
+        self.assertAlmostEqual(favorite_cover + underdog_cover, 1.0)
+
+    def test_challenger_maps_each_offense_to_opposing_staff(self):
+        row = {
+            "h_sp_sup": 0.9,
+            "a_sp_sup": 1.1,
+            "h_off_faced": 0.8,
+            "a_off_faced": 1.2,
+        }
+        model = {
+            "home_base_runs": 4.0,
+            "away_base_runs": 4.0,
+            "offense_weight": 1.0,
+            "pitching_weight": 1.0,
+        }
+        home_runs, away_runs = backtest_starters.project_expected_runs(
+            row, model)
+        self.assertAlmostEqual(home_runs, 4.0 * 1.2 / 1.1)
+        self.assertAlmostEqual(away_runs, 4.0 * 0.8 / 0.9)
 
 
 class AsOfReliabilityTests(unittest.TestCase):

@@ -131,6 +131,21 @@ The MLB layer is no longer just historical scores. It uses MLB Stats API and Bas
 
 The model separates feature generation from feature strength. Raw starter, bullpen, and lineup features are built first; calibration files decide how much those features are allowed to move a prediction. The announced-lineup adjustment runs only when a complete nine-player order is available. A 2024 chronological fit selected a 0.75 exposure blend for batter hits (holdout MAE improved 0.262%, with both later rolling folds improving); the equivalent batter-strikeout exposure signal failed forward validation and remains disabled.
 
+#### MLB expected-runs challenger (not live)
+
+`backtest_starters.py --season 2024 --test-runs` fits separate home and away
+run expectations from leakage-safe offense-vs-hand, probable-starter workload,
+and bullpen run-prevention features. Moneyline probability uses the modern MLB
+Pythagorean exponent of **1.83**; home `-1.5` probability comes from the same
+expected runs through an independent-Poisson score distribution.
+
+The initial July 1 through October 5, 2024 holdout improved moneyline Brier
+score (`0.2489` current → `0.2463` challenger), winner accuracy (`52.12%` →
+`56.64%`), margin RMSE (`4.861` → `4.402`), and home `-1.5` Brier score
+(`0.2410` → `0.2226`). It also beat training-period base-rate forecasts on all
+three gates. The challenger remains disabled until another season and the
+incremental park-factor and bullpen-availability features are validated.
+
 ### NFL: EPA-based team strength
 
 The NFL layer uses **Expected Points Added per play** from nflverse play-by-play data. EPA is more predictive than raw yards or final scores because it measures the value of each play in game context.
@@ -281,7 +296,7 @@ The repository includes scripts for testing and refitting the model:
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
 - `forward_tracker.py` — captures one-shot exact-line closing prices and runs outcome maintenance
-- `backtest_starters.py` — fits MLB starter/bullpen adjustment weights
+- `backtest_starters.py` — fits MLB starter/bullpen weights and tests the disabled expected-runs/Pythagorean challenger
 - `backtest_nfl_epa.py` — fits NFL EPA margin weights
 - `savant_history.py` — leakage-safe historical Statcast feature cache for MLB backtests
 

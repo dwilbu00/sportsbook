@@ -818,7 +818,36 @@ def render_model_guide():
             "same batting-order adjustment is disabled for batter strikeouts because "
             "it did not improve forward validation."
         )
-        mlb_meta = calibration_blobs.get("baseball_mlb", {}).get("meta") or {}
+        mlb_blob = calibration_blobs.get("baseball_mlb", {})
+        mlb_meta = mlb_blob.get("meta") or {}
+        expected_runs = mlb_blob.get("expected_runs_challenger") or {}
+        if expected_runs:
+            expected_holdout = expected_runs.get("holdout") or {}
+            st.subheader("Expected-runs / Pythagorean challenger")
+            st.dataframe([
+                {
+                    "Gate": "Moneyline Brier",
+                    **(expected_holdout.get("moneyline_brier") or {}),
+                },
+                {
+                    "Gate": "Moneyline accuracy",
+                    **(expected_holdout.get("moneyline_accuracy") or {}),
+                },
+                {
+                    "Gate": "Margin RMSE",
+                    **(expected_holdout.get("margin_rmse") or {}),
+                },
+                {
+                    "Gate": "Home -1.5 Brier",
+                    **(expected_holdout.get("home_minus_1_5_brier") or {}),
+                },
+            ], hide_index=True, width="stretch")
+            st.warning(
+                "The 1.83 Pythagorean challenger passed its first chronological "
+                "2024 holdout but remains **disabled**. It needs another season "
+                "and separate park-factor and bullpen-availability tests before "
+                "it can replace the live margin model."
+            )
         prop_fit = ((mlb_meta.get("starter_adjustment") or {}).get("props") or {})
         holdout = (prop_fit if prop_fit.get("results")
                    else mlb_meta.get("prop_matchup_holdout") or {})

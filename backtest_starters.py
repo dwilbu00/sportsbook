@@ -18,6 +18,7 @@ Usage:
     python backtest_starters.py --season 2024 --fetch      # slow one-time pull
     python backtest_starters.py --season 2024              # fit (days cached)
     python backtest_starters.py --season 2024 --save       # fit + write weights
+    python backtest_starters.py --season 2024 --test-runs  # expected-runs challenger
 
 Caveats (documented, not hidden):
   * Uses the *probable* starter from the schedule (≈ actual; late scratches
@@ -30,6 +31,7 @@ Caveats (documented, not hidden):
 """
 
 import argparse
+from collections import defaultdict
 import json
 import math
 import os
@@ -91,6 +93,35 @@ def get_season_games(season, start=None, end=None, verbose=True):
     if verbose:
         print(f"season {season}: {len(games)} Final games with starters")
     return games
+
+
+def _enrich_games(games, season):
+    """Attach team identities and separate run outcomes to cached games."""
+    from backtest_props import season_schedule
+
+    identities = {}
+    for date, scheduled in season_schedule(season).items():
+        for game in scheduled:
+            key = (date, str(game.get("home_sp")), str(game.get("away_sp")))
+            identities[key] = (game.get("home_abbr"), game.get("away_abbr"))
+
+    enriched = []
+    for game in games:
+        key = (game["date"], str(game["home_sp"]), str(game["away_sp"]))
+        teams = identities.get(key)
+        if not teams or not all(teams):
+            continue
+        home_runs = (game["total_runs"] + game["margin"]) / 2.0
+        away_runs = (game["total_runs"] - game["margin"]) / 2.0
+        enriched.append(dict(
+            game,
+            season=season,
+            home_team=teams[0],
+            away_team=teams[1],
+            home_runs=home_runs,
+            away_runs=away_runs,
+        ))
+    return enriched
 
 
 def _bullpen_features(rows, season):
@@ -159,6 +190,18 @@ def _ip_index(season):
     return idx
 
 
+def _pitcher_xwoba_index(rows):
+    """Build the starter xwOBAcon index used by the team-market backtest."""
+    from backtest_props import AsOfIndex
+
+    index = AsOfIndex()
+    for row in rows:
+        if (row.get("pitcher") and row.get("game_date")
+                and row.get("xwoba") is not None):
+            index.add(row["pitcher"], row["game_date"], row["xwoba"])
+    return index
+
+
 def build_dataset(games, season):
     """Attach leakage-safe as-of starter + bullpen features to each game.
 
@@ -180,8 +223,7 @@ def build_dataset(games, season):
 
     # As-of starter index (prefix sums) — identical result to
     # sh.asof_pitcher_xwoba but O(log n) instead of a full scan per game.
-    from backtest_props import build_pitcher_index
-    sp_idx = build_pitcher_index(rows)
+    sp_idx = _pitcher_xwoba_index(rows)
     ip_idx = _ip_index(season)  # as-of avg innings/start per starter
 
     # Two-sided edge: as-of offense a lineup PRODUCES vs a pitcher's hand, so a
@@ -239,6 +281,14 @@ def build_dataset(games, season):
                     a_off = max(0.5, min(2.0, ov / league_xwoba))
 
         out.append({
+            "season": season,
+            "date": g["date"],
+            "home_team": g.get("home_team"),
+            "away_team": g.get("away_team"),
+            "home_sp": g["home_sp"],
+            "away_sp": g["away_sp"],
+            "home_runs": g.get("home_runs"),
+            "away_runs": g.get("away_runs"),
             "starter_edge": math.tanh(h_rs - a_rs),
             "combined_excess": (h_rs - 1.0) + (a_rs - 1.0),
             "bullpen_excess": bullpen_excess,
@@ -311,11 +361,22 @@ def build_pooled_dataset(seasons):
     pooled = []
     per_season = {}
     for s in seasons:
-        games = get_season_games(s)
+        games = _enrich_games(get_season_games(s), s)
         data, lg = build_dataset(games, s)
         per_season[s] = {"games": len(data), "league_xwoba": lg}
         pooled.extend(data)
     return pooled, per_season
+
+
+def _staff_suppression(row, side):
+    """Return the innings-weighted starter/bullpen suppression for one side."""
+    starter = row[f"{side}_sp_sup"]
+    bullpen = row.get(f"{side}_bp_sup")
+    innings = row.get(f"{side}_ip")
+    if bullpen and innings:
+        weight = max(0.30, min(0.85, innings / 9.0))
+        return weight * starter + (1.0 - weight) * bullpen
+    return starter
 
 
 def _eff_edge(d):
@@ -329,16 +390,9 @@ def _eff_edge(d):
     starter-quality-only when bullpen/innings are missing, and to a neutral 1.0
     offense factor when lineup data is missing.
     """
-    def eff(sp, bp, ip, off):
-        if bp and ip:
-            w = max(0.30, min(0.85, ip / 9.0))
-            base = w * sp + (1.0 - w) * bp
-        else:
-            base = sp
-        return base / (off or 1.0)
     return math.tanh(
-        eff(d["h_sp_sup"], d.get("h_bp_sup"), d.get("h_ip"), d.get("h_off_faced", 1.0))
-        - eff(d["a_sp_sup"], d.get("a_bp_sup"), d.get("a_ip"), d.get("a_off_faced", 1.0)))
+        _staff_suppression(d, "h") / (d.get("h_off_faced") or 1.0)
+        - _staff_suppression(d, "a") / (d.get("a_off_faced") or 1.0))
 
 
 def fit(seasons, do_save=False):
@@ -460,6 +514,330 @@ def fit(seasons, do_save=False):
                                 }})
         print("saved fitted weights "
               "(moneyline, spreads, run_scale, bullpen).")
+
+
+EXPECTED_RUN_WEIGHT_GRID = tuple(i / 4.0 for i in range(7))
+
+
+def _expected_run_multipliers(row, offense_weight, pitching_weight):
+    """Return home/away multiplicative run factors for one historical game."""
+    # a_off_faced is the HOME lineup facing the away starter's hand; the
+    # inverse naming comes from indexing offense from the staff's perspective.
+    home_offense = row.get("a_off_faced") or 1.0
+    away_offense = row.get("h_off_faced") or 1.0
+    home_staff = _staff_suppression(row, "h")
+    away_staff = _staff_suppression(row, "a")
+    return (
+        home_offense ** offense_weight / away_staff ** pitching_weight,
+        away_offense ** offense_weight / home_staff ** pitching_weight,
+    )
+
+
+def fit_expected_run_model(rows):
+    """Fit offense/pitching powers before the chronological holdout.
+
+    The grid minimizes Poisson negative log likelihood. Separate home and away
+    baselines absorb the run environment and ordinary home-field advantage.
+    """
+    usable = [row for row in rows
+              if row.get("home_runs") is not None
+              and row.get("away_runs") is not None]
+    if not usable:
+        return None
+    best = None
+    for offense_weight in EXPECTED_RUN_WEIGHT_GRID:
+        for pitching_weight in EXPECTED_RUN_WEIGHT_GRID:
+            multipliers = [
+                _expected_run_multipliers(
+                    row, offense_weight, pitching_weight)
+                for row in usable
+            ]
+            home_base = (sum(row["home_runs"] for row in usable)
+                         / sum(pair[0] for pair in multipliers))
+            away_base = (sum(row["away_runs"] for row in usable)
+                         / sum(pair[1] for pair in multipliers))
+            loss = 0.0
+            for row, (home_mult, away_mult) in zip(usable, multipliers):
+                home_expected = max(0.5, min(12.0, home_base * home_mult))
+                away_expected = max(0.5, min(12.0, away_base * away_mult))
+                loss += home_expected - row["home_runs"] * math.log(home_expected)
+                loss += away_expected - row["away_runs"] * math.log(away_expected)
+            candidate = {
+                "offense_weight": offense_weight,
+                "pitching_weight": pitching_weight,
+                "home_base_runs": home_base,
+                "away_base_runs": away_base,
+                "poisson_nll": loss / (2.0 * len(usable)),
+                "n_train": len(usable),
+            }
+            if best is None or candidate["poisson_nll"] < best["poisson_nll"]:
+                best = candidate
+    return best
+
+
+def project_expected_runs(row, model):
+    """Project home and away runs from one fitted challenger model."""
+    home_mult, away_mult = _expected_run_multipliers(
+        row, model["offense_weight"], model["pitching_weight"])
+    home_runs = mlb_starters.expected_runs_from_factors(
+        model["home_base_runs"], home_mult, 1.0)
+    away_runs = mlb_starters.expected_runs_from_factors(
+        model["away_base_runs"], away_mult, 1.0)
+    return home_runs, away_runs
+
+
+def _fit_probability_shrink(probabilities, outcomes):
+    """Fit p' = .5 + s*(p-.5) on training observations only."""
+    best = None
+    for step in range(21):
+        shrink = step / 20.0
+        predictions = [0.5 + shrink * (prob - 0.5)
+                       for prob in probabilities]
+        score = brier(predictions, outcomes)
+        if best is None or score < best[1]:
+            best = (shrink, score)
+    return best[0]
+
+
+def _probability_metrics(probabilities, outcomes):
+    clipped = [max(1e-9, min(1.0 - 1e-9, prob))
+               for prob in probabilities]
+    return {
+        "brier": brier(clipped, outcomes),
+        "log_loss": -sum(
+            outcome * math.log(prob) + (1 - outcome) * math.log(1 - prob)
+            for prob, outcome in zip(clipped, outcomes)
+        ) / len(outcomes),
+        "accuracy": sum(
+            (prob >= 0.5) == bool(outcome)
+            for prob, outcome in zip(clipped, outcomes)
+        ) / len(outcomes),
+    }
+
+
+def _margin_metrics(predictions, outcomes):
+    return {
+        "mae": sum(abs(pred - actual)
+                   for pred, actual in zip(predictions, outcomes)) / len(outcomes),
+        "rmse": rmse(predictions, outcomes),
+    }
+
+
+def _game_key(row):
+    return (row["season"], row["date"],
+            str(row["home_sp"]), str(row["away_sp"]))
+
+
+def _current_margin_predictions(seasons, rows):
+    """Reproduce the current live MLB margin engine without future games."""
+    from analysis import _norm_cdf, _predict_margin
+
+    row_by_key = {_game_key(row): row for row in rows}
+    predictions = {}
+    for season in seasons:
+        games = _enrich_games(get_season_games(season), season)
+        by_date = defaultdict(list)
+        for game in games:
+            by_date[game["date"]].append(game)
+        history = defaultdict(list)
+        for date in sorted(by_date):
+            # Grade every same-day game before adding any same-day result. This
+            # keeps doubleheaders and split games from leaking into each other.
+            for game in by_date[date]:
+                row = row_by_key.get(_game_key(game))
+                if not row:
+                    continue
+                home_prior = list(reversed(history[game["home_team"]][-20:]))
+                away_prior = list(reversed(history[game["away_team"]][-20:]))
+                if not home_prior or not away_prior:
+                    continue
+                margin = _predict_margin(
+                    {"home_team": game["home_team"],
+                     "away_team": game["away_team"]},
+                    {"recent_games": home_prior},
+                    {"recent_games": away_prior},
+                    "baseball_mlb",
+                    {"starter_edge": _eff_edge(row)},
+                )
+                if margin is None:
+                    continue
+                predicted_margin, predicted_std, _, _ = margin
+                predictions[_game_key(row)] = {
+                    "margin": predicted_margin,
+                    "std": predicted_std,
+                    "win_probability": _norm_cdf(
+                        predicted_margin / predicted_std),
+                    "minus_1_5_probability": _norm_cdf(
+                        (predicted_margin - 1.5) / predicted_std),
+                }
+            for game in by_date[date]:
+                record = {
+                    "home_team": game["home_team"],
+                    "away_team": game["away_team"],
+                    "home_score": game["home_runs"],
+                    "away_score": game["away_runs"],
+                }
+                history[game["home_team"]].append(record)
+                history[game["away_team"]].append(record)
+    return predictions
+
+
+def test_expected_runs_challenger(seasons, holdout_start=None):
+    """Chronologically compare Pythagorean expected runs with production."""
+    from analysis import _apply_shrink
+
+    latest_season = max(seasons)
+    holdout_start = holdout_start or f"{latest_season}-07-01"
+    rows, _ = build_pooled_dataset(seasons)
+    train = [row for row in rows
+             if row["season"] < latest_season or row["date"] < holdout_start]
+    holdout = [row for row in rows
+               if row["season"] == latest_season
+               and row["date"] >= holdout_start]
+    if len(train) < 200 or len(holdout) < 200:
+        print(f"Need at least 200 train and holdout games; found "
+              f"{len(train)} and {len(holdout)}.")
+        return None
+
+    model = fit_expected_run_model(train)
+
+    train_ml_prob = []
+    train_spread_prob = []
+    train_win = []
+    train_cover = []
+    for row in train:
+        home_runs, away_runs = project_expected_runs(row, model)
+        train_ml_prob.append(mlb_starters.pythagorean_win_probability(
+            home_runs, away_runs))
+        train_spread_prob.append(mlb_starters.poisson_margin_probability(
+            home_runs, away_runs, -1.5))
+        train_win.append(row["home_win"])
+        train_cover.append(1 if row["margin"] > 1.5 else 0)
+    ml_shrink = _fit_probability_shrink(train_ml_prob, train_win)
+    spread_shrink = _fit_probability_shrink(
+        train_spread_prob, train_cover)
+
+    current = _current_margin_predictions(seasons, rows)
+    comparison = [row for row in holdout if _game_key(row) in current]
+    if len(comparison) < 200:
+        print(f"Only {len(comparison)} holdout games have current-model history.")
+        return None
+    actual_win = [row["home_win"] for row in comparison]
+    actual_margin = [row["margin"] for row in comparison]
+    actual_cover = [1 if row["margin"] > 1.5 else 0 for row in comparison]
+
+    null_win_probability = sum(train_win) / len(train_win)
+    null_cover_probability = sum(train_cover) / len(train_cover)
+    null_margin_prediction = sum(row["margin"] for row in train) / len(train)
+    null_ml_metrics = _probability_metrics(
+        [null_win_probability] * len(comparison), actual_win)
+    null_spread_metrics = _probability_metrics(
+        [null_cover_probability] * len(comparison), actual_cover)
+    null_margin_metrics = _margin_metrics(
+        [null_margin_prediction] * len(comparison), actual_margin)
+
+    current_ml = []
+    current_spread = []
+    current_margins = []
+    challenger_ml_raw = []
+    challenger_ml = []
+    challenger_spread = []
+    challenger_margins = []
+    for row in comparison:
+        baseline = current[_game_key(row)]
+        current_ml.append(_apply_shrink(
+            baseline["win_probability"], "baseball_mlb", "moneyline"))
+        current_spread.append(_apply_shrink(
+            baseline["minus_1_5_probability"],
+            "baseball_mlb", "spreads"))
+        current_margins.append(baseline["margin"])
+
+        home_runs, away_runs = project_expected_runs(row, model)
+        raw_ml = mlb_starters.pythagorean_win_probability(
+            home_runs, away_runs)
+        raw_spread = mlb_starters.poisson_margin_probability(
+            home_runs, away_runs, -1.5)
+        challenger_ml_raw.append(raw_ml)
+        challenger_ml.append(0.5 + ml_shrink * (raw_ml - 0.5))
+        challenger_spread.append(
+            0.5 + spread_shrink * (raw_spread - 0.5))
+        challenger_margins.append(home_runs - away_runs)
+
+    current_ml_metrics = _probability_metrics(current_ml, actual_win)
+    challenger_raw_metrics = _probability_metrics(
+        challenger_ml_raw, actual_win)
+    challenger_ml_metrics = _probability_metrics(challenger_ml, actual_win)
+    current_spread_metrics = _probability_metrics(
+        current_spread, actual_cover)
+    challenger_spread_metrics = _probability_metrics(
+        challenger_spread, actual_cover)
+    current_margin_metrics = _margin_metrics(current_margins, actual_margin)
+    challenger_margin_metrics = _margin_metrics(
+        challenger_margins, actual_margin)
+
+    passed = (
+        challenger_ml_metrics["brier"]
+        < min(current_ml_metrics["brier"], null_ml_metrics["brier"])
+        and challenger_spread_metrics["brier"]
+        < min(current_spread_metrics["brier"], null_spread_metrics["brier"])
+        and challenger_margin_metrics["rmse"]
+        < min(current_margin_metrics["rmse"], null_margin_metrics["rmse"])
+    )
+    print(f"\n=== expected-runs challenger — holdout {holdout_start}+ ===")
+    print(f"train={len(train)} holdout={len(comparison)}; "
+          f"Pythagorean exponent={mlb_starters.PYTHAGOREAN_EXPONENT}")
+    print("fit: offense_weight={offense_weight:.2f}, "
+          "pitching_weight={pitching_weight:.2f}, home_base={home_base_runs:.3f}, "
+          "away_base={away_base_runs:.3f}".format(**model))
+    print(f"probability shrink fitted on train: ML={ml_shrink:.2f}, "
+          f"home -1.5={spread_shrink:.2f}")
+    print("\nMONEYLINE (lower is better)")
+    print(f"  base rate:  Brier={null_ml_metrics['brier']:.4f} "
+          f"logloss={null_ml_metrics['log_loss']:.4f} "
+          f"accuracy={null_ml_metrics['accuracy']:.2%}")
+    print(f"  current:    Brier={current_ml_metrics['brier']:.4f} "
+          f"logloss={current_ml_metrics['log_loss']:.4f} "
+          f"accuracy={current_ml_metrics['accuracy']:.2%}")
+    print(f"  Pyth raw:   Brier={challenger_raw_metrics['brier']:.4f} "
+          f"logloss={challenger_raw_metrics['log_loss']:.4f}")
+    print(f"  challenger: Brier={challenger_ml_metrics['brier']:.4f} "
+          f"logloss={challenger_ml_metrics['log_loss']:.4f} "
+          f"accuracy={challenger_ml_metrics['accuracy']:.2%}")
+    print("\nMARGIN / RUN LINE")
+    print(f"  base-rate margin:  MAE={null_margin_metrics['mae']:.3f} "
+          f"RMSE={null_margin_metrics['rmse']:.3f}")
+    print(f"  current margin:    MAE={current_margin_metrics['mae']:.3f} "
+          f"RMSE={current_margin_metrics['rmse']:.3f}")
+    print(f"  challenger margin: MAE={challenger_margin_metrics['mae']:.3f} "
+          f"RMSE={challenger_margin_metrics['rmse']:.3f}")
+    print(f"  current home -1.5 Brier:    "
+          f"{current_spread_metrics['brier']:.4f}")
+    print(f"  base-rate home -1.5 Brier:  "
+          f"{null_spread_metrics['brier']:.4f}")
+    print(f"  challenger home -1.5 Brier: "
+          f"{challenger_spread_metrics['brier']:.4f}")
+    print("\nDECISION: " + (
+        "PASS challenger gate; validate additional seasons before live use."
+        if passed else
+        "KEEP OFF; challenger did not beat current ML, margin, and spread gates."
+    ))
+    return {
+        "model": model,
+        "train_n": len(train),
+        "holdout_n": len(comparison),
+        "ml_shrink": ml_shrink,
+        "spread_shrink": spread_shrink,
+        "null_ml": null_ml_metrics,
+        "current_ml": current_ml_metrics,
+        "challenger_ml": challenger_ml_metrics,
+        "null_margin": null_margin_metrics,
+        "current_margin": current_margin_metrics,
+        "challenger_margin": challenger_margin_metrics,
+        "null_spread": null_spread_metrics,
+        "current_spread": current_spread_metrics,
+        "challenger_spread": challenger_spread_metrics,
+        "passed": passed,
+    }
 
 
 def _pearson(xs, ys):
@@ -587,7 +965,6 @@ def test_two_sided(seasons):
     offense factor of the lineup that starter faces (offense factor >1 = the
     opposing hitters are better than league vs that hand, so prevention drops).
     """
-    from backtest_props import build_pitcher_index
     base_edges, two_edges, margins = [], [], []
     for s in seasons:
         games = get_season_games(s)
@@ -597,7 +974,7 @@ def test_two_sided(seasons):
             continue
         vals = [r["xwoba"] for r in rows if r["xwoba"] is not None]
         league = sum(vals) / len(vals)
-        sp_idx = build_pitcher_index(rows)
+        sp_idx = _pitcher_xwoba_index(rows)
         off_idx = _offense_index(rows)
         _, _, game_teams = _bullpen_features(rows, s)
         hands = {}
@@ -656,6 +1033,9 @@ if __name__ == "__main__":
     ap.add_argument("--test-2sided", action="store_true",
                     help="A/B test the two-sided (pitcher-vs-lineup) edge vs "
                          "the pitcher-only edge; reports metrics, no save")
+    ap.add_argument("--test-runs", action="store_true",
+                    help="chronologically test expected runs + Pythagorean 1.83 "
+                         "against the current MLB moneyline/spread engine")
     args = ap.parse_args()
 
     seasons = _parse_seasons(args.season)
@@ -669,5 +1049,7 @@ if __name__ == "__main__":
         test_innings_weighting(seasons)
     elif args.test_2sided:
         test_two_sided(seasons)
+    elif args.test_runs:
+        test_expected_runs_challenger(seasons)
     else:
         fit(seasons, do_save=args.save)
