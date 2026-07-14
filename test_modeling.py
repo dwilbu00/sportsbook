@@ -9,11 +9,16 @@ from unittest.mock import patch
 import requests
 
 import analysis
+import forward_tracker
 import mlb_starters
 import odds_client
 import recalibration
 from backtest_props import _rolling_splits
-from forward_tracker import closing_event_groups, find_closing_offer
+from forward_tracker import (
+    closing_event_groups,
+    find_closing_offer,
+    next_closing_capture,
+)
 from odds_client import parse_player_props
 from prop_filter import filter_player_gamelog
 from recalibration import fit_platt_chronological, summarize_prediction_rows
@@ -440,6 +445,24 @@ class RecalibrationTests(unittest.TestCase):
 
 
 class ForwardTrackerTests(unittest.TestCase):
+    def test_next_capture_targets_five_minutes_before_nearest_event(self):
+        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
+        row = {
+            "sport_key": "baseball_mlb",
+            "event_id": "game-1",
+            "commence_time": "2024-07-01T20:35:00Z",
+            "prop_key": "batter_hits",
+            "player": "José Ramírez",
+            "direction": "OVER",
+        }
+        scheduled = next_closing_capture([row], now=now)
+        self.assertEqual(scheduled["event_id"], "game-1")
+        self.assertEqual(scheduled["target_time"], "2024-07-01T20:30:00+00:00")
+        self.assertEqual(scheduled["wait_seconds"], 30 * 60)
+        self.assertIsNone(next_closing_capture(
+            [dict(row, closing_attempted_at="2024-07-01T20:30:00Z")],
+            now=now))
+
     def test_closing_window_requires_uncaptured_event_metadata(self):
         now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
         base = {
@@ -492,6 +515,46 @@ class ForwardTrackerTests(unittest.TestCase):
         self.assertEqual(offer["price"], -105)
         self.assertEqual(offer["book"], "FanDuel")
         self.assertEqual(offer["same_book_price"], -115)
+
+    def test_missing_exact_line_is_attempted_only_once_automatically(self):
+        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
+        rows = [{
+            "ts": "2024-07-01T18:00:00Z",
+            "sport_key": "baseball_mlb",
+            "event_id": "game-1",
+            "commence_time": "2024-07-01T20:08:00Z",
+            "prop_key": "batter_hits",
+            "player": "José Ramírez",
+            "direction": "OVER",
+            "line": 1.5,
+            "resolved": False,
+        }]
+
+        def mutate(mutator):
+            return mutator(rows)
+
+        with patch.object(
+                forward_tracker, "read_prediction_log", return_value=rows), patch.object(
+                forward_tracker, "get_event_odds",
+                return_value={"bookmakers": []}) as get_odds, patch.object(
+                forward_tracker, "mutate_prediction_log", side_effect=mutate):
+            first = forward_tracker.capture_closing_odds(
+                "key", now=now, window_minutes=10)
+            # A later analysis can append another physical row for the same
+            # event. The event-level attempt must still suppress another call.
+            rows.append(dict(
+                rows[0], ts="2024-07-01T19:00:00Z",
+                closing_attempted_at=None, closing_attempt_error=None))
+            second = forward_tracker.capture_closing_odds(
+                "key", now=now, window_minutes=10)
+
+        self.assertEqual(first["events"], 1)
+        self.assertEqual(first["exact_line_misses"], 1)
+        self.assertEqual(first["closing_captured"], 0)
+        self.assertEqual(second["events"], 0)
+        self.assertEqual(get_odds.call_count, 1)
+        self.assertEqual(rows[0]["closing_attempt_error"],
+                         "exact_line_not_found")
 
 
 class ParlayCorrelationTests(unittest.TestCase):

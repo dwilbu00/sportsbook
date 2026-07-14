@@ -332,6 +332,94 @@ def needs_setup(config):
     return not key or key == "YOUR_API_KEY_HERE"
 
 
+def _closing_capture_status(result):
+    """Build a concise user-facing status for a closing-capture attempt."""
+    if not result.get("events"):
+        return "info", "No uncaptured analyzed event is within ten minutes of starting."
+    captured = result.get("closing_captured", 0)
+    misses = result.get("exact_line_misses", 0)
+    errors = result.get("request_errors", 0)
+    if errors:
+        return (
+            "warning",
+            f"Closing odds were requested for {result['events']} event(s), but "
+            f"{errors} request(s) failed. Use the manual retry if needed.",
+        )
+    if captured:
+        message = f"Captured {captured} exact-line closing price(s)."
+        if misses:
+            message += f" {misses} logged line(s) were no longer offered."
+        return "success", message
+    return "warning", "The closing market was checked once, but no exact logged lines remained."
+
+
+def render_forward_capture_service(config):
+    """Arm one Streamlit-session timer for the next analyzed event close."""
+    from forward_tracker import capture_closing_odds, next_closing_capture
+    from recalibration import read_prediction_log
+
+    api_key = config.get("odds_api_key")
+    bookmakers = config.get("bookmakers") or None
+    try:
+        scheduled = next_closing_capture(read_prediction_log())
+    except Exception:
+        scheduled = None
+    run_every = None
+    if scheduled and scheduled["wait_seconds"] > 2:
+        run_every = scheduled["wait_seconds"]
+
+    @st.fragment(run_every=run_every)
+    def one_shot_capture():
+        status = st.session_state.pop("_closing_capture_status", None)
+        if status:
+            getattr(st, status[0])(status[1])
+
+        manual_capture = st.button(
+            "Capture eligible closing odds now",
+            key="capture_closing_odds_now",
+            help=(
+                "Makes no Odds API request unless an analyzed event begins "
+                "within ten minutes. This can manually retry a prior miss."
+            ),
+            width="stretch",
+        )
+        if manual_capture:
+            result = capture_closing_odds(
+                api_key, bookmakers=bookmakers, window_minutes=10,
+                force_retry=True)
+            st.session_state["_closing_capture_status"] = (
+                _closing_capture_status(result))
+            st.rerun()
+
+        try:
+            next_capture = next_closing_capture(read_prediction_log())
+        except Exception:
+            next_capture = None
+        if not next_capture:
+            st.caption("No closing snapshot is currently armed.")
+            return
+        if next_capture["wait_seconds"] <= 2:
+            # A small tolerance prevents scheduler jitter from placing the
+            # request a fraction of a second outside the five-minute window.
+            result = capture_closing_odds(
+                api_key, bookmakers=bookmakers, window_minutes=5.25)
+            if result.get("events"):
+                st.session_state["_closing_capture_status"] = (
+                    _closing_capture_status(result))
+                st.rerun()
+            return
+
+        target = datetime.fromisoformat(next_capture["target_time"])
+        target_et = target.astimezone(ZoneInfo("America/New_York"))
+        st.caption(
+            "One closing request armed for "
+            f"{target_et.strftime('%b %d at %I:%M %p ET')}. "
+            "The browser session must remain open."
+        )
+
+    one_shot_capture()
+
+
 def show_setup_wizard():
     """Display a first-run setup wizard to help the user get an API key."""
     st.markdown("## 👋 Welcome to Sportsbook Value Finder!")
@@ -583,8 +671,8 @@ def render_model_guide():
         storage_backend = prediction_log_storage()
         if storage_backend == "Local cache":
             st.warning(
-                "Forward data is using local cache storage. This persists on the "
-                "Windows host but can be reset on Streamlit Cloud. Configure "
+                "Forward data is using local container storage, which can reset "
+                "when Streamlit Cloud restarts or redeploys. Configure "
                 "PREDICTION_LOG_BLOB_URL for a shared durable Azure Blob."
             )
         else:
@@ -857,6 +945,12 @@ with st.sidebar:
         ["🎯 Value Finder", "📘 Model Guide & Performance"],
         key="app_page",
     )
+
+if not needs_setup(config):
+    with st.sidebar:
+        st.divider()
+        st.subheader("Forward tracking")
+        render_forward_capture_service(config)
 
 if app_page == "📘 Model Guide & Performance":
     render_model_guide()
@@ -1561,6 +1655,10 @@ if analyze_clicked:
     }
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
+    # Prediction rows were just created. Rerun once so the one-shot Streamlit
+    # timer above can arm itself for the nearest newly analyzed event.
+    if selected_props:
+        st.rerun()
 
 # ── Conditional alt-line fetch ──
 # Always fetch when safe mode is on (safe-mode props need real alt prices and

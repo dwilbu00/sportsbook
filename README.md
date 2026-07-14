@@ -280,8 +280,7 @@ The repository includes scripts for testing and refitting the model:
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
-- `forward_tracker.py` — captures exact-line closing prices and runs scheduled outcome maintenance
-- `INSTALL_FORWARD_TRACKING_TASKS.ps1` — installs the Windows closing-price and daily-resolution tasks
+- `forward_tracker.py` — captures one-shot exact-line closing prices and runs outcome maintenance
 - `backtest_starters.py` — fits MLB starter/bullpen adjustment weights
 - `backtest_nfl_epa.py` — fits NFL EPA margin weights
 - `savant_history.py` — leakage-safe historical Statcast feature cache for MLB backtests
@@ -324,11 +323,11 @@ The app has several built-in defenses against impressive-looking but fragile pre
 4. Get an API key from [the-odds-api.com](https://the-odds-api.com/#get-access).
 5. For durable forward tracking, create a private Azure Block Blob SAS URL with
    **read, create, and write** permissions. Add the same URL to Streamlit Cloud
-   secrets and the local `.streamlit/secrets.toml` used by the scheduled tasks.
+   secrets.
 
 Without `PREDICTION_LOG_BLOB_URL`, the app falls back to `cache/predictions/`.
-That is persistent on a single local Windows host but is not durable across
-Streamlit Cloud restarts or redeployments.
+That local container storage is not durable across Streamlit Cloud restarts or
+redeployments.
 
 ### Local
 
@@ -344,23 +343,20 @@ ODDS_API_KEY = "your_api_key_here"
 PREDICTION_LOG_BLOB_URL = "https://ACCOUNT.blob.core.windows.net/CONTAINER/prediction_log.jsonl?SAS_TOKEN"
 ```
 
-### Automated forward tracking on Windows
+### Event-timed forward tracking in Streamlit
 
-Install the two scheduled tasks from PowerShell:
+After a player-prop analysis logs an upcoming event, the active Streamlit
+session arms a one-shot fragment for five minutes before that event starts. The
+fragment makes no periodic Odds API requests: it wakes once at the target time,
+requests the required prop markets, and records the exact player/prop/line/side
+snapshot. A checked event is not retried automatically, even when an exact line
+has disappeared, so multiple app sessions do not intentionally repeat the same
+credit spend.
 
-```powershell
-cd C:\Users\Dwilburn\Documents\Git\ODI_SCRIPTS\SPORTSBOOK_ODDS\deploy
-powershell -ExecutionPolicy Bypass -File .\INSTALL_FORWARD_TRACKING_TASKS.ps1
-```
-
-The closing task checks every five minutes but calls The Odds API only for
-already-logged events beginning within ten minutes. It records one exact-line
-snapshot per prediction, so the approximate cost is one credit per requested
-prop market per logged event—not one API call on every task run. The resolution
-task runs daily at 6:00 AM, grades completed predictions through ESPN, and
-refits only after the existing minimum-sample and chronological-validation gates
-are satisfied. These user-level tasks run while the Windows account is signed in
-and the computer is awake.
+The browser session must remain active until the target time. The sidebar's
+**Capture eligible closing odds now** button provides a manual retry for an
+analyzed event beginning within ten minutes. Outcome resolution remains part of
+normal app analysis and uses ESPN rather than The Odds API.
 
 Useful manual commands:
 
@@ -368,12 +364,6 @@ Useful manual commands:
 python forward_tracker.py --capture-closing --dry-run
 python forward_tracker.py --capture-closing
 python forward_tracker.py --resolve
-```
-
-Remove the tasks with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\INSTALL_FORWARD_TRACKING_TASKS.ps1 -Remove
 ```
 
 ## Practical note

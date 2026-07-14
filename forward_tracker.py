@@ -9,9 +9,10 @@ Examples:
 import argparse
 import json
 import os
+import threading
 import unicodedata
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from odds_client import get_event_odds
 from recalibration import (
@@ -31,6 +32,7 @@ SPORT_ALIASES = {
     "nfl": "americanfootball_nfl",
     "nhl": "icehockey_nhl",
 }
+_capture_lock = threading.Lock()
 
 
 def _load_settings():
@@ -76,15 +78,25 @@ def _normalize_name(value):
     )
 
 
-def closing_event_groups(rows, now=None, window_minutes=10, sport_key=None):
+def closing_event_groups(rows, now=None, window_minutes=10, sport_key=None,
+                         include_attempted=False):
     """Group log rows for events beginning within the closing window."""
     now = now or datetime.now(timezone.utc)
     groups = defaultdict(list)
+    attempted_events = {
+        (row.get("sport_key"), row.get("event_id"))
+        for row in rows
+        if row.get("event_id") and (row.get("closing_attempted_at")
+                                    or row.get("closing_captured_at"))
+    }
     for row in rows:
         if sport_key and row.get("sport_key") != sport_key:
             continue
         if (row.get("resolved") or row.get("closing_captured_at")
                 or not row.get("event_id")):
+            continue
+        event_key = (row.get("sport_key"), row["event_id"])
+        if event_key in attempted_events and not include_attempted:
             continue
         if not row.get("prop_key") or not row.get("player"):
             continue
@@ -97,6 +109,47 @@ def closing_event_groups(rows, now=None, window_minutes=10, sport_key=None):
         if 0 <= minutes_before <= window_minutes:
             groups[(row.get("sport_key"), row["event_id"])].append(row)
     return groups
+
+
+def next_closing_capture(rows, now=None, lead_minutes=5, sport_key=None):
+    """Return timing metadata for the next one-shot closing capture."""
+    now = now or datetime.now(timezone.utc)
+    events = {}
+    attempted_events = {
+        (row.get("sport_key"), row.get("event_id"))
+        for row in rows
+        if row.get("event_id") and (row.get("closing_attempted_at")
+                                    or row.get("closing_captured_at"))
+    }
+    for row in rows:
+        if sport_key and row.get("sport_key") != sport_key:
+            continue
+        if (row.get("resolved") or row.get("closing_captured_at")
+                or not row.get("event_id")):
+            continue
+        if not row.get("prop_key") or not row.get("player"):
+            continue
+        if (row.get("direction") or "").upper() not in ("OVER", "UNDER"):
+            continue
+        commence = _parse_utc(row.get("commence_time"))
+        if commence is None or commence <= now:
+            continue
+        key = (row.get("sport_key"), row["event_id"])
+        if key in attempted_events:
+            continue
+        events[key] = commence
+    if not events:
+        return None
+    (event_sport, event_id), commence = min(
+        events.items(), key=lambda item: item[1])
+    target = commence - timedelta(minutes=lead_minutes)
+    return {
+        "sport_key": event_sport,
+        "event_id": event_id,
+        "commence_time": commence.isoformat(),
+        "target_time": target.isoformat(),
+        "wait_seconds": max(0.0, (target - now).total_seconds()),
+    }
 
 
 def find_closing_offer(game_data, row):
@@ -147,64 +200,94 @@ def find_closing_offer(game_data, row):
 
 
 def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
-                         sport_key=None, dry_run=False, now=None):
+                         sport_key=None, dry_run=False, now=None,
+                         force_retry=False):
     """Capture latest exact-line prices for logged events near game time."""
     now = now or datetime.now(timezone.utc)
-    groups = closing_event_groups(
-        read_prediction_log(), now=now, window_minutes=window_minutes,
-        sport_key=sport_key)
-    market_count = sum(len({row["prop_key"] for row in rows})
-                       for rows in groups.values())
-    if dry_run:
-        return {
-            "events": len(groups), "markets": market_count,
-            "rows_updated": 0, "exact_line_misses": 0,
-        }
-
-    updates = {}
-    misses = 0
-    for (event_sport, event_id), rows in groups.items():
-        markets = ",".join(sorted({row["prop_key"] for row in rows}))
-        try:
-            game_data = get_event_odds(
-                api_key, event_sport, event_id, markets=markets,
-                bookmakers=bookmakers, force_refresh=True)
-        except Exception as exc:
-            print(f"  [closing] {event_id}: {exc}")
-            continue
-        for row in rows:
-            offer = find_closing_offer(game_data, row)
-            if not offer:
-                misses += 1
-                continue
-            commence = _parse_utc(row.get("commence_time"))
-            minutes_before = ((commence - now).total_seconds() / 60.0
-                              if commence else None)
-            updates[prediction_row_key(row)] = {
-                "closing_price": offer["price"],
-                "closing_book": offer["book"],
-                "closing_same_book_price": offer["same_book_price"],
-                "closing_books_sampled": offer["books_sampled"],
-                "closing_captured_at": now.isoformat(),
-                "closing_minutes_before": (
-                    round(minutes_before, 2) if minutes_before is not None else None),
-                "closing_source": "odds_api_exact_line_pregame",
+    # Streamlit can have multiple active sessions in one process. Serialize the
+    # read/fetch/write cycle so two sessions cannot spend credits on the same
+    # event before either one records its attempt.
+    with _capture_lock:
+        groups = closing_event_groups(
+            read_prediction_log(), now=now, window_minutes=window_minutes,
+            sport_key=sport_key, include_attempted=force_retry)
+        market_count = sum(len({row["prop_key"] for row in rows})
+                           for rows in groups.values())
+        if dry_run:
+            return {
+                "events": len(groups), "markets": market_count,
+                "rows_updated": 0, "exact_line_misses": 0,
+                "request_errors": 0, "closing_captured": 0,
             }
 
-    def apply_updates(current_rows):
-        changed = 0
-        for row in current_rows:
-            update = updates.get(prediction_row_key(row))
-            if update:
-                row.update(update)
-                changed += 1
-        return changed
+        updates = {}
+        misses = 0
+        request_errors = 0
+        captured = 0
+        for (event_sport, event_id), rows in groups.items():
+            markets = ",".join(sorted({row["prop_key"] for row in rows}))
+            attempted_at = now.isoformat()
+            try:
+                game_data = get_event_odds(
+                    api_key, event_sport, event_id, markets=markets,
+                    bookmakers=bookmakers, force_refresh=True)
+            except Exception as exc:
+                status_code = getattr(getattr(exc, "response", None),
+                                      "status_code", None)
+                error_code = type(exc).__name__
+                if status_code is not None:
+                    error_code += f"_{status_code}"
+                print(f"  [closing] {event_id}: {error_code}")
+                request_errors += 1
+                for row in rows:
+                    updates[prediction_row_key(row)] = {
+                        "closing_attempted_at": attempted_at,
+                        "closing_attempt_error": error_code,
+                    }
+                continue
+            for row in rows:
+                offer = find_closing_offer(game_data, row)
+                update = {
+                    "closing_attempted_at": attempted_at,
+                    "closing_attempt_error": None,
+                }
+                if not offer:
+                    misses += 1
+                    update["closing_attempt_error"] = "exact_line_not_found"
+                    updates[prediction_row_key(row)] = update
+                    continue
+                commence = _parse_utc(row.get("commence_time"))
+                minutes_before = ((commence - now).total_seconds() / 60.0
+                                  if commence else None)
+                update.update({
+                    "closing_price": offer["price"],
+                    "closing_book": offer["book"],
+                    "closing_same_book_price": offer["same_book_price"],
+                    "closing_books_sampled": offer["books_sampled"],
+                    "closing_captured_at": attempted_at,
+                    "closing_minutes_before": (
+                        round(minutes_before, 2)
+                        if minutes_before is not None else None),
+                    "closing_source": "odds_api_exact_line_pregame",
+                })
+                captured += 1
+                updates[prediction_row_key(row)] = update
 
-    rows_updated = mutate_prediction_log(apply_updates) if updates else 0
-    return {
-        "events": len(groups), "markets": market_count,
-        "rows_updated": rows_updated or 0, "exact_line_misses": misses,
-    }
+        def apply_updates(current_rows):
+            changed = 0
+            for row in current_rows:
+                update = updates.get(prediction_row_key(row))
+                if update:
+                    row.update(update)
+                    changed += 1
+            return changed
+
+        rows_updated = mutate_prediction_log(apply_updates) if updates else 0
+        return {
+            "events": len(groups), "markets": market_count,
+            "rows_updated": rows_updated or 0, "exact_line_misses": misses,
+            "request_errors": request_errors, "closing_captured": captured,
+        }
 
 
 def resolve_and_refit(sport_key=None):
