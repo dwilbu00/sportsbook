@@ -143,7 +143,8 @@ def get_upcoming_events(api_key, sport):
     return data
 
 
-def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h", bookmakers=None):
+def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h",
+                   bookmakers=None, force_refresh=False):
     """
     Fetch odds for a single event.
     Cost: number of markets x number of regions.
@@ -155,16 +156,18 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h", bookma
         regions (str): Comma-separated regions
         markets (str): Comma-separated markets (h2h, spreads, totals)
         bookmakers (list): Optional bookmaker filter
+        force_refresh (bool): Skip the one-hour cache (for closing snapshots)
 
     Returns:
         dict: Single game dict with odds data
     """
     books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
     cache_path = _cache_key("event_odds", sport, event_id, regions, markets, books_key)
-    cached, age = _read_cache(cache_path)
-    if cached is not None:
-        print(f"    [Cache] Using cached odds for {event_id} ({int(age)}s old)")
-        return cached
+    if not force_refresh:
+        cached, age = _read_cache(cache_path)
+        if cached is not None:
+            print(f"    [Cache] Using cached odds for {event_id} ({int(age)}s old)")
+            return cached
 
     url = f"{BASE_URL}/sports/{sport}/events/{event_id}/odds"
     params = {
@@ -180,8 +183,9 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h", bookma
         resp = _get_with_retry(url, params)
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        # Fall back to expired cache if credits exhausted (401/429)
-        if resp.status_code in (401, 429):
+        # An expired cache is useful for interactive analysis, but must never
+        # be mislabeled as a fresh closing snapshot by a forced refresh.
+        if not force_refresh and resp.status_code in (401, 429):
             expired = _read_cache_expired(cache_path)
             if expired is not None:
                 print(f"  [Odds API] Credits exhausted — using expired cache for {event_id}")

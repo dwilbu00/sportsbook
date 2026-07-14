@@ -36,6 +36,7 @@ import os
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,15 +44,17 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 PRED_DIR = os.path.join(CACHE_DIR, "predictions")
 LOG_PATH = os.path.join(PRED_DIR, "prediction_log.jsonl")
 CALIB_DIR = os.path.join(SCRIPT_DIR, "calibration")
+REMOTE_LOG_URL_ENV = "PREDICTION_LOG_BLOB_URL"
 
 MIN_FIT_SAMPLES = 50          # below this, skip Platt fit for a prop
 MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
 MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
 MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
+AUTO_MAINTENANCE_INTERVAL_SECONDS = 3600
 
 _lock = threading.Lock()
-_refit_done_this_session = set()   # {sport_key} — already refit in this process
+_last_auto_maintenance = {}  # sport_key -> attempt timestamp
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -67,14 +70,147 @@ def _ensure_dirs():
     os.makedirs(CALIB_DIR, exist_ok=True)
 
 
+def _prediction_log_blob_url():
+    """Return an optional Azure Blob SAS URL for durable shared log storage."""
+    url = os.environ.get(REMOTE_LOG_URL_ENV, "").strip()
+    if url:
+        return url
+    secrets_path = os.path.join(SCRIPT_DIR, ".streamlit", "secrets.toml")
+    try:
+        import tomllib
+        with open(secrets_path, "rb") as f:
+            value = tomllib.load(f).get(REMOTE_LOG_URL_ENV)
+        return str(value).strip() if value else ""
+    except (ImportError, OSError, TypeError, ValueError):
+        return ""
+
+
+def prediction_log_storage():
+    """Human-readable active prediction-log backend."""
+    return "Azure Blob" if _prediction_log_blob_url() else "Local cache"
+
+
+def _parse_log_text(text):
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _serialize_log(rows):
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+class _LogConflict(Exception):
+    pass
+
+
+@contextmanager
+def _local_log_lock():
+    """Hold an inter-process lock while replacing the local prediction log."""
+    _ensure_dirs()
+    lock_path = LOG_PATH + ".lock"
+    with open(lock_path, "a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_log_snapshot():
+    """Return (rows, version) from local disk or the configured Azure blob."""
+    blob_url = _prediction_log_blob_url()
+    if blob_url:
+        import requests
+        response = requests.get(blob_url, timeout=30)
+        if response.status_code == 404:
+            return [], None
+        response.raise_for_status()
+        return _parse_log_text(response.text), response.headers.get("ETag")
+    if not os.path.exists(LOG_PATH):
+        return [], None
+    with open(LOG_PATH, "r", encoding="utf-8") as f:
+        return _parse_log_text(f.read()), None
+
+
+def _write_log_snapshot(rows, version=None):
+    """Conditionally write a complete log snapshot."""
+    content = _serialize_log(rows)
+    blob_url = _prediction_log_blob_url()
+    if blob_url:
+        import requests
+        headers = {
+            "Content-Type": "application/x-ndjson",
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2023-11-03",
+        }
+        headers["If-Match" if version else "If-None-Match"] = version or "*"
+        response = requests.put(
+            blob_url, data=content.encode("utf-8"), headers=headers, timeout=30)
+        if response.status_code in (409, 412):
+            raise _LogConflict()
+        response.raise_for_status()
+        return
+    _ensure_dirs()
+    tmp = LOG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, LOG_PATH)
+
+
+def mutate_prediction_log(mutator, max_retries=5):
+    """Atomically mutate the prediction log; returns the mutator's result."""
+    if not _prediction_log_blob_url():
+        with _lock:
+            with _local_log_lock():
+                rows, version = _read_log_snapshot()
+                result = mutator(rows)
+                if result:
+                    _write_log_snapshot(rows, version)
+                return result
+    for _ in range(max_retries):
+        rows, version = _read_log_snapshot()
+        result = mutator(rows)
+        if not result:
+            return result
+        try:
+            _write_log_snapshot(rows, version)
+            return result
+        except _LogConflict:
+            continue
+    raise RuntimeError("Prediction log changed repeatedly; update was not saved")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
 def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
                    projected=None, direction=None, price=None, book=None,
-                   final_prob=None):
-    """Append one prediction row to the JSONL log. Best-effort, never raises."""
+                   final_prob=None, event_id=None, commence_time=None,
+                   is_value=None, write=True):
+    """Build and optionally append one prediction row. Best-effort, never raises."""
     if not sport_key or not prop_key or not player or game_date is None:
         return
     try:
@@ -93,6 +229,8 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "sport_key": sport_key,
+        "event_id": event_id,
+        "commence_time": commence_time,
         "prop_key": prop_key,
         "player": player,
         "game_date": str(game_date)[:10],  # YYYY-MM-DD
@@ -103,35 +241,63 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "direction": direction,
         "price": price,
         "book": book,
+        "is_value": bool(is_value) if is_value is not None else None,
         "resolved": False,
         "actual": None,
         "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
     }
+    if write:
+        log_prediction_rows([row])
+    return row
+
+
+def log_prediction_rows(new_rows):
+    """Append a batch of prediction rows in one local or remote transaction."""
+    if not new_rows:
+        return 0
     try:
-        with _lock:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
+        def append(rows):
+            rows.extend(new_rows)
+            return len(new_rows)
+        return mutate_prediction_log(append)
     except Exception:
-        pass
+        return 0
 
 
 def _read_log():
-    if not os.path.exists(LOG_PATH):
-        return []
-    rows = []
     try:
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
+        rows, _ = _read_log_snapshot()
+        return rows
+    except Exception:
         return []
-    return rows
+
+
+def read_prediction_log():
+    """Public read-only snapshot for maintenance tools."""
+    return _read_log()
+
+
+def prediction_identity(row):
+    """Stable forecast identity, with legacy fallback for pre-event-ID rows."""
+    event_ref = row.get("event_id") or row.get("game_date")
+    return (
+        row.get("sport_key"), event_ref, row.get("prop_key"),
+        row.get("player"), row.get("line"),
+    )
+
+
+def prediction_row_key(row):
+    """Identity for updating one physical log row, including its timestamp."""
+    return (row.get("ts"),) + prediction_identity(row)
+
+
+def _american_decimal(price):
+    price = int(price)
+    if price > 0:
+        return 1.0 + price / 100.0
+    if price < 0:
+        return 1.0 + 100.0 / -price
+    return None
 
 
 def summarize_prediction_rows(rows, sport_key=None):
@@ -140,10 +306,7 @@ def summarize_prediction_rows(rows, sport_key=None):
     for row in rows:
         if sport_key and row.get("sport_key") != sport_key:
             continue
-        identity = (
-            row.get("sport_key"), row.get("prop_key"), row.get("player"),
-            row.get("game_date"), row.get("line"),
-        )
+        identity = prediction_identity(row)
         current = unique.get(identity)
         if current and current.get("resolved") and not row.get("resolved"):
             continue
@@ -157,6 +320,19 @@ def summarize_prediction_rows(rows, sport_key=None):
         outcomes = []
         direction_hits = []
         realized_returns = []
+        probability_clv = []
+        odds_clv = []
+        for row in group:
+            try:
+                opening_decimal = _american_decimal(row.get("price"))
+                closing_decimal = _american_decimal(row.get("closing_price"))
+            except (TypeError, ValueError):
+                continue
+            if not opening_decimal or not closing_decimal:
+                continue
+            probability_clv.append(
+                1.0 / closing_decimal - 1.0 / opening_decimal)
+            odds_clv.append(opening_decimal / closing_decimal - 1.0)
         for row in graded:
             try:
                 logged_probability = row.get("final_prob")
@@ -211,6 +387,14 @@ def summarize_prediction_rows(rows, sport_key=None):
             ),
             "probability_brier": brier,
             "priced_resolved": len(realized_returns),
+            "closing_captured": len(probability_clv),
+            "average_probability_clv": (
+                sum(probability_clv) / len(probability_clv)
+                if probability_clv else None
+            ),
+            "average_odds_clv": (
+                sum(odds_clv) / len(odds_clv) if odds_clv else None
+            ),
             "realized_roi": (
                 sum(realized_returns) / len(realized_returns)
                 if realized_returns else None
@@ -240,15 +424,6 @@ def summarize_prediction_rows(rows, sport_key=None):
 def prediction_performance_summary(sport_key=None):
     """Return current forward-log status and resolved forecast performance."""
     return summarize_prediction_rows(_read_log(), sport_key=sport_key)
-
-
-def _rewrite_log(rows):
-    with _lock:
-        tmp = LOG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
-        os.replace(tmp, LOG_PATH)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -312,6 +487,7 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
         return 0
 
     resolved_count = 0
+    resolved_updates = {}
     for player, p_rows in by_player.items():
         if resolved_count >= max_to_resolve:
             break
@@ -319,7 +495,10 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
             aid = cached_athlete_id(espn_sport, espn_league, player)
             if not aid:
                 continue
-            gamelog = cached_gamelog(espn_sport, espn_league, aid)
+            # Outcome maintenance needs yesterday's result; the cache helper's
+            # 30-day historical default is too stale for forward tracking.
+            gamelog = cached_gamelog(
+                espn_sport, espn_league, aid, ttl_hours=6)
             if not gamelog:
                 continue
         except Exception:
@@ -362,16 +541,33 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
                 outcome = None  # push
             else:
                 outcome = 1 if actual > line else 0
-            r["actual"] = actual
-            r["outcome"] = outcome
-            r["resolved"] = True
+            resolved_at = datetime.now(timezone.utc).isoformat()
+            resolved_updates[prediction_row_key(r)] = {
+                "actual": actual,
+                "outcome": outcome,
+                "resolved": True,
+                "resolved_at": resolved_at,
+            }
             resolved_count += 1
             if resolved_count >= max_to_resolve:
                 break
 
-    if resolved_count:
-        _rewrite_log(rows)
-    return resolved_count
+    if not resolved_updates:
+        return 0
+
+    def apply_resolutions(current_rows):
+        changed = 0
+        for row in current_rows:
+            update = resolved_updates.get(prediction_row_key(row))
+            if update and not row.get("resolved"):
+                row.update(update)
+                changed += 1
+        return changed
+
+    try:
+        return mutate_prediction_log(apply_resolutions)
+    except Exception:
+        return 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -633,12 +829,14 @@ def load_recalibration(sport_key):
 # Refit (resolve + fit + save) and gated auto-refit
 # ──────────────────────────────────────────────────────────────────────────────
 
-def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNCH):
+def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNCH,
+                newly_resolved=None):
     """Resolve pending outcomes, then refit Platt for every prop with enough
     resolved entries. Returns dict {prop_key: (a, b, n_fit)}."""
-    newly_resolved = 0
     if resolve_first:
         newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
+    elif newly_resolved is None:
+        newly_resolved = 0
 
     rows = _read_log()
     # Repeated app launches can log the same published player/game/line more
@@ -653,10 +851,7 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
         o = r.get("outcome")
         if o not in (0, 1):
             continue
-        identity = (
-            r.get("prop_key"), r.get("player"), r.get("game_date"),
-            r.get("line"),
-        )
+        identity = prediction_identity(r)
         unique_rows[identity] = r
 
     by_prop_records = defaultdict(list)
@@ -709,7 +904,9 @@ def _count_resolved_since(sport_key, since_ts):
         if not r.get("resolved"):
             continue
         try:
-            ts = datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp()
+            timestamp = r.get("resolved_at") or r.get("ts") or ""
+            ts = datetime.fromisoformat(
+                timestamp.replace("Z", "+00:00")).timestamp()
         except Exception:
             ts = 0
         if ts > cutoff:
@@ -717,37 +914,43 @@ def _count_resolved_since(sport_key, since_ts):
     return n
 
 
+def maintain_sport(sport_key):
+    """Resolve pending rows and refit only when the existing gates allow it."""
+    newly_resolved = resolve_pending_outcomes(sport_key)
+    path = recalibration_path(sport_key)
+    do_refit = not os.path.exists(path)
+    last_fit_ts = 0.0
+    if not do_refit:
+        try:
+            last_fit_ts = os.path.getmtime(path)
+        except OSError:
+            last_fit_ts = 0.0
+        age_hours = (time.time() - last_fit_ts) / 3600.0
+        if age_hours >= MIN_REFIT_INTERVAL_HOURS:
+            do_refit = (_count_resolved_since(sport_key, last_fit_ts)
+                        >= MIN_NEW_FOR_REFIT)
+    fits = {}
+    if do_refit:
+        fits = refit_sport(
+            sport_key, resolve_first=False, newly_resolved=newly_resolved)
+    return {"newly_resolved": newly_resolved, "refit": bool(fits)}
+
+
 def maybe_auto_refit(sport_key):
     """
     Called by analysis.py on first prop analysis per (process, sport).
-    Refits only if:
-      * never refit this session
-      * AND (no calibration file yet) OR (file > MIN_REFIT_INTERVAL_HOURS old
-        AND >=MIN_NEW_FOR_REFIT new resolved entries since last fit)
+    Runs bounded outcome maintenance at most hourly per process. Refit remains
+    gated by calibration age and the number of newly resolved observations.
     Best-effort; never raises.
     """
-    if sport_key in _refit_done_this_session:
+    now = time.time()
+    last_attempt = _last_auto_maintenance.get(sport_key, 0.0)
+    if now - last_attempt < AUTO_MAINTENANCE_INTERVAL_SECONDS:
         return
-    _refit_done_this_session.add(sport_key)
+    _last_auto_maintenance[sport_key] = now
 
     try:
-        path = recalibration_path(sport_key)
-        do_refit = False
-        last_fit_ts = 0.0
-        if not os.path.exists(path):
-            do_refit = True
-        else:
-            try:
-                last_fit_ts = os.path.getmtime(path)
-            except OSError:
-                last_fit_ts = 0.0
-            age_hours = (time.time() - last_fit_ts) / 3600.0
-            if age_hours >= MIN_REFIT_INTERVAL_HOURS:
-                new_n = _count_resolved_since(sport_key, last_fit_ts)
-                if new_n >= MIN_NEW_FOR_REFIT:
-                    do_refit = True
-        if do_refit:
-            refit_sport(sport_key)
+        maintain_sport(sport_key)
     except Exception:
         pass
 

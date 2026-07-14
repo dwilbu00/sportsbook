@@ -1,10 +1,19 @@
 """Focused regression tests for sportsbook model correctness boundaries."""
 
+import os
+import tempfile
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import requests
 
 import analysis
 import mlb_starters
+import odds_client
+import recalibration
 from backtest_props import _rolling_splits
+from forward_tracker import closing_event_groups, find_closing_offer
 from odds_client import parse_player_props
 from prop_filter import filter_player_gamelog
 from recalibration import fit_platt_chronological, summarize_prediction_rows
@@ -336,6 +345,7 @@ class RecalibrationTests(unittest.TestCase):
                 "final_prob": 0.9,
                 "direction": "OVER",
                 "price": 100,
+                "closing_price": -110,
                 "resolved": True,
                 "outcome": 1,
             },
@@ -360,6 +370,128 @@ class RecalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["probability_brier"], 0.05)
         self.assertEqual(summary["priced_resolved"], 2)
         self.assertAlmostEqual(summary["realized_roi"], (1 + 10 / 11) / 2)
+        self.assertEqual(summary["closing_captured"], 1)
+        self.assertAlmostEqual(
+            summary["average_probability_clv"], 11 / 21 - 1 / 2)
+
+    def test_maintenance_resolves_before_testing_refit_gate(self):
+        with patch.object(
+                recalibration, "resolve_pending_outcomes", return_value=25), patch.object(
+                recalibration.os.path, "exists", return_value=False), patch.object(
+                recalibration, "refit_sport", return_value={"prop": (1, 0, 90)}) as refit:
+            result = recalibration.maintain_sport("baseball_mlb")
+        self.assertEqual(result, {"newly_resolved": 25, "refit": True})
+        refit.assert_called_once_with(
+            "baseball_mlb", resolve_first=False, newly_resolved=25)
+
+    def test_outcome_resolution_refreshes_recent_gamelogs(self):
+        rows = [{
+            "ts": "2024-04-01T10:00:00Z",
+            "sport_key": "baseball_mlb",
+            "prop_key": "batter_hits",
+            "player": "Player One",
+            "game_date": "2024-04-01",
+            "line": 0.5,
+            "resolved": False,
+        }]
+
+        def mutate(mutator):
+            return mutator(rows)
+
+        with patch.object(recalibration, "_read_log", return_value=rows), patch(
+                "espn_cache.cached_athlete_id", return_value="123"), patch(
+                "espn_cache.cached_gamelog",
+                return_value=[{"game_date": "2024-04-01", "H": 1}],
+        ) as gamelog, patch.object(
+                recalibration, "_stat_label", return_value="H"), patch.object(
+                recalibration, "mutate_prediction_log", side_effect=mutate):
+            resolved = recalibration.resolve_pending_outcomes("baseball_mlb")
+
+        self.assertEqual(resolved, 1)
+        self.assertTrue(rows[0]["resolved"])
+        gamelog.assert_called_once_with(
+            "baseball", "mlb", "123", ttl_hours=6)
+
+    def test_forced_odds_refresh_never_uses_expired_cache(self):
+        response = requests.Response()
+        response.status_code = 429
+        response.url = "https://example.test/odds"
+        with patch.object(
+                odds_client, "_get_with_retry", return_value=response), patch.object(
+                odds_client, "_read_cache_expired", return_value={"stale": True},
+        ) as expired:
+            with self.assertRaises(requests.HTTPError):
+                odds_client.get_event_odds(
+                    "key", "baseball_mlb", "event-1",
+                    markets="batter_hits", force_refresh=True)
+        expired.assert_not_called()
+
+    def test_local_prediction_log_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+                recalibration, "PRED_DIR", temp_dir), patch.object(
+                recalibration, "CALIB_DIR", temp_dir), patch.object(
+                recalibration, "LOG_PATH",
+                os.path.join(temp_dir, "prediction_log.jsonl")), patch.object(
+                recalibration, "_prediction_log_blob_url", return_value=""):
+            written = recalibration.log_prediction_rows([{"test": 1}])
+            rows = recalibration.read_prediction_log()
+        self.assertEqual(written, 1)
+        self.assertEqual(rows, [{"test": 1}])
+
+
+class ForwardTrackerTests(unittest.TestCase):
+    def test_closing_window_requires_uncaptured_event_metadata(self):
+        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
+        base = {
+            "sport_key": "baseball_mlb",
+            "event_id": "game-1",
+            "commence_time": "2024-07-01T20:08:00Z",
+            "prop_key": "batter_hits",
+            "player": "José Ramírez",
+            "direction": "OVER",
+            "line": 1.5,
+            "resolved": False,
+        }
+        groups = closing_event_groups([base], now=now, window_minutes=10)
+        self.assertEqual(list(groups), [("baseball_mlb", "game-1")])
+        self.assertFalse(closing_event_groups(
+            [dict(base, closing_captured_at="2024-07-01T20:00:00Z")],
+            now=now, window_minutes=10))
+
+    def test_closing_offer_matches_exact_player_line_and_side(self):
+        game = {
+            "bookmakers": [
+                {
+                    "title": "DraftKings",
+                    "markets": [{
+                        "key": "batter_hits",
+                        "outcomes": [
+                            {"description": "Jose Ramirez", "name": "Over",
+                             "point": 1.5, "price": -115},
+                            {"description": "Jose Ramirez", "name": "Over",
+                             "point": 2.5, "price": 180},
+                        ],
+                    }],
+                },
+                {
+                    "title": "FanDuel",
+                    "markets": [{
+                        "key": "batter_hits",
+                        "outcomes": [
+                            {"description": "José Ramírez", "name": "Over",
+                             "point": 1.5, "price": -105},
+                        ],
+                    }],
+                },
+            ],
+        }
+        offer = find_closing_offer(game, {
+            "player": "José Ramírez", "prop_key": "batter_hits",
+            "direction": "OVER", "line": 1.5, "book": "DraftKings",
+        })
+        self.assertEqual(offer["price"], -105)
+        self.assertEqual(offer["book"], "FanDuel")
+        self.assertEqual(offer["same_book_price"], -115)
 
 
 class ParlayCorrelationTests(unittest.TestCase):

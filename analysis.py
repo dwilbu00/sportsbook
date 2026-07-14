@@ -54,6 +54,7 @@ from recalibration import (
     load_recalibration,
     apply_platt,
     log_prediction,
+    log_prediction_rows,
     maybe_auto_refit,
 )
 
@@ -1299,6 +1300,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         list: Value candidates for player props
     """
     candidates = []
+    prediction_rows = []
     threshold = threshold_pct / 100.0
     # Persistent per-(sport, prop) calibration overrides the in-code defaults
     # when available; absent file → falls back to defaults below.
@@ -1814,8 +1816,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # We log the *raw* (pre-Platt) probability — that's what Platt
             # was fit against and what subsequent refits should map.
             if log_game_date and sport_key:
-                log_prediction(
+                prediction_row = log_prediction(
                     sport_key=sport_key,
+                    event_id=prop_data.get("game_id"),
+                    commence_time=commence_iso,
                     prop_key=prop_key,
                     player=player_name,
                     game_date=log_game_date,
@@ -1826,7 +1830,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     direction=direction,
                     price=best_price,
                     book=over_book if direction == "OVER" else under_book,
+                    is_value=edge >= threshold,
+                    write=False,
                 )
+                if prediction_row:
+                    prediction_rows.append(prediction_row)
 
             candidates.append({
                 "type": "player_prop",
@@ -1856,6 +1864,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "_weights": list(weights),
             })
 
+    log_prediction_rows(prediction_rows)
     return candidates
 
 

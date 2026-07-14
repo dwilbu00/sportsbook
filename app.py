@@ -15,6 +15,13 @@ from zoneinfo import ZoneInfo
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+try:
+    prediction_blob_url = st.secrets.get("PREDICTION_LOG_BLOB_URL")
+    if prediction_blob_url:
+        os.environ.setdefault(
+            "PREDICTION_LOG_BLOB_URL", str(prediction_blob_url))
+except Exception:
+    pass
 
 from odds_client import (
     get_upcoming_events,
@@ -301,7 +308,14 @@ MARKET_OPTIONS = {
 
 def load_config():
     with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+        config = json.load(f)
+    try:
+        secret_api_key = st.secrets.get("ODDS_API_KEY")
+        if secret_api_key:
+            config["odds_api_key"] = str(secret_api_key)
+    except Exception:
+        pass
+    return config
 
 
 def save_api_key(key):
@@ -561,13 +575,26 @@ def render_model_guide():
             st.info("No committed player-prop calibration summaries were found.")
 
         st.subheader("Forward prediction tracking")
-        from recalibration import prediction_performance_summary
+        from recalibration import (
+            prediction_log_storage,
+            prediction_performance_summary,
+        )
         forward = prediction_performance_summary()
+        storage_backend = prediction_log_storage()
+        if storage_backend == "Local cache":
+            st.warning(
+                "Forward data is using local cache storage. This persists on the "
+                "Windows host but can be reset on Streamlit Cloud. Configure "
+                "PREDICTION_LOG_BLOB_URL for a shared durable Azure Blob."
+            )
+        else:
+            st.caption(f"Prediction log storage: {storage_backend} (shared and durable).")
         if forward["total"]:
             hit_rate = forward.get("direction_hit_rate")
             probability_brier = forward.get("probability_brier")
             realized_roi = forward.get("realized_roi")
-            forward_cols = st.columns(5)
+            average_clv = forward.get("average_probability_clv")
+            forward_cols = st.columns(7)
             forward_cols[0].metric("Logged predictions", forward["total"])
             forward_cols[1].metric("Resolved", forward["resolved"])
             forward_cols[2].metric(
@@ -584,11 +611,19 @@ def render_model_guide():
                 f"{realized_roi * 100:+.1f}%"
                 if realized_roi is not None else "Awaiting priced results",
             )
+            forward_cols[5].metric(
+                "Average CLV",
+                f"{average_clv * 100:+.2f} pp"
+                if average_clv is not None else "Awaiting closes",
+            )
+            forward_cols[6].metric(
+                "Closing prices", forward.get("closing_captured", 0))
             forward_rows = []
             for row in forward["by_prop"]:
                 row_hit_rate = row.get("direction_hit_rate")
                 row_brier = row.get("probability_brier")
                 row_roi = row.get("realized_roi")
+                row_clv = row.get("average_probability_clv")
                 forward_rows.append({
                     "Sport": sport_names.get(row["sport_key"], row["sport_key"]),
                     "Prediction": PROP_LABELS.get(
@@ -610,6 +645,10 @@ def render_model_guide():
                         f"{row_roi * 100:+.1f}%" if row_roi is not None else "—"
                     ),
                     "Priced results": row["priced_resolved"],
+                    "Average CLV": (
+                        f"{row_clv * 100:+.2f} pp" if row_clv is not None else "—"
+                    ),
+                    "Closing prices": row["closing_captured"],
                 })
             st.dataframe(forward_rows, hide_index=True, width="stretch")
             st.caption(
@@ -619,8 +658,9 @@ def render_model_guide():
                 "probability. ROI is shown only for newly logged rows that "
                 "retain the offered "
                 "price; older rows remain usable for hit-rate and Brier scoring. "
-                "Closing-line value is not available because closing prices are "
-                "not captured."
+                "CLV compares the opening and latest captured pregame price at "
+                "the exact same player/prop/line/side; positive CLV means the "
+                "forecast beat the closing market."
             )
         else:
             st.info(
