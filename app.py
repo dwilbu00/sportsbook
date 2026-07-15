@@ -667,8 +667,8 @@ def render_model_guide():
         st.markdown(
             """
             - **Model probability** — the calibrated probability that this exact bet wins.
-            - **Book implied probability** — the break-even probability encoded by the offered American price, including vig.
-            - **Edge** — `model probability − book implied probability`, measured in percentage points.
+            - **Price break-even probability** — the win rate required to break even at the offered American price, including vig.
+            - **Edge** — `model probability − price break-even probability`, measured in percentage points.
             - **Expected ROI** — `model probability × decimal odds − 1`; the modeled average profit or loss per dollar staked.
 
             A positive edge is necessary for a value recommendation. The standard
@@ -879,7 +879,7 @@ def render_model_guide():
             4. Find the highest integer threshold whose calibrated model probability reaches the selected confidence target.
             5. Require the weighted historical hit rate to be within 5 percentage points of that target.
             6. Fetch the exact DraftKings alternate-line price.
-            7. Recommend the bet only when `model probability − actual alt-price implied probability ≥ 5 percentage points`.
+            7. Recommend the bet only when `model probability − actual alt-price break-even probability ≥ 5 percentage points`.
 
             High-confidence `1+` floors are rejected above an 80% target, and thresholds
             that collapse below half the standard book line are rejected. Value Parlays
@@ -1433,7 +1433,7 @@ if "parlay_results" in st.session_state:
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit at their suggested safe thresholds, adjusted for sport-specific correlations between legs.",
                     )
-                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[2].metric("Price Break-even", f"{p['combined_implied_prob']}%")
                     cols[3].metric("Parlay Edge", f"{p['parlay_edge_pct']:+.2f}%")
                     cols[4].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
                     cols[5].metric(
@@ -1456,7 +1456,7 @@ if "parlay_results" in st.session_state:
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit at their suggested thresholds, adjusted for sport-specific correlations.",
                     )
-                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[2].metric("Price Break-even", f"{p['combined_implied_prob']}%")
                     cols[3].metric("Parlay Edge", f"{p['parlay_edge_pct']:+.2f}%")
                     cols[4].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
                     cols[5].metric(
@@ -1474,7 +1474,7 @@ if "parlay_results" in st.session_state:
                         f"{p['combined_hist_prob']}%",
                         help="Joint probability all legs hit, adjusted for sport-specific correlations between legs.",
                     )
-                    cols[2].metric("Book Implied", f"{p['combined_implied_prob']}%")
+                    cols[2].metric("Price Break-even", f"{p['combined_implied_prob']}%")
                     cols[3].metric(
                         "Hit Prob (no correlation)",
                         f"{p['combined_hist_prob_indep']}%",
@@ -1483,7 +1483,7 @@ if "parlay_results" in st.session_state:
                     cols[4].metric(
                         "Parlay Edge",
                         f"{pe:+.2f}%" if pe is not None else "n/a",
-                        help="Joint hit probability minus the book's combined implied probability — the model's expected edge over the book on the full parlay.",
+                        help="Joint hit probability minus the parlay price's break-even probability — the model's expected edge over the book on the full parlay.",
                     )
                     cols[5].metric("Expected ROI", f"{p['expected_roi_pct']:+.2f}%")
                     cols[6].metric(
@@ -1894,7 +1894,7 @@ if "analysis_results" in st.session_state:
                 with st.expander(f"🔥 {c['team']} ({c['home_away']}) vs {c['opponent']}  —  Best edge: +{c['best_edge_pct']}%", expanded=True):
                     cols = st.columns(7)
                     cols[0].metric("Model Probability", f"{c['blended_prob']}%")
-                    cols[1].metric("Book Implied", f"{c['best_book_implied_prob']}%")
+                    cols[1].metric("Price Break-even", f"{c['best_book_implied_prob']}%")
                     cols[2].metric("Edge", f"{c['best_edge_pct']:+.2f}%",
                                    delta=f"{c['best_price']:+d} at {c['best_book']}")
                     cols[3].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
@@ -1913,7 +1913,7 @@ if "analysis_results" in st.session_state:
                     rows.append({
                         "Team": c["team"],
                         "Home/Away": c["home_away"],
-                        "Book Implied": f"{c['book_implied_prob']}%",
+                        "Price Break-even": f"{c['book_implied_prob']}%",
                         "Model Probability": f"{c.get('blended_prob', c['hist_prob'])}%",
                         "Edge": f"{c['edge_pct']:+.2f}%",
                         "Expected ROI": f"{c.get('expected_roi_pct', 0):+.2f}%",
@@ -1940,7 +1940,7 @@ if "analysis_results" in st.session_state:
                     cols = st.columns(7)
                     cols[0].metric("Spread", f"{c['spread']:+.2f}")
                     cols[1].metric("Model Probability", f"{c['cover_rate']}%")
-                    cols[2].metric("Book Implied", f"{c['implied_prob']}%")
+                    cols[2].metric("Price Break-even", f"{c['implied_prob']}%")
                     cols[3].metric("Edge", f"{c['edge_pct']:+.2f}%")
                     cols[4].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
                     cols[5].metric("Projected Margin", f"{c['pred_game_margin']:+.2f}")
@@ -1970,7 +1970,7 @@ if "analysis_results" in st.session_state:
                         "Team": c["team"],
                         "Spread": f"{c['spread']:+.2f}",
                         "Model Probability": f"{c['cover_rate']}%",
-                        "Book Implied": f"{c.get('implied_prob', 50.0)}%",
+                        "Price Break-even": f"{c.get('implied_prob', 50.0)}%",
                         "Edge": f"{c['edge_pct']:+.2f}%",
                         "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                          if c.get("expected_roi_pct") is not None else "n/a"),
@@ -2019,7 +2019,7 @@ if "analysis_results" in st.session_state:
                 cols[0].metric("Line", c["line"])
                 cols[1].metric("Projected Total", c["projected_total"])
                 cols[2].metric(f"Model Probability ({side})", f"{model_probability:.2f}%")
-                cols[3].metric("Book Implied", f"{implied_probability:.2f}%")
+                cols[3].metric("Price Break-even", f"{implied_probability:.2f}%")
                 cols[4].metric("Edge", f"{edge_pct:+.2f}%")
                 cols[5].metric("Expected ROI", (f"{expected_roi:+.2f}%"
                                                  if expected_roi is not None else "n/a"))
@@ -2095,7 +2095,7 @@ if "analysis_results" in st.session_state:
                             f"{c['model_hit_at_safe']}%",
                         )
                         cols[2].metric(
-                            "Book Implied",
+                            "Price Break-even",
                             f"{c['safe_alt_implied']}%",
                         )
                         cols[3].metric(
@@ -2140,7 +2140,7 @@ if "analysis_results" in st.session_state:
                         cols[0].metric("Line", c["line"])
                         cols[1].metric("Projected Average", c["avg_stat"])
                         cols[2].metric("Model Probability", f"{hit_prob}%")
-                        cols[3].metric("Book Implied", f"{implied_prob}%")
+                        cols[3].metric("Price Break-even", f"{implied_prob}%")
                         cols[4].metric("Edge", f"{c['edge_pct']:+.2f}%")
                         cols[5].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
                         cols[6].metric("Direction", c["direction"])
@@ -2175,7 +2175,7 @@ if "analysis_results" in st.session_state:
                             "Prob @ Suggested": f"{c['model_hit_at_safe']}%",
                             "Book Line": c["line"],
                             "Prob @ Book": f"{c['model_hit_at_line']}%",
-                            "Book Implied": f"{c.get('safe_alt_implied', 0)}%",
+                            "Price Break-even": f"{c.get('safe_alt_implied', 0)}%",
                             "Edge": f"{c['edge_pct']:+.2f}%",
                             "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                              if c.get("expected_roi_pct") is not None else "n/a"),
@@ -2189,8 +2189,8 @@ if "analysis_results" in st.session_state:
                             "Projected Average": c["avg_stat"],
                             "Direction": c["direction"],
                             "Model Probability": f"{hit_prob}%",
-                            "Book Implied": (f"{c['over_implied']}%" if c["direction"] == "OVER"
-                                             else f"{c['under_implied']}%"),
+                            "Price Break-even": (f"{c['over_implied']}%" if c["direction"] == "OVER"
+                                                 else f"{c['under_implied']}%"),
                             "Edge": f"{c['edge_pct']:+.2f}%",
                             "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                              if c.get("expected_roi_pct") is not None else "n/a"),
