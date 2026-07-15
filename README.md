@@ -160,9 +160,24 @@ The same chronological runs separately test three additions:
   required `0.001` in any holdout.
 
 These tests use the free MLB Stats API and Baseball Savant cache, not Odds API
-credits. Because the independent 2023 base gate failed and the extensions are
-not stable across holdouts, the challenger and all three additions remain
-**disabled for live picks**.
+credits.
+
+A final predeclared test used July 1 through October 5, 2025 as a previously
+untouched holdout. Raw Pythagorean moneyline probability (`0.2486` Brier) and a
+train-fitted current/Pythagorean ensemble (`0.2473`) both lost to the current
+moneyline model (`0.2456`), so expected runs will not replace or blend into MLB
+moneylines. The market-specific result was different: the expected-runs
+ensemble improved margin RMSE from `4.968` to `4.583` and home `-1.5` Brier from
+`0.2426` to `0.2311`. Its challenger shares—fitted before the holdout—were
+`0.90` for margin and `0.70` for the run line.
+
+Actual-venue park factors estimated only from completed 2023–2024 outcomes also
+failed the final gate: they slightly improved score NLL and total RMSE but made
+home `-1.5` Brier slightly worse than unadjusted expected runs. Moneyline and
+park candidates therefore remain rejected. The margin/run-line ensemble may
+advance to shadow/forward validation, but it remains **disabled for live picks**.
+Any live version must first preserve the application's shared-margin-distribution
+contract so moneyline and spread probabilities cannot contradict each other.
 
 ### NFL: EPA-based team strength
 

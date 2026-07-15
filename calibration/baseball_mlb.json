@@ -3831,7 +3831,7 @@
     "enabled": false,
     "pythagorean_exponent": 1.83,
     "score_distribution": "independent_poisson",
-    "validation_timestamp": "2026-07-14",
+    "validation_timestamp": "2026-07-15",
     "fit_window": "2024-03-20 through 2024-06-30",
     "holdout_window": "2024-07-01 through 2024-10-05",
     "train_n": 916,
@@ -3926,7 +3926,63 @@
       "minimum_score_nll_gain": 0.001,
       "minimum_run_rmse_gain": 0.005
     },
-    "decision": "The independent 2023 base gate narrowly failed moneyline Brier; park effects passed only with full prior-season history, while bullpen workload and negative-binomial run-line probabilities did not produce stable, meaningful holdout gains."
+    "final_2025_validation": {
+      "holdout_window": "2025-07-01 through 2025-10-05",
+      "train_n": 4923,
+      "holdout_n": 1073,
+      "model": {
+        "offense_weight": 1.25,
+        "pitching_weight": 0.75,
+        "home_base_runs": 4.423,
+        "away_base_runs": 4.429
+      },
+      "ensemble_challenger_share": {
+        "moneyline": 0.75,
+        "home_minus_1_5": 0.7,
+        "margin": 0.9
+      },
+      "candidate_summary": [
+        {
+          "Candidate": "Current model",
+          "ML Brier": 0.2456,
+          "ML log loss": 0.6843,
+          "Margin RMSE": 4.968,
+          "Home -1.5 Brier": 0.2426,
+          "Decision": "KEEP FOR ML"
+        },
+        {
+          "Candidate": "Raw expected runs",
+          "ML Brier": 0.2486,
+          "ML log loss": 0.6904,
+          "Margin RMSE": 4.601,
+          "Home -1.5 Brier": 0.2363,
+          "Decision": "ML FAIL; MARGIN/RUN LINE PASS"
+        },
+        {
+          "Candidate": "Current/expected-runs ensemble",
+          "ML Brier": 0.2473,
+          "ML log loss": 0.6878,
+          "Margin RMSE": 4.583,
+          "Home -1.5 Brier": 0.2311,
+          "Decision": "ML FAIL; MARGIN/RUN LINE PASS"
+        },
+        {
+          "Candidate": "Prior-season actual-venue parks",
+          "ML Brier": 0.2486,
+          "ML log loss": 0.6904,
+          "Margin RMSE": 4.599,
+          "Home -1.5 Brier": 0.2364,
+          "Decision": "FAIL"
+        }
+      ],
+      "park_evidence": {
+        "holdout_coverage": "1008/1073",
+        "score_nll": "2.6861 to 2.6846",
+        "total_rmse": "4.471 to 4.463",
+        "decision": "fail: home -1.5 Brier was slightly worse than raw expected runs"
+      }
+    },
+    "decision": "The untouched 2025 holdout rejected raw and ensembled expected runs for moneylines and rejected prior-season actual-venue park factors. Keep the current moneyline model. Raw expected runs and the train-fitted ensemble both passed the margin and home -1.5 gates, so the ensemble may advance to spread/margin shadow validation but remains disabled for live picks; any promotion must preserve the shared margin-distribution contract."
   },
   "lineup_adjustment": {
     "enabled": true,

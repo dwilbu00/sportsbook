@@ -22,6 +22,8 @@ Usage:
     python backtest_starters.py --season 2024 --test-runs
     # Add a prior full season to the pre-2024 holdout fit:
     python backtest_starters.py --season 2023,2024 --test-runs
+    # Predeclared candidates against an untouched final season:
+    python backtest_starters.py --season 2023-2025 --test-final
 
 Caveats (documented, not hidden):
   * Uses the *probable* starter from the schedule (≈ actual; late scratches
@@ -101,7 +103,60 @@ def get_season_games(season, start=None, end=None, verbose=True):
     return games
 
 
-def _enrich_games(games, season):
+def _season_venue_index(season):
+    """Return actual MLB venue IDs keyed by historical matchup identity."""
+    path = os.path.join(CACHE_DIR, f"season_venues_{season}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            cached = json.load(f)
+    else:
+        from backtest_props import _team_maps
+
+        start, end = _season_bounds(season)
+        id_abbr, _ = _team_maps(season)
+        try:
+            data = mlb_starters._get("schedule", {
+                "sportId": 1,
+                "startDate": start,
+                "endDate": end,
+                "hydrate": "probablePitcher,venue",
+            }, timeout=120)
+        except Exception:
+            data = {"dates": []}
+        cached = []
+        for day in data.get("dates", []):
+            for game in day.get("games", []):
+                home = game.get("teams", {}).get("home", {})
+                away = game.get("teams", {}).get("away", {})
+                venue_id = (game.get("venue") or {}).get("id")
+                home_abbr = id_abbr.get((home.get("team") or {}).get("id"))
+                away_abbr = id_abbr.get((away.get("team") or {}).get("id"))
+                if not venue_id or not home_abbr or not away_abbr:
+                    continue
+                cached.append({
+                    "date": day.get("date"),
+                    "home_team": home_abbr,
+                    "away_team": away_abbr,
+                    "home_sp": (home.get("probablePitcher") or {}).get("id"),
+                    "away_sp": (away.get("probablePitcher") or {}).get("id"),
+                    "venue_id": str(venue_id),
+                })
+        if cached:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(cached, f)
+
+    exact = {}
+    matchup = {}
+    for row in cached:
+        exact[(row["date"], str(row.get("home_sp")),
+               str(row.get("away_sp")))] = row["venue_id"]
+        matchup[(row["date"], row["home_team"],
+                 row["away_team"])] = row["venue_id"]
+    return exact, matchup
+
+
+def _enrich_games(games, season, include_venues=False):
     """Attach team identities and separate run outcomes to cached games."""
     from backtest_props import season_schedule
 
@@ -111,6 +166,8 @@ def _enrich_games(games, season):
             key = (date, str(game.get("home_sp")), str(game.get("away_sp")))
             identities[key] = (game.get("home_abbr"), game.get("away_abbr"))
 
+    venue_exact, venue_matchup = (
+        _season_venue_index(season) if include_venues else ({}, {}))
     enriched = []
     for game in games:
         key = (game["date"], str(game["home_sp"]), str(game["away_sp"]))
@@ -124,6 +181,8 @@ def _enrich_games(games, season):
             season=season,
             home_team=teams[0],
             away_team=teams[1],
+            venue_id=(venue_exact.get(key) or venue_matchup.get(
+                (game["date"], teams[0], teams[1]))),
             home_runs=home_runs,
             away_runs=away_runs,
         ))
@@ -353,6 +412,7 @@ def build_dataset(games, season):
             "date": g["date"],
             "home_team": g.get("home_team"),
             "away_team": g.get("away_team"),
+            "venue_id": g.get("venue_id"),
             "home_sp": g["home_sp"],
             "away_sp": g["away_sp"],
             "home_runs": g.get("home_runs"),
@@ -421,7 +481,7 @@ def rmse(preds, ys):
     return (sum((p - y) ** 2 for p, y in zip(preds, ys)) / len(ys)) ** 0.5
 
 
-def build_pooled_dataset(seasons):
+def build_pooled_dataset(seasons, include_venues=False):
     """Pool leakage-safe features across multiple seasons.
 
     Each season is normalized against its OWN league xwOBAcon baseline (so
@@ -431,7 +491,8 @@ def build_pooled_dataset(seasons):
     pooled = []
     per_season = {}
     for s in seasons:
-        games = _enrich_games(get_season_games(s), s)
+        games = _enrich_games(
+            get_season_games(s), s, include_venues=include_venues)
         data, lg = build_dataset(games, s)
         per_season[s] = {"games": len(data), "league_xwoba": lg}
         pooled.extend(data)
@@ -659,7 +720,8 @@ def project_expected_runs(row, model):
 
     park_factors = model.get("park_factors") or {}
     park_strength = model.get("park_strength", 0.0)
-    raw_park = park_factors.get(row.get("home_team"), 1.0)
+    park_key = row.get("venue_id") or row.get("home_team")
+    raw_park = park_factors.get(park_key, 1.0)
     park_multiplier = 1.0 + park_strength * (raw_park - 1.0)
 
     fatigue_weight = model.get("fatigue_weight", 0.0)
@@ -719,7 +781,8 @@ def _raw_park_factors(rows, model):
     totals = defaultdict(lambda: [0.0, 0.0, 0])
     for row in rows:
         home_expected, away_expected = project_expected_runs(row, model)
-        bucket = totals[row["home_team"]]
+        park_key = row.get("venue_id") or row["home_team"]
+        bucket = totals[park_key]
         bucket[0] += row["home_runs"] + row["away_runs"]
         bucket[1] += home_expected + away_expected
         bucket[2] += 1
@@ -940,6 +1003,273 @@ def _current_margin_predictions(seasons, rows):
                 history[game["home_team"]].append(record)
                 history[game["away_team"]].append(record)
     return predictions
+
+
+def _fit_blend_weight(current_values, challenger_values, outcomes):
+    """Fit challenger share on training MSE; 0=current and 1=challenger."""
+    best = None
+    for step in range(21):
+        weight = step / 20.0
+        predictions = [
+            current + weight * (challenger - current)
+            for current, challenger in zip(current_values, challenger_values)
+        ]
+        loss = sum((prediction - outcome) ** 2
+                   for prediction, outcome in zip(predictions, outcomes))
+        loss /= len(outcomes)
+        if best is None or loss < best[1]:
+            best = (weight, loss)
+    return best[0]
+
+
+def _final_candidate_series(rows, current, model):
+    """Build aligned current and raw expected-runs predictions."""
+    from analysis import _apply_shrink
+
+    series = defaultdict(list)
+    for row in rows:
+        baseline = current.get(_game_key(row))
+        if not baseline:
+            continue
+        home_runs, away_runs = project_expected_runs(row, model)
+        series["rows"].append(row)
+        series["current_ml"].append(_apply_shrink(
+            baseline["win_probability"], "baseball_mlb", "moneyline"))
+        series["challenger_ml"].append(
+            mlb_starters.pythagorean_win_probability(home_runs, away_runs))
+        series["current_spread"].append(_apply_shrink(
+            baseline["minus_1_5_probability"],
+            "baseball_mlb", "spreads"))
+        series["challenger_spread"].append(
+            mlb_starters.poisson_margin_probability(
+                home_runs, away_runs, -1.5))
+        series["current_margin"].append(baseline["margin"])
+        series["challenger_margin"].append(home_runs - away_runs)
+        series["challenger_total"].append(home_runs + away_runs)
+        series["win"].append(row["home_win"])
+        series["cover"].append(1 if row["margin"] > 1.5 else 0)
+        series["margin"].append(row["margin"])
+        series["total"].append(row["total_runs"])
+    return series
+
+
+def _blend_values(current_values, challenger_values, weight):
+    return [
+        current + weight * (challenger - current)
+        for current, challenger in zip(current_values, challenger_values)
+    ]
+
+
+def test_final_expected_run_candidates(seasons, holdout_start=None):
+    """Test predeclared expected-runs candidates on an untouched final season.
+
+    Candidates are deliberately fixed before inspecting the holdout:
+      * raw (unshrunk) Pythagorean moneyline probability,
+      * current/expected-runs blends fitted only on the training window, and
+      * strength-1 venue factors estimated only from completed prior seasons.
+    """
+    latest_season = max(seasons)
+    prior_seasons = [season for season in seasons if season < latest_season]
+    if not prior_seasons:
+        print("Final validation needs at least one completed prior season.")
+        return None
+    holdout_start = holdout_start or f"{latest_season}-07-01"
+    rows, _ = build_pooled_dataset(seasons, include_venues=True)
+    train = [row for row in rows
+             if row["season"] < latest_season or row["date"] < holdout_start]
+    holdout = [row for row in rows
+               if row["season"] == latest_season
+               and row["date"] >= holdout_start]
+    prior_rows = [row for row in train if row["season"] < latest_season]
+    venue_coverage = sum(row.get("venue_id") is not None for row in prior_rows)
+    if (len(train) < 500 or len(holdout) < 200
+            or venue_coverage < 0.9 * len(prior_rows)):
+        print("Insufficient train, holdout, or actual-venue coverage for final test.")
+        return None
+
+    model = fit_expected_run_model(train)
+    current = _current_margin_predictions(seasons, rows)
+    train_series = _final_candidate_series(train, current, model)
+    holdout_series = _final_candidate_series(holdout, current, model)
+    if len(holdout_series["rows"]) < 200:
+        print("Not enough final-holdout games with current-model history.")
+        return None
+
+    blend_weights = {
+        "moneyline": _fit_blend_weight(
+            train_series["current_ml"], train_series["challenger_ml"],
+            train_series["win"]),
+        "spread": _fit_blend_weight(
+            train_series["current_spread"],
+            train_series["challenger_spread"], train_series["cover"]),
+        "margin": _fit_blend_weight(
+            train_series["current_margin"],
+            train_series["challenger_margin"], train_series["margin"]),
+    }
+    ensemble_ml = _blend_values(
+        holdout_series["current_ml"], holdout_series["challenger_ml"],
+        blend_weights["moneyline"])
+    ensemble_spread = _blend_values(
+        holdout_series["current_spread"],
+        holdout_series["challenger_spread"], blend_weights["spread"])
+    ensemble_margin = _blend_values(
+        holdout_series["current_margin"],
+        holdout_series["challenger_margin"], blend_weights["margin"])
+
+    # The park candidate uses only completed prior-season outcomes. Strength
+    # was fixed at 1.0 before opening the final holdout; nothing is tuned
+    # against the final season's results.
+    park_model = dict(model)
+    park_model.update({
+        "park_factors": _raw_park_factors(prior_rows, model),
+        "park_strength": 1.0,
+    })
+    park_series = _final_candidate_series(holdout, current, park_model)
+    park_coverage = sum(
+        row.get("venue_id") in park_model["park_factors"]
+        for row in park_series["rows"])
+
+    current_ml_metrics = _probability_metrics(
+        holdout_series["current_ml"], holdout_series["win"])
+    raw_ml_metrics = _probability_metrics(
+        holdout_series["challenger_ml"], holdout_series["win"])
+    ensemble_ml_metrics = _probability_metrics(
+        ensemble_ml, holdout_series["win"])
+    current_spread_metrics = _probability_metrics(
+        holdout_series["current_spread"], holdout_series["cover"])
+    raw_spread_metrics = _probability_metrics(
+        holdout_series["challenger_spread"], holdout_series["cover"])
+    ensemble_spread_metrics = _probability_metrics(
+        ensemble_spread, holdout_series["cover"])
+    park_spread_metrics = _probability_metrics(
+        park_series["challenger_spread"], park_series["cover"])
+    current_margin_metrics = _margin_metrics(
+        holdout_series["current_margin"], holdout_series["margin"])
+    raw_margin_metrics = _margin_metrics(
+        holdout_series["challenger_margin"], holdout_series["margin"])
+    ensemble_margin_metrics = _margin_metrics(
+        ensemble_margin, holdout_series["margin"])
+    park_margin_metrics = _margin_metrics(
+        park_series["challenger_margin"], park_series["margin"])
+    raw_total_rmse = rmse(
+        holdout_series["challenger_total"], holdout_series["total"])
+    park_total_rmse = rmse(
+        park_series["challenger_total"], park_series["total"])
+    raw_score_nll = _score_nll(holdout_series["rows"], model)
+    park_score_nll = _score_nll(park_series["rows"], park_model)
+
+    raw_ml_passed = (
+        current_ml_metrics["brier"] - raw_ml_metrics["brier"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+        and current_ml_metrics["log_loss"] - raw_ml_metrics["log_loss"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+    )
+    ensemble_ml_passed = (
+        current_ml_metrics["brier"] - ensemble_ml_metrics["brier"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+        and current_ml_metrics["log_loss"] - ensemble_ml_metrics["log_loss"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+    )
+    raw_spread_passed = (
+        current_spread_metrics["brier"] - raw_spread_metrics["brier"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+        and current_spread_metrics["log_loss"]
+        - raw_spread_metrics["log_loss"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+    )
+    ensemble_spread_passed = (
+        current_spread_metrics["brier"] - ensemble_spread_metrics["brier"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+        and current_spread_metrics["log_loss"]
+        - ensemble_spread_metrics["log_loss"]
+        >= MIN_HOLDOUT_PROBABILITY_GAIN
+    )
+    raw_margin_passed = (
+        current_margin_metrics["rmse"] - raw_margin_metrics["rmse"]
+        >= MIN_HOLDOUT_RMSE_GAIN
+    )
+    ensemble_margin_passed = (
+        current_margin_metrics["rmse"] - ensemble_margin_metrics["rmse"]
+        >= MIN_HOLDOUT_RMSE_GAIN
+    )
+    park_passed = (
+        park_coverage >= 0.9 * len(park_series["rows"])
+        and raw_score_nll - park_score_nll >= MIN_HOLDOUT_NLL_GAIN
+        and raw_total_rmse - park_total_rmse >= MIN_HOLDOUT_RMSE_GAIN
+        and park_spread_metrics["brier"] <= raw_spread_metrics["brier"]
+    )
+
+    print(f"\n=== FINAL expected-runs candidates — holdout {holdout_start}+ ===")
+    print(f"prior seasons={','.join(map(str, prior_seasons))}; "
+          f"train={len(train_series['rows'])}; "
+          f"holdout={len(holdout_series['rows'])}")
+    print("expected-runs fit: offense={offense_weight:.2f}, "
+          "pitching={pitching_weight:.2f}, home_base={home_base_runs:.3f}, "
+          "away_base={away_base_runs:.3f}".format(**model))
+    print("ensemble challenger shares fitted on train: "
+          f"ML={blend_weights['moneyline']:.2f}, "
+          f"home -1.5={blend_weights['spread']:.2f}, "
+          f"margin={blend_weights['margin']:.2f}")
+    print("\nMONEYLINE")
+    for label, metrics in (
+            ("current", current_ml_metrics),
+            ("raw Pyth", raw_ml_metrics),
+            ("ensemble", ensemble_ml_metrics)):
+        print(f"  {label:<10} Brier={metrics['brier']:.4f} "
+              f"logloss={metrics['log_loss']:.4f} "
+              f"accuracy={metrics['accuracy']:.2%}")
+    print("\nMARGIN / HOME -1.5")
+    for label, margin_metrics, spread_metrics in (
+            ("current", current_margin_metrics, current_spread_metrics),
+            ("raw runs", raw_margin_metrics, raw_spread_metrics),
+            ("ensemble", ensemble_margin_metrics, ensemble_spread_metrics),
+            ("prior park", park_margin_metrics, park_spread_metrics)):
+        print(f"  {label:<10} margin RMSE={margin_metrics['rmse']:.3f} "
+              f"-1.5 Brier={spread_metrics['brier']:.4f}")
+    print("\nPRIOR-SEASON ACTUAL-VENUE PARK FACTORS")
+    print(f"  holdout coverage={park_coverage}/{len(park_series['rows'])}; "
+          f"score NLL {raw_score_nll:.4f} -> {park_score_nll:.4f}; "
+          f"total RMSE {raw_total_rmse:.3f} -> {park_total_rmse:.3f}")
+    print("\nGATES")
+    print(f"  raw Pythagorean ML: {'PASS' if raw_ml_passed else 'FAIL'}")
+    print(f"  current/Pythagorean ML ensemble: "
+          f"{'PASS' if ensemble_ml_passed else 'FAIL'}")
+    print(f"  raw expected-runs margin / run line: "
+          f"{'PASS' if raw_margin_passed and raw_spread_passed else 'FAIL'}")
+    print(f"  current/expected-runs margin / run-line ensemble: "
+          f"{'PASS' if ensemble_margin_passed and ensemble_spread_passed else 'FAIL'}")
+    print(f"  prior-season park factors: {'PASS' if park_passed else 'FAIL'}")
+    print("  No live settings changed.")
+    return {
+        "holdout_start": holdout_start,
+        "train_n": len(train_series["rows"]),
+        "holdout_n": len(holdout_series["rows"]),
+        "model": model,
+        "blend_weights": blend_weights,
+        "current_ml": current_ml_metrics,
+        "raw_ml": raw_ml_metrics,
+        "ensemble_ml": ensemble_ml_metrics,
+        "current_spread": current_spread_metrics,
+        "raw_spread": raw_spread_metrics,
+        "ensemble_spread": ensemble_spread_metrics,
+        "park_spread": park_spread_metrics,
+        "current_margin": current_margin_metrics,
+        "raw_margin": raw_margin_metrics,
+        "ensemble_margin": ensemble_margin_metrics,
+        "park_margin": park_margin_metrics,
+        "raw_score_nll": raw_score_nll,
+        "park_score_nll": park_score_nll,
+        "raw_total_rmse": raw_total_rmse,
+        "park_total_rmse": park_total_rmse,
+        "park_coverage": park_coverage,
+        "raw_ml_passed": raw_ml_passed,
+        "ensemble_ml_passed": ensemble_ml_passed,
+        "raw_spread_passed": raw_spread_passed,
+        "ensemble_spread_passed": ensemble_spread_passed,
+        "raw_margin_passed": raw_margin_passed,
+        "ensemble_margin_passed": ensemble_margin_passed,
+        "park_passed": park_passed,
+    }
 
 
 def test_expected_runs_challenger(seasons, holdout_start=None):
@@ -1408,6 +1738,10 @@ if __name__ == "__main__":
     ap.add_argument("--test-runs", action="store_true",
                     help="chronologically test expected runs + Pythagorean 1.83 "
                          "against the current MLB moneyline/spread engine")
+    ap.add_argument("--test-final", action="store_true",
+                    help="test raw Pythagorean, current/Pythagorean ensemble, "
+                         "and prior-season actual-venue park factors against "
+                         "the latest season's untouched chronological holdout")
     args = ap.parse_args()
 
     seasons = _parse_seasons(args.season)
@@ -1421,6 +1755,8 @@ if __name__ == "__main__":
         test_innings_weighting(seasons)
     elif args.test_2sided:
         test_two_sided(seasons)
+    elif args.test_final:
+        test_final_expected_run_candidates(seasons)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:

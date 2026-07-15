@@ -853,6 +853,13 @@ def render_model_guide():
                 st.caption("Incremental feature and score-distribution gates")
                 st.dataframe(
                     extension_validation, hide_index=True, width="stretch")
+            final_validation = (
+                expected_runs.get("final_2025_validation") or {})
+            final_candidates = final_validation.get("candidate_summary") or []
+            if final_candidates:
+                st.caption("Untouched 2025 final holdout")
+                st.dataframe(
+                    final_candidates, hide_index=True, width="stretch")
             st.warning(
                 "The 1.83 Pythagorean challenger remains **disabled**. "
                 + expected_runs.get(

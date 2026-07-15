@@ -248,6 +248,7 @@ class ExpectedRunsTests(unittest.TestCase):
     def test_park_and_opposing_bullpen_workload_adjust_expected_runs(self):
         row = {
             "home_team": "TST",
+            "venue_id": "99",
             "h_sp_sup": 1.0,
             "a_sp_sup": 1.0,
             "h_off_faced": 1.0,
@@ -260,7 +261,7 @@ class ExpectedRunsTests(unittest.TestCase):
             "away_base_runs": 4.0,
             "offense_weight": 1.0,
             "pitching_weight": 1.0,
-            "park_factors": {"TST": 1.1},
+            "park_factors": {"99": 1.1},
             "park_strength": 1.0,
             "fatigue_weight": 0.2,
             "workload_center": 100.0,
@@ -269,6 +270,36 @@ class ExpectedRunsTests(unittest.TestCase):
             row, model)
         self.assertAlmostEqual(home_runs, 4.0 * 1.1 * math.exp(0.1))
         self.assertAlmostEqual(away_runs, 4.0 * 1.1 * math.exp(-0.05))
+
+    def test_ensemble_weight_prefers_more_accurate_candidate(self):
+        current = [0.4, 0.6, 0.4, 0.6]
+        challenger = [0.8, 0.2, 0.8, 0.2]
+        outcomes = [1, 0, 1, 0]
+        self.assertEqual(
+            backtest_starters._fit_blend_weight(
+                current, challenger, outcomes),
+            1.0,
+        )
+
+    @patch("backtest_starters._season_venue_index")
+    @patch("backtest_props.season_schedule")
+    def test_game_enrichment_attaches_actual_venue(
+            self, schedule, venue_index):
+        schedule.return_value = {
+            "2025-04-01": [{
+                "home_abbr": "HME", "away_abbr": "AWY",
+                "home_sp": 10, "away_sp": 20,
+            }],
+        }
+        venue_index.return_value = (
+            {("2025-04-01", "10", "20"): "123"}, {})
+        games = [{
+            "date": "2025-04-01", "home_sp": 10, "away_sp": 20,
+            "home_win": 1, "total_runs": 7, "margin": 3,
+        }]
+        enriched = backtest_starters._enrich_games(
+            games, 2025, include_venues=True)
+        self.assertEqual(enriched[0]["venue_id"], "123")
 
     @patch("backtest_props.season_schedule")
     def test_bullpen_workload_uses_only_prior_relief_pitches(self, schedule):
