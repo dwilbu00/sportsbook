@@ -285,6 +285,87 @@ def _render_market_comparison(
         st.caption(f"🏈 {better_side} reaches or crosses NFL key number {keys}.")
 
 
+def _clear_bet_selections():
+    for key in list(st.session_state):
+        if str(key).startswith("bet_selection:"):
+            st.session_state.pop(key, None)
+
+
+def _value_bet_checklist_entries(
+        all_ml, all_spreads, all_totals, all_props):
+    entries = []
+    entries.extend(
+        make_bet_checklist_entry(candidate, "moneyline")
+        for candidate in all_ml if candidate.get("is_value")
+    )
+    entries.extend(
+        make_bet_checklist_entry(candidate, "spread")
+        for candidate in all_spreads if candidate.get("is_value")
+    )
+    for candidate in all_totals:
+        if candidate.get("is_over_value"):
+            entries.append(make_bet_checklist_entry(
+                candidate, "total", side="OVER"))
+        if candidate.get("is_under_value"):
+            entries.append(make_bet_checklist_entry(
+                candidate, "total", side="UNDER"))
+    entries.extend(
+        make_bet_checklist_entry(candidate, "player_prop")
+        for candidate in all_props
+        if candidate.get("is_value") and not candidate.get("no_history")
+    )
+    type_order = {
+        "Moneyline": 0,
+        "Spread": 1,
+        "Game total": 2,
+        "Player prop": 3,
+    }
+    return sorted(entries, key=lambda entry: (
+        entry["matchup"], type_order[entry["type"]], entry["bet"]
+    ))
+
+
+def _select_bet_checkbox(candidate, bet_type, side=None):
+    entry = make_bet_checklist_entry(candidate, bet_type, side=side)
+    st.checkbox(
+        "Add to DraftKings bet list",
+        key=entry["selection_key"],
+        help=(
+            "Adds only the bet instruction and matchup/team context to the "
+            "consolidated list."
+        ),
+    )
+
+
+def _render_selected_bet_checklist(entries):
+    selected = [
+        entry for entry in entries
+        if st.session_state.get(entry["selection_key"], False)
+    ]
+    with st.container(border=True):
+        st.subheader("🧾 Selected DraftKings Bets")
+        if not selected:
+            st.caption(
+                "Select “Add to DraftKings bet list” on any value bet to build "
+                "a simple checklist here."
+            )
+            return
+        st.caption(f"{len(selected)} selected bet(s) · bet details only")
+        st.dataframe(
+            [{
+                "Bet type": entry["type"],
+                "Bet to place": entry["bet"],
+                "Matchup": entry["matchup"],
+                "Team": entry["team"],
+            } for entry in selected],
+            hide_index=True,
+            width="stretch",
+        )
+        if st.button("Clear selected bets", key="clear_selected_bets"):
+            _clear_bet_selections()
+            st.rerun()
+
+
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
     """Render a compact alt-line ladder near a target line. If `direction` is
     'over', show OVER price column; if 'under', show UNDER; if 'both', show both.
@@ -356,6 +437,7 @@ from analysis import (
     analyze_totals_value,
     analyze_player_props_value,
     generate_parlays,
+    make_bet_checklist_entry,
 )
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
@@ -1112,6 +1194,7 @@ with st.sidebar:
         st.session_state["selected_games"] = []
         st.session_state["markets"] = []
         st.session_state["props"] = []
+        _clear_bet_selections()
         st.session_state.pop("analysis_results", None)
         st.session_state.pop("parlay_results", None)
         st.session_state.pop("parlay_mode", None)
@@ -1285,6 +1368,7 @@ with col_safe:
 # Clear stale parlays as soon as a new Analyze is requested so they don't
 # render below this point before the analysis block runs.
 if analyze_clicked:
+    _clear_bet_selections()
     st.session_state.pop("parlay_results", None)
     st.session_state.pop("parlay_mode", None)
 
@@ -1848,6 +1932,8 @@ if "analysis_results" in st.session_state:
     all_spreads = [c for c in ar["all_spreads"] if c.get("games_sampled", 0) >= 5]
     all_totals = ar["all_totals"]
     all_props = [c for c in ar["all_props"] if c.get("no_history") or c.get("games_sampled", 0) >= 5]
+    checklist_entries = _value_bet_checklist_entries(
+        all_ml, all_spreads, all_totals, all_props)
 
     st.divider()
 
@@ -1876,6 +1962,8 @@ if "analysis_results" in st.session_state:
     col1.metric("Games Analyzed", ar["total_games"])
     col2.metric("Value Bets Found", value_count)
     col3.metric("Credits Used", ar["total_cost"])
+    if checklist_entries:
+        _render_selected_bet_checklist(checklist_entries)
 
     # Moneyline results
     if all_ml:
@@ -1892,6 +1980,7 @@ if "analysis_results" in st.session_state:
             st.success(f"**{len(value_ml)} value bet(s) found!**")
             for c in sorted(value_ml, key=lambda x: x["edge_pct"], reverse=True):
                 with st.expander(f"🔥 {c['team']} ({c['home_away']}) vs {c['opponent']}  —  Best edge: +{c['best_edge_pct']}%", expanded=True):
+                    _select_bet_checkbox(c, "moneyline")
                     cols = st.columns(7)
                     cols[0].metric("Model Probability", f"{c['blended_prob']}%")
                     cols[1].metric("Price Break-even", f"{c['best_book_implied_prob']}%")
@@ -1937,6 +2026,7 @@ if "analysis_results" in st.session_state:
             st.success(f"**{len(value_sp)} spread value bet(s) found!**")
             for c in sorted(value_sp, key=lambda x: x["edge_pct"], reverse=True):
                 with st.expander(f"🔥 {c['team']} {c['spread']:+.2f} ({c['home_away']})  —  Edge: +{c['edge_pct']}%", expanded=True):
+                    _select_bet_checkbox(c, "spread")
                     cols = st.columns(7)
                     cols[0].metric("Spread", f"{c['spread']:+.2f}")
                     cols[1].metric("Model Probability", f"{c['cover_rate']}%")
@@ -2014,6 +2104,8 @@ if "analysis_results" in st.session_state:
                     implied_probability = c.get("over_implied", 50.0)
                     edge_pct = c.get("over_edge_pct", model_probability - implied_probability)
                     expected_roi = c.get("over_expected_roi_pct")
+                if c.get("is_over_value") or c.get("is_under_value"):
+                    _select_bet_checkbox(c, "total", side=side)
                 p_val, p_delta = _dk_payout_strs(payout_price)
                 cols = st.columns(7)
                 cols[0].metric("Line", c["line"])
@@ -2088,6 +2180,7 @@ if "analysis_results" in st.session_state:
                     title = (f"🎯 {c['player']} — {_safe_label(c)}  "
                              f"[{tag}]  Edge: {c['edge_pct']:+.2f}%  |{payout_str}  book line: {c['line']}")
                     with st.expander(title, expanded=(gap >= 0)):
+                        _select_bet_checkbox(c, "player_prop")
                         cols = st.columns(8)
                         cols[0].metric("Suggested", f"{c['prop_label']} {c['safe_threshold']}+")
                         cols[1].metric(
@@ -2136,6 +2229,7 @@ if "analysis_results" in st.session_state:
                     bet_price = (c.get("over_price") if c["direction"] == "OVER"
                                  else c.get("under_price"))
                     with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
+                        _select_bet_checkbox(c, "player_prop")
                         cols = st.columns(8)
                         cols[0].metric("Line", c["line"])
                         cols[1].metric("Projected Average", c["avg_stat"])

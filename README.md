@@ -32,6 +32,7 @@ Value bets, safe alt-lines, and correlation-aware parlays
 - **Value parlays and safe parlays** using a joint-probability model instead of naïvely multiplying every leg together
 - **Live sportsbook prices** converted into implied probabilities, de-vigged from same-book/same-line pairs while retaining the best executable side prices
 - **Market Comparison** context showing DraftKings' line and price beside the median of at least three complete peer-book offers, without changing model edge or rankings
+- **Selected DraftKings Bets** checklist built from value-bet checkboxes, showing only the bet instruction, matchup, and team context needed to place the picks
 
 ## The mathematical stack
 

@@ -2048,6 +2048,93 @@ def format_totals_report(candidates):
     return "\n".join(lines)
 
 
+def make_bet_checklist_entry(candidate, bet_type, side=None):
+    """Build a price-free DraftKings instruction from one value candidate."""
+    def _line(value, signed=False):
+        try:
+            value = float(value)
+            return f"{value:+g}" if signed else f"{value:g}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    if bet_type in ("moneyline", "spread"):
+        team = candidate["team"]
+        opponent = candidate["opponent"]
+        matchup = (
+            f"{opponent} @ {team}"
+            if candidate.get("home_away") == "HOME"
+            else f"{team} @ {opponent}"
+        )
+    else:
+        matchup = candidate["matchup"]
+
+    if bet_type == "moneyline":
+        type_label = "Moneyline"
+        bet = f"{candidate['team']} moneyline"
+        team = candidate["team"]
+        identity = (candidate.get("event_id") or matchup, bet_type, team)
+    elif bet_type == "spread":
+        type_label = "Spread"
+        spread = _line(candidate["spread"], signed=True)
+        bet = f"{candidate['team']} {spread}"
+        team = candidate["team"]
+        identity = (
+            candidate.get("event_id") or matchup,
+            bet_type,
+            team,
+            spread,
+        )
+    elif bet_type == "total":
+        type_label = "Game total"
+        side = (side or "").upper()
+        line = _line(candidate["line"])
+        bet = f"{side} {line}"
+        team = "Both teams"
+        identity = (
+            candidate.get("event_id") or matchup,
+            bet_type,
+            side,
+            line,
+        )
+    elif bet_type == "player_prop":
+        type_label = "Player prop"
+        direction = candidate.get("direction", "OVER").upper()
+        if candidate.get("safe_mode"):
+            threshold = _line(candidate["safe_threshold"])
+            bet = (
+                f"{candidate['player']} — {candidate['prop_label']} "
+                f"{threshold}+"
+            )
+            bet_line = threshold
+        else:
+            bet_line = _line(candidate["line"])
+            bet = (
+                f"{candidate['player']} — {candidate['prop_label']} "
+                f"{direction} {bet_line}"
+            )
+        team = candidate.get("team") or "Team unavailable"
+        identity = (
+            candidate.get("event_id") or matchup,
+            bet_type,
+            candidate["player"],
+            candidate.get("prop"),
+            direction,
+            bet_line,
+        )
+    else:
+        raise ValueError(f"Unsupported checklist bet type: {bet_type}")
+
+    selection_key = "bet_selection:" + "::".join(
+        str(value) for value in identity)
+    return {
+        "selection_key": selection_key,
+        "type": type_label,
+        "bet": bet,
+        "matchup": matchup,
+        "team": team,
+    }
+
+
 def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
     """
     Convert all analysis results into a uniform leg format for parlay building.

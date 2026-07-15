@@ -639,6 +639,67 @@ class AsOfReliabilityTests(unittest.TestCase):
 
 
 class MarketParsingTests(unittest.TestCase):
+    def test_bet_checklist_entries_include_instructions_not_pricing(self):
+        common = {"event_id": "game-1", "edge_pct": 8.5,
+                  "best_price": -110, "expected_roi_pct": 12.0}
+        entries = [
+            analysis.make_bet_checklist_entry({
+                **common,
+                "team": "Indiana Pacers",
+                "opponent": "New York Knicks",
+                "home_away": "HOME",
+            }, "moneyline"),
+            analysis.make_bet_checklist_entry({
+                **common,
+                "team": "New York Knicks",
+                "opponent": "Indiana Pacers",
+                "home_away": "AWAY",
+                "spread": 3.5,
+            }, "spread"),
+            analysis.make_bet_checklist_entry({
+                **common,
+                "matchup": "New York Knicks @ Indiana Pacers",
+                "line": 224.5,
+            }, "total", side="UNDER"),
+            analysis.make_bet_checklist_entry({
+                **common,
+                "matchup": "New York Knicks @ Indiana Pacers",
+                "player": "Jalen Brunson",
+                "team": "New York Knicks",
+                "prop": "player_points",
+                "prop_label": "Points",
+                "direction": "OVER",
+                "line": 24.5,
+            }, "player_prop"),
+            analysis.make_bet_checklist_entry({
+                **common,
+                "matchup": "New York Knicks @ Indiana Pacers",
+                "player": "Jalen Brunson",
+                "team": "New York Knicks",
+                "prop": "player_points",
+                "prop_label": "Points",
+                "direction": "OVER",
+                "line": 24.5,
+                "safe_mode": True,
+                "safe_threshold": 20,
+            }, "player_prop"),
+        ]
+
+        self.assertEqual(entries[0]["bet"], "Indiana Pacers moneyline")
+        self.assertEqual(
+            entries[0]["matchup"], "New York Knicks @ Indiana Pacers")
+        self.assertEqual(entries[1]["bet"], "New York Knicks +3.5")
+        self.assertEqual(entries[2]["bet"], "UNDER 224.5")
+        self.assertEqual(entries[2]["team"], "Both teams")
+        self.assertEqual(
+            entries[3]["bet"], "Jalen Brunson — Points OVER 24.5")
+        self.assertEqual(entries[3]["team"], "New York Knicks")
+        self.assertEqual(entries[4]["bet"], "Jalen Brunson — Points 20+")
+        for entry in entries:
+            self.assertEqual(set(entry), {
+                "selection_key", "type", "bet", "matchup", "team"})
+            self.assertTrue(entry["selection_key"].startswith("bet_selection:"))
+
     def test_market_comparison_keeps_dk_separate_from_peer_medians(self):
         def book(key, spread, spread_price, total, total_price,
                  complete=True):
