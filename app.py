@@ -860,11 +860,18 @@ def render_model_guide():
                 st.caption("Untouched 2025 final holdout")
                 st.dataframe(
                     final_candidates, hide_index=True, width="stretch")
-            st.warning(
-                "The 1.83 Pythagorean challenger remains **disabled**. "
-                + expected_runs.get(
-                    "decision", "More chronological validation is required.")
-            )
+            if (expected_runs.get("enabled")
+                    and (expected_runs.get("live_markets") or {}).get("spreads")):
+                st.success(
+                    "The expected-runs ensemble is active for **MLB spreads "
+                    "and displayed margin only** when its live inputs are "
+                    "complete. " + expected_runs.get("decision", ""))
+            else:
+                st.warning(
+                    "The 1.83 Pythagorean challenger remains **disabled**. "
+                    + expected_runs.get(
+                        "decision", "More chronological validation is required.")
+                )
         prop_fit = ((mlb_meta.get("starter_adjustment") or {}).get("props") or {})
         holdout = (prop_fit if prop_fit.get("results")
                    else mlb_meta.get("prop_matchup_holdout") or {})
@@ -1826,6 +1833,12 @@ if "analysis_results" in st.session_state:
                     p_val, p_delta = _dk_payout_strs(c.get("price"))
                     cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
                                    help="American odds and profit on a $10 bet at DraftKings.")
+                    if c.get("model_source") == "expected_runs_ensemble":
+                        st.caption(
+                            "Expected-runs spread ensemble active · projected "
+                            f"score {c['expected_away_runs']:.2f}–"
+                            f"{c['expected_home_runs']:.2f} (away–home)."
+                        )
                     if fetch_alt_lines and c.get("alt_ladder"):
                         _render_alt_ladder(c["alt_ladder"], direction="over",
                                            title=f"Alt spreads for {c['team']}",

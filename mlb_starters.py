@@ -19,6 +19,7 @@ outcomes rather than guessed.
 """
 
 import csv
+from datetime import date as _date, timedelta
 import io
 import json
 import math
@@ -146,6 +147,90 @@ def get_pitcher_expected_stats(season, min_bip=40):
             "xwoba": _to_float(r.get("est_woba")),
             "xba": _to_float(r.get("est_ba")),
         }
+    _write_cache(cache, out)
+    return out
+
+
+def get_expected_runs_team_factors(season, as_of, min_pa=40):
+    """Return leakage-safe live team inputs for the expected-runs model.
+
+    The model was validated on league-relative Savant expected-wOBA averages,
+    split by opposing pitcher hand for offenses and restricted to relievers for
+    bullpens. Savant's aggregate search endpoint produces those same averages
+    in small team-level responses, avoiding a runtime pitch-level download.
+    Only games before ``as_of`` are included.
+    """
+    cutoff = _date.fromisoformat(as_of) - timedelta(days=1)
+    if cutoff.year < int(season):
+        return None
+
+    cache = f"savant_expected_runs_teams_v1_{season}_{cutoff.isoformat()}_{min_pa}"
+    cached = _read_cache(cache, max_age=24 * 3600)
+    if cached is not None:
+        return cached
+
+    common = {
+        "all": "true",
+        "game_date_gt": f"{season}-01-01",
+        "game_date_lt": cutoff.isoformat(),
+        "group_by": "team",
+        "min_pitches": 0,
+        "min_results": 0,
+        "min_pas": 0,
+        "hfGT": "R|",
+    }
+
+    def _team_xwoba(extra):
+        rows = _get_savant_csv("statcast_search/csv", dict(common, **extra))
+        parsed = {}
+        for row in rows:
+            team = row.get("player_name")
+            xwoba = _to_float(row.get("xwoba"))
+            pa = _to_float(row.get("pa"))
+            if team and xwoba and pa and pa >= min_pa:
+                parsed[team] = {"xwoba": xwoba, "pa": pa}
+        return parsed
+
+    offense_vs_hand = {
+        hand: _team_xwoba({
+            "player_type": "batter",
+            "pitcher_throws": hand,
+        })
+        for hand in ("L", "R")
+    }
+    bullpens = _team_xwoba({
+        "player_type": "pitcher",
+        "position": "RP",
+    })
+
+    offense_rows = [
+        row
+        for hand_rows in offense_vs_hand.values()
+        for row in hand_rows.values()
+    ]
+    if not offense_rows or not bullpens:
+        return None
+
+    league_xwoba = (
+        sum(row["xwoba"] * row["pa"] for row in offense_rows)
+        / sum(row["pa"] for row in offense_rows)
+    )
+    bullpen_rows = list(bullpens.values())
+    league_bullpen_xwoba = (
+        sum(row["xwoba"] * row["pa"] for row in bullpen_rows)
+        / sum(row["pa"] for row in bullpen_rows)
+    )
+    out = {
+        "league_xwoba": league_xwoba,
+        "league_bullpen_xwoba": league_bullpen_xwoba,
+        "offense_vs_hand": {
+            hand: {team: row["xwoba"] for team, row in rows.items()}
+            for hand, rows in offense_vs_hand.items()
+        },
+        "bullpen_xwoba": {
+            team: row["xwoba"] for team, row in bullpens.items()
+        },
+    }
     _write_cache(cache, out)
     return out
 
@@ -700,21 +785,80 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None):
                 return 1.0
             return max(0.5, min(2.0, split["ops"] / LEAGUE_AVG["ops"]))
 
-        def _eff(side):
+        def _staff_factor(side):
             q = quality[side]
             sp = q.get("run_suppression", 1.0)
             pen = (result.get(side) or {}).get("bullpen")
             avg_ip = q.get("avg_ip")
             if pen and avg_ip:
                 w = max(0.30, min(0.85, avg_ip / 9.0))
-                base = w * sp + (1.0 - w) * pen.get("bullpen_suppression", 1.0)
-            else:
-                base = sp
+                return (w * sp
+                        + (1.0 - w) * pen.get("bullpen_suppression", 1.0))
+            return sp
+
+        def _eff(side):
             # Two-sided: degrade run-prevention by the offense faced.
-            return base / _off_factor(side)
+            return _staff_factor(side) / _off_factor(side)
         # Positive => home better than away. tanh keeps it bounded; magnitude of
         # effect is applied by the (calibratable) weight in the analyzer.
         result["starter_edge"] = _tanh(_eff("home") - _eff("away"))
+
+        # Build the spread-only challenger from the same Savant expected-wOBA
+        # scale used in its historical fit. Keep this separate from _eff so the
+        # existing starter adjustment, moneyline, and totals paths are unchanged.
+        try:
+            expected_inputs = get_expected_runs_team_factors(season, date)
+        except (OSError, ValueError, requests.RequestException):
+            expected_inputs = None
+
+        home_info = _match_team_id(home_team, team_index)
+        away_info = _match_team_id(away_team, team_index)
+        home_abbr = home_info.get("abbr") if home_info else None
+        away_abbr = away_info.get("abbr") if away_info else None
+
+        def _expected_offense(abbr, opposing_hand):
+            if not expected_inputs or not abbr or opposing_hand not in ("L", "R"):
+                return None
+            xwoba = ((expected_inputs.get("offense_vs_hand") or {})
+                     .get(opposing_hand, {}).get(abbr))
+            league = expected_inputs.get("league_xwoba")
+            if not xwoba or not league:
+                return None
+            return max(0.5, min(2.0, xwoba / league))
+
+        def _expected_staff(side, abbr):
+            if not expected_inputs or not abbr:
+                return None
+            league = expected_inputs.get("league_xwoba")
+            starter_xwoba = quality[side].get("xwoba")
+            if not league or not starter_xwoba:
+                return None
+            starter = max(0.5, min(2.0, league / starter_xwoba))
+            bullpen_xwoba = ((expected_inputs.get("bullpen_xwoba") or {})
+                              .get(abbr))
+            bullpen_league = expected_inputs.get("league_bullpen_xwoba")
+            avg_ip = quality[side].get("avg_ip")
+            if bullpen_xwoba and bullpen_league and avg_ip:
+                weight = max(0.30, min(0.85, avg_ip / 9.0))
+                bullpen = max(
+                    0.5, min(2.0, bullpen_league / bullpen_xwoba))
+                return weight * starter + (1.0 - weight) * bullpen
+            return starter
+
+        home_offense = _expected_offense(
+            home_abbr, quality["away"].get("throws"))
+        away_offense = _expected_offense(
+            away_abbr, quality["home"].get("throws"))
+        home_staff = _expected_staff("home", home_abbr)
+        away_staff = _expected_staff("away", away_abbr)
+        result["expected_runs"] = {
+            "complete": all(value is not None for value in (
+                home_offense, away_offense, home_staff, away_staff)),
+            "home_offense_factor": home_offense,
+            "away_offense_factor": away_offense,
+            "home_staff_suppression": home_staff,
+            "away_staff_suppression": away_staff,
+        }
 
     return result
 

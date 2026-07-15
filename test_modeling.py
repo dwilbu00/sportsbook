@@ -175,6 +175,83 @@ class StarterAdjustmentTests(unittest.TestCase):
 
 
 class ExpectedRunsTests(unittest.TestCase):
+    def setUp(self):
+        analysis._EXPECTED_RUNS_CACHE.clear()
+
+    def tearDown(self):
+        analysis._EXPECTED_RUNS_CACHE.clear()
+
+    @staticmethod
+    def _calibration():
+        return {
+            "enabled": True,
+            "live_markets": {
+                "moneyline": False, "spreads": True, "totals": False,
+            },
+            "final_2025_validation": {
+                "model": {
+                    "offense_weight": 1.25,
+                    "pitching_weight": 0.75,
+                    "home_base_runs": 4.423,
+                    "away_base_runs": 4.429,
+                },
+                "ensemble_challenger_share": {
+                    "moneyline": 0.75,
+                    "home_minus_1_5": 0.70,
+                    "margin": 0.90,
+                },
+            },
+        }
+
+    @staticmethod
+    def _team_stats():
+        games = [
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 6, "away_score": 3},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 2, "away_score": 4},
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 1, "away_score": 5},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 3, "away_score": 2},
+        ]
+        base = {
+            "season": {"win_pct": 0.5},
+            "recent": {"win_pct": 0.5},
+            "recent_games": games,
+        }
+        return dict(base), dict(base)
+
+    @staticmethod
+    def _game_odds():
+        return {
+            "home_team": "Home",
+            "away_team": "Away",
+            "spreads": {
+                "Home": [{"spread": -1.5, "price": -110}],
+                "Away": [{"spread": 1.5, "price": -110}],
+            },
+            "moneyline": {
+                "Home": [{"implied_prob": 0.5, "price": 100,
+                          "book": "Test"}],
+                "Away": [{"implied_prob": 0.5, "price": 100,
+                          "book": "Test"}],
+            },
+        }
+
+    @staticmethod
+    def _matchup_features(complete=True):
+        return {
+            "starter_edge": 0.15,
+            "expected_runs": {
+                "complete": complete,
+                "home_offense_factor": 1.15,
+                "away_offense_factor": 0.90,
+                "home_staff_suppression": 1.10,
+                "away_staff_suppression": 0.85,
+            },
+        }
+
     def test_pythagorean_uses_modern_baseball_exponent(self):
         probability = mlb_starters.pythagorean_win_probability(5.0, 4.0)
         expected = 5.0 ** 1.83 / (5.0 ** 1.83 + 4.0 ** 1.83)
@@ -280,6 +357,195 @@ class ExpectedRunsTests(unittest.TestCase):
                 current, challenger, outcomes),
             1.0,
         )
+
+    def test_expected_runs_team_factors_use_savant_aggregates(self):
+        offense_left = [
+            {"player_name": "HME", "xwoba": "0.330", "pa": "100"},
+            {"player_name": "AWY", "xwoba": "0.300", "pa": "100"},
+        ]
+        offense_right = [
+            {"player_name": "HME", "xwoba": "0.350", "pa": "200"},
+            {"player_name": "AWY", "xwoba": "0.310", "pa": "200"},
+        ]
+        bullpens = [
+            {"player_name": "HME", "xwoba": "0.300", "pa": "150"},
+            {"player_name": "AWY", "xwoba": "0.360", "pa": "150"},
+        ]
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+                mlb_starters, "CACHE_DIR", cache_dir), patch.object(
+                mlb_starters, "_get_savant_csv",
+                side_effect=[offense_left, offense_right, bullpens]) as fetch:
+            factors = mlb_starters.get_expected_runs_team_factors(
+                2026, "2026-07-15")
+
+        self.assertEqual(fetch.call_count, 3)
+        for call in fetch.call_args_list:
+            self.assertEqual(call.args[1]["game_date_lt"], "2026-07-14")
+            self.assertEqual(call.args[1]["hfGT"], "R|")
+        self.assertAlmostEqual(factors["league_xwoba"], 0.325)
+        self.assertAlmostEqual(factors["league_bullpen_xwoba"], 0.330)
+        self.assertEqual(factors["offense_vs_hand"]["L"]["HME"], 0.330)
+        self.assertEqual(factors["offense_vs_hand"]["R"]["AWY"], 0.310)
+        self.assertEqual(factors["bullpen_xwoba"]["HME"], 0.300)
+
+    def test_live_matchup_features_expose_separate_run_factors(self):
+        team_index = {
+            "home": {"id": 1, "name": "Home", "abbr": "HME"},
+            "away": {"id": 2, "name": "Away", "abbr": "AWY"},
+        }
+        probables = {
+            "home": {"pitcher_id": 11},
+            "away": {"pitcher_id": 22},
+        }
+        qualities = {
+            11: {"throws": "R", "run_suppression": 1.2,
+                 "run_suppression_basis": "xera", "avg_ip": 6.0,
+                 "xwoba": 0.280},
+            22: {"throws": "L", "run_suppression": 0.8,
+                 "run_suppression_basis": "era", "avg_ip": 4.5,
+                 "xwoba": 0.360},
+        }
+        offense_splits = {
+            1: {"vL": {"ops": 0.780}, "vR": {"ops": 0.750}},
+            2: {"vL": {"ops": 0.700}, "vR": {"ops": 0.640}},
+        }
+        bullpens = {
+            1: {"bullpen_suppression": 1.1},
+            2: {"bullpen_suppression": 0.9},
+        }
+        expected_inputs = {
+            "league_xwoba": 0.320,
+            "league_bullpen_xwoba": 0.330,
+            "offense_vs_hand": {
+                "L": {"HME": 0.352, "AWY": 0.310},
+                "R": {"HME": 0.330, "AWY": 0.288},
+            },
+            "bullpen_xwoba": {"HME": 0.300, "AWY": 0.360},
+        }
+        with patch.object(
+                mlb_starters, "get_probable_starters",
+                return_value=probables), patch.object(
+                mlb_starters, "get_pitcher_quality",
+                side_effect=lambda pitcher_id, season: qualities[pitcher_id]), patch.object(
+                mlb_starters, "get_team_offense_splits",
+                side_effect=lambda team_id, season: offense_splits[team_id]), patch.object(
+                mlb_starters, "get_team_bullpen_quality",
+                side_effect=lambda team_id, season: bullpens[team_id]), patch.object(
+                mlb_starters, "get_expected_runs_team_factors",
+                side_effect=[expected_inputs, None]):
+            features = mlb_starters.build_matchup_features(
+                "Home", "Away", "2026-07-15", 2026,
+                team_index=team_index)
+            fallback_features = mlb_starters.build_matchup_features(
+                "Home", "Away", "2026-07-15", 2026,
+                team_index=team_index)
+
+        factors = features["expected_runs"]
+        self.assertTrue(factors["complete"])
+        legacy_home_staff = (6.0 / 9.0) * 1.2 + (3.0 / 9.0) * 1.1
+        legacy_away_staff = 0.5 * 0.8 + 0.5 * 0.9
+        self.assertAlmostEqual(
+            features["starter_edge"],
+            math.tanh(
+                legacy_home_staff / (0.640 / 0.711)
+                - legacy_away_staff / (0.780 / 0.711)))
+        self.assertAlmostEqual(
+            fallback_features["starter_edge"], features["starter_edge"])
+        self.assertFalse(fallback_features["expected_runs"]["complete"])
+        self.assertAlmostEqual(
+            factors["home_offense_factor"], 0.352 / 0.320)
+        self.assertAlmostEqual(
+            factors["away_offense_factor"], 0.288 / 0.320)
+        self.assertAlmostEqual(
+            factors["home_staff_suppression"],
+            (6.0 / 9.0) * (0.320 / 0.280)
+            + (3.0 / 9.0) * (0.330 / 0.300))
+        self.assertAlmostEqual(
+            factors["away_staff_suppression"],
+            0.5 * (0.320 / 0.360) + 0.5 * (0.330 / 0.360))
+
+    def test_mlb_spreads_use_validated_expected_runs_ensemble(self):
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        features = self._matchup_features()
+        with patch.object(
+                analysis, "load_expected_runs_challenger",
+                return_value=self._calibration()), patch.object(
+                analysis, "_shrink_factor", return_value=0.25), patch.object(
+                analysis, "_blend_weight", return_value=1.0):
+            current_margin, pred_std, _, _ = analysis._predict_margin(
+                game_odds, home_stats, away_stats,
+                "baseball_mlb", features)
+            candidates = analysis.analyze_spreads_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb", matchup_features=features)
+
+        home_runs = mlb_starters.expected_runs_from_factors(
+            4.423, 1.15, 0.85, 1.25, 0.75)
+        away_runs = mlb_starters.expected_runs_from_factors(
+            4.429, 0.90, 1.10, 1.25, 0.75)
+        current_cover = analysis._norm_cdf(
+            (current_margin - 1.5) / pred_std)
+        current_adjusted = 0.5 + 0.25 * (current_cover - 0.5)
+        expected_cover = mlb_starters.poisson_margin_probability(
+            home_runs, away_runs, -1.5)
+        ensemble_cover = (
+            0.30 * current_adjusted + 0.70 * expected_cover)
+        ensemble_margin = (
+            0.10 * current_margin + 0.90 * (home_runs - away_runs))
+        home = next(c for c in candidates if c["home_away"] == "HOME")
+        away = next(c for c in candidates if c["home_away"] == "AWAY")
+        self.assertEqual(home["model_source"], "expected_runs_ensemble")
+        self.assertEqual(home["cover_rate"], round(ensemble_cover * 100, 2))
+        self.assertEqual(home["pred_game_margin"], round(ensemble_margin, 2))
+        self.assertEqual(home["expected_home_runs"], round(home_runs, 2))
+        self.assertEqual(home["expected_away_runs"], round(away_runs, 2))
+        self.assertAlmostEqual(
+            home["cover_rate"] + away["cover_rate"], 100.0)
+
+    def test_incomplete_mlb_inputs_fall_back_to_current_spread_model(self):
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        baseline_features = {"starter_edge": 0.15}
+        incomplete_features = self._matchup_features(complete=False)
+        with patch.object(analysis, "_blend_weight", return_value=1.0):
+            baseline = analysis.analyze_spreads_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb",
+                matchup_features=baseline_features)
+            fallback = analysis.analyze_spreads_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb",
+                matchup_features=incomplete_features)
+        self.assertEqual(fallback, baseline)
+        self.assertTrue(all(
+            candidate["model_source"] == "current_margin_model"
+            for candidate in fallback))
+
+    def test_expected_runs_inputs_do_not_change_moneyline_or_other_sports(self):
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        baseline_features = {"starter_edge": 0.15}
+        complete_features = self._matchup_features()
+        with patch.object(analysis, "_blend_weight", return_value=1.0):
+            baseline_ml = analysis.analyze_moneyline_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb",
+                matchup_features=baseline_features)
+            expected_runs_ml = analysis.analyze_moneyline_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb",
+                matchup_features=complete_features)
+            baseline_other = analysis.analyze_spreads_value(
+                game_odds, home_stats, away_stats,
+                sport_key="basketball_nba",
+                matchup_features=baseline_features)
+            expected_runs_other = analysis.analyze_spreads_value(
+                game_odds, home_stats, away_stats,
+                sport_key="basketball_nba",
+                matchup_features=complete_features)
+        self.assertEqual(expected_runs_ml, baseline_ml)
+        self.assertEqual(expected_runs_other, baseline_other)
 
     @patch("backtest_starters._season_venue_index")
     @patch("backtest_props.season_schedule")

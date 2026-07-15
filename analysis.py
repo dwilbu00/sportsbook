@@ -7,6 +7,7 @@ import heapq
 import math
 import random
 
+import mlb_starters
 from odds_client import (
     PROP_LABELS,
     american_to_decimal,
@@ -45,6 +46,7 @@ from calibration_loader import (
     load_market_blend,
     load_prob_shrink,
     load_starter_adjustment,
+    load_expected_runs_challenger,
     load_lineup_adjustment,
     apply_calibration_with_warmup,
     count_current_season_games,
@@ -66,6 +68,7 @@ _MARKET_BLEND_CACHE = {}
 _PROB_SHRINK_CACHE = {}
 _STARTER_ADJ_CACHE = {}
 _LINEUP_ADJ_CACHE = {}
+_EXPECTED_RUNS_CACHE = {}
 
 # MLB league baselines used as log5-style denominators for the props matchup
 # multiplier. Priors (not fitted); refresh occasionally.
@@ -721,9 +724,11 @@ def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed, streng
 
 def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
                     matchup_features=None):
-    """Shared home-perspective game-margin distribution used by BOTH the
-    moneyline and spread analyzers so they stay coherent: ML win prob and spread
-    cover prob both derive from the same Normal(pred_margin, pred_std).
+    """Shared home-perspective baseline game-margin distribution.
+
+    Moneyline and spread analyzers both start from this Normal distribution.
+    A validated market-specific challenger may be blended into the MLB spread
+    result later without changing this baseline or the moneyline model.
 
     Returns (pred_margin, pred_std, home_stats, away_stats) or None when either
     team lacks usable recent games.
@@ -776,6 +781,65 @@ def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
     return pred_margin, pred_std, home_stats, away_stats
 
 
+def _mlb_expected_runs_projection(sport_key, matchup_features):
+    """Return the enabled spread-only expected-runs projection, when complete."""
+    if sport_key != "baseball_mlb" or not matchup_features:
+        return None
+    factors = matchup_features.get("expected_runs") or {}
+    if not factors.get("complete"):
+        return None
+
+    if sport_key not in _EXPECTED_RUNS_CACHE:
+        try:
+            _EXPECTED_RUNS_CACHE[sport_key] = (
+                load_expected_runs_challenger(sport_key) or {})
+        except Exception:
+            _EXPECTED_RUNS_CACHE[sport_key] = {}
+    config = _EXPECTED_RUNS_CACHE[sport_key]
+    live_markets = config.get("live_markets") or {}
+    final_validation = config.get("final_2025_validation") or {}
+    model = final_validation.get("model") or {}
+    shares = final_validation.get("ensemble_challenger_share") or {}
+    if not config.get("enabled") or not live_markets.get("spreads"):
+        return None
+
+    try:
+        offense_weight = float(model["offense_weight"])
+        pitching_weight = float(model["pitching_weight"])
+        home_base_runs = float(model["home_base_runs"])
+        away_base_runs = float(model["away_base_runs"])
+        home_offense = float(factors["home_offense_factor"])
+        away_offense = float(factors["away_offense_factor"])
+        home_staff = float(factors["home_staff_suppression"])
+        away_staff = float(factors["away_staff_suppression"])
+        spread_share = float(shares["home_minus_1_5"])
+        margin_share = float(shares["margin"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (min(home_base_runs, away_base_runs, home_offense, away_offense,
+            home_staff, away_staff) <= 0
+            or offense_weight < 0 or pitching_weight < 0
+            or not 0.0 <= spread_share <= 1.0
+            or not 0.0 <= margin_share <= 1.0):
+        return None
+
+    home_runs = mlb_starters.expected_runs_from_factors(
+        home_base_runs, home_offense, away_staff,
+        offense_weight, pitching_weight)
+    away_runs = mlb_starters.expected_runs_from_factors(
+        away_base_runs, away_offense, home_staff,
+        offense_weight, pitching_weight)
+    if home_runs is None or away_runs is None:
+        return None
+    return {
+        "home_runs": home_runs,
+        "away_runs": away_runs,
+        "margin": home_runs - away_runs,
+        "spread_share": spread_share,
+        "margin_share": margin_share,
+    }
+
+
 def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare moneyline implied probabilities against historical win rates.
@@ -805,12 +869,12 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             avg_implied_by_team[tn] = sum(o["implied_prob"] for o in lst) / len(lst)
     blend_w = _blend_weight(sport_key, "moneyline")
 
-    # ── Shared margin model (coherent with analyze_spreads_value) ───────────
-    # ML and spreads now derive from ONE predicted-margin distribution:
+    # ── Shared baseline margin model ────────────────────────────────────────
+    # ML and spreads begin with ONE predicted-margin distribution:
     #   P(home win) = P(margin > 0) = Φ(pred_margin / pred_std)
-    # At spread 0 the ML home-win prob equals the spread cover prob, so the two
-    # markets can never disagree. The starter/opponent edge already shifts the
-    # margin inside _predict_margin(), so no separate ML starter logit is needed.
+    # The starter/opponent edge already shifts the margin inside
+    # _predict_margin(), so no separate ML starter logit is needed. Validated
+    # spread-only overlays are applied later and do not alter this ML result.
     margin = _predict_margin(game_odds, home_team_stats, away_team_stats,
                              sport_key, matchup_features)
     model_win_by_team = {}
@@ -1089,15 +1153,16 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
 def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
-    Compare spread lines against historical scoring margins, using a JOINT
-    distribution of the predicted game margin (home perspective).
+    Compare spread lines against historical scoring margins, using a joint
+    baseline distribution of the predicted game margin (home perspective).
 
     For each team, the model estimates the weighted mean and weighted std of
     that team's recent margins. The game's actual margin is then approximated
     as Normal(home_mean − away_mean, sqrt(home_var + away_var)) under
-    independence. Cover probabilities are derived from this joint distribution,
-    so home_cover_prob + away_cover_prob ≈ 1 (zero-sum, vig aside) — only one
-    side can be a value bet in a given matchup.
+    independence. For MLB games with complete probable-starter and handedness
+    inputs, the chronologically validated expected-runs model is blended into
+    spread probability and displayed margin only. Moneylines remain unchanged.
+    Home and away probabilities remain complementary for opposing half-run lines.
 
     Parameters:
         game_odds (dict): Parsed game odds from odds_client.parse_game_odds()
@@ -1113,9 +1178,7 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
     home_team = game_odds["home_team"]
     away_team = game_odds["away_team"]
 
-    # ── Shared predicted-margin distribution (coherent with moneyline) ──────
-    # Both markets derive from the SAME _predict_margin() output, so at spread 0
-    # the spread cover prob equals the ML home-win prob — they cannot disagree.
+    # ── Shared baseline predicted-margin distribution ───────────────────────
     margin = _predict_margin(game_odds, home_team_stats, away_team_stats,
                              sport_key, matchup_features)
     # If we lack usable recent games for either side we cannot compute a
@@ -1123,7 +1186,14 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
     # recommending both halves of a bet on half the information).
     if margin is None:
         return []
-    pred_margin, pred_std, home_stats, away_stats = margin
+    current_pred_margin, pred_std, home_stats, away_stats = margin
+    expected_runs = _mlb_expected_runs_projection(
+        sport_key, matchup_features)
+    pred_margin = current_pred_margin
+    if expected_runs:
+        margin_share = expected_runs["margin_share"]
+        pred_margin += margin_share * (
+            expected_runs["margin"] - pred_margin)
 
     # ── Consensus spread per team ───────────────────────────────────────────
     def _consensus_spread(team):
@@ -1155,16 +1225,29 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             american_to_implied_prob(home_price),
             american_to_implied_prob(away_price))
 
-    def _blend(model_cover, market_cover):
-        # Calibrated overconfidence correction first (no-op when unset), then
-        # the optional model⇄market blend.
-        shrunk = _apply_shrink(model_cover, sport_key, "spreads")
+    def _cover_probabilities(current_cover, expected_cover, market_cover):
+        # The final holdout fitted the challenger share against the already-
+        # shrunk current spread model. Do not shrink the resulting ensemble a
+        # second time. With no complete expected-runs projection this follows
+        # the original path exactly.
+        if expected_cover is None:
+            model_cover = current_cover
+            adjusted = _apply_shrink(current_cover, sport_key, "spreads")
+        else:
+            current_adjusted = _apply_shrink(
+                current_cover, sport_key, "spreads")
+            share = expected_runs["spread_share"]
+            model_cover = current_adjusted + share * (
+                expected_cover - current_adjusted)
+            adjusted = model_cover
         if market_cover is None:
-            return shrunk
-        return blend_w * shrunk + (1.0 - blend_w) * market_cover
+            return model_cover, adjusted
+        return (model_cover,
+                blend_w * adjusted + (1.0 - blend_w) * market_cover)
 
     def _add_candidate(team_name, opponent, is_home, spread, model_cover,
-                       cover_prob, team_avg_margin, price):
+                       cover_prob, team_avg_margin, price,
+                       current_cover, expected_cover):
         implied_prob = (american_to_implied_prob(price)
                         if price is not None else 0.50)
         edge = cover_prob - implied_prob
@@ -1186,24 +1269,52 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             "pred_game_margin": round(pred_margin, 2),
             "pred_game_std": round(pred_std, 2),
             "price": price,
+            "model_source": ("expected_runs_ensemble" if expected_runs
+                             else "current_margin_model"),
         })
+        if expected_runs:
+            candidates[-1].update({
+                "current_model_cover_rate": round(current_cover * 100, 2),
+                "expected_runs_cover_rate": round(expected_cover * 100, 2),
+                "current_pred_game_margin": round(current_pred_margin, 2),
+                "expected_home_runs": round(expected_runs["home_runs"], 2),
+                "expected_away_runs": round(expected_runs["away_runs"], 2),
+            })
 
     if home_spread is not None:
         # Home covers iff actual_margin + home_spread > 0  ⇔  margin > -home_spread.
         # P(margin > -home_spread) = Φ((pred_margin + home_spread) / pred_std)
-        home_cover_prob = _norm_cdf((pred_margin + home_spread) / pred_std)
-        _add_candidate(home_team, away_team, True, home_spread, home_cover_prob,
-                       _blend(home_cover_prob, market_home_cover),
-                       home_stats["mean"], home_price)
+        current_home_cover = _norm_cdf(
+            (current_pred_margin + home_spread) / pred_std)
+        expected_home_cover = (
+            mlb_starters.poisson_margin_probability(
+                expected_runs["home_runs"], expected_runs["away_runs"],
+                home_spread)
+            if expected_runs else None)
+        model_home_cover, home_cover_prob = _cover_probabilities(
+            current_home_cover, expected_home_cover, market_home_cover)
+        _add_candidate(home_team, away_team, True, home_spread,
+                       model_home_cover, home_cover_prob,
+                       home_stats["mean"], home_price,
+                       current_home_cover, expected_home_cover)
     if away_spread is not None:
         # Away covers iff -actual_margin + away_spread > 0  ⇔  margin < away_spread.
         # P(margin < away_spread) = Φ((away_spread - pred_margin) / pred_std)
-        away_cover_prob = _norm_cdf((away_spread - pred_margin) / pred_std)
+        current_away_cover = _norm_cdf(
+            (away_spread - current_pred_margin) / pred_std)
+        expected_away_cover = (
+            mlb_starters.poisson_margin_probability(
+                expected_runs["away_runs"], expected_runs["home_runs"],
+                away_spread)
+            if expected_runs else None)
         market_away_cover = (1.0 - market_home_cover
                              if market_home_cover is not None else None)
-        _add_candidate(away_team, home_team, False, away_spread, away_cover_prob,
-                       _blend(away_cover_prob, market_away_cover),
-                       away_stats["mean"], away_price)
+        model_away_cover, away_cover_prob = _cover_probabilities(
+            current_away_cover, expected_away_cover, market_away_cover)
+        _add_candidate(away_team, home_team, False, away_spread,
+                       model_away_cover, away_cover_prob,
+                       away_stats["mean"], away_price,
+                       current_away_cover, expected_away_cover)
 
     return candidates
 

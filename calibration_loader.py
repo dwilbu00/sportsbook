@@ -162,6 +162,13 @@ def load_starter_adjustment(sport_key):
     return _load_blob(sport_key).get("starter_adjustment", {})
 
 
+def load_expected_runs_challenger(sport_key):
+    """Load the validated MLB expected-runs market configuration."""
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("expected_runs_challenger", {})
+
+
 def save_starter_adjustment(sport_key, adj, meta=None):
     """Persist starter-adjustment weights, preserving other calibration blocks."""
     os.makedirs(CALIBRATION_DIR, exist_ok=True)

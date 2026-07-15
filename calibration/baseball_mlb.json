@@ -3828,7 +3828,12 @@
     "spreads": 5.261
   },
   "expected_runs_challenger": {
-    "enabled": false,
+    "enabled": true,
+    "live_markets": {
+      "moneyline": false,
+      "spreads": true,
+      "totals": false
+    },
     "pythagorean_exponent": 1.83,
     "score_distribution": "independent_poisson",
     "validation_timestamp": "2026-07-15",
@@ -3982,7 +3987,7 @@
         "decision": "fail: home -1.5 Brier was slightly worse than raw expected runs"
       }
     },
-    "decision": "The untouched 2025 holdout rejected raw and ensembled expected runs for moneylines and rejected prior-season actual-venue park factors. Keep the current moneyline model. Raw expected runs and the train-fitted ensemble both passed the margin and home -1.5 gates, so the ensemble may advance to spread/margin shadow validation but remains disabled for live picks; any promotion must preserve the shared margin-distribution contract."
+    "decision": "The untouched 2025 holdout rejected raw and ensembled expected runs for moneylines and rejected prior-season actual-venue park factors. The validated ensemble is enabled only for MLB spreads and displayed margin when live probable-starter, expected-wOBA-vs-hand, and expected-wOBA staff inputs match the historical feature basis and are complete. Moneylines and totals remain on the current model, and incomplete MLB inputs fall back to the current spread model."
   },
   "lineup_adjustment": {
     "enabled": true,

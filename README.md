@@ -131,7 +131,7 @@ The MLB layer is no longer just historical scores. It uses MLB Stats API and Bas
 
 The model separates feature generation from feature strength. Raw starter, bullpen, and lineup features are built first; calibration files decide how much those features are allowed to move a prediction. The announced-lineup adjustment runs only when a complete nine-player order is available. A 2024 chronological fit selected a 0.75 exposure blend for batter hits (holdout MAE improved 0.262%, with both later rolling folds improving); the equivalent batter-strikeout exposure signal failed forward validation and remains disabled.
 
-#### MLB expected-runs challenger (not live)
+#### MLB expected-runs spread ensemble
 
 `backtest_starters.py --season 2024 --test-runs` fits separate home and away
 run expectations from leakage-safe offense-vs-hand, probable-starter workload,
@@ -174,10 +174,19 @@ ensemble improved margin RMSE from `4.968` to `4.583` and home `-1.5` Brier from
 Actual-venue park factors estimated only from completed 2023–2024 outcomes also
 failed the final gate: they slightly improved score NLL and total RMSE but made
 home `-1.5` Brier slightly worse than unadjusted expected runs. Moneyline and
-park candidates therefore remain rejected. The margin/run-line ensemble may
-advance to shadow/forward validation, but it remains **disabled for live picks**.
-Any live version must first preserve the application's shared-margin-distribution
-contract so moneyline and spread probabilities cannot contradict each other.
+park candidates therefore remain rejected.
+
+The validated ensemble is now active for **MLB spreads only**. It blends 70% of
+the independent-Poisson expected-runs cover probability with 30% of the current
+calibrated spread probability, and displays a margin blended 90% toward the
+expected-runs margin. Its live factors use the same league-relative Baseball
+Savant expected-wOBA basis as the historical fit: starter expected wOBA,
+team expected wOBA split by opposing pitcher hand, and reliever expected wOBA.
+The small team aggregates are cached daily. The ensemble activates only when
+both probable starters, both offense-vs-hand splits, and both staff-quality
+inputs are available; otherwise the existing spread model runs unchanged. MLB
+moneylines and totals are not modified, and park factors and negative-binomial
+scoring remain disabled.
 
 ### NFL: EPA-based team strength
 
@@ -329,7 +338,7 @@ The repository includes scripts for testing and refitting the model:
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
 - `forward_tracker.py` — captures one-shot exact-line closing prices and runs outcome maintenance
-- `backtest_starters.py` — fits MLB starter/bullpen weights and tests the disabled expected-runs/Pythagorean challenger
+- `backtest_starters.py` — fits MLB starter/bullpen weights and validates the spread-only expected-runs/Pythagorean ensemble
 - `backtest_nfl_epa.py` — fits NFL EPA margin weights
 - `savant_history.py` — leakage-safe historical Statcast feature cache for MLB backtests
 
