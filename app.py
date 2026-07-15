@@ -288,7 +288,7 @@ def _render_market_comparison(
 def _clear_bet_selections():
     for key in list(st.session_state):
         if str(key).startswith("bet_selection:"):
-            st.session_state.pop(key, None)
+            st.session_state[key] = False
 
 
 def _value_bet_checklist_entries(
