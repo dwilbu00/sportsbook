@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import random
+import statistics
 import time
 
 import requests
@@ -521,6 +522,129 @@ def parse_game_odds(game):
                     })
 
     return result
+
+
+def _complete_featured_offer(game, bookmaker, market_key):
+    """Return one complete two-sided featured offer from a bookmaker."""
+    market = next(
+        (entry for entry in bookmaker.get("markets", [])
+         if entry.get("key") == market_key),
+        None,
+    )
+    if not market:
+        return None
+
+    if market_key in ("h2h", "spreads"):
+        side_names = (game.get("home_team"), game.get("away_team"))
+    else:
+        side_names = ("Over", "Under")
+
+    offer = {}
+    for side_name in side_names:
+        outcome = next(
+            (entry for entry in market.get("outcomes", [])
+             if entry.get("name") == side_name),
+            None,
+        )
+        if not outcome:
+            return None
+        price = outcome.get("price")
+        if (not isinstance(price, (int, float)) or isinstance(price, bool)
+                or abs(price) < 100):
+            return None
+        point = outcome.get("point")
+        if market_key != "h2h" and not isinstance(point, (int, float)):
+            return None
+        offer[side_name] = {"line": point, "price": price}
+
+    first, second = (offer[name] for name in side_names)
+    if market_key == "spreads" and abs(first["line"] + second["line"]) > 1e-9:
+        return None
+    if market_key == "totals" and abs(first["line"] - second["line"]) > 1e-9:
+        return None
+    return offer
+
+
+def _decimal_to_american(decimal_odds):
+    if decimal_odds >= 2.0:
+        return int(round((decimal_odds - 1.0) * 100))
+    return int(round(-100.0 / (decimal_odds - 1.0)))
+
+
+def build_market_comparisons(
+        game, primary_bookmaker="draftkings", min_peer_books=3):
+    """Compare one book's featured offers with complete peer-book medians.
+
+    This is line-shopping context only. It deliberately returns no probability
+    or edge adjustment, so callers cannot accidentally blend it into the model.
+    """
+    comparisons = {"h2h": {}, "spreads": {}, "totals": {}}
+    primary_book = next(
+        (book for book in game.get("bookmakers", [])
+         if book.get("key") == primary_bookmaker),
+        None,
+    )
+    if not primary_book:
+        return comparisons
+
+    for market_key in comparisons:
+        primary_offer = _complete_featured_offer(
+            game, primary_book, market_key)
+        if not primary_offer:
+            continue
+        peer_offers = []
+        for book in game.get("bookmakers", []):
+            if book is primary_book or book.get("key") == primary_bookmaker:
+                continue
+            offer = _complete_featured_offer(game, book, market_key)
+            if offer:
+                peer_offers.append(offer)
+        if len(peer_offers) < min_peer_books:
+            continue
+
+        for side_name, primary_side in primary_offer.items():
+            peer_decimal_price = statistics.median(
+                american_to_decimal(offer[side_name]["price"])
+                for offer in peer_offers
+            )
+            primary_decimal_price = american_to_decimal(primary_side["price"])
+            peer_line = None
+            line_advantage = None
+            key_numbers = []
+            if market_key != "h2h":
+                peer_line = statistics.median(
+                    offer[side_name]["line"] for offer in peer_offers)
+                if market_key == "spreads":
+                    line_advantage = primary_side["line"] - peer_line
+                    key_numbers = sorted({
+                        abs(key_number)
+                        for key_number in (-7.0, -3.0, 3.0, 7.0)
+                        if min(primary_side["line"], peer_line)
+                        <= key_number
+                        <= max(primary_side["line"], peer_line)
+                    })
+                elif side_name == "Over":
+                    line_advantage = peer_line - primary_side["line"]
+                else:
+                    line_advantage = primary_side["line"] - peer_line
+
+            price_advantage = primary_decimal_price - peer_decimal_price
+            comparisons[market_key][side_name] = {
+                "primary_line": primary_side["line"],
+                "primary_price": primary_side["price"],
+                "peer_median_line": peer_line,
+                "peer_median_price": _decimal_to_american(peer_decimal_price),
+                "peer_count": len(peer_offers),
+                "line_advantage": line_advantage,
+                "price_advantage": price_advantage,
+                "dominates_peer_offer": (
+                    line_advantage is not None
+                    and line_advantage > 1e-9
+                    and price_advantage >= -1e-9
+                ),
+                "key_numbers": key_numbers,
+            }
+    return comparisons
 
 
 def american_to_implied_prob(american_odds):

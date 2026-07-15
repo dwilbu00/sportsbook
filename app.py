@@ -30,6 +30,7 @@ from odds_client import (
     parse_player_props,
     parse_alt_player_props,
     parse_alt_team_lines,
+    build_market_comparisons,
     get_remaining_credits,
     is_event_cached,
     american_to_decimal,
@@ -201,6 +202,87 @@ def _dk_payout_strs(american_price, stake=10):
     dec = american_to_decimal(american_price)
     total_payout = dec * stake
     return f"${total_payout:.2f}", f"on ${stake:.0f} ({american_price:+d})"
+
+
+def _market_offer_text(comparison, peer=False, market_key="h2h", side=None):
+    prefix = "peer_median_" if peer else "primary_"
+    price = comparison.get(f"{prefix}price")
+    line = comparison.get(f"{prefix}line")
+    price_text = f"{price:+g}" if price is not None else "n/a"
+    if market_key == "spreads" and line is not None:
+        return f"{line:+g} · {price_text}"
+    if market_key == "totals" and line is not None:
+        return f"{side.upper()} {line:g} · {price_text}"
+    return price_text
+
+
+def _market_comparison_status(comparison):
+    line_advantage = comparison.get("line_advantage")
+    price_advantage = comparison.get("price_advantage", 0.0)
+    if line_advantage is None:
+        if price_advantage > 1e-9:
+            return "Better DK payout"
+        if price_advantage < -1e-9:
+            return "Better peer payout"
+        return "In line with market"
+    if line_advantage > 1e-9:
+        if comparison.get("dominates_peer_offer"):
+            return "Best of both"
+        return "Better line, higher cost"
+    if line_advantage < -1e-9:
+        if price_advantage > 1e-9:
+            return "Worse line, better payout"
+        return "Peer median has better line"
+    if price_advantage > 1e-9:
+        return "Same line, better DK payout"
+    if price_advantage < -1e-9:
+        return "Same line, better peer payout"
+    return "In line with market"
+
+
+def _market_comparison_summary(
+        comparison, market_key="h2h", side=None):
+    if not comparison:
+        return "—"
+    primary = _market_offer_text(
+        comparison, market_key=market_key, side=side)
+    peer = _market_offer_text(
+        comparison, peer=True, market_key=market_key, side=side)
+    return (
+        f"{_market_comparison_status(comparison)} · "
+        f"DK {primary} vs peer {peer}"
+    )
+
+
+def _render_market_comparison(
+        comparison, sport_key, market_key="h2h", side=None):
+    if not comparison:
+        return
+    st.markdown("**Market Comparison**")
+    cols = st.columns(3)
+    cols[0].metric(
+        "DraftKings offer",
+        _market_offer_text(
+            comparison, market_key=market_key, side=side),
+    )
+    cols[1].metric(
+        f"Peer median ({comparison['peer_count']} books)",
+        _market_offer_text(
+            comparison, peer=True, market_key=market_key, side=side),
+    )
+    cols[2].metric(
+        "Offer context", _market_comparison_status(comparison))
+    if (sport_key == "americanfootball_nfl"
+            and market_key == "spreads"
+            and comparison.get("key_numbers")):
+        keys = " and ".join(
+            f"{key:g}" for key in comparison["key_numbers"])
+        better_side = (
+            "DraftKings' better point"
+            if comparison.get("line_advantage", 0.0) > 0
+            else "The peer median's better point"
+        )
+        st.caption(f"🏈 {better_side} reaches or crosses NFL key number {keys}.")
 
 
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
@@ -1168,7 +1250,10 @@ actual_cost = 0
 for gl in selected_game_labels:
     ev = game_options[gl]
     eid = ev["id"]
-    if markets_str and not is_event_cached(sport["key"], eid, markets=markets_str, bookmakers=bookmakers_param):
+    # Team markets fetch all U.S. books in one same-cost request so the UI can
+    # show peer context. Only DraftKings is passed into the model below.
+    if markets_str and not is_event_cached(
+            sport["key"], eid, markets=markets_str, bookmakers=None):
         actual_cost += len(market_keys)
     if selected_props:
         prop_markets_str = ",".join(selected_props)
@@ -1458,9 +1543,9 @@ if analyze_clicked:
 
             # Game odds (moneyline/spreads/totals)
             if markets_str:
-                bookmakers = bookmakers_str.split(",") if bookmakers_str else None
                 odds_futures[eid] = pool.submit(
-                    get_event_odds, api_key, sport["key"], eid, markets=markets_str, bookmakers=bookmakers
+                    get_event_odds, api_key, sport["key"], eid,
+                    markets=markets_str, bookmakers=None
                 )
 
             # Player prop odds
@@ -1587,7 +1672,14 @@ if analyze_clicked:
 
         # Team market analysis
         if eid in odds_results:
-            game_odds = parse_game_odds(odds_results[eid])
+            raw_game_odds = odds_results[eid]
+            market_comparisons = build_market_comparisons(raw_game_odds)
+            draftkings_game_odds = dict(raw_game_odds)
+            draftkings_game_odds["bookmakers"] = [
+                book for book in raw_game_odds.get("bookmakers", [])
+                if book.get("key") == "draftkings"
+            ]
+            game_odds = parse_game_odds(draftkings_game_odds)
             home_espn = find_team(espn_teams, home)
             away_espn = find_team(espn_teams, away)
 
@@ -1623,17 +1715,25 @@ if analyze_clicked:
                     "recent_games": away_recent,
                 }
 
-                def _tag_event(cands):
+                def _tag_event(cands, market_key):
                     for c in cands:
                         c["event_id"] = eid
+                        if market_key == "totals":
+                            c["market_comparisons"] = (
+                                market_comparisons[market_key])
+                        else:
+                            comparison = market_comparisons[market_key].get(
+                                c.get("team"))
+                            if comparison:
+                                c["market_comparison"] = comparison
                     return cands
 
                 if "h2h" in market_keys:
-                    all_ml.extend(_tag_event(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features)))
+                    all_ml.extend(_tag_event(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "h2h"))
                 if "spreads" in market_keys:
-                    all_spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features)))
+                    all_spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "spreads"))
                 if "totals" in market_keys:
-                    all_totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features)))
+                    all_totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "totals"))
 
         # Player props analysis
         if eid in parsed_props:
@@ -1780,6 +1880,11 @@ if "analysis_results" in st.session_state:
     # Moneyline results
     if all_ml:
         st.subheader("💰 Moneyline Analysis")
+        if any(c.get("market_comparison") for c in all_ml):
+            st.caption(
+                "Market Comparison is line-shopping context only and does not "
+                "change model probability, edge, or ranking."
+            )
         value_ml = [c for c in all_ml if c["is_value"]]
         other_ml = [c for c in all_ml if not c["is_value"]]
 
@@ -1798,6 +1903,8 @@ if "analysis_results" in st.session_state:
                     p_val, p_delta = _dk_payout_strs(c.get("best_price"))
                     cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
                                    help="American odds and profit on a $10 bet at DraftKings.")
+                    _render_market_comparison(
+                        c.get("market_comparison"), ar["sport_key"])
 
         if other_ml:
             with st.expander(f"Other matchups ({len(other_ml)})"):
@@ -1810,12 +1917,19 @@ if "analysis_results" in st.session_state:
                         "Model Probability": f"{c.get('blended_prob', c['hist_prob'])}%",
                         "Edge": f"{c['edge_pct']:+.2f}%",
                         "Expected ROI": f"{c.get('expected_roi_pct', 0):+.2f}%",
+                        "Market Comparison": _market_comparison_summary(
+                            c.get("market_comparison")),
                     })
                 st.table(rows)
 
     # Spreads results
     if all_spreads:
         st.subheader("📊 Spread Analysis")
+        if any(c.get("market_comparison") for c in all_spreads):
+            st.caption(
+                "Market Comparison shows line and price together. It is "
+                "informational and does not change model edge or ranking."
+            )
         value_sp = [c for c in all_spreads if c["is_value"]]
         other_sp = [c for c in all_spreads if not c["is_value"]]
 
@@ -1833,6 +1947,9 @@ if "analysis_results" in st.session_state:
                     p_val, p_delta = _dk_payout_strs(c.get("price"))
                     cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
                                    help="American odds and profit on a $10 bet at DraftKings.")
+                    _render_market_comparison(
+                        c.get("market_comparison"), ar["sport_key"],
+                        market_key="spreads")
                     if c.get("model_source") == "expected_runs_ensemble":
                         st.caption(
                             "Expected-runs spread ensemble active · projected "
@@ -1857,12 +1974,20 @@ if "analysis_results" in st.session_state:
                         "Edge": f"{c['edge_pct']:+.2f}%",
                         "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                          if c.get("expected_roi_pct") is not None else "n/a"),
+                        "Market Comparison": _market_comparison_summary(
+                            c.get("market_comparison"), market_key="spreads"),
                     })
                 st.table(rows)
 
     # Totals results
     if all_totals:
         st.subheader("📈 Over/Under Analysis")
+        if any(c.get("market_comparisons") for c in all_totals):
+            st.caption(
+                "Market Comparison shows the displayed side's line and price "
+                "together. It is informational and does not change model edge "
+                "or ranking."
+            )
         for c in all_totals:
             flag = ""
             if c.get("is_over_value"):
@@ -1901,6 +2026,9 @@ if "analysis_results" in st.session_state:
                 cols[6].metric(payout_label, p_val, delta=p_delta, delta_color="off",
                                help="American odds and profit on a $10 bet at DraftKings.")
                 st.caption(f"Projected total minus book line: {c['diff_from_line']:+.2f}")
+                _render_market_comparison(
+                    (c.get("market_comparisons") or {}).get(side.title()),
+                    ar["sport_key"], market_key="totals", side=side)
                 # Merge OVER and UNDER alt ladders by line so the table shows
                 # both prices side-by-side.
                 if fetch_alt_lines:

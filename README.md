@@ -31,6 +31,7 @@ Value bets, safe alt-lines, and correlation-aware parlays
 - **Alternate lines** for safer threshold-style props such as `8+ points` or `4+ strikeouts`
 - **Value parlays and safe parlays** using a joint-probability model instead of naïvely multiplying every leg together
 - **Live sportsbook prices** converted into implied probabilities, de-vigged from same-book/same-line pairs while retaining the best executable side prices
+- **Market Comparison** context showing DraftKings' line and price beside the median of at least three complete peer-book offers, without changing model edge or rankings
 
 ## The mathematical stack
 
@@ -333,6 +334,7 @@ That makes the parlay builder much harder to fool with same-game correlation tra
 The repository includes scripts for testing and refitting the model:
 
 - `backtest.py` — team-market projection, player-prop sweeps, Safe Mode tests, and odds-history evaluation
+- `backtest_market_consensus.py` — budget-guarded, same-snapshot comparison of de-vigged peer-book consensus against DraftKings
 - `backtest_props.py` — chronological MLB starter xBA/K and batting-order exposure fits with holdout and rolling-fold gates
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files

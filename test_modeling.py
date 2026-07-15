@@ -10,6 +10,7 @@ from unittest.mock import patch
 import requests
 
 import analysis
+import backtest_market_consensus
 import backtest_starters
 import forward_tracker
 import mlb_starters
@@ -638,6 +639,196 @@ class AsOfReliabilityTests(unittest.TestCase):
 
 
 class MarketParsingTests(unittest.TestCase):
+    def test_market_comparison_keeps_dk_separate_from_peer_medians(self):
+        def book(key, spread, spread_price, total, total_price,
+                 complete=True):
+            spread_outcomes = [
+                {"name": "Home", "point": spread,
+                 "price": spread_price},
+            ]
+            if complete:
+                spread_outcomes.append({
+                    "name": "Away", "point": -spread, "price": -110})
+            return {
+                "key": key,
+                "markets": [
+                    {
+                        "key": "h2h",
+                        "outcomes": [
+                            {"name": "Home", "price": -110},
+                            {"name": "Away", "price": -110},
+                        ],
+                    },
+                    {"key": "spreads", "outcomes": spread_outcomes},
+                    {
+                        "key": "totals",
+                        "outcomes": [
+                            {"name": "Over", "point": total,
+                             "price": total_price},
+                            {"name": "Under", "point": total,
+                             "price": -110},
+                        ],
+                    },
+                ],
+            }
+
+        game = {
+            "home_team": "Home",
+            "away_team": "Away",
+            "bookmakers": [
+                book("draftkings", 1.5, -190, 8.5, -115),
+                book("peer-one", -1.5, 150, 9.0, -105),
+                book("peer-two", -1.5, 155, 9.0, -110),
+                book("peer-three", -1.5, 160, 9.0, -115),
+                book("incomplete", -2.5, 250, 10.0, 200,
+                     complete=False),
+            ],
+        }
+        comparisons = odds_client.build_market_comparisons(game)
+
+        spread = comparisons["spreads"]["Home"]
+        self.assertEqual(spread["primary_line"], 1.5)
+        self.assertEqual(spread["primary_price"], -190)
+        self.assertEqual(spread["peer_median_line"], -1.5)
+        self.assertEqual(spread["peer_median_price"], 155)
+        self.assertEqual(spread["peer_count"], 3)
+        self.assertEqual(spread["line_advantage"], 3.0)
+        self.assertFalse(spread["dominates_peer_offer"])
+        self.assertNotIn("edge", spread)
+
+        over = comparisons["totals"]["Over"]
+        under = comparisons["totals"]["Under"]
+        self.assertEqual(over["line_advantage"], 0.5)
+        self.assertEqual(under["line_advantage"], -0.5)
+
+        game["bookmakers"] = [
+            book("draftkings", 3.5, -115, 8.5, -110),
+            book("peer-one", 2.5, -110, 8.5, -110),
+            book("peer-two", 2.5, -105, 8.5, -110),
+            book("peer-three", 2.5, -115, 8.5, -110),
+        ]
+        key_number = odds_client.build_market_comparisons(
+            game)["spreads"]["Home"]
+        self.assertEqual(key_number["key_numbers"], [3.0])
+
+    def test_market_consensus_excludes_draftkings_and_cross_line_peers(self):
+        def book(key, home_price, away_price, home_point=-1.5):
+            return {
+                "key": key,
+                "markets": [{
+                    "key": "spreads",
+                    "outcomes": [
+                        {"name": "Home", "price": home_price,
+                         "point": home_point},
+                        {"name": "Away", "price": away_price,
+                         "point": -home_point},
+                    ],
+                }],
+            }
+
+        game = {
+            "id": "game",
+            "home_team": "Home",
+            "away_team": "Away",
+            "bookmakers": [
+                book("draftkings", 110, -130),
+                book("peer-one", -110, -110),
+                book("peer-two", -105, -115),
+                book("peer-three", -115, -105),
+                book("cross-line-outlier", 200, -250, home_point=-2.5),
+            ],
+        }
+        rows = backtest_market_consensus._build_market_observations(
+            game,
+            {"date": "2025-07-01", "home_score": 5, "away_score": 3},
+            "spreads",
+            min_peer_books=3,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["peer_count"], 3)
+        self.assertNotIn("draftkings", rows[0]["peer_books"])
+        self.assertNotIn("cross-line-outlier", rows[0]["peer_books"])
+        self.assertAlmostEqual(
+            sum(row["peer_probability"] for row in rows), 1.0)
+        self.assertEqual([row["result"] for row in rows], [1, -1])
+
+    def test_market_consensus_grades_totals_and_run_lines_by_side(self):
+        spread = {"point_a": -1.5, "point_b": 1.5}
+        total = {"point_a": 7.5, "point_b": 7.5}
+        self.assertEqual(
+            backtest_market_consensus._grade_side(
+                "spreads", "a", spread, 5, 3),
+            1,
+        )
+        self.assertEqual(
+            backtest_market_consensus._grade_side(
+                "spreads", "b", spread, 5, 3),
+            -1,
+        )
+        self.assertEqual(
+            backtest_market_consensus._grade_side(
+                "totals", "a", total, 5, 3),
+            1,
+        )
+        self.assertEqual(
+            backtest_market_consensus._grade_side(
+                "totals", "b", total, 5, 3),
+            -1,
+        )
+
+    def test_line_advantage_keeps_draftkings_price_in_the_grade(self):
+        def book(key, home_point, home_price, away_price):
+            return {
+                "key": key,
+                "markets": [{
+                    "key": "spreads",
+                    "outcomes": [
+                        {"name": "Home", "point": home_point,
+                         "price": home_price},
+                        {"name": "Away", "point": -home_point,
+                         "price": away_price},
+                    ],
+                }],
+            }
+
+        game = {
+            "id": "game",
+            "home_team": "Home",
+            "away_team": "Away",
+            "bookmakers": [
+                book("draftkings", 1.5, -190, 155),
+                book("peer-one", -1.5, 155, -185),
+                book("peer-two", -1.5, 160, -190),
+                book("peer-three", -1.5, 150, -180),
+            ],
+        }
+        rows = backtest_market_consensus._build_line_advantage_observations(
+            game,
+            {"date": "2025-07-01", "home_score": 4, "away_score": 3},
+            "spreads",
+            min_peer_books=3,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["side"], "home")
+        self.assertEqual(rows[0]["point_advantage"], 3.0)
+        self.assertEqual(rows[0]["price"], -190)
+        self.assertFalse(rows[0]["dominates_peer_offer"])
+        self.assertAlmostEqual(rows[0]["profit"], 100 / 190)
+
+        game["bookmakers"] = [
+            book("draftkings", 3.5, -115, -105),
+            book("peer-one", 2.5, -110, -110),
+            book("peer-two", 2.5, -105, -115),
+            book("peer-three", 2.5, -115, -105),
+        ]
+        rows = backtest_market_consensus._build_line_advantage_observations(
+            game,
+            {"date": "2025-07-01", "home_score": 4, "away_score": 3},
+            "spreads",
+            min_peer_books=3,
+        )
+        self.assertEqual(rows[0]["crossed_key_numbers"], [3.0])
+
     def test_props_use_devigged_consensus_and_best_side_prices(self):
         game = {
             "id": "game",
