@@ -426,8 +426,26 @@ def search_athlete(sport, league, name):
         name (str): Player name to search for
 
     Returns:
-        dict or None: {'id': str, 'name': str} or None if not found
+        dict or None: {'id': str, 'name': str, 'team_id': str|None} or None
+        if not found
     """
+    def _result(athlete):
+        team = athlete.get("team") or {}
+        team_id = team.get("id") if isinstance(team, dict) else None
+        if team_id is None:
+            for relationship in athlete.get("teamRelationships") or []:
+                if relationship.get("type") != "team":
+                    continue
+                team_id = (relationship.get("core") or {}).get("id")
+                if team_id is not None:
+                    break
+        return {
+            "id": str(athlete.get("id", "")),
+            "name": athlete.get(
+                "displayName", athlete.get("fullName", name)),
+            "team_id": str(team_id) if team_id is not None else None,
+        }
+
     # Try site API first (works for NBA, NFL)
     try:
         url = f"{SITE_API}/{sport}/{league}/athletes"
@@ -437,12 +455,10 @@ def search_athlete(sport, league, name):
             data = resp.json()
             athletes = data.get("athletes", [])
             if athletes and isinstance(athletes[0], dict):
-                athlete = athletes[0]
-                return {"id": str(athlete.get("id", "")), "name": athlete.get("displayName", athlete.get("fullName", name))}
+                return _result(athletes[0])
             items = data.get("items", [])
             if items:
-                athlete = items[0]
-                return {"id": str(athlete.get("id", "")), "name": athlete.get("displayName", athlete.get("fullName", name))}
+                return _result(items[0])
     except Exception:
         pass
 
@@ -456,10 +472,10 @@ def search_athlete(sport, league, name):
             items = data.get("items", [])
             for item in items:
                 if item.get("sport") == sport and item.get("league") == league:
-                    return {"id": str(item.get("id", "")), "name": item.get("displayName", name)}
+                    return _result(item)
             # If no sport/league match, take first player result
             if items:
-                return {"id": str(items[0].get("id", "")), "name": items[0].get("displayName", name)}
+                return _result(items[0])
     except Exception:
         pass
 
@@ -740,6 +756,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         return result
 
     result["athlete_id"] = athlete["id"]
+    result["team_id"] = athlete.get("team_id")
 
     gamelog = get_athlete_gamelog(sport, league, athlete["id"])
 
@@ -774,7 +791,10 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
     game_dates = []  # ISO timestamp per game (used for current-season counting)
     plate_appearances = []  # MLB batter exposure for PA-level matchup models
     at_bats = []
-    team_id = None
+    # Prefer the player's current team from search. Some ESPN game-log rows
+    # omit team metadata, and the game log can also reflect a former team
+    # immediately after a trade. Fall back to the newest row that has an ID.
+    team_id = result["team_id"]
     for game in gamelog[:n]:
         val = game.get(matched_label, 0.0)
         if prop_key == "pitcher_outs":

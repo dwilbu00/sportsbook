@@ -12,6 +12,7 @@ import requests
 import analysis
 import backtest_market_consensus
 import backtest_starters
+import espn_client
 import forward_tracker
 import mlb_starters
 import odds_client
@@ -639,6 +640,19 @@ class AsOfReliabilityTests(unittest.TestCase):
 
 
 class MarketParsingTests(unittest.TestCase):
+    def test_player_history_keeps_current_team_when_gamelog_omits_it(self):
+        with patch.object(espn_client, "search_athlete", return_value={
+                "id": "3934672", "name": "Jalen Brunson", "team_id": "18",
+        }), patch.object(espn_client, "get_athlete_gamelog", return_value=[
+                {"PTS": 25.0, "opponent": "Indiana Pacers",
+                 "is_home": False, "team_id": None},
+        ]):
+            history = espn_client.get_player_stat_history(
+                "basketball", "nba", "Jalen Brunson", "player_points")
+
+        self.assertTrue(history["found"])
+        self.assertEqual(history["team_id"], "18")
+
     def test_bet_checklist_entries_include_instructions_not_pricing(self):
         common = {"event_id": "game-1", "edge_pct": 8.5,
                   "best_price": -110, "expected_roi_pct": 12.0}
