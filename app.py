@@ -499,18 +499,32 @@ def needs_setup(config):
 def _closing_capture_status(result):
     """Build a concise user-facing status for a closing-capture attempt."""
     if not result.get("events"):
-        return "info", "No uncaptured analyzed event is within ten minutes of starting."
+        return "info", "No queued or currently eligible closing snapshot was found."
     captured = result.get("closing_captured", 0)
+    recovered = result.get("historical_captured", 0)
     misses = result.get("exact_line_misses", 0)
     errors = result.get("request_errors", 0)
     if errors:
+        historical_note = (
+            " Postgame recovery requires a paid Odds API plan."
+            if result.get("historical_events") else ""
+        )
         return (
             "warning",
             f"Closing odds were requested for {result['events']} event(s), but "
-            f"{errors} request(s) failed. Use the manual retry if needed.",
+            f"{errors} request(s) failed.{historical_note} "
+            "Use the manual retry if needed.",
         )
     if captured:
-        message = f"Captured {captured} exact-line closing price(s)."
+        if recovered == captured:
+            message = f"Recovered {captured} exact-line closing price(s) from the queued snapshot."
+        elif recovered:
+            message = (
+                f"Captured {captured} exact-line closing price(s), including "
+                f"{recovered} from queued historical snapshots."
+            )
+        else:
+            message = f"Captured {captured} exact-line closing price(s)."
         if misses:
             message += f" {misses} logged line(s) were no longer offered."
         return "success", message
@@ -518,7 +532,7 @@ def _closing_capture_status(result):
 
 
 def render_forward_capture_service(config):
-    """Arm one Streamlit-session timer for the next analyzed event close."""
+    """Run or arm the next durable closing-snapshot request."""
     from forward_tracker import capture_closing_odds, next_closing_capture
     from recalibration import read_prediction_log
 
@@ -542,8 +556,8 @@ def render_forward_capture_service(config):
             "Capture eligible closing odds now",
             key="capture_closing_odds_now",
             help=(
-                "Makes no Odds API request unless an analyzed event begins "
-                "within ten minutes. This can manually retry a prior miss."
+                "Captures a live event beginning within ten minutes or retries "
+                "an overdue queued snapshot through the paid historical API."
             ),
             width="stretch",
         )
@@ -576,9 +590,11 @@ def render_forward_capture_service(config):
         target = datetime.fromisoformat(next_capture["target_time"])
         target_et = target.astimezone(ZoneInfo("America/New_York"))
         st.caption(
-            "One closing request armed for "
+            "One closing request queued for "
             f"{target_et.strftime('%b %d at %I:%M %p ET')}. "
-            "The browser session must remain open."
+            "You may close this browser; it will run on the next app launch "
+            "after that time. Postgame recovery uses paid historical odds "
+            "(10 credits per requested market)."
         )
 
     one_shot_capture()

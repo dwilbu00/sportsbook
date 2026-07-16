@@ -14,7 +14,7 @@ import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from odds_client import get_event_odds
+from odds_client import get_event_odds, get_historical_event_odds
 from recalibration import (
     maintain_sport,
     mutate_prediction_log,
@@ -111,8 +111,38 @@ def closing_event_groups(rows, now=None, window_minutes=10, sport_key=None,
     return groups
 
 
+def overdue_closing_event_groups(rows, now=None, sport_key=None,
+                                 include_attempted=False):
+    """Group queued closing captures whose events have already started."""
+    now = now or datetime.now(timezone.utc)
+    groups = defaultdict(list)
+    attempted_events = {
+        (row.get("sport_key"), row.get("event_id"))
+        for row in rows
+        if row.get("event_id") and (row.get("closing_attempted_at")
+                                    or row.get("closing_captured_at"))
+    }
+    for row in rows:
+        if sport_key and row.get("sport_key") != sport_key:
+            continue
+        if (row.get("resolved") or row.get("closing_captured_at")
+                or not row.get("event_id")):
+            continue
+        event_key = (row.get("sport_key"), row["event_id"])
+        if event_key in attempted_events and not include_attempted:
+            continue
+        if not row.get("prop_key") or not row.get("player"):
+            continue
+        if (row.get("direction") or "").upper() not in ("OVER", "UNDER"):
+            continue
+        commence = _parse_utc(row.get("commence_time"))
+        if commence is not None and commence <= now:
+            groups[event_key].append(row)
+    return groups
+
+
 def next_closing_capture(rows, now=None, lead_minutes=5, sport_key=None):
-    """Return timing metadata for the next one-shot closing capture."""
+    """Return timing metadata for the next queued closing capture."""
     now = now or datetime.now(timezone.utc)
     events = {}
     attempted_events = {
@@ -132,7 +162,7 @@ def next_closing_capture(rows, now=None, lead_minutes=5, sport_key=None):
         if (row.get("direction") or "").upper() not in ("OVER", "UNDER"):
             continue
         commence = _parse_utc(row.get("commence_time"))
-        if commence is None or commence <= now:
+        if commence is None:
             continue
         key = (row.get("sport_key"), row["event_id"])
         if key in attempted_events:
@@ -202,35 +232,65 @@ def find_closing_offer(game_data, row):
 def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
                          sport_key=None, dry_run=False, now=None,
                          force_retry=False):
-    """Capture latest exact-line prices for logged events near game time."""
+    """Capture live or queued historical exact-line closing prices."""
     now = now or datetime.now(timezone.utc)
     # Streamlit can have multiple active sessions in one process. Serialize the
     # read/fetch/write cycle so two sessions cannot spend credits on the same
     # event before either one records its attempt.
     with _capture_lock:
-        groups = closing_event_groups(
-            read_prediction_log(), now=now, window_minutes=window_minutes,
+        prediction_rows = read_prediction_log()
+        live_groups = closing_event_groups(
+            prediction_rows, now=now, window_minutes=window_minutes,
             sport_key=sport_key, include_attempted=force_retry)
+        historical_groups = overdue_closing_event_groups(
+            prediction_rows, now=now, sport_key=sport_key,
+            include_attempted=force_retry)
+        # At the exact commence-time boundary an event can satisfy both group
+        # predicates. It must use the timestamped historical endpoint once the
+        # game has started, not the mutable live endpoint.
+        for event_key in historical_groups:
+            live_groups.pop(event_key, None)
+        event_groups = [
+            (event_key, rows, False)
+            for event_key, rows in live_groups.items()
+        ] + [
+            (event_key, rows, True)
+            for event_key, rows in historical_groups.items()
+        ]
         market_count = sum(len({row["prop_key"] for row in rows})
-                           for rows in groups.values())
+                           for _, rows, _ in event_groups)
         if dry_run:
             return {
-                "events": len(groups), "markets": market_count,
+                "events": len(event_groups), "markets": market_count,
+                "historical_events": len(historical_groups),
                 "rows_updated": 0, "exact_line_misses": 0,
                 "request_errors": 0, "closing_captured": 0,
+                "historical_captured": 0,
             }
 
         updates = {}
         misses = 0
         request_errors = 0
         captured = 0
-        for (event_sport, event_id), rows in groups.items():
+        historical_captured = 0
+        for (event_sport, event_id), rows, use_historical in event_groups:
             markets = ",".join(sorted({row["prop_key"] for row in rows}))
             attempted_at = now.isoformat()
+            snapshot_at = attempted_at
             try:
-                game_data = get_event_odds(
-                    api_key, event_sport, event_id, markets=markets,
-                    bookmakers=bookmakers, force_refresh=True)
+                if use_historical:
+                    commence = _parse_utc(rows[0].get("commence_time"))
+                    target = commence - timedelta(minutes=5)
+                    target_time = target.isoformat().replace("+00:00", "Z")
+                    game_data, snapshot_at = get_historical_event_odds(
+                        api_key, event_sport, event_id, date=target_time,
+                        markets=markets, bookmakers=bookmakers)
+                    if not game_data:
+                        raise RuntimeError("historical_snapshot_not_found")
+                else:
+                    game_data = get_event_odds(
+                        api_key, event_sport, event_id, markets=markets,
+                        bookmakers=bookmakers, force_refresh=True)
             except Exception as exc:
                 status_code = getattr(getattr(exc, "response", None),
                                       "status_code", None)
@@ -257,7 +317,8 @@ def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
                     updates[prediction_row_key(row)] = update
                     continue
                 commence = _parse_utc(row.get("commence_time"))
-                minutes_before = ((commence - now).total_seconds() / 60.0
+                snapshot_time = _parse_utc(snapshot_at) or now
+                minutes_before = ((commence - snapshot_time).total_seconds() / 60.0
                                   if commence else None)
                 update.update({
                     "closing_price": offer["price"],
@@ -265,12 +326,18 @@ def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
                     "closing_same_book_price": offer["same_book_price"],
                     "closing_books_sampled": offer["books_sampled"],
                     "closing_captured_at": attempted_at,
+                    "closing_snapshot_at": snapshot_time.isoformat(),
                     "closing_minutes_before": (
                         round(minutes_before, 2)
                         if minutes_before is not None else None),
-                    "closing_source": "odds_api_exact_line_pregame",
+                    "closing_source": (
+                        "odds_api_historical_exact_line_pregame"
+                        if use_historical
+                        else "odds_api_exact_line_pregame"),
                 })
                 captured += 1
+                if use_historical:
+                    historical_captured += 1
                 updates[prediction_row_key(row)] = update
 
         def apply_updates(current_rows):
@@ -284,9 +351,11 @@ def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
 
         rows_updated = mutate_prediction_log(apply_updates) if updates else 0
         return {
-            "events": len(groups), "markets": market_count,
+            "events": len(event_groups), "markets": market_count,
+            "historical_events": len(historical_groups),
             "rows_updated": rows_updated or 0, "exact_line_misses": misses,
             "request_errors": request_errors, "closing_captured": captured,
+            "historical_captured": historical_captured,
         }
 
 

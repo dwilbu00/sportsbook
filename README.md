@@ -413,10 +413,20 @@ snapshot. A checked event is not retried automatically, even when an exact line
 has disappeared, so multiple app sessions do not intentionally repeat the same
 credit spend.
 
-The browser session must remain active until the target time. The sidebar's
-**Capture eligible closing odds now** button provides a manual retry for an
-analyzed event beginning within ten minutes. Outcome resolution remains part of
-normal app analysis and uses ESPN rather than The Odds API.
+The prediction log also serves as a durable request queue. The browser can be
+closed after analysis; the next app launch at or after the target time consumes
+the queued request. If the event has not started, the app uses the normal live
+endpoint. If it has started, the app recovers the original five-minutes-before
+snapshot through the historical event-odds endpoint. Historical recovery
+requires a paid Odds API plan and costs 10 credits per requested market; a live
+capture costs one credit per requested market. Durable recovery across
+Streamlit container restarts requires the Azure Blob configuration described
+above.
+
+The sidebar's **Capture eligible closing odds now** button provides a manual
+retry for a live event beginning within ten minutes or for an overdue queued
+snapshot. Outcome resolution remains part of normal app analysis and uses ESPN
+rather than The Odds API.
 
 Useful manual commands:
 

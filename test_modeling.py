@@ -1150,6 +1150,23 @@ class ForwardTrackerTests(unittest.TestCase):
             [dict(row, closing_attempted_at="2024-07-01T20:30:00Z")],
             now=now))
 
+    def test_started_event_remains_queued_for_historical_recovery(self):
+        now = datetime(2024, 7, 1, 21, 0, tzinfo=timezone.utc)
+        row = {
+            "sport_key": "baseball_mlb",
+            "event_id": "game-1",
+            "commence_time": "2024-07-01T20:35:00Z",
+            "prop_key": "batter_hits",
+            "player": "José Ramírez",
+            "direction": "OVER",
+        }
+
+        scheduled = next_closing_capture([row], now=now)
+
+        self.assertEqual(scheduled["event_id"], "game-1")
+        self.assertEqual(scheduled["target_time"], "2024-07-01T20:30:00+00:00")
+        self.assertEqual(scheduled["wait_seconds"], 0)
+
     def test_closing_window_requires_uncaptured_event_metadata(self):
         now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
         base = {
@@ -1202,6 +1219,63 @@ class ForwardTrackerTests(unittest.TestCase):
         self.assertEqual(offer["price"], -105)
         self.assertEqual(offer["book"], "FanDuel")
         self.assertEqual(offer["same_book_price"], -115)
+
+    def test_overdue_capture_uses_original_historical_snapshot_time(self):
+        now = datetime(2024, 7, 1, 21, 0, tzinfo=timezone.utc)
+        rows = [{
+            "ts": "2024-07-01T18:00:00Z",
+            "sport_key": "baseball_mlb",
+            "event_id": "game-1",
+            "commence_time": "2024-07-01T20:35:00Z",
+            "prop_key": "batter_hits",
+            "player": "José Ramírez",
+            "direction": "OVER",
+            "line": 1.5,
+            "book": "DraftKings",
+            "resolved": False,
+        }]
+        historical_game = {
+            "bookmakers": [{
+                "title": "DraftKings",
+                "markets": [{
+                    "key": "batter_hits",
+                    "outcomes": [{
+                        "description": "Jose Ramirez", "name": "Over",
+                        "point": 1.5, "price": -105,
+                    }],
+                }],
+            }],
+        }
+
+        def mutate(mutator):
+            return mutator(rows)
+
+        with patch.object(
+                forward_tracker, "read_prediction_log", return_value=rows), patch.object(
+                forward_tracker, "get_historical_event_odds",
+                return_value=(historical_game, "2024-07-01T20:30:01Z")) as historical, patch.object(
+                forward_tracker, "get_event_odds") as live, patch.object(
+                forward_tracker, "mutate_prediction_log", side_effect=mutate):
+            result = forward_tracker.capture_closing_odds("key", now=now)
+
+        historical.assert_called_once_with(
+            "key", "baseball_mlb", "game-1",
+            date="2024-07-01T20:30:00Z", markets="batter_hits",
+            bookmakers=None,
+        )
+        live.assert_not_called()
+        self.assertEqual(result["historical_events"], 1)
+        self.assertEqual(result["historical_captured"], 1)
+        self.assertEqual(rows[0]["closing_price"], -105)
+        self.assertEqual(
+            rows[0]["closing_source"],
+            "odds_api_historical_exact_line_pregame",
+        )
+        self.assertEqual(
+            rows[0]["closing_snapshot_at"],
+            "2024-07-01T20:30:01+00:00",
+        )
+        self.assertAlmostEqual(rows[0]["closing_minutes_before"], 4.98)
 
     def test_missing_exact_line_is_attempted_only_once_automatically(self):
         now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
