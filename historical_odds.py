@@ -31,7 +31,7 @@ without any extra parsing.
 """
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "historical_odds")
@@ -69,6 +69,6 @@ def save_store(sport_key, store, label=""):
     """Persist the store; creates historical_odds/ if needed."""
     os.makedirs(STORE_DIR, exist_ok=True)
     store["sport_key"] = sport_key
-    store["updated"] = datetime.utcnow().isoformat() + "Z"
+    store["updated"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open(store_path(sport_key, label), "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)

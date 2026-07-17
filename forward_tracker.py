@@ -14,6 +14,8 @@ import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 from odds_client import get_event_odds, get_historical_event_odds
 from recalibration import (
     maintain_sport,
@@ -232,11 +234,29 @@ def find_closing_offer(game_data, row):
 def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
                          sport_key=None, dry_run=False, now=None,
                          force_retry=False):
-    """Capture live or queued historical exact-line closing prices."""
+    """Capture live or queued historical exact-line closing prices.
+
+    Concurrency / single-replica assumption
+    ---------------------------------------
+    The `_capture_lock` below is *process-local*: it prevents two Streamlit
+    sessions in the SAME process from paying for the same event's closing
+    snapshot. It does NOT coordinate across processes/replicas. The event is
+    also read (`read_prediction_log`) and its "attempted" flag written
+    (`mutate_prediction_log`) in two separate steps, so two replicas running
+    this concurrently could both see an event as un-attempted and each spend a
+    credit fetching its closing odds (a double-spend), even though the log
+    write itself is transactional.
+
+    This is safe on Streamlit Community Cloud, which runs a SINGLE replica per
+    app — the deployment target here. Before scaling to multiple replicas,
+    replace the read-then-write with an atomic claim (e.g. conditionally stamp
+    `closing_attempted_at` via the blob's If-Match ETag and only fetch after
+    winning the claim), so exactly one replica pays per event.
+    """
     now = now or datetime.now(timezone.utc)
-    # Streamlit can have multiple active sessions in one process. Serialize the
-    # read/fetch/write cycle so two sessions cannot spend credits on the same
-    # event before either one records its attempt.
+    # Serialize the read/fetch/write cycle within this process (see the
+    # single-replica note above) so two sessions cannot spend credits on the
+    # same event before either one records its attempt.
     with _capture_lock:
         prediction_rows = read_prediction_log()
         live_groups = closing_event_groups(
@@ -292,13 +312,27 @@ def capture_closing_odds(api_key, bookmakers=None, window_minutes=10,
                         api_key, event_sport, event_id, markets=markets,
                         bookmakers=bookmakers, force_refresh=True)
             except Exception as exc:
-                status_code = getattr(getattr(exc, "response", None),
-                                      "status_code", None)
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
                 error_code = type(exc).__name__
                 if status_code is not None:
                     error_code += f"_{status_code}"
                 print(f"  [closing] {event_id}: {error_code}")
                 request_errors += 1
+                # Don't burn the one-shot "attempted" flag on failures that are
+                # retryable later and spent no credit: transient network faults
+                # (a RequestException with no HTTP response) and quota/rate-limit
+                # responses (401/429). Leaving the event un-attempted lets the
+                # next run recover the paid closing snapshot instead of dropping
+                # it forever. Definitive outcomes (snapshot-not-found = credit
+                # spent, or a malformed-request HTTP error) are still marked.
+                retry_later = (
+                    (isinstance(exc, requests.exceptions.RequestException)
+                     and response is None)
+                    or status_code in (401, 429)
+                )
+                if retry_later:
+                    continue
                 for row in rows:
                     updates[prediction_row_key(row)] = {
                         "closing_attempted_at": attempted_at,

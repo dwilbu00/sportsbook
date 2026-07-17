@@ -286,9 +286,15 @@ def _render_market_comparison(
 
 
 def _clear_bet_selections():
+    # Delete (don't just set False) the checkbox keys: writing to a widget key
+    # promotes it to a durable session_state entry and defeats Streamlit's
+    # automatic garbage-collection of keys not rendered on the latest run, so
+    # the bet_selection:* namespace would grow unbounded across sport switches
+    # and re-analyses. Called only from callbacks / pre-render points, so the
+    # widgets are not yet instantiated this run and pop is safe.
     for key in list(st.session_state):
         if str(key).startswith("bet_selection:"):
-            st.session_state[key] = False
+            st.session_state.pop(key, None)
 
 
 def _value_bet_checklist_entries(
@@ -361,9 +367,10 @@ def _render_selected_bet_checklist(entries):
             hide_index=True,
             width="stretch",
         )
-        if st.button("Clear selected bets", key="clear_selected_bets"):
-            _clear_bet_selections()
-            st.rerun()
+        # on_click runs the reset in a callback (before widgets are
+        # instantiated on the rerun), so popping the checkbox keys is safe.
+        st.button("Clear selected bets", key="clear_selected_bets",
+                  on_click=_clear_bet_selections)
 
 
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
@@ -441,6 +448,10 @@ from analysis import (
 )
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+# config.json holds the API key and is git-ignored (see .gitignore). Only the
+# placeholder template is committed, so a fresh clone falls back to it and lands
+# on the setup screen instead of crashing.
+CONFIG_EXAMPLE_PATH = os.path.join(SCRIPT_DIR, "config.json.example")
 
 SPORTS = {
     "NBA": {
@@ -471,20 +482,34 @@ MARKET_OPTIONS = {
 
 
 def load_config():
-    with open(CONFIG_PATH, "r") as f:
+    path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else CONFIG_EXAMPLE_PATH
+    with open(path, "r") as f:
         config = json.load(f)
+    # Prefer the deployment secret / env var over the local file so the key
+    # never has to live on disk in a hosted environment.
     try:
         secret_api_key = st.secrets.get("ODDS_API_KEY")
         if secret_api_key:
             config["odds_api_key"] = str(secret_api_key)
     except Exception:
         pass
+    if not config.get("odds_api_key"):
+        config["odds_api_key"] = os.environ.get("ODDS_API_KEY", "")
     return config
 
 
 def save_api_key(key):
-    """Save the API key to config.json."""
-    config = load_config()
+    """Save the API key to the local, git-ignored config.json.
+
+    config.json is git-ignored, so the key stays on this machine. In a hosted
+    deployment (e.g. Streamlit Cloud) this local file is ephemeral — set
+    ODDS_API_KEY in Streamlit secrets there instead.
+    """
+    if os.path.exists(CONFIG_PATH):
+        config = load_config()
+    else:
+        with open(CONFIG_EXAMPLE_PATH, "r") as f:
+            config = json.load(f)
     config["odds_api_key"] = key
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
@@ -640,7 +665,9 @@ def show_setup_wizard():
     new_key = st.text_input(
         "API Key",
         placeholder="Paste your API key here...",
-        help="The key will be saved locally in config.json. It never leaves your computer.",
+        help=("Saved to a local, git-ignored config.json on this machine. "
+              "For a hosted deployment, set ODDS_API_KEY in Streamlit secrets "
+              "instead — the local file is not durable there."),
     )
 
     if st.button("💾 Save API Key", type="primary", width='stretch'):
@@ -660,7 +687,7 @@ def show_setup_wizard():
             - Listing upcoming games: **FREE** (0 credits)
             - Each market (moneyline, spreads, totals): **1 credit per call**
             - Each player prop market: **1 credit per game**
-            - This app **caches results for 10 minutes** to avoid wasting credits
+            - This app **caches results for 60 minutes (1 hour)** to avoid wasting credits
             - Example: analyzing 3 games with moneyline + spreads = **6 credits**
             """
         )
@@ -674,49 +701,6 @@ def fetch_events(api_key, sport_key):
 @st.cache_data(ttl=3600)
 def fetch_espn_teams(espn_sport, espn_league):
     return get_all_teams(espn_sport, espn_league)
-
-
-@st.cache_data(ttl=3600)
-def fetch_event_odds_cached(api_key, sport_key, event_id, markets, bookmakers_str):
-    bookmakers = bookmakers_str.split(",") if bookmakers_str else None
-    return get_event_odds(api_key, sport_key, event_id, markets=markets, bookmakers=bookmakers)
-
-
-@st.cache_data(ttl=3600)
-def fetch_team_schedule_cached(espn_sport, espn_league, team_id):
-    return get_team_schedule(espn_sport, espn_league, team_id)
-
-
-@st.cache_data(ttl=3600)
-def fetch_player_history_cached(espn_sport, espn_league, player_name, prop_key, n,
-                                cache_version="v2-minutes"):
-    """
-    Cached player history. `cache_version` is a no-op arg whose value is
-    bumped whenever the upstream return shape changes (forces cache miss).
-    Note: must NOT start with underscore — Streamlit excludes _-prefixed
-    args from the cache key.
-    """
-    return get_player_stat_history(espn_sport, espn_league, player_name, prop_key, n)
-
-
-def build_team_stats(team_info, espn_sport, espn_league, recent_n):
-    team_id = team_info["id"]
-    display_name = team_info["display_name"]
-    try:
-        games = fetch_team_schedule_cached(espn_sport, espn_league, team_id)
-    except Exception:
-        games = []
-    recent = compute_recent_form(games, display_name, n=recent_n)
-    return {
-        "season": {
-            "record": team_info["record"],
-            "wins": team_info["wins"],
-            "losses": team_info["losses"],
-            "win_pct": team_info["win_pct"],
-        },
-        "recent": recent,
-        "recent_games": games[:recent_n],
-    }
 
 
 def format_time(commence_time):
@@ -1205,6 +1189,22 @@ st.caption("Compare book odds vs historical stats to find value")
 with st.sidebar:
     st.header("⚙️ Settings")
 
+    # Durability notice (P1.8): the forward-tracking prediction log is only
+    # durable when an Azure Blob is configured. Without it the log lives in
+    # ephemeral container storage that a hosted deploy wipes on restart —
+    # silently resetting CLV/recalibration. Surface it during normal use, not
+    # only on the Model Guide page.
+    try:
+        from recalibration import prediction_log_storage as _pls
+        if _pls() == "Local cache":
+            st.warning(
+                "Forward-tracking data is stored locally and resets when a "
+                "hosted app (e.g. Streamlit Cloud) restarts or redeploys. Set "
+                "PREDICTION_LOG_BLOB_URL for a durable Azure Blob."
+            )
+    except Exception:
+        pass
+
     # Reset game selection when sport changes
     def on_sport_change():
         st.session_state["selected_games"] = []
@@ -1608,6 +1608,22 @@ if "parlay_results" in st.session_state:
         st.info("Not enough positive-edge bets to build parlays. Try selecting more games or markets.")
 
 if analyze_clicked:
+    # Pre-flight credit-budget guard (P1.7): don't silently spend into (or past)
+    # a reserve floor. `remaining` is None on a cold process (no live call has
+    # reported the balance yet), so we can only guard once it's known. Nothing
+    # has been spent at this point — the paid fan-out is below.
+    _reserve = int(config.get("credit_reserve", 0) or 0)
+    if (remaining is not None and actual_cost > 0
+            and actual_cost > remaining - _reserve):
+        st.error(
+            f"⛔ This analysis needs about {actual_cost} credit(s) but only "
+            f"{remaining} remain"
+            + (f" (holding {_reserve} in reserve)" if _reserve else "")
+            + ". Nothing was spent. Deselect some games or markets, wait for "
+            "your monthly reset, or lower `credit_reserve` in config.json."
+        )
+        st.stop()
+
     progress = st.progress(0, text="Starting analysis...")
 
     # Fetch ESPN teams
@@ -1685,6 +1701,23 @@ if analyze_clicked:
             except Exception as e:
                 warnings.append(f"Failed to fetch prop odds for event {eid}: {e}")
 
+        # Stale-odds warning (P1.5): get_event_odds serves bounded-age cached
+        # odds when credits are exhausted / rate-limited, flagged `_stale_cache`.
+        # Surface it so edges aren't trusted against outdated lines.
+        stale_events = {
+            eid for eid, data in
+            list(odds_results.items()) + list(prop_odds_results.items())
+            if isinstance(data, dict) and data.get("_stale_cache")
+        }
+        if stale_events:
+            warnings.append(
+                f"⚠️ Odds API credits appear exhausted or rate-limited — "
+                f"{len(stale_events)} event(s) were priced from STALE cached "
+                "odds (up to a few hours old). Verify current prices before "
+                "betting; edges for those games may be against lines that have "
+                "since moved."
+            )
+
         schedule_results = {}
         for tid, fut in team_schedule_futures.items():
             try:
@@ -1705,6 +1738,16 @@ if analyze_clicked:
         for eid, raw_data in prop_odds_results.items():
             parsed = parse_player_props(raw_data)
             parsed_props[eid] = parsed
+            # ESPN team ids for THIS matchup disambiguate same-name players so
+            # the correct athlete's history is fetched (see search_athlete
+            # team_ids). Global (player, prop) dedup means the first event to
+            # reference a name wins its hint — a namesake in a different game on
+            # the same slate is a documented residual.
+            event_teams = [find_team(espn_teams, tn)
+                           for tn in (parsed.get("home_team"),
+                                      parsed.get("away_team")) if tn]
+            event_team_ids = [str(t["id"]) for t in event_teams
+                              if t and t.get("id")]
             for prop_key, players in parsed.get("props", {}).items():
                 for player_name in players:
                     key = (player_name, prop_key)
@@ -1713,6 +1756,7 @@ if analyze_clicked:
                             get_player_stat_history,
                             sport["espn_sport"], sport["espn_league"],
                             player_name, prop_key, recent_n,
+                            team_ids=event_team_ids,
                         )
 
         # Collect all player histories

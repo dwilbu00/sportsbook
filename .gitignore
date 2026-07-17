@@ -10,5 +10,8 @@ __pycache__/
 # Streamlit secrets (only the example is committed)
 .streamlit/secrets.toml
 
+# Local runtime config holding the API key (only config.json.example is committed)
+config.json
+
 # Runtime caches and logs (populated by the app at run time, not source)
 cache/

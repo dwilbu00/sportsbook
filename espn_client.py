@@ -4,6 +4,7 @@ Fetches team records, recent results, and scoring averages.
 No authentication required.
 """
 
+import sys
 import requests
 from datetime import datetime, timedelta
 
@@ -14,6 +15,16 @@ CORE_API = "https://sports.core.api.espn.com/v2/sports"
 
 # Common timeout for all ESPN requests
 TIMEOUT = 15
+
+
+def _warn(message):
+    """Surface an otherwise-swallowed ESPN failure to the server log.
+
+    These calls fail closed (return None/[]) so the app keeps working, but a
+    silent failure is indistinguishable from a player genuinely having no data
+    and can quietly degrade projections. Emitting to stderr makes an outage or
+    a systematic parse break visible to operators without crashing analysis."""
+    print(f"[espn_client] {message}", file=sys.stderr)
 
 
 def get_all_teams(sport, league):
@@ -415,7 +426,125 @@ def find_team(teams_dict, search_name):
     return None
 
 
-def search_athlete(sport, league, name):
+def list_season_athletes(sport, league, season_year, seasontype=2,
+                         limit=250, max_pages=6):
+    """
+    Return season-long per-athlete stats for a league (free, no key).
+
+    Hits ESPN's public `statistics/byathlete` endpoint and returns a list of
+        {"id", "name", "position", "games", "minutes", "avg_minutes"}
+    for every athlete carrying a `general` stat block, across up to `max_pages`
+    pages. Used to build a usage-representative calibration pool (top-N by
+    minutes) instead of a hand-picked star list.
+
+    Column values are mapped to their names via the response's top-level
+    `categories[].names` (zipped positionally with each athlete's category
+    `values`), so a column reorder won't silently mis-read a stat.
+
+    Fails closed as a WHOLE: the byathlete feed is NOT minutes-ordered, so a
+    page-1-only subset omits high-minute rotation players stranded on later
+    pages. If any page errors mid-pagination — or `max_pages` truncates before
+    the last page is reached — the function warns and returns [] (discarding the
+    partial sample) so `_nba_player_pool` -> `refit_sport` aborts loudly rather
+    than silently fitting a ranking-biased subset. Only a clean traversal to the
+    last page (or an empty page) returns data. `max_pages` is a runaway safety
+    cap, not a sampling knob; the default comfortably covers a full league.
+    """
+    url = (f"https://site.web.api.espn.com/apis/common/v3/sports/"
+           f"{sport}/{league}/statistics/byathlete")
+    base_params = {
+        "region": "us", "lang": "en", "contentorigin": "espn",
+        "isqualified": "false", "seasontype": seasontype, "limit": limit,
+    }
+    if season_year:
+        base_params["season"] = season_year
+
+    out = []
+    complete = False
+    page = 1
+    while page <= max_pages:
+        try:
+            resp = requests.get(url, params=dict(base_params, page=page),
+                                timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            _warn(f"list_season_athletes failed for {sport}/{league} "
+                  f"season={season_year} page={page}: "
+                  f"{type(exc).__name__}: {exc}")
+            break  # incomplete: `complete` stays False -> return [] below
+
+        # Column names are defined once at the top level, per category.
+        columns = {cat.get("name"): (cat.get("names") or [])
+                   for cat in data.get("categories", []) if cat.get("name")}
+
+        athletes = data.get("athletes", [])
+        for entry in athletes:
+            parsed = _parse_byathlete_entry(entry, columns)
+            if parsed:
+                out.append(parsed)
+
+        # Completeness is decided by page traversal, NOT by comparing the count
+        # to `pagination.count` — legitimate parse skips (rows without an id)
+        # make `len(out) < count` on a perfectly complete fetch.
+        if not athletes:
+            complete = True
+            break
+        total_pages = (data.get("pagination") or {}).get("pages")
+        if total_pages and page >= total_pages:
+            complete = True
+            break
+        page += 1
+
+    if not complete:
+        _warn(f"list_season_athletes incomplete for {sport}/{league} "
+              f"season={season_year}: stopped at page {page} with {len(out)} "
+              f"athletes collected — returning [] (fail closed)")
+        return []
+    return out
+
+
+def _parse_byathlete_entry(entry, columns):
+    """
+    Extract id/name/position/games/minutes from one `byathlete` row.
+
+    `columns` maps a category name (e.g. "general") to its list of stat column
+    names, taken from the response's top-level `categories`. Returns None when
+    the row has no usable athlete id/name.
+    """
+    athlete = entry.get("athlete") or {}
+    aid = athlete.get("id")
+    name = athlete.get("displayName") or athlete.get("fullName")
+    if not aid or not name:
+        return None
+
+    def stat(category, stat_name):
+        names = columns.get(category) or []
+        if stat_name not in names:
+            return None
+        idx = names.index(stat_name)
+        for cat in entry.get("categories", []):
+            if cat.get("name") == category:
+                values = cat.get("values") or []
+                if idx < len(values):
+                    try:
+                        return float(values[idx])
+                    except (TypeError, ValueError):
+                        return None
+        return None
+
+    position = (athlete.get("position") or {}).get("abbreviation")
+    return {
+        "id": str(aid),
+        "name": name,
+        "position": position,
+        "games": stat("general", "gamesPlayed"),
+        "minutes": stat("general", "minutes"),
+        "avg_minutes": stat("general", "avgMinutes"),
+    }
+
+
+def search_athlete(sport, league, name, team_ids=None):
     """
     Search for an athlete by name.
     Tries the site API first (works for NBA/NFL), falls back to web search API (works for MLB).
@@ -424,11 +553,20 @@ def search_athlete(sport, league, name):
         sport (str): ESPN sport (e.g., 'basketball')
         league (str): ESPN league (e.g., 'nba')
         name (str): Player name to search for
+        team_ids (iterable, optional): ESPN team ids for the game this player is
+            in (typically the two teams of the matchup). When provided, a
+            candidate whose team matches one of these is preferred over ESPN's
+            raw first result — disambiguating same-name players (e.g. two
+            "Will Smith"s) so we don't project the wrong athlete's stats onto a
+            bet. Falls back to the first result when no candidate matches, so
+            behavior is never worse than the previous first-match-wins logic.
 
     Returns:
         dict or None: {'id': str, 'name': str, 'team_id': str|None} or None
         if not found
     """
+    wanted_teams = {str(t) for t in team_ids if t} if team_ids else set()
+
     def _result(athlete):
         team = athlete.get("team") or {}
         team_id = team.get("id") if isinstance(team, dict) else None
@@ -446,6 +584,22 @@ def search_athlete(sport, league, name):
             "team_id": str(team_id) if team_id is not None else None,
         }
 
+    def _pick(raw_candidates):
+        """Map raw ESPN entries to results and pick the best one.
+
+        Prefers a candidate on one of ``wanted_teams``; otherwise the first
+        (ESPN's own ranking), matching the historical behavior.
+        """
+        candidates = [_result(c) for c in raw_candidates
+                      if isinstance(c, dict)]
+        if not candidates:
+            return None
+        if wanted_teams:
+            for c in candidates:
+                if c.get("team_id") and c["team_id"] in wanted_teams:
+                    return c
+        return candidates[0]
+
     # Try site API first (works for NBA, NFL)
     try:
         url = f"{SITE_API}/{sport}/{league}/athletes"
@@ -453,14 +607,14 @@ def search_athlete(sport, league, name):
         resp = requests.get(url, params=params, timeout=TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
-            athletes = data.get("athletes", [])
-            if athletes and isinstance(athletes[0], dict):
-                return _result(athletes[0])
-            items = data.get("items", [])
-            if items:
-                return _result(items[0])
-    except Exception:
-        pass
+            picked = _pick(data.get("athletes") or data.get("items") or [])
+            if picked:
+                return picked
+    except Exception as exc:
+        # Keep the broad catch here so a site-API hiccup still falls through to
+        # the web-search fallback below, but no longer swallow it silently.
+        _warn(f"search_athlete site API failed for "
+              f"{sport}/{league} {name!r}: {type(exc).__name__}: {exc}")
 
     # Fallback: web search API (works for MLB and all sports)
     try:
@@ -470,14 +624,25 @@ def search_athlete(sport, league, name):
         if resp.status_code == 200:
             data = resp.json()
             items = data.get("items", [])
-            for item in items:
-                if item.get("sport") == sport and item.get("league") == league:
-                    return _result(item)
-            # If no sport/league match, take first player result
-            if items:
-                return _result(items[0])
-    except Exception:
-        pass
+            # The web search is cross-sport (a name can hit MLB/NHL/CFB/etc.), so
+            # restrict to the requested sport/league and apply the team hint only
+            # within that set. If nothing matches, fall back to the first player
+            # result exactly as before — do NOT team-prefer across a cross-sport
+            # list (team ids overlap numerically between sports, so a coincidental
+            # match could otherwise surface a wrong-sport athlete).
+            matched = [it for it in items
+                       if it.get("sport") == sport and it.get("league") == league]
+            if matched:
+                picked = _pick(matched)
+            elif items:
+                picked = _result(items[0])
+            else:
+                picked = None
+            if picked:
+                return picked
+    except Exception as exc:
+        _warn(f"search_athlete web search failed for "
+              f"{sport}/{league} {name!r}: {type(exc).__name__}: {exc}")
 
     return None
 
@@ -511,7 +676,12 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
         resp = requests.get(url, params=params or None, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError) as exc:
+        # Network fault or malformed JSON. Fail closed (callers treat [] as
+        # "no games"), but surface it: a swallowed outage is otherwise
+        # indistinguishable from a player who genuinely has no gamelog.
+        _warn(f"get_athlete_gamelog failed for {sport}/{league} "
+              f"athlete {athlete_id}: {type(exc).__name__}: {exc}")
         return []
 
     games = []
@@ -717,7 +887,8 @@ PROP_STAT_MAP = {
 }
 
 
-def get_player_stat_history(sport, league, player_name, prop_key, n=20):
+def get_player_stat_history(sport, league, player_name, prop_key, n=20,
+                            team_ids=None):
     """
     Look up a player on ESPN and return their recent stat values for a given prop.
 
@@ -727,6 +898,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         player_name (str): Player name from the odds API
         prop_key (str): Odds API prop market key (e.g., 'player_points')
         n (int): Number of recent games to return
+        team_ids (iterable, optional): ESPN team ids of the matchup, forwarded to
+            search_athlete to disambiguate same-name players (see that function).
 
     Returns:
         dict: {
@@ -751,7 +924,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20):
         "found": False,
     }
 
-    athlete = search_athlete(sport, league, player_name)
+    athlete = search_athlete(sport, league, player_name, team_ids=team_ids)
     if not athlete or not athlete["id"]:
         return result
 

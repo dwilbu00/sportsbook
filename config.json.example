@@ -1,5 +1,5 @@
 {
-    "odds_api_key": "86e5622c3e84bcd0a48de5e49b24eb80",
+    "odds_api_key": "YOUR_API_KEY_HERE",
     "default_sport": "basketball_nba",
     "value_threshold_pct": 5.0,
     "recent_games_window": 10,

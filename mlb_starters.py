@@ -25,10 +25,50 @@ import json
 import math
 import os
 import random
+import sys
 import time
 import unicodedata
 
 import requests
+
+
+def _warn(msg):
+    """Surface a non-fatal data problem to stderr (fail-visible, not fail-silent).
+
+    Mirrors ``espn_client._warn``. Used where a silent fallback would otherwise
+    hide a real defect — e.g. a Savant/StatsAPI team-key mismatch quietly
+    disabling the expected-runs ensemble challenger for the affected teams.
+    """
+    print(f"[mlb_starters] {msg}", file=sys.stderr)
+
+
+# Baseball Savant returns team abbreviations (in the grouped-by-team CSV's
+# ``player_name`` column) that occasionally diverge from the MLB Stats API
+# ``abbreviation`` the consumer looks up by. Known divergence: the Athletics
+# rebrand — Savant emits ``ATH`` while the Stats API (2024) still returns
+# ``OAK``. The mapping is Savant-key -> StatsAPI-abbr; _canonical_team_key
+# applies it only when the target actually exists in the season's team index
+# (so it can't mis-remap a season where StatsAPI itself uses ``ATH``), and the
+# coverage validation in get_expected_runs_team_factors loudly flags any NEW
+# divergence that this table doesn't yet cover.
+_SAVANT_TO_STATSAPI_ABBR = {"ATH": "OAK"}
+
+
+def _canonical_team_key(savant_key, statsapi_abbrs):
+    """Map a Savant team key into the StatsAPI-abbreviation namespace.
+
+    Self-correcting across seasons: an alias is only applied when the mapped
+    abbreviation is present in ``statsapi_abbrs`` for this season AND the raw
+    key is not, so it fixes the current divergence without breaking a future
+    season where the two sources happen to agree. Unresolved keys are returned
+    unchanged so the caller's validation can flag them.
+    """
+    if savant_key in statsapi_abbrs:
+        return savant_key
+    alias = _SAVANT_TO_STATSAPI_ABBR.get(savant_key)
+    if alias and alias in statsapi_abbrs:
+        return alias
+    return savant_key
 
 
 BASE_URL = "https://statsapi.mlb.com/api/v1"
@@ -164,7 +204,9 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
     if cutoff.year < int(season):
         return None
 
-    cache = f"savant_expected_runs_teams_v1_{season}_{cutoff.isoformat()}_{min_pa}"
+    # v2: team keys are now normalized into the StatsAPI-abbreviation namespace
+    # (see below); a stale v1 cache holds raw Savant keys, so bump to invalidate.
+    cache = f"savant_expected_runs_teams_v2_{season}_{cutoff.isoformat()}_{min_pa}"
     cached = _read_cache(cache, max_age=24 * 3600)
     if cached is not None:
         return cached
@@ -202,6 +244,41 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
         "player_type": "pitcher",
         "position": "RP",
     })
+
+    # Normalize Savant's team keys into the StatsAPI-abbreviation namespace the
+    # consumer (_expected_offense / _expected_staff) looks up by. Without this a
+    # divergent key (e.g. Savant 'ATH' vs StatsAPI 'OAK') silently yields no
+    # match -> expected_runs.complete=False -> the ensemble challenger is dropped
+    # for that team with zero visibility. A team-index hiccup just skips
+    # normalization (raw keys still match ~29/30) rather than disabling the model.
+    try:
+        team_index = get_team_index(season)
+    except (OSError, ValueError, requests.RequestException) as exc:
+        _warn(f"team index unavailable for season {season}: "
+              f"{type(exc).__name__}: {exc}; skipping Savant team-key normalization")
+        team_index = None
+    statsapi_abbrs = {info.get("abbr") for info in (team_index or {}).values()
+                      if info.get("abbr")}
+    if statsapi_abbrs:
+        def _norm_keys(d):
+            return {_canonical_team_key(k, statsapi_abbrs): v
+                    for k, v in d.items()}
+        offense_vs_hand = {hand: _norm_keys(rows)
+                           for hand, rows in offense_vs_hand.items()}
+        bullpens = _norm_keys(bullpens)
+        # Fail-visible coverage check: an unmapped Savant key (likely a new team
+        # rename not yet in _SAVANT_TO_STATSAPI_ABBR) or a StatsAPI team with no
+        # Savant coverage means the challenger is disabled for those teams. Warn
+        # loudly instead of failing silently as before.
+        offense_keys = {k for rows in offense_vs_hand.values() for k in rows}
+        unmapped = sorted(offense_keys - statsapi_abbrs)
+        missing = sorted(statsapi_abbrs - offense_keys)
+        if unmapped or missing:
+            _warn(f"expected-runs team-key coverage gap for season {season}: "
+                  f"Savant keys outside the StatsAPI namespace={unmapped}; "
+                  f"StatsAPI teams with no Savant offense data={missing}. The "
+                  f"ensemble challenger is disabled for these teams — extend "
+                  f"_SAVANT_TO_STATSAPI_ABBR if 'unmapped' is a rename.")
 
     offense_rows = [
         row

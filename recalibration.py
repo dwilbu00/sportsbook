@@ -252,14 +252,71 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
 
 
 def log_prediction_rows(new_rows):
-    """Append a batch of prediction rows in one local or remote transaction."""
+    """Append prediction rows, de-duplicating by forecast identity.
+
+    Re-viewing the same slate would otherwise append a fresh row for every
+    (sport, event, prop, player, line) on each analysis, growing the log
+    without bound and rewriting the whole blob every append. Instead we keep a
+    single row per forecast identity: the newest forecast supersedes stale
+    unresolved duplicates, while any graded outcome or captured closing price
+    on an older duplicate is folded forward so scoring/CLV survive. A forecast
+    whose outcome is already resolved is never overwritten by a later re-log.
+
+    Returns the number of log rows added or changed.
+    """
     if not new_rows:
         return 0
     try:
-        def append(rows):
-            rows.extend(new_rows)
-            return len(new_rows)
-        return mutate_prediction_log(append)
+        def upsert(rows):
+            incoming = {}
+            for row in new_rows:
+                incoming[prediction_identity(row)] = row  # last in batch wins
+            incoming_idents = set(incoming)
+            existing = defaultdict(list)
+            for row in rows:
+                ident = prediction_identity(row)
+                if ident in incoming_idents:
+                    existing[ident].append(row)
+            kept = [row for row in rows
+                    if prediction_identity(row) not in incoming_idents]
+            changes = 0
+            for ident, row in incoming.items():
+                group = existing.get(ident, [])
+                collapsed = _collapse_identity_rows(group + [row])
+                kept.append(collapsed)
+                # Re-logging a single already-resolved forecast changes nothing.
+                no_op = (len(group) == 1 and group[0].get("resolved")
+                         and collapsed == group[0])
+                if not no_op:
+                    changes += 1
+            rows[:] = kept
+            return changes
+        return mutate_prediction_log(upsert)
+    except Exception:
+        return 0
+
+
+def compact_prediction_log():
+    """Collapse duplicate forecasts (same identity) into a single row each.
+
+    Bounds historical growth of the prediction log. A no-op (returns 0, writes
+    nothing) once the log already holds one row per forecast identity."""
+    def compact(rows):
+        order = []
+        grouped = defaultdict(list)
+        for row in rows:
+            ident = prediction_identity(row)
+            if ident not in grouped:
+                order.append(ident)
+            grouped[ident].append(row)
+        merged = [_collapse_identity_rows(grouped[ident]) for ident in order]
+        removed = len(rows) - len(merged)
+        if removed <= 0:
+            return 0
+        rows[:] = merged
+        return removed
+    try:
+        return mutate_prediction_log(compact)
     except Exception:
         return 0
 
@@ -289,6 +346,40 @@ def prediction_identity(row):
 def prediction_row_key(row):
     """Identity for updating one physical log row, including its timestamp."""
     return (row.get("ts"),) + prediction_identity(row)
+
+
+def _merge_closing_and_outcome(dest, src):
+    """Fold resolved-outcome and closing-price fields from `src` into `dest`
+    when `dest` lacks them, so de-duplicating never drops a graded result or a
+    captured closing price."""
+    if not dest.get("resolved") and src.get("resolved"):
+        for key in ("resolved", "actual", "outcome", "resolved_at"):
+            if key in src:
+                dest[key] = src[key]
+    if not dest.get("closing_captured_at") and src.get("closing_captured_at"):
+        for key, value in src.items():
+            if key.startswith("closing_"):
+                dest[key] = value
+
+
+def _collapse_identity_rows(group):
+    """Merge duplicate rows that share a prediction identity into one row.
+
+    Prefers the most recent *resolved* forecast (else the most recent forecast)
+    as the base, then folds in outcome and closing-price fields captured on any
+    sibling. Returns the sole row unchanged when there is nothing to merge."""
+    if len(group) == 1:
+        return group[0]
+
+    def _recency(row):
+        return row.get("resolved_at") or row.get("ts") or ""
+
+    resolved = [row for row in group if row.get("resolved")]
+    base = dict(max(resolved or group, key=_recency))
+    for row in group:
+        if row is not base:
+            _merge_closing_and_outcome(base, row)
+    return base
 
 
 def _american_decimal(price):
@@ -758,6 +849,13 @@ def fit_platt_chronological(records):
     if final_fit is None:
         return None
     final_a, final_b = final_fit
+    # The deployed (a, b) are refit on *all* observations for the strongest
+    # estimate. The holdout_* metrics are the cross-validated score of the
+    # fitting *procedure* over two expanding folds — not of these exact deployed
+    # parameters, which by construction have seen every row and so cannot be
+    # scored on unseen data. Both folds had to beat the raw probabilities on
+    # their untouched later window to reach here, so the procedure is validated
+    # even though the final parameters themselves are not directly held out.
     return {
         "a": final_a,
         "b": final_b,
@@ -769,6 +867,8 @@ def fit_platt_chronological(records):
         "holdout_calibrated_brier": cal_brier,
         "holdout_raw_log_loss": raw_log_loss,
         "holdout_calibrated_log_loss": cal_log_loss,
+        "holdout_metric_scope": "fold_cross_validation",
+        "deploy_fit_scope": "all_observations",
         "validation_folds": validation_folds,
         "validated": True,
     }
@@ -882,6 +982,10 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
             "holdout_raw_log_loss": round(result["holdout_raw_log_loss"], 6),
             "holdout_calibrated_log_loss": round(
                 result["holdout_calibrated_log_loss"], 6),
+            "holdout_metric_scope": result.get(
+                "holdout_metric_scope", "fold_cross_validation"),
+            "deploy_fit_scope": result.get(
+                "deploy_fit_scope", "all_observations"),
             "validation_folds": result["validation_folds"],
             "validated": True,
         }
@@ -933,6 +1037,9 @@ def maintain_sport(sport_key):
     if do_refit:
         fits = refit_sport(
             sport_key, resolve_first=False, newly_resolved=newly_resolved)
+    # Opportunistically bound log growth from repeated same-slate logging.
+    # Writes only when duplicates actually exist, so this is free on a clean log.
+    compact_prediction_log()
     return {"newly_resolved": newly_resolved, "refit": bool(fits)}
 
 
@@ -1003,7 +1110,18 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         prop_cfg = cal.get(obs["prop_key"]) or {}
         raw = emp
         if prop_cfg.get("method"):
-            curr_games = len(obs.get("prior_games") or [])
+            # Match runtime warmup blending: count only the player's prior games
+            # inside the observation's *current season*, not every historical
+            # game — otherwise the current-season fit is over-weighted and the
+            # seeded raw probabilities diverge from what production emits.
+            prior_dates = [g.get("game_date")
+                           for g in (obs.get("prior_games") or [])]
+            try:
+                obs_now = datetime.fromisoformat(str(obs.get("game_date"))[:10])
+            except (TypeError, ValueError):
+                obs_now = None
+            curr_games = count_current_season_games(
+                prior_dates, sport_key, now=obs_now)
             p_cal = apply_calibration_with_warmup(
                 prop_cfg, projected, obs["line"], curr_games,
                 empirical_over=emp,
@@ -1039,6 +1157,10 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
             "holdout_raw_log_loss": round(result["holdout_raw_log_loss"], 6),
             "holdout_calibrated_log_loss": round(
                 result["holdout_calibrated_log_loss"], 6),
+            "holdout_metric_scope": result.get(
+                "holdout_metric_scope", "fold_cross_validation"),
+            "deploy_fit_scope": result.get(
+                "deploy_fit_scope", "all_observations"),
             "validation_folds": result["validation_folds"],
             "validated": True,
             "source": "book_line_cache_seed",
@@ -1109,4 +1231,6 @@ def _main_cli():
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     _main_cli()

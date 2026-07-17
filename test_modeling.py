@@ -373,8 +373,17 @@ class ExpectedRunsTests(unittest.TestCase):
             {"player_name": "HME", "xwoba": "0.300", "pa": "150"},
             {"player_name": "AWY", "xwoba": "0.360", "pa": "150"},
         ]
+        # Savant team keys are normalized against the season's StatsAPI abbrs;
+        # give a fake index using the same placeholder abbrs so normalization is
+        # a no-op (and the test stays hermetic — no live team-index fetch).
+        fake_index = {
+            "home": {"id": 1, "name": "Home", "abbr": "HME"},
+            "away": {"id": 2, "name": "Away", "abbr": "AWY"},
+        }
         with tempfile.TemporaryDirectory() as cache_dir, patch.object(
                 mlb_starters, "CACHE_DIR", cache_dir), patch.object(
+                mlb_starters, "get_team_index", return_value=fake_index), \
+                patch.object(
                 mlb_starters, "_get_savant_csv",
                 side_effect=[offense_left, offense_right, bullpens]) as fetch:
             factors = mlb_starters.get_expected_runs_team_factors(

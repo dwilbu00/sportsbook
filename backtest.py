@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from espn_client import (
@@ -655,7 +656,7 @@ def _best_shrink(obs, step=0.05):
 def _write_shrink_calibration(sport_key, results):
     """Fit and persist the Brier-optimal probability shrink per team market
     (from the 'live' variant) to calibration/<sport>.json."""
-    from datetime import datetime
+    from datetime import datetime, timezone
     variant = "live" if "live" in results else next(iter(results), None)
     if not variant:
         print("  [write-calibration] No variant to write.")
@@ -674,7 +675,7 @@ def _write_shrink_calibration(sport_key, results):
         return
     save_prob_shrink(sport_key, shrink, meta={
         "source": "odds backtest --engine live",
-        "fit_timestamp": datetime.utcnow().isoformat() + "Z",
+        "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
     print(f"\n  [write-calibration] Wrote prob_shrink to "
           f"calibration/{sport_key}.json: {shrink}")
@@ -1080,7 +1081,7 @@ def _print_odds_results(results):
 def _write_blend_calibration(sport_key, results):
     """Write the best blend weight per market (from the chosen variant) to
     calibration/<sport>.json so the live analyzers consume it."""
-    from datetime import datetime
+    from datetime import datetime, timezone
     # Prefer the production-like 'all' variant; else the first available.
     variant = "all" if "all" in results else next(iter(results), None)
     if not variant:
@@ -1106,7 +1107,7 @@ def _write_blend_calibration(sport_key, results):
         return
     save_market_blend(sport_key, blend, meta={
         "variant": variant,
-        "fit_timestamp": datetime.utcnow().isoformat() + "Z",
+        "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
     print(f"\n  [write-calibration] Wrote blend weights (variant '{variant}') "
           f"to calibration/{sport_key}.json:")
@@ -1570,7 +1571,11 @@ def _build_props_sweep_grid():
 #  Player-props backtest
 # ────────────────────────────────────────────────────────────────
 
-# Default starter lists per sport (used when --players is not provided).
+# Manual fallback player lists per sport, used when --players is not provided
+# AND no data-driven pool applies. Calibration refits build usage-representative
+# pools instead (refit_calibration._mlb_player_pool / _nba_player_pool); these
+# hand-picked names are a survivorship-biased convenience for quick ad-hoc
+# backtest.py runs, NOT the calibration pool.
 DEFAULT_STARTERS = {
     "nba": [
         "Cade Cunningham",
@@ -1813,13 +1818,19 @@ def _team_defense_lookup(espn_sport, espn_league, season_year=None):
     return lookup, series, league_avg
 
 
-def _resolve_opp_pa_windowed(opp_name, test_date, team_series, window):
+def _resolve_opp_pa_asof(opp_name, test_date, team_series, window=None):
     """
-    Return avg pts allowed by `opp_name` using only their `window` most-recent
-    games STRICTLY BEFORE `test_date`. Avoids look-ahead leakage in backtest.
-    Returns None if not enough data.
+    Return avg pts allowed by `opp_name` using only their games STRICTLY BEFORE
+    `test_date` (leakage-safe). This is the backtest analogue of the runtime
+    model, which sees only season-to-date opponent defense.
+
+    window=None  → all prior games this season (season-to-date, matches runtime)
+    window=N (>0) → only the trailing N games before test_date
+
+    Returns None when no prior games exist (caller should then skip the
+    adjustment rather than fall back to a full-season average, which would leak).
     """
-    if not opp_name or not team_series or not window:
+    if not opp_name or not team_series:
         return None
     # Tolerant team-name lookup (same logic as _resolve_opp_pts_allowed)
     rows = team_series.get(opp_name)
@@ -1836,7 +1847,8 @@ def _resolve_opp_pa_windowed(opp_name, test_date, team_series, window):
     prior = [a for d, a in rows if d and d < cutoff]
     if not prior:
         return None
-    prior = prior[:window]
+    if window:
+        prior = prior[:window]
     return sum(prior) / len(prior)
 
 
@@ -2075,16 +2087,20 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
 
                     output_def_s = params.get("def_adj", 0.0)
                     def_window = params.get("def_window")
-                    if output_def_s > 0 and team_defense and league_avg_def:
-                        if def_window and team_defense_series:
-                            opp_pa = _resolve_opp_pa_windowed(
-                                upcoming_opp, upcoming_date,
-                                team_defense_series, def_window)
-                            # Fallback to season avg when no windowed data
-                            if opp_pa is None:
-                                opp_pa = _resolve_opp_pts_allowed(upcoming_opp, team_defense)
-                        else:
-                            opp_pa = _resolve_opp_pts_allowed(upcoming_opp, team_defense)
+                    if output_def_s > 0 and team_defense_series and league_avg_def:
+                        # Leakage-safe opponent defense: use only the opponent's
+                        # games strictly before this game — season-to-date when
+                        # def_window is None (matching the runtime model), else
+                        # the trailing def_window games. Fitting on the
+                        # full-season aggregate would leak future results and
+                        # miscalibrate live probabilities (the residual
+                        # distribution would be fit against projections the
+                        # production model never produces). When no prior games
+                        # exist yet, skip the adjustment rather than falling back
+                        # to the (leaky) full-season average.
+                        opp_pa = _resolve_opp_pa_asof(
+                            upcoming_opp, upcoming_date,
+                            team_defense_series, def_window)
                         if opp_pa:
                             projected *= 1.0 + output_def_s * (opp_pa / league_avg_def - 1.0)
 
@@ -2462,7 +2478,7 @@ def _evaluate_calibration_methods(obs, k_values, holdout=False):
     holdout=False: fit and score on the same `obs` (diagnostic / in-sample).
     holdout=True:  sort by game_date, fit on earliest 50%, score on latest 50%.
     """
-    if len(obs) < 40 if holdout else 20:
+    if len(obs) < (40 if holdout else 20):
         return []
 
     # Determine fit vs score sets
@@ -2477,8 +2493,28 @@ def _evaluate_calibration_methods(obs, k_values, holdout=False):
         fit_obs = obs
         score_obs = obs
 
+    return _score_calibration_methods(fit_obs, score_obs, k_values)
+
+
+def _score_calibration_methods(fit_obs, score_obs, k_values):
+    """
+    Fit calibration params on `fit_obs` and score them on `score_obs`.
+
+    Returns a list of {method, k, brier, hit} for methods A (empirical),
+    B (pooled Gaussian), C (pooled ECDF) and B*/C* (per-player shrinkage) at
+    each k. Both inputs use the calib_obs schema
+    (name, projected, line, actual, empirical_over, date). Splitting fit from
+    score lets callers supply arbitrary chronological folds (e.g. the
+    confirmation folds used by the calibration refit) without re-deriving the
+    method math. Returns [] when either set has no usable rows.
+    """
+    if not fit_obs or not score_obs:
+        return []
+
     # Pool stats from fit_obs
     all_resid = [actual - proj for _, proj, _, actual, _, *_ in fit_obs]
+    if not all_resid:
+        return []
     mu_pool = sum(all_resid) / len(all_resid)
     var_pool = sum((r - mu_pool) ** 2 for r in all_resid) / len(all_resid)
     sigma_pool = math.sqrt(var_pool) if var_pool > 0 else 1e-6
@@ -3243,4 +3279,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     main()

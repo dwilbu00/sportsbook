@@ -1,0 +1,206 @@
+"""Oracle and regression tests for the core money math.
+
+Covers the primitives that decide which bets are shown as +EV — odds
+conversion, expected ROI, the player-prop value gate (P1.1), the same-game
+parlay payout neutralization (P1.2), the Gaussian-copula joint probability, and
+the live Platt application. These are the highest-leverage surfaces in the app:
+a regression here mislabels real-money bets, so each assertion pins a
+hand-computed expected value rather than re-deriving through the code under test.
+"""
+
+import math
+import unittest
+
+import analysis
+import odds_client
+from odds_client import american_to_decimal, american_to_implied_prob
+from recalibration import apply_platt
+
+
+class OddsConversionTests(unittest.TestCase):
+    def test_american_to_decimal_table(self):
+        self.assertAlmostEqual(american_to_decimal(-110), 1.9090909, places=6)
+        self.assertEqual(american_to_decimal(100), 2.0)
+        self.assertEqual(american_to_decimal(150), 2.5)
+        self.assertEqual(american_to_decimal(-200), 1.5)
+        self.assertEqual(american_to_decimal(-500), 1.2)
+        self.assertEqual(american_to_decimal(300), 4.0)
+
+    def test_implied_prob_is_inverse_of_decimal(self):
+        # american_to_implied_prob(x) must equal 1 / american_to_decimal(x);
+        # this exact-inverse property is what makes the ML/totals/spreads EV
+        # gates safe.
+        for a in (-500, -200, -110, 120, 150, 300):
+            self.assertAlmostEqual(
+                american_to_implied_prob(a),
+                1.0 / american_to_decimal(a),
+                places=9,
+                msg=f"mismatch at {a}",
+            )
+
+    def test_decimal_to_american_roundtrip(self):
+        for a in (-500, -200, -110, 120, 150, 300):
+            d = american_to_decimal(a)
+            self.assertEqual(odds_client._decimal_to_american(d), a)
+            self.assertEqual(analysis._decimal_to_american(d), a)
+
+    def test_expected_roi(self):
+        # Fair coin at +100 is break-even; 55% at +100 returns +10%.
+        self.assertAlmostEqual(analysis._expected_roi(0.5, 100), 0.0, places=9)
+        self.assertAlmostEqual(analysis._expected_roi(0.55, 100), 0.10, places=9)
+        # No executable price -> no ROI.
+        self.assertIsNone(analysis._expected_roi(0.6, None))
+        # Heavy favorite: 74.23% at -300 is actually -EV.
+        self.assertLess(analysis._expected_roi(0.7423, -300), 0.0)
+
+
+class PropValueGateTests(unittest.TestCase):
+    """P1.1 — a prop must be +EV at the executable price, not just beat the
+    de-vigged edge threshold."""
+
+    def test_edge_clears_threshold_but_negative_ev_is_not_value(self):
+        # Failure scenario: Over -300 (break-even 0.75). De-vigged fair 0.68,
+        # model over-rate 0.74 -> edge +6.0% clears the 5% threshold, but the
+        # bet is -EV at the price actually bettable.
+        fair_over = 0.68
+        over_rate = 0.74
+        threshold = 0.05
+        edge = over_rate - fair_over
+        roi = analysis._expected_roi(over_rate, -300)
+        self.assertGreaterEqual(edge, threshold)   # would pass an edge-only gate
+        self.assertLess(roi, 0.0)                   # but is a losing bet
+        self.assertFalse(analysis._prop_is_value(edge, threshold, roi))
+
+    def test_positive_ev_and_edge_is_value(self):
+        edge = 0.1077
+        roi = analysis._expected_roi(0.80, -300)   # 0.80 * 1.3333 - 1 > 0
+        self.assertGreater(roi, 0.0)
+        self.assertTrue(analysis._prop_is_value(edge, 0.05, roi))
+
+    def test_missing_price_is_not_value(self):
+        self.assertFalse(analysis._prop_is_value(0.20, 0.05, None))
+
+    def test_positive_ev_but_edge_below_threshold_is_not_value(self):
+        roi = analysis._expected_roi(0.55, 100)     # +10% ROI
+        self.assertGreater(roi, 0.0)
+        self.assertFalse(analysis._prop_is_value(0.02, 0.05, roi))
+
+
+class ParlayValueJointTests(unittest.TestCase):
+    """P1.2 — same-game parlays must not credit the copula correlation benefit
+    against the naive (independent) payout the book will not pay."""
+
+    def test_sgp_prices_against_independent_joint(self):
+        best_joint = 0.17          # copula, correlation-inflated
+        independent = 0.125        # product of leg probs
+        decimal_product = american_to_decimal(-110) ** 3  # ~6.96
+
+        # Naive figure would look like strong value...
+        self.assertGreater(best_joint * decimal_product - 1.0, 0.0)
+
+        # ...but an SGP is priced against the independent joint, which is -EV.
+        vj = analysis._parlay_value_joint(best_joint, independent, has_sgp=True)
+        self.assertEqual(vj, independent)
+        self.assertLess(vj * decimal_product - 1.0, 0.0)
+
+    def test_cross_game_parlay_uses_copula_joint(self):
+        best_joint = 0.17
+        independent = 0.125
+        vj = analysis._parlay_value_joint(best_joint, independent, has_sgp=False)
+        self.assertEqual(vj, best_joint)
+
+
+class DevigFairBaselineTests(unittest.TestCase):
+    """P2a — every market measures edge against the de-vigged fair prob."""
+
+    def test_symmetric_market_removes_hold(self):
+        raw = american_to_implied_prob(-110)          # ~0.5238
+        fair = analysis._devig_fair(raw, raw)
+        self.assertAlmostEqual(fair, 0.5, places=6)
+        self.assertLess(fair, raw)                     # hold removed
+
+    def test_asymmetric_market(self):
+        over = american_to_implied_prob(-200)          # 0.6667
+        under = american_to_implied_prob(150)          # 0.40
+        fair = analysis._devig_fair(over, under)
+        self.assertAlmostEqual(fair, over / (over + under), places=9)
+
+    def test_one_sided_market_falls_back_to_raw(self):
+        raw = american_to_implied_prob(-110)
+        self.assertEqual(analysis._devig_fair(raw, None), raw)
+
+    def test_missing_side_is_none(self):
+        self.assertIsNone(analysis._devig_fair(None, 0.5))
+
+
+class CopulaInvariantTests(unittest.TestCase):
+    N = 40000
+
+    def _identity(self, n):
+        return [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+
+    def test_independence_recovers_product(self):
+        joint = analysis._gaussian_copula_joint_prob(
+            [0.5, 0.5, 0.5], self._identity(3), n_samples=self.N, seed=42)
+        self.assertAlmostEqual(joint, 0.125, delta=0.01)
+
+    def test_positive_correlation_raises_negative_lowers(self):
+        probs = [0.5, 0.5]
+        ident = self._identity(2)
+        pos = [[1.0, 0.5], [0.5, 1.0]]
+        neg = [[1.0, -0.5], [-0.5, 1.0]]
+        j_ind = analysis._gaussian_copula_joint_prob(
+            probs, ident, n_samples=self.N, seed=7)
+        j_pos = analysis._gaussian_copula_joint_prob(
+            probs, pos, n_samples=self.N, seed=7)
+        j_neg = analysis._gaussian_copula_joint_prob(
+            probs, neg, n_samples=self.N, seed=7)
+        self.assertAlmostEqual(j_ind, 0.25, delta=0.01)
+        self.assertGreater(j_pos, j_ind + 0.02)
+        self.assertLess(j_neg, j_ind - 0.02)
+
+    def test_boundaries(self):
+        self.assertEqual(analysis._gaussian_copula_joint_prob([], []), 1.0)
+        self.assertEqual(
+            analysis._gaussian_copula_joint_prob([0.7], [[1.0]]), 0.7)
+        self.assertEqual(
+            analysis._gaussian_copula_joint_prob(
+                [0.0, 0.5], self._identity(2)), 0.0)
+        self.assertEqual(
+            analysis._gaussian_copula_joint_prob(
+                [1.0, 1.0], self._identity(2)), 1.0)
+
+
+class ApplyPlattTests(unittest.TestCase):
+    """The live per-prediction recalibration transform."""
+
+    def test_identity_recovers_input(self):
+        for p in (0.1, 0.3, 0.5, 0.7, 0.9):
+            self.assertAlmostEqual(apply_platt(p, 1.0, 0.0), p, places=7)
+
+    def test_none_passthrough(self):
+        self.assertIsNone(apply_platt(None, 1.0, 0.0))
+        self.assertEqual(apply_platt(0.7, None, None), 0.7)
+
+    def test_monotonic_in_p(self):
+        prev = -1.0
+        for i in range(1, 20):
+            v = apply_platt(0.05 * i, 1.3, -0.2)
+            self.assertGreater(v, prev)
+            prev = v
+
+    def test_slope_sharpens_or_shrinks(self):
+        # a > 1 pushes a >0.5 probability further from 0.5; a < 1 pulls toward.
+        self.assertGreater(apply_platt(0.7, 2.0, 0.0), 0.7)
+        self.assertLess(apply_platt(0.7, 0.5, 0.0), 0.7)
+        self.assertGreater(apply_platt(0.7, 0.5, 0.0), 0.5)
+
+    def test_boundary_probs_stay_finite(self):
+        for p in (0.0, 1.0):
+            v = apply_platt(p, 1.0, 0.0)
+            self.assertTrue(math.isfinite(v))
+            self.assertTrue(0.0 < v < 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

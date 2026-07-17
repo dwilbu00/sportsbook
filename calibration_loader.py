@@ -38,7 +38,9 @@ JSON schema per prop entry:
 import json
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
+from stats import _norm_cdf  # canonical shared implementation (P3 dedup)
 
 # Match backtest.py: months when each sport's season starts.
 SPORT_SEASON_START_MONTH = {
@@ -97,7 +99,7 @@ def save_calibration(sport_key, props_cfg, meta=None, merge_props=True):
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
     blob = _load_blob(sport_key)
     blob["sport_key"] = sport_key
-    blob["fit_timestamp"] = datetime.utcnow().isoformat() + "Z"
+    blob["fit_timestamp"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     existing_props = blob.get("props")
     if merge_props and isinstance(existing_props, dict):
         existing_props.update(props_cfg)
@@ -283,9 +285,7 @@ def count_current_season_games(game_dates, sport_key, now=None):
 
 
 # ─── core calibration math ────────────────────────────────────────────────
-
-def _norm_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+# _norm_cdf is imported from stats (canonical, shared with analysis).
 
 
 def _empirical_cdf(sorted_vals, x):

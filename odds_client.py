@@ -17,6 +17,10 @@ import requests
 BASE_URL = "https://api.the-odds-api.com/v4"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 CACHE_MAX_AGE = 3600  # 1 hour in seconds
+# When credits are exhausted we may fall back to expired cache for interactive
+# analysis, but only up to this age. Beyond it, pricing bets against the stale
+# line is worse than failing, so we surface the error instead.
+STALE_CACHE_MAX_AGE = 6 * 3600  # 6 hours in seconds
 
 # Track remaining API credits (updated on each live API call)
 _remaining_credits = None
@@ -58,15 +62,49 @@ def _read_cache(cache_path):
 
 
 def _read_cache_expired(cache_path):
-    """Read cached data even if expired. Used as fallback when API credits run out."""
+    """Read cached data even if expired, returning (data, age_seconds).
+
+    Used as a fallback when API credits run out. The caller decides whether the
+    age is acceptable (see STALE_CACHE_MAX_AGE) rather than serving arbitrarily
+    old odds. Returns (None, None) on miss or when the cache lacks a timestamp.
+    """
     if not os.path.exists(cache_path):
-        return None
+        return None, None
     try:
         with open(cache_path, "r") as f:
             cached = json.load(f)
-        return cached.get("data")
+        data = cached.get("data")
+        cached_at = cached.get("cached_at", 0)
+        if not cached_at:
+            return None, None
+        return data, time.time() - cached_at
     except (json.JSONDecodeError, KeyError, OSError):
-        return None
+        return None, None
+
+
+def _is_quota_error(resp):
+    """True when an error response is exhausted-usage / rate-limit rather than
+    an invalid API key.
+
+    The Odds API returns 429 for rate limits and 401 for BOTH an invalid key
+    and exhausted usage credits, distinguished only by the response body. We
+    serve (bounded-age) stale cache on the former but never the latter — an
+    invalid-key auth error must surface, not be masked by old odds.
+    """
+    if resp is None:
+        return False
+    if resp.status_code == 429:
+        return True
+    if resp.status_code != 401:
+        return False
+    try:
+        body = resp.json()
+        code = body.get("error_code") or ""
+        message = body.get("message") or ""
+    except (ValueError, AttributeError):
+        code, message = "", (getattr(resp, "text", "") or "")
+    text = f"{code} {message}".upper()
+    return any(token in text for token in ("USAGE", "CREDIT", "QUOTA", "LIMIT"))
 
 
 def _write_cache(cache_path, data):
@@ -91,7 +129,22 @@ def _get_with_retry(url, params, timeout=30, max_retries=5, backoff_base=1.5):
     """
     resp = None
     for attempt in range(max_retries + 1):
-        resp = requests.get(url, params=params, timeout=timeout)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            # Transient network fault (connection reset, read timeout, DNS
+            # blip): no HTTP response was received and no credit was spent, so
+            # it is safe to retry. Without this the whole analysis — and, worse,
+            # a paid closing-line capture — fails on a momentary blip.
+            if attempt < max_retries:
+                delay = backoff_base ** attempt + random.uniform(0, 0.5)
+                print(
+                    f"  [Odds API] network error ({type(exc).__name__}) — "
+                    f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                continue
+            raise
         is_retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
         if is_retryable and attempt < max_retries:
             # Honor the server's Retry-After hint when present, otherwise use
@@ -183,13 +236,25 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h",
     try:
         resp = _get_with_retry(url, params)
         resp.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        # An expired cache is useful for interactive analysis, but must never
-        # be mislabeled as a fresh closing snapshot by a forced refresh.
-        if not force_refresh and resp.status_code in (401, 429):
-            expired = _read_cache_expired(cache_path)
-            if expired is not None:
-                print(f"  [Odds API] Credits exhausted — using expired cache for {event_id}")
+    except requests.exceptions.HTTPError:
+        # A bounded-age expired cache is useful for interactive analysis when
+        # credits are exhausted / rate-limited, but:
+        #   • never for a forced refresh (would mislabel a stale line as a fresh
+        #     closing snapshot),
+        #   • never for an invalid-key auth error (that must surface), and
+        #   • never beyond STALE_CACHE_MAX_AGE (pricing bets against a very old
+        #     line is worse than failing).
+        # When served, the payload is flagged so the caller can warn the user
+        # and avoid trusting the edge.
+        if not force_refresh and _is_quota_error(resp):
+            expired, age = _read_cache_expired(cache_path)
+            if expired is not None and age is not None and age <= STALE_CACHE_MAX_AGE:
+                print(f"  [Odds API] Credits exhausted — using stale cache for "
+                      f"{event_id} ({int(age)}s old)")
+                if isinstance(expired, dict):
+                    expired = dict(expired)
+                    expired["_stale_cache"] = True
+                    expired["_stale_age_seconds"] = int(age)
                 return expired
         raise
 

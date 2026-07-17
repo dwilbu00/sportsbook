@@ -359,6 +359,14 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             prop_data = parse_player_props(raw_prop)
             print(f"  [{i}/{len(raw_props)}] {prop_data['away_team']} @ {prop_data['home_team']}")
 
+            # ESPN team ids for this matchup disambiguate same-name players so
+            # the correct athlete's history is fetched (see search_athlete team_ids).
+            event_teams = [find_team(espn_teams, tn)
+                           for tn in (prop_data.get("home_team"),
+                                      prop_data.get("away_team")) if tn]
+            event_team_ids = [str(t["id"]) for t in event_teams
+                              if t and t.get("id")]
+
             # Collect all unique players and their prop keys
             player_histories = {}
             for prop_key, players in prop_data.get("props", {}).items():
@@ -368,7 +376,8 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
                     if prop_key not in player_histories[player_name]:
                         print(f"    Looking up {player_name} ({PROP_LABELS.get(prop_key, prop_key)})...")
                         history = get_player_stat_history(
-                            espn_sport, espn_league, player_name, prop_key, n=recent_n
+                            espn_sport, espn_league, player_name, prop_key,
+                            n=recent_n, team_ids=event_team_ids
                         )
                         player_histories[player_name][prop_key] = history
                         if history["found"]:
@@ -512,4 +521,6 @@ Examples:
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     main()

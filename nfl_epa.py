@@ -29,7 +29,7 @@ import gzip
 import io
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -329,7 +329,7 @@ def export_ratings(season):
                    "net_epa": round(v["net_epa"], 5)}
                for t, v in ratings.items()}
     blob = {"season": season,
-            "generated": datetime.utcnow().isoformat() + "Z",
+            "generated": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "ratings": trimmed}
     os.makedirs(RATINGS_DIR, exist_ok=True)
     with open(_ratings_path(season), "w", encoding="utf-8") as f:
@@ -364,6 +364,8 @@ def live_ratings(season):
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     import argparse
     ap = argparse.ArgumentParser(description="NFL EPA ratings tools")
     ap.add_argument("--export-ratings", type=int, metavar="SEASON",

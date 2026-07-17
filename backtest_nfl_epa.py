@@ -123,4 +123,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     main()

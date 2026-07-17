@@ -203,6 +203,8 @@ def asof_batter_xwoba_vs_hand(batter_id, hand, rows, as_of, min_bbe=MIN_BBE):
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     # Smoke test: two days, then an as-of estimate using only the earlier day.
     for d in ("2024-07-03", "2024-07-04"):
         rows = fetch_statcast_day(d)

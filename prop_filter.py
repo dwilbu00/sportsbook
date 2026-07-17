@@ -18,7 +18,9 @@ NBA `half_life=7` that's 8 — i.e., the player needs 8 consecutive, healthy,
 no-layoff games before we trust their projection again.
 
 A "break" in the run is any of:
-  • A low-minutes game (MIN < max(MIN_FLOOR, MIN_FRACTION × median MIN)).
+  • A low-participation game (participation < max(FLOOR, MIN_FRACTION × median)).
+    Participation is minutes for NBA/NHL and plate appearances / at-bats for
+    MLB; sports with no reliable per-game signal (NFL) skip this check.
   • The game played immediately BEFORE a layoff (treated as the
     likely injury / suspension trigger).
   • A layoff itself (≥ missed_thresh team games missed; sport-specific,
@@ -39,12 +41,59 @@ DEFAULT_MISSED_GAMES_THRESHOLD = 3
 # Number of games BEFORE a layoff to invalidate (likely injury/suspension game).
 PRE_LAYOFF_N = 1
 
-# Low-minutes filter knobs.
-MIN_PLAYED_FLOOR = 10.0
+# Low-participation filter knobs.
+#
+# The filter drops games where a player barely participated so a DNP / early
+# exit / garbage-time cameo can't drag the projection down. The participation
+# METRIC is sport-specific (see `_participation`): minutes for NBA/NHL, plate
+# appearances / at-bats for MLB. NFL has no reliable per-game participation
+# signal in the gamelog, so the filter is disabled there (status quo).
+MIN_PLAYED_FLOOR = 10.0   # basketball/hockey minutes floor (legacy name kept)
 MIN_FRACTION = 0.5
+
+# Per-sport participation threshold = max(floor, fraction * median participation),
+# computed over games with positive participation. Sports absent from FLOOR
+# disable the participation filter entirely (e.g. NFL — no reliable signal).
+#
+# NBA/NHL use minutes with a median-relative fraction (a 5-minute game when the
+# player normally plays 30 is garbage-time and is dropped). MLB uses a fraction
+# of 0.0 — i.e. floor-only — so ONLY zero-plate-appearance games (a true DNP,
+# which `_parse_stat_row` would otherwise count as "0 hits") are dropped. A
+# backtest showed that also dropping 1-PA cameos (median-relative) removed
+# real, signal-bearing games and hurt projection accuracy, so MLB excludes only
+# genuine non-participation.
+PARTICIPATION_FLOOR = {
+    "basketball_nba": MIN_PLAYED_FLOOR,
+    "icehockey_nhl":  MIN_PLAYED_FLOOR,
+    "baseball_mlb":   1.0,   # with fraction 0.0 → drops only 0-PA games
+}
+PARTICIPATION_FRACTION = {
+    "basketball_nba": MIN_FRACTION,
+    "icehockey_nhl":  MIN_FRACTION,
+    "baseball_mlb":   0.0,
+}
 
 # Absolute floor on the streak threshold when half_life is None / 0.
 STREAK_FLOOR = 5
+
+
+def _participation(game, sport_key):
+    """Sport-appropriate per-game participation metric, or None when there is
+    no reliable signal (so the low-participation filter stays disabled).
+
+    Reads keys that both callers already supply: analysis.py (runtime) threads
+    `_pa`/`_ab`; backtest.py passes raw ESPN gamelog dicts with `PA`/`AB`.
+    MLB pitchers come from the splits endpoint (only real starts, no PA/AB) so
+    they correctly return None and are left unfiltered."""
+    if sport_key in ("basketball_nba", "icehockey_nhl"):
+        return game.get("MIN")
+    if sport_key == "baseball_mlb":
+        for key in ("_pa", "PA", "_ab", "AB"):
+            value = game.get(key)
+            if value is not None:
+                return value
+        return None
+    return None  # NFL / unknown: no reliable participation signal in the gamelog
 
 
 def _missed_games_threshold(sport_key):
@@ -87,7 +136,7 @@ def resolve_min_streak(half_life, override=None):
 
 def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
                           pre_layoff_n=PRE_LAYOFF_N,
-                          min_floor=MIN_PLAYED_FLOOR, min_fraction=MIN_FRACTION,
+                          min_floor=None, min_fraction=None,
                           min_streak=None, as_of_date=None):
     """
     Apply the streak-based reliability filter.
@@ -106,8 +155,10 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
           "min_threshold": float | None,
         }
 
-    gamelog: list of dicts (any ordering) with 'game_date' (ISO str). For
-        the MIN-based filter to engage, dicts should also have 'MIN'.
+    gamelog: list of dicts (any ordering) with 'game_date' (ISO str). For the
+        low-participation filter to engage, dicts should also carry the
+        sport's participation metric ('MIN' for NBA/NHL; 'PA'/'AB' or the
+        runtime '_pa'/'_ab' for MLB). See `_participation`.
     team_schedule: iterable of dicts with 'date' / 'gameDate' / 'game_date'.
         None disables layoff detection (only low-min remains, plus the
         sport-independent streak threshold).
@@ -153,13 +204,21 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
     chrono = sorted(gamelog, key=lambda g: g.get("game_date") or "")
     n = len(chrono)
 
-    # ── Low-min threshold from median of played minutes (MIN > 0). ──
+    # ── Low-participation threshold from the median of played games. ──
+    # The metric is sport-specific (minutes for NBA/NHL, plate appearances /
+    # at-bats for MLB); sports with no reliable signal resolve to floor=None,
+    # which disables the filter (median over an all-None metric is 0).
+    if min_floor is None:
+        min_floor = PARTICIPATION_FLOOR.get(sport_key)
+    if min_fraction is None:
+        min_fraction = PARTICIPATION_FRACTION.get(sport_key, MIN_FRACTION)
     played_mins = sorted(
-        (g.get("MIN") or 0.0) for g in chrono if (g.get("MIN") or 0.0) > 0
+        (_participation(g, sport_key) or 0.0) for g in chrono
+        if (_participation(g, sport_key) or 0.0) > 0
     )
     median_min = _median(played_mins)
     min_threshold = (max(min_floor, min_fraction * median_min)
-                     if median_min > 0 else None)
+                     if median_min > 0 and min_floor is not None else None)
 
     sched_dates = _extract_schedule_dates(team_schedule)
     base_missed_thresh = _missed_games_threshold(sport_key)
@@ -214,7 +273,7 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
                 is_pre_layoff[L - k] = True
     if min_threshold is not None:
         for i, g in enumerate(chrono):
-            if (g.get("MIN") or 0.0) < min_threshold:
+            if (_participation(g, sport_key) or 0.0) < min_threshold:
                 is_low_min[i] = True
 
     is_invalid = [is_low_min[i] or is_pre_layoff[i] for i in range(n)]
@@ -271,10 +330,10 @@ def filter_player_gamelog(gamelog, team_schedule, sport_key, half_life=None,
     # ── Skip prediction policy ──
     skip_reason = None
     last_game = chrono[last_idx]
-    last_min = last_game.get("MIN") or 0.0
+    last_part = _participation(last_game, sport_key) or 0.0
     if is_low_min[last_idx]:
-        skip_reason = (f"last_game_low_min "
-                       f"(MIN={last_min:.0f} < {min_threshold:.0f})")
+        skip_reason = (f"last_game_low_participation "
+                       f"({last_part:.0f} < {min_threshold:.0f})")
     elif is_pre_layoff[last_idx]:
         skip_reason = "last_game_pre_layoff_invalid"
     elif current_streak < threshold:

@@ -1723,6 +1723,8 @@ def test_two_sided(seasons):
 
 
 if __name__ == "__main__":
+    from cli_encoding import configure_stdio
+    configure_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True,
                     help="single '2024', list '2021,2022', or range '2021-2024'")
