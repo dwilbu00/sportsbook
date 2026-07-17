@@ -521,110 +521,6 @@ def needs_setup(config):
     return not key or key == "YOUR_API_KEY_HERE"
 
 
-def _closing_capture_status(result):
-    """Build a concise user-facing status for a closing-capture attempt."""
-    if not result.get("events"):
-        return "info", "No queued or currently eligible closing snapshot was found."
-    captured = result.get("closing_captured", 0)
-    recovered = result.get("historical_captured", 0)
-    misses = result.get("exact_line_misses", 0)
-    errors = result.get("request_errors", 0)
-    if errors:
-        historical_note = (
-            " Postgame recovery requires a paid Odds API plan."
-            if result.get("historical_events") else ""
-        )
-        return (
-            "warning",
-            f"Closing odds were requested for {result['events']} event(s), but "
-            f"{errors} request(s) failed.{historical_note} "
-            "Use the manual retry if needed.",
-        )
-    if captured:
-        if recovered == captured:
-            message = f"Recovered {captured} exact-line closing price(s) from the queued snapshot."
-        elif recovered:
-            message = (
-                f"Captured {captured} exact-line closing price(s), including "
-                f"{recovered} from queued historical snapshots."
-            )
-        else:
-            message = f"Captured {captured} exact-line closing price(s)."
-        if misses:
-            message += f" {misses} logged line(s) were no longer offered."
-        return "success", message
-    return "warning", "The closing market was checked once, but no exact logged lines remained."
-
-
-def render_forward_capture_service(config):
-    """Run or arm the next durable closing-snapshot request."""
-    from forward_tracker import capture_closing_odds, next_closing_capture
-    from recalibration import read_prediction_log
-
-    api_key = config.get("odds_api_key")
-    bookmakers = config.get("bookmakers") or None
-    try:
-        scheduled = next_closing_capture(read_prediction_log())
-    except Exception:
-        scheduled = None
-    run_every = None
-    if scheduled and scheduled["wait_seconds"] > 2:
-        run_every = scheduled["wait_seconds"]
-
-    @st.fragment(run_every=run_every)
-    def one_shot_capture():
-        status = st.session_state.pop("_closing_capture_status", None)
-        if status:
-            getattr(st, status[0])(status[1])
-
-        manual_capture = st.button(
-            "Capture eligible closing odds now",
-            key="capture_closing_odds_now",
-            help=(
-                "Captures a live event beginning within ten minutes or retries "
-                "an overdue queued snapshot through the paid historical API."
-            ),
-            width="stretch",
-        )
-        if manual_capture:
-            result = capture_closing_odds(
-                api_key, bookmakers=bookmakers, window_minutes=10,
-                force_retry=True)
-            st.session_state["_closing_capture_status"] = (
-                _closing_capture_status(result))
-            st.rerun()
-
-        try:
-            next_capture = next_closing_capture(read_prediction_log())
-        except Exception:
-            next_capture = None
-        if not next_capture:
-            st.caption("No closing snapshot is currently armed.")
-            return
-        if next_capture["wait_seconds"] <= 2:
-            # A small tolerance prevents scheduler jitter from placing the
-            # request a fraction of a second outside the five-minute window.
-            result = capture_closing_odds(
-                api_key, bookmakers=bookmakers, window_minutes=5.25)
-            if result.get("events"):
-                st.session_state["_closing_capture_status"] = (
-                    _closing_capture_status(result))
-                st.rerun()
-            return
-
-        target = datetime.fromisoformat(next_capture["target_time"])
-        target_et = target.astimezone(ZoneInfo("America/New_York"))
-        st.caption(
-            "One closing request queued for "
-            f"{target_et.strftime('%b %d at %I:%M %p ET')}. "
-            "You may close this browser; it will run on the next app launch "
-            "after that time. Postgame recovery uses paid historical odds "
-            "(10 credits per requested market)."
-        )
-
-    one_shot_capture()
-
-
 def show_setup_wizard():
     """Display a first-run setup wizard to help the user get an API key."""
     st.markdown("## 👋 Welcome to Sportsbook Value Finder!")
@@ -864,8 +760,7 @@ def render_model_guide():
             hit_rate = forward.get("direction_hit_rate")
             probability_brier = forward.get("probability_brier")
             realized_roi = forward.get("realized_roi")
-            average_clv = forward.get("average_probability_clv")
-            forward_cols = st.columns(7)
+            forward_cols = st.columns(5)
             forward_cols[0].metric("Logged predictions", forward["total"])
             forward_cols[1].metric("Resolved", forward["resolved"])
             forward_cols[2].metric(
@@ -882,19 +777,11 @@ def render_model_guide():
                 f"{realized_roi * 100:+.1f}%"
                 if realized_roi is not None else "Awaiting priced results",
             )
-            forward_cols[5].metric(
-                "Average CLV",
-                f"{average_clv * 100:+.2f} pp"
-                if average_clv is not None else "Awaiting closes",
-            )
-            forward_cols[6].metric(
-                "Closing prices", forward.get("closing_captured", 0))
             forward_rows = []
             for row in forward["by_prop"]:
                 row_hit_rate = row.get("direction_hit_rate")
                 row_brier = row.get("probability_brier")
                 row_roi = row.get("realized_roi")
-                row_clv = row.get("average_probability_clv")
                 forward_rows.append({
                     "Sport": sport_names.get(row["sport_key"], row["sport_key"]),
                     "Prediction": PROP_LABELS.get(
@@ -916,10 +803,6 @@ def render_model_guide():
                         f"{row_roi * 100:+.1f}%" if row_roi is not None else "—"
                     ),
                     "Priced results": row["priced_resolved"],
-                    "Average CLV": (
-                        f"{row_clv * 100:+.2f} pp" if row_clv is not None else "—"
-                    ),
-                    "Closing prices": row["closing_captured"],
                 })
             st.dataframe(forward_rows, hide_index=True, width="stretch")
             st.caption(
@@ -928,10 +811,7 @@ def render_model_guide():
                 "probability; legacy rows fall back to their pre-Platt raw "
                 "probability. ROI is shown only for newly logged rows that "
                 "retain the offered "
-                "price; older rows remain usable for hit-rate and Brier scoring. "
-                "CLV compares the opening and latest captured pregame price at "
-                "the exact same player/prop/line/side; positive CLV means the "
-                "forecast beat the closing market."
+                "price; older rows remain usable for hit-rate and Brier scoring."
             )
         else:
             st.info(
@@ -1182,12 +1062,6 @@ with st.sidebar:
         key="app_page",
     )
 
-if not needs_setup(config):
-    with st.sidebar:
-        st.divider()
-        st.subheader("Forward tracking")
-        render_forward_capture_service(config)
-
 if app_page == "📘 Model Guide & Performance":
     render_model_guide()
     st.stop()
@@ -1211,8 +1085,8 @@ with st.sidebar:
     # Durability notice (P1.8): the forward-tracking prediction log is only
     # durable when an Azure Blob is configured. Without it the log lives in
     # ephemeral container storage that a hosted deploy wipes on restart —
-    # silently resetting CLV/recalibration. Surface it during normal use, not
-    # only on the Model Guide page.
+    # silently resetting resolved outcomes and recalibration. Surface it during
+    # normal use, not only on the Model Guide page.
     try:
         from recalibration import prediction_log_storage as _pls
         if _pls() == "Local cache":
@@ -2030,10 +1904,6 @@ if analyze_clicked and selected_game_labels:
     }
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
-    # Prediction rows were just created. Rerun once so the one-shot Streamlit
-    # timer above can arm itself for the nearest newly analyzed event.
-    if selected_props:
-        st.rerun()
 
 # ── Conditional alt-line fetch ──
 # Always fetch when safe mode is on (safe-mode props need real alt prices and

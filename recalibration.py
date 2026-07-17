@@ -258,9 +258,9 @@ def log_prediction_rows(new_rows):
     (sport, event, prop, player, line) on each analysis, growing the log
     without bound and rewriting the whole blob every append. Instead we keep a
     single row per forecast identity: the newest forecast supersedes stale
-    unresolved duplicates, while any graded outcome or captured closing price
-    on an older duplicate is folded forward so scoring/CLV survive. A forecast
-    whose outcome is already resolved is never overwritten by a later re-log.
+    unresolved duplicates, while any graded outcome on an older duplicate is
+    folded forward so scoring survives. A forecast whose outcome is already
+    resolved is never overwritten by a later re-log.
 
     Returns the number of log rows added or changed.
     """
@@ -348,26 +348,21 @@ def prediction_row_key(row):
     return (row.get("ts"),) + prediction_identity(row)
 
 
-def _merge_closing_and_outcome(dest, src):
-    """Fold resolved-outcome and closing-price fields from `src` into `dest`
-    when `dest` lacks them, so de-duplicating never drops a graded result or a
-    captured closing price."""
+def _merge_outcome_fields(dest, src):
+    """Fold resolved-outcome fields from `src` into `dest` when `dest` lacks
+    them, so de-duplicating never drops a graded result."""
     if not dest.get("resolved") and src.get("resolved"):
         for key in ("resolved", "actual", "outcome", "resolved_at"):
             if key in src:
                 dest[key] = src[key]
-    if not dest.get("closing_captured_at") and src.get("closing_captured_at"):
-        for key, value in src.items():
-            if key.startswith("closing_"):
-                dest[key] = value
 
 
 def _collapse_identity_rows(group):
     """Merge duplicate rows that share a prediction identity into one row.
 
     Prefers the most recent *resolved* forecast (else the most recent forecast)
-    as the base, then folds in outcome and closing-price fields captured on any
-    sibling. Returns the sole row unchanged when there is nothing to merge."""
+    as the base, then folds in outcome fields captured on any sibling. Returns
+    the sole row unchanged when there is nothing to merge."""
     if len(group) == 1:
         return group[0]
 
@@ -378,17 +373,8 @@ def _collapse_identity_rows(group):
     base = dict(max(resolved or group, key=_recency))
     for row in group:
         if row is not base:
-            _merge_closing_and_outcome(base, row)
+            _merge_outcome_fields(base, row)
     return base
-
-
-def _american_decimal(price):
-    price = int(price)
-    if price > 0:
-        return 1.0 + price / 100.0
-    if price < 0:
-        return 1.0 + 100.0 / -price
-    return None
 
 
 def summarize_prediction_rows(rows, sport_key=None):
@@ -411,19 +397,6 @@ def summarize_prediction_rows(rows, sport_key=None):
         outcomes = []
         direction_hits = []
         realized_returns = []
-        probability_clv = []
-        odds_clv = []
-        for row in group:
-            try:
-                opening_decimal = _american_decimal(row.get("price"))
-                closing_decimal = _american_decimal(row.get("closing_price"))
-            except (TypeError, ValueError):
-                continue
-            if not opening_decimal or not closing_decimal:
-                continue
-            probability_clv.append(
-                1.0 / closing_decimal - 1.0 / opening_decimal)
-            odds_clv.append(opening_decimal / closing_decimal - 1.0)
         for row in graded:
             try:
                 logged_probability = row.get("final_prob")
@@ -478,14 +451,6 @@ def summarize_prediction_rows(rows, sport_key=None):
             ),
             "probability_brier": brier,
             "priced_resolved": len(realized_returns),
-            "closing_captured": len(probability_clv),
-            "average_probability_clv": (
-                sum(probability_clv) / len(probability_clv)
-                if probability_clv else None
-            ),
-            "average_odds_clv": (
-                sum(odds_clv) / len(odds_clv) if odds_clv else None
-            ),
             "realized_roi": (
                 sum(realized_returns) / len(realized_returns)
                 if realized_returns else None

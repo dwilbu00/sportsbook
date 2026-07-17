@@ -13,16 +13,10 @@ import analysis
 import backtest_market_consensus
 import backtest_starters
 import espn_client
-import forward_tracker
 import mlb_starters
 import odds_client
 import recalibration
 from backtest_props import _rolling_splits
-from forward_tracker import (
-    closing_event_groups,
-    find_closing_offer,
-    next_closing_capture,
-)
 from odds_client import parse_player_props
 from prop_filter import filter_player_gamelog
 from recalibration import fit_platt_chronological, summarize_prediction_rows
@@ -1046,7 +1040,6 @@ class RecalibrationTests(unittest.TestCase):
                 "final_prob": 0.9,
                 "direction": "OVER",
                 "price": 100,
-                "closing_price": -110,
                 "resolved": True,
                 "outcome": 1,
             },
@@ -1071,9 +1064,6 @@ class RecalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["probability_brier"], 0.05)
         self.assertEqual(summary["priced_resolved"], 2)
         self.assertAlmostEqual(summary["realized_roi"], (1 + 10 / 11) / 2)
-        self.assertEqual(summary["closing_captured"], 1)
-        self.assertAlmostEqual(
-            summary["average_probability_clv"], 11 / 21 - 1 / 2)
 
     def test_maintenance_resolves_before_testing_refit_gate(self):
         with patch.object(
@@ -1138,193 +1128,6 @@ class RecalibrationTests(unittest.TestCase):
             rows = recalibration.read_prediction_log()
         self.assertEqual(written, 1)
         self.assertEqual(rows, [{"test": 1}])
-
-
-class ForwardTrackerTests(unittest.TestCase):
-    def test_next_capture_targets_five_minutes_before_nearest_event(self):
-        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
-        row = {
-            "sport_key": "baseball_mlb",
-            "event_id": "game-1",
-            "commence_time": "2024-07-01T20:35:00Z",
-            "prop_key": "batter_hits",
-            "player": "José Ramírez",
-            "direction": "OVER",
-        }
-        scheduled = next_closing_capture([row], now=now)
-        self.assertEqual(scheduled["event_id"], "game-1")
-        self.assertEqual(scheduled["target_time"], "2024-07-01T20:30:00+00:00")
-        self.assertEqual(scheduled["wait_seconds"], 30 * 60)
-        self.assertIsNone(next_closing_capture(
-            [dict(row, closing_attempted_at="2024-07-01T20:30:00Z")],
-            now=now))
-
-    def test_started_event_remains_queued_for_historical_recovery(self):
-        now = datetime(2024, 7, 1, 21, 0, tzinfo=timezone.utc)
-        row = {
-            "sport_key": "baseball_mlb",
-            "event_id": "game-1",
-            "commence_time": "2024-07-01T20:35:00Z",
-            "prop_key": "batter_hits",
-            "player": "José Ramírez",
-            "direction": "OVER",
-        }
-
-        scheduled = next_closing_capture([row], now=now)
-
-        self.assertEqual(scheduled["event_id"], "game-1")
-        self.assertEqual(scheduled["target_time"], "2024-07-01T20:30:00+00:00")
-        self.assertEqual(scheduled["wait_seconds"], 0)
-
-    def test_closing_window_requires_uncaptured_event_metadata(self):
-        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
-        base = {
-            "sport_key": "baseball_mlb",
-            "event_id": "game-1",
-            "commence_time": "2024-07-01T20:08:00Z",
-            "prop_key": "batter_hits",
-            "player": "José Ramírez",
-            "direction": "OVER",
-            "line": 1.5,
-            "resolved": False,
-        }
-        groups = closing_event_groups([base], now=now, window_minutes=10)
-        self.assertEqual(list(groups), [("baseball_mlb", "game-1")])
-        self.assertFalse(closing_event_groups(
-            [dict(base, closing_captured_at="2024-07-01T20:00:00Z")],
-            now=now, window_minutes=10))
-
-    def test_closing_offer_matches_exact_player_line_and_side(self):
-        game = {
-            "bookmakers": [
-                {
-                    "title": "DraftKings",
-                    "markets": [{
-                        "key": "batter_hits",
-                        "outcomes": [
-                            {"description": "Jose Ramirez", "name": "Over",
-                             "point": 1.5, "price": -115},
-                            {"description": "Jose Ramirez", "name": "Over",
-                             "point": 2.5, "price": 180},
-                        ],
-                    }],
-                },
-                {
-                    "title": "FanDuel",
-                    "markets": [{
-                        "key": "batter_hits",
-                        "outcomes": [
-                            {"description": "José Ramírez", "name": "Over",
-                             "point": 1.5, "price": -105},
-                        ],
-                    }],
-                },
-            ],
-        }
-        offer = find_closing_offer(game, {
-            "player": "José Ramírez", "prop_key": "batter_hits",
-            "direction": "OVER", "line": 1.5, "book": "DraftKings",
-        })
-        self.assertEqual(offer["price"], -105)
-        self.assertEqual(offer["book"], "FanDuel")
-        self.assertEqual(offer["same_book_price"], -115)
-
-    def test_overdue_capture_uses_original_historical_snapshot_time(self):
-        now = datetime(2024, 7, 1, 21, 0, tzinfo=timezone.utc)
-        rows = [{
-            "ts": "2024-07-01T18:00:00Z",
-            "sport_key": "baseball_mlb",
-            "event_id": "game-1",
-            "commence_time": "2024-07-01T20:35:00Z",
-            "prop_key": "batter_hits",
-            "player": "José Ramírez",
-            "direction": "OVER",
-            "line": 1.5,
-            "book": "DraftKings",
-            "resolved": False,
-        }]
-        historical_game = {
-            "bookmakers": [{
-                "title": "DraftKings",
-                "markets": [{
-                    "key": "batter_hits",
-                    "outcomes": [{
-                        "description": "Jose Ramirez", "name": "Over",
-                        "point": 1.5, "price": -105,
-                    }],
-                }],
-            }],
-        }
-
-        def mutate(mutator):
-            return mutator(rows)
-
-        with patch.object(
-                forward_tracker, "read_prediction_log", return_value=rows), patch.object(
-                forward_tracker, "get_historical_event_odds",
-                return_value=(historical_game, "2024-07-01T20:30:01Z")) as historical, patch.object(
-                forward_tracker, "get_event_odds") as live, patch.object(
-                forward_tracker, "mutate_prediction_log", side_effect=mutate):
-            result = forward_tracker.capture_closing_odds("key", now=now)
-
-        historical.assert_called_once_with(
-            "key", "baseball_mlb", "game-1",
-            date="2024-07-01T20:30:00Z", markets="batter_hits",
-            bookmakers=None,
-        )
-        live.assert_not_called()
-        self.assertEqual(result["historical_events"], 1)
-        self.assertEqual(result["historical_captured"], 1)
-        self.assertEqual(rows[0]["closing_price"], -105)
-        self.assertEqual(
-            rows[0]["closing_source"],
-            "odds_api_historical_exact_line_pregame",
-        )
-        self.assertEqual(
-            rows[0]["closing_snapshot_at"],
-            "2024-07-01T20:30:01+00:00",
-        )
-        self.assertAlmostEqual(rows[0]["closing_minutes_before"], 4.98)
-
-    def test_missing_exact_line_is_attempted_only_once_automatically(self):
-        now = datetime(2024, 7, 1, 20, 0, tzinfo=timezone.utc)
-        rows = [{
-            "ts": "2024-07-01T18:00:00Z",
-            "sport_key": "baseball_mlb",
-            "event_id": "game-1",
-            "commence_time": "2024-07-01T20:08:00Z",
-            "prop_key": "batter_hits",
-            "player": "José Ramírez",
-            "direction": "OVER",
-            "line": 1.5,
-            "resolved": False,
-        }]
-
-        def mutate(mutator):
-            return mutator(rows)
-
-        with patch.object(
-                forward_tracker, "read_prediction_log", return_value=rows), patch.object(
-                forward_tracker, "get_event_odds",
-                return_value={"bookmakers": []}) as get_odds, patch.object(
-                forward_tracker, "mutate_prediction_log", side_effect=mutate):
-            first = forward_tracker.capture_closing_odds(
-                "key", now=now, window_minutes=10)
-            # A later analysis can append another physical row for the same
-            # event. The event-level attempt must still suppress another call.
-            rows.append(dict(
-                rows[0], ts="2024-07-01T19:00:00Z",
-                closing_attempted_at=None, closing_attempt_error=None))
-            second = forward_tracker.capture_closing_odds(
-                "key", now=now, window_minutes=10)
-
-        self.assertEqual(first["events"], 1)
-        self.assertEqual(first["exact_line_misses"], 1)
-        self.assertEqual(first["closing_captured"], 0)
-        self.assertEqual(second["events"], 0)
-        self.assertEqual(get_odds.call_count, 1)
-        self.assertEqual(rows[0]["closing_attempt_error"],
-                         "exact_line_not_found")
 
 
 class ParlayCorrelationTests(unittest.TestCase):

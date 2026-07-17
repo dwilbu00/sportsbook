@@ -1,8 +1,7 @@
 """Tests for prediction-log durability fixes (P2 batch 2):
 
 - log_prediction_rows upserts by forecast identity so repeated same-slate
-  logging cannot grow the log without bound, while preserving graded outcomes
-  and captured closing prices (CLV).
+  logging cannot grow the log without bound, while preserving graded outcomes.
 - compact_prediction_log collapses historical duplicates.
 - seed_from_book_line_cache counts only current-season prior games for warmup
   blending, matching the runtime pipeline.
@@ -67,17 +66,6 @@ class UpsertDeduplicationTests(unittest.TestCase):
         self.assertEqual(rows[0]["raw_prob"], 0.60)  # graded forecast preserved
         self.assertEqual(changed, 0)  # a no-op re-log triggers no write
 
-    def test_closing_price_survives_deduplication(self):
-        rows = [_row(ts="t1", raw=0.60, closing_price=-110,
-                     closing_book="DK", closing_captured_at="c1")]
-        with patch.object(recalibration, "mutate_prediction_log",
-                          side_effect=_InMemoryLog(rows)):
-            recalibration.log_prediction_rows([_row(ts="t2", raw=0.65)])
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["raw_prob"], 0.65)       # latest forecast
-        self.assertEqual(rows[0]["closing_price"], -110)  # CLV inherited
-        self.assertEqual(rows[0]["closing_captured_at"], "c1")
-
     def test_distinct_forecasts_are_all_appended(self):
         rows = []
         with patch.object(recalibration, "mutate_prediction_log",
@@ -89,10 +77,9 @@ class UpsertDeduplicationTests(unittest.TestCase):
 
 
 class CompactionTests(unittest.TestCase):
-    def test_compaction_merges_outcome_and_closing_and_preserves_order(self):
+    def test_compaction_merges_outcome_and_preserves_order(self):
         rows = [
-            _row(player="A", ts="t1", raw=0.60,
-                 closing_price=-110, closing_captured_at="c1"),
+            _row(player="A", ts="t1", raw=0.60),
             _row(player="A", ts="t2", raw=0.65,
                  resolved=True, outcome=1, actual=25.0),
             _row(player="B", ts="t3", raw=0.40),
@@ -106,7 +93,6 @@ class CompactionTests(unittest.TestCase):
         self.assertTrue(merged["resolved"])
         self.assertEqual(merged["outcome"], 1)
         self.assertEqual(merged["raw_prob"], 0.65)         # resolved base
-        self.assertEqual(merged["closing_price"], -110)    # merged from dupe
 
     def test_compaction_is_a_no_op_on_a_clean_log(self):
         rows = [_row(player="A"), _row(player="B")]

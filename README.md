@@ -257,7 +257,7 @@ p_calibrated = sigmoid(a * logit(p_raw) + b)
 
 The fit uses cross-entropy loss, Newton-Raphson optimization, mild L2 regularization, and minimum-sample guards. A mapping is enabled only if it improves both Brier score and log loss in two expanding-window chronological folds; repeated logs for the same player/game/line are de-duplicated. This gives the app a feedback loop without letting in-sample fit quality masquerade as validation.
 
-The Model Guide also reports forward-log status by sport and prop: resolved and pending counts, model-side hit rate, probability Brier score, realized ROI, and exact-line closing-line value (CLV). New rows retain the event ID, start time, raw and final probabilities, opening price/book, and one pregame closing snapshot. Positive CLV means the model captured a better price than the final snapshot at the exact same player, prop, line, and side. Legacy rows remain usable through backward-compatible fallbacks.
+The Model Guide also reports forward-log status by sport and prop: resolved and pending counts, model-side hit rate, probability Brier score, and realized ROI (computed at the price offered when the pick was logged). New rows retain the event ID, start time, raw and final probabilities, and opening price/book. Outcomes are graded against ESPN box scores (no odds-API credits). Legacy rows remain usable through backward-compatible fallbacks.
 
 ## Safe Mode: conservative alt-line math
 
@@ -340,7 +340,7 @@ The repository includes scripts for testing and refitting the model:
 - `book_line_calibration.py` — joins cached book lines to actual player outcomes
 - `refit_calibration.py` — writes per-sport prop calibration files
 - `recalibration.py` — resolves logged predictions and refits Platt scaling
-- `forward_tracker.py` — captures one-shot exact-line closing prices and runs outcome maintenance
+- `forward_tracker.py` — resolves logged prediction outcomes and runs gated recalibration (`--resolve`)
 - `backtest_starters.py` — fits MLB starter/bullpen weights and validates the spread-only expected-runs/Pythagorean ensemble
 - `backtest_nfl_epa.py` — fits NFL EPA margin weights
 - `savant_history.py` — leakage-safe historical Statcast feature cache for MLB backtests
@@ -403,36 +403,25 @@ ODDS_API_KEY = "your_api_key_here"
 PREDICTION_LOG_BLOB_URL = "https://ACCOUNT.blob.core.windows.net/CONTAINER/prediction_log.jsonl?SAS_TOKEN"
 ```
 
-### Event-timed forward tracking in Streamlit
+### Forward tracking in Streamlit
 
-After a player-prop analysis logs an upcoming event, the active Streamlit
-session arms a one-shot fragment for five minutes before that event starts. The
-fragment makes no periodic Odds API requests: it wakes once at the target time,
-requests the required prop markets, and records the exact player/prop/line/side
-snapshot. A checked event is not retried automatically, even when an exact line
-has disappeared, so multiple app sessions do not intentionally repeat the same
-credit spend.
+Every player-prop analysis logs its predictions (event ID, start time, raw and
+final probabilities, and the price/book offered at analysis time) to a durable
+prediction log. Outcomes are graded later against ESPN box scores — no odds-API
+credits — and once enough new resolved observations accumulate, the model
+Platt-recalibrates itself, gated by calibration age and sample count. Resolution
+and gated refitting run automatically during normal app analysis
+(`maybe_auto_refit`), so no manual step is required. The Model Guide's forward-log
+metrics (hit rate, Brier, realized ROI) are computed from these resolved outcomes;
+realized ROI uses the price offered when the pick was logged.
 
-The prediction log also serves as a durable request queue. The browser can be
-closed after analysis; the next app launch at or after the target time consumes
-the queued request. If the event has not started, the app uses the normal live
-endpoint. If it has started, the app recovers the original five-minutes-before
-snapshot through the historical event-odds endpoint. Historical recovery
-requires a paid Odds API plan and costs 10 credits per requested market; a live
-capture costs one credit per requested market. Durable recovery across
-Streamlit container restarts requires the Azure Blob configuration described
-above.
+Durability across Streamlit container restarts requires the Azure Blob
+configuration described above; otherwise the log lives in ephemeral container
+storage that a hosted deploy wipes on restart.
 
-The sidebar's **Capture eligible closing odds now** button provides a manual
-retry for a live event beginning within ten minutes or for an overdue queued
-snapshot. Outcome resolution remains part of normal app analysis and uses ESPN
-rather than The Odds API.
-
-Useful manual commands:
+You can also resolve outcomes and run gated recalibration from the CLI:
 
 ```powershell
-python forward_tracker.py --capture-closing --dry-run
-python forward_tracker.py --capture-closing
 python forward_tracker.py --resolve
 ```
 
