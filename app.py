@@ -712,6 +712,25 @@ def format_time(commence_time):
         return commence_time[:19] if commence_time else "TBD"
 
 
+def _event_not_started(event, now=None):
+    """True when an event's start time is unknown or still in the future.
+
+    Used to prune already-started/finished games from a restored (stale) events
+    slate so the empty-refetch fallback can't re-offer a game that has begun.
+    Unknown/unparseable start times are kept rather than over-filtered.
+    """
+    commence = event.get("commence_time")
+    if not commence:
+        return True
+    try:
+        start = datetime.fromisoformat(commence.replace("Z", "+00:00"))
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return start > now
+    except (ValueError, AttributeError, TypeError):
+        return True
+
+
 def render_value_badge(edge_pct):
     if edge_pct >= 10:
         st.markdown(f":green[**+{edge_pct}%** 🔥]")
@@ -1215,6 +1234,7 @@ with st.sidebar:
         st.session_state.pop("parlay_results", None)
         st.session_state.pop("parlay_mode", None)
         st.session_state.pop("result_filter", None)
+        st.session_state.pop("_last_events", None)
 
     sport_label = st.selectbox("Sport", list(SPORTS.keys()), key="sport", on_change=on_sport_change)
     sport = SPORTS[sport_label]
@@ -1312,15 +1332,68 @@ with st.sidebar:
 st.subheader(f"📅 Upcoming {sport_label} Games")
 
 with st.spinner("Loading events (free)..."):
+    events, events_error = [], None
     try:
         events = fetch_events(api_key, sport["key"])
     except Exception as e:
-        st.error(f"Failed to fetch events: {e}")
-        st.stop()
+        events_error = e
+
+# A background rerun (notably the forward-capture timer, which only arms after an
+# analysis has logged a prediction) re-runs this block on its own. If the live
+# "upcoming" list has momentarily gone empty — a just-analyzed game drops off the
+# API's list once it starts — or the fetch fails transiently, the st.stop() gates
+# here (and the "no games selected" gate below) would collapse the page and
+# discard a completed, on-screen analysis. Guard against that:
+#   * stash the last non-empty slate per sport, timestamped;
+#   * on an empty/failed refetch, fall back to a *fresh* stash minus games that
+#     have already started (never re-offer a begun game or a finished slate);
+#   * never st.stop() while an analysis is on screen — show the notice inline and
+#     let the stored results keep rendering.
+_STALE_EVENTS_MAX_AGE = 20 * 60  # seconds: long enough to ride out a rerun storm
+                                 # near tip-off, short enough not to surface an
+                                 # already-finished slate as "upcoming".
+_now = datetime.now(timezone.utc)
+# Stash the raw non-empty slate per sport (timestamped) for the fallback below.
+if events:
+    st.session_state["_last_events"] = {
+        "sport": sport["key"], "events": events, "ts": _now}
+
+_using_stale_slate = False
+if not events:
+    _stash = st.session_state.get("_last_events")
+    _fresh = (_stash and _stash.get("sport") == sport["key"] and _stash.get("ts")
+              and (_now - _stash["ts"]).total_seconds() < _STALE_EVENTS_MAX_AGE)
+    if _fresh:
+        events = _stash.get("events", [])
+        _using_stale_slate = True
+
+# Never offer a game that has already started/finished, regardless of source —
+# a live fetch (the Odds API events endpoint includes in-play games), the 1-hour
+# fetch cache (which can span a tip-off), or the stale-slate fallback. Pricing a
+# begun game against pre-game history is wrong and pollutes forward-tracking.
+events = [e for e in events if _event_not_started(e, _now)]
+
+_has_results = "analysis_results" in st.session_state
+if _using_stale_slate and events:
+    st.caption(
+        "⚠️ Showing the last known games — the live schedule is momentarily "
+        "unavailable; start times may be slightly stale."
+    )
 
 if not events:
-    st.warning("No upcoming games found.")
-    st.stop()
+    # Only hard-stop on a genuine cold start. If a completed analysis is already
+    # on screen, keep it — a transient empty/failed refetch must not wipe it, and
+    # the misleading "no games" banner must not sit above the preserved results.
+    if not _has_results:
+        if events_error is not None:
+            st.error(f"Failed to fetch events: {events_error}")
+        else:
+            st.warning("No upcoming games found.")
+        st.stop()
+    st.caption(
+        "ℹ️ The live game list is momentarily unavailable — showing your most "
+        "recent analysis below."
+    )
 
 game_options = {}
 for event in events:
@@ -1338,8 +1411,13 @@ selected_game_labels = st.multiselect(
 )
 
 if not selected_game_labels:
-    st.info("👆 Select one or more games above to begin analysis")
-    st.stop()
+    # Don't prompt-and-halt over a completed analysis: a background rerun can
+    # empty the selection when a started game drops off the slate. Only show the
+    # "select games" prompt (and stop) on a genuine cold start; otherwise keep
+    # the stored results rendering below without a contradictory banner.
+    if "analysis_results" not in st.session_state:
+        st.info("👆 Select one or more games above to begin analysis")
+        st.stop()
 
 # Calculate actual credit cost (accounting for cached data)
 bookmakers_list = config.get("bookmakers", [])
@@ -1383,7 +1461,7 @@ with col_safe:
 
 # Clear stale parlays as soon as a new Analyze is requested so they don't
 # render below this point before the analysis block runs.
-if analyze_clicked:
+if analyze_clicked and selected_game_labels:
     _clear_bet_selections()
     st.session_state.pop("parlay_results", None)
     st.session_state.pop("parlay_mode", None)
@@ -1607,7 +1685,7 @@ if "parlay_results" in st.session_state:
     else:
         st.info("Not enough positive-edge bets to build parlays. Try selecting more games or markets.")
 
-if analyze_clicked:
+if analyze_clicked and selected_game_labels:
     # Pre-flight credit-budget guard (P1.7): don't silently spend into (or past)
     # a reserve floor. `remaining` is None on a cold process (no live call has
     # reported the balance yet), so we can only guard once it's known. Nothing
