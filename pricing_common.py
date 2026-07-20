@@ -52,6 +52,26 @@ def _expected_roi(probability, american_price):
     return probability * american_to_decimal(american_price) - 1.0
 
 
+def profit(american_price, stake, won):
+    """Realized profit on a settled bet at ``american_price`` for ``stake`` units.
+
+    ``won`` is True (win), False (loss), or None (push). A win returns
+    ``(decimal_odds - 1) * stake``; a loss returns ``-stake``; a push returns
+    0.0 (stake returned). Mirrors the priced-ROI formula used for the forward
+    prediction log, but scaled by an actual dollar stake for the bets ledger."""
+    try:
+        stake = float(stake)
+    except (TypeError, ValueError):
+        return 0.0
+    if won is None:
+        return 0.0
+    if not won:
+        return -stake
+    if american_price is None:
+        return 0.0
+    return (american_to_decimal(american_price) - 1.0) * stake
+
+
 def _prop_is_value(edge, threshold, expected_roi):
     """Decide whether a player prop qualifies as a value bet.
 

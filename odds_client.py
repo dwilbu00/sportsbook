@@ -267,6 +267,15 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h",
 
     data = resp.json()
     _write_cache(cache_path, data)
+    # Durable archive of the freshly fetched snapshot (roadmap 0.4). Best-effort,
+    # lazy-imported to avoid an import cycle, and only on a genuine live fetch
+    # (cache hits / stale-cache fallbacks return earlier), so it is free.
+    try:
+        import warehouse
+        warehouse.capture_event_odds(
+            sport, event_id, regions, markets, bookmakers, data)
+    except Exception:
+        pass
     return data
 
 

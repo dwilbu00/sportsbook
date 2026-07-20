@@ -154,6 +154,9 @@ def main():
                    help="Stop if remaining account credits would drop below this.")
     p.add_argument("--dry-run", action="store_true",
                    help="Show the plan and estimated cost without calling the API.")
+    p.add_argument("--warehouse", action="store_true",
+                   help="Also archive each fetched snapshot to the durable odds "
+                        "warehouse (roadmap 0.4). Free — reuses fetched payloads.")
     args = p.parse_args()
 
     if args.snapshot_time is not None:
@@ -330,6 +333,15 @@ def main():
                 })
                 store["games"][key] = entry
                 feat_stored += 1
+                if args.warehouse:
+                    try:
+                        import warehouse
+                        warehouse.capture_event_odds(
+                            sport_key, api_game.get("id"), args.regions,
+                            args.markets, [bookmaker], api_game,
+                            captured_at=snap_ts)
+                    except Exception:
+                        pass
             if i % 25 == 0 or i == len(feat_ts_list):
                 store_mod.save_store(sport_key, store, args.label)
                 print(f"  [featured {i}/{len(feat_ts_list)}] spent ~{spent}, "
@@ -390,6 +402,14 @@ def main():
             entry["props"] = parsed.get("props", {})
             store["games"][key] = entry
             prop_stored += 1
+            if args.warehouse:
+                try:
+                    import warehouse
+                    warehouse.capture_event_odds(
+                        sport_key, eid, args.regions, args.props,
+                        [bookmaker], data, captured_at=snap_ts)
+                except Exception:
+                    pass
             if i % 25 == 0 or i == len(prop_games):
                 store_mod.save_store(sport_key, store, args.label)
                 print(f"  [props {i}/{len(prop_games)}] spent ~{spent}, "
@@ -398,6 +418,14 @@ def main():
         print("\n  [interrupt] Saving progress before exit...")
     finally:
         store_mod.save_store(sport_key, store, args.label)
+        if args.warehouse:
+            try:
+                import warehouse
+                flushed = warehouse.flush()
+                print(f"  [warehouse] archived {flushed} snapshot(s) "
+                      f"({warehouse.storage_backend()}).")
+            except Exception as exc:
+                print(f"  [warehouse] flush failed: {exc}")
 
     print(f"\n=== Done. Spent ~{spent} credits. "
           f"Featured stored: {feat_stored}, props stored: {prop_stored}. "

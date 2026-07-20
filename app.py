@@ -343,13 +343,80 @@ def _select_bet_checkbox(candidate, bet_type, side=None):
     )
 
 
-def _render_selected_bet_checklist(entries):
+def _iter_wager_candidates(ar):
+    """Yield (selection_key, bet_type, side, candidate) for every value bet in
+    `ar`, matching the checklist's selection_key so a checked box maps back to
+    the full candidate (with model price/prob) needed to build a wager row."""
+    for c in ar.get("all_ml", []):
+        if c.get("is_value"):
+            key = make_bet_checklist_entry(c, "moneyline")["selection_key"]
+            yield key, "moneyline", None, c
+    for c in ar.get("all_spreads", []):
+        if c.get("is_value"):
+            key = make_bet_checklist_entry(c, "spread")["selection_key"]
+            yield key, "spread", None, c
+    for c in ar.get("all_totals", []):
+        if c.get("is_over_value"):
+            key = make_bet_checklist_entry(c, "total", side="OVER")["selection_key"]
+            yield key, "total", "OVER", c
+        if c.get("is_under_value"):
+            key = make_bet_checklist_entry(c, "total", side="UNDER")["selection_key"]
+            yield key, "total", "UNDER", c
+    for c in ar.get("all_props", []):
+        if c.get("is_value") and not c.get("no_history"):
+            key = make_bet_checklist_entry(c, "player_prop")["selection_key"]
+            yield key, "player_prop", None, c
+
+
+def _submit_selected_picks(ar):
+    """Record the checked value bets to the actual-bets ledger (flat unit stake,
+    model price). Runs as a button callback (before widgets re-instantiate), so
+    clearing the checkbox keys afterward is safe."""
+    import wagers
+    stake = float(st.session_state.get("wager_unit_stake", 10.0) or 0.0)
+    events = ar.get("events", {})
+    sport_key = ar.get("sport_key")
+    placed_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+    seq = 0
+    for sel_key, bet_type, side, candidate in _iter_wager_candidates(ar):
+        if not st.session_state.get(sel_key, False):
+            continue
+        meta = dict(events.get(candidate.get("event_id"), {}))
+        meta.update({
+            "sport_key": sport_key,
+            "event_id": candidate.get("event_id"),
+            "stake": stake,
+            "placed_at": placed_at,
+            "seq": seq,
+        })
+        row = wagers.build_wager_row(bet_type, side, candidate, meta)
+        if row:
+            rows.append(row)
+            seq += 1
+    if not rows:
+        st.session_state["_submit_picks_msg"] = (
+            "warning", "No selected bets to submit.")
+        return
+    added = wagers.submit_wagers(rows)
+    _clear_bet_selections()
+    st.session_state["_submit_picks_msg"] = (
+        "success",
+        f"Submitted {added} pick(s) to your bet ledger — track ROI on "
+        "the 🧾 My Bets page.",
+    )
+
+
+def _render_selected_bet_checklist(entries, ar):
+    msg = st.session_state.pop("_submit_picks_msg", None)
     selected = [
         entry for entry in entries
         if st.session_state.get(entry["selection_key"], False)
     ]
     with st.container(border=True):
         st.subheader("🧾 Selected DraftKings Bets")
+        if msg:
+            getattr(st, msg[0], st.info)(msg[1])
         if not selected:
             st.caption(
                 "Select “Add to DraftKings bet list” on any value bet to build "
@@ -367,10 +434,25 @@ def _render_selected_bet_checklist(entries):
             hide_index=True,
             width="stretch",
         )
-        # on_click runs the reset in a callback (before widgets are
-        # instantiated on the rerun), so popping the checkbox keys is safe.
-        st.button("Clear selected bets", key="clear_selected_bets",
-                  on_click=_clear_bet_selections)
+        # Submit the checked bets to the actual-bets ledger at a flat unit stake,
+        # executed at the model's best price at submit (tracks REAL ROI). Both
+        # buttons use on_click callbacks (fire before widgets re-instantiate), so
+        # popping the checkbox keys is safe.
+        stake_col, submit_col, clear_col = st.columns([1, 1, 1])
+        with stake_col:
+            st.number_input(
+                "Unit stake ($)", min_value=0.0, value=10.0, step=1.0,
+                key="wager_unit_stake",
+                help="Flat dollar stake recorded for each submitted pick.",
+            )
+        with submit_col:
+            st.button(
+                "✅ Submit Picks", key="submit_picks", width="stretch",
+                help="Record the checked bets to your actual-bets ledger.",
+                on_click=_submit_selected_picks, args=(ar,))
+        with clear_col:
+            st.button("Clear selected bets", key="clear_selected_bets",
+                      width="stretch", on_click=_clear_bet_selections)
 
 
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
@@ -1048,6 +1130,138 @@ def render_model_guide():
 # ──────────────────────────────────────────────────────────
 #  Page Config
 # ──────────────────────────────────────────────────────────
+def render_my_bets():
+    """Actual-bets ledger — realized ROI on the picks the user really placed."""
+    import wagers
+    st.title("🧾 My Bets — Actual ROI")
+    st.caption(
+        "Realized return on the bets you actually submitted (flat unit stake, "
+        "executed at the model's best price at submit). Bets auto-grade from "
+        "free box scores; closing-line value fills in as the odds warehouse "
+        "accumulates."
+    )
+
+    if wagers.storage_backend() == "Local cache":
+        st.warning(
+            "Your bet ledger is stored locally and resets when a hosted app "
+            "(e.g. Streamlit Cloud) restarts or redeploys. Set "
+            "PREDICTION_LOG_BLOB_URL for a durable Azure Blob."
+        )
+
+    refresh = st.button("🔄 Refresh results",
+                        help="Grade any newly settled bets now.")
+    try:
+        if refresh or not st.session_state.get("_wagers_graded"):
+            with st.spinner("Grading settled bets..."):
+                graded = wagers.resolve_pending_wagers()
+            st.session_state["_wagers_graded"] = True
+            if graded:
+                st.success(f"Graded {graded} newly settled bet(s).")
+    except Exception:
+        pass
+
+    rows = wagers.read_wagers()
+    if not rows:
+        st.info(
+            "No submitted picks yet. On the 🎯 Value Finder page, check "
+            "“Add to DraftKings bet list” on the bets you place, then click "
+            "**Submit Picks**."
+        )
+        return
+
+    try:
+        wagers.attach_clv(rows)
+    except Exception:
+        pass
+
+    sport_labels = {info["key"]: name for name, info in SPORTS.items()}
+
+    def _bet_label(r):
+        bt = r.get("bet_type")
+        if bt == "player_prop":
+            return (f"{r.get('player')} — {r.get('prop_label')} "
+                    f"{r.get('direction')} {r.get('line')}")
+        if bt == "total":
+            return f"{r.get('direction')} {r.get('line')}"
+        if bt == "spread":
+            point = r.get("point")
+            return (f"{r.get('team')} {point:+g}" if isinstance(point, (int, float))
+                    else f"{r.get('team')} spread")
+        return f"{r.get('team')} ML"
+
+    summary = wagers.summarize_wagers(rows)
+    cols = st.columns(5)
+    cols[0].metric("Bets placed", summary["total"])
+    cols[1].metric("Settled", summary["resolved"])
+    roi = summary.get("roi")
+    cols[2].metric("Realized ROI",
+                   f"{roi * 100:+.1f}%" if roi is not None else "—")
+    cols[3].metric("Realized P/L", f"${summary['realized_profit']:+.2f}")
+    hit = summary.get("hit_rate")
+    cols[4].metric("Hit rate",
+                   f"{hit * 100:.1f}%" if hit is not None else "—")
+    st.caption(
+        f"Record: {summary['won']}–{summary['lost']}–{summary['push']} "
+        f"(W–L–P)  ·  Total staked: ${summary['total_staked']:.2f}  ·  "
+        f"Pending: {summary['pending']} (${summary['pending_stake']:.2f})"
+    )
+
+    if summary["by_bet_type"]:
+        st.subheader("By bet type")
+        st.dataframe([
+            {
+                "Bet type": (b["bet_type"] or "—").title(),
+                "Settled": b["resolved"],
+                "W–L–P": f"{b['won']}–{b['lost']}–{b['push']}",
+                "Staked": f"${b['total_staked']:.2f}",
+                "P/L": f"${b['realized_profit']:+.2f}",
+                "ROI": (f"{b['roi'] * 100:+.1f}%" if b["roi"] is not None else "—"),
+            } for b in summary["by_bet_type"]
+        ], hide_index=True, width="stretch")
+
+    settled = [r for r in rows if r.get("status") in ("won", "lost", "push")]
+    pending = [r for r in rows if r.get("status") == "pending"]
+
+    if settled:
+        st.subheader("Settled bets")
+        st.dataframe([
+            {
+                "Placed": (r.get("placed_at") or "")[:10],
+                "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
+                "Bet": _bet_label(r),
+                "Matchup": r.get("matchup"),
+                "Stake": f"${_safe_float(r.get('stake')):.2f}",
+                "Price": r.get("executed_price"),
+                "Result": (r.get("status") or "").upper(),
+                "P/L": f"${_safe_float(r.get('profit')):+.2f}",
+                "CLV": (f"{r.get('clv_pct'):+.1f}%"
+                        if r.get("clv_pct") is not None else "—"),
+            } for r in sorted(settled, key=lambda r: r.get("placed_at") or "",
+                              reverse=True)
+        ], hide_index=True, width="stretch")
+
+    if pending:
+        st.subheader("Pending bets")
+        st.dataframe([
+            {
+                "Placed": (r.get("placed_at") or "")[:10],
+                "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
+                "Bet": _bet_label(r),
+                "Matchup": r.get("matchup"),
+                "Stake": f"${_safe_float(r.get('stake')):.2f}",
+                "Price": r.get("executed_price"),
+                "Game date": r.get("game_date"),
+            } for r in sorted(pending, key=lambda r: r.get("game_date") or "")
+        ], hide_index=True, width="stretch")
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layout="wide")
 
 # ──────────────────────────────────────────────────────────
@@ -1058,12 +1272,16 @@ config = load_config()
 with st.sidebar:
     app_page = st.radio(
         "Navigate",
-        ["🎯 Value Finder", "📘 Model Guide & Performance"],
+        ["🎯 Value Finder", "📘 Model Guide & Performance", "🧾 My Bets"],
         key="app_page",
     )
 
 if app_page == "📘 Model Guide & Performance":
     render_model_guide()
+    st.stop()
+
+if app_page == "🧾 My Bets":
+    render_my_bets()
     st.stop()
 
 if needs_setup(config):
@@ -1901,6 +2119,17 @@ if analyze_clicked and selected_game_labels:
         "alt_data": {},
         "alts_applied": False,
         "threshold_pct": threshold,
+        # Per-event metadata so "Submit Picks" can build ledger rows (commence,
+        # game_date, home/away) without a live re-fetch.
+        "events": {
+            e["id"]: {
+                "commence_time": e.get("commence_time"),
+                "game_date": (e.get("commence_time") or "")[:10],
+                "home_team": e.get("home_team"),
+                "away_team": e.get("away_team"),
+            }
+            for e in selected_events
+        },
     }
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
@@ -1930,6 +2159,14 @@ if "analysis_results" in st.session_state:
             )
         # Clear cached parlays so they re-build using new alt prices.
         st.session_state.pop("parlay_results", None)
+
+    # Fold the fetched odds snapshots into the durable warehouse (roadmap 0.4).
+    # Runs after both fetch waves; a no-op when nothing new was captured.
+    try:
+        import warehouse
+        warehouse.flush()
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────
 #  Display Results (from session state, persists across reruns)
@@ -1971,7 +2208,7 @@ if "analysis_results" in st.session_state:
     col2.metric("Value Bets Found", value_count)
     col3.metric("Credits Used", ar["total_cost"])
     if checklist_entries:
-        _render_selected_bet_checklist(checklist_entries)
+        _render_selected_bet_checklist(checklist_entries, ar)
 
     # Moneyline results
     if all_ml:

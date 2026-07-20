@@ -113,10 +113,13 @@ class _LogConflict(Exception):
 
 
 @contextmanager
-def _local_log_lock():
-    """Hold an inter-process lock while replacing the local prediction log."""
+def _local_file_lock(path):
+    """Hold an inter-process lock while replacing a local NDJSON file.
+
+    Generalizes the prediction-log lock to any sibling NDJSON store (e.g.
+    wagers.jsonl) so concurrent local writers serialize on the same file."""
     _ensure_dirs()
-    lock_path = LOG_PATH + ".lock"
+    lock_path = path + ".lock"
     with open(lock_path, "a+b") as lock_file:
         if os.name == "nt":
             import msvcrt
@@ -137,6 +140,13 @@ def _local_log_lock():
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _local_log_lock():
+    """Hold an inter-process lock while replacing the local prediction log."""
+    with _local_file_lock(LOG_PATH):
+        yield
 
 
 def _read_log_snapshot():
@@ -201,6 +211,89 @@ def mutate_prediction_log(mutator, max_retries=5):
         except _LogConflict:
             continue
     raise RuntimeError("Prediction log changed repeatedly; update was not saved")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generalized NDJSON blob store (sibling files: wagers.jsonl, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
+# The prediction log's read-modify-write + ETag loop is reusable for any small
+# NDJSON store. These helpers parameterize it by filename via _blob_url_for
+# (container-scoped SAS — no new secret), mirroring the prediction-log path
+# exactly. The dedicated prediction-log functions above are left untouched.
+
+def _ndjson_local_path(filename):
+    return os.path.join(PRED_DIR, filename)
+
+
+def _read_ndjson_blob(filename):
+    """Return (rows, version) for an NDJSON store, from Azure or local disk."""
+    blob_url = _blob_url_for(filename)
+    if blob_url:
+        import requests
+        response = requests.get(blob_url, timeout=30)
+        if response.status_code == 404:
+            return [], None
+        response.raise_for_status()
+        return _parse_log_text(response.text), response.headers.get("ETag")
+    path = _ndjson_local_path(filename)
+    if not os.path.exists(path):
+        return [], None
+    with open(path, "r", encoding="utf-8") as f:
+        return _parse_log_text(f.read()), None
+
+
+def _write_ndjson_blob(filename, rows, version=None):
+    """Conditionally write a complete NDJSON snapshot (create or If-Match)."""
+    content = _serialize_log(rows)
+    blob_url = _blob_url_for(filename)
+    if blob_url:
+        import requests
+        headers = {
+            "Content-Type": "application/x-ndjson",
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2023-11-03",
+        }
+        headers["If-Match" if version else "If-None-Match"] = version or "*"
+        response = requests.put(
+            blob_url, data=content.encode("utf-8"), headers=headers, timeout=30)
+        if response.status_code in (409, 412):
+            raise _LogConflict()
+        response.raise_for_status()
+        return
+    path = _ndjson_local_path(filename)
+    _ensure_dirs()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def mutate_ndjson_log(filename, mutator, max_retries=5):
+    """Atomically mutate an arbitrary NDJSON store; returns the mutator's result.
+
+    Generalizes mutate_prediction_log to any sibling NDJSON file. The mutator
+    receives the row list and mutates it in place; a falsy return skips the
+    write. Blob-backed writers retry on ETag conflict; local writers hold an
+    inter-process file lock."""
+    if not _blob_url_for(filename):
+        with _lock:
+            with _local_file_lock(_ndjson_local_path(filename)):
+                rows, version = _read_ndjson_blob(filename)
+                result = mutator(rows)
+                if result:
+                    _write_ndjson_blob(filename, rows, version)
+                return result
+    for _ in range(max_retries):
+        rows, version = _read_ndjson_blob(filename)
+        result = mutator(rows)
+        if not result:
+            return result
+        try:
+            _write_ndjson_blob(filename, rows, version)
+            return result
+        except _LogConflict:
+            continue
+    raise RuntimeError(f"{filename} changed repeatedly; update was not saved")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -688,6 +781,53 @@ def _load_player_gamelog(espn_sport, espn_league, player):
     return gamelog, by_date
 
 
+def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
+    """Resolve one player's actual stat for a single forecast game.
+
+    MLB rows resolve via the statsapi hard-ID (gamePk) path first (disambiguating
+    doubleheaders and grading pitcher props ESPN cannot), falling back to cached
+    ESPN gamelogs with a ±1-day tolerance for UTC/local date slippage. Returns
+    the actual stat as a float, or None when it can't be resolved. `line` is part
+    of the forecast context callers pass but is not used to derive the value.
+    Never raises. Shared by the prediction-log resolver and the wagers resolver.
+    """
+    pair = SPORT_ESPN_MAP.get(sport_key)
+    if not pair:
+        return None
+    espn_sport, espn_league = pair
+    game_date = str(game_date)[:10]
+    # Hard-ID path first (MLB statsapi gamePk); None -> ESPN fallback.
+    actual = _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence)
+    if actual is None:
+        gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
+        if not gamelog:
+            return None
+        stat_label = _stat_label(prop_key, gamelog)
+        if not stat_label:
+            return None
+        idx = _pick_candidate(by_date.get(game_date), commence)
+        if idx is None:
+            # ±1 day fallback for timezone slippage
+            for delta in (-1, 1):
+                try:
+                    alt = (datetime.fromisoformat(game_date)
+                           + timedelta(days=delta)).date().isoformat()
+                except Exception:
+                    continue
+                idx = _pick_candidate(by_date.get(alt), commence)
+                if idx is not None:
+                    break
+        if idx is None:
+            return None
+        actual = gamelog[idx].get(stat_label)
+    if actual is None:
+        return None
+    try:
+        return float(actual)
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     """
     Walk the log, find unresolved entries for this sport whose game_date is in
@@ -699,7 +839,6 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     pair = SPORT_ESPN_MAP.get(sport_key)
     if not pair:
         return 0
-    espn_sport, espn_league = pair
     rows = _read_log()
     if not rows:
         return 0
@@ -724,51 +863,15 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     for player, p_rows in by_player.items():
         if resolved_count >= max_to_resolve:
             break
-        # ESPN gamelog is loaded lazily (once) only when the hard-ID path can't
-        # resolve a row, so statsapi-only-resolvable players (MLB pitchers, or
-        # players ESPN can't name-match) are still graded.
-        espn_loaded = False
-        gamelog = None
-        by_date = {}
-
         for r in p_rows:
             if resolved_count >= max_to_resolve:
                 break
             commence = r.get("commence_time")
-            # Hard-ID path first (MLB statsapi gamePk); None -> ESPN fallback.
-            actual = _resolve_mlb_actual(
-                sport_key, r["prop_key"], player, r["game_date"], commence)
+            # Shared resolver: statsapi hard-ID first, then cached ESPN gamelog.
+            actual = resolve_one_prop(
+                sport_key, player, r["prop_key"], r.get("line"),
+                r["game_date"], commence)
             if actual is None:
-                if not espn_loaded:
-                    espn_loaded = True
-                    gamelog, by_date = _load_player_gamelog(
-                        espn_sport, espn_league, player)
-                if not gamelog:
-                    continue
-                stat_label = _stat_label(r["prop_key"], gamelog)
-                if not stat_label:
-                    continue
-                d = r["game_date"]
-                idx = _pick_candidate(by_date.get(d), commence)
-                if idx is None:
-                    # ±1 day fallback for timezone slippage
-                    for delta in (-1, 1):
-                        try:
-                            alt = (datetime.fromisoformat(d)
-                                   + timedelta(days=delta)).date().isoformat()
-                        except Exception:
-                            continue
-                        idx = _pick_candidate(by_date.get(alt), commence)
-                        if idx is not None:
-                            break
-                if idx is None:
-                    continue
-                actual = gamelog[idx].get(stat_label)
-            if actual is None:
-                continue
-            try:
-                actual = float(actual)
-            except (TypeError, ValueError):
                 continue
             line = float(r["line"])
             if actual == line:

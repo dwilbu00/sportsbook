@@ -15,3 +15,6 @@ config.json
 
 # Runtime caches and logs (populated by the app at run time, not source)
 cache/
+
+# Local odds-warehouse fallback (durable copy lives in Azure Blob at run time)
+warehouse/
