@@ -440,6 +440,170 @@ def evaluate_calibration(per_prop_obs, prop_key, label, shrinkage_k=15):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Step 5: re-select the deployed calibration METHOD at REAL book lines
+#          (roadmap 0.3 — the synthetic-vs-real-line fix)
+#
+#  refit_calibration.py chooses the A/B/C method by Brier at a SYNTHETIC
+#  season-average line, but props.py applies it at the REAL book line. Residual
+#  mu/sigma/ecdf are line-invariant, so the only thing that must be re-decided at
+#  real lines is the A-vs-B/C method choice (method A's empirical over-rate is
+#  already recomputed at the real line at runtime). These helpers mirror the gate
+#  in refit_calibration._best_per_prop / _confirms_over_baseline but score every
+#  method at the real book line carried on each row.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_real_line_obs(enriched, params, sport_key, prop_key,
+                        team_defense=None, league_avg_def=None):
+    """Project every joined observation for one prop at its REAL book line.
+
+    Returns a list of row dicts {player, projected, line, actual,
+    empirical_over, game_date}, reusing project_and_empirical (which evaluates
+    the empirical over-rate at obs["line"], the book line).
+    """
+    rows = []
+    for obs in enriched:
+        if obs["prop_key"] != prop_key:
+            continue
+        projected, emp = project_and_empirical(
+            obs, params, sport_key, team_defense, league_avg_def)
+        if projected is None:
+            continue
+        rows.append({
+            "player": obs["player"],
+            "projected": projected,
+            "line": obs["line"],
+            "actual": obs["actual"],
+            "empirical_over": emp,
+            "game_date": obs["game_date"],
+        })
+    return rows
+
+
+def _score_abc_real(train, test):
+    """Fit pooled residuals on `train`, score methods A/B/C on `test` at each
+    row's REAL book line. Returns ({"A","B","C": brier}, (mu, sigma, sorted)).
+
+    A = empirical over-rate passthrough; B = pooled Gaussian residual;
+    C = pooled residual ECDF. Same math as evaluate_calibration, factored so the
+    single split and the confirmation folds share one implementation.
+    """
+    resid = [r["actual"] - r["projected"] for r in train]
+    mu = sum(resid) / len(resid)
+    var = sum((x - mu) ** 2 for x in resid) / len(resid)
+    sigma = math.sqrt(var) if var > 0 else 1e-6
+    srt = sorted(resid)
+    pA, pB, pC, out = [], [], [], []
+    for r in test:
+        out.append(1 if r["actual"] > r["line"] else 0)
+        pA.append(max(0.0, min(1.0, r["empirical_over"])))
+        corrected = r["projected"] + mu
+        z = (corrected - r["line"]) / sigma if sigma > 0 else 0.0
+        pB.append(_norm_cdf(z))
+        pC.append(1.0 - _empirical_cdf(srt, r["line"] - corrected))
+    return ({"A": _brier(pA, out), "B": _brier(pB, out), "C": _brier(pC, out)},
+            (mu, sigma, srt))
+
+
+def _real_line_folds(rows, min_set_n=20):
+    """Two expanding-train chronological folds over real-line rows (dict shape).
+
+    Mirrors refit_calibration._chronological_folds: cut at 60%/80% of the
+    date-sorted rows, each fold with strictly earlier train than test and
+    >= min_set_n in both sets. Returns [] when the data can't form two folds.
+    """
+    rows = sorted(rows, key=lambda r: r["game_date"])
+    n = len(rows)
+    if n < 3 * min_set_n:
+        return []
+    cut1 = rows[int(n * 0.6)]["game_date"]
+    cut2 = rows[int(n * 0.8)]["game_date"]
+    if not cut1 or not cut2 or cut1 == cut2:
+        return []
+    folds = [
+        ([r for r in rows if r["game_date"] < cut1],
+         [r for r in rows if cut1 <= r["game_date"] < cut2]),
+        ([r for r in rows if r["game_date"] < cut2],
+         [r for r in rows if r["game_date"] >= cut2]),
+    ]
+    for fit_rows, score_rows in folds:
+        if len(fit_rows) < min_set_n or len(score_rows) < min_set_n:
+            return []
+    return folds
+
+
+def select_method_at_real_lines(rows, shrinkage_k=15):
+    """Choose the deployed A/B/C method at REAL book lines, gated like refit.
+
+    Method A (empirical) is the safe baseline and always eligible. A non-empirical
+    method (B/C) is chosen only if it beats A on the single chronological holdout
+    by >= MIN_CALIB_BRIER_GAIN AND beats A in BOTH expanding confirmation folds
+    (defeats winner's-curse). Residuals for the winner are fit on ALL usable obs
+    (the deployed distribution), matching refit_calibration._fit_residuals.
+
+    Returns None if fewer than 20 usable (actual != line) observations, else:
+      {method, fit_brier, baseline_brier, cv_brier, confirmed,
+       residual_mu, residual_sigma, residual_ecdf, n_obs}
+    """
+    from refit_calibration import MIN_CALIB_BRIER_GAIN  # single source of truth
+
+    usable = [r for r in rows if r["actual"] != r["line"]]
+    if len(usable) < 20:
+        return None
+    usable.sort(key=lambda r: r["game_date"])
+
+    # Single chronological holdout: baseline (A) + candidate (B/C) Briers.
+    split = len(usable) // 2
+    single, _ = _score_abc_real(usable[:split], usable[split:])
+    baseline = single["A"]
+
+    # Two-fold out-of-sample confirmation for non-empirical methods.
+    folds = _real_line_folds(usable)
+    fold_scores = [_score_abc_real(tr, te)[0] for tr, te in folds] if folds else []
+
+    def _confirms(method):
+        if not fold_scores:
+            return False
+        return all(fs.get("A") is not None and fs.get(method) is not None
+                   and fs[method] < fs["A"] for fs in fold_scores)
+
+    best_method, best_brier = "A", baseline
+    for method in ("B", "C"):
+        cand = single.get(method)
+        if cand is None or baseline is None:
+            continue
+        if baseline - cand < MIN_CALIB_BRIER_GAIN:
+            continue
+        if not _confirms(method):
+            continue
+        if best_brier is None or cand < best_brier:
+            best_method, best_brier = method, cand
+
+    # Deployed residual distribution: fit on ALL usable obs.
+    resid = [r["actual"] - r["projected"] for r in usable]
+    mu = sum(resid) / len(resid)
+    var = sum((x - mu) ** 2 for x in resid) / len(resid)
+    sigma = math.sqrt(var) if var > 0 else 0.0
+
+    cv_brier = None
+    if fold_scores:
+        vals = [fs.get(best_method) for fs in fold_scores]
+        if all(v is not None for v in vals):
+            cv_brier = round(sum(vals) / len(vals), 4)
+
+    return {
+        "method": best_method,
+        "fit_brier": round(best_brier, 4) if best_brier is not None else None,
+        "baseline_brier": round(baseline, 4) if baseline is not None else None,
+        "cv_brier": cv_brier,
+        "confirmed": best_method != "A",
+        "residual_mu": mu,
+        "residual_sigma": sigma,
+        "residual_ecdf": sorted(resid),
+        "n_obs": len(usable),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  Confidence-threshold "precision vs coverage" report
 # ──────────────────────────────────────────────────────────────────────────────
 

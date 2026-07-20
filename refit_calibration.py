@@ -23,10 +23,10 @@ from datetime import datetime
 from backtest import (
     SPORT_MAP, DEFAULT_STARTERS, DEFAULT_PROPS, VARIANT_PRESETS,
     _build_props_sweep_grid, _evaluate_calibration_methods,
-    _score_calibration_methods,
+    _score_calibration_methods, _team_defense_lookup,
     run_player_props_backtest,
 )
-from calibration_loader import save_calibration
+from calibration_loader import load_calibration, save_calibration
 from espn_cache import seed_athlete_id
 from espn_client import list_season_athletes
 
@@ -418,6 +418,137 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
           f"({len(props_cfg)} props)")
 
 
+def refit_sport_real_lines(sport, store_label="", warmup_games=10,
+                           shrinkage_k_default=0):
+    """Re-select each prop's calibration METHOD at REAL book lines (roadmap 0.3).
+
+    The synthetic-line sweep (`refit_sport`) chooses each prop's A/B/C method by
+    Brier at a season-average line, but `props.py` applies it at the real book
+    line. Residual mu/sigma/ecdf are line-invariant, so only the A-vs-B/C choice
+    needs re-deciding at real lines. This reads the real book lines held in the
+    durable historical_odds store, re-selects the method per prop using the same
+    confirmation gate as `_best_per_prop` (via
+    book_line_calibration.select_method_at_real_lines), and MERGES the result
+    into calibration/<sport>.json.
+
+    The projection variant (half_life/venue/def) is held fixed at the shipped
+    choice; only `method` and its (line-invariant) residual distribution are
+    refit. Props with too little real-line data are SKIPPED (their synthetic fit
+    is preserved). The warmup block is carried forward unchanged — there is no
+    prior-season real-line data, and warmup only affects players with fewer than
+    `warmup_games` current-season games.
+
+    OFFLINE + FREE: reads the store + free ESPN gamelogs; no Odds API credits.
+    """
+    import book_line_calibration as blc
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key)
+    if not existing:
+        print(f"No existing calibration/{sport_key}.json props to refit; run the "
+              f"synthetic sweep (refit_sport) first.")
+        return
+    target_props = list(existing.keys())
+
+    print(f"\n=== Re-selecting calibration method at REAL book lines for "
+          f"{sport_key} ===")
+    book_lines = blc.harvest_book_lines_from_store(
+        sport_key, target_props, store_label)
+    print(f"  {len(book_lines)} store book lines across {len(target_props)} "
+          f"calibrated props")
+    if not book_lines:
+        print("  No real book lines in the store; nothing to refit.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to refit.")
+        return
+
+    # Weight-side opponent-defense lookup only if some prop's variant uses it.
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in existing):
+        print("  Building team-defense lookup (a variant uses opp_defense)...")
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    changed = {}
+    for prop_key in target_props:
+        cfg = existing.get(prop_key) or {}
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        rows = blc.build_real_line_obs(
+            enriched, params, sport_key, prop_key, team_defense, league_avg_def)
+        sel = blc.select_method_at_real_lines(rows)
+        if sel is None:
+            print(f"  [skip] {prop_key}: {len(rows)} real-line obs "
+                  f"(<20 usable) — keeping synthetic fit "
+                  f"(method={cfg.get('method')})")
+            continue
+
+        old_method = cfg.get("method")
+        if sel["method"] == old_method:
+            # The real-line evaluation confirms the shipped method — leave the
+            # cfg untouched. Rewriting it would only replace the (unused-for-A,
+            # or better-sampled-for-B/C) synthetic residual fit with a smaller
+            # real-line one and churn the fit_brier onto a different line/season
+            # basis, for no runtime change. Only a genuine method FLIP is written.
+            print(f"  [keep] {prop_key}: real-line eval confirms method "
+                  f"{old_method} (real-line brier={sel['fit_brier']}, "
+                  f"baseline(A)={sel['baseline_brier']}, n={sel['n_obs']})")
+            continue
+
+        # Preserve variant params, shrinkage_k, variant_label, warmup, etc.;
+        # overwrite only the method + its line-invariant residual distribution.
+        new_cfg = dict(cfg)
+        new_cfg.update({
+            "method": sel["method"],
+            "residual_mu": sel["residual_mu"],
+            "residual_sigma": sel["residual_sigma"],
+            "residual_ecdf": sel["residual_ecdf"],
+            "n_obs": sel["n_obs"],
+            "fit_brier": sel["fit_brier"],
+            "baseline_brier": sel["baseline_brier"],
+            "cv_brier": sel["cv_brier"],
+            "confirmed": sel["confirmed"],
+        })
+        new_cfg.setdefault("warmup_games", warmup_games)
+        new_cfg.setdefault("shrinkage_k", cfg.get("shrinkage_k",
+                                                  shrinkage_k_default))
+        new_cfg["real_line_fit"] = {
+            "fit_at_real_lines": True,
+            "n_obs": sel["n_obs"],
+            "source": "historical_odds store",
+            "store_label": store_label or "default",
+        }
+        changed[prop_key] = new_cfg
+        note = (f"{old_method}→{sel['method']} FLIP"
+                if sel["method"] != old_method else "unchanged")
+        print(f"  [{prop_key}] method {note}  brier={sel['fit_brier']} "
+              f"baseline(A)={sel['baseline_brier']} cv={sel['cv_brier']} "
+              f"n={sel['n_obs']}")
+
+    if not changed:
+        print("\nNo props had enough real-line data to re-select. "
+              "Nothing written.")
+        return
+
+    save_calibration(
+        sport_key, changed,
+        meta={"real_line_refit": {
+            "props": sorted(changed.keys()),
+            "store_label": store_label or "default",
+        }},
+        merge_props=True)
+    print(f"\n✓ Updated calibration/{sport_key}.json "
+          f"({len(changed)} prop(s) re-selected at real book lines; "
+          f"other props/blocks preserved)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Refit persistent calibration files")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), required=True)
@@ -445,7 +576,21 @@ def main():
     p.add_argument("--nba-min-games", type=int, default=15,
                    help="Minimum games played for an NBA player to enter the "
                         "data-driven pool.")
+    p.add_argument("--real-lines", action="store_true",
+                   help="Re-select each prop's calibration method at REAL book "
+                        "lines from the durable historical_odds store (roadmap "
+                        "0.3), instead of the synthetic-line sweep. OFFLINE + "
+                        "free; merges into the existing calibration file.")
+    p.add_argument("--store-label", default="",
+                   help="historical_odds store label to read real book lines "
+                        "from with --real-lines (default: the unlabeled store).")
     args = p.parse_args()
+
+    if args.real_lines:
+        refit_sport_real_lines(args.sport, store_label=args.store_label,
+                               warmup_games=args.warmup_games,
+                               shrinkage_k_default=args.shrinkage_k)
+        return
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None
     props = [pk.strip() for pk in args.props.split(",")] if args.props else None
