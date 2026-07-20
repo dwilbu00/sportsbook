@@ -195,23 +195,26 @@ def read_wagers():
 
 
 def submit_wagers(rows):
-    """Append new wager rows, de-duplicating by wager_id. Returns count added."""
+    """Append new wager rows, de-duplicating by wager_id. Returns count added.
+
+    Raises on a storage failure rather than swallowing it — a Submit is a
+    user-initiated action, so the caller must be able to tell the user it failed
+    (and keep their selections) instead of silently reporting zero."""
     if not rows:
         return 0
-    try:
-        def upsert(existing):
-            have = {r.get("wager_id") for r in existing}
-            added = 0
-            for row in rows:
-                if row.get("wager_id") in have:
-                    continue
-                existing.append(row)
-                have.add(row.get("wager_id"))
-                added += 1
-            return added
-        return recalibration.mutate_ndjson_log(WAGERS_FILE, upsert)
-    except Exception:
-        return 0
+
+    def upsert(existing):
+        have = {r.get("wager_id") for r in existing}
+        added = 0
+        for row in rows:
+            if row.get("wager_id") in have:
+                continue
+            existing.append(row)
+            have.add(row.get("wager_id"))
+            added += 1
+        return added
+
+    return recalibration.mutate_ndjson_log(WAGERS_FILE, upsert)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

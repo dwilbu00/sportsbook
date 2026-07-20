@@ -390,7 +390,10 @@ def _submit_selected_picks(ar):
             "placed_at": placed_at,
             "seq": seq,
         })
-        row = wagers.build_wager_row(bet_type, side, candidate, meta)
+        try:
+            row = wagers.build_wager_row(bet_type, side, candidate, meta)
+        except Exception:
+            row = None
         if row:
             rows.append(row)
             seq += 1
@@ -398,7 +401,24 @@ def _submit_selected_picks(ar):
         st.session_state["_submit_picks_msg"] = (
             "warning", "No selected bets to submit.")
         return
-    added = wagers.submit_wagers(rows)
+    # Surface storage failures instead of silently reporting "Submitted 0", and
+    # keep the selections checked so the user can retry without re-picking.
+    try:
+        added = wagers.submit_wagers(rows)
+    except Exception as exc:
+        st.session_state["_submit_picks_msg"] = (
+            "error",
+            f"Couldn't save your {len(rows)} pick(s) to the ledger: {exc}. "
+            "Your selections were kept — try again.",
+        )
+        return
+    if not added:
+        st.session_state["_submit_picks_msg"] = (
+            "error",
+            f"Storage reported 0 of {len(rows)} pick(s) written. Your "
+            "selections were kept — try again.",
+        )
+        return
     _clear_bet_selections()
     st.session_state["_submit_picks_msg"] = (
         "success",
@@ -1268,6 +1288,23 @@ st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layou
 #  First-run setup check
 # ──────────────────────────────────────────────────────────
 config = load_config()
+
+# Preserve Value Finder widget state across page switches. Streamlit clears a
+# widget's key from session_state when that widget is NOT rendered on a run —
+# which happens whenever the Model Guide or My Bets page is showing. Without this,
+# returning to Value Finder resets the Sport selectbox to its default, which fires
+# on_sport_change and wipes the whole analysis (results + game selection + bet
+# ticks). Re-touching these keys here (before any of them is created) keeps them,
+# so navigating away and back preserves the analysis. Genuine user sport changes
+# still fire on_sport_change normally. `selected_games` is deliberately excluded:
+# its options are the live slate (games drop off), and re-injecting stale labels
+# risks an options-mismatch — the analysis itself survives via analysis_results,
+# which is a plain key Streamlit never garbage-collects.
+for _persist_key in list(st.session_state.keys()):
+    if (_persist_key in ("sport", "markets", "props", "result_filter",
+                         "wager_unit_stake")
+            or str(_persist_key).startswith("bet_selection:")):
+        st.session_state[_persist_key] = st.session_state[_persist_key]
 
 with st.sidebar:
     app_page = st.radio(
