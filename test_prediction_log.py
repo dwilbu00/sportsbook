@@ -106,7 +106,6 @@ class CompactionTests(unittest.TestCase):
 class SeedWarmupSeasonCountTests(unittest.TestCase):
     def test_seed_counts_only_current_season_prior_games(self):
         import book_line_calibration as blc
-        import backtest
         import calibration_loader as cl
 
         obs = {
@@ -129,11 +128,12 @@ class SeedWarmupSeasonCountTests(unittest.TestCase):
             captured["curr"] = current_season_games
             return None
 
-        with patch.object(blc, "harvest_book_lines", return_value=[1]), \
+        with patch.object(blc, "harvest_book_lines_from_store", return_value=[]), \
+             patch.object(blc, "harvest_book_lines", return_value=[1]), \
              patch.object(blc, "join_book_lines_to_actuals", return_value=[obs]), \
              patch.object(blc, "project_and_empirical", return_value=(22.0, 0.6)), \
-             patch.object(backtest, "_resolve_params",
-                          return_value={"opp_defense_strength": 0.0}), \
+             patch.object(blc, "_team_defense_lookup",
+                          return_value=(None, None, None)), \
              patch.object(cl, "load_calibration",
                           return_value={"player_points": {"method": "B"}}), \
              patch.object(cl, "apply_calibration_with_warmup",

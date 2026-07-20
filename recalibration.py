@@ -1041,33 +1041,80 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
     Returns dict {prop_key: (a, b, n_fit)} actually fit & saved.
     """
     from book_line_calibration import (
-        harvest_book_lines, join_book_lines_to_actuals,
-        project_and_empirical, _team_defense_lookup, VARIANT_PRESETS,
+        harvest_book_lines, harvest_book_lines_from_store,
+        join_book_lines_to_actuals, project_and_empirical, _team_defense_lookup,
     )
-    from backtest import _resolve_params
     from calibration_loader import (
         load_calibration as _load_cal,
         apply_calibration_with_warmup, count_current_season_games,
     )
+    # Imported lazily (function scope) to avoid the props <-> recalibration
+    # module import cycle; by call time both modules are fully loaded.
+    from props import (
+        _player_prop_half_life, _player_prop_defense_strength,
+        _player_prop_venue_strength,
+    )
 
-    book_lines = harvest_book_lines(sport_key, target_props)
+    # Prefer the DURABLE historical_odds store (backfill output); fall back to
+    # the ephemeral cache/*.json HTTP cache for backward compatibility.
+    book_lines = harvest_book_lines_from_store(sport_key, target_props)
+    if not book_lines:
+        book_lines = harvest_book_lines(sport_key, target_props)
     if not book_lines:
         return {}
     enriched = join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
     if not enriched:
         return {}
 
-    # Use the "all" preset (matches what production resolves to in most cases)
-    params = _resolve_params(VARIANT_PRESETS["all"], sport_key)
-    team_defense = league_avg_def = None
-    if params.get("opp_defense_strength", 0.0) > 0:
-        team_defense, _, league_avg_def = _team_defense_lookup(espn_sport, espn_league)
-
     cal = _load_cal(sport_key) or {}
+
+    # Resolve per-prop projection knobs EXACTLY as the production analyzer does
+    # (props.py::analyze_player_props_value _knob resolution), so the seed fits
+    # Platt on the SAME raw-probability distribution production emits. A single
+    # global preset (e.g. VARIANT_PRESETS["all"], venue_strength=0.25 for all)
+    # would fit Platt on the WRONG distribution: empirical_over depends on the
+    # per-prop half_life and venue weighting, which vary by prop in the shipped
+    # calibration (e.g. MLB half_life null/7/15, venue 0.0/0.25).
+    default_half_life = _player_prop_half_life(sport_key)
+    default_def_strength = _player_prop_defense_strength(sport_key)
+    default_venue = _player_prop_venue_strength(sport_key)
+
+    def _knob(cfg, name, default):
+        if cfg and name in cfg:
+            value = cfg[name]
+            # half_life=null explicitly means equal weighting; other null knobs
+            # mean "use the default".
+            if value is not None or name == "half_life":
+                return value
+        return default
+
+    def _params_for(prop_key):
+        cfg = cal.get(prop_key) or {}
+        return {
+            "half_life": _knob(cfg, "half_life", default_half_life),
+            # None venue/defense defaults -> 0.0 (project_and_empirical needs a
+            # scalar strength; MLB props set both explicitly so this is exact).
+            "venue_strength": _knob(cfg, "venue_strength", default_venue) or 0.0,
+            "opp_defense_strength": (
+                _knob(cfg, "opp_defense_strength", default_def_strength) or 0.0),
+            "use_minutes": False,
+        }
+
+    # Team-defense lookup only if some target prop actually uses input-side
+    # opponent-defense weighting (MLB props ship at 0.0 -> skipped).
+    need_defense = any(
+        (_params_for(pk)["opp_defense_strength"] or 0.0) > 0
+        for pk in (target_props or [])
+    )
+    team_defense = league_avg_def = None
+    if need_defense:
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
 
     by_prop_records = defaultdict(list)
 
     for obs in enriched:
+        params = _params_for(obs["prop_key"])
         projected, emp = project_and_empirical(obs, params, sport_key,
                                                 team_defense, league_avg_def)
         if projected is None or emp is None:

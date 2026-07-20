@@ -1,0 +1,43 @@
+{
+  "sport_key": "baseball_mlb",
+  "fit_timestamp": "2026-07-20T13:54:15.742307+00:00",
+  "props": {
+    "batter_hits": {
+      "a": 0.55646,
+      "b": 0.19613,
+      "n_fit": 938,
+      "n_validation": 402,
+      "n_validation_folds": 2,
+      "holdout_start": "2026-07-17",
+      "holdout_raw_brier": 0.245514,
+      "holdout_calibrated_brier": 0.240931,
+      "holdout_raw_log_loss": 0.685784,
+      "holdout_calibrated_log_loss": 0.674996,
+      "holdout_metric_scope": "fold_cross_validation",
+      "deploy_fit_scope": "all_observations",
+      "validation_folds": [
+        {
+          "holdout_start": "2026-07-17",
+          "n_validation": 210,
+          "raw_brier": 0.2519178444606166,
+          "calibrated_brier": 0.24572128045429306,
+          "raw_log_loss": 0.6992812006381999,
+          "calibrated_log_loss": 0.6848631844327849
+        },
+        {
+          "holdout_start": "2026-07-19",
+          "n_validation": 192,
+          "raw_brier": 0.23850901381787226,
+          "calibrated_brier": 0.2356915375119164,
+          "raw_log_loss": 0.671022469994592,
+          "calibrated_log_loss": 0.6642031905732435
+        }
+      ],
+      "validated": true,
+      "source": "book_line_cache_seed"
+    }
+  },
+  "meta": {
+    "source": "book_line_cache_seed"
+  }
+}

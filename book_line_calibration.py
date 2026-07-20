@@ -136,6 +136,50 @@ def harvest_book_lines(sport_key, target_props):
     return out
 
 
+def harvest_book_lines_from_store(sport_key, target_props, label=""):
+    """
+    Harvest (player, prop, game) book lines from the DURABLE historical_odds
+    store (backfill_historical_odds.py output) instead of the ephemeral
+    cache/*.json HTTP cache. Returns the same shape as harvest_book_lines():
+      {sport_key, game_date, home_team, away_team, player, prop_key, line,
+       over_price, under_price}
+
+    The store already consolidates each (player, prop, game) to one consensus
+    line + best executable price per side (see odds_client.parse_player_props),
+    so no per-book median is computed here.
+    """
+    import historical_odds as store_mod
+    store = store_mod.load_store(sport_key, label)
+    target = set(target_props or [])
+    out = []
+    for entry in (store.get("games") or {}).values():
+        date = (entry.get("commence_time") or "")[:10]
+        if not date:
+            continue
+        home = entry.get("home_team")
+        away = entry.get("away_team")
+        for prop_key, by_player in (entry.get("props") or {}).items():
+            if prop_key not in target:
+                continue
+            for player, info in (by_player or {}).items():
+                line = info.get("line")
+                if line is None:
+                    continue
+                out.append({
+                    "sport_key": sport_key,
+                    "game_date": date,
+                    "home_team": home,
+                    "away_team": away,
+                    "player": player,
+                    "prop_key": prop_key,
+                    "line": line,
+                    "over_price": info.get("over_price"),
+                    "under_price": info.get("under_price"),
+                })
+    out.sort(key=lambda r: (r["game_date"], r["player"], r["prop_key"]))
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Step 2: join each book line to the player's actual stat in that game
 # ──────────────────────────────────────────────────────────────────────────────
