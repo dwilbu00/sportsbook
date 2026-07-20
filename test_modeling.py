@@ -1066,9 +1066,14 @@ class RecalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["realized_roi"], (1 + 10 / 11) / 2)
 
     def test_maintenance_resolves_before_testing_refit_gate(self):
+        # blob-url -> "" keeps compact_prediction_log off live Azure (secrets.toml
+        # is present locally); a None last-fit forces the refit branch the way the
+        # old os.path.exists=False mock did before the gate became blob-aware.
         with patch.object(
                 recalibration, "resolve_pending_outcomes", return_value=25), patch.object(
-                recalibration.os.path, "exists", return_value=False), patch.object(
+                recalibration, "_prediction_log_blob_url", return_value=""), patch.object(
+                recalibration, "_load_recal_cached", return_value=(None, {})), patch.object(
+                recalibration, "compact_prediction_log", return_value=0), patch.object(
                 recalibration, "refit_sport", return_value={"prop": (1, 0, 90)}) as refit:
             result = recalibration.maintain_sport("baseball_mlb")
         self.assertEqual(result, {"newly_resolved": 25, "refit": True})
@@ -1089,7 +1094,10 @@ class RecalibrationTests(unittest.TestCase):
         def mutate(mutator):
             return mutator(rows)
 
-        with patch.object(recalibration, "_read_log", return_value=rows), patch(
+        # _resolve_mlb_actual -> None forces the ESPN fallback (and keeps this
+        # MLB row off live statsapi, which the hard-ID path would otherwise hit).
+        with patch.object(recalibration, "_read_log", return_value=rows), patch.object(
+                recalibration, "_resolve_mlb_actual", return_value=None), patch(
                 "espn_cache.cached_athlete_id", return_value="123"), patch(
                 "espn_cache.cached_gamelog",
                 return_value=[{"game_date": "2024-04-01", "H": 1}],

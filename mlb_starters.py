@@ -19,7 +19,7 @@ outcomes rather than guessed.
 """
 
 import csv
-from datetime import date as _date, timedelta
+from datetime import date as _date, datetime, timedelta, timezone
 import io
 import json
 import math
@@ -943,6 +943,190 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None):
 def _tanh(x):
     import math
     return math.tanh(x)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hard-ID outcome resolution (gamePk) — used by recalibration.resolve_pending_outcomes
+# ──────────────────────────────────────────────────────────────────────────────
+# The prediction log carries an Odds API event id (not a gamePk) plus the game's
+# commence_time. To grade a bet against the *right* game — including the correct
+# leg of a doubleheader — we resolve the player -> MLBAM id -> season gameLog ->
+# gamePk, and join gamePk to that date's schedule to pick the game whose start is
+# nearest commence_time. This also grades pitcher props, which ESPN's synthesized
+# (dateless) pitcher gamelogs cannot.
+
+def _parse_utc(value):
+    """Parse an ISO timestamp as tz-aware UTC (coercing naive -> UTC), or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _candidate_dates(game_date):
+    """[game_date, game_date-1, game_date+1] for UTC/local slippage tolerance."""
+    day = str(game_date)[:10]
+    out = [day]
+    try:
+        base = _date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return out
+    for delta in (-1, 1):
+        out.append((base + timedelta(days=delta)).isoformat())
+    return out
+
+
+def get_schedule_index(date):
+    """{str(gamePk): {gameDate, gameNumber, doubleHeader, home, away}} for one
+    calendar date (YYYY-MM-DD). gamePk is the hard game id; gameDate is the UTC
+    start used to disambiguate doubleheaders against a forecast's commence_time.
+    Past-date schedules are static, so this caches for a day."""
+    cache = f"schedule_index_{date}"
+    cached = _read_cache(cache, max_age=24 * 3600)
+    if cached is not None:
+        return cached
+    data = _get("schedule", {"sportId": 1, "date": date})
+    out = {}
+    for d in data.get("dates", []) or []:
+        for g in d.get("games", []) or []:
+            pk = g.get("gamePk")
+            if pk is None:
+                continue
+            teams = g.get("teams", {}) or {}
+            out[str(pk)] = {
+                "gameDate": g.get("gameDate"),
+                "gameNumber": g.get("gameNumber"),
+                "doubleHeader": g.get("doubleHeader"),
+                "home": ((teams.get("home") or {}).get("team") or {}).get("name"),
+                "away": ((teams.get("away") or {}).get("team") or {}).get("name"),
+            }
+    _write_cache(cache, out)
+    return out
+
+
+_PLAYER_INDEX_CACHE = {}  # season -> {norm_name: [(mlbam_id, is_pitcher), ...]}
+
+
+def _player_index(season):
+    """{normalized_full_name: [(id, is_pitcher), ...]} for a season's players."""
+    cached = _PLAYER_INDEX_CACHE.get(season)
+    if cached is not None:
+        return cached
+    disk = _read_cache(f"players_index_{season}", max_age=7 * 24 * 3600)
+    if disk is not None:
+        index = {k: [tuple(v) for v in vs] for k, vs in disk.items()}
+        _PLAYER_INDEX_CACHE[season] = index
+        return index
+    data = _get("sports/1/players", {"season": season})
+    index = {}
+    for p in data.get("people", []) or []:
+        pid = p.get("id")
+        full = p.get("fullName")
+        if not pid or not full:
+            continue
+        pos = p.get("primaryPosition") or {}
+        is_pitcher = (pos.get("abbreviation") == "P"
+                      or pos.get("type") == "Pitcher"
+                      or str(pos.get("code")) == "1")
+        index.setdefault(_norm(full), []).append((pid, is_pitcher))
+    _write_cache(f"players_index_{season}",
+                 {k: [[pid, isp] for pid, isp in vs] for k, vs in index.items()})
+    _PLAYER_INDEX_CACHE[season] = index
+    return index
+
+
+def find_player_id(name, season):
+    """(mlbam_id, is_pitcher) for a UNIQUE exact full-name match, else None.
+
+    The forecast row carries no team, so a non-unique name is skipped rather
+    than risk binding a prop to the wrong player and poisoning the fit."""
+    matches = _player_index(season).get(_norm(name))
+    if not matches or len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _player_gamelog_splits(pid, group, season):
+    """Season gameLog splits for a player + stat group ('hitting'/'pitching')."""
+    cache = f"gamelog_{pid}_{group}_{season}"
+    cached = _read_cache(cache)
+    if cached is not None:
+        return cached
+    data = _get(f"people/{pid}/stats",
+                {"stats": "gameLog", "group": group, "season": season})
+    splits = []
+    for grp in data.get("stats", []) or []:
+        splits.extend(grp.get("splits", []) or [])
+    _write_cache(cache, splits)
+    return splits
+
+
+def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
+                             season):
+    """Resolve one player's actual stat for a specific game via the gamePk hard
+    ID, disambiguating doubleheaders by commence_time. Returns a float, or None
+    when the player/game/stat can't be resolved unambiguously (caller falls back
+    to the ESPN path). Position group must match (a pitching prop only binds to a
+    pitcher) to avoid same-name cross-position mismatches."""
+    found = find_player_id(name, season)
+    if not found:
+        return None
+    pid, is_pitcher = found
+    if group == "pitching" and not is_pitcher:
+        return None
+    if group == "hitting" and is_pitcher:
+        return None
+
+    by_pk = {}
+    for sp in _player_gamelog_splits(pid, group, season):
+        pk = (sp.get("game") or {}).get("gamePk") or sp.get("gamePk")
+        if pk is None:
+            continue
+        stat = sp.get("stat") or {}
+        if stat_key not in stat:
+            continue
+        try:
+            by_pk[str(pk)] = float(stat[stat_key])
+        except (TypeError, ValueError):
+            continue
+    if not by_pk:
+        return None
+
+    target = _parse_utc(commence_time)
+    # Gather the player's games across the forecast date AND adjacent days. The
+    # stored game_date is the UTC date of first pitch (props logs commence[:10]),
+    # which for late US games is one day AHEAD of the schedule's official/local
+    # date — so the true game can live under game_date-1. Collect every candidate
+    # and choose by nearest scheduled start, never first-date-wins (which would
+    # bind an everyday hitter to the following day's game).
+    candidates = []  # (gamePk, scheduled_start_dt_or_None)
+    seen = set()
+    for d in _candidate_dates(game_date):
+        for pk, info in get_schedule_index(d).items():
+            if pk in by_pk and pk not in seen:
+                seen.add(pk)
+                candidates.append((pk, _parse_utc(info.get("gameDate"))))
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return by_pk[candidates[0][0]]
+    # Multiple nearby games (doubleheader or date slippage): disambiguate by the
+    # start nearest commence_time. Without commence we can't choose safely.
+    if target is None:
+        return None
+    best_pk, best_delta = None, None
+    for pk, gdt in candidates:
+        if gdt is None:
+            continue
+        delta = abs((gdt - target).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best_delta, best_pk = delta, pk
+    return by_pk[best_pk] if best_pk is not None else None
 
 
 if __name__ == "__main__":

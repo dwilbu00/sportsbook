@@ -14477,8 +14477,51 @@
       "home_team": "St. Louis Cardinals",
       "away_team": "Atlanta Braves",
       "event_id": "a2501dff8c71ab28b0051fafeed81903",
-      "props_snapshot_timestamp": "2026-07-11T00:10:37Z",
-      "props": {}
+      "props_snapshot_timestamp": "2026-07-11T23:10:36Z",
+      "props": {
+        "pitcher_strikeouts": {
+          "Matthew Liberatore": {
+            "line": 4.5,
+            "over_price": 101,
+            "under_price": -129,
+            "over_book": "DraftKings",
+            "under_book": "DraftKings",
+            "over_implied": 0.468983595813963,
+            "under_implied": 0.531016404186037,
+            "offers": [
+              {
+                "book": "DraftKings",
+                "over_price": 101,
+                "under_price": -129
+              }
+            ],
+            "books_sampled": 1,
+            "over_prices_sampled": 1,
+            "under_prices_sampled": 1,
+            "market_implied_method": "two_way_devig_consensus"
+          },
+          "Reynaldo Lopez": {
+            "line": 3.5,
+            "over_price": -111,
+            "under_price": -114,
+            "over_book": "DraftKings",
+            "under_book": "DraftKings",
+            "over_implied": 0.4968624497991968,
+            "under_implied": 0.5031375502008032,
+            "offers": [
+              {
+                "book": "DraftKings",
+                "over_price": -111,
+                "under_price": -114
+              }
+            ],
+            "books_sampled": 1,
+            "over_prices_sampled": 1,
+            "under_prices_sampled": 1,
+            "market_implied_method": "two_way_devig_consensus"
+          }
+        }
+      }
     },
     "2026-07-11|Chicago Cubs @ Cincinnati Reds": {
       "commence_time": "2026-07-11T23:10Z",
@@ -22272,5 +22315,5 @@
     }
   },
   "bookmaker": "draftkings",
-  "updated": "2026-07-20T13:45:19.190695Z"
+  "updated": "2026-07-20T14:51:51.151169Z"
 }

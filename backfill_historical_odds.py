@@ -261,6 +261,12 @@ def main():
         print(f"  Budget allows {max_prop_games} prop games — trimming "
               f"{len(prop_games) - max_prop_games} oldest.")
         prop_games = prop_games[:max(max_prop_games, 0)]
+    # Re-derive event-ID dates from the (possibly trimmed) prop games so the ID
+    # phase never looks up a date whose games were all trimmed away — that would
+    # make `min(g["date"] for g in date_games)` raise on an empty sequence.
+    if need_event_lookup:
+        id_dates = sorted({(g["date"])[:10] for g in prop_games})
+        id_credits = len(id_dates) * 1
     planned = feat_credits + id_credits + len(prop_games) * prop_cost
     print(f"\n  This run: {len(feat_tasks)} featured snapshots + "
           f"{len(prop_games)} prop games  ≈ {planned} credits.\n")

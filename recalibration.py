@@ -52,6 +52,7 @@ MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitt
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
 MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
 AUTO_MAINTENANCE_INTERVAL_SECONDS = 3600
+RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal blob
 
 _lock = threading.Lock()
 _last_auto_maintenance = {}  # sport_key -> attempt timestamp
@@ -200,6 +201,77 @@ def mutate_prediction_log(mutator, max_retries=5):
         except _LogConflict:
             continue
     raise RuntimeError("Prediction log changed repeatedly; update was not saved")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generic JSON-blob helpers (durable calibration state)
+# ──────────────────────────────────────────────────────────────────────────────
+# The prediction-log SAS is container-scoped (sr=c), so sibling blobs are
+# reachable with the SAME token by swapping the last path segment. This lets the
+# learned Platt store persist to Azure exactly like the log, without a new secret.
+
+def _blob_url_for(filename):
+    """Sibling blob URL for `filename`, reusing the prediction-log SAS token.
+    Returns "" when no blob backend is configured."""
+    base = _prediction_log_blob_url()
+    if not base:
+        return ""
+    path, sep, query = base.partition("?")
+    parent = path.rsplit("/", 1)[0]
+    url = f"{parent}/{filename}"
+    return f"{url}{sep}{query}" if sep else url
+
+
+def _read_json_blob(filename, etag=None):
+    """Read a JSON blob.
+
+    Returns (status, obj, etag) where status is "ok" | "notmodified" | "missing".
+    Sends a conditional GET when `etag` is provided. Raises on network / HTTP
+    errors other than 404 (missing) and 304 (not modified) so callers can retry
+    or degrade explicitly.
+    """
+    url = _blob_url_for(filename)
+    if not url:
+        return "missing", {}, None
+    import requests
+    headers = {"If-None-Match": etag} if etag else {}
+    response = requests.get(url, headers=headers, timeout=10)
+    if response.status_code == 304:
+        return "notmodified", {}, etag
+    if response.status_code == 404:
+        return "missing", {}, None
+    response.raise_for_status()
+    etag = response.headers.get("ETag")
+    try:
+        obj = json.loads(response.text)
+    except json.JSONDecodeError:
+        # Present but corrupt: return the ETag so a save can overwrite it
+        # (If-Match) instead of looping forever on If-None-Match:*.
+        return "unreadable", {}, etag
+    if not isinstance(obj, dict):
+        return "unreadable", {}, etag
+    return "ok", obj, etag
+
+
+def _write_json_blob(filename, obj, version=None):
+    """Conditionally PUT a JSON blob. Raises _LogConflict on 409/412 so a
+    read-modify-write caller can retry with a fresh ETag."""
+    url = _blob_url_for(filename)
+    if not url:
+        return
+    import requests
+    content = json.dumps(obj, indent=2)
+    headers = {
+        "Content-Type": "application/json",
+        "x-ms-blob-type": "BlockBlob",
+        "x-ms-version": "2023-11-03",
+    }
+    headers["If-Match" if version else "If-None-Match"] = version or "*"
+    response = requests.put(
+        url, data=content.encode("utf-8"), headers=headers, timeout=10)
+    if response.status_code in (409, 412):
+        raise _LogConflict()
+    response.raise_for_status()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -507,21 +579,126 @@ def _stat_label(prop_key, gamelog):
     return None
 
 
+def _parse_dt(value):
+    """Parse an ISO timestamp as tz-aware UTC (coercing naive -> UTC), or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _pick_candidate(candidates, commence):
+    """Pick the gamelog index best matching a forecast's commence_time.
+
+    `candidates` is a list of (full_datetime_str, idx) that share a calendar
+    date. Disambiguates same-day games (doubleheaders) by nearest start time;
+    falls back to the first candidate when commence is absent or the gamelog
+    timestamps are unparseable / date-only (so single-game and legacy rows keep
+    resolving exactly as before).
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0][1]
+    target = _parse_dt(commence)
+    if target is not None:
+        best_idx = best_delta = None
+        for full, idx in candidates:
+            dt = _parse_dt(full)
+            if dt is None:
+                continue
+            delta = abs((dt - target).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best_delta, best_idx = delta, idx
+        if best_idx is not None:
+            return best_idx
+    return candidates[0][1]
+
+
+# prop_key -> (statsapi group, statsapi gameLog stat key). Unmapped props fall
+# through to the ESPN gamelog path.
+_MLB_STAT_SPEC = {
+    "batter_hits": ("hitting", "hits"),
+    "batter_home_runs": ("hitting", "homeRuns"),
+    "batter_total_bases": ("hitting", "totalBases"),
+    "batter_rbis": ("hitting", "rbi"),
+    "batter_strikeouts": ("hitting", "strikeOuts"),
+    "pitcher_strikeouts": ("pitching", "strikeOuts"),
+    "pitcher_outs": ("pitching", "outs"),
+    "pitcher_earned_runs": ("pitching", "earnedRuns"),
+}
+
+
+def _mlb_stat_spec(prop_key):
+    return _MLB_STAT_SPEC.get(prop_key)
+
+
+def _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence):
+    """Resolve a player's actual stat for the forecast game via the MLB statsapi
+    hard-ID (gamePk) path, disambiguating doubleheaders by commence_time. Returns
+    the stat value, or None to fall back to the ESPN path. Never raises, so a
+    statsapi outage degrades to ESPN and never blocks other sports."""
+    if sport_key != "baseball_mlb":
+        return None
+    spec = _mlb_stat_spec(prop_key)
+    if not spec:
+        return None
+    group, stat_key = spec
+    try:
+        season = int(str(game_date)[:4])
+    except (TypeError, ValueError):
+        return None
+    try:
+        import mlb_starters
+        return mlb_starters.resolve_player_game_stat(
+            player, commence, game_date, group, stat_key, season)
+    except Exception:
+        return None
+
+
+def _load_player_gamelog(espn_sport, espn_league, player):
+    """(gamelog, {date: [(full_datetime, idx), ...]}) from ESPN, or (None, {}).
+
+    Keeps EVERY game per date (a first-wins index would drop the 2nd game of a
+    doubleheader). Never raises; a missing player/gamelog degrades to (None, {}).
+    """
+    try:
+        from espn_cache import cached_athlete_id, cached_gamelog
+        aid = cached_athlete_id(espn_sport, espn_league, player)
+        if not aid:
+            return None, {}
+        # Outcome maintenance needs yesterday's result; the cache helper's
+        # 30-day historical default is too stale for forward tracking.
+        gamelog = cached_gamelog(espn_sport, espn_league, aid, ttl_hours=6)
+        if not gamelog:
+            return None, {}
+    except Exception:
+        return None, {}
+    by_date = defaultdict(list)
+    for i, g in enumerate(gamelog):
+        full = g.get("game_date") or ""
+        d = full[:10]
+        if d:
+            by_date[d].append((full, i))
+    return gamelog, by_date
+
+
 def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     """
-    Walk the log, find unresolved entries for this sport whose game_date is
-    in the past, and fill in actual + outcome from cached ESPN gamelogs.
-    Caps per-launch resolution by `max_to_resolve` to bound ESPN cost.
-    Returns the number of newly resolved entries.
+    Walk the log, find unresolved entries for this sport whose game_date is in
+    the past, and fill in actual + outcome. MLB rows resolve via the statsapi
+    hard-ID (gamePk) path first (disambiguating doubleheaders and grading pitcher
+    props ESPN cannot), falling back to cached ESPN gamelogs. Caps per-launch
+    resolution by `max_to_resolve`. Returns the number of newly resolved entries.
     """
     pair = SPORT_ESPN_MAP.get(sport_key)
     if not pair:
         return 0
-    try:
-        from espn_cache import cached_athlete_id, cached_gamelog
-    except Exception:
-        return 0
-
     espn_sport, espn_league = pair
     rows = _read_log()
     if not rows:
@@ -547,45 +724,46 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     for player, p_rows in by_player.items():
         if resolved_count >= max_to_resolve:
             break
-        try:
-            aid = cached_athlete_id(espn_sport, espn_league, player)
-            if not aid:
-                continue
-            # Outcome maintenance needs yesterday's result; the cache helper's
-            # 30-day historical default is too stale for forward tracking.
-            gamelog = cached_gamelog(
-                espn_sport, espn_league, aid, ttl_hours=6)
-            if not gamelog:
-                continue
-        except Exception:
-            continue
-
-        date_idx = {}
-        for i, g in enumerate(gamelog):
-            d = (g.get("game_date") or "")[:10]
-            if d and d not in date_idx:
-                date_idx[d] = i
+        # ESPN gamelog is loaded lazily (once) only when the hard-ID path can't
+        # resolve a row, so statsapi-only-resolvable players (MLB pitchers, or
+        # players ESPN can't name-match) are still graded.
+        espn_loaded = False
+        gamelog = None
+        by_date = {}
 
         for r in p_rows:
-            stat_label = _stat_label(r["prop_key"], gamelog)
-            if not stat_label:
-                continue
-            d = r["game_date"]
-            idx = date_idx.get(d)
-            if idx is None:
-                # ±1 day fallback for timezone slippage
-                for delta in (-1, 1):
-                    try:
-                        dt = datetime.fromisoformat(d) + timedelta(days=delta)
-                        alt = dt.date().isoformat()
-                    except Exception:
-                        continue
-                    if alt in date_idx:
-                        idx = date_idx[alt]
-                        break
-            if idx is None:
-                continue
-            actual = gamelog[idx].get(stat_label)
+            if resolved_count >= max_to_resolve:
+                break
+            commence = r.get("commence_time")
+            # Hard-ID path first (MLB statsapi gamePk); None -> ESPN fallback.
+            actual = _resolve_mlb_actual(
+                sport_key, r["prop_key"], player, r["game_date"], commence)
+            if actual is None:
+                if not espn_loaded:
+                    espn_loaded = True
+                    gamelog, by_date = _load_player_gamelog(
+                        espn_sport, espn_league, player)
+                if not gamelog:
+                    continue
+                stat_label = _stat_label(r["prop_key"], gamelog)
+                if not stat_label:
+                    continue
+                d = r["game_date"]
+                idx = _pick_candidate(by_date.get(d), commence)
+                if idx is None:
+                    # ±1 day fallback for timezone slippage
+                    for delta in (-1, 1):
+                        try:
+                            alt = (datetime.fromisoformat(d)
+                                   + timedelta(days=delta)).date().isoformat()
+                        except Exception:
+                            continue
+                        idx = _pick_candidate(by_date.get(alt), commence)
+                        if idx is not None:
+                            break
+                if idx is None:
+                    continue
+                actual = gamelog[idx].get(stat_label)
             if actual is None:
                 continue
             try:
@@ -597,16 +775,13 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
                 outcome = None  # push
             else:
                 outcome = 1 if actual > line else 0
-            resolved_at = datetime.now(timezone.utc).isoformat()
             resolved_updates[prediction_row_key(r)] = {
                 "actual": actual,
                 "outcome": outcome,
                 "resolved": True,
-                "resolved_at": resolved_at,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
             }
             resolved_count += 1
-            if resolved_count >= max_to_resolve:
-                break
 
     if not resolved_updates:
         return 0
@@ -843,7 +1018,12 @@ def fit_platt_chronological(records):
 # Persistence + load
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_recalibration(sport_key, per_prop_params, meta=None):
+def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
+    """Persist a Platt fit. Always writes the local file (provenance + the
+    git-committed bootstrap that ships to Cloud). When `to_blob` and a blob
+    backend is configured, also durably persists to Azure so runtime refits
+    survive Cloud restarts. Offline seeding passes `to_blob=False` so local
+    runs never write the production blob."""
     _ensure_dirs()
     blob = {
         "sport_key": sport_key,
@@ -852,41 +1032,131 @@ def save_recalibration(sport_key, per_prop_params, meta=None):
     }
     if meta:
         blob["meta"] = meta
+    # Local write (atomic swap) — always.
     tmp = recalibration_path(sport_key) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
     os.replace(tmp, recalibration_path(sport_key))
+    # Durable Blob write — best-effort last-writer-wins with If-Match retry.
+    # A transient blob failure leaves the local file intact; the next refit
+    # retries. Swallowing keeps the free loop (maybe_auto_refit) crash-proof.
+    if to_blob and _prediction_log_blob_url():
+        filename = os.path.basename(recalibration_path(sport_key))
+        try:
+            for _ in range(5):
+                _, _, version = _read_json_blob(filename)
+                try:
+                    _write_json_blob(filename, blob, version)
+                    break
+                except _LogConflict:
+                    continue
+        except Exception:
+            pass
+    _LOAD_CACHE.pop(sport_key, None)
 
 
-_LOAD_CACHE = {}  # sport_key -> (mtime, blob)
+_LOAD_CACHE = {}  # sport_key -> {fetched_at, etag, fit_ts, props}
 
 
-def load_recalibration(sport_key):
-    """Return {prop_key: {"a": ..., "b": ..., "n_fit": ...}} or {}."""
+def _parse_recal_blob(blob):
+    """(fit_ts_epoch_or_None, validated_props) from a raw recalibration blob.
+    Fully defensive: any malformed shape yields (None, {}) rather than raising
+    into the (unwrapped) free-loop load path. Legacy/unvalidated fits are kept on
+    disk for provenance but never applied."""
+    if not isinstance(blob, dict):
+        return None, {}
+    fit_ts = None
+    ts_raw = blob.get("fit_timestamp")
+    if ts_raw:
+        try:
+            fit_ts = datetime.fromisoformat(
+                str(ts_raw).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            fit_ts = None
+    props = {}
+    raw_props = blob.get("props")
+    if isinstance(raw_props, dict):
+        for prop_key, cfg in raw_props.items():
+            if isinstance(cfg, dict) and cfg.get("validated") is True:
+                props[prop_key] = cfg
+    return fit_ts, props
+
+
+def _read_local_recal(sport_key):
+    """(fit_ts_epoch_or_None, validated_props) from the local git-committed
+    file, or (None, {}). This is the bootstrap the Blob overlays."""
     path = recalibration_path(sport_key)
     if not os.path.exists(path):
-        return {}
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return {}
-    cached = _LOAD_CACHE.get(sport_key)
-    if cached and cached[0] == mtime:
-        return cached[1]
+        return None, {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             blob = json.load(f)
     except Exception:
-        return {}
-    # Legacy fits were trained and evaluated on the same rows. Keep them on
-    # disk for provenance, but do not apply them until a chronological holdout
-    # has demonstrated that recalibration improves unseen probabilities.
-    props = {
-        prop_key: cfg
-        for prop_key, cfg in (blob.get("props", {}) or {}).items()
-        if cfg.get("validated") is True
-    }
-    _LOAD_CACHE[sport_key] = (mtime, props)
+        return None, {}
+    return _parse_recal_blob(blob)
+
+
+def _load_recal_cached(sport_key):
+    """
+    Return (fit_ts_epoch_or_None, validated_props).
+
+    Reads the Azure blob when configured — with a short TTL and an ETag
+    conditional GET — and falls back to the local git-committed file so a
+    fresh/empty blob never hides the shipped seed. Never raises; degrades to the
+    last good cache, then the local file, then {}. Shared by load_recalibration
+    (applied on every analyze) and the maintain_sport refit gate, so a
+    maintenance tick plus the following analyze issue a single blob GET.
+    """
+    if not _prediction_log_blob_url():
+        # Local-only: mtime-keyed cache (unchanged semantics).
+        path = recalibration_path(sport_key)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            _LOAD_CACHE.pop(sport_key, None)
+            return None, {}
+        cached = _LOAD_CACHE.get(sport_key)
+        if cached and cached.get("fetched_at") == mtime:
+            return cached["fit_ts"], cached["props"]
+        fit_ts, props = _read_local_recal(sport_key)
+        _LOAD_CACHE[sport_key] = {
+            "fetched_at": mtime, "etag": None, "fit_ts": fit_ts, "props": props}
+        return fit_ts, props
+
+    filename = os.path.basename(recalibration_path(sport_key))
+    now = time.time()
+    cached = _LOAD_CACHE.get(sport_key)
+    if cached and (now - cached["fetched_at"]) < RECAL_LOAD_TTL_SECONDS:
+        return cached["fit_ts"], cached["props"]
+    etag = cached["etag"] if cached else None
+    try:
+        status, blob, new_etag = _read_json_blob(filename, etag=etag)
+    except Exception:
+        # Blob outage: prefer the last good cache, else the local baseline.
+        if cached:
+            cached["fetched_at"] = now
+            return cached["fit_ts"], cached["props"]
+        return _read_local_recal(sport_key)
+    if status == "notmodified" and cached:
+        cached["fetched_at"] = now
+        return cached["fit_ts"], cached["props"]
+    if status == "ok":
+        fit_ts, props = _parse_recal_blob(blob)
+        _LOAD_CACHE[sport_key] = {
+            "fetched_at": now, "etag": new_etag,
+            "fit_ts": fit_ts, "props": props}
+        return fit_ts, props
+    # "missing" (404) — overlay the local git-committed baseline.
+    fit_ts, props = _read_local_recal(sport_key)
+    _LOAD_CACHE[sport_key] = {
+        "fetched_at": now, "etag": None, "fit_ts": fit_ts, "props": props}
+    return fit_ts, props
+
+
+def load_recalibration(sport_key):
+    """Return {prop_key: {"a": ..., "b": ..., "n_fit": ...}} of validated fits,
+    or {}. Blob-backed (overlaying the local baseline) when configured."""
+    _, props = _load_recal_cached(sport_key)
     return props
 
 
@@ -986,14 +1256,12 @@ def _count_resolved_since(sport_key, since_ts):
 def maintain_sport(sport_key):
     """Resolve pending rows and refit only when the existing gates allow it."""
     newly_resolved = resolve_pending_outcomes(sport_key)
-    path = recalibration_path(sport_key)
-    do_refit = not os.path.exists(path)
-    last_fit_ts = 0.0
+    # Gate on the last fit's timestamp from the durable store (blob-backed when
+    # configured, else the local file's mtime). Using os.path.getmtime alone
+    # would refit on every Cloud restart, since the ephemeral FS has no file.
+    last_fit_ts, _ = _load_recal_cached(sport_key)
+    do_refit = last_fit_ts is None
     if not do_refit:
-        try:
-            last_fit_ts = os.path.getmtime(path)
-        except OSError:
-            last_fit_ts = 0.0
         age_hours = (time.time() - last_fit_ts) / 3600.0
         if age_hours >= MIN_REFIT_INTERVAL_HOURS:
             do_refit = (_count_resolved_since(sport_key, last_fit_ts)
@@ -1179,8 +1447,12 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         }
 
     if per_prop_params:
+        # Offline bootstrap: write the local file only (committed to git and
+        # shipped as the Cloud baseline). The production blob is populated by the
+        # online refit loop, not by local seed runs.
         save_recalibration(sport_key, per_prop_params,
-                           meta={"source": "book_line_cache_seed"})
+                           meta={"source": "book_line_cache_seed"},
+                           to_blob=False)
         _LOAD_CACHE.pop(sport_key, None)
     return fits
 
