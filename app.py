@@ -1254,13 +1254,14 @@ def render_my_bets():
         st.subheader("Pending bets")
         st.caption(
             "Correct **Price**, **Line**, or **Stake** if a number changed "
-            "between running the analysis and placing the bet. To remove an "
-            "accidental bet, select its row (checkbox on the left) and press the "
-            "🗑 toolbar button or Delete key. Then click **Save changes**."
+            "between running the analysis and placing the bet, or tick "
+            "**Delete** to remove an accidental bet. Then click **Save "
+            "changes**."
         )
         pending_df = pd.DataFrame([
             {
                 "wager_id": r.get("wager_id"),
+                "Delete": False,
                 "Placed": (r.get("placed_at") or "")[:10],
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
                 "Bet": _bet_label(r),
@@ -1275,10 +1276,11 @@ def render_my_bets():
             pending_df,
             hide_index=True,
             width="stretch",
-            num_rows="dynamic",
             key="pending_editor",
             disabled=["Placed", "Sport", "Bet", "Matchup", "Game date"],
             column_config={
+                "Delete": st.column_config.CheckboxColumn(
+                    "Delete", default=False, help="Remove this bet on Save"),
                 "Price": st.column_config.NumberColumn(
                     "Price", help="American odds you actually got", step=1,
                     format="%d"),
@@ -1298,12 +1300,13 @@ def render_my_bets():
         st.caption(
             "Settled bets can't be edited. Tick **Re-grade** to reset a bet to "
             "pending and re-grade it on refresh (fixes bets graded while the "
-            "game was still live), or select a row and delete it. Then click "
+            "game was still live), or tick **Delete** to remove one. Then click "
             "**Apply**."
         )
         settled_df = pd.DataFrame([
             {
                 "wager_id": r.get("wager_id"),
+                "Delete": False,
                 "Re-grade": False,
                 "Placed": (r.get("placed_at") or "")[:10],
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
@@ -1322,11 +1325,12 @@ def render_my_bets():
             settled_df,
             hide_index=True,
             width="stretch",
-            num_rows="dynamic",
             key="settled_editor",
             disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
                       "Result", "P/L", "CLV"],
             column_config={
+                "Delete": st.column_config.CheckboxColumn(
+                    "Delete", default=False, help="Remove this bet on Apply"),
                 "Re-grade": st.column_config.CheckboxColumn(
                     "Re-grade", default=False,
                     help="Reset to pending and re-grade on the next refresh."),
@@ -1360,19 +1364,23 @@ def _coerce_float(value):
 
 
 def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False):
-    """Diff an edited bets table against the original and persist the changes.
+    """Read an edited bets table and persist the requested changes.
 
-    Rows removed in the editor are deleted by wager_id. When ``editable``,
-    changed Price/Line/Stake cells (pending only) go through
-    wagers.update_wagers. When ``regradable``, rows with the Re-grade box ticked
-    are reset to pending via wagers.regrade_wagers so the next refresh re-grades
-    them. Added blank rows are ignored (bets are created via Submit Picks).
-    Surfaces storage failures instead of silently dropping them."""
+    Rows with the **Delete** box ticked are removed by wager_id. When
+    ``editable``, changed Price/Line/Stake cells (pending only) go through
+    wagers.update_wagers. When ``regradable``, rows with the **Re-grade** box
+    ticked are reset to pending via wagers.regrade_wagers so the next refresh
+    re-grades them. Surfaces storage failures instead of silently dropping
+    them."""
     import wagers
-    orig_ids = _wager_ids(original_df)
-    kept_ids = _wager_ids(edited_df)
-    deleted = sorted(orig_ids - kept_ids)
-    survivors = orig_ids & kept_ids
+    ids = _wager_ids(edited_df)
+
+    def _checked(wid, col):
+        return col in edited_df.columns and bool(edited_df.loc[wid].get(col))
+
+    deleted = sorted(wid for wid in ids if _checked(wid, "Delete"))
+    deleted_set = set(deleted)
+    survivors = [wid for wid in ids if wid not in deleted_set]
 
     edits = {}
     if editable:
@@ -1391,9 +1399,8 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
                 edits[wid] = patch
 
     regrades = []
-    if regradable and "Re-grade" in edited_df.columns:
-        regrades = [wid for wid in survivors
-                    if bool(edited_df.loc[wid].get("Re-grade"))]
+    if regradable:
+        regrades = [wid for wid in survivors if _checked(wid, "Re-grade")]
 
     if not deleted and not edits and not regrades:
         st.info("No changes to save.")
