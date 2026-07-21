@@ -1250,6 +1250,11 @@ def render_my_bets():
     settled = [r for r in rows if r.get("status") in ("won", "lost", "push")]
     pending = [r for r in rows if r.get("status") == "pending"]
 
+    # Editor keys carry a nonce that bumps after each Save/Apply so the tables
+    # rebuild fresh (otherwise ticked Delete/Re-grade boxes persist across the
+    # post-save rerun).
+    editor_nonce = st.session_state.get("_wagers_editor_nonce", 0)
+
     if pending:
         st.subheader("Pending bets")
         st.caption(
@@ -1276,7 +1281,7 @@ def render_my_bets():
             pending_df,
             hide_index=True,
             width="stretch",
-            key="pending_editor",
+            key=f"pending_editor_{editor_nonce}",
             disabled=["Placed", "Sport", "Bet", "Matchup", "Game date"],
             column_config={
                 "Delete": st.column_config.CheckboxColumn(
@@ -1325,7 +1330,7 @@ def render_my_bets():
             settled_df,
             hide_index=True,
             width="stretch",
-            key="settled_editor",
+            key=f"settled_editor_{editor_nonce}",
             disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
                       "Result", "P/L", "CLV"],
             column_config={
@@ -1423,10 +1428,11 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
     # A re-grade must trigger a fresh grading pass on the rerun below.
     if n_regrade:
         st.session_state["_wagers_graded"] = False
-    # Drop stale editor widget state so the tables reflect the new ledger, then
-    # rerun so the summary metrics and both tables recompute.
-    st.session_state.pop("pending_editor", None)
-    st.session_state.pop("settled_editor", None)
+    # Bump the editor nonce so both tables rebuild with fresh keys — clears the
+    # ticked Delete/Re-grade boxes and reflects the new ledger — then rerun so
+    # the summary metrics and tables recompute.
+    st.session_state["_wagers_editor_nonce"] = \
+        st.session_state.get("_wagers_editor_nonce", 0) + 1
     st.rerun()
 
 

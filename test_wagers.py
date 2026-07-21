@@ -372,6 +372,33 @@ class DeleteAndEditTests(unittest.TestCase):
             self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
 
 
+class AttachClvTests(unittest.TestCase):
+    def test_clv_queries_warehouse_by_utc_commence_date(self):
+        # The row's game_date is US-local (7/20) but the warehouse partitions by
+        # the UTC commence date (7/21). attach_clv must query by the UTC date or
+        # it misses the snapshot folder and CLV never populates.
+        import warehouse
+        row = {
+            "bet_type": "player_prop", "sport_key": "baseball_mlb",
+            "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
+            "direction": "OVER", "line": 1.5, "point": 1.5,
+            "game_date": "2026-07-20",
+            "commence_time": "2026-07-21T02:30:00Z",
+            "executed_price": -110,
+        }
+        seen = {}
+
+        def fake_closing(**kwargs):
+            seen.update(kwargs)
+            return {"price": -120, "implied_prob": 0.545, "captured_at": "x"}
+
+        with patch.object(warehouse, "closing_line_for", side_effect=fake_closing):
+            wagers.attach_clv([row])
+        self.assertEqual(seen.get("game_date"), "2026-07-21")  # UTC, not 7/20
+        self.assertEqual(row["close_price"], -120)
+        self.assertIsNotNone(row["clv_pct"])
+
+
 class SummaryTests(unittest.TestCase):
     def test_stake_weighted_roi(self):
         rows = [

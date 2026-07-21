@@ -460,10 +460,15 @@ def attach_clv(rows):
             continue
         try:
             bet_type = row.get("bet_type")
-            game_date = (row.get("game_date") or "")[:10]
-            common = dict(sport=row.get("sport_key"), game_date=game_date,
+            commence = row.get("commence_time")
+            # The warehouse partitions snapshots by the UTC commence date
+            # (commence[:10]); the row's game_date is now US-local, so a late
+            # game would miss its snapshot folder. Query by the UTC date, only
+            # falling back to game_date when commence is absent.
+            wh_date = (commence or "")[:10] or (row.get("game_date") or "")[:10]
+            common = dict(sport=row.get("sport_key"), game_date=wh_date,
                           event_id=row.get("event_id"),
-                          commence_time=row.get("commence_time"))
+                          commence_time=commence)
             if bet_type == "player_prop":
                 close = warehouse.closing_line_for(
                     bet_type="player_prop", player=row.get("player"),
