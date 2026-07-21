@@ -10,6 +10,7 @@ import os
 import random
 import statistics
 import time
+from datetime import datetime
 
 import requests
 
@@ -809,6 +810,65 @@ PROP_LABELS = {
 }
 
 
+def _dk_offer(side_offers, book_key="draftkings"):
+    """First offer whose book title matches DraftKings (case-insensitive), or
+    None. Used to carve the executable DK price out of the multi-book set for
+    staking/display (P1.1b)."""
+    for offer in side_offers or []:
+        if book_key in str(offer.get("book", "")).lower():
+            return offer
+    return None
+
+
+# ── De-vig consensus quality (P1.1c) ──
+# Sharp books whose de-vigged prices are up-weighted when averaging the prop
+# consensus. Keys are lowercased substrings matched against the book title.
+# NOTE: Pinnacle is usually an EU-region book, so it rarely appears in a
+# regions=us payload — the weight is inert then, but kept for when it does /
+# if the fetch region widens. Circa is US (Nevada). Weights are conservative
+# judgment values (this methodology change is NOT backtestable against existing
+# captures, whose warehoused consensus is unweighted).
+SHARP_BOOK_WEIGHTS = {"pinnacle": 3.0, "circa": 2.0}
+# Drop a book's quote from the consensus when its last_update is this many
+# seconds staler than the freshest quote (best-effort; only when timestamps
+# parse; never trims below one surviving offer).
+MAX_STALE_SECONDS = 600
+
+
+def _book_weight(book_title):
+    t = str(book_title).lower()
+    for key, weight in SHARP_BOOK_WEIGHTS.items():
+        if key in t:
+            return weight
+    return 1.0
+
+
+def _parse_ts(value):
+    """Parse an Odds API ISO-8601 timestamp (e.g. '2026-07-20T18:00:00Z') to an
+    epoch float, or None when absent/unparseable. Best-effort, never raises."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(value).strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _trim_stale_offers(offers, max_stale_seconds=MAX_STALE_SECONDS):
+    """Drop offers whose last_update is more than max_stale_seconds behind the
+    freshest offer. Offers without a parseable timestamp are always kept (we
+    can't judge them); if no offer has a timestamp, all are kept. Never returns
+    fewer than one offer."""
+    stamped = [(offer, _parse_ts(offer.get("last_update"))) for offer in offers]
+    parseable = [ts for _, ts in stamped if ts is not None]
+    if not parseable:
+        return offers
+    cutoff = max(parseable) - max_stale_seconds
+    kept = [offer for offer, ts in stamped if ts is None or ts >= cutoff]
+    return kept or offers
+
+
 def parse_player_props(game_data):
     """
     Parse player prop odds from an event odds response.
@@ -877,6 +937,10 @@ def parse_player_props(game_data):
                         "book": book_title,
                         "over_price": over_price,
                         "under_price": under_price,
+                        # Freshness for the staleness trim (P1.1c). Market-level
+                        # is more precise than bookmaker-level; may be absent.
+                        "last_update": (market.get("last_update")
+                                        or bookmaker.get("last_update")),
                     })
 
     for market_key, by_player in grouped.items():
@@ -892,25 +956,44 @@ def parse_player_props(game_data):
                                    -abs(float(value) - float(median_line))),
             )
             offers = by_line[line]
-            fair_pairs = []
-            for offer in offers:
+            # De-vig each book first, drop stale quotes, then take a sharp-book-
+            # weighted mean of the fair OVER probs (P1.1c). Reduces to the plain
+            # arithmetic mean when no sharp book and no timestamps are present.
+            survivors = _trim_stale_offers(offers)
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for offer in survivors:
                 raw_over = american_to_implied_prob(offer["over_price"])
                 raw_under = american_to_implied_prob(offer["under_price"])
-                fair_pairs.append(devig_two_way(raw_over, raw_under))
+                fo, _ = devig_two_way(raw_over, raw_under)
+                w = _book_weight(offer.get("book"))
+                weighted_sum += fo * w
+                weight_total += w
 
-            fair_over = sum(pair[0] for pair in fair_pairs) / len(fair_pairs)
+            fair_over = weighted_sum / weight_total if weight_total else 0.5
             fair_under = 1.0 - fair_over
             executable = side_prices[market_key][player][line]
             best_over = max(
                 executable["Over"], key=lambda offer: offer["price"])
             best_under = max(
                 executable["Under"], key=lambda offer: offer["price"])
+            # Best-price line-shopping (P1.1b, hybrid): edge/EV are measured at
+            # the BEST executable price across all US books, but staking/display
+            # use the DraftKings price (the user bets at DK). dk_* is None when
+            # DK doesn't post this prop at the consensus line — callers fall back
+            # to the best price.
+            dk_over = _dk_offer(executable["Over"])
+            dk_under = _dk_offer(executable["Under"])
             result["props"][market_key][player] = {
                 "line": line,
                 "over_price": best_over["price"],
                 "under_price": best_under["price"],
                 "over_book": best_over["book"],
                 "under_book": best_under["book"],
+                "dk_over_price": dk_over["price"] if dk_over else None,
+                "dk_under_price": dk_under["price"] if dk_under else None,
+                "dk_over_book": dk_over["book"] if dk_over else None,
+                "dk_under_book": dk_under["book"] if dk_under else None,
                 # Edge is measured against the consensus fair probability;
                 # expected ROI still uses the best executable side price.
                 "over_implied": fair_over,
@@ -919,7 +1002,7 @@ def parse_player_props(game_data):
                 "books_sampled": len(offers),
                 "over_prices_sampled": len(executable["Over"]),
                 "under_prices_sampled": len(executable["Under"]),
-                "market_implied_method": "two_way_devig_consensus",
+                "market_implied_method": "two_way_devig_sharpweighted_consensus",
             }
 
     return result

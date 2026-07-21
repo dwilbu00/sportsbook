@@ -252,6 +252,21 @@ PLAYER_PROP_SHRINKAGE_K = {
 DEFAULT_PLAYER_PROP_SHRINKAGE_K = 0  # off by default for unknown sports
 
 
+# ── Market-as-prior shrinkage (P1.1a) ──
+# Distinct from the *projection* shrinkage above. That one regularizes the mean
+# stat toward the season prior; this one regularizes the final OVER *probability*
+# toward the de-vigged market OVER probability (the sharp consensus prior):
+#   p_shrunk = w * p_model + (1 - w) * p_market_novig,   w = n / (n + k)
+# where n is the player's sampled game count. A ~15-game recency-weighted
+# over-rate has SE ≈ ±13pp — larger than most flagged edges — so thin samples
+# should lean on the market and only large samples / large deviations survive.
+# `k` is in pseudo-observations (0 = off). Tuned per prop by the props-odds
+# backtest (backtest.py --mode props-odds); persisted per-prop into
+# calibration/<sport>.json as "market_prior_k".
+PLAYER_PROP_MARKET_PRIOR_K = {}
+DEFAULT_PLAYER_PROP_MARKET_PRIOR_K = 0  # off by default until tuned per backtest
+
+
 # Per-sport override for the recency half-life *for player props specifically*.
 # When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
 # projection. Zero disables exponential decay; None inherits from
@@ -298,6 +313,12 @@ def _player_prop_shrinkage_k(sport_key):
     if sport_key is None:
         return DEFAULT_PLAYER_PROP_SHRINKAGE_K
     return PLAYER_PROP_SHRINKAGE_K.get(sport_key, DEFAULT_PLAYER_PROP_SHRINKAGE_K)
+
+
+def _player_prop_market_prior_k(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_MARKET_PRIOR_K
+    return PLAYER_PROP_MARKET_PRIOR_K.get(sport_key, DEFAULT_PLAYER_PROP_MARKET_PRIOR_K)
 
 
 def _player_prop_half_life(sport_key):
@@ -370,6 +391,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_venue_override = _player_prop_venue_strength(sport_key)
     default_output_def = _player_prop_output_defense_strength(sport_key)
     default_shrinkage_k = _player_prop_shrinkage_k(sport_key)
+    default_market_prior_k = _player_prop_market_prior_k(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -404,6 +426,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         venue_strength_override = _knob(prop_key, "venue_strength", default_venue_override)
         output_def_strength = _knob(prop_key, "output_def_strength", default_output_def)
         shrinkage_k = _knob(prop_key, "shrinkage_k", default_shrinkage_k)
+        market_prior_k = _knob(prop_key, "market_prior_k", default_market_prior_k)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -414,6 +437,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             under_price = odds_info["under_price"]
             over_book = odds_info.get("over_book")
             under_book = odds_info.get("under_book")
+            # DraftKings executable prices (P1.1b): edge/EV use the best price
+            # above; staking/display use these. None when DK didn't post the
+            # prop at the consensus line → callers fall back to over/under_price.
+            dk_over_price = odds_info.get("dk_over_price")
+            dk_under_price = odds_info.get("dk_under_price")
+            dk_over_book = odds_info.get("dk_over_book")
+            dk_under_book = odds_info.get("dk_under_book")
 
             history = player_histories.get(player_name, {}).get(prop_key)
             if not history or not history.get("found") or not history.get("values"):
@@ -796,6 +826,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "line": line,
                     "over_price": over_price,
                     "under_price": under_price,
+                    "dk_over_price": dk_over_price,
+                    "dk_under_price": dk_under_price,
                     "over_implied": round(over_implied * 100, 2),
                     "under_implied": round(under_implied * 100, 2),
                     "avg_stat": round(avg_stat, 2),
@@ -829,6 +861,29 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 })
                 continue
 
+            # ── Market-as-prior shrinkage (P1.1a) ──
+            # Blend the final calibrated model OVER prob toward the de-vigged
+            # market OVER prob with w = n/(n+k). Thin samples (small n) lean on
+            # the sharp market prior; large samples keep the model. Applied to
+            # the standard line only — over_implied is defined here; safe mode's
+            # alt-line probabilities exited above via `continue`. raw_over_rate
+            # (logged for Platt refits) was snapshotted before this, so the blend
+            # shows up in final_prob only and never contaminates future fits.
+            market_prior_meta = None
+            if market_prior_k and market_prior_k > 0 and values:
+                n_prior = len(values)
+                w = n_prior / (n_prior + market_prior_k)
+                pre_blend = over_rate
+                over_rate = max(0.0, min(
+                    1.0, w * over_rate + (1.0 - w) * over_implied))
+                market_prior_meta = {
+                    "k": market_prior_k,
+                    "n": n_prior,
+                    "w": round(w, 3),
+                    "prior": round(over_implied * 100, 2),
+                    "pre_blend": round(pre_blend * 100, 2),
+                }
+
             # Compare historical over rate vs book implied over probability
             over_edge = over_rate - over_implied
             under_rate = 1 - over_rate
@@ -837,19 +892,30 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             if over_edge > under_edge:
                 direction = "OVER"
                 edge = over_edge
-                best_price = over_price
+                dk_price = dk_over_price
+                dk_book = dk_over_book
             else:
                 direction = "UNDER"
                 edge = under_edge
-                best_price = under_price
+                dk_price = dk_under_price
+                dk_book = dk_under_book
 
+            # The user bets exclusively at DraftKings (2026-07-21). Multi-book
+            # odds feed ONLY the de-vigged consensus (over_implied) the edge is
+            # measured against — market analysis, not execution. Price, EV,
+            # staking, and display all use the DK price. `best_price` is retained
+            # as the executable (DK) price for downstream compatibility. When DK
+            # doesn't post this prop/line, dk_price is None → expected_roi is None
+            # → the bet is NOT flagged as value (never recommend an un-bettable
+            # line). (P1.1b, DK-only per user.)
+            best_price = dk_price
             expected_roi = _expected_roi(
                 over_rate if direction == "OVER" else under_rate,
-                best_price,
+                dk_price,
             )
 
             # Value requires clearing the fair-market edge AND being +EV at the
-            # executable price (see _prop_is_value / P1.1).
+            # DraftKings price (see _prop_is_value / P1.1).
             is_value = _prop_is_value(edge, threshold, expected_roi)
 
             # Log the published probability so future refits learn from it.
@@ -868,8 +934,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     final_prob=over_rate,
                     projected=avg_stat,
                     direction=direction,
-                    price=best_price,
-                    book=over_book if direction == "OVER" else under_book,
+                    price=dk_price,
+                    book=dk_book,
                     is_value=is_value,
                     write=False,
                 )
@@ -894,12 +960,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "edge_pct": round(edge * 100, 2),
                 "direction": direction,
                 "best_price": best_price,
+                "dk_over_price": dk_over_price,
+                "dk_under_price": dk_under_price,
+                "dk_price": dk_price,
+                "dk_book": dk_book,
                 "expected_roi_pct": (round(expected_roi * 100, 2)
                                       if expected_roi is not None else None),
                 "is_value": is_value,
                 "no_history": False,
                 "calibration": calibration_meta,
                 "recalibration": recal_meta,
+                "market_prior": market_prior_meta,
                 "_values": list(values),
                 "_weights": list(weights),
             })

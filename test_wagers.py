@@ -90,6 +90,28 @@ class BuildWagerRowTests(unittest.TestCase):
         self.assertEqual(row["direction"], "OVER")
         self.assertAlmostEqual(row["model_prob"], 0.60)
 
+    def test_player_prop_stakes_at_dk_price_when_present(self):
+        # P1.1b: over_price is the best-across-books price (value/EV); the
+        # ledger must record the DraftKings price the user actually bets.
+        cand = {"player": "Rafael Devers", "prop": "batter_hits",
+                "prop_label": "Hits", "line": 1.5, "direction": "OVER",
+                "over_price": 150, "under_price": -110,
+                "dk_over_price": 100, "dk_under_price": -120,
+                "over_rate": 60.0, "edge_pct": 7.0, "matchup": "NYY @ BOS",
+                "team": "Boston Red Sox", "event_id": "E1"}
+        row = wagers.build_wager_row("player_prop", None, cand, _meta())
+        self.assertEqual(row["executed_price"], 100)  # DK, not the +150 best
+
+    def test_player_prop_falls_back_to_best_when_dk_absent(self):
+        cand = {"player": "Rafael Devers", "prop": "batter_hits",
+                "prop_label": "Hits", "line": 1.5, "direction": "OVER",
+                "over_price": 150, "under_price": -110,
+                "dk_over_price": None, "dk_under_price": None,
+                "over_rate": 60.0, "edge_pct": 7.0, "matchup": "NYY @ BOS",
+                "team": "Boston Red Sox", "event_id": "E1"}
+        row = wagers.build_wager_row("player_prop", None, cand, _meta())
+        self.assertEqual(row["executed_price"], 150)  # falls back to best
+
     def test_safe_mode_prop_uses_alt_line_and_price(self):
         cand = {"player": "Aaron Judge", "prop": "batter_hits",
                 "prop_label": "Hits", "safe_mode": True, "safe_alt_line": 0.5,

@@ -61,6 +61,7 @@ import historical_odds as hist_store
 from calibration_loader import (
     save_market_blend,
     save_prob_shrink,
+    save_calibration,
     load_calibration,
     apply_calibration_with_warmup,
 )
@@ -564,7 +565,7 @@ MARKETS = ("moneyline", "spreads", "totals")
 
 def _empty_market_bucket():
     return {"n": 0, "model_brier": [], "market_brier": [], "correct": 0,
-            "bets": 0, "profit": 0.0, "blend": []}
+            "bets": 0, "profit": 0.0, "blend": [], "prior_k": []}
 
 
 def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
@@ -633,6 +634,49 @@ def _best_blend_weight(obs, step=0.05):
     model_brier = sum((pm - o) ** 2 for pm, mk, o in obs) / n
     market_brier = sum((mk - o) ** 2 for pm, mk, o in obs) / n
     return round(best_w, 2), best_brier, model_brier, market_brier
+
+
+def _best_market_prior_k(obs, k_values=(0, 2, 5, 10, 15, 20, 30, 50, 75, 100,
+                                        150, 200),
+                         threshold=0.05):
+    """Sweep the market-as-prior shrinkage k (P1.1a) on prop observations.
+
+    obs = [(model_p, market_p, outcome, n), ...] where n is the player's game
+    count. For each k the model prob is shrunk toward the market prob with
+    w = n/(n+k) (matching props.py) and scored by Brier. Also counts the
+    threshold-clearing bets at k=0 (pure model) vs the best k, so the
+    thin-sample false-positive collapse — 1.1a's acceptance criterion — is
+    visible. Returns (best_k, best_brier, model_brier, bets_at_k0, bets_at_best)
+    or None on empty input."""
+    if not obs:
+        return None
+    n_obs = len(obs)
+
+    def _blend(k):
+        out = []
+        for pm, mk, o, n in obs:
+            w = n / (n + k) if (n + k) else 1.0
+            out.append((w * pm + (1 - w) * mk, mk, o))
+        return out
+
+    def _bets(blended):
+        c = 0
+        for p, mk, o in blended:
+            if p - mk >= threshold:
+                c += 1
+            if (1 - p) - (1 - mk) >= threshold:
+                c += 1
+        return c
+
+    model_brier = sum((pm - o) ** 2 for pm, _, o, _ in obs) / n_obs
+    bets_k0 = _bets([(pm, mk, o) for pm, mk, o, _ in obs])
+    best_k, best_brier, best_bets = 0, float("inf"), bets_k0
+    for k in k_values:
+        blended = _blend(k)
+        brier = sum((p - o) ** 2 for p, _, o in blended) / n_obs
+        if brier < best_brier:
+            best_brier, best_k, best_bets = brier, k, _bets(blended)
+    return best_k, best_brier, model_brier, bets_k0, best_bets
 
 
 def _best_shrink(obs, step=0.05):
@@ -1163,9 +1207,47 @@ def _props_p_over(prop_cfg, proj, line, vals, wts, emp_over):
     return emp_over
 
 
+def _write_market_prior_calibration(sport_key, results):
+    """Persist the Brier-optimal market-as-prior shrinkage k (P1.1a) per prop
+    into calibration/<sport>.json as "market_prior_k".
+
+    Only writes a prop whose best k > 0 AND whose blended Brier beats the pure
+    model (k=0) — so activating the market prior never ships a regression. Reads
+    the existing per-prop cfg and adds the knob so method/half_life/etc. are
+    preserved. NOTE: k is chosen by single-split argmin (like the blend/shrink
+    writers); the nested-CV confirmation gate is roadmap §2.1."""
+    from datetime import datetime, timezone
+    existing = load_calibration(sport_key) or {}
+    to_write = {}
+    chosen = {}
+    for prop, r in results.items():
+        res = _best_market_prior_k(r.get("prior_k") or [])
+        if not res:
+            continue
+        best_k, best_brier, model_brier, _bets_k0, _bets_best = res
+        if best_k > 0 and best_brier < model_brier - 1e-9:
+            cfg = dict(existing.get(prop) or {})
+            cfg["market_prior_k"] = best_k
+            to_write[prop] = cfg
+            chosen[prop] = best_k
+    if not to_write:
+        print("  [write-calibration] No prop improved under a market prior; "
+              "nothing written.")
+        return
+    save_calibration(sport_key, to_write, meta={
+        "market_prior_refit": {
+            "source": "backtest --mode props-odds --write-calibration",
+            "k_by_prop": chosen,
+            "fit_timestamp": datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z"),
+        },
+    })
+    print(f"  [write-calibration] Wrote market_prior_k for: {chosen}")
+
+
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
-                            store_label=""):
+                            store_label="", write_calibration=False):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -1188,6 +1270,12 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
               f"{store.get('snapshot_time','labeled')} price, not the close.")
 
     calibration = load_calibration(sport_key)
+    # Production applies a final Platt recalibration after residual calibration
+    # (props.py). The k-sweep must be tuned on that SAME post-Platt prob, or k is
+    # inflated by overconfidence Platt already removes. (Lazy import avoids any
+    # import-order coupling; recalibration is otherwise unused here.)
+    from recalibration import apply_platt, load_recalibration
+    recal = load_recalibration(sport_key) or {}
     hl = half_life or _half_life_for(sport_key)
     results = {prop: _empty_market_bucket() for prop in props}
     series_cache = {}
@@ -1244,6 +1332,19 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 outcome = 1 if actual > line else 0
                 _grade(results[prop], p_model, fair_over, outcome,
                        over_price, under_price, threshold)
+                # For the market-as-prior (P1.1a) k-sweep: record the PRODUCTION
+                # final prob (post-Platt, matching props.py) so k is tuned on the
+                # probability the app actually ships, plus the market fair prob,
+                # the outcome, and the sample size n. (_grade/blend above keep the
+                # pre-Platt prob to preserve existing backtest semantics.)
+                rc = recal.get(prop) or {}
+                p_final = p_model
+                if rc.get("a") is not None:
+                    adj = apply_platt(p_model, rc.get("a"), rc.get("b"))
+                    if adj is not None:
+                        p_final = max(0.0, min(1.0, adj))
+                results[prop]["prior_k"].append(
+                    (p_final, fair_over, outcome, len(prior)))
 
     # Diagnostics on coverage
     print("\nCoverage (why lines were dropped):")
@@ -1253,6 +1354,10 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
               f"no_actual/min_prior={no_actual[prop]:>5}")
 
     _print_props_odds_results(results, threshold_pct)
+
+    if write_calibration:
+        print("\n[write-calibration] Persisting market-as-prior k (P1.1a)...")
+        _write_market_prior_calibration(sport_key, results)
 
 
 def _print_props_odds_results(results, threshold_pct):
@@ -1284,6 +1389,21 @@ def _print_props_odds_results(results, threshold_pct):
         best_w, best_brier, model_brier, market_brier = res
         print(f"  {prop:<18} {best_w:>7.2f} {best_brier:>11.4f} "
               f"{model_brier - best_brier:>+9.4f} {market_brier - best_brier:>+10.4f}")
+
+    print("\nOptimal market-as-prior shrinkage (P1.1a, w = n/(n+k) toward the "
+          "market):")
+    print(f"  {'prop':<18} {'best k':>6} {'k*Brier':>9} {'vs model':>9} "
+          f"{'bets@k0':>8} {'bets@k*':>8}")
+    for prop, r in results.items():
+        res = _best_market_prior_k(r["prior_k"])
+        if not res:
+            continue
+        best_k, best_brier, model_brier, bets_k0, bets_best = res
+        print(f"  {prop:<18} {best_k:>6} {best_brier:>9.4f} "
+              f"{model_brier - best_brier:>+9.4f} {bets_k0:>8} {bets_best:>8}")
+    print("  best k>0 with k*Brier < model Brier = thin-sample edges the market "
+          "prior should collapse (bets@k* < bets@k0).")
+
     print("\n  ROI = profit per 1u bet on flags where model edge over the de-vigged "
           "line ≥ threshold.")
     print("  Positive ROI with model Brier ≤ market Brier = a real prop edge.\n")
@@ -3225,7 +3345,8 @@ def main():
         run_props_odds_backtest(args.sport, espn_sport, espn_league, sport_key,
                                 props=props, min_prior=args.min_sample,
                                 threshold_pct=args.threshold,
-                                store_label=args.store_label)
+                                store_label=args.store_label,
+                                write_calibration=args.write_calibration)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         run_odds_backtest(sport_key, espn_sport, espn_league,

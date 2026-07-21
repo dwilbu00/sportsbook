@@ -15,6 +15,7 @@ import backtest_starters
 import espn_client
 import mlb_starters
 import odds_client
+import props
 import recalibration
 from backtest_props import _rolling_splits
 from odds_client import parse_player_props
@@ -1165,6 +1166,245 @@ class ParlayCorrelationTests(unittest.TestCase):
             5.0 * analysis._pair_correlation(
                 moneyline, same_team_hit, "baseball_mlb"),
         )
+
+
+class BestPriceHybridTests(unittest.TestCase):
+    """P1.1b: props line-shop the BEST price across U.S. books for edge/EV, but
+    carry the DraftKings price separately for staking/display."""
+
+    def _game(self, books):
+        return {
+            "id": "g1", "home_team": "H", "away_team": "A",
+            "commence_time": "2026-07-20T23:10:00Z", "sport_key": "baseball_mlb",
+            "bookmakers": books,
+        }
+
+    def _book(self, title, over, under):
+        outcomes = [{"description": "Player", "name": "Over",
+                     "price": over, "point": 1.5}]
+        if under is not None:
+            outcomes.append({"description": "Player", "name": "Under",
+                             "price": under, "point": 1.5})
+        return {"title": title, "markets": [{"key": "batter_hits",
+                                             "outcomes": outcomes}]}
+
+    def test_dk_price_carved_out_alongside_best(self):
+        game = self._game([
+            self._book("DraftKings", over=100, under=-120),
+            self._book("BetMGM", over=150, under=-110),
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["Player"]
+        # Best across books drives value/EV.
+        self.assertEqual(info["over_price"], 150)
+        self.assertEqual(info["over_book"], "BetMGM")
+        self.assertEqual(info["under_price"], -110)
+        # DraftKings carved out for staking/display.
+        self.assertEqual(info["dk_over_price"], 100)
+        self.assertEqual(info["dk_over_book"], "DraftKings")
+        self.assertEqual(info["dk_under_price"], -120)
+
+    def test_dk_absent_is_none(self):
+        game = self._game([
+            self._book("BetMGM", over=150, under=-110),
+            self._book("Caesars", over=140, under=-115),
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["Player"]
+        self.assertEqual(info["over_price"], 150)  # best still resolves
+        self.assertIsNone(info["dk_over_price"])
+        self.assertIsNone(info["dk_under_price"])
+        self.assertIsNone(info["dk_over_book"])
+
+
+class SharpWeightedConsensusTests(unittest.TestCase):
+    """P1.1c: the prop de-vig consensus up-weights sharp books (Pinnacle/Circa)
+    and drops stale quotes, reducing to the plain arithmetic mean when neither
+    a sharp book nor timestamps are present."""
+
+    def _game(self, books):
+        return {
+            "id": "g1", "home_team": "H", "away_team": "A",
+            "commence_time": "2026-07-20T23:10:00Z", "sport_key": "baseball_mlb",
+            "bookmakers": books,
+        }
+
+    def _book(self, title, over, under, last_update=None):
+        market = {"key": "batter_hits", "outcomes": [
+            {"description": "P", "name": "Over", "price": over, "point": 1.5},
+            {"description": "P", "name": "Under", "price": under, "point": 1.5},
+        ]}
+        if last_update is not None:
+            market["last_update"] = last_update
+        return {"title": title, "markets": [market]}
+
+    def test_sharp_book_pulls_consensus_toward_it(self):
+        game = self._game([
+            self._book("Book A", -110, -110),      # fair_over 0.500
+            self._book("Book B", -110, -110),      # fair_over 0.500
+            self._book("Pinnacle", 200, -250),     # fair_over ~0.318
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["P"]
+        # Weighted (Pinnacle x3): (0.5+0.5+3*0.3182)/5 ≈ 0.391, vs plain mean
+        # ≈ 0.439. Consensus is pulled toward the sharp book.
+        self.assertAlmostEqual(info["over_implied"], 0.3909, places=3)
+        self.assertLess(info["over_implied"], 0.439)
+
+    def test_stale_book_dropped(self):
+        game = self._game([
+            self._book("Fresh", -110, -110, last_update="2026-07-20T18:00:00Z"),
+            self._book("Stale", -300, 250, last_update="2026-07-20T17:00:00Z"),
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["P"]
+        # Stale quote (>600s behind) is excluded; only the fresh 0.5 survives.
+        self.assertAlmostEqual(info["over_implied"], 0.5, places=3)
+
+    def test_no_sharp_no_timestamp_matches_plain_mean(self):
+        game = self._game([
+            self._book("Book A", -110, -110),     # fair_over 0.5000
+            self._book("Book B", 100, -120),      # fair_over ~0.4783
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["P"]
+        self.assertAlmostEqual(info["over_implied"], (0.5 + 0.4783) / 2, places=3)
+
+
+class MarketPriorShrinkageTests(unittest.TestCase):
+    """P1.1a: blend the calibrated OVER prob toward the de-vigged market prob
+    with w = n/(n+k). Thin samples lean on the market prior (collapsing false
+    edges); large samples keep the model.
+
+    Uses sport_key=None so calibration/recalibration/refit/statsapi/logging are
+    all bypassed (method-A passthrough: over_rate == empirical over-rate), and
+    the reliability filter's participation/layoff gates are disabled — leaving a
+    clean, hermetic path through the runtime prop pipeline.
+    """
+
+    def _prop_data(self, line=0.5, over_implied=0.45, under_implied=0.55):
+        return {
+            "commence_time": "2026-07-20T23:10:00Z",  # late US game (next-day UTC)
+            "home_team": "Home Nine",
+            "away_team": "Away Nine",
+            "game_id": "evt1",
+            "props": {
+                "batter_hits": {
+                    "Slumping Sammy": {
+                        "line": line,
+                        "over_implied": over_implied,
+                        "under_implied": under_implied,
+                        "over_price": -110,
+                        "under_price": -110,
+                        "over_book": "DK",
+                        "under_book": "DK",
+                    }
+                }
+            },
+        }
+
+    def _histories(self, n_games, value=0.0):
+        # n_games consecutive daily games (no layoffs), all the same stat value
+        # so the weighted over-rate is deterministic regardless of decay.
+        dates = [f"2026-06-{d:02d}" for d in range(1, 1 + n_games)]
+        return {
+            "Slumping Sammy": {
+                "batter_hits": {
+                    "found": True,
+                    "values": [value] * n_games,
+                    "game_dates": list(reversed(dates)),  # newest-first
+                }
+            }
+        }
+
+    def _run(self, prop_data, histories, k):
+        # k is injected via the per-sport default (sport_key=None reads
+        # DEFAULT_PLAYER_PROP_MARKET_PRIOR_K) so no calibration file is needed.
+        with patch.object(props, "DEFAULT_PLAYER_PROP_MARKET_PRIOR_K", k):
+            cands = props.analyze_player_props_value(
+                prop_data, histories, threshold_pct=1.0, sport_key=None)
+        return cands[0]
+
+    def test_thin_sample_edge_collapses_toward_market(self):
+        # A 0-for-15 hitter at a 0.5 line: raw model says P(over)=0 -> a huge
+        # false UNDER edge. The market prior should pull the prob toward 45%.
+        pd_ = self._prop_data(over_implied=0.45, under_implied=0.55)
+        hist = self._histories(15, value=0.0)
+
+        base = self._run(pd_, hist, k=0)
+        self.assertIsNone(base["market_prior"])
+        self.assertEqual(base["over_rate"], 0.0)  # pure model
+        self.assertEqual(base["direction"], "UNDER")
+        base_edge = base["edge_pct"]
+
+        shrunk = self._run(pd_, hist, k=15)
+        meta = shrunk["market_prior"]
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["k"], 15)
+        self.assertEqual(meta["n"], 15)
+        self.assertAlmostEqual(meta["w"], 15 / 30, places=3)
+        self.assertEqual(meta["pre_blend"], 0.0)  # raw model unchanged by blend
+        # over_rate blended 0.5*0 + 0.5*45% = 22.5%, moving toward the market.
+        self.assertAlmostEqual(shrunk["over_rate"], 22.5, places=1)
+        # The false UNDER edge shrinks substantially.
+        self.assertLess(shrunk["edge_pct"], base_edge)
+        self.assertAlmostEqual(shrunk["edge_pct"], 22.5, places=1)
+
+    def test_large_sample_edge_preserved(self):
+        # With 200 games the model is trusted: w ~ 0.98, prob barely moves.
+        pd_ = self._prop_data(over_implied=0.45, under_implied=0.55)
+        hist = self._histories(200, value=0.0)
+
+        base = self._run(pd_, hist, k=0)
+        shrunk = self._run(pd_, hist, k=15)
+        self.assertEqual(base["market_prior"], None)
+        self.assertGreater(shrunk["market_prior"]["w"], 0.9)
+        # Movement is tiny: over_rate stays near the model's 0.
+        self.assertLess(shrunk["over_rate"], 5.0)
+        self.assertAlmostEqual(
+            shrunk["edge_pct"], base["edge_pct"], delta=5.0)
+
+    def test_k_zero_is_a_no_op(self):
+        pd_ = self._prop_data()
+        hist = self._histories(15, value=1.0)  # 15-for-15 -> P(over 0.5)=1
+        base = self._run(pd_, hist, k=0)
+        self.assertIsNone(base["market_prior"])
+        self.assertEqual(base["over_rate"], 100.0)
+
+
+class BestMarketPriorKSweepTests(unittest.TestCase):
+    """P1.1a backtest k-sweep: _best_market_prior_k should pick k>0 when a
+    thin-sample noisy model is corrected by an accurate market, and report the
+    false-positive (bet-count) collapse."""
+
+    def test_prefers_shrinkage_when_market_is_accurate(self):
+        from backtest import _best_market_prior_k
+        # Noisy thin-sample model (n=6) that is confidently wrong half the time,
+        # vs a market pinned at the true 50/50. Outcomes alternate.
+        obs = []
+        for i in range(40):
+            outcome = i % 2
+            model_p = 0.05 if outcome == 1 else 0.95  # wrong-way confident
+            obs.append((model_p, 0.5, outcome, 6))
+        res = _best_market_prior_k(obs)
+        self.assertIsNotNone(res)
+        best_k, best_brier, model_brier, bets_k0, bets_best = res
+        self.assertGreater(best_k, 0)
+        self.assertLess(best_brier, model_brier)
+        # The wrong-way "edges" the model flagged collapse under the prior.
+        self.assertLess(bets_best, bets_k0)
+
+    def test_keeps_model_when_it_is_sharp_and_sample_large(self):
+        from backtest import _best_market_prior_k
+        # Large-sample model that is always right; shrinking toward a coin-flip
+        # market only hurts, so k=0 should win.
+        obs = []
+        for i in range(40):
+            outcome = i % 2
+            model_p = 0.98 if outcome == 1 else 0.02
+            obs.append((model_p, 0.5, outcome, 400))
+        res = _best_market_prior_k(obs)
+        best_k, best_brier, model_brier, bets_k0, bets_best = res
+        self.assertEqual(best_k, 0)
+
+    def test_empty_returns_none(self):
+        from backtest import _best_market_prior_k
+        self.assertIsNone(_best_market_prior_k([]))
 
 
 if __name__ == "__main__":

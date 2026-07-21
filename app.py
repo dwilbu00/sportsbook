@@ -1764,7 +1764,8 @@ if not selected_game_labels:
 
 # Calculate actual credit cost (accounting for cached data)
 bookmakers_list = config.get("bookmakers", [])
-bookmakers_param = bookmakers_list if bookmakers_list else None
+# bookmakers_str (DraftKings) still scopes the safe-mode ALT-line fetch; standard
+# props + team markets now fetch all U.S. books for line-shopping (P1.1b).
 bookmakers_str = ",".join(bookmakers_list) if bookmakers_list else ""
 actual_cost = 0
 for gl in selected_game_labels:
@@ -1777,7 +1778,10 @@ for gl in selected_game_labels:
         actual_cost += len(market_keys)
     if selected_props:
         prop_markets_str = ",".join(selected_props)
-        if not is_event_cached(sport["key"], eid, markets=prop_markets_str, bookmakers=bookmakers_param):
+        # Props now fetch all U.S. books (bookmakers=None) for line-shopping;
+        # keep the cache-hit check aligned or credits are mis-estimated / the
+        # cache key won't match the fetch below (P1.1b).
+        if not is_event_cached(sport["key"], eid, markets=prop_markets_str, bookmakers=None):
             actual_cost += len(selected_props)
 
 total_max_cost = len(selected_game_labels) * total_per_game
@@ -2085,12 +2089,14 @@ if analyze_clicked and selected_game_labels:
                     markets=markets_str, bookmakers=None
                 )
 
-            # Player prop odds
+            # Player prop odds — fetch ALL U.S. books (same credit cost as a
+            # single-book request) so props can line-shop the best price and
+            # de-vig a real multi-book consensus (P1.1b). DraftKings is carved
+            # out inside parse_player_props for staking/display.
             if selected_props:
                 prop_markets_str = ",".join(selected_props)
-                bookmakers = bookmakers_str.split(",") if bookmakers_str else None
                 prop_odds_futures[eid] = pool.submit(
-                    get_event_odds, api_key, sport["key"], eid, markets=prop_markets_str, bookmakers=bookmakers
+                    get_event_odds, api_key, sport["key"], eid, markets=prop_markets_str, bookmakers=None
                 )
 
             # Team schedules (for both teams)
@@ -2702,9 +2708,9 @@ if "analysis_results" in st.session_state:
                             payout_label = f"DK Payout (OVER {c['safe_alt_line']})"
                             payout_help = f"Actual DraftKings price for OVER {c['safe_alt_line']} (≡ {c['prop_label']} {c['safe_threshold']}+)."
                         else:
-                            p_val, p_delta = _dk_payout_strs(c.get("over_price"))
+                            p_val, p_delta = _dk_payout_strs(c.get("dk_over_price"))
                             payout_label = "DK Payout (book line)"
-                            payout_help = "Payout for the OVER at the standard book line. Alt-line fetch is disabled or no alt was offered at the suggested threshold — DK's actual alt price will differ."
+                            payout_help = "Payout for the OVER at the standard book line on DraftKings. Alt-line fetch is disabled or no alt was offered at the suggested threshold — DK's actual alt price will differ."
                         cols[7].metric(payout_label, p_val, delta=p_delta,
                                        delta_color="off", help=payout_help)
                         st.caption(
@@ -2723,8 +2729,10 @@ if "analysis_results" in st.session_state:
                     hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
                     implied_prob = (c["over_implied"] if c["direction"] == "OVER"
                                     else c["under_implied"])
-                    bet_price = (c.get("over_price") if c["direction"] == "OVER"
-                                 else c.get("under_price"))
+                    # DraftKings price is what the user bets and is displayed;
+                    # multi-book data only feeds the consensus break-even/edge
+                    # (P1.1b, DK-only). Value bets always have a DK price.
+                    dk_bet_price = c.get("dk_price")
                     with st.expander(f"🔥 {c['player']} — {c['prop_label']} {c['direction']} {c['line']}  —  Edge: +{c['edge_pct']}%", expanded=True):
                         _select_bet_checkbox(c, "player_prop")
                         cols = st.columns(8)
@@ -2735,10 +2743,12 @@ if "analysis_results" in st.session_state:
                         cols[4].metric("Edge", f"{c['edge_pct']:+.2f}%")
                         cols[5].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
                         cols[6].metric("Direction", c["direction"])
-                        p_val, p_delta = _dk_payout_strs(bet_price)
+                        p_val, p_delta = _dk_payout_strs(dk_bet_price)
                         cols[7].metric(
                             f"DK Payout ({c['direction']})", p_val, delta=p_delta, delta_color="off",
-                            help=f"Payout for the {c['direction']} at the book line on DraftKings.",
+                            help=(f"DraftKings price for the {c['direction']} at the book "
+                                  "line. Edge is measured vs the de-vigged consensus of "
+                                  "all U.S. books; Expected ROI is at this DK price."),
                         )
                         line_gap = c["avg_stat"] - c["line"]
                         st.caption(

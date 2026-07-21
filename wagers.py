@@ -172,8 +172,14 @@ def build_wager_row(bet_type, side, candidate, meta):
                 direction = "OVER"
             else:
                 line = candidate.get("line")
-                price = (candidate.get("over_price") if direction == "OVER"
-                         else candidate.get("under_price"))
+                # Stake at the DraftKings price the user actually bets (P1.1b).
+                # over/under_price is the best-across-books price used only for
+                # the value/EV decision; fall back to it when DK is absent.
+                best_side = (candidate.get("over_price") if direction == "OVER"
+                             else candidate.get("under_price"))
+                dk_side = (candidate.get("dk_over_price") if direction == "OVER"
+                           else candidate.get("dk_under_price"))
+                price = dk_side if dk_side is not None else best_side
                 over_rate = candidate.get("over_rate")
                 model_prob = (_pct(over_rate) if direction == "OVER"
                               else (None if over_rate is None
