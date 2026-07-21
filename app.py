@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+import pricing_common
+
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -1154,6 +1157,11 @@ def render_my_bets():
     """Actual-bets ledger — realized ROI on the picks the user really placed."""
     import wagers
     st.title("🧾 My Bets — Actual ROI")
+    # A save (edit/delete) reruns to refresh the tables; carry the confirmation
+    # across that rerun so it isn't lost.
+    flash = st.session_state.pop("_wagers_flash", None)
+    if flash:
+        st.success(flash)
     st.caption(
         "Realized return on the bets you actually submitted (flat unit stake, "
         "executed at the model's best price at submit). Bets auto-grade from "
@@ -1242,10 +1250,59 @@ def render_my_bets():
     settled = [r for r in rows if r.get("status") in ("won", "lost", "push")]
     pending = [r for r in rows if r.get("status") == "pending"]
 
+    if pending:
+        st.subheader("Pending bets")
+        st.caption(
+            "Correct **Price**, **Line**, or **Stake** if a number changed "
+            "between running the analysis and placing the bet. To remove an "
+            "accidental bet, select its row (checkbox on the left) and press the "
+            "🗑 toolbar button or Delete key. Then click **Save changes**."
+        )
+        pending_df = pd.DataFrame([
+            {
+                "wager_id": r.get("wager_id"),
+                "Placed": (r.get("placed_at") or "")[:10],
+                "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
+                "Bet": _bet_label(r),
+                "Matchup": r.get("matchup"),
+                "Game date": r.get("game_date"),
+                "Price": r.get("executed_price"),
+                "Line": r.get("line"),
+                "Stake": _safe_float(r.get("stake")),
+            } for r in sorted(pending, key=lambda r: r.get("game_date") or "")
+        ]).set_index("wager_id")
+        edited_pending = st.data_editor(
+            pending_df,
+            hide_index=True,
+            width="stretch",
+            num_rows="dynamic",
+            key="pending_editor",
+            disabled=["Placed", "Sport", "Bet", "Matchup", "Game date"],
+            column_config={
+                "Price": st.column_config.NumberColumn(
+                    "Price", help="American odds you actually got", step=1,
+                    format="%d"),
+                "Line": st.column_config.NumberColumn(
+                    "Line", help="The line you placed at", step=0.5,
+                    format="%.1f"),
+                "Stake": st.column_config.NumberColumn(
+                    "Stake", help="Dollar stake", min_value=0.0, step=1.0,
+                    format="$%.2f"),
+            },
+        )
+        if st.button("💾 Save changes", key="save_pending"):
+            _apply_wager_edits(pending_df, edited_pending)
+
     if settled:
         st.subheader("Settled bets")
-        st.dataframe([
+        st.caption(
+            "Settled bets are graded and can't be edited. To remove an "
+            "accidental one, select its row and delete it, then click **Delete "
+            "selected**."
+        )
+        settled_df = pd.DataFrame([
             {
+                "wager_id": r.get("wager_id"),
                 "Placed": (r.get("placed_at") or "")[:10],
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
                 "Bet": _bet_label(r),
@@ -1258,21 +1315,92 @@ def render_my_bets():
                         if r.get("clv_pct") is not None else "—"),
             } for r in sorted(settled, key=lambda r: r.get("placed_at") or "",
                               reverse=True)
-        ], hide_index=True, width="stretch")
+        ]).set_index("wager_id")
+        edited_settled = st.data_editor(
+            settled_df,
+            hide_index=True,
+            width="stretch",
+            num_rows="dynamic",
+            key="settled_editor",
+            disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
+                      "Result", "P/L", "CLV"],
+        )
+        if st.button("🗑 Delete selected", key="delete_settled"):
+            _apply_wager_edits(settled_df, edited_settled, deletes_only=True)
 
-    if pending:
-        st.subheader("Pending bets")
-        st.dataframe([
-            {
-                "Placed": (r.get("placed_at") or "")[:10],
-                "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
-                "Bet": _bet_label(r),
-                "Matchup": r.get("matchup"),
-                "Stake": f"${_safe_float(r.get('stake')):.2f}",
-                "Price": r.get("executed_price"),
-                "Game date": r.get("game_date"),
-            } for r in sorted(pending, key=lambda r: r.get("game_date") or "")
-        ], hide_index=True, width="stretch")
+
+def _wager_ids(df):
+    """Wager-id index values from a bets dataframe (drops any blank add-rows)."""
+    return {i for i in df.index.tolist() if isinstance(i, str) and i}
+
+
+def _coerce_int(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_wager_edits(original_df, edited_df, deletes_only=False):
+    """Diff an edited bets table against the original and persist deletes/edits.
+
+    Rows removed in the editor are deleted by wager_id; changed Price/Line/Stake
+    cells (pending only) are pushed through wagers.update_wagers. Added blank
+    rows are ignored (bets are created via Submit Picks). Surfaces storage
+    failures instead of silently dropping them."""
+    import wagers
+    orig_ids = _wager_ids(original_df)
+    kept_ids = _wager_ids(edited_df)
+    deleted = sorted(orig_ids - kept_ids)
+
+    edits = {}
+    if not deletes_only:
+        field_map = (("Price", "executed_price", _coerce_int),
+                     ("Line", "line", _coerce_float),
+                     ("Stake", "stake", _coerce_float))
+        for wid in (orig_ids & kept_ids):
+            before = original_df.loc[wid]
+            after = edited_df.loc[wid]
+            patch = {}
+            for col, field, coerce in field_map:
+                new = coerce(after.get(col))
+                if new is not None and new != coerce(before.get(col)):
+                    patch[field] = new
+            if patch:
+                edits[wid] = patch
+
+    if not deleted and not edits:
+        st.info("No changes to save.")
+        return
+    try:
+        n_del = wagers.delete_wagers(deleted) if deleted else 0
+        n_edit = wagers.update_wagers(edits) if edits else 0
+    except Exception as exc:
+        st.error(f"Could not save changes ({type(exc).__name__}). "
+                 "Your ledger is unchanged — please try again.")
+        return
+    if not n_del and not n_edit:
+        st.info("No changes to save.")
+        return
+    parts = ([f"{n_edit} edited"] if n_edit else []) + \
+            ([f"{n_del} deleted"] if n_del else [])
+    st.session_state["_wagers_flash"] = "Saved: " + ", ".join(parts) + "."
+    # Drop stale editor widget state so the tables reflect the new ledger, then
+    # rerun so the summary metrics and both tables recompute.
+    st.session_state.pop("pending_editor", None)
+    st.session_state.pop("settled_editor", None)
+    st.rerun()
 
 
 def _safe_float(value):
@@ -2157,11 +2285,12 @@ if analyze_clicked and selected_game_labels:
         "alts_applied": False,
         "threshold_pct": threshold,
         # Per-event metadata so "Submit Picks" can build ledger rows (commence,
-        # game_date, home/away) without a live re-fetch.
+        # game_date, home/away) without a live re-fetch. game_date is the
+        # US-Eastern local date (a late US game's UTC date is one day ahead).
         "events": {
             e["id"]: {
                 "commence_time": e.get("commence_time"),
-                "game_date": (e.get("commence_time") or "")[:10],
+                "game_date": pricing_common.et_local_date(e.get("commence_time")),
                 "home_team": e.get("home_team"),
                 "away_team": e.get("away_team"),
             }

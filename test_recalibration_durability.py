@@ -239,6 +239,18 @@ class DoubleheaderPickTests(unittest.TestCase):
         self.assertEqual(row["actual"], 8.0)
         self.assertEqual(row["outcome"], 1)
 
+    def test_live_game_sentinel_stays_pending_and_skips_espn(self):
+        # A statsapi GAME_NOT_FINAL sentinel must keep the bet pending and NOT
+        # fall through to the un-gated ESPN partial-stat path.
+        with patch.object(recalibration, "_resolve_mlb_actual",
+                          return_value=mlb_starters.GAME_NOT_FINAL), \
+             patch("espn_cache.cached_gamelog") as mock_gamelog:
+            result = recalibration.resolve_one_prop(
+                "baseball_mlb", "Live Bat", "batter_hits", 0.5,
+                "2024-07-04", "2024-07-04T23:10:00Z")
+        self.assertIsNone(result)
+        mock_gamelog.assert_not_called()
+
 
 class StatsapiResolverTests(unittest.TestCase):
     def setUp(self):
@@ -271,9 +283,9 @@ class StatsapiResolverTests(unittest.TestCase):
         if path == "schedule" and (params or {}).get("date") == "2024-07-04":
             return {"dates": [{"games": [
                 {"gamePk": 1, "gameDate": "2024-07-04T17:10:00Z",
-                 "teams": {}},
+                 "status": {"abstractGameState": "Final"}, "teams": {}},
                 {"gamePk": 2, "gameDate": "2024-07-04T23:10:00Z",
-                 "teams": {}},
+                 "status": {"abstractGameState": "Final"}, "teams": {}},
             ]}]}
         return {"dates": []}
 
@@ -316,10 +328,12 @@ class StatsapiResolverTests(unittest.TestCase):
                 if d == "2024-07-11":
                     return {"dates": [{"games": [
                         {"gamePk": 10, "gameDate": "2024-07-12T02:10:00Z",
+                         "status": {"abstractGameState": "Final"},
                          "teams": {}}]}]}
                 if d == "2024-07-12":
                     return {"dates": [{"games": [
                         {"gamePk": 11, "gameDate": "2024-07-12T20:10:00Z",
+                         "status": {"abstractGameState": "Final"},
                          "teams": {}}]}]}
             return {"dates": []}
 
@@ -328,6 +342,30 @@ class StatsapiResolverTests(unittest.TestCase):
                 "Everyday Bat", "2024-07-12T02:10:00Z", "2024-07-12",
                 "hitting", "hits", 2024)
         self.assertEqual(val, 2.0)  # the 07-11 night game, not 07-12's 0 hits
+
+    def test_live_game_returns_not_final_sentinel(self):
+        # The player's forecast game is still in progress: the resolver must
+        # return the GAME_NOT_FINAL sentinel (not a partial stat) so the bet
+        # stays pending instead of grading off an incomplete line.
+        def fake_get(path, params=None, **kw):
+            if path == "sports/1/players":
+                return {"people": [{"id": 77, "fullName": "Live Bat",
+                                    "primaryPosition": {"abbreviation": "CF"}}]}
+            if path.startswith("people/") and path.endswith("/stats"):
+                return {"stats": [{"splits": [
+                    {"game": {"gamePk": 20}, "date": "2024-07-04",
+                     "stat": {"hits": 0}}]}]}  # 0 hits SO FAR (3rd inning)
+            if path == "schedule":
+                return {"dates": [{"games": [
+                    {"gamePk": 20, "gameDate": "2024-07-04T23:10:00Z",
+                     "status": {"abstractGameState": "Live"}, "teams": {}}]}]}
+            return {"dates": []}
+
+        with patch.object(mlb_starters, "_get", side_effect=fake_get):
+            val = mlb_starters.resolve_player_game_stat(
+                "Live Bat", "2024-07-04T23:10:00Z", "2024-07-04",
+                "hitting", "hits", 2024)
+        self.assertIs(val, mlb_starters.GAME_NOT_FINAL)
 
 
 if __name__ == "__main__":

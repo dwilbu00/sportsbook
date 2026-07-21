@@ -9,12 +9,39 @@ use ``_starter_adjustment`` and the venue/defense multipliers). ``analysis``
 re-exports every name below for backward compatibility with its importers.
 """
 
+from datetime import datetime, timezone
+
 from calibration_loader import (
     load_market_blend,
     load_prob_shrink,
     load_starter_adjustment,
 )
 from odds_client import american_to_decimal, devig_two_way
+
+
+def et_local_date(commence_iso):
+    """US-Eastern calendar date (YYYY-MM-DD) for an ISO commence timestamp.
+
+    The Odds API ``commence_time`` is UTC; a late US game (first pitch after
+    ~8pm ET) has a UTC date one day AHEAD of its official/local game date. The
+    bet ledger and prediction log key grading and display off the local date, so
+    derive it in ``America/New_York`` — the convention ``app.py`` already uses
+    for MLB matchup features. Falls back to the raw UTC date when the timestamp
+    is unparseable or tz data is unavailable; never raises."""
+    if not commence_iso:
+        return None
+    raw = str(commence_iso)
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return raw[:10] or None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return dt.date().isoformat()
 
 
 # Calibration caches (populated lazily). Tests mutate these in place through the

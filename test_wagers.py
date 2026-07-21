@@ -102,6 +102,18 @@ class BuildWagerRowTests(unittest.TestCase):
         self.assertEqual(row["direction"], "OVER")
         self.assertAlmostEqual(row["model_prob"], 0.80)
 
+    def test_blank_row_derives_et_local_game_date(self):
+        # 02:30 UTC on 7/21 is 10:30 PM ET on 7/20 -> official game date is 7/20,
+        # NOT the raw UTC 7/21. Meta omits game_date so the fallback is exercised.
+        meta = {"sport_key": "baseball_mlb", "event_id": "E9",
+                "commence_time": "2026-07-21T02:30:00Z",
+                "home_team": "H", "away_team": "A", "stake": 10.0,
+                "placed_at": "2026-07-20T20:00:00+00:00", "seq": 0}
+        cand = {"team": "H", "opponent": "A", "home_away": "HOME",
+                "best_price": 120, "event_id": "E9"}
+        row = wagers.build_wager_row("moneyline", None, cand, meta)
+        self.assertEqual(row["game_date"], "2026-07-20")
+
 
 class GradeTeamBetTests(unittest.TestCase):
     def test_moneyline(self):
@@ -211,6 +223,122 @@ class RoundTripAndGradeTests(unittest.TestCase):
             with patch.object(game_results, "final_score", return_value=(5, 3)):
                 self.assertEqual(wagers.resolve_pending_wagers(now=now), 0)
             self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
+    def _live_prop(self):
+        return wagers.build_wager_row("player_prop", None, {
+            "player": "Live Bat", "prop": "batter_hits", "prop_label": "Hits",
+            "line": 1.5, "direction": "OVER", "over_price": -110,
+            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
+            "team": "H", "event_id": "E1"},
+            {"sport_key": "baseball_mlb", "event_id": "E1",
+             "commence_time": "2026-07-21T23:10:00Z", "home_team": "H",
+             "away_team": "A", "stake": 10.0,
+             "placed_at": "2026-07-21T20:00:00+00:00", "seq": 0})
+
+    def test_in_progress_game_not_attempted_within_buffer(self):
+        # Bug 1: 30 min after first pitch the game is clearly live -> the
+        # commence+buffer pre-filter must skip it before any resolver fetch.
+        with _LocalLedger():
+            wagers.submit_wagers([self._live_prop()])
+            now = datetime(2026, 7, 21, 23, 40, tzinfo=timezone.utc)
+            with patch.object(recalibration, "resolve_one_prop") as rp:
+                self.assertEqual(wagers.resolve_pending_wagers(now=now), 0)
+                rp.assert_not_called()
+            self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
+    def test_unresolvable_live_game_stays_pending(self):
+        # Bug 1: past the buffer but the resolver can't confirm a final stat
+        # (returns None, e.g. an extra-innings game still going) -> stay pending,
+        # never grade a partial line as a loss.
+        with _LocalLedger():
+            wagers.submit_wagers([self._live_prop()])
+            now = datetime(2026, 7, 22, 4, 0, tzinfo=timezone.utc)  # 5h later
+            with patch.object(recalibration, "resolve_one_prop", return_value=None):
+                self.assertEqual(wagers.resolve_pending_wagers(now=now), 0)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
+    def test_late_us_game_with_utc_date_grades_and_heals(self):
+        # Bug 2: a 7/20-night game legacy-stored with the raw UTC game_date 7/21
+        # (commence 02:30Z 7/21 = 10:30 PM ET 7/20). The old UTC guard treated it
+        # as "not finished" the next day forever; the new guard grades it, and
+        # settling heals game_date to the correct ET-local 7/20.
+        prop = wagers.build_wager_row("player_prop", None, {
+            "player": "Bat", "prop": "batter_hits", "prop_label": "Hits",
+            "line": 1.5, "direction": "OVER", "over_price": -110,
+            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
+            "team": "H", "event_id": "E1"},
+            {"sport_key": "baseball_mlb", "event_id": "E1",
+             "commence_time": "2026-07-21T02:30:00Z", "game_date": "2026-07-21",
+             "home_team": "H", "away_team": "A", "stake": 10.0,
+             "placed_at": "2026-07-20T20:00:00+00:00", "seq": 0})
+        self.assertEqual(prop["game_date"], "2026-07-21")  # legacy stored value
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            now = datetime(2026, 7, 21, 14, 0, tzinfo=timezone.utc)  # next morning
+            with patch.object(recalibration, "resolve_one_prop", return_value=2.0):
+                self.assertEqual(wagers.resolve_pending_wagers(now=now), 1)
+            row = wagers.read_wagers()[0]
+            self.assertEqual(row["status"], "won")
+            self.assertEqual(row["game_date"], "2026-07-20")  # healed to ET-local
+
+
+class DeleteAndEditTests(unittest.TestCase):
+    def _seed(self):
+        prop = wagers.build_wager_row("player_prop", None, {
+            "player": "Rafael Devers", "prop": "batter_hits",
+            "prop_label": "Hits", "line": 1.5, "direction": "OVER",
+            "over_price": -110, "over_rate": 60.0, "edge_pct": 7.0,
+            "matchup": "NYY @ BOS", "team": "Boston Red Sox", "event_id": "E1"},
+            _meta(0))
+        ml = wagers.build_wager_row("moneyline", None, {
+            "team": "Boston Red Sox", "opponent": "New York Yankees",
+            "home_away": "HOME", "best_price": 120, "best_book": "DK",
+            "blended_prob": 58.0, "best_edge_pct": 6.0, "event_id": "E1"},
+            _meta(1))
+        return prop, ml
+
+    def test_delete_by_id_is_idempotent(self):
+        prop, ml = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop, ml])
+            self.assertEqual(wagers.delete_wagers([prop["wager_id"]]), 1)
+            self.assertEqual([r["wager_id"] for r in wagers.read_wagers()],
+                             [ml["wager_id"]])
+            # Deleting an already-gone id removes nothing.
+            self.assertEqual(wagers.delete_wagers([prop["wager_id"]]), 0)
+
+    def test_delete_empty_is_noop(self):
+        prop, ml = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop, ml])
+            self.assertEqual(wagers.delete_wagers([]), 0)
+            self.assertEqual(len(wagers.read_wagers()), 2)
+
+    def test_edit_price_line_stake_and_point_sync(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            n = wagers.update_wagers({prop["wager_id"]: {
+                "executed_price": -120, "line": 2.5, "stake": 25.0}})
+            self.assertEqual(n, 1)
+            row = wagers.read_wagers()[0]
+            self.assertEqual(row["executed_price"], -120)
+            self.assertEqual(row["line"], 2.5)
+            self.assertEqual(row["point"], 2.5)   # line edit syncs the point
+            self.assertEqual(row["stake"], 25.0)
+
+    def test_edit_skips_settled_rows(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            now = datetime(2026, 7, 20, tzinfo=timezone.utc)
+            with patch.object(recalibration, "resolve_one_prop", return_value=2.0):
+                wagers.resolve_pending_wagers(now=now)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "won")
+            # A settled bet's realized fields must not be editable.
+            self.assertEqual(
+                wagers.update_wagers({prop["wager_id"]: {"stake": 99.0}}), 0)
+            self.assertEqual(wagers.read_wagers()[0]["stake"], 10.0)
 
 
 class SummaryTests(unittest.TestCase):

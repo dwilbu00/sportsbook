@@ -713,6 +713,33 @@ def _pick_candidate(candidates, commence):
     return candidates[0][1]
 
 
+def _today_et():
+    """Current calendar date in US-Eastern (YYYY-MM-DD)."""
+    now = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return now.date().isoformat()
+
+
+def _espn_row_final(row):
+    """True unless an ESPN gamelog row could still be in progress.
+
+    A row explicitly flagged ``completed`` is final. Otherwise a row dated today
+    (US-Eastern) or later may be live, so treat it as not-final and keep the bet
+    pending rather than grade a partial line; a past-dated game is always final.
+    A row with no date preserves the legacy assume-final behavior. This is the
+    backstop for the narrow case where the statsapi hard-ID path can't resolve a
+    live MLB game and grading falls through to the ESPN gamelog."""
+    if row.get("completed"):
+        return True
+    row_date = str(row.get("game_date") or "")[:10]
+    if not row_date:
+        return True
+    return row_date < _today_et()
+
+
 # prop_key -> (statsapi group, statsapi gameLog stat key). Unmapped props fall
 # through to the ESPN gamelog path.
 _MLB_STAT_SPEC = {
@@ -734,8 +761,10 @@ def _mlb_stat_spec(prop_key):
 def _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence):
     """Resolve a player's actual stat for the forecast game via the MLB statsapi
     hard-ID (gamePk) path, disambiguating doubleheaders by commence_time. Returns
-    the stat value, or None to fall back to the ESPN path. Never raises, so a
-    statsapi outage degrades to ESPN and never blocks other sports."""
+    the stat value; None to fall back to the ESPN path; or the
+    ``mlb_starters.GAME_NOT_FINAL`` sentinel when the bet's game is still live
+    (caller keeps it pending). Never raises, so a statsapi outage degrades to
+    ESPN and never blocks other sports."""
     if sport_key != "baseball_mlb":
         return None
     spec = _mlb_stat_spec(prop_key)
@@ -798,6 +827,14 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
     game_date = str(game_date)[:10]
     # Hard-ID path first (MLB statsapi gamePk); None -> ESPN fallback.
     actual = _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence)
+    # A live game located by statsapi returns the GAME_NOT_FINAL sentinel: keep
+    # the bet pending and DO NOT fall through to the un-gated ESPN partial line.
+    try:
+        import mlb_starters
+        if actual is mlb_starters.GAME_NOT_FINAL:
+            return None
+    except Exception:
+        pass
     if actual is None:
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
@@ -818,6 +855,10 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
                 if idx is not None:
                     break
         if idx is None:
+            return None
+        # Completion gate: a same-day-or-later ESPN row may be a live game with a
+        # partial line. Grade only confirmed-final games; stay pending otherwise.
+        if not _espn_row_final(gamelog[idx]):
             return None
         actual = gamelog[idx].get(stat_label)
     if actual is None:

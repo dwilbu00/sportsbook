@@ -981,15 +981,39 @@ def _candidate_dates(game_date):
     return out
 
 
+# Read-time freshness for a schedule that still contains a non-final game. Once
+# every game on a date is Final the schedule is immutable and cached a full day;
+# while any game is scheduled/live we only trust the cache briefly so the
+# ``status`` used by the outcome-resolution final gate reflects reality.
+_SCHEDULE_LIVE_TTL = 900        # 15 min while any game is not Final
+_SCHEDULE_FINAL_TTL = 24 * 3600  # 1 day once all games are Final
+
+
+def _all_final(index):
+    """True when every game in a schedule index is Final (schedule is static)."""
+    return bool(index) and all(
+        (info or {}).get("status") == "Final" for info in index.values())
+
+
 def get_schedule_index(date):
-    """{str(gamePk): {gameDate, gameNumber, doubleHeader, home, away}} for one
-    calendar date (YYYY-MM-DD). gamePk is the hard game id; gameDate is the UTC
-    start used to disambiguate doubleheaders against a forecast's commence_time.
-    Past-date schedules are static, so this caches for a day."""
+    """{str(gamePk): {gameDate, gameNumber, doubleHeader, home, away, status}}
+    for one calendar date (YYYY-MM-DD). gamePk is the hard game id; gameDate is
+    the UTC start used to disambiguate doubleheaders against a forecast's
+    commence_time; ``status`` is the statsapi abstractGameState ('Final',
+    'Live', 'Preview') used to gate outcome resolution to completed games.
+
+    Adaptive cache: a date whose games are all Final is static and cached for a
+    day; a date with any non-final game refreshes every ~15 min so live status
+    doesn't go stale (a wrong 'Final' would let a live game be graded)."""
     cache = f"schedule_index_{date}"
-    cached = _read_cache(cache, max_age=24 * 3600)
-    if cached is not None:
+    # Trust the long cache only when it says every game is Final; otherwise fall
+    # back to the short freshness window (and refetch when it too has expired).
+    cached = _read_cache(cache, max_age=_SCHEDULE_FINAL_TTL)
+    if cached is not None and _all_final(cached):
         return cached
+    fresh = _read_cache(cache, max_age=_SCHEDULE_LIVE_TTL)
+    if fresh is not None:
+        return fresh
     data = _get("schedule", {"sportId": 1, "date": date})
     out = {}
     for d in data.get("dates", []) or []:
@@ -1004,6 +1028,7 @@ def get_schedule_index(date):
                 "doubleHeader": g.get("doubleHeader"),
                 "home": ((teams.get("home") or {}).get("team") or {}).get("name"),
                 "away": ((teams.get("away") or {}).get("team") or {}).get("name"),
+                "status": (g.get("status") or {}).get("abstractGameState"),
             }
     _write_cache(cache, out)
     return out
@@ -1051,10 +1076,15 @@ def find_player_id(name, season):
     return matches[0]
 
 
-def _player_gamelog_splits(pid, group, season):
-    """Season gameLog splits for a player + stat group ('hitting'/'pitching')."""
+def _player_gamelog_splits(pid, group, season, max_age=CACHE_MAX_AGE):
+    """Season gameLog splits for a player + stat group ('hitting'/'pitching').
+
+    ``max_age`` overrides the cache freshness: the outcome-resolution path passes
+    0 so it always reads a FRESH gamelog. Otherwise a partial stat cached during
+    a live game (default 1h TTL) could be read moments after the game goes final
+    and grade a bet off an incomplete line."""
     cache = f"gamelog_{pid}_{group}_{season}"
-    cached = _read_cache(cache)
+    cached = _read_cache(cache, max_age=max_age)
     if cached is not None:
         return cached
     data = _get(f"people/{pid}/stats",
@@ -1066,13 +1096,20 @@ def _player_gamelog_splits(pid, group, season):
     return splits
 
 
+# Sentinel: the player's game was located but is not yet Final. Distinct from
+# None (which means "couldn't resolve" and permits the ESPN fallback), it tells
+# the caller to keep the bet PENDING and never grade off a live/partial stat.
+GAME_NOT_FINAL = object()
+
+
 def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
                              season):
     """Resolve one player's actual stat for a specific game via the gamePk hard
-    ID, disambiguating doubleheaders by commence_time. Returns a float, or None
-    when the player/game/stat can't be resolved unambiguously (caller falls back
-    to the ESPN path). Position group must match (a pitching prop only binds to a
-    pitcher) to avoid same-name cross-position mismatches."""
+    ID, disambiguating doubleheaders by commence_time. Returns a float; None when
+    the player/game/stat can't be resolved unambiguously (caller falls back to
+    the ESPN path); or ``GAME_NOT_FINAL`` when the bet's game exists but is still
+    in progress (caller keeps it pending). Position group must match (a pitching
+    prop only binds to a pitcher) to avoid same-name cross-position mismatches."""
     found = find_player_id(name, season)
     if not found:
         return None
@@ -1082,8 +1119,10 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     if group == "hitting" and is_pitcher:
         return None
 
+    # Fresh read (max_age=0): a gamelog cached during live play holds a partial
+    # line, so never trust the cache when we may be about to grade a bet.
     by_pk = {}
-    for sp in _player_gamelog_splits(pid, group, season):
+    for sp in _player_gamelog_splits(pid, group, season, max_age=0):
         pk = (sp.get("game") or {}).get("gamePk") or sp.get("gamePk")
         if pk is None:
             continue
@@ -1104,29 +1143,44 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     # date — so the true game can live under game_date-1. Collect every candidate
     # and choose by nearest scheduled start, never first-date-wins (which would
     # bind an everyday hitter to the following day's game).
-    candidates = []  # (gamePk, scheduled_start_dt_or_None)
+    candidates = []  # (gamePk, scheduled_start_dt_or_None, status)
     seen = set()
     for d in _candidate_dates(game_date):
         for pk, info in get_schedule_index(d).items():
             if pk in by_pk and pk not in seen:
                 seen.add(pk)
-                candidates.append((pk, _parse_utc(info.get("gameDate"))))
+                candidates.append(
+                    (pk, _parse_utc(info.get("gameDate")),
+                     (info or {}).get("status")))
     if not candidates:
         return None
+
+    # Identify WHICH physical game the bet is on (nearest scheduled start to
+    # commence_time), THEN gate on that game's status. Picking the game first is
+    # what stops a doubleheader's already-final leg from grading a bet on the
+    # still-live leg.
     if len(candidates) == 1:
-        return by_pk[candidates[0][0]]
-    # Multiple nearby games (doubleheader or date slippage): disambiguate by the
-    # start nearest commence_time. Without commence we can't choose safely.
-    if target is None:
-        return None
-    best_pk, best_delta = None, None
-    for pk, gdt in candidates:
-        if gdt is None:
-            continue
-        delta = abs((gdt - target).total_seconds())
-        if best_delta is None or delta < best_delta:
-            best_delta, best_pk = delta, pk
-    return by_pk[best_pk] if best_pk is not None else None
+        _, _, status = candidates[0]
+        pk = candidates[0][0]
+    else:
+        # Multiple nearby games (doubleheader or date slippage): without a
+        # commence_time we can't choose safely.
+        if target is None:
+            return None
+        best = None  # (delta_seconds, gamePk, status)
+        for cand_pk, gdt, status in candidates:
+            if gdt is None:
+                continue
+            delta = abs((gdt - target).total_seconds())
+            if best is None or delta < best[0]:
+                best = (delta, cand_pk, status)
+        if best is None:
+            return None
+        _, pk, status = best
+
+    if status != "Final":
+        return GAME_NOT_FINAL
+    return by_pk[pk]
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from pricing_common import (
     _prop_is_value,
     _starter_adjustment,
     _venue_match_multiplier,
+    et_local_date,
 )
 from prop_filter import filter_player_gamelog
 from recalibration import (
@@ -350,7 +351,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # Pull commence_time once so we can log this game's predictions for
     # later outcome resolution.
     commence_iso = prop_data.get("commence_time")
-    log_game_date = commence_iso[:10] if commence_iso else None
+    # US-Eastern local date (a late US game's UTC date is one day ahead), so the
+    # outcome resolver buckets the prediction under its official game date.
+    log_game_date = et_local_date(commence_iso) if commence_iso else None
 
     def _knob(prop_key, name, default):
         cfg = calibration.get(prop_key) if calibration else None

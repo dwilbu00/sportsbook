@@ -647,6 +647,30 @@ def search_athlete(sport, league, name, team_ids=None):
     return None
 
 
+def _game_completed(ev):
+    """Best-effort 'is this gamelog game final?' from an ESPN event dict.
+
+    Returns True/False when ESPN gives a clear signal, else None (unknown). A
+    final game carries a ``gameResult`` (W/L/D) or a completed status flag; a
+    live game has neither — its running score is deliberately NOT treated as
+    completion (that would grade a partial line). The outcome resolver combines
+    an unknown (None) result with the game's date to stay fail-safe (past-dated
+    games are final; a same-day game with no completion signal stays pending)."""
+    if not isinstance(ev, dict):
+        return None
+    result = ev.get("gameResult") or ev.get("result")
+    if isinstance(result, str) and result.strip():
+        return True
+    status = ev.get("status")
+    if isinstance(status, dict):
+        stype = status.get("type")
+        if isinstance(stype, dict) and "completed" in stype:
+            return bool(stype.get("completed"))
+        if "completed" in status:
+            return bool(status.get("completed"))
+    return None
+
+
 def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
     """
     Fetch game log (game-by-game stats) for an athlete.
@@ -741,6 +765,7 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
                 game_stats["is_home"] = _is_home(eid_key)
                 game_stats["team_id"] = _team_id(eid_key)
                 game_stats["game_date"] = _game_date(eid_key)
+                game_stats["completed"] = _game_completed(_resolve_event(eid_key))
                 games.append(game_stats)
 
     if games:
@@ -756,6 +781,7 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
                 game_stats["is_home"] = _is_home(event)
                 game_stats["team_id"] = _team_id(event)
                 game_stats["game_date"] = _game_date(event)
+                game_stats["completed"] = _game_completed(event)
                 games.append(game_stats)
 
     return games

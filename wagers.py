@@ -16,7 +16,7 @@ have a home the prediction log can't give them.
 Every public entry point is best-effort and never raises into the app.
 """
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import game_results
 import pricing_common
@@ -24,6 +24,20 @@ import recalibration
 
 WAGERS_FILE = "wagers.jsonl"
 _SETTLED = ("won", "lost", "push", "void")
+
+# Minimum plausible game duration per sport. A wager is not even considered for
+# grading until now >= commence_time + this buffer, so a game that is still in
+# progress is never fetched and graded off a partial line. This is only a cheap
+# pre-filter; the resolvers' own final-status gates are the real guarantee, so
+# the buffer is deliberately short and a long/extra-innings game that runs past
+# it simply stays pending (its resolver returns "not final" until it ends).
+_MIN_GAME_DURATION = {
+    "baseball_mlb": timedelta(hours=3),
+    "basketball_nba": timedelta(hours=2, minutes=30),
+    "americanfootball_nfl": timedelta(hours=3, minutes=30),
+    "icehockey_nhl": timedelta(hours=3),
+}
+_DEFAULT_MIN_GAME_DURATION = timedelta(hours=3)
 
 
 def storage_backend():
@@ -59,7 +73,9 @@ def _blank_row(bet_type, meta):
         "bet_type": bet_type,
         "event_id": meta.get("event_id"),
         "commence_time": commence,
-        "game_date": meta.get("game_date") or (commence or "")[:10],
+        # US-Eastern local date, NOT the raw UTC date: a late US game's UTC
+        # first-pitch date is one day ahead, which mis-buckets grading + display.
+        "game_date": meta.get("game_date") or pricing_common.et_local_date(commence),
         "home_team": meta.get("home_team"),
         "away_team": meta.get("away_team"),
         "matchup": None,
@@ -217,6 +233,66 @@ def submit_wagers(rows):
     return recalibration.mutate_ndjson_log(WAGERS_FILE, upsert)
 
 
+# Fields the user may correct on a PENDING bet when the number changed between
+# running the analysis and actually placing the bet. Editing the line also syncs
+# ``point`` (see update_wagers) so grading stays consistent across bet types.
+_EDITABLE_FIELDS = ("executed_price", "line", "stake")
+
+
+def delete_wagers(wager_ids):
+    """Remove ledger rows by wager_id. Returns the count removed.
+
+    Raises on a storage failure (like submit_wagers, this is user-initiated) so
+    the caller can report it instead of silently reporting zero."""
+    ids = {wid for wid in (wager_ids or []) if wid}
+    if not ids:
+        return 0
+
+    def prune(existing):
+        before = len(existing)
+        existing[:] = [r for r in existing if r.get("wager_id") not in ids]
+        return before - len(existing)
+
+    return recalibration.mutate_ndjson_log(WAGERS_FILE, prune)
+
+
+def update_wagers(edits):
+    """Apply field corrections to PENDING rows. Returns the count changed.
+
+    ``edits`` maps wager_id -> {field: value} over ``_EDITABLE_FIELDS``. Settled
+    rows are never touched — their grade and profit are already realized. Editing
+    the line syncs both ``line`` (prop grading) and ``point`` (team-market
+    grading) so a corrected line grades every bet type consistently. Raises on a
+    storage failure so the caller can surface it."""
+    clean = {wid: patch for wid, patch in (edits or {}).items() if wid and patch}
+    if not clean:
+        return 0
+
+    def apply(existing):
+        changed = 0
+        for row in existing:
+            wid = row.get("wager_id")
+            if wid not in clean or row.get("status") != "pending":
+                continue
+            touched = False
+            for field in _EDITABLE_FIELDS:
+                patch = clean[wid]
+                if field not in patch:
+                    continue
+                value = patch[field]
+                if row.get(field) == value:
+                    continue
+                row[field] = value
+                if field == "line":
+                    row["point"] = value  # keep the graded point in sync
+                touched = True
+            if touched:
+                changed += 1
+        return changed
+
+    return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Grading
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,12 +336,29 @@ def _grade_wager(row):
     return status, f"{home_score:g}-{away_score:g}"
 
 
+def _maybe_finished(row, now):
+    """True when the wager's game has plausibly ended (commence + sport buffer).
+
+    Prefers ``commence_time`` (timezone-correct — sidesteps the UTC-vs-local
+    date trap that let a live evening game look 'past' and stranded a finished
+    late game as 'pending'). Falls back to the legacy UTC game_date < today check
+    only when commence is missing/unparseable. The resolver's own final-status
+    gate is what actually prevents grading a still-live game; this is a cheap
+    pre-filter that also avoids fetching clearly-unfinished games."""
+    commence = game_results._parse_utc(row.get("commence_time"))
+    if commence is not None:
+        buffer = _MIN_GAME_DURATION.get(row.get("sport_key"),
+                                        _DEFAULT_MIN_GAME_DURATION)
+        return now >= commence + buffer
+    game_date = (row.get("game_date") or "")[:10]
+    return bool(game_date) and game_date < now.date().isoformat()
+
+
 def resolve_pending_wagers(max_to_resolve=200, now=None):
-    """Grade past-dated pending wagers and record status/actual/profit.
+    """Grade finished pending wagers and record status/actual/profit.
 
     Returns the number newly graded. Best-effort; never raises."""
     now = now or datetime.now(timezone.utc)
-    today = now.date().isoformat()
     rows = read_wagers()
     if not rows:
         return 0
@@ -276,9 +369,8 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
             break
         if row.get("status") != "pending":
             continue
-        game_date = (row.get("game_date") or "")[:10]
-        if not game_date or game_date >= today:
-            continue  # game hasn't finished yet
+        if not _maybe_finished(row, now):
+            continue  # game hasn't plausibly finished yet
         graded = _grade_wager(row)
         if graded is None:
             continue
@@ -286,12 +378,18 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
         won = None if status == "push" else (status == "won")
         realized = pricing_common.profit(
             row.get("executed_price"), row.get("stake"), won)
-        updates[row.get("wager_id")] = {
+        update = {
             "status": status,
             "actual": actual,
             "profit": realized,
             "resolved_at": now.isoformat(),
         }
+        # Heal a legacy row stored with the raw UTC date so it displays the
+        # correct US-local game date now that it has settled.
+        healed = pricing_common.et_local_date(row.get("commence_time"))
+        if healed:
+            update["game_date"] = healed
+        updates[row.get("wager_id")] = update
         count += 1
 
     if not updates:
