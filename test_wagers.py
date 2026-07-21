@@ -340,6 +340,37 @@ class DeleteAndEditTests(unittest.TestCase):
                 wagers.update_wagers({prop["wager_id"]: {"stake": 99.0}}), 0)
             self.assertEqual(wagers.read_wagers()[0]["stake"], 10.0)
 
+    def test_regrade_resets_settled_to_pending_then_regrades(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            now = datetime(2026, 7, 20, tzinfo=timezone.utc)
+            # Simulate the OLD bug: graded "lost" off a live/partial 0 hits.
+            with patch.object(recalibration, "resolve_one_prop", return_value=0.0):
+                wagers.resolve_pending_wagers(now=now)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "lost")
+
+            # Re-grade resets it to pending and clears the realized fields.
+            self.assertEqual(wagers.regrade_wagers([prop["wager_id"]]), 1)
+            row = wagers.read_wagers()[0]
+            self.assertEqual(row["status"], "pending")
+            self.assertIsNone(row["profit"])
+            self.assertIsNone(row["actual"])
+            self.assertIsNone(row["resolved_at"])
+
+            # Next pass re-grades with the true final stat -> now a win.
+            with patch.object(recalibration, "resolve_one_prop", return_value=2.0):
+                self.assertEqual(wagers.resolve_pending_wagers(now=now), 1)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "won")
+
+    def test_regrade_ignores_pending_and_empty(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])  # still pending
+            self.assertEqual(wagers.regrade_wagers([prop["wager_id"]]), 0)
+            self.assertEqual(wagers.regrade_wagers([]), 0)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
 
 class SummaryTests(unittest.TestCase):
     def test_stake_weighted_roi(self):

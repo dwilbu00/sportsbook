@@ -1291,18 +1291,20 @@ def render_my_bets():
             },
         )
         if st.button("💾 Save changes", key="save_pending"):
-            _apply_wager_edits(pending_df, edited_pending)
+            _apply_wager_edits(pending_df, edited_pending, editable=True)
 
     if settled:
         st.subheader("Settled bets")
         st.caption(
-            "Settled bets are graded and can't be edited. To remove an "
-            "accidental one, select its row and delete it, then click **Delete "
-            "selected**."
+            "Settled bets can't be edited. Tick **Re-grade** to reset a bet to "
+            "pending and re-grade it on refresh (fixes bets graded while the "
+            "game was still live), or select a row and delete it. Then click "
+            "**Apply**."
         )
         settled_df = pd.DataFrame([
             {
                 "wager_id": r.get("wager_id"),
+                "Re-grade": False,
                 "Placed": (r.get("placed_at") or "")[:10],
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
                 "Bet": _bet_label(r),
@@ -1324,9 +1326,14 @@ def render_my_bets():
             key="settled_editor",
             disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
                       "Result", "P/L", "CLV"],
+            column_config={
+                "Re-grade": st.column_config.CheckboxColumn(
+                    "Re-grade", default=False,
+                    help="Reset to pending and re-grade on the next refresh."),
+            },
         )
-        if st.button("🗑 Delete selected", key="delete_settled"):
-            _apply_wager_edits(settled_df, edited_settled, deletes_only=True)
+        if st.button("💾 Apply", key="apply_settled"):
+            _apply_wager_edits(settled_df, edited_settled, regradable=True)
 
 
 def _wager_ids(df):
@@ -1352,24 +1359,27 @@ def _coerce_float(value):
         return None
 
 
-def _apply_wager_edits(original_df, edited_df, deletes_only=False):
-    """Diff an edited bets table against the original and persist deletes/edits.
+def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False):
+    """Diff an edited bets table against the original and persist the changes.
 
-    Rows removed in the editor are deleted by wager_id; changed Price/Line/Stake
-    cells (pending only) are pushed through wagers.update_wagers. Added blank
-    rows are ignored (bets are created via Submit Picks). Surfaces storage
-    failures instead of silently dropping them."""
+    Rows removed in the editor are deleted by wager_id. When ``editable``,
+    changed Price/Line/Stake cells (pending only) go through
+    wagers.update_wagers. When ``regradable``, rows with the Re-grade box ticked
+    are reset to pending via wagers.regrade_wagers so the next refresh re-grades
+    them. Added blank rows are ignored (bets are created via Submit Picks).
+    Surfaces storage failures instead of silently dropping them."""
     import wagers
     orig_ids = _wager_ids(original_df)
     kept_ids = _wager_ids(edited_df)
     deleted = sorted(orig_ids - kept_ids)
+    survivors = orig_ids & kept_ids
 
     edits = {}
-    if not deletes_only:
+    if editable:
         field_map = (("Price", "executed_price", _coerce_int),
                      ("Line", "line", _coerce_float),
                      ("Stake", "stake", _coerce_float))
-        for wid in (orig_ids & kept_ids):
+        for wid in survivors:
             before = original_df.loc[wid]
             after = edited_df.loc[wid]
             patch = {}
@@ -1380,22 +1390,32 @@ def _apply_wager_edits(original_df, edited_df, deletes_only=False):
             if patch:
                 edits[wid] = patch
 
-    if not deleted and not edits:
+    regrades = []
+    if regradable and "Re-grade" in edited_df.columns:
+        regrades = [wid for wid in survivors
+                    if bool(edited_df.loc[wid].get("Re-grade"))]
+
+    if not deleted and not edits and not regrades:
         st.info("No changes to save.")
         return
     try:
         n_del = wagers.delete_wagers(deleted) if deleted else 0
         n_edit = wagers.update_wagers(edits) if edits else 0
+        n_regrade = wagers.regrade_wagers(regrades) if regrades else 0
     except Exception as exc:
         st.error(f"Could not save changes ({type(exc).__name__}). "
                  "Your ledger is unchanged — please try again.")
         return
-    if not n_del and not n_edit:
+    if not n_del and not n_edit and not n_regrade:
         st.info("No changes to save.")
         return
     parts = ([f"{n_edit} edited"] if n_edit else []) + \
+            ([f"{n_regrade} reset to pending"] if n_regrade else []) + \
             ([f"{n_del} deleted"] if n_del else [])
     st.session_state["_wagers_flash"] = "Saved: " + ", ".join(parts) + "."
+    # A re-grade must trigger a fresh grading pass on the rerun below.
+    if n_regrade:
+        st.session_state["_wagers_graded"] = False
     # Drop stale editor widget state so the tables reflect the new ledger, then
     # rerun so the summary metrics and both tables recompute.
     st.session_state.pop("pending_editor", None)

@@ -293,6 +293,30 @@ def update_wagers(edits):
     return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
 
 
+def regrade_wagers(wager_ids):
+    """Reset settled rows to pending so the next resolve pass re-grades them.
+
+    Clears the realized fields (status/actual/profit/resolved_at) on the given
+    SETTLED rows while leaving stake/price/line intact. Use to correct bets that
+    were graded under the old buggy live-game logic (a still-live game marked as
+    a loss). Already-pending rows are ignored. Returns the count reset. Raises on
+    a storage failure so the caller can surface it."""
+    ids = {wid for wid in (wager_ids or []) if wid}
+    if not ids:
+        return 0
+
+    def reset(existing):
+        changed = 0
+        for row in existing:
+            if row.get("wager_id") in ids and row.get("status") in _SETTLED:
+                row.update({"status": "pending", "actual": None,
+                            "profit": None, "resolved_at": None})
+                changed += 1
+        return changed
+
+    return recalibration.mutate_ndjson_log(WAGERS_FILE, reset)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Grading
 # ──────────────────────────────────────────────────────────────────────────────
