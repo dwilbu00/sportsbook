@@ -202,9 +202,13 @@ def build_wager_row(bet_type, side, candidate, meta):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def read_wagers():
-    """All ledger rows (best-effort snapshot)."""
+    """All ledger rows (best-effort snapshot).
+
+    Uses the short-TTL blob read cache: the ledger is read on every My Bets
+    rerun, and every writer invalidates the cache, so this avoids a full-ledger
+    GET+parse per rerun without risking staleness after an edit."""
     try:
-        rows, _ = recalibration._read_ndjson_blob(WAGERS_FILE)
+        rows, _ = recalibration._read_ndjson_blob(WAGERS_FILE, use_cache=True)
         return rows
     except Exception:
         return []

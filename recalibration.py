@@ -30,6 +30,7 @@ Schema for recalibration_<sport>.json
   }
 }
 """
+import copy
 import json
 import math
 import os
@@ -56,6 +57,14 @@ RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal blo
 
 _lock = threading.Lock()
 _last_auto_maintenance = {}  # sport_key -> attempt timestamp
+
+# Short-TTL in-memory cache for read-only NDJSON blob reads (e.g. the wagers
+# ledger read on every My Bets rerun). Only the Azure-blob path is cached; local
+# disk reads are already cheap. Every writer goes through mutate_ndjson_log,
+# which reads FRESH (use_cache=False) and pops this cache after a successful
+# write, so cached reads never mask a just-persisted change within a session.
+_NDJSON_CACHE = {}            # filename -> (rows, version, fetched_at)
+_NDJSON_CACHE_TTL = 30        # seconds
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,16 +234,31 @@ def _ndjson_local_path(filename):
     return os.path.join(PRED_DIR, filename)
 
 
-def _read_ndjson_blob(filename):
-    """Return (rows, version) for an NDJSON store, from Azure or local disk."""
+def _read_ndjson_blob(filename, use_cache=False):
+    """Return (rows, version) for an NDJSON store, from Azure or local disk.
+
+    ``use_cache`` (read-only callers only) serves the Azure-blob read from a
+    short-TTL in-memory cache to avoid a full GET+parse on every rerun. Writers
+    (mutate_ndjson_log) MUST leave it False so the read-modify-write always sees
+    the authoritative blob + its ETag."""
     blob_url = _blob_url_for(filename)
     if blob_url:
+        if use_cache:
+            entry = _NDJSON_CACHE.get(filename)
+            if entry and (time.time() - entry[2]) < _NDJSON_CACHE_TTL:
+                return copy.deepcopy(entry[0]), entry[1]
         import requests
         response = requests.get(blob_url, timeout=30)
         if response.status_code == 404:
+            if use_cache:
+                _NDJSON_CACHE[filename] = ([], None, time.time())
             return [], None
         response.raise_for_status()
-        return _parse_log_text(response.text), response.headers.get("ETag")
+        rows = _parse_log_text(response.text)
+        version = response.headers.get("ETag")
+        if use_cache:
+            _NDJSON_CACHE[filename] = (copy.deepcopy(rows), version, time.time())
+        return rows, version
     path = _ndjson_local_path(filename)
     if not os.path.exists(path):
         return [], None
@@ -282,6 +306,7 @@ def mutate_ndjson_log(filename, mutator, max_retries=5):
                 result = mutator(rows)
                 if result:
                     _write_ndjson_blob(filename, rows, version)
+                    _NDJSON_CACHE.pop(filename, None)
                 return result
     for _ in range(max_retries):
         rows, version = _read_ndjson_blob(filename)
@@ -290,6 +315,7 @@ def mutate_ndjson_log(filename, mutator, max_retries=5):
             return result
         try:
             _write_ndjson_blob(filename, rows, version)
+            _NDJSON_CACHE.pop(filename, None)
             return result
         except _LogConflict:
             continue

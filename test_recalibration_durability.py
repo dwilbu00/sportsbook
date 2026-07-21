@@ -368,5 +368,80 @@ class StatsapiResolverTests(unittest.TestCase):
         self.assertIs(val, mlb_starters.GAME_NOT_FINAL)
 
 
+class _Resp:
+    """Minimal requests.Response stand-in for the NDJSON read-cache test."""
+    def __init__(self, status, text="", etag=None):
+        self.status_code = status
+        self.text = text
+        self.headers = {"ETag": etag} if etag else {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(str(self.status_code))
+
+
+class NdjsonReadCacheTests(unittest.TestCase):
+    """The blob read-cache (use_cache=True) must serve repeat reads without a
+    new GET, and every write through mutate_ndjson_log must invalidate it."""
+
+    def setUp(self):
+        recalibration._NDJSON_CACHE.clear()
+        self.addCleanup(recalibration._NDJSON_CACHE.clear)
+
+    def test_cached_read_then_write_invalidates(self):
+        state = {"body": '{"wager_id": "w1", "status": "pending"}\n',
+                 "etag": '"v1"', "gets": 0}
+
+        def fake_get(url, timeout=None, **kw):
+            state["gets"] += 1
+            return _Resp(200, state["body"], state["etag"])
+
+        def fake_put(url, data=None, headers=None, timeout=None, **kw):
+            state["body"] = data.decode("utf-8") if isinstance(data, bytes) else data
+            state["etag"] = '"v2"'
+            return _Resp(201)
+
+        with patch.object(recalibration, "_prediction_log_blob_url",
+                          return_value=_FAKE_URL), \
+             patch("requests.get", side_effect=fake_get), \
+             patch("requests.put", side_effect=fake_put):
+            rows1, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+            self.assertEqual(len(rows1), 1)
+            self.assertEqual(state["gets"], 1)
+
+            # Second read within TTL is served from cache — no new GET.
+            rows2, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+            self.assertEqual(state["gets"], 1)
+            self.assertEqual(len(rows2), 1)
+
+            # A write pops the cache; the next cached read re-fetches fresh rows.
+            def add(rows):
+                rows.append({"wager_id": "w2", "status": "pending"})
+                return 1
+            recalibration.mutate_ndjson_log("wagers.jsonl", add)
+            gets_before = state["gets"]
+            rows3, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+            self.assertGreater(state["gets"], gets_before)  # cache was invalidated
+            self.assertEqual(len(rows3), 2)
+
+    def test_mutated_rows_do_not_poison_cache(self):
+        # A read returns a deep copy, so a caller mutating rows in place cannot
+        # corrupt the cached snapshot served to the next reader.
+        state = {"body": '{"wager_id": "w1", "close_price": null}\n', "gets": 0}
+
+        def fake_get(url, timeout=None, **kw):
+            state["gets"] += 1
+            return _Resp(200, state["body"], '"v1"')
+
+        with patch.object(recalibration, "_prediction_log_blob_url",
+                          return_value=_FAKE_URL), \
+             patch("requests.get", side_effect=fake_get):
+            rows1, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+            rows1[0]["close_price"] = -120  # caller mutates its copy
+            rows2, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+            self.assertIsNone(rows2[0]["close_price"])  # cache untouched
+
+
 if __name__ == "__main__":
     unittest.main()

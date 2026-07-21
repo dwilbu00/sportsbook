@@ -524,11 +524,18 @@ def get_remaining_credits():
 
 
 def is_event_cached(sport, event_id, regions="us", markets="h2h", bookmakers=None):
-    """Check if odds for a specific event/market combo are cached and fresh."""
+    """Check if odds for a specific event/market combo are cached and fresh.
+
+    Uses the file mtime instead of reading + JSON-parsing the whole payload
+    (40-128 KB): the credit-cost estimator calls this per selected game on every
+    rerun, and it only needs a yes/no. Cache files are written once and never
+    modified, so mtime is a faithful proxy for the stored ``cached_at``."""
     books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
     cache_path = _cache_key("event_odds", sport, event_id, regions, markets, books_key)
-    cached, _ = _read_cache(cache_path)
-    return cached is not None
+    try:
+        return (time.time() - os.path.getmtime(cache_path)) < CACHE_MAX_AGE
+    except OSError:
+        return False
 
 
 def parse_game_odds(game):

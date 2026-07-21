@@ -586,7 +586,34 @@ MARKET_OPTIONS = {
 }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_calibration_blobs(sport_keys):
+    """Committed calibration/<sport>.json files (change only on redeploy → a new
+    process clears the cache). Cached so the Model Guide doesn't re-read + parse
+    them on every rerun."""
+    blobs = {}
+    for sport_key in sport_keys:
+        path = os.path.join(SCRIPT_DIR, "calibration", f"{sport_key}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                blobs[sport_key] = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            blobs[sport_key] = {}
+    return blobs
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_prediction_summary():
+    """Forward prediction-log summary (a full log read). Short TTL so the Model
+    Guide reflects newly-graded outcomes without a blob GET on every rerun."""
+    from recalibration import prediction_performance_summary
+    return prediction_performance_summary()
+
+
+@st.cache_data(show_spinner=False)
 def load_config():
+    # Cached: config.json + secrets + env are stable within a session, so this
+    # avoids a file read + JSON parse on every rerun. save_api_key() clears it.
     path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else CONFIG_EXAMPLE_PATH
     with open(path, "r") as f:
         config = json.load(f)
@@ -618,6 +645,7 @@ def save_api_key(key):
     config["odds_api_key"] = key
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
+    load_config.clear()  # invalidate the cached config so the new key is read
 
 
 def needs_setup(config):
@@ -796,19 +824,12 @@ def render_model_guide():
             """
         )
 
-    calibration_blobs = {}
     sport_names = {
         "baseball_mlb": "MLB",
         "basketball_nba": "NBA",
         "americanfootball_nfl": "NFL",
     }
-    for sport_key, sport_name in sport_names.items():
-        path = os.path.join(SCRIPT_DIR, "calibration", f"{sport_key}.json")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                calibration_blobs[sport_key] = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            calibration_blobs[sport_key] = {}
+    calibration_blobs = _cached_calibration_blobs(tuple(sport_names))
 
     with performance_tab:
         st.subheader("Player-prop chronological calibration scores")
@@ -847,11 +868,8 @@ def render_model_guide():
             st.info("No committed player-prop calibration summaries were found.")
 
         st.subheader("Forward prediction tracking")
-        from recalibration import (
-            prediction_log_storage,
-            prediction_performance_summary,
-        )
-        forward = prediction_performance_summary()
+        from recalibration import prediction_log_storage
+        forward = _cached_prediction_summary()
         storage_backend = prediction_log_storage()
         if storage_backend == "Local cache":
             st.warning(
@@ -1198,10 +1216,12 @@ def render_my_bets():
         )
         return
 
-    try:
-        wagers.attach_clv(rows)
-    except Exception:
-        pass
+    # CLV is read straight from the durable ledger — persist_clv() fills it (for
+    # games past first pitch, the only ones with a real closing line) during the
+    # once-per-session prefetch and on Refresh. We deliberately do NOT call
+    # attach_clv() here: it hit the odds warehouse (a manifest + snapshot GET per
+    # un-priced row) on every rerun, which was the dominant source of My Bets
+    # sluggishness. CLV updates at startup and whenever you click Refresh.
 
     sport_labels = {info["key"]: name for name, info in SPORTS.items()}
 
@@ -1278,27 +1298,32 @@ def render_my_bets():
                 "Stake": _safe_float(r.get("stake")),
             } for r in sorted(pending, key=lambda r: r.get("game_date") or "")
         ]).set_index("wager_id")
-        edited_pending = st.data_editor(
-            pending_df,
-            hide_index=True,
-            width="stretch",
-            key=f"pending_editor_{editor_nonce}",
-            disabled=["Placed", "Sport", "Bet", "Matchup", "Game date"],
-            column_config={
-                "Delete": st.column_config.CheckboxColumn(
-                    "Delete", default=False, help="Remove this bet on Save"),
-                "Price": st.column_config.NumberColumn(
-                    "Price", help="American odds you actually got", step=1,
-                    format="%d"),
-                "Line": st.column_config.NumberColumn(
-                    "Line", help="The line you placed at", step=0.5,
-                    format="%.1f"),
-                "Stake": st.column_config.NumberColumn(
-                    "Stake", help="Dollar stake", min_value=0.0, step=1.0,
-                    format="$%.2f"),
-            },
-        )
-        if st.button("💾 Save changes", key="save_pending"):
+        # A form batches all edits: cell changes and Delete ticks do NOT rerun
+        # the app until "Save changes" is pressed, so editing no longer dims/
+        # reruns the page on every keystroke.
+        with st.form(f"pending_form_{editor_nonce}", clear_on_submit=False):
+            edited_pending = st.data_editor(
+                pending_df,
+                hide_index=True,
+                width="stretch",
+                key=f"pending_editor_{editor_nonce}",
+                disabled=["Placed", "Sport", "Bet", "Matchup", "Game date"],
+                column_config={
+                    "Delete": st.column_config.CheckboxColumn(
+                        "Delete", default=False, help="Remove this bet on Save"),
+                    "Price": st.column_config.NumberColumn(
+                        "Price", help="American odds you actually got", step=1,
+                        format="%d"),
+                    "Line": st.column_config.NumberColumn(
+                        "Line", help="The line you placed at", step=0.5,
+                        format="%.1f"),
+                    "Stake": st.column_config.NumberColumn(
+                        "Stake", help="Dollar stake", min_value=0.0, step=1.0,
+                        format="$%.2f"),
+                },
+            )
+            submit_pending = st.form_submit_button("💾 Save changes")
+        if submit_pending:
             _apply_wager_edits(pending_df, edited_pending, editable=True)
 
     if settled:
@@ -1327,22 +1352,24 @@ def render_my_bets():
             } for r in sorted(settled, key=lambda r: r.get("placed_at") or "",
                               reverse=True)
         ]).set_index("wager_id")
-        edited_settled = st.data_editor(
-            settled_df,
-            hide_index=True,
-            width="stretch",
-            key=f"settled_editor_{editor_nonce}",
-            disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
-                      "Result", "P/L", "CLV"],
-            column_config={
-                "Delete": st.column_config.CheckboxColumn(
-                    "Delete", default=False, help="Remove this bet on Apply"),
-                "Re-grade": st.column_config.CheckboxColumn(
-                    "Re-grade", default=False,
-                    help="Reset to pending and re-grade on the next refresh."),
-            },
-        )
-        if st.button("💾 Apply", key="apply_settled"):
+        with st.form(f"settled_form_{editor_nonce}", clear_on_submit=False):
+            edited_settled = st.data_editor(
+                settled_df,
+                hide_index=True,
+                width="stretch",
+                key=f"settled_editor_{editor_nonce}",
+                disabled=["Placed", "Sport", "Bet", "Matchup", "Stake", "Price",
+                          "Result", "P/L", "CLV"],
+                column_config={
+                    "Delete": st.column_config.CheckboxColumn(
+                        "Delete", default=False, help="Remove this bet on Apply"),
+                    "Re-grade": st.column_config.CheckboxColumn(
+                        "Re-grade", default=False,
+                        help="Reset to pending and re-grade on the next refresh."),
+                },
+            )
+            submit_settled = st.form_submit_button("💾 Apply")
+        if submit_settled:
             _apply_wager_edits(settled_df, edited_settled, regradable=True)
 
 
