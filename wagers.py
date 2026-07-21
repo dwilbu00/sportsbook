@@ -495,6 +495,55 @@ def attach_clv(rows):
     return rows
 
 
+def _commence_passed(row, now):
+    """True once first pitch/kickoff has passed (the closing line is now final)."""
+    commence = game_results._parse_utc(row.get("commence_time"))
+    return commence is not None and now >= commence
+
+
+def persist_clv(rows=None, now=None):
+    """Compute closing-line value for started games and write it durably.
+
+    CLV is only meaningful once the game has started — before then the warehouse
+    has no post-commence "closing" snapshot and the latest line is still moving —
+    so this only fills rows whose commence_time has passed and that don't already
+    have a close_price. The filled close_price/close_line/clv_pct are written
+    back through the ETag-safe ledger store so later renders (and restarts) read
+    them cheaply instead of re-hitting the warehouse every time. Returns the
+    count newly persisted. Best-effort; never raises."""
+    now = now or datetime.now(timezone.utc)
+    rows = read_wagers() if rows is None else rows
+    if not rows:
+        return 0
+    candidates = [r for r in rows
+                  if r.get("close_price") is None and _commence_passed(r, now)]
+    if not candidates:
+        return 0
+    attach_clv(candidates)  # fills close_price/close_line/clv_pct in memory
+    filled = {
+        r["wager_id"]: {k: r.get(k)
+                        for k in ("close_price", "close_line", "clv_pct")}
+        for r in candidates
+        if r.get("wager_id") and r.get("close_price") is not None
+    }
+    if not filled:
+        return 0
+
+    def apply(current):
+        changed = 0
+        for row in current:
+            update = filled.get(row.get("wager_id"))
+            if update and row.get("close_price") is None:
+                row.update(update)
+                changed += 1
+        return changed
+
+    try:
+        return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
+    except Exception:
+        return 0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Summary (stake-weighted realized ROI)
 # ──────────────────────────────────────────────────────────────────────────────

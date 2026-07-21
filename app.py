@@ -1182,6 +1182,7 @@ def render_my_bets():
         if refresh or not st.session_state.get("_wagers_graded"):
             with st.spinner("Grading settled bets..."):
                 graded = wagers.resolve_pending_wagers()
+                wagers.persist_clv()
             st.session_state["_wagers_graded"] = True
             if graded:
                 st.success(f"Graded {graded} newly settled bet(s).")
@@ -1466,6 +1467,31 @@ for _persist_key in list(st.session_state.keys()):
                          "wager_unit_stake")
             or str(_persist_key).startswith("bet_selection:")):
         st.session_state[_persist_key] = st.session_state[_persist_key]
+
+# Prefetch the My Bets ledger once per session, BEFORE the page router, so the
+# 🧾 My Bets page opens ready (it then just reads the already-graded, CLV-filled
+# durable ledger). Runs above the st.stop() router + setup gate so it fires on
+# whichever page loads first, and needs no odds API key (grading uses free box
+# scores). Results persist to the blob, so this is a one-time cost per session.
+# A separate sentinel from _wagers_graded so the post-save regrade reset doesn't
+# re-trigger this block; setting _wagers_graded=True lets My Bets skip its pass.
+if not st.session_state.get("_wagers_prefetched"):
+    st.session_state["_wagers_prefetched"] = True
+    try:
+        import wagers as _wagers
+        with st.status("Updating your bet ledger…", expanded=False) as _status:
+            _graded = _wagers.resolve_pending_wagers()
+            _clv = _wagers.persist_clv()
+            st.session_state["_wagers_graded"] = True
+            _bits = ([f"{_graded} bet(s) graded"] if _graded else []) + \
+                    ([f"CLV on {_clv} bet(s)"] if _clv else [])
+            _status.update(
+                label=("Updated: " + ", ".join(_bits) + "." if _bits
+                       else "Bet ledger up to date."),
+                state="complete")
+    except Exception:
+        # Best-effort: My Bets lazily grades on open as the backstop.
+        pass
 
 with st.sidebar:
     app_page = st.radio(

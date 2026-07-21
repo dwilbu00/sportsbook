@@ -399,6 +399,57 @@ class AttachClvTests(unittest.TestCase):
         self.assertIsNotNone(row["clv_pct"])
 
 
+class PersistClvTests(unittest.TestCase):
+    def _prop(self, commence, seq=0):
+        meta = {"sport_key": "baseball_mlb", "event_id": "E1",
+                "commence_time": commence, "game_date": commence[:10],
+                "home_team": "H", "away_team": "A", "stake": 10.0,
+                "placed_at": "2026-07-20T12:00:00+00:00", "seq": seq}
+        return wagers.build_wager_row("player_prop", None, {
+            "player": "Bat", "prop": "batter_hits", "prop_label": "Hits",
+            "line": 1.5, "direction": "OVER", "over_price": -110,
+            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
+            "team": "H", "event_id": "E1"}, meta)
+
+    def test_persists_clv_for_started_game_and_is_idempotent(self):
+        import warehouse
+        row = self._prop("2026-07-21T02:30:00Z")
+        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)  # after commence
+        with _LocalLedger():
+            wagers.submit_wagers([row])
+            with patch.object(warehouse, "closing_line_for",
+                              return_value={"price": -120, "implied_prob": 0.545,
+                                            "captured_at": "x"}):
+                self.assertEqual(wagers.persist_clv(now=now), 1)
+                saved = wagers.read_wagers()[0]
+                self.assertEqual(saved["close_price"], -120)
+                self.assertIsNotNone(saved["clv_pct"])
+                # Already persisted -> nothing more to write.
+                self.assertEqual(wagers.persist_clv(now=now), 0)
+
+    def test_skips_pregame_rows(self):
+        import warehouse
+        row = self._prop("2026-07-21T02:30:00Z")
+        now = datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc)  # before commence
+        with _LocalLedger():
+            wagers.submit_wagers([row])
+            with patch.object(warehouse, "closing_line_for",
+                              return_value={"price": -120, "implied_prob": 0.5}) as m:
+                self.assertEqual(wagers.persist_clv(now=now), 0)
+                m.assert_not_called()  # pre-commence -> not even queried
+            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
+
+    def test_returns_zero_when_warehouse_has_no_line(self):
+        import warehouse
+        row = self._prop("2026-07-21T02:30:00Z")
+        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
+        with _LocalLedger():
+            wagers.submit_wagers([row])
+            with patch.object(warehouse, "closing_line_for", return_value=None):
+                self.assertEqual(wagers.persist_clv(now=now), 0)
+            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
+
+
 class SummaryTests(unittest.TestCase):
     def test_stake_weighted_roi(self):
         rows = [
