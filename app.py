@@ -25,6 +25,16 @@ try:
             "PREDICTION_LOG_BLOB_URL", str(prediction_blob_url))
 except Exception:
     pass
+# Promote the Azure SQL connection secrets into the environment so the storage
+# layer (db_store, imported lazily by recalibration) can build its engine. When
+# these are unset the app keeps using the Blob/local store unchanged.
+try:
+    for _sql_key in ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD"):
+        _sql_val = st.secrets.get(_sql_key)
+        if _sql_val:
+            os.environ.setdefault(_sql_key, str(_sql_val))
+except Exception:
+    pass
 
 from odds_client import (
     get_upcoming_events,

@@ -1,2 +1,7 @@
 requests
 streamlit>=1.56
+# Azure SQL durable-state backend (used only when SQL_* secrets are set; the app
+# falls back to the local/Blob store otherwise). pymssql is the TDS driver
+# (pip wheel, no system ODBC driver / packages.txt needed on Streamlit Cloud).
+SQLAlchemy>=2.0,<2.1
+pymssql>=2.3,<2.4

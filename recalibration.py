@@ -67,6 +67,31 @@ _NDJSON_CACHE = {}            # filename -> (rows, version, fetched_at)
 _NDJSON_CACHE_TTL = 30        # seconds
 
 
+# ── SQL backend (Azure SQL) dispatch ──
+# When db_store is importable AND its SQL_* secret is configured, the durable
+# stores here (prediction log, wagers ledger, recalibration params) route to SQL
+# instead of the Azure-Blob SAS path. A missing SQLAlchemy install or unset
+# secret leaves _sql() False → the Blob/local path is used unchanged. The row-list
+# mutators are reused verbatim; db_store runs them inside a transaction and
+# replaces the store's rows (its CHECK/UNIQUE constraints reject bad data).
+try:
+    import db_store as _db
+except Exception:  # pragma: no cover - SQLAlchemy absent
+    _db = None
+
+_PRED_TABLE = "prediction_log"
+
+
+def _sql():
+    return _db is not None and _db.enabled()
+
+
+def _table_for(filename):
+    """Map an NDJSON store filename to its SQL table (e.g. 'wagers.jsonl'
+    → 'wagers')."""
+    return os.path.splitext(filename)[0]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Path / file helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,6 +122,8 @@ def _prediction_log_blob_url():
 
 def prediction_log_storage():
     """Human-readable active prediction-log backend."""
+    if _sql():
+        return "Azure SQL"
     return "Azure Blob" if _prediction_log_blob_url() else "Local cache"
 
 
@@ -159,7 +186,9 @@ def _local_log_lock():
 
 
 def _read_log_snapshot():
-    """Return (rows, version) from local disk or the configured Azure blob."""
+    """Return (rows, version) from SQL, local disk, or the configured Azure blob."""
+    if _sql():
+        return _db.read_rows(_PRED_TABLE), None
     blob_url = _prediction_log_blob_url()
     if blob_url:
         import requests
@@ -201,6 +230,14 @@ def _write_log_snapshot(rows, version=None):
 
 def mutate_prediction_log(mutator, max_retries=5):
     """Atomically mutate the prediction log; returns the mutator's result."""
+    if _sql():
+        # Serialize with the module lock, mirroring the local path: SQL's
+        # read->mutate->replace is a read-modify-write, so concurrent threads in
+        # the (single-replica) Streamlit process must not interleave and lose an
+        # update. db_store.mutate's transaction is the atomicity guarantee; this
+        # lock is the in-process concurrency guard the blob ETag path provided.
+        with _lock:
+            return _db.mutate(_PRED_TABLE, mutator)
     if not _prediction_log_blob_url():
         with _lock:
             with _local_log_lock():
@@ -241,6 +278,15 @@ def _read_ndjson_blob(filename, use_cache=False):
     short-TTL in-memory cache to avoid a full GET+parse on every rerun. Writers
     (mutate_ndjson_log) MUST leave it False so the read-modify-write always sees
     the authoritative blob + its ETag."""
+    if _sql():
+        if use_cache:
+            entry = _NDJSON_CACHE.get(filename)
+            if entry and (time.time() - entry[2]) < _NDJSON_CACHE_TTL:
+                return copy.deepcopy(entry[0]), entry[1]
+        rows = _db.read_rows(_table_for(filename))
+        if use_cache:
+            _NDJSON_CACHE[filename] = (copy.deepcopy(rows), None, time.time())
+        return rows, None
     blob_url = _blob_url_for(filename)
     if blob_url:
         if use_cache:
@@ -299,6 +345,12 @@ def mutate_ndjson_log(filename, mutator, max_retries=5):
     receives the row list and mutates it in place; a falsy return skips the
     write. Blob-backed writers retry on ETag conflict; local writers hold an
     inter-process file lock."""
+    if _sql():
+        with _lock:  # in-process serialization of read->mutate->replace
+            result = _db.mutate(_table_for(filename), mutator)
+        if result:
+            _NDJSON_CACHE.pop(filename, None)
+        return result
     if not _blob_url_for(filename):
         with _lock:
             with _local_file_lock(_ndjson_local_path(filename)):
@@ -1210,7 +1262,13 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
     # Durable Blob write — best-effort last-writer-wins with If-Match retry.
     # A transient blob failure leaves the local file intact; the next refit
     # retries. Swallowing keeps the free loop (maybe_auto_refit) crash-proof.
-    if to_blob and _prediction_log_blob_url():
+    if to_blob and _sql():
+        # SQL is the durable overlay when configured (replaces the blob write).
+        try:
+            _db.save_recal(sport_key, blob)
+        except Exception:
+            pass
+    elif to_blob and _prediction_log_blob_url():
         filename = os.path.basename(recalibration_path(sport_key))
         try:
             for _ in range(5):
@@ -1277,6 +1335,26 @@ def _load_recal_cached(sport_key):
     (applied on every analyze) and the maintain_sport refit gate, so a
     maintenance tick plus the following analyze issue a single blob GET.
     """
+    if _sql():
+        # SQL overlay of the git-committed baseline, mirroring the blob path:
+        # a sport with no (validated) SQL fit falls back to the shipped seed.
+        now = time.time()
+        cached = _LOAD_CACHE.get(sport_key)
+        if cached and (now - cached["fetched_at"]) < RECAL_LOAD_TTL_SECONDS:
+            return cached["fit_ts"], cached["props"]
+        try:
+            cfg = _db.load_recal(sport_key)
+        except Exception:
+            if cached:
+                cached["fetched_at"] = now
+                return cached["fit_ts"], cached["props"]
+            return _read_local_recal(sport_key)
+        fit_ts, props = _parse_recal_blob(cfg) if cfg else (None, {})
+        if not props:
+            fit_ts, props = _read_local_recal(sport_key)
+        _LOAD_CACHE[sport_key] = {
+            "fetched_at": now, "etag": None, "fit_ts": fit_ts, "props": props}
+        return fit_ts, props
     if not _prediction_log_blob_url():
         # Local-only: mtime-keyed cache (unchanged semantics).
         path = recalibration_path(sport_key)
