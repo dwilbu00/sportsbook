@@ -932,6 +932,8 @@ from props import (  # noqa: E402
     _player_prop_venue_strength,
     _player_prop_output_defense_strength,
     _player_prop_shrinkage_k,
+    _player_prop_park_strength,
+    _park_factor_mult,
     _player_prop_half_life,
     _MLB_LEAGUE,
     _LINEUP_ADJ_CACHE,

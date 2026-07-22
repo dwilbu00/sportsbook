@@ -15,6 +15,7 @@ from calibration_loader import (
     load_lineup_adjustment,
 )
 from odds_client import PROP_LABELS
+from park_factors import PROP_PARK_KIND, park_factor
 from pricing_common import (
     _expected_roi,
     _opponent_defense_multiplier,
@@ -267,6 +268,22 @@ PLAYER_PROP_MARKET_PRIOR_K = {}
 DEFAULT_PLAYER_PROP_MARKET_PRIOR_K = 0  # off by default until tuned per backtest
 
 
+# ── Park-factor road-context delta (P1.2) ──
+# Strength of the ballpark adjustment applied to the projection. The adjustment
+# scales by how the upcoming park's factor compares to the weighted-average park
+# factor of the player's recent games (which already embed his home park — so a
+# DELTA, never an absolute multiply). Only props in park_factors.PROP_PARK_KIND
+# (batter_hits, pitcher_earned_runs) get a non-neutral effect; everything else
+# is 1.0 regardless of strength. Ships ON for MLB (park factors are a known
+# physical effect the market prices; aligning the projection trims false
+# Coors-driven edges). 0.0 disables. Per-prop override via calibration JSON
+# "park_factor_strength".
+PLAYER_PROP_PARK_STRENGTH = {"baseball_mlb": 1.0}
+DEFAULT_PLAYER_PROP_PARK_STRENGTH = 0.0  # off for sports with no park table
+# Bounds on the final park multiplier (caps extreme parks like Coors runs).
+PARK_FACTOR_BOUNDS = (0.85, 1.20)
+
+
 # Per-sport override for the recency half-life *for player props specifically*.
 # When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
 # projection. Zero disables exponential decay; None inherits from
@@ -319,6 +336,69 @@ def _player_prop_market_prior_k(sport_key):
     if sport_key is None:
         return DEFAULT_PLAYER_PROP_MARKET_PRIOR_K
     return PLAYER_PROP_MARKET_PRIOR_K.get(sport_key, DEFAULT_PLAYER_PROP_MARKET_PRIOR_K)
+
+
+def _player_prop_park_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_PARK_STRENGTH
+    return PLAYER_PROP_PARK_STRENGTH.get(
+        sport_key, DEFAULT_PLAYER_PROP_PARK_STRENGTH)
+
+
+def _park_factor_mult(prop_key, past_parks, past_weights, upcoming_park,
+                      strength):
+    """Road-context ballpark multiplier for an MLB player-prop projection.
+
+    Scales the projection by ``park_factor(upcoming) / park_factor(baseline)``,
+    where the baseline is the recency-weighted average park factor of the
+    player's recent games. Because his logs already embed the parks he played
+    in (≈half at home), only the DIFFERENCE between tonight's park and his
+    recent park environment should move the projection — this avoids
+    double-counting his home park. 1.0 = no change.
+
+    Args:
+        prop_key: odds-API prop market key (maps to a stat kind via
+            park_factors.PROP_PARK_KIND; unmapped props → no effect).
+        past_parks: per-recent-game home-team park names (odds-API/ESPN
+            spellings), aligned with ``past_weights``; None for a game whose
+            park is unknown (excluded from the baseline).
+        past_weights: the recency/venue/defense weights already computed for
+            those games.
+        upcoming_park: the upcoming game's home-team name (the park played in).
+        strength: 0..1 fraction of the raw ratio to apply.
+
+    Returns:
+        (multiplier, meta_dict or None). Fails closed to (1.0, None) when the
+        prop is park-neutral, strength<=0, the upcoming park is unknown, or no
+        recent game has a known park.
+    """
+    kind = PROP_PARK_KIND.get(prop_key)
+    if not kind or not strength or strength <= 0 or not upcoming_park:
+        return 1.0, None
+    num = 0.0
+    den = 0.0
+    for name, weight in zip(past_parks or [], past_weights or []):
+        if not name or weight is None or weight <= 0:
+            continue
+        num += park_factor(name, kind) * weight
+        den += weight
+    if den <= 0:
+        return 1.0, None
+    pf_base = num / den
+    pf_up = park_factor(upcoming_park, kind)
+    if pf_base <= 0:
+        return 1.0, None
+    raw = pf_up / pf_base
+    lo, hi = PARK_FACTOR_BOUNDS
+    mult = max(lo, min(hi, 1.0 + strength * (raw - 1.0)))
+    if mult == 1.0:
+        return 1.0, None
+    return mult, {
+        "kind": kind,
+        "pf_up": round(pf_up, 3),
+        "pf_base": round(pf_base, 3),
+        "mult": round(mult, 3),
+    }
 
 
 def _player_prop_half_life(sport_key):
@@ -392,6 +472,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_output_def = _player_prop_output_defense_strength(sport_key)
     default_shrinkage_k = _player_prop_shrinkage_k(sport_key)
     default_market_prior_k = _player_prop_market_prior_k(sport_key)
+    default_park_strength = _player_prop_park_strength(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -427,6 +508,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         output_def_strength = _knob(prop_key, "output_def_strength", default_output_def)
         shrinkage_k = _knob(prop_key, "shrinkage_k", default_shrinkage_k)
         market_prior_k = _knob(prop_key, "market_prior_k", default_market_prior_k)
+        park_strength = _knob(prop_key, "park_factor_strength", default_park_strength)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -616,7 +698,30 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         player_context=player_context)
                 lineup_mult = _mlb_lineup_exposure_mult(
                     prop_key, player_context)
-            combined_mult = output_def_mult * matchup_mult * lineup_mult
+
+            # ── Park-factor road-context delta (P1.2) ──
+            # Scale by how the upcoming park differs from the player's recent
+            # park environment. Each past game's park is the player's own park
+            # when he was home, else the opponent's park; the upcoming park is
+            # always the home team's. MLB batter_hits / pitcher_earned_runs
+            # only (park_factors.PROP_PARK_KIND) — 1.0 for everything else.
+            park_mult = 1.0
+            park_meta = None
+            if park_strength and park_strength > 0:
+                past_parks = []
+                for _opp, _past_h in zip(opponents, past_home_aways):
+                    if _past_h is True:
+                        past_parks.append(player_team_name)
+                    elif _past_h is False:
+                        past_parks.append(_opp)
+                    else:
+                        past_parks.append(None)
+                park_mult, park_meta = _park_factor_mult(
+                    prop_key, past_parks, weights, home_team_name,
+                    park_strength)
+
+            combined_mult = (output_def_mult * matchup_mult
+                             * lineup_mult * park_mult)
 
             avg_stat = base_proj * combined_mult
             # When the projection is scaled, the over-rate calc shifts the
@@ -856,6 +961,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "bettable_at_standard_line": bettable_at_standard_line,
                     "calibration": calibration_meta,
                     "recalibration": recal_meta,
+                    "park_factor": park_meta,
                     "_values": list(values),
                     "_weights": list(weights),
                 })
@@ -971,6 +1077,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "calibration": calibration_meta,
                 "recalibration": recal_meta,
                 "market_prior": market_prior_meta,
+                "park_factor": park_meta,
                 "_values": list(values),
                 "_weights": list(weights),
             })

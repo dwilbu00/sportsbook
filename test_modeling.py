@@ -15,6 +15,7 @@ import backtest_starters
 import espn_client
 import mlb_starters
 import odds_client
+import park_factors
 import props
 import recalibration
 from backtest_props import _rolling_splits
@@ -1405,6 +1406,176 @@ class BestMarketPriorKSweepTests(unittest.TestCase):
     def test_empty_returns_none(self):
         from backtest import _best_market_prior_k
         self.assertIsNone(_best_market_prior_k([]))
+
+
+class ParkFactorTableTests(unittest.TestCase):
+    """P1.2: static MLB park-factor table + name normalization."""
+
+    def test_park_key_normalizes_and_aliases(self):
+        self.assertEqual(park_factors._park_key("Colorado Rockies"),
+                         "coloradorockies")
+        # Relocation / rename aliases collapse to one canonical key.
+        self.assertEqual(park_factors._park_key("Oakland Athletics"),
+                         "athletics")
+        self.assertEqual(park_factors._park_key("Sacramento Athletics"),
+                         "athletics")
+        self.assertEqual(park_factors._park_key("Cleveland Indians"),
+                         "clevelandguardians")
+        self.assertEqual(park_factors._park_key("Arizona D-backs"),
+                         "arizonadiamondbacks")
+        self.assertEqual(park_factors._park_key(None), "")
+
+    def test_park_factor_lookup(self):
+        # Coors is hitter/run friendly; a marine pitcher park suppresses.
+        self.assertGreater(park_factors.park_factor("Colorado Rockies", "hits"),
+                           1.0)
+        self.assertGreater(park_factors.park_factor("Colorado Rockies", "runs"),
+                           park_factors.park_factor("Colorado Rockies", "hits"))
+        self.assertLess(park_factors.park_factor("Seattle Mariners", "hits"),
+                        1.0)
+        # Unknown team or kind → neutral 1.0 (fail closed).
+        self.assertEqual(park_factors.park_factor("Nowhere FC", "hits"), 1.0)
+        self.assertEqual(park_factors.park_factor("Colorado Rockies", "steals"),
+                         1.0)
+        # Aliases resolve to the same factor as the canonical name.
+        self.assertEqual(park_factors.park_factor("Oakland Athletics", "hits"),
+                         park_factors.park_factor("Athletics", "hits"))
+
+
+class ParkFactorMultTests(unittest.TestCase):
+    """P1.2: road-context delta multiplier (props._park_factor_mult)."""
+
+    def test_neutral_sample_to_coors_raises(self):
+        mult, meta = props._park_factor_mult(
+            "batter_hits", ["Houston Astros", "Houston Astros"], [1.0, 1.0],
+            "Colorado Rockies", 1.0)
+        self.assertGreater(mult, 1.0)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["kind"], "hits")
+        self.assertAlmostEqual(meta["pf_base"], 1.0, places=3)
+        self.assertAlmostEqual(
+            mult, park_factors.park_factor("Colorado Rockies", "hits"),
+            places=3)
+
+    def test_coors_heavy_sample_no_double_count(self):
+        # A Rockies hitter (home logs already at Coors) going to Coors: the
+        # delta is ≈1.0 — the point of the road-context formulation.
+        mult, meta = props._park_factor_mult(
+            "batter_hits",
+            ["Colorado Rockies", "Colorado Rockies", "Colorado Rockies"],
+            [1.0, 1.0, 1.0], "Colorado Rockies", 1.0)
+        self.assertAlmostEqual(mult, 1.0, places=3)
+        self.assertIsNone(meta)
+
+    def test_earned_runs_uses_runs_kind(self):
+        mult, meta = props._park_factor_mult(
+            "pitcher_earned_runs", ["Houston Astros"], [1.0],
+            "Colorado Rockies", 1.0)
+        self.assertEqual(meta["kind"], "runs")
+        # Runs factor is capped by PARK_FACTOR_BOUNDS.
+        self.assertAlmostEqual(mult, props.PARK_FACTOR_BOUNDS[1], places=3)
+
+    def test_strength_scales_effect(self):
+        full, _ = props._park_factor_mult(
+            "batter_hits", ["Houston Astros"], [1.0], "Colorado Rockies", 1.0)
+        half, _ = props._park_factor_mult(
+            "batter_hits", ["Houston Astros"], [1.0], "Colorado Rockies", 0.5)
+        self.assertAlmostEqual(half, 1.0 + 0.5 * (full - 1.0), places=3)
+
+    def test_bounds_clamp_extreme_delta(self):
+        # Coors baseline → a strong pitcher park would push below the floor.
+        mult, _ = props._park_factor_mult(
+            "batter_hits", ["Colorado Rockies"], [1.0], "Seattle Mariners", 1.0)
+        self.assertEqual(mult, props.PARK_FACTOR_BOUNDS[0])
+
+    def test_missing_data_is_neutral(self):
+        # No known past parks → baseline undefined → neutral.
+        mult, meta = props._park_factor_mult(
+            "batter_hits", [None, None], [1.0, 1.0], "Colorado Rockies", 1.0)
+        self.assertEqual((mult, meta), (1.0, None))
+        # Unknown upcoming park → neutral.
+        mult, meta = props._park_factor_mult(
+            "batter_hits", ["Houston Astros"], [1.0], None, 1.0)
+        self.assertEqual((mult, meta), (1.0, None))
+
+    def test_non_mapped_prop_is_neutral(self):
+        mult, meta = props._park_factor_mult(
+            "pitcher_strikeouts", ["Houston Astros"], [1.0],
+            "Colorado Rockies", 1.0)
+        self.assertEqual((mult, meta), (1.0, None))
+
+    def test_zero_strength_is_neutral(self):
+        mult, meta = props._park_factor_mult(
+            "batter_hits", ["Houston Astros"], [1.0], "Colorado Rockies", 0.0)
+        self.assertEqual((mult, meta), (1.0, None))
+
+
+class ParkFactorProjectionTests(unittest.TestCase):
+    """P1.2: the park delta actually moves the projection through the runtime
+    prop pipeline. Uses sport_key=None + a patched default strength so the MLB
+    calibration/statsapi/logging paths stay out (like MarketPriorShrinkageTests),
+    and all past games are AWAY at a neutral park so no espn_teams lookup is
+    needed to resolve the baseline."""
+
+    def _prop_data(self, home_team):
+        return {
+            "commence_time": "2026-07-20T23:10:00Z",
+            "home_team": home_team,
+            "away_team": "Houston Astros",  # the player's team (on the road)
+            "game_id": "evt-park",
+            "props": {
+                "batter_hits": {
+                    "Roady Rob": {
+                        "line": 0.5,
+                        "over_implied": 0.5,
+                        "under_implied": 0.5,
+                        "over_price": -110,
+                        "under_price": -110,
+                        "over_book": "DK",
+                        "under_book": "DK",
+                    }
+                }
+            },
+        }
+
+    def _histories(self, n=12):
+        dates = [f"2026-06-{d:02d}" for d in range(1, 1 + n)]
+        return {
+            "Roady Rob": {
+                "batter_hits": {
+                    "found": True,
+                    "values": [1.0] * n,               # 1 hit each → base_proj 1.0
+                    "opponents": ["Minnesota Twins"] * n,  # neutral park
+                    "home_aways": [False] * n,         # all road → park = opponent
+                    "game_dates": list(reversed(dates)),
+                }
+            }
+        }
+
+    def _run(self, home_team, strength):
+        with patch.object(props, "DEFAULT_PLAYER_PROP_PARK_STRENGTH", strength):
+            cands = props.analyze_player_props_value(
+                self._prop_data(home_team), self._histories(),
+                threshold_pct=1.0, sport_key=None)
+        return cands[0]
+
+    def test_coors_upcoming_raises_projection(self):
+        off = self._run("Colorado Rockies", 0.0)
+        on = self._run("Colorado Rockies", 1.0)
+        self.assertIsNone(off["park_factor"])
+        self.assertAlmostEqual(off["avg_stat"], 1.0, places=2)
+        self.assertIsNotNone(on["park_factor"])
+        # Baseline is a neutral park; upcoming Coors → projection scales up.
+        self.assertGreater(on["avg_stat"], off["avg_stat"])
+        self.assertAlmostEqual(
+            on["avg_stat"],
+            round(park_factors.park_factor("Colorado Rockies", "hits"), 2),
+            places=2)
+
+    def test_neutral_upcoming_is_a_no_op(self):
+        on = self._run("Minnesota Twins", 1.0)  # same neutral park as baseline
+        self.assertIsNone(on["park_factor"])
+        self.assertAlmostEqual(on["avg_stat"], 1.0, places=2)
 
 
 if __name__ == "__main__":

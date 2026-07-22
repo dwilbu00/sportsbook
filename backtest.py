@@ -47,6 +47,7 @@ from analysis import (
     _weighted_std,
     _half_life_for,
     _norm_cdf,
+    _park_factor_mult,
     analyze_moneyline_value,
     analyze_spreads_value,
     analyze_totals_value,
@@ -1591,7 +1592,8 @@ def _print_table_row(name, n, tmae, trmse, mmae, wpct, brier):
 def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             opp_defense_strength=0.0, use_minutes=False,
             pace_adj=0.0, def_adj=0.0,
-            shrink_k=0.0, rest_adj=0.0, def_window=None):
+            shrink_k=0.0, rest_adj=0.0, def_window=None,
+            park_strength=0.0):
     return {
         "half_life": half_life,
         "opp_strength": opp_strength,
@@ -1605,6 +1607,7 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
         "shrink_k": shrink_k,                # Bayesian shrinkage toward unweighted prior mean
         "rest_adj": rest_adj,                # B2B / rest-days projection scaling
         "def_window": def_window,            # use only last N opp games for defense (None = season)
+        "park_strength": park_strength,      # P1.2 ballpark road-context delta (MLB hits/ER)
     }
 
 
@@ -1637,6 +1640,12 @@ VARIANT_PRESETS = {
     "def+defwin15": _preset(half_life="auto", def_adj=1.0, def_window=15),
     "def+all_new":  _preset(half_life="auto", def_adj=1.0,
                             shrink_k=5, rest_adj=0.05, def_window=10),
+    # ── Park-factor isolation (P1.2): identical MLB baseline (no decay),
+    #    park adjustment off vs half vs full. Only batter_hits /
+    #    pitcher_earned_runs move; other props are identical across the three.
+    "park_off":     _preset(half_life=None),
+    "park_half":    _preset(half_life=None, park_strength=0.5),
+    "park_full":    _preset(half_life=None, park_strength=1.0),
 }
 
 
@@ -2066,6 +2075,20 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
               f"(league avg pace = {league_avg_pace:.2f})" if league_avg_pace
               else "Pace lookup empty.")
 
+    # Build team-id -> display-name map if any variant uses park factors
+    # (P1.2). Needed to resolve the player's own home park from their team_id,
+    # mirroring the production id_to_name lookup.
+    team_id_to_name = {}
+    needs_park = any(
+        (p.get("park_strength", 0.0) or 0.0) > 0 for p in variants.values())
+    if needs_park:
+        _park_teams = get_all_teams(espn_sport, espn_league)
+        team_id_to_name = {
+            str(info["id"]): nm for nm, info in _park_teams.items()
+            if info.get("id")
+        }
+        print(f"Built team-name map for park factors ({len(team_id_to_name)} teams).")
+
     # results[variant][prop] = {errors, n, hits, decisive, safe[offset]={"hits":, "n":}}
     # When calibrate=True, also collect per-observation tuples for residual-
     # calibration analysis: (projected, synthetic_line, actual, empirical_over).
@@ -2114,6 +2137,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     (g.get("team_id") for g in prior_games if g.get("team_id")),
                     None,
                 )
+                player_team_name = (team_id_to_name.get(str(tid))
+                                    if tid else None)
                 schedule = (team_schedules_for_filter.get(str(tid))
                             if tid else None)
                 filt = filter_player_gamelog(
@@ -2230,6 +2255,27 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     rest_adj = params.get("rest_adj", 0.0) or 0.0
                     if rest_adj > 0 and days_rest is not None and days_rest <= 1:
                         projected *= (1.0 - rest_adj)
+
+                    # ── Park-factor road-context delta (P1.2) ──
+                    # Mirror production props._park_factor_mult: each past game's
+                    # park = the player's own park when home, else the opponent's;
+                    # the upcoming park is the home team's. Only batter_hits /
+                    # pitcher_earned_runs move (park_factors.PROP_PARK_KIND).
+                    park_s = params.get("park_strength", 0.0) or 0.0
+                    if park_s > 0:
+                        past_parks = []
+                        for ph, opp in zip(prior_home_aways, prior_opponents):
+                            if ph is True:
+                                past_parks.append(player_team_name)
+                            elif ph is False:
+                                past_parks.append(opp)
+                            else:
+                                past_parks.append(None)
+                        upcoming_park = (player_team_name if upcoming_is_home
+                                         else upcoming_opp)
+                        park_mult, _ = _park_factor_mult(
+                            prop_key, past_parks, weights, upcoming_park, park_s)
+                        projected *= park_mult
 
                     err = projected - actual
                     cell = results[vname][prop_key]
