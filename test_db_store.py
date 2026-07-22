@@ -269,6 +269,101 @@ class SchemaParityTests(unittest.TestCase):
                      | {"sport_key", "prop_key", "fold_index"})
         self.assertEqual(spec_cols, table_cols)
 
+    def test_odds_snapshot_columns(self):
+        self.assertEqual(
+            {c.name for c in db_store.odds_snapshot.columns},
+            {"id", "sport", "game_date", "event_id", "kind", "snapshot_hour",
+             "captured_at", "commence_time", "home", "away", "regions",
+             "markets", "bookmakers"})
+
+    def test_odds_line_columns(self):
+        self.assertEqual(
+            {c.name for c in db_store.odds_line.columns},
+            {"id", "snapshot_id", "bet_type", "selection", "point", "player",
+             "prop_key", "direction", "price", "implied_prob"})
+
+
+class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):
+    """Phase B: normalized odds warehouse on SQL (capture + closing_line_for)."""
+
+    def _meta(self, hour, kind="team"):
+        return {"sport": "baseball_mlb", "game_date": "2026-07-22",
+                "event_id": "e1", "kind": kind, "snapshot_hour": hour,
+                "captured_at": f"2026-07-22T{hour[-3:-1]}:00:00Z",
+                "commence_time": "2026-07-22T23:00:00Z",
+                "home": "Rockies", "away": "Astros", "regions": "us",
+                "markets": "h2h,spreads,totals", "bookmakers": None}
+
+    def test_capture_write_once_and_lookup(self):
+        lines = [
+            {"bet_type": "moneyline", "selection": "Rockies", "price": 120,
+             "implied_prob": 0.45},
+            {"bet_type": "total", "selection": "Over", "point": 9.5,
+             "price": -105, "implied_prob": 0.51},
+        ]
+        self.assertTrue(db_store.capture_odds_snapshot(self._meta("20260722T18Z"), lines))
+        # Write-once: same (sport,date,event,kind,hour) is rejected.
+        self.assertFalse(db_store.capture_odds_snapshot(self._meta("20260722T18Z"), lines))
+        snaps = db_store.odds_snapshots_for_event("baseball_mlb", "2026-07-22", "e1")
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(
+            db_store.odds_line_lookup(snaps[0]["id"], "moneyline",
+                                      selection="Rockies")["price"], 120)
+        # Total point-exact + h2h alias.
+        self.assertEqual(
+            db_store.odds_line_lookup(snaps[0]["id"], "totals",
+                                      selection="Over", point=9.5)["price"], -105)
+
+    def test_spread_point_fallback(self):
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), [
+            {"bet_type": "spread", "selection": "Rockies", "point": 1.5,
+             "price": -110, "implied_prob": 0.52}])
+        sid = db_store.odds_snapshots_for_event(
+            "baseball_mlb", "2026-07-22", "e1")[0]["id"]
+        # Exact point missing → best price for the selection.
+        self.assertEqual(
+            db_store.odds_line_lookup(sid, "spread", selection="Rockies",
+                                      point=2.5)["price"], -110)
+
+    def test_closing_line_picks_nearest_at_or_before_commence(self):
+        import warehouse
+        # Two snapshots: 18Z (before 23Z commence) and 22Z (closer, before).
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), [
+            {"bet_type": "moneyline", "selection": "Rockies", "price": 100,
+             "implied_prob": 0.5}])
+        db_store.capture_odds_snapshot(self._meta("20260722T22Z"), [
+            {"bet_type": "moneyline", "selection": "Rockies", "price": 130,
+             "implied_prob": 0.43}])
+        close = warehouse.closing_line_for(
+            "baseball_mlb", "2026-07-22", "e1", "moneyline",
+            selection="Rockies", commence_time="2026-07-22T23:00:00Z")
+        self.assertEqual(close["price"], 130)          # the 22Z (nearest) snapshot
+        self.assertEqual(close["captured_at"], "2026-07-22T22:00:00Z")
+
+    def test_capture_event_odds_parses_payload(self):
+        import warehouse
+        payload = {
+            "id": "e1", "home_team": "Rockies", "away_team": "Astros",
+            "commence_time": "2026-07-22T23:00:00Z",
+            "bookmakers": [
+                {"key": "draftkings", "title": "DraftKings", "markets": [
+                    {"key": "h2h", "outcomes": [
+                        {"name": "Rockies", "price": 118},
+                        {"name": "Astros", "price": -140}]}]},
+                {"key": "fanduel", "title": "FanDuel", "markets": [
+                    {"key": "h2h", "outcomes": [
+                        {"name": "Rockies", "price": 122},  # best → stored
+                        {"name": "Astros", "price": -145}]}]},
+            ],
+        }
+        warehouse.capture_event_odds(
+            "baseball_mlb", "e1", "us", "h2h", None, payload)
+        close = warehouse.closing_line_for(
+            "baseball_mlb", "2026-07-22", "e1", "moneyline",
+            selection="Rockies", commence_time="2026-07-22T23:00:00Z")
+        self.assertEqual(close["price"], 122)          # best across books
+        self.assertEqual(warehouse.storage_backend(), "Azure SQL")
+
 
 if __name__ == "__main__":
     unittest.main()

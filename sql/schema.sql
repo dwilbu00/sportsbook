@@ -141,3 +141,56 @@ CREATE TABLE dbo.recalibration_meta (
     source          NVARCHAR(64)
 );
 GO
+
+------------------------------------------------------------------- odds_snapshot
+-- Odds warehouse (Phase B): normalized, replaces the Blob snapshot blobs +
+-- _manifest.json. One row per captured snapshot (write-once per hour bucket).
+IF OBJECT_ID('dbo.odds_snapshot', 'U') IS NULL
+CREATE TABLE dbo.odds_snapshot (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    sport         NVARCHAR(64)  NOT NULL,
+    game_date     NVARCHAR(10)  NOT NULL,
+    event_id      NVARCHAR(128) NOT NULL,
+    kind          NVARCHAR(16)  NOT NULL,          -- team|props|alt|seed
+    snapshot_hour NVARCHAR(16)  NOT NULL,          -- YYYYMMDDTHHZ bucket
+    captured_at   NVARCHAR(40),
+    commence_time NVARCHAR(40),
+    home          NVARCHAR(128),
+    away          NVARCHAR(128),
+    regions       NVARCHAR(64),
+    markets       NVARCHAR(256),
+    bookmakers    NVARCHAR(256),
+    CONSTRAINT uq_odds_snapshot
+        UNIQUE (sport, game_date, event_id, kind, snapshot_hour)  -- write-once
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_odds_snapshot_event'
+                 AND object_id = OBJECT_ID('dbo.odds_snapshot'))
+CREATE INDEX ix_odds_snapshot_event
+    ON dbo.odds_snapshot (sport, game_date, event_id);
+GO
+
+----------------------------------------------------------------------- odds_line
+-- One row per extracted line within a snapshot. price/implied reproduce
+-- closing_line_for's extraction (best-across-books for team; consensus for
+-- props), computed at capture. snapshot_id references odds_snapshot.id.
+IF OBJECT_ID('dbo.odds_line', 'U') IS NULL
+CREATE TABLE dbo.odds_line (
+    id           INT IDENTITY(1,1) PRIMARY KEY,
+    snapshot_id  INT NOT NULL,
+    bet_type     NVARCHAR(16) NOT NULL,            -- moneyline|spread|total|player_prop
+    selection    NVARCHAR(160),                    -- team | Over | Under | player
+    point        FLOAT,
+    player       NVARCHAR(160),
+    prop_key     NVARCHAR(64),
+    direction    NVARCHAR(8),
+    price        INT,
+    implied_prob FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_odds_line_snapshot'
+                 AND object_id = OBJECT_ID('dbo.odds_line'))
+CREATE INDEX ix_odds_line_snapshot ON dbo.odds_line (snapshot_id);
+GO

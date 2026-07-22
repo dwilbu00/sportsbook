@@ -44,6 +44,20 @@ _TEAM_MARKETS = {"h2h", "spreads", "totals"}
 _accumulator = []          # list of (sport, game_date, entry dict)
 _acc_lock = threading.Lock()
 
+# ── SQL backend (Azure SQL, Phase B) ──
+# When db_store is importable AND configured, the warehouse stores normalized
+# snapshots + extracted lines in SQL (no Blob, no _manifest.json). A missing
+# SQLAlchemy install or unset secret leaves _sql() False → the Blob/local path is
+# used unchanged. Guarded import (self-contained module, no import cycle).
+try:
+    import db_store as _db
+except Exception:  # pragma: no cover - SQLAlchemy absent
+    _db = None
+
+
+def _sql():
+    return _db is not None and _db.enabled()
+
 # sport nickname -> The Odds API sport_key (CLI convenience).
 _SPORT_KEYS = {
     "nba": "basketball_nba",
@@ -100,6 +114,8 @@ def _blob_base():
 
 def storage_backend():
     """Human-readable active warehouse backend."""
+    if _sql():
+        return "Azure SQL"
     return "Azure Blob" if _blob_base() else "Local warehouse/"
 
 
@@ -228,14 +244,104 @@ def manifest_name(sport, game_date):
     return f"warehouse/{sport}/{game_date}/_manifest.json"
 
 
+def _books_str(bookmakers):
+    if isinstance(bookmakers, (list, tuple)):
+        return ",".join(str(b) for b in bookmakers) or None
+    return str(bookmakers) if bookmakers else None
+
+
+def _emit_team_lines(parsed, lines):
+    """Best-across-books price per team/side (mirrors _extract_line's max)."""
+    from odds_client import american_to_implied_prob
+
+    def _implied(price):
+        try:
+            return american_to_implied_prob(int(price))
+        except (TypeError, ValueError):
+            return None
+
+    for team, offers in (parsed.get("moneyline") or {}).items():
+        prices = [o.get("price") for o in offers if o.get("price") is not None]
+        if prices:
+            best = max(prices)
+            lines.append({"bet_type": "moneyline", "selection": team,
+                          "price": best, "implied_prob": _implied(best)})
+    for market, key, pt_field in (("spread", "spreads", "spread"),
+                                  ("total", "totals", "line")):
+        for selection, offers in (parsed.get(key) or {}).items():
+            by_point = {}
+            for o in offers:
+                if o.get("price") is None:
+                    continue
+                by_point.setdefault(o.get(pt_field), []).append(o["price"])
+            for point, prices in by_point.items():
+                best = max(prices)
+                lines.append({"bet_type": market, "selection": selection,
+                              "point": point, "price": best,
+                              "implied_prob": _implied(best)})
+
+
+def _emit_prop_lines(parsed, lines):
+    """Per-player over/under consensus line (mirrors _extract_line's prop path)."""
+    from odds_client import american_to_implied_prob
+
+    def _implied(price):
+        try:
+            return american_to_implied_prob(int(price))
+        except (TypeError, ValueError):
+            return None
+
+    for prop_key, players in (parsed.get("props") or {}).items():
+        for player, info in (players or {}).items():
+            if not isinstance(info, dict):
+                continue
+            point = info.get("line")
+            for direction, price_key, imp_key in (
+                    ("OVER", "over_price", "over_implied"),
+                    ("UNDER", "under_price", "under_implied")):
+                price = info.get(price_key)
+                if price is None:
+                    continue
+                implied = info.get(imp_key)
+                # Match _extract_line: fall back to raw implied when the
+                # consensus implied is absent.
+                if implied is None:
+                    implied = _implied(price)
+                lines.append({"bet_type": "player_prop", "selection": player,
+                              "player": player, "prop_key": prop_key,
+                              "direction": direction, "point": point,
+                              "price": price, "implied_prob": implied})
+
+
+def _enumerate_lines(payload, fmt, kind):
+    """Parse-on-capture: extract every closing-line descriptor from a payload,
+    reproducing _extract_line's best-price (team) / consensus (props) logic so
+    closing_line_for is a plain SQL lookup. Best-effort; returns [] on failure."""
+    lines = []
+    try:
+        if fmt == "historical_odds_store":
+            _emit_team_lines(payload, lines)     # already parsed shape
+            _emit_prop_lines(payload, lines)
+        elif kind == "props":
+            from odds_client import parse_player_props
+            _emit_prop_lines(parse_player_props(payload), lines)
+        else:  # team (alt yields little from parse_game_odds — metadata only)
+            from odds_client import parse_game_odds
+            _emit_team_lines(parse_game_odds(payload), lines)
+    except Exception:
+        pass
+    return lines
+
+
 def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
                        captured_at=None):
     """Archive one fetched event-odds payload. Best-effort; never raises.
 
-    Eagerly PUTs the immutable snapshot (write-once, short timeout) and queues a
-    manifest entry for the next flush(). A no-op when the payload lacks an event
-    id or a commence date. ``captured_at`` overrides the timestamp (used by the
-    historical backfill so past snapshots land under their true snapshot time)."""
+    SQL backend: parse the payload into normalized snapshot + line rows
+    (write-once). Blob/local backend: eagerly PUT the immutable snapshot and
+    queue a manifest entry for the next flush(). A no-op when the payload lacks an
+    event id or a commence date. ``captured_at`` overrides the timestamp (used by
+    the historical backfill so past snapshots land under their true time)."""
     try:
         if not event_id or not isinstance(payload, dict):
             return
@@ -245,6 +351,16 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
             return
         captured_at = captured_at or _now_iso()
         kind = _kind_for_markets(markets)
+        if _sql():
+            _db.capture_odds_snapshot({
+                "sport": sport, "game_date": game_date, "event_id": event_id,
+                "kind": kind, "snapshot_hour": _hour_bucket(captured_at),
+                "captured_at": captured_at, "commence_time": commence,
+                "home": payload.get("home_team"), "away": payload.get("away_team"),
+                "regions": regions, "markets": markets,
+                "bookmakers": _books_str(bookmakers),
+            }, _enumerate_lines(payload, "the-odds-api-v4-event-odds", kind))
+            return
         name = snapshot_name(sport, game_date, event_id, kind, captured_at)
         envelope = {
             "captured_at": captured_at,
@@ -334,6 +450,8 @@ def flush():
 
 def list_snapshots(sport, game_date):
     """Manifest entries for a (sport, date). Falls back to a local dir scan."""
+    if _sql():
+        return _db.list_odds_snapshots(sport, game_date)
     status, manifest, _ = _read_json(manifest_name(sport, game_date))
     if status == "ok" and isinstance(manifest, dict):
         return list(manifest.get("snapshots", []))
@@ -464,10 +582,6 @@ def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
     (else the nearest after), and extracts the bet's price. Returns
     ``{'price','implied_prob','captured_at'}`` or None. Best-effort."""
     try:
-        snaps = [s for s in list_snapshots(sport, game_date)
-                 if s.get("event_id") == event_id]
-        if not snaps:
-            return None
         target = _parse_utc(commence_time)
 
         def _order(snap):
@@ -477,9 +591,27 @@ def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
             if target is None:
                 return (0, -captured.timestamp())
             if captured <= target:
-                return (0, -(target - captured).total_seconds())
+                # Nearest AT-OR-BEFORE commence = the closing line (smallest gap
+                # sorts first). (Was -(gap), which picked the farthest/opening
+                # snapshot — a latent CLV bug surfaced by the Phase B tests.)
+                return (0, (target - captured).total_seconds())
             return (1, (captured - target).total_seconds())
 
+        if _sql():
+            snaps = _db.odds_snapshots_for_event(sport, game_date, event_id)
+            for snap in sorted(snaps, key=_order):
+                line = _db.odds_line_lookup(
+                    snap["id"], bet_type, selection=selection, point=point,
+                    player=player, prop_key=prop_key, direction=direction)
+                if line is not None:
+                    line["captured_at"] = snap.get("captured_at")
+                    return line
+            return None
+
+        snaps = [s for s in list_snapshots(sport, game_date)
+                 if s.get("event_id") == event_id]
+        if not snaps:
+            return None
         for snap in sorted(snaps, key=_order):
             env = read_snapshot(snap.get("name"))
             if not env:
@@ -578,6 +710,17 @@ def seed_from_store(sport_key, label=""):
             "format": "historical_odds_store",
             "payload": payload,
         }
+        if _sql():
+            if _db.capture_odds_snapshot({
+                "sport": sport_key, "game_date": game_date,
+                "event_id": event_id, "kind": "seed",
+                "snapshot_hour": _hour_bucket(captured_at),
+                "captured_at": captured_at, "commence_time": commence,
+                "home": entry.get("home_team"), "away": entry.get("away_team"),
+                "regions": None, "markets": "seed", "bookmakers": None,
+            }, _enumerate_lines(payload, "historical_odds_store", "seed")):
+                written += 1
+            continue
         name = snapshot_name(sport_key, game_date, event_id, "seed", captured_at)
         if _write_json(name, envelope, if_none_match=True):
             written += 1

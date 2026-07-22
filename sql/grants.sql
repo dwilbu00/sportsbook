@@ -14,4 +14,6 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.wagers               TO StreamlitApp
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.recalibration_params TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.recalibration_folds  TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.recalibration_meta   TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.odds_snapshot        TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.odds_line            TO StreamlitApp;
 GO

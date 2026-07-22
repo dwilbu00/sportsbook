@@ -38,10 +38,10 @@ import threading
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, Index, Integer, MetaData,
     PrimaryKeyConstraint, String, Table, UniqueConstraint, create_engine,
-    delete, insert, select,
+    delete, func, insert, select,
 )
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import StaticPool
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -212,6 +212,47 @@ recalibration_meta = Table(
     Column("sport_key", String(64), primary_key=True),
     Column("fit_timestamp", String(40)),
     Column("source", String(64)),
+)
+
+# Odds warehouse (Phase B) — normalized, replaces the Blob snapshot blobs +
+# _manifest.json. One row per captured snapshot (write-once) ...
+odds_snapshot = Table(
+    "odds_snapshot", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("sport", String(64), nullable=False),
+    Column("game_date", String(10), nullable=False),
+    Column("event_id", String(128), nullable=False),
+    Column("kind", String(16), nullable=False),          # team|props|alt|seed
+    Column("snapshot_hour", String(16), nullable=False),  # YYYYMMDDTHHZ bucket
+    Column("captured_at", String(40)),
+    Column("commence_time", String(40)),
+    Column("home", String(128)),
+    Column("away", String(128)),
+    Column("regions", String(64)),
+    Column("markets", String(256)),
+    Column("bookmakers", String(256)),
+    UniqueConstraint("sport", "game_date", "event_id", "kind", "snapshot_hour",
+                     name="uq_odds_snapshot"),   # write-once per hour bucket
+    Index("ix_odds_snapshot_event", "sport", "game_date", "event_id"),
+)
+
+# ... and one row per extracted line within a snapshot. The stored price/implied
+# reproduce closing_line_for's extraction (best-across-books for team markets;
+# de-vigged consensus for props), computed at capture — so CLV lookups are a
+# plain query, not a re-parse. (Per-descriptor grain, not per-book raw.)
+odds_line = Table(
+    "odds_line", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("snapshot_id", Integer, nullable=False),
+    Column("bet_type", String(16), nullable=False),   # moneyline|spread|total|player_prop
+    Column("selection", String(160)),                 # team | Over | Under | player
+    Column("point", Float),
+    Column("player", String(160)),
+    Column("prop_key", String(64)),
+    Column("direction", String(8)),
+    Column("price", Integer),
+    Column("implied_prob", Float),
+    Index("ix_odds_line_snapshot", "snapshot_id"),
 )
 
 
@@ -533,3 +574,127 @@ def save_recal(sport_key, cfg):
             "fit_timestamp": (cfg or {}).get("fit_timestamp"),
             "source": meta.get("source"),
         })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Odds warehouse (Phase B) — snapshots + extracted lines
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ODDS_LINE_COLS = ("bet_type", "selection", "point", "player", "prop_key",
+                   "direction", "price", "implied_prob")
+
+
+def capture_odds_snapshot(meta, lines):
+    """Write-once insert of one snapshot + its extracted lines.
+
+    Returns True if a new snapshot was written, False if it already existed
+    (write-once, enforced by uq_odds_snapshot) or on a transient conflict. ``meta``
+    carries the odds_snapshot columns; ``lines`` is a list of dicts over
+    _ODDS_LINE_COLS."""
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(insert(odds_snapshot), {
+                "sport": meta.get("sport"),
+                "game_date": meta.get("game_date"),
+                "event_id": meta.get("event_id"),
+                "kind": meta.get("kind"),
+                "snapshot_hour": meta.get("snapshot_hour"),
+                "captured_at": _s(meta.get("captured_at")),
+                "commence_time": _s(meta.get("commence_time")),
+                "home": _s(meta.get("home")),
+                "away": _s(meta.get("away")),
+                "regions": _s(meta.get("regions")),
+                "markets": _s(meta.get("markets")),
+                "bookmakers": _s(meta.get("bookmakers")),
+            })
+            snapshot_id = result.inserted_primary_key[0]
+            if lines:
+                conn.execute(insert(odds_line), [{
+                    "snapshot_id": snapshot_id,
+                    "bet_type": _s(ln.get("bet_type")),
+                    "selection": _s(ln.get("selection")),
+                    "point": _f(ln.get("point")),
+                    "player": _s(ln.get("player")),
+                    "prop_key": _s(ln.get("prop_key")),
+                    "direction": _s(ln.get("direction")),
+                    "price": _i(ln.get("price")),
+                    "implied_prob": _f(ln.get("implied_prob")),
+                } for ln in lines])
+        return True
+    except IntegrityError:
+        return False  # snapshot already captured this hour (write-once)
+
+
+def odds_snapshots_for_event(sport, game_date, event_id):
+    """(id, captured_at) for an event's snapshots — caller picks nearest-commence."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(odds_snapshot.c.id, odds_snapshot.c.captured_at,
+                   odds_snapshot.c.kind)
+            .where((odds_snapshot.c.sport == sport)
+                   & (odds_snapshot.c.game_date == game_date)
+                   & (odds_snapshot.c.event_id == event_id))
+        ).all()
+    return [{"id": r[0], "captured_at": r[1], "kind": r[2]} for r in rows]
+
+
+def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
+                     player=None, prop_key=None, direction=None):
+    """The stored line for a descriptor within one snapshot, or None.
+
+    Reproduces _extract_line's matching: props key on (prop_key, player,
+    direction); team markets on (selection[, point]) with a fall back to the best
+    price across points when the exact point isn't stored."""
+    table = odds_line
+    bt = (bet_type or "").lower()
+    with get_engine().connect() as conn:
+        if bt == "player_prop":
+            row = conn.execute(
+                select(table.c.price, table.c.implied_prob).where(
+                    (table.c.snapshot_id == snapshot_id)
+                    & (table.c.bet_type == "player_prop")
+                    & (table.c.prop_key == prop_key)
+                    & (table.c.player == player)
+                    & (table.c.direction == ((direction or "OVER").upper())))
+            ).first()
+            return {"price": row[0], "implied_prob": row[1]} if row else None
+
+        norm = {"h2h": "moneyline", "moneyline": "moneyline",
+                "spreads": "spread", "spread": "spread",
+                "totals": "total", "total": "total"}.get(bt, bt)
+        sel = ("Under" if norm == "total" and (selection or "").lower() == "under"
+               else "Over" if norm == "total" else selection)
+        base = ((table.c.snapshot_id == snapshot_id)
+                & (table.c.bet_type == norm) & (table.c.selection == sel))
+        if point is not None:
+            row = conn.execute(
+                select(table.c.price, table.c.implied_prob).where(
+                    base & (func.abs(table.c.point - float(point)) < 1e-9))
+            ).first()
+            if row:
+                return {"price": row[0], "implied_prob": row[1]}
+        # No exact point (or point-less market) → best price for the selection.
+        row = conn.execute(
+            select(table.c.price, table.c.implied_prob)
+            .where(base).order_by(table.c.price.desc())
+        ).first()
+        return {"price": row[0], "implied_prob": row[1]} if row else None
+
+
+def list_odds_snapshots(sport, game_date):
+    """Snapshot metadata rows for a (sport, date) — for reporting/enumeration."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(odds_snapshot)
+            .where((odds_snapshot.c.sport == sport)
+                   & (odds_snapshot.c.game_date == game_date))
+            .order_by(odds_snapshot.c.captured_at)
+        ).all()
+    return [{
+        "event_id": r._mapping["event_id"], "kind": r._mapping["kind"],
+        "commence_time": r._mapping["commence_time"],
+        "home": r._mapping["home"], "away": r._mapping["away"],
+        "captured_at": r._mapping["captured_at"],
+        "markets": r._mapping["markets"],
+    } for r in rows]
