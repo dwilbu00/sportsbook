@@ -1501,9 +1501,14 @@ def _count_resolved_since(sport_key, since_ts):
     return n
 
 
-def maintain_sport(sport_key):
-    """Resolve pending rows and refit only when the existing gates allow it."""
-    newly_resolved = resolve_pending_outcomes(sport_key)
+def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
+    """Resolve pending rows and refit only when the existing gates allow it.
+
+    ``max_resolve`` caps successful resolutions this pass. The live-app hot path
+    keeps the default (80) to stay responsive + ESPN-polite; an offline drain
+    (forward_tracker --resolve --max-resolve N) can pass a high value to clear a
+    backlog in one run."""
+    newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
     # Gate on the last fit's timestamp from the durable store (blob-backed when
     # configured, else the local file's mtime). Using os.path.getmtime alone
     # would refit on every Cloud restart, since the ephemeral FS has no file.

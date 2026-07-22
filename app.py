@@ -889,6 +889,37 @@ def render_model_guide():
             )
         else:
             st.caption(f"Prediction log storage: {storage_backend} (shared and durable).")
+
+        # Manual full-drain of the prediction backlog. The automatic loop stays
+        # small (80/cycle, hourly) so the app stays responsive; this grades
+        # everything on demand when you fall behind. It blocks while ESPN/statsapi
+        # box scores are fetched (up to a minute or two for a large backlog; uses
+        # no odds credits), so it's opt-in. Today's unfinished games stay pending.
+        if st.button(
+            "⚖️ Resolve all pending predictions now",
+            help="Grade every past-game forecast against final box scores. The "
+                 "automatic loop only resolves 80/hour to stay fast — use this to "
+                 "catch up a backlog. May take a minute; no odds credits used.",
+        ):
+            from recalibration import maintain_sport
+            resolved_total = 0
+            with st.status("Resolving pending predictions…", expanded=True) as _drain:
+                for _sk, _sname in sport_names.items():
+                    try:
+                        _res = maintain_sport(_sk, max_resolve=5000)
+                    except Exception as _exc:  # best-effort; report + continue
+                        _drain.write(f"⚠️ {_sname}: {type(_exc).__name__}")
+                        continue
+                    _n = _res.get("newly_resolved", 0)
+                    resolved_total += _n
+                    if _n:
+                        _drain.write(f"✓ {_sname}: resolved {_n}")
+                _drain.update(
+                    label=f"Resolved {resolved_total} prediction(s).",
+                    state="complete")
+            _cached_prediction_summary.clear()
+            st.rerun()
+
         if forward["total"]:
             hit_rate = forward.get("direction_hit_rate")
             probability_brier = forward.get("probability_brier")
