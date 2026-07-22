@@ -783,6 +783,15 @@ def _main_cli():
                    help="historical_odds store label to seed from.")
     args = p.parse_args()
 
+    # Target the SQL backend when the SQL_* secrets are configured (mirrors the
+    # app's boot promotion; outside Streamlit they aren't in the env yet). Falls
+    # back to Blob/local when SQL isn't configured or db_store is unavailable.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
+
     sport_key = _SPORT_KEYS[args.sport]
     dates = [d.strip() for d in args.dates.split(",") if d.strip()]
 
