@@ -472,6 +472,32 @@ class PersistClvTests(unittest.TestCase):
             self.assertIsNone(wagers.read_wagers()[0]["close_price"])
 
 
+class ResetClvTests(unittest.TestCase):
+    def test_reset_clears_clv_fields_and_is_idempotent(self):
+        with _LocalLedger():
+            wagers.submit_wagers([{
+                "wager_id": "w1", "status": "won", "stake": 10.0,
+                "close_price": -105, "close_line": 9.5, "clv_pct": 3.2}])
+            self.assertEqual(wagers.reset_clv(), 1)
+            row = wagers.read_wagers()[0]
+            self.assertIsNone(row["close_price"])
+            self.assertIsNone(row["close_line"])
+            self.assertIsNone(row["clv_pct"])
+            self.assertEqual(wagers.reset_clv(), 0)  # nothing left to clear
+
+    def test_reset_limited_to_ids(self):
+        with _LocalLedger():
+            wagers.submit_wagers([
+                {"wager_id": "a", "status": "won", "close_price": -110,
+                 "clv_pct": 1.0},
+                {"wager_id": "b", "status": "won", "close_price": -120,
+                 "clv_pct": 2.0}])
+            self.assertEqual(wagers.reset_clv(["a"]), 1)
+            rows = {r["wager_id"]: r for r in wagers.read_wagers()}
+            self.assertIsNone(rows["a"]["close_price"])
+            self.assertEqual(rows["b"]["close_price"], -120)
+
+
 class SummaryTests(unittest.TestCase):
     def test_stake_weighted_roi(self):
         rows = [

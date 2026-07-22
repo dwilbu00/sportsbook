@@ -554,6 +554,33 @@ def persist_clv(rows=None, now=None):
         return 0
 
 
+def reset_clv(wager_ids=None):
+    """Clear close_price/close_line/clv_pct so persist_clv recomputes them.
+
+    Use after a closing-line correction (e.g. the _order bugfix that had CLV
+    computed against the opening snapshot): persist_clv only fills rows whose
+    close_price IS NULL, so already-filled (stale) values must be cleared first.
+    Limited to ``wager_ids`` when given, else every row that has a CLV value.
+    Returns the count cleared. Raises on a storage failure so callers can surface
+    it."""
+    ids = {wid for wid in (wager_ids or []) if wid} or None
+
+    def clear(rows):
+        changed = 0
+        for row in rows:
+            if ids is not None and row.get("wager_id") not in ids:
+                continue
+            if row.get("close_price") is None and row.get("clv_pct") is None:
+                continue
+            row["close_price"] = None
+            row["close_line"] = None
+            row["clv_pct"] = None
+            changed += 1
+        return changed
+
+    return recalibration.mutate_ndjson_log(WAGERS_FILE, clear)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Summary (stake-weighted realized ROI)
 # ──────────────────────────────────────────────────────────────────────────────
