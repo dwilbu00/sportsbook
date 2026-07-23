@@ -34,6 +34,7 @@ from espn_client import (
     get_athlete_gamelog,
     search_athlete,
     get_team_pace_factor,
+    ip_to_outs,
     PROP_STAT_MAP,
 )
 # Re-export ESPN cache helpers (now live in espn_cache.py) so existing
@@ -1186,9 +1187,7 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
         if not d or val is None:
             continue
         if prop_key == "pitcher_outs":
-            whole = int(val)
-            frac = round((val - whole) * 10)
-            val = whole * 3 + frac
+            val = ip_to_outs(val)   # IP notation -> outs
         out.append((d, float(val)))
     out.sort(key=lambda x: x[0])
     return out
@@ -2119,6 +2118,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 actual = test_game.get(stat_label)
                 if actual is None:
                     continue
+                if prop_key == "pitcher_outs":
+                    actual = ip_to_outs(actual)   # IP notation -> outs
                 prior_games = gamelog[i + 1:]
                 test_date = test_game.get("game_date")
 
@@ -2159,6 +2160,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     continue
 
                 prior_values = [g.get(stat_label, 0.0) for g in prior_games]
+                if prop_key == "pitcher_outs":
+                    prior_values = [ip_to_outs(v) for v in prior_values]
                 prior_minutes = [g.get("MIN", 0.0) for g in prior_games]
                 prior_home_aways = [g.get("is_home") for g in prior_games]
                 prior_opponents = [g.get("opponent") for g in prior_games]

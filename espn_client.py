@@ -796,6 +796,37 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
     return games
 
 
+def ip_to_outs(ip):
+    """Convert baseball innings-pitched notation to a raw out count.
+
+    IP is recorded so the fractional digit counts OUTS, not tenths: X.1 = X
+    innings + 1 out, X.2 = X + 2 outs (X.0 = X exactly). So 6.1 IP = 19 outs.
+    ``pitcher_outs`` is the ONLY prop whose ESPN stat label ('IP') needs this
+    conversion; every read of that label for pitcher_outs must pass through here
+    before any arithmetic (average / compare / grade) or the thirds get treated
+    as decimals. Returns None for None; assumes valid .0/.1/.2 notation."""
+    if ip is None:
+        return None
+    whole = int(ip)
+    frac = round((ip - whole) * 10)
+    return whole * 3 + frac
+
+
+def outs_to_ip(outs):
+    """Inverse of ip_to_outs: an out count -> IP notation (X.0/.1/.2).
+
+    Used to synthesize per-game IP estimates (get_pitcher_stats) that downstream
+    code converts back via ip_to_outs — so the average must be taken in OUT space
+    and re-encoded here, never divided as a decimal. Rounds a fractional out
+    count to the nearest whole out."""
+    if outs is None:
+        return None
+    total = int(round(outs))
+    whole = total // 3
+    rem = total - whole * 3
+    return whole + rem / 10.0
+
+
 def get_pitcher_stats(league, athlete_id, season=None):
     """
     Fetch pitcher stats from ESPN splits endpoint.
@@ -855,6 +886,13 @@ def get_pitcher_stats(league, athlete_id, season=None):
                                 game_row[key] = val  # rates stay as-is
                             elif key == "GP":
                                 game_row[key] = 1
+                            elif key == "IP":
+                                # IP is base-3 notation: average in OUT space,
+                                # then re-encode so the downstream ip_to_outs
+                                # converter reads it correctly (dividing the
+                                # notation as a decimal scrambles the outs).
+                                game_row[key] = (outs_to_ip(ip_to_outs(val) / gp)
+                                                 if gp > 0 else val)
                             else:
                                 game_row[key] = round(val / gp, 1) if gp > 0 else val
                         games.append(game_row)
@@ -871,6 +909,10 @@ def get_pitcher_stats(league, athlete_id, season=None):
                     game_row[key] = val
                 elif key in ("GP", "GS"):
                     game_row[key] = 1
+                elif key == "IP":
+                    # Average IP in OUT space, then re-encode (see the per-
+                    # opponent branch above).
+                    game_row[key] = outs_to_ip(ip_to_outs(val) / gs)
                 else:
                     game_row[key] = round(val / gs, 1)
             games.append(game_row)
@@ -1023,11 +1065,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     for game in gamelog[:n]:
         val = game.get(matched_label, 0.0)
         if prop_key == "pitcher_outs":
-            # Convert innings pitched to outs (IP like 6.1 means 6 innings + 1 out = 19 outs)
-            # ESPN stores IP as decimal where .1 = 1/3, .2 = 2/3
-            whole = int(val)
-            frac = round((val - whole) * 10)
-            val = whole * 3 + frac
+            # IP (e.g. 6.1 = 6 innings + 1 out) -> outs; see ip_to_outs.
+            val = ip_to_outs(val)
         values.append(val)
         opponents.append(game.get("opponent"))
         home_aways.append(game.get("is_home"))

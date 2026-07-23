@@ -939,6 +939,13 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
         if not _espn_row_final(gamelog[idx]):
             return None
         actual = gamelog[idx].get(stat_label)
+        # ESPN reports pitcher_outs as IP notation (6.1 = 6 innings + 1 out = 19
+        # outs). The statsapi hard-ID path above already returns true outs, so
+        # convert ONLY on this ESPN-fallback branch — else a bet would grade a
+        # raw 6.1 against an outs line (~18.5) and always resolve UNDER.
+        if prop_key == "pitcher_outs" and actual is not None:
+            import espn_client
+            actual = espn_client.ip_to_outs(actual)
     if actual is None:
         return None
     try:

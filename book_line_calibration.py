@@ -37,7 +37,7 @@ from backtest import (
     _team_defense_lookup, _resolve_opp_pts_allowed,
     _per_player_stats, _shrunk,
 )
-from espn_client import PROP_STAT_MAP
+from espn_client import PROP_STAT_MAP, ip_to_outs
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -253,6 +253,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
             if actual is None:
                 skipped_no_game += 1
                 continue
+            if stat_label == "IP":       # pitcher_outs: IP notation -> outs
+                actual = ip_to_outs(actual)
             min_played = test_game.get("MIN", 0.0) or 0.0
             if min_played and min_played < 10.0:
                 skipped_no_game += 1
@@ -295,6 +297,8 @@ def project_and_empirical(obs, params, sport_key,
     test_game = obs["test_game"]
 
     prior_values = [g.get(stat_label, 0.0) for g in prior_games]
+    if stat_label == "IP":               # pitcher_outs: IP notation -> outs
+        prior_values = [ip_to_outs(v) for v in prior_values]
     prior_minutes = [g.get("MIN", 0.0) for g in prior_games]
     prior_home_aways = [g.get("is_home") for g in prior_games]
     prior_opponents = [g.get("opponent") for g in prior_games]
@@ -684,6 +688,8 @@ def simulate_safe_mode(obs, params, sport_key, safe_target,
     actual = obs["actual"]
 
     prior_values = [g.get(stat_label, 0.0) for g in prior_games]
+    if stat_label == "IP":               # pitcher_outs: IP notation -> outs
+        prior_values = [ip_to_outs(v) for v in prior_values]
     prior_minutes = [g.get("MIN", 0.0) for g in prior_games]
     prior_home_aways = [g.get("is_home") for g in prior_games]
     prior_opponents = [g.get("opponent") for g in prior_games]
