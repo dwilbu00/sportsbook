@@ -15,6 +15,18 @@ import time
 
 from espn_client import get_athlete_gamelog, search_athlete
 
+# Optional SQL backend (Phase C durable gamelog store). Guarded so a missing
+# SQLAlchemy install simply leaves SQL disabled and the file cache is used.
+try:
+    import db_store
+except Exception:  # pragma: no cover - import guard
+    db_store = None
+
+
+def _sql():
+    return db_store is not None and db_store.enabled()
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(SCRIPT_DIR, "cache", "backtest")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -54,16 +66,38 @@ def _is_fresh(path, ttl_hours):
     return age < ttl_hours * 3600
 
 
-def cached_athlete_id(espn_sport, espn_league, player_name, ttl_hours=24 * 30):
-    """Cached athlete ID lookup (player names rarely change)."""
-    path = _cache_key("athlete_id", espn_sport, espn_league, player_name.lower())
+def cached_athlete_id(espn_sport, espn_league, player_name, ttl_hours=24 * 30,
+                      team_ids=None):
+    """Cached athlete ID lookup (player names rarely change).
+
+    ``team_ids`` (the matchup's ESPN team ids) disambiguates same-name players;
+    it is forwarded to search_athlete and folded into the cache key so different
+    teams don't collide.
+    """
+    if _sql():
+        import gamelog_store
+        athlete = gamelog_store.get_athlete_id(
+            espn_sport, espn_league, player_name, team_ids=team_ids,
+            ttl_hours=ttl_hours)
+        return athlete["id"] if athlete else None
+    # Default (no team_ids) keeps the legacy 4-part key so existing caches +
+    # seed_athlete_id stay valid; a provided team_ids extends the key so
+    # different-team same-name players don't collide.
+    if team_ids:
+        team_key = "|".join(sorted(str(t) for t in team_ids if t))
+        path = _cache_key("athlete_id", espn_sport, espn_league,
+                          player_name.lower(), team_key)
+    else:
+        path = _cache_key("athlete_id", espn_sport, espn_league,
+                          player_name.lower())
     cached = _read_cache_file(path)
     if cached is not None:
         aid = cached.get("id")
         # A missing id is trusted only for the short negative TTL.
         if _is_fresh(path, ttl_hours if aid else NEGATIVE_TTL_HOURS):
             return aid
-    athlete = search_athlete(espn_sport, espn_league, player_name)
+    athlete = search_athlete(espn_sport, espn_league, player_name,
+                             team_ids=team_ids)
     aid = athlete["id"] if athlete else None
     with open(path, "w") as f:
         json.dump({"id": aid}, f)
@@ -100,6 +134,11 @@ def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
 
     Set ODI_GAMELOG_TTL_HOURS env var to override (e.g., "8760" for a year).
     """
+    if _sql():
+        import gamelog_store
+        return gamelog_store.get_gamelog(
+            espn_sport, espn_league, athlete_id, season_year=season_year,
+            ttl_hours=ttl_hours)
     env_ttl = os.environ.get("ODI_GAMELOG_TTL_HOURS")
     if env_ttl:
         try:

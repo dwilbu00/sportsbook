@@ -194,3 +194,119 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.odds_line'))
 CREATE INDEX ix_odds_line_snapshot ON dbo.odds_line (snapshot_id);
 GO
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Durable rolling ESPN gamelog store (Phase C). Replaces the ephemeral file
+-- cache (cache/backtest/*.json) so completed games survive Cloud restarts.
+-- Per-sport dense fact tables: columns = ONLY the stats the app reads, so a read
+-- reconstructs the exact get_athlete_gamelog dict shape. Mirrors gamelog_store.py
+-- (test_gamelog_store.py::SchemaParityTests enforces it). MLB + NBA only; NFL and
+-- other sports pass through to direct ESPN with no persistence. season_bucket 0 =
+-- current/None season; a specific past year is its own immutable bucket.
+-- game_date is the FULL ISO timestamp (its time component disambiguates
+-- doubleheaders). Refresh is DELETE+INSERT per (athlete, season_bucket).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+--------------------------------------------------------------- mlb_batter_gamelog
+IF OBJECT_ID('dbo.mlb_batter_gamelog', 'U') IS NULL
+CREATE TABLE dbo.mlb_batter_gamelog (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,
+    season_bucket INT NOT NULL,                     -- 0 = current/None season
+    game_key      NVARCHAR(220),                    -- synthetic (not unique)
+    game_date     NVARCHAR(40),                     -- FULL ISO timestamp
+    opponent      NVARCHAR(160),
+    is_home       BIT,
+    team_id       NVARCHAR(32),
+    completed     BIT,
+    [AB]  FLOAT, [H]   FLOAT, [SO]  FLOAT, [BB] FLOAT,
+    [HBP] FLOAT, [SF]  FLOAT, [SH]  FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_batter_gamelog_athlete'
+                 AND object_id = OBJECT_ID('dbo.mlb_batter_gamelog'))
+CREATE INDEX ix_mlb_batter_gamelog_athlete
+    ON dbo.mlb_batter_gamelog (athlete_id, season_bucket);
+GO
+
+-------------------------------------------------------------- mlb_pitcher_gamelog
+IF OBJECT_ID('dbo.mlb_pitcher_gamelog', 'U') IS NULL
+CREATE TABLE dbo.mlb_pitcher_gamelog (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,
+    season_bucket INT NOT NULL,
+    game_key      NVARCHAR(220),
+    game_date     NVARCHAR(40),
+    opponent      NVARCHAR(160),
+    is_home       BIT,
+    team_id       NVARCHAR(32),
+    completed     BIT,
+    [IP] FLOAT, [K] FLOAT, [ER] FLOAT               -- IP raw (outs derived at runtime)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_pitcher_gamelog_athlete'
+                 AND object_id = OBJECT_ID('dbo.mlb_pitcher_gamelog'))
+CREATE INDEX ix_mlb_pitcher_gamelog_athlete
+    ON dbo.mlb_pitcher_gamelog (athlete_id, season_bucket);
+GO
+
+--------------------------------------------------------------------- nba_gamelog
+IF OBJECT_ID('dbo.nba_gamelog', 'U') IS NULL
+CREATE TABLE dbo.nba_gamelog (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,
+    season_bucket INT NOT NULL,
+    game_key      NVARCHAR(220),
+    game_date     NVARCHAR(40),
+    opponent      NVARCHAR(160),
+    is_home       BIT,
+    team_id       NVARCHAR(32),
+    completed     BIT,
+    [MIN] FLOAT, [PTS] FLOAT, [REB] FLOAT, [AST] FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_gamelog_athlete'
+                 AND object_id = OBJECT_ID('dbo.nba_gamelog'))
+CREATE INDEX ix_nba_gamelog_athlete
+    ON dbo.nba_gamelog (athlete_id, season_bucket);
+GO
+
+--------------------------------------------------------------- gamelog_fetch_meta
+-- TTL gate + which fact table an athlete lives in (player_type).
+IF OBJECT_ID('dbo.gamelog_fetch_meta', 'U') IS NULL
+CREATE TABLE dbo.gamelog_fetch_meta (
+    id              INT IDENTITY(1,1) PRIMARY KEY,
+    sport           NVARCHAR(32) NOT NULL,
+    league          NVARCHAR(32) NOT NULL,
+    athlete_id      NVARCHAR(32) NOT NULL,
+    season_bucket   INT NOT NULL,
+    player_type     NVARCHAR(16),                   -- batter|pitcher|nba
+    last_fetched_at FLOAT,                           -- epoch seconds
+    game_count      INT,
+    CONSTRAINT uq_gamelog_fetch_meta
+        UNIQUE (sport, league, athlete_id, season_bucket)
+);
+GO
+
+---------------------------------------------------------------- athlete_id_cache
+-- Durable name->id (replaces the file cached_athlete_id); stores team_id so the
+-- get_player_stat_history reroute keeps athlete.team_id. team_key = sorted
+-- team_ids (or '') to preserve same-name disambiguation.
+IF OBJECT_ID('dbo.athlete_id_cache', 'U') IS NULL
+CREATE TABLE dbo.athlete_id_cache (
+    id                INT IDENTITY(1,1) PRIMARY KEY,
+    sport             NVARCHAR(32) NOT NULL,
+    league            NVARCHAR(32) NOT NULL,
+    player_name_lower NVARCHAR(160) NOT NULL,
+    team_key          NVARCHAR(64) NOT NULL,
+    athlete_id        NVARCHAR(32),                  -- NULL = not found
+    name              NVARCHAR(160),
+    team_id           NVARCHAR(32),
+    fetched_at        FLOAT,
+    CONSTRAINT uq_athlete_id_cache
+        UNIQUE (sport, league, player_name_lower, team_key)
+);
+GO

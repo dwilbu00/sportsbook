@@ -16,4 +16,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.recalibration_folds  TO StreamlitApp
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.recalibration_meta   TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.odds_snapshot        TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.odds_line            TO StreamlitApp;
+-- Phase C: rolling ESPN gamelog store (replace-all refresh needs DELETE).
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.mlb_batter_gamelog   TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.mlb_pitcher_gamelog  TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.nba_gamelog          TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.gamelog_fetch_meta   TO StreamlitApp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.athlete_id_cache     TO StreamlitApp;
 GO

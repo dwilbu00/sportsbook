@@ -8,6 +8,15 @@ import sys
 import requests
 from datetime import datetime, timedelta
 
+# Optional SQL backend (Phase C durable gamelog store). Guarded so a missing
+# SQLAlchemy install just leaves SQL disabled and the direct-fetch path is used.
+# gamelog_store is imported LAZILY inside get_player_stat_history to avoid an
+# import cycle (gamelog_store imports espn_client).
+try:
+    import db_store
+except Exception:  # pragma: no cover - import guard
+    db_store = None
+
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports"
 STANDINGS_API = "https://site.api.espn.com/apis/v2/sports"
@@ -950,24 +959,41 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         "found": False,
     }
 
-    athlete = search_athlete(sport, league, player_name, team_ids=team_ids)
-    if not athlete or not athlete["id"]:
-        return result
+    # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact
+    # extraction/return below is reused (identical result-dict shape). Gated on a
+    # sport that has a fact table; other sports (NFL) keep the direct path
+    # unchanged. gamelog_store.get_gamelog handles the MLB pitcher fallback.
+    use_sql = (db_store is not None and db_store.enabled()
+               and sport in ("baseball", "basketball"))
+    if use_sql:
+        import gamelog_store
+        athlete = gamelog_store.get_athlete_id(sport, league, player_name,
+                                               team_ids=team_ids)
+        if not athlete or not athlete["id"]:
+            return result
+        result["athlete_id"] = athlete["id"]
+        result["team_id"] = athlete.get("team_id")
+        gamelog = gamelog_store.get_gamelog(sport, league, athlete["id"])
+        if not gamelog:
+            return result
+    else:
+        athlete = search_athlete(sport, league, player_name, team_ids=team_ids)
+        if not athlete or not athlete["id"]:
+            return result
 
-    result["athlete_id"] = athlete["id"]
-    result["team_id"] = athlete.get("team_id")
+        result["athlete_id"] = athlete["id"]
+        result["team_id"] = athlete.get("team_id")
 
-    gamelog = get_athlete_gamelog(sport, league, athlete["id"])
+        gamelog = get_athlete_gamelog(sport, league, athlete["id"])
 
-    # For MLB pitchers, the gamelog endpoint returns empty.
-    # Fall back to the splits-based pitcher stats.
-    is_pitcher_prop = prop_key in ("pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs")
-    if not gamelog and sport == "baseball":
-        gamelog = get_pitcher_stats(league, athlete["id"])
-        # Also try for batter props if gamelog was empty (unlikely but safe)
+        # For MLB pitchers, the gamelog endpoint returns empty.
+        # Fall back to the splits-based pitcher stats.
+        if not gamelog and sport == "baseball":
+            gamelog = get_pitcher_stats(league, athlete["id"])
+            # Also try for batter props if gamelog was empty (unlikely but safe)
 
-    if not gamelog:
-        return result
+        if not gamelog:
+            return result
 
     # Find the matching stat label
     stat_labels = PROP_STAT_MAP.get(prop_key, [])

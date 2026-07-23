@@ -1,0 +1,336 @@
+"""Tests for the durable rolling ESPN gamelog store (gamelog_store, Phase C),
+exercised against in-memory SQLite so pymssql and the live Azure DB are never
+touched. Mirrors test_db_store.py::_SqliteBackend: the SQL backend is enabled via
+configure_engine (tests never set SQL_* env), and tearDown clears the override.
+"""
+
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+import db_store
+import gamelog_store
+import espn_client
+
+
+def _batter_row(game_date, opp="Yankees", home=True, team="10",
+                completed=True, h=2.0, so=1.0, ab=4.0):
+    """A realistic ESPN batter gamelog row (extra keys the app ignores)."""
+    return {"AB": ab, "R": 1.0, "H": h, "2B": 1.0, "3B": 0.0, "HR": 0.0,
+            "RBI": 1.0, "BB": 1.0, "HBP": 0.0, "SO": so, "SB": 0.0, "CS": 0.0,
+            "AVG": .3, "OBP": .4, "SLG": .5, "OPS": .9,
+            "opponent": opp, "is_home": home, "team_id": team,
+            "game_date": game_date, "completed": completed}
+
+
+def _pitcher_row(game_date, ip=6.1, k=7.0, er=2.0, completed=True):
+    return {"IP": ip, "H": 5.0, "R": 2.0, "ER": er, "HR": 0.0, "BB": 1.0,
+            "K": k, "GB": 3.0, "FB": 7.0, "P": 90.0, "TBF": 24.0, "ERA": 3.0,
+            "opponent": "Angels", "is_home": False, "team_id": "6",
+            "game_date": game_date, "completed": completed}
+
+
+def _nba_row(game_date, pts=25.0, reb=8.0, ast=6.0, minutes=34.0):
+    return {"MIN": minutes, "FG": 9.0, "3PT": 3.0, "FT": 4.0, "REB": reb,
+            "AST": ast, "BLK": 1.0, "STL": 2.0, "PF": 3.0, "TO": 2.0,
+            "PTS": pts, "opponent": "Celtics", "is_home": True, "team_id": "2",
+            "game_date": game_date, "completed": True}
+
+
+class _Backend:
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        gamelog_store.create_all()
+        gamelog_store._KEY_LOCKS.clear()
+
+    def tearDown(self):
+        db_store.configure_engine(None)   # → enabled() False (no SQL_* env)
+        gamelog_store._KEY_LOCKS.clear()
+
+
+class RoundTripTests(_Backend, unittest.TestCase):
+
+    def test_batter_roundtrip_reduced_shape(self):
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00"),
+                _batter_row("2026-07-19T18:00:00.000+00:00", h=0.0)]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            first = gamelog_store.get_gamelog("baseball", "mlb", "99")
+            self.assertEqual(len(first), 2)          # fetch path returns raw rows
+        # Second call is fresh → reconstructed reduced shape, no ESPN call.
+        with patch.object(espn_client, "get_athlete_gamelog") as mock:
+            served = gamelog_store.get_gamelog("baseball", "mlb", "99")
+            mock.assert_not_called()
+        self.assertEqual(len(served), 2)
+        g0 = served[0]
+        # Only consumer-read keys survive; PA is derived downstream, not stored.
+        self.assertEqual(set(g0),
+                         {"AB", "H", "SO", "BB", "HBP", "opponent", "is_home",
+                          "team_id", "game_date", "completed"})
+        self.assertEqual(g0["H"], 2.0)
+        self.assertEqual(g0["game_date"], "2026-07-20T18:00:00.000+00:00")
+        self.assertTrue(g0["is_home"])
+        self.assertTrue(g0["completed"])
+        # Insertion order preserved (recent-first as ESPN returns).
+        self.assertEqual(served[1]["H"], 0.0)
+
+    def test_pitcher_roundtrip_and_ip_preserved(self):
+        rows = [_pitcher_row("2026-07-19T20:07:00.000+00:00", ip=6.1, k=7.0)]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            gamelog_store.get_gamelog("baseball", "mlb", "42")
+        with patch.object(espn_client, "get_athlete_gamelog") as mock:
+            served = gamelog_store.get_gamelog("baseball", "mlb", "42")
+            mock.assert_not_called()
+        self.assertEqual(set(served[0]),
+                         {"IP", "K", "ER", "opponent", "is_home", "team_id",
+                          "game_date", "completed"})
+        self.assertEqual(served[0]["IP"], 6.1)   # raw, not converted to outs
+
+    def test_nba_roundtrip(self):
+        rows = [_nba_row("2026-01-15T00:00:00.000+00:00")]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            gamelog_store.get_gamelog("basketball", "nba", "7")
+        with patch.object(espn_client, "get_athlete_gamelog") as mock:
+            served = gamelog_store.get_gamelog("basketball", "nba", "7")
+            mock.assert_not_called()
+        self.assertEqual(set(served[0]),
+                         {"MIN", "PTS", "REB", "AST", "opponent", "is_home",
+                          "team_id", "game_date", "completed"})
+        self.assertEqual(served[0]["PTS"], 25.0)
+
+
+class TtlGateTests(_Backend, unittest.TestCase):
+
+    def test_fresh_meta_serves_from_sql(self):
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00")]
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=rows) as mock:
+            gamelog_store.get_gamelog("baseball", "mlb", "1")
+            gamelog_store.get_gamelog("baseball", "mlb", "1")
+            self.assertEqual(mock.call_count, 1)   # 2nd served from SQL
+
+    def test_stale_ttl_triggers_refetch(self):
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00")]
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=rows) as mock:
+            gamelog_store.get_gamelog("baseball", "mlb", "1")
+            gamelog_store.get_gamelog("baseball", "mlb", "1", ttl_hours=0)
+            self.assertEqual(mock.call_count, 2)
+
+    def test_empty_fetch_keeps_negative_ttl(self):
+        # Empty baseball gamelog also exercises the (dormant) pitcher-splits
+        # fallback → patch it too so the test stays hermetic.
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=[]) as gl, \
+             patch.object(espn_client, "get_pitcher_stats", return_value=[]):
+            out = gamelog_store.get_gamelog("baseball", "mlb", "5")
+            self.assertEqual(out, [])
+            # Second call within the negative TTL serves [] from the fast path
+            # (player_type is None on a not-found meta) without a re-fetch/crash.
+            out2 = gamelog_store.get_gamelog("baseball", "mlb", "5")
+            self.assertEqual(out2, [])
+            self.assertEqual(gl.call_count, 1)
+        # A not-found row exists with game_count 0 so the negative TTL governs.
+        with db_store.get_engine().connect() as conn:
+            meta = gamelog_store._read_meta(conn, "baseball", "mlb", "5", 0)
+        self.assertEqual(meta["game_count"], 0)
+
+
+class ClobberGuardTests(_Backend, unittest.TestCase):
+
+    def _store(self, aid, rows):
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            gamelog_store.get_gamelog("baseball", "mlb", aid, ttl_hours=0)
+
+    def _count(self, aid):
+        with patch.object(espn_client, "get_athlete_gamelog") as mock:
+            served = gamelog_store.get_gamelog("baseball", "mlb", aid)
+            if mock.called:            # meta may be negative-TTL → refetch guard
+                pass
+        return len(served)
+
+    def test_partial_same_season_rejected(self):
+        full = [_batter_row(f"2026-07-{10+i:02d}T18:00:00.000+00:00")
+                for i in range(5)]
+        self._store("77", full)
+        partial = [_batter_row("2026-07-14T18:00:00.000+00:00")]
+        self._store("77", partial)             # fewer completed, same season
+        with db_store.get_engine().connect() as conn:
+            kept = gamelog_store._read_rows(conn, "batter", "77", 0)
+        self.assertEqual(len(kept), 5)         # durable log preserved
+
+    def test_rollover_replaces(self):
+        old = [_batter_row(f"2026-07-{10+i:02d}T18:00:00.000+00:00")
+               for i in range(5)]
+        self._store("88", old)
+        new = [_batter_row(f"2027-04-{10+i:02d}T18:00:00.000+00:00")
+               for i in range(2)]
+        self._store("88", new)                 # different season → replace
+        with db_store.get_engine().connect() as conn:
+            kept = gamelog_store._read_rows(conn, "batter", "88", 0)
+        self.assertEqual(len(kept), 2)
+        self.assertTrue(kept[0]["game_date"].startswith("2027"))
+
+
+class ClassificationTests(_Backend, unittest.TestCase):
+
+    def _player_type(self, aid):
+        with db_store.get_engine().connect() as conn:
+            meta = gamelog_store._read_meta(conn, "baseball", "mlb", aid, 0)
+        return meta["player_type"] if meta else None
+
+    def test_pitcher_classified_by_ip(self):
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=[_pitcher_row("2026-07-19T20:00:00Z")]):
+            gamelog_store.get_gamelog("baseball", "mlb", "p1")
+        self.assertEqual(self._player_type("p1"), "pitcher")
+
+    def test_batter_classified_by_ab(self):
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=[_batter_row("2026-07-19T18:00:00Z")]):
+            gamelog_store.get_gamelog("baseball", "mlb", "b1")
+        self.assertEqual(self._player_type("b1"), "batter")
+
+    def test_pitcher_fallback_marks_pitcher(self):
+        # Empty gamelog → the (dormant) splits fallback → pitcher.
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=[]), \
+             patch.object(espn_client, "get_pitcher_stats",
+                          return_value=[{"IP": 5.0, "K": 6.0, "ER": 3.0}]):
+            gamelog_store.get_gamelog("baseball", "mlb", "p2")
+        self.assertEqual(self._player_type("p2"), "pitcher")
+
+    def test_unknown_sport_passthrough_no_persist(self):
+        rows = [{"YDS": 88.0, "TD": 1.0, "opponent": "Bears", "is_home": True,
+                 "team_id": "3", "game_date": "2026-09-14T18:00:00Z"}]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            out = gamelog_store.get_gamelog("football", "nfl", "n1")
+        self.assertEqual(out, rows)            # passthrough returns raw
+        # Nothing persisted for an unclassifiable sport.
+        with db_store.get_engine().connect() as conn:
+            meta = gamelog_store._read_meta(conn, "football", "nfl", "n1", 0)
+        self.assertIsNone(meta)
+
+
+class AthleteIdCacheTests(_Backend, unittest.TestCase):
+
+    def test_lookup_caches_and_disambiguates_by_team(self):
+        athlete = {"id": "123", "name": "Will Smith", "team_id": "5"}
+        with patch.object(espn_client, "search_athlete",
+                          return_value=athlete) as mock:
+            a1 = gamelog_store.get_athlete_id("baseball", "mlb", "Will Smith")
+            a2 = gamelog_store.get_athlete_id("baseball", "mlb", "Will Smith")
+            self.assertEqual(mock.call_count, 1)          # 2nd from cache
+        self.assertEqual(a1["id"], "123")
+        self.assertEqual(a1["team_id"], "5")
+        self.assertEqual(a2["id"], "123")
+        # A different matchup (team_ids) is a distinct cache key → new lookup.
+        other = {"id": "456", "name": "Will Smith", "team_id": "9"}
+        with patch.object(espn_client, "search_athlete",
+                          return_value=other) as mock:
+            a3 = gamelog_store.get_athlete_id("baseball", "mlb", "Will Smith",
+                                              team_ids=[9])
+            self.assertEqual(mock.call_count, 1)
+        self.assertEqual(a3["id"], "456")
+
+    def test_not_found_returns_none(self):
+        with patch.object(espn_client, "search_athlete", return_value=None):
+            self.assertIsNone(
+                gamelog_store.get_athlete_id("baseball", "mlb", "Nobody"))
+
+
+class ConcurrencyTests(_Backend, unittest.TestCase):
+
+    def test_same_athlete_fetched_once(self):
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00")]
+        calls = []
+
+        def slow(*a, **k):
+            calls.append(1)
+            time.sleep(0.05)
+            return rows
+
+        barrier = threading.Barrier(2)
+        results = []
+
+        def worker():
+            barrier.wait()
+            results.append(gamelog_store.get_gamelog("baseball", "mlb", "z1"))
+
+        with patch.object(espn_client, "get_athlete_gamelog", side_effect=slow):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(calls), 1)         # per-key lock → one fetch
+        self.assertEqual(len(results), 2)
+        # No duplicate rows from a double insert.
+        with db_store.get_engine().connect() as conn:
+            stored = gamelog_store._read_rows(conn, "batter", "z1", 0)
+        self.assertEqual(len(stored), 1)
+
+
+class DispatchTests(_Backend, unittest.TestCase):
+
+    def test_cached_gamelog_routes_to_sql(self):
+        import espn_cache
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00")]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            espn_cache.cached_gamelog("baseball", "mlb", "d1")
+        with db_store.get_engine().connect() as conn:
+            meta = gamelog_store._read_meta(conn, "baseball", "mlb", "d1", 0)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["player_type"], "batter")
+
+    def test_get_player_stat_history_routes_to_sql(self):
+        rows = [_batter_row("2026-07-20T18:00:00.000+00:00", h=2.0),
+                _batter_row("2026-07-19T18:00:00.000+00:00", h=1.0)]
+        athlete = {"id": "555", "name": "Slugger", "team_id": "10"}
+        with patch.object(espn_client, "search_athlete", return_value=athlete), \
+             patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=rows) as gl:
+            hist = espn_client.get_player_stat_history(
+                "baseball", "mlb", "Slugger", "batter_hits", n=20)
+            # Second call serves from SQL (no second ESPN gamelog fetch).
+            espn_client.get_player_stat_history(
+                "baseball", "mlb", "Slugger", "batter_hits", n=20)
+            self.assertEqual(gl.call_count, 1)
+        self.assertTrue(hist["found"])
+        self.assertEqual(hist["values"], [2.0, 1.0])
+        self.assertEqual(hist["team_id"], "10")
+
+
+class SchemaParityTests(_Backend, unittest.TestCase):
+    """Guard the fact-table + bookkeeping columns against drift (sql/schema.sql
+    mirrors these for the hand-run Azure DDL)."""
+
+    def test_batter_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.mlb_batter_gamelog.columns},
+            set(gamelog_store._FACT_META_COLS) | set(gamelog_store._BATTER_STATS))
+
+    def test_pitcher_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.mlb_pitcher_gamelog.columns},
+            set(gamelog_store._FACT_META_COLS) | set(gamelog_store._PITCHER_STATS))
+
+    def test_nba_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.nba_gamelog.columns},
+            set(gamelog_store._FACT_META_COLS) | set(gamelog_store._NBA_STATS))
+
+    def test_meta_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.gamelog_fetch_meta.columns},
+            {"id", "sport", "league", "athlete_id", "season_bucket",
+             "player_type", "last_fetched_at", "game_count"})
+
+    def test_athlete_id_cache_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.athlete_id_cache.columns},
+            {"id", "sport", "league", "player_name_lower", "team_key",
+             "athlete_id", "name", "team_id", "fetched_at"})
+
+
+if __name__ == "__main__":
+    unittest.main()
