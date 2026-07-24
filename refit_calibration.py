@@ -116,24 +116,43 @@ def _nba_player_pool(season, max_players=150, min_games=15):
 
 def _parse_variant_name(name):
     """
-    Parse a sweep variant key like 'hl15/defadj1.0/ven0.25' into a dict of
-    {half_life, opp_defense_strength, output_def_strength, venue_strength}.
-    Returns None if the format isn't recognized.
+    Parse a sweep variant key into
+    {half_life, opp_defense_strength, output_def_strength, shrink_k,
+     venue_strength}. Returns None if the format isn't recognized.
 
-    NOTE: The sweep grid uses `def_adj` (output-side defense). The
-    `opp_defense_strength` (weight-side) is always 0 in the sweep grid.
+    Two formats are accepted so legacy committed labels stay parseable:
+      • legacy 3-part 'hl15/defadj1.0/ven0.25'
+          — the pre-P2.1b grid; opp_defense_strength defaults to 0.0 and shrink_k
+            to None (== "unspecified" → _build_prop_cfg falls back to the CLI
+            --shrinkage-k, since the label never swept it).
+      • P2.1b 5-part  'hl15/opp0.5/defadj1.0/shrink5/ven0.25'
+          — adds the weight-side opponent-defense and Bayesian-shrinkage knobs
+            (both have a props.py runtime, so an enabled knob behaves live as
+            validated). shrink_k is an explicit float here — a swept 0 is honored.
     """
     parts = name.split("/")
-    if len(parts) != 3:
+    if len(parts) not in (3, 5):
         return None
-    hl_part, da_part, ven_part = parts
     try:
         # _build_props_sweep_grid emits "none" or "hl<N>" for the half-life.
+        hl_part = parts[0]
         if hl_part == "none":
             hl = None
         elif hl_part.startswith("hl"):
             hl = int(hl_part[2:])
         else:
+            return None
+        if len(parts) == 3:
+            da_part, ven_part = parts[1], parts[2]
+            opp, shrink = 0.0, None
+        else:  # 5-part P2.1b
+            opp_part, da_part, shrink_part, ven_part = parts[1:5]
+            if not (opp_part.startswith("opp")
+                    and shrink_part.startswith("shrink")):
+                return None
+            opp = float(opp_part[len("opp"):])
+            shrink = float(shrink_part[len("shrink"):])
+        if not (da_part.startswith("defadj") and ven_part.startswith("ven")):
             return None
         da = float(da_part[len("defadj"):])
         ven = float(ven_part[len("ven"):])
@@ -141,8 +160,9 @@ def _parse_variant_name(name):
         return None
     return {
         "half_life": hl,
-        "opp_defense_strength": 0.0,
+        "opp_defense_strength": opp,
         "output_def_strength": da,
+        "shrink_k": shrink,
         "venue_strength": ven,
     }
 
@@ -242,7 +262,8 @@ def _is_baseline_variant(vname):
     always eligible WITHOUT the gate (so a winner always exists)."""
     p = _parse_variant_name(vname)
     return (bool(p) and not p.get("half_life") and not p.get("output_def_strength")
-            and not p.get("venue_strength") and not p.get("opp_defense_strength"))
+            and not p.get("venue_strength") and not p.get("opp_defense_strength")
+            and not p.get("shrink_k"))
 
 
 def _baseline_variant_obs(results, prop_key):
@@ -347,13 +368,20 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
     parsed = _parse_variant_name(vname) or {}
     obs = results[vname][prop_key].get("calib_obs") or []
     fit = _fit_residuals(obs) or {}
+    # P2.1b: shrinkage is now a swept knob (parsed from the winning label). The
+    # CLI --shrinkage-k is only a fallback for legacy 3-part labels that carry no
+    # shrink token — a candidate that won with shrink=0 keeps 0 (the gate chose
+    # it), it is NOT overridden by the CLI default.
+    parsed_shrink = parsed.get("shrink_k")
+    shrinkage_k = int(parsed_shrink if parsed_shrink is not None
+                      else shrinkage_k_default)
     cfg = {
         "method": winner["method"],
         "half_life": parsed.get("half_life"),
         "venue_strength": parsed.get("venue_strength"),
         "opp_defense_strength": parsed.get("opp_defense_strength", 0.0),
         "output_def_strength": parsed.get("output_def_strength", 0.0),
-        "shrinkage_k": shrinkage_k_default,
+        "shrinkage_k": shrinkage_k,
         "variant_label": vname,
         "fit_brier": round(winner["brier"], 4),
         "fit_hit_pct": round(winner["hit"], 2) if winner["hit"] is not None else None,
@@ -457,9 +485,11 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 "fit_season": prior_season,
                 **warm_fit,
             }
+        vconf = "confirmed" if winner.get("variant_confirmed") else "baseline"
         print(f"  [{prop_key}] method={cfg['method']} hl={cfg['half_life']} "
-              f"defadj={cfg['output_def_strength']} ven={cfg['venue_strength']} "
-              f"brier={cfg.get('fit_brier')} n={cfg.get('n_obs')}")
+              f"opp={cfg['opp_defense_strength']} defadj={cfg['output_def_strength']} "
+              f"shrink={cfg['shrinkage_k']} ven={cfg['venue_strength']} "
+              f"[{vconf}] brier={cfg.get('fit_brier')} n={cfg.get('n_obs')}")
         props_cfg[prop_key] = cfg
 
     meta = {

@@ -1677,24 +1677,45 @@ def _build_sweep_grid():
 
 def _build_props_sweep_grid():
     """
-    Cross-product for player-props sweep mode.
-    Tunes the three knobs that empirically move the needle:
-      • half_life (recency decay)
-      • def_adj   (output-side opponent-defense scaling — best single feature)
-      • venue     (venue-match weighting)
+    Cross-product for player-props sweep mode (P2.1b expanded).
+
+    Sweeps the five knobs that each have a RUNTIME counterpart in
+    props.analyze_player_props_value, so a knob the confirmation gate enables
+    behaves live EXACTLY as it was validated. NBA-only preset knobs
+    (use_minutes / pace_adj / rest_adj) are deliberately excluded — they have no
+    MLB runtime, so selecting one would be a silent no-op (the trap P2.1 fixes):
+      • half_life             (recency decay)
+      • opp_defense_strength  (weight-side opponent-defense reweighting)   [P2.1b]
+      • def_adj               (output-side opponent-defense scaling)
+      • shrink_k              (Bayesian shrinkage toward the season mean)  [P2.1b]
+      • venue                 (venue-match reweighting)
+
+    The all-off cell 'none/opp0.0/defadj0.0/shrink0/ven0.0' is the baseline the
+    P2.1 variant gate measures every candidate against (refit_calibration), so
+    the sweep can never ship worse than plain recency (baseline = the floor).
+    Grid size: 4×3×3×4×2 = 288 variants — bounded for the offline refit; the
+    fetch happens once and each variant is a pure re-projection pass. The current
+    shipped selections (hl∈{None,15}, ven∈{0.0,0.25}, all other knobs 0) all lie
+    inside this grid, so §2.1b cannot regress a prop by dropping its winner.
     """
-    half_lifes = [None, 3, 5, 7, 10, 15, 20]
-    def_adjs = [0.0, 0.5, 1.0, 1.5]
-    venue_strengths = [0.0, 0.15, 0.25]
+    half_lifes = [None, 5, 10, 15]
+    opp_defenses = [0.0, 0.5, 1.0]
+    def_adjs = [0.0, 0.5, 1.0]
+    shrink_ks = [0, 5, 10, 15]
+    venue_strengths = [0.0, 0.25]
 
     variants = {}
     for hl in half_lifes:
-        for da in def_adjs:
-            for vs in venue_strengths:
-                hl_label = "none" if hl is None else f"hl{hl}"
-                name = f"{hl_label}/defadj{da}/ven{vs}"
-                variants[name] = _preset(half_life=hl, def_adj=da,
-                                         venue_strength=vs)
+        for opp in opp_defenses:
+            for da in def_adjs:
+                for sk in shrink_ks:
+                    for vs in venue_strengths:
+                        hl_label = "none" if hl is None else f"hl{hl}"
+                        name = (f"{hl_label}/opp{opp}/defadj{da}/"
+                                f"shrink{sk}/ven{vs}")
+                        variants[name] = _preset(
+                            half_life=hl, opp_defense_strength=opp,
+                            def_adj=da, shrink_k=sk, venue_strength=vs)
     return variants
 
 
@@ -3051,12 +3072,12 @@ def _print_safe_mode_results(results, props, cushion_sweep=False):
 
 def _parse_variant_label(vname):
     """
-    Parse variant names like 'hl10/defadj1.0/ven0.25' into a dict of knob values.
-    Recognizes prefixes: hl, defadj, def, ven, pace.
+    Parse variant names like 'hl10/opp0.5/defadj1.0/shrink5/ven0.25' into a dict
+    of knob values. Recognizes prefixes: hl, opp, defadj, def, shrink, ven, pace.
     """
     parts = {}
     # Order matters — match longer prefixes first ("defadj" before "def")
-    prefixes = ("defadj", "pace", "hl", "def", "ven")
+    prefixes = ("defadj", "shrink", "pace", "opp", "hl", "def", "ven")
     for tok in vname.split("/"):
         for prefix in prefixes:
             if tok.startswith(prefix):
@@ -3171,14 +3192,16 @@ def _print_props_sweep_results(results, props, top_k=10, safe_target=0.80):
 
     knob_label = {
         "hl": "Half-life",
+        "opp": "Defense weight strength (opp_defense)",
         "def": "Defense weight strength",
         "defadj": "Defense output adj. strength",
+        "shrink": "Bayesian shrinkage k",
         "pace": "Pace adj. strength",
         "ven": "Venue strength",
     }
     # Only display knobs that actually appear in the parsed variants
     knobs_present = {k for _, parts, _ in parsed for k in parts}
-    for knob in ("hl", "defadj", "def", "pace", "ven"):
+    for knob in ("hl", "opp", "defadj", "def", "shrink", "pace", "ven"):
         if knob not in knobs_present:
             continue
         # Group rows by value of this knob (averaging across all other knobs)
@@ -3222,7 +3245,7 @@ def _print_props_sweep_results(results, props, top_k=10, safe_target=0.80):
             print(f"{v:<6} {n:>9} {avg_mae:>10.4f} {avg_rmse:>10.4f} {avg_bias:>+10.4f}  {hit_str}")
 
     # ── Marginal-effect tables, ranked by Safe-Target Cushion ──
-    for knob in ("hl", "defadj", "def", "pace", "ven"):
+    for knob in ("hl", "opp", "defadj", "def", "shrink", "pace", "ven"):
         if knob not in knobs_present:
             continue
         groups = {}

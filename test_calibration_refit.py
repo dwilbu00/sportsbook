@@ -117,5 +117,129 @@ class SelectionGateTests(unittest.TestCase):
         self.assertFalse(winner["confirmed"])
 
 
+class SweepGridTests(unittest.TestCase):
+    """P2.1b: the expanded props sweep grid + variant-name round-trip."""
+
+    def setUp(self):
+        self.grid = backtest._build_props_sweep_grid()
+
+    def test_size_and_baseline_cell(self):
+        # 4 half_lives × 3 opp × 3 def_adj × 4 shrink × 2 venue = 288
+        self.assertEqual(len(self.grid), 288)
+        self.assertIn("none/opp0.0/defadj0.0/shrink0/ven0.0", self.grid)
+
+    def test_contains_current_shipped_selections(self):
+        # Baseline-is-the-floor requires the grid to still contain every knob
+        # combo the live MLB calibration currently ships — else §2.1b could
+        # regress a prop by dropping its winner from the grid.
+        for cell in (
+            "none/opp0.0/defadj0.0/shrink0/ven0.0",    # batter_hits, pitcher_outs
+            "none/opp0.0/defadj0.0/shrink0/ven0.25",   # pitcher_K, batter_K
+            "hl15/opp0.0/defadj0.0/shrink0/ven0.25",   # pitcher_earned_runs
+        ):
+            self.assertIn(cell, self.grid)
+
+    def test_only_runtime_backed_knobs_are_set(self):
+        # No NBA-only preset knob (use_minutes / pace_adj / rest_adj / def_window)
+        # is ever turned on — those have no props.py runtime, so selecting one for
+        # MLB would be a silent no-op (the trap P2.1 exists to avoid).
+        for name, preset in self.grid.items():
+            self.assertFalse(preset["use_minutes"], name)
+            self.assertEqual(preset["pace_adj"], 0.0, name)
+            self.assertEqual(preset["rest_adj"], 0.0, name)
+            self.assertIsNone(preset["def_window"], name)
+
+    def test_preset_values_match_label(self):
+        p = self.grid["hl10/opp0.5/defadj1.0/shrink5/ven0.25"]
+        self.assertEqual(p["half_life"], 10)
+        self.assertEqual(p["opp_defense_strength"], 0.5)
+        self.assertEqual(p["def_adj"], 1.0)
+        self.assertEqual(p["shrink_k"], 5)
+        self.assertEqual(p["venue_strength"], 0.25)
+
+    def test_every_label_parses_and_roundtrips(self):
+        for name, preset in self.grid.items():
+            parsed = refit_calibration._parse_variant_name(name)
+            self.assertIsNotNone(parsed, name)
+            self.assertEqual(parsed["half_life"], preset["half_life"], name)
+            self.assertEqual(parsed["opp_defense_strength"],
+                             preset["opp_defense_strength"], name)
+            self.assertEqual(parsed["output_def_strength"], preset["def_adj"], name)
+            self.assertEqual(parsed["shrink_k"], preset["shrink_k"], name)
+            self.assertEqual(parsed["venue_strength"],
+                             preset["venue_strength"], name)
+
+
+class ParseVariantNameTests(unittest.TestCase):
+    """P2.1b: dual-format variant-name parser (legacy 3-part + new 5-part)."""
+
+    def test_five_part_new_format(self):
+        p = refit_calibration._parse_variant_name(
+            "hl15/opp0.5/defadj1.0/shrink10/ven0.25")
+        self.assertEqual(p, {
+            "half_life": 15, "opp_defense_strength": 0.5,
+            "output_def_strength": 1.0, "shrink_k": 10.0,
+            "venue_strength": 0.25})
+
+    def test_legacy_three_part_defers_shrink_to_cli(self):
+        # Legacy label carries no shrink token → shrink_k is None (unspecified),
+        # opp defaults to 0.0 (it has no CLI fallback).
+        p = refit_calibration._parse_variant_name("hl15/defadj1.0/ven0.25")
+        self.assertEqual(p["half_life"], 15)
+        self.assertEqual(p["opp_defense_strength"], 0.0)
+        self.assertEqual(p["output_def_strength"], 1.0)
+        self.assertEqual(p["venue_strength"], 0.25)
+        self.assertIsNone(p["shrink_k"])
+
+    def test_none_half_life(self):
+        self.assertIsNone(refit_calibration._parse_variant_name(
+            "none/opp0.0/defadj0.0/shrink0/ven0.0")["half_life"])
+
+    def test_malformed_returns_none(self):
+        for bad in (
+            "garbage",
+            "hl15/defadj1.0",                        # 2 parts
+            "hl15/xyz0.5/defadj1.0/shrink5/ven0.25",  # bad opp prefix
+            "zz15/opp0/defadj0/shrink0/ven0",         # bad hl prefix
+            "hl15/opp0.5/defadj1.0/shrink5/xxx0.25",  # bad ven prefix
+        ):
+            self.assertIsNone(refit_calibration._parse_variant_name(bad), bad)
+
+
+class BuildPropCfgKnobTests(unittest.TestCase):
+    """P2.1b: swept opp_defense_strength + shrinkage_k persist into the cfg."""
+
+    def _cfg(self, vname, variant_confirmed, shrinkage_k_default=0):
+        obs = _make_obs(60, "flat", separate=True)
+        results = {vname: {"points": {"calib_obs": obs}}}
+        winner = {"variant": vname, "method": "A", "brier": 0.2, "hit": 0.5,
+                  "baseline_brier": 0.22, "cv_brier": 0.21, "confirmed": False,
+                  "variant_confirmed": variant_confirmed}
+        return refit_calibration._build_prop_cfg(
+            winner, results, "points", shrinkage_k_default)
+
+    def test_swept_knobs_persist_from_five_part_label(self):
+        cfg = self._cfg("hl10/opp0.5/defadj1.0/shrink5/ven0.25", True)
+        self.assertEqual(cfg["half_life"], 10)
+        self.assertEqual(cfg["opp_defense_strength"], 0.5)
+        self.assertEqual(cfg["output_def_strength"], 1.0)
+        self.assertEqual(cfg["shrinkage_k"], 5)
+        self.assertEqual(cfg["venue_strength"], 0.25)
+        self.assertTrue(cfg["variant_confirmed"])
+
+    def test_swept_shrink_zero_is_honored_over_cli_default(self):
+        # A 5-part winner that CHOSE shrink0 keeps 0 even if --shrinkage-k is set;
+        # the gate's choice wins.
+        cfg = self._cfg("none/opp0.0/defadj0.0/shrink0/ven0.0", False,
+                        shrinkage_k_default=7)
+        self.assertEqual(cfg["shrinkage_k"], 0)
+        self.assertEqual(cfg["opp_defense_strength"], 0.0)
+        self.assertFalse(cfg["variant_confirmed"])
+
+    def test_legacy_label_falls_back_to_cli_shrinkage_default(self):
+        cfg = self._cfg("hl10/defadj0.0/ven0.0", False, shrinkage_k_default=7)
+        self.assertEqual(cfg["shrinkage_k"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()
