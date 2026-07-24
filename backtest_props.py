@@ -296,6 +296,18 @@ def build_pitcher_xba_index(rows):
     return idx
 
 
+def build_batter_xba_index(rows):
+    """Expected BA a BATTER produced, as-of (keyed by batter MLBAM id). P2.4a:
+    the batter's OWN quality-of-contact prior (vs build_pitcher_xba_index, which
+    is the opposing starter's xBA-allowed matchup signal)."""
+    idx = AsOfIndex()
+    for row in rows:
+        xba = row.get("xba")
+        if xba is not None and row.get("batter") and row.get("game_date"):
+            idx.add(row["batter"], row["game_date"], xba)
+    return idx
+
+
 def build_team_hand_index(rows):
     """xwOBAcon a team PRODUCED vs a pitcher hand, keyed by (team, p_throws)."""
     idx = AsOfIndex()
@@ -999,6 +1011,92 @@ def _prop_method(prop_key):
         return None
 
 
+def fit_xstats(seasons, top_n=120, verbose=True):
+    """Validate the P2.4a batter_hits xBA blend: does shrinking base_proj toward
+    the batter's OWN season-to-date as-of xBA × recent AB/game reduce holdout MAE?
+
+    This is the ship gate. Mirrors fit()'s chronological holdout (July 1 for one
+    season, latest season for a range) and WEIGHT_GRID sweep, but grades a LINEAR
+    projection blend `(1-w)·base + w·(xBA×AB/game)` (the same blend props.py
+    applies) against actual hits. Prints per-weight holdout MAE and returns the
+    accepted ship weight (0 if no out-of-sample gain over baseline)."""
+    prop_key = "batter_hits"
+    _, field = PROP_SPEC[prop_key]
+    holdout_start = (f"{max(seasons)}-01-01" if len(seasons) > 1
+                     else f"{seasons[0]}-07-01")
+
+    xba_index_by_season = {}
+    for s in seasons:
+        s0, s1 = _season_bounds(s)
+        rows = sh.load_days(s0, s1)
+        if not rows:
+            raise RuntimeError(
+                f"No Statcast days cached for {s} — run backtest_starters.py "
+                f"--season {s} --fetch first.")
+        xba_index_by_season[s] = build_batter_xba_index(rows)
+
+    obs = []   # (base, xstats_mean, actual, date)
+    for season in seasons:
+        idx = xba_index_by_season[season]
+        for bid in frequent_batter_ids([season], top_n):
+            splits = sorted(gamelog(bid, season, "hitting"),
+                            key=lambda s: s.get("date", ""))
+            vals, abs_hist = [], []
+            for sp in splits:
+                actual = _stat_val(sp, field)
+                date = sp.get("date")
+                if actual is not None and date and len(vals) >= MIN_PRIOR:
+                    recent_vals = vals[:LIVE_RECENT_N]
+                    recent_ab = abs_hist[:LIVE_RECENT_N]
+                    weights = analysis._recency_weights(
+                        len(recent_vals), _half_life(prop_key))
+                    base = analysis._weighted_mean(recent_vals, weights)
+                    xba = idx.asof_mean(str(bid), date)   # min_bbe = sh.MIN_BBE
+                    ab_valid = [(ab, w) for ab, w in zip(recent_ab, weights)
+                                if ab is not None and ab > 0 and w > 0]
+                    if base > 0 and xba is not None and ab_valid:
+                        ab_pg = analysis._weighted_mean(
+                            [ab for ab, _ in ab_valid], [w for _, w in ab_valid])
+                        if ab_pg and ab_pg > 0:
+                            obs.append((base, xba * ab_pg, actual, date))
+                if actual is not None and date:
+                    vals.insert(0, actual)
+                    abs_hist.insert(0, _stat_val(sp, "atBats"))
+        if verbose:
+            print(f"  batter_hits {season}: pooled {len(obs)} xstats obs so far")
+
+    train = [o for o in obs if o[3] < holdout_start]
+    holdout = [o for o in obs if o[3] >= holdout_start]
+    if len(train) < 100 or len(holdout) < 100:
+        print(f"[xstats] insufficient obs: train={len(train)} "
+              f"holdout={len(holdout)} (need 100 each).")
+        return None
+
+    def _mae(rows_, w):
+        ae = sum(abs(actual - ((1.0 - w) * base + w * xm))
+                 for base, xm, actual, _d in rows_)
+        return ae / len(rows_)
+
+    train_mae = {w: _mae(train, w) for w in WEIGHT_GRID}
+    holdout_mae = {w: _mae(holdout, w) for w in WEIGHT_GRID}
+    best_w = min(WEIGHT_GRID, key=lambda w: train_mae[w])
+    baseline, cand = holdout_mae[0.0], holdout_mae[best_w]
+    gain = (baseline - cand) / baseline * 100 if baseline else 0.0
+    accepted = best_w if (best_w != 0.0 and cand < baseline) else 0.0
+    if verbose:
+        grid = "  ".join(f"{w:>5.2f}" for w in WEIGHT_GRID)
+        print(f"\n[xstats] batter_hits — train={len(train)} holdout={len(holdout)}")
+        print(f"  weight  : {grid}")
+        print("  trainMAE: " + "  ".join(f"{train_mae[w]:.3f}" for w in WEIGHT_GRID))
+        print("  holdMAE : " + "  ".join(f"{holdout_mae[w]:.3f}" for w in WEIGHT_GRID))
+        print(f"  best(train)={best_w}  holdout_gain_vs_w0={gain:+.2f}%  "
+              f"-> SHIP xstats_strength = {accepted}")
+    return {"train_n": len(train), "holdout_n": len(holdout),
+            "train_mae": train_mae, "holdout_mae": holdout_mae,
+            "best_weight": best_w, "accepted_weight": accepted,
+            "holdout_gain_pct": gain}
+
+
 if __name__ == "__main__":
     from cli_encoding import configure_stdio
     configure_stdio()
@@ -1013,10 +1111,16 @@ if __name__ == "__main__":
                     help="pre-cache all schedules + gameLogs (slow, one-time)")
     ap.add_argument("--save", action="store_true",
                     help="write the fitted props weight to calibration")
+    ap.add_argument("--xstats", action="store_true",
+                    help="P2.4a: validate the batter_hits xBA projection blend "
+                         "(prints per-weight holdout MAE + ship weight)")
     args = ap.parse_args()
 
     seasons = _parse_seasons(args.season)
     props = [p.strip() for p in args.props.split(",") if p.strip()]
     if args.fetch:
         prefetch(seasons, args.max_batters)
-    fit(seasons, props, top_n=args.max_batters, do_save=args.save)
+    if args.xstats:
+        fit_xstats(seasons, top_n=args.max_batters)
+    else:
+        fit(seasons, props, top_n=args.max_batters, do_save=args.save)

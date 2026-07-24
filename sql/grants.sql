@@ -22,4 +22,6 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.mlb_pitcher_gamelog  TO StreamlitApp
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.nba_gamelog          TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.gamelog_fetch_meta   TO StreamlitApp;
 GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.athlete_id_cache     TO StreamlitApp;
+-- P2.4a: derived per-batter Statcast as-of rates (replace-all refresh needs DELETE).
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.statcast_player_asof TO StreamlitApp;
 GO

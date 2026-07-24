@@ -419,7 +419,8 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 
 
 def refit_sport_real_lines(sport, store_label="", warmup_games=10,
-                           shrinkage_k_default=0):
+                           shrinkage_k_default=0, xstats_strength=0.0,
+                           dry_run=False):
     """Re-select each prop's calibration METHOD at REAL book lines (roadmap 0.3).
 
     The synthetic-line sweep (`refit_sport`) chooses each prop's A/B/C method by
@@ -472,6 +473,32 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         team_defense, _, league_avg_def = _team_defense_lookup(
             espn_sport, espn_league)
 
+    # ── P2.4a: leakage-safe as-of xBA index for the projection blend ──
+    # Built once from the raw Statcast day cache spanning the obs seasons. Only
+    # applies to props in props.PROP_XSTATS_KIND (batter_hits). Uses a per-game
+    # as-of index (NOT the current-as-of SQL table) so a past-dated obs never
+    # sees future data. xstats_strength=0 → byte-identical to the prior behavior.
+    from props import PROP_XSTATS_KIND
+    xba_index = None
+    if xstats_strength and xstats_strength > 0:
+        import savant_history as sh
+        import backtest_props
+        years = sorted({str(o["game_date"])[:4] for o in enriched
+                        if o.get("game_date")})
+        raw = []
+        for y in years:
+            try:
+                raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+            except Exception:
+                pass
+        if raw:
+            xba_index = backtest_props.build_batter_xba_index(raw)
+            print(f"  [xstats] as-of xBA index built from {len(raw)} pitch rows "
+                  f"over {years} (strength={xstats_strength})")
+        else:
+            print("  [xstats] no Statcast days cached for the obs seasons — "
+                  "xBA blend inactive; refit falls back to the plain projection.")
+
     changed = {}
     for prop_key in target_props:
         cfg = existing.get(prop_key) or {}
@@ -481,8 +508,11 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
             "use_minutes": cfg.get("use_minutes", False),
         }
+        prop_xstats = (xstats_strength if (xba_index is not None
+                       and prop_key in PROP_XSTATS_KIND) else 0.0)
         rows = blc.build_real_line_obs(
-            enriched, params, sport_key, prop_key, team_defense, league_avg_def)
+            enriched, params, sport_key, prop_key, team_defense, league_avg_def,
+            xstats_strength=prop_xstats, xba_index=xba_index)
         sel = blc.select_method_at_real_lines(rows)
         if sel is None:
             print(f"  [skip] {prop_key}: {len(rows)} real-line obs "
@@ -491,12 +521,13 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             continue
 
         old_method = cfg.get("method")
-        if sel["method"] == old_method:
-            # The real-line evaluation confirms the shipped method — leave the
-            # cfg untouched. Rewriting it would only replace the (unused-for-A,
-            # or better-sampled-for-B/C) synthetic residual fit with a smaller
-            # real-line one and churn the fit_brier onto a different line/season
-            # basis, for no runtime change. Only a genuine method FLIP is written.
+        # Normally only a genuine method FLIP is written (a same-method re-fit
+        # would just churn the residuals onto a smaller real-line basis for no
+        # runtime change). BUT when the PROJECTION BASIS changed (P2.4a xBA blend
+        # applied to this prop), the residuals MUST be re-fit even if the method
+        # stays the same — the "no runtime change" premise is false.
+        projection_changed = prop_xstats > 0
+        if sel["method"] == old_method and not projection_changed:
             print(f"  [keep] {prop_key}: real-line eval confirms method "
                   f"{old_method} (real-line brier={sel['fit_brier']}, "
                   f"baseline(A)={sel['baseline_brier']}, n={sel['n_obs']})")
@@ -524,10 +555,17 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             "n_obs": sel["n_obs"],
             "source": "historical_odds store",
             "store_label": store_label or "default",
+            "xstats_strength": prop_xstats,
         }
+        # Persist the xBA blend weight into the prop cfg so props._knob activates
+        # it in production at exactly the weight its residuals were re-fit under.
+        if prop_xstats > 0:
+            new_cfg["xstats_strength"] = prop_xstats
         changed[prop_key] = new_cfg
         note = (f"{old_method}→{sel['method']} FLIP"
-                if sel["method"] != old_method else "unchanged")
+                if sel["method"] != old_method
+                else (f"re-fit @xstats={prop_xstats}" if projection_changed
+                      else "unchanged"))
         print(f"  [{prop_key}] method {note}  brier={sel['fit_brier']} "
               f"baseline(A)={sel['baseline_brier']} cv={sel['cv_brier']} "
               f"n={sel['n_obs']}")
@@ -535,6 +573,10 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     if not changed:
         print("\nNo props had enough real-line data to re-select. "
               "Nothing written.")
+        return
+    if dry_run:
+        print(f"\n[dry-run] {len(changed)} prop(s) would be written "
+              f"({sorted(changed.keys())}); nothing saved.")
         return
 
     save_calibration(
@@ -584,12 +626,22 @@ def main():
     p.add_argument("--store-label", default="",
                    help="historical_odds store label to read real book lines "
                         "from with --real-lines (default: the unlabeled store).")
+    p.add_argument("--xstats-strength", type=float, default=0.0,
+                   help="P2.4a: with --real-lines, re-fit batter_hits residuals "
+                        "under the Statcast xBA projection blend at this weight "
+                        "(leakage-safe as-of), and persist the weight into the "
+                        "prop cfg. 0 = no blend (default).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="With --real-lines, compute + print per-prop Brier but "
+                        "write nothing (use to compare --xstats-strength values).")
     args = p.parse_args()
 
     if args.real_lines:
         refit_sport_real_lines(args.sport, store_label=args.store_label,
                                warmup_games=args.warmup_games,
-                               shrinkage_k_default=args.shrinkage_k)
+                               shrinkage_k_default=args.shrinkage_k,
+                               xstats_strength=args.xstats_strength,
+                               dry_run=args.dry_run)
         return
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None

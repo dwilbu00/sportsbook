@@ -310,3 +310,51 @@ CREATE TABLE dbo.athlete_id_cache (
         UNIQUE (sport, league, player_name_lower, team_key)
 );
 GO
+
+----------------------------------------------------------- statcast_player_asof
+-- P2.4a/b: small DERIVED per-player Statcast as-of rate table. Built OFFLINE from
+-- the raw (gitignored, ephemeral) pitch cache by statcast_asof.py and read live by
+-- props.py. P2.4a: batter xBA/xwOBA. P2.4b: adds plate-discipline / contact rates
+-- (whiff/CSW/hard-hit/barrel) + a `role` ("bat"|"pit") discriminator (both share
+-- the MLBAM id space). One row per (player_id, season_bucket, split, role);
+-- replace-all per (season, split, role) refresh (fully rebuildable).
+--
+-- ⚠ P2.4b MIGRATION (existing §2.4a table): `role` joins the UNIQUE key, so an
+--   already-created table must be rebuilt. This table is 100% derived, so the
+--   simplest one-time migration is to DROP + recreate + re-run the build:
+--       DROP TABLE dbo.statcast_player_asof;   -- run ONCE, then the CREATE below
+--   (then `python statcast_asof.py --build --season 2026` [+ 2024] repopulates.)
+IF OBJECT_ID('dbo.statcast_player_asof', 'U') IS NULL
+CREATE TABLE dbo.statcast_player_asof (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    player_id     NVARCHAR(32) NOT NULL,             -- MLBAM id
+    season_bucket INT NOT NULL,                       -- season year (e.g. 2026)
+    split         NVARCHAR(16) NOT NULL,              -- all|vsL|vsR
+    role          NVARCHAR(4) NOT NULL,               -- bat|pit
+    as_of_date    NVARCHAR(16),                       -- YYYY-MM-DD build cutoff
+    xba           FLOAT,                               -- expected BA (per AB) [bat]
+    xwoba         FLOAT,                               -- xwOBAcon (per batted ball)
+    n_ab          INT,                                 -- official ABs behind xba
+    n_bbe         INT,                                 -- batted balls behind xwoba
+    whiff_pct     FLOAT,                               -- whiffs / swings
+    csw_pct       FLOAT,                               -- (called + whiff) / pitches
+    hard_hit_pct  FLOAT,                               -- LS>=95 / batted balls
+    barrel_pct    FLOAT,                               -- barrels / batted balls
+    n_pitches     INT,                                 -- pitches behind whiff/csw
+    n_bip         INT,                                 -- batted balls behind hh/brl
+    CONSTRAINT uq_statcast_player_asof
+        UNIQUE (player_id, season_bucket, split, role)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_statcast_player_asof_key'
+                 AND object_id = OBJECT_ID('dbo.statcast_player_asof'))
+CREATE INDEX ix_statcast_player_asof_key
+    ON dbo.statcast_player_asof (season_bucket, split, role);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_statcast_player_asof_player'
+                 AND object_id = OBJECT_ID('dbo.statcast_player_asof'))
+CREATE INDEX ix_statcast_player_asof_player
+    ON dbo.statcast_player_asof (player_id, season_bucket, role);
+GO

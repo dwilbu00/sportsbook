@@ -311,6 +311,35 @@ _WEATHER_COEF = {
 }
 
 
+# ── Statcast expected-BA blend (P2.4a) ──
+# Shrinks the batter_hits projection toward the player's season-to-date Statcast
+# expected BA (xBA × recent AB/game). xBA (quality-of-contact) stabilizes in far
+# fewer PA than a raw ~15-game hit rate, so this trims the small-sample false
+# edges the market prices sharply. Read from the durable `statcast_asof` SQL table
+# (built offline from the raw pitch cache). `strength` is the LINEAR blend weight
+# w∈[0,1]: base_proj = (1-w)·base + w·(xBA×AB/game). Gated on ≥ XSTATS_MIN_N
+# official ABs. Ships at 0 (OFF) until validated on the backtest holdout
+# (`backtest_props.py --xstats`); per-prop override via calibration JSON
+# "xstats_strength".
+PLAYER_PROP_XSTATS_STRENGTH = {"baseball_mlb": 0.0}
+DEFAULT_PLAYER_PROP_XSTATS_STRENGTH = 0.0
+# Which props blend toward which Statcast stat. Only batter_hits ← xBA for v1
+# (strikeouts ← whiff/CSW is §2.4b, pending a raw re-pull).
+PROP_XSTATS_KIND = {"batter_hits": "xba"}
+# Minimum official ABs behind the as-of xBA before it is trusted (mirrors MIN_BBE).
+XSTATS_MIN_N = 40
+
+
+def _xstats_blend(base_proj, xba, ab_per_game, strength):
+    """Linear blend of the projection toward the xBA-implied per-game mean.
+
+    Returns (blended_proj, xstats_mean). Pure — the caller supplies the looked-up
+    xBA and the player's recent AB/game. strength is clamped to [0, 1]."""
+    w = max(0.0, min(1.0, strength))
+    xstats_mean = xba * ab_per_game
+    return (1.0 - w) * base_proj + w * xstats_mean, xstats_mean
+
+
 # Per-sport override for the recency half-life *for player props specifically*.
 # When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
 # projection. Zero disables exponential decay; None inherits from
@@ -377,6 +406,13 @@ def _player_prop_weather_strength(sport_key):
         return DEFAULT_PLAYER_PROP_WEATHER_STRENGTH
     return PLAYER_PROP_WEATHER_STRENGTH.get(
         sport_key, DEFAULT_PLAYER_PROP_WEATHER_STRENGTH)
+
+
+def _player_prop_xstats_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_XSTATS_STRENGTH
+    return PLAYER_PROP_XSTATS_STRENGTH.get(
+        sport_key, DEFAULT_PLAYER_PROP_XSTATS_STRENGTH)
 
 
 def _park_factor_mult(prop_key, past_parks, past_weights, upcoming_park,
@@ -556,6 +592,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_market_prior_k = _player_prop_market_prior_k(sport_key)
     default_park_strength = _player_prop_park_strength(sport_key)
     default_weather_strength = _player_prop_weather_strength(sport_key)
+    default_xstats_strength = _player_prop_xstats_strength(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -593,6 +630,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         market_prior_k = _knob(prop_key, "market_prior_k", default_market_prior_k)
         park_strength = _knob(prop_key, "park_factor_strength", default_park_strength)
         weather_strength = _knob(prop_key, "weather_factor_strength", default_weather_strength)
+        xstats_strength = _knob(prop_key, "xstats_strength", default_xstats_strength)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -749,6 +787,49 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 eff_n = sum(weights) if weights else 0.0
                 if eff_n + shrinkage_k > 0:
                     base_proj = ((eff_n * base_proj) + (shrinkage_k * unweighted_mean)) / (eff_n + shrinkage_k)
+
+            # ── Statcast expected-BA blend (P2.4a) ──
+            # Shrink base_proj toward the batter's season-to-date xBA-implied hits
+            # (xBA × recent AB/game) — quality-of-contact stabilizes faster than
+            # the noisy ~15-game rate. MLB batter_hits only; reads the durable
+            # statcast_asof SQL table keyed by MLBAM id. Fails OPEN (unknown id /
+            # n<XSTATS_MIN_N / SQL miss → no change). The park/weather/matchup
+            # multipliers below still apply on the blended base_proj.
+            # (No explicit sport gate: xstats_strength defaults to 0 for any sport
+            # without a PLAYER_PROP_XSTATS_STRENGTH entry, and PROP_XSTATS_KIND
+            # only whitelists MLB batter_hits — so this is a no-op elsewhere.)
+            xstats_meta = None
+            if (xstats_strength and xstats_strength > 0
+                    and PROP_XSTATS_KIND.get(prop_key) and commence_iso):
+                try:
+                    import mlb_starters
+                    import statcast_asof
+                    season = int(str(commence_iso)[:4])
+                    pid_info = mlb_starters.find_player_id(player_name, season)
+                    if pid_info and pid_info[0] and not pid_info[1]:  # batter only
+                        xba, n_ab = statcast_asof.get_batter_xba(pid_info[0], season)
+                        ab_valid = [(ab, w) for ab, w in zip(at_bats, weights)
+                                    if ab is not None and ab > 0 and w > 0]
+                        if xba is not None and n_ab >= XSTATS_MIN_N and ab_valid:
+                            ab_per_game = _weighted_mean(
+                                [ab for ab, _ in ab_valid],
+                                [w for _, w in ab_valid])
+                            if ab_per_game and ab_per_game > 0:
+                                base_before = base_proj
+                                base_proj, xstats_mean = _xstats_blend(
+                                    base_proj, xba, ab_per_game, xstats_strength)
+                                xstats_meta = {
+                                    "xba": round(xba, 3),
+                                    "n_ab": n_ab,
+                                    "ab_per_game": round(ab_per_game, 2),
+                                    "proj_xstats": round(xstats_mean, 3),
+                                    "weight": xstats_strength,
+                                    "base_before": round(base_before, 3),
+                                    "blended": round(base_proj, 3),
+                                }
+                except Exception:
+                    xstats_meta = None  # fail open — never block a rec on xStats
+
             # ── MLB starter/opponent matchup multiplier (Phase 2) ──
             # Scales the projection by the log5-style matchup (opposing lineup
             # for pitcher props; opposing starter for batter props). No-op for
@@ -1055,6 +1136,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "recalibration": recal_meta,
                     "park_factor": park_meta,
                     "weather": weather_meta,
+                    "xstats": xstats_meta,
                     "_values": list(values),
                     "_weights": list(weights),
                 })
@@ -1177,6 +1259,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "market_prior": market_prior_meta,
                 "park_factor": park_meta,
                 "weather": weather_meta,
+                "xstats": xstats_meta,
                 "_values": list(values),
                 "_weights": list(weights),
             })

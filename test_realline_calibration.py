@@ -158,7 +158,8 @@ class RefitSportRealLinesTests(unittest.TestCase):
         save_mock = MagicMock()
         # build returns a per-prop marker list so the patched selector can key
         # off the prop; the actual projection math is not exercised here.
-        def _build(enriched, params, sport_key, prop_key, td=None, la=None):
+        def _build(enriched, params, sport_key, prop_key, td=None, la=None,
+                   xstats_strength=0.0, xba_index=None):
             return [{"prop_key": prop_key}]
         def _select(rows, shrinkage_k=15):
             pk = rows[0]["prop_key"] if rows else None

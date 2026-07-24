@@ -284,10 +284,20 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def project_and_empirical(obs, params, sport_key,
-                          team_defense=None, league_avg_def=None):
+                          team_defense=None, league_avg_def=None,
+                          xstats_strength=0.0, xba_index=None):
     """
     Mirrors backtest.run_player_props_backtest's per-obs projection logic,
     but takes the line from the book instead of synthetic.
+
+    When ``xstats_strength > 0`` and a leakage-safe ``xba_index`` (an
+    ``AsOfIndex`` keyed by batter MLBAM id, from
+    ``backtest_props.build_batter_xba_index``) is supplied, the reconstructed
+    projection is blended toward the batter's OWN as-of xBA × recent AB/game —
+    exactly the P2.4a blend props.py applies live — so the re-fit residual
+    distribution matches production. Uses a per-GAME as-of estimate (strictly
+    before the obs's game_date), never the current-as-of SQL table. Fails open
+    (unknown id / <MIN_BBE ABs / no AB data → unblended).
 
     Returns (projected, empirical_over) or (None, None) if data is too thin.
     """
@@ -347,6 +357,35 @@ def project_and_empirical(obs, params, sport_key,
             projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
     else:
         projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+
+    # ── Statcast xBA blend (P2.4a, leakage-safe as-of) ──
+    # Shrink the projection toward the batter's own as-of xBA × recent AB/game,
+    # mirroring props._xstats_blend, so the re-fit residuals match production.
+    # Only fires when a strength + as-of index are supplied (batter_hits). Uses a
+    # per-game as-of estimate (< this obs's game_date); fails open. Note A
+    # (empirical_over) is unaffected — it doesn't read `projected` — so this
+    # changes only the B/C-method residual basis.
+    if (xstats_strength and xstats_strength > 0 and xba_index is not None
+            and len(prior_games) == len(weights)):
+        try:
+            import mlb_starters
+            game_date = obs.get("game_date")
+            player = obs.get("player")
+            season = int(str(game_date)[:4]) if game_date else None
+            pid_info = (mlb_starters.find_player_id(player, season)
+                        if (player and season) else None)
+            if pid_info and pid_info[0] and not pid_info[1]:   # batter only
+                xba = xba_index.asof_mean(str(pid_info[0]), game_date)  # min_bbe=40
+                ab_valid = [(g.get("AB"), w) for g, w in zip(prior_games, weights)
+                            if g.get("AB") and w > 0]
+                if xba is not None and ab_valid:
+                    ab_pg = (sum(ab * w for ab, w in ab_valid)
+                             / sum(w for _, w in ab_valid))
+                    if ab_pg > 0:
+                        wgt = max(0.0, min(1.0, xstats_strength))
+                        projected = (1.0 - wgt) * projected + wgt * (xba * ab_pg)
+        except Exception:
+            pass  # fail open — never let the xBA lookup break the refit
 
     # Empirical over-probability AT THE BOOK LINE
     empirical_over = _weighted_rate(
@@ -457,19 +496,22 @@ def evaluate_calibration(per_prop_obs, prop_key, label, shrinkage_k=15):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_real_line_obs(enriched, params, sport_key, prop_key,
-                        team_defense=None, league_avg_def=None):
+                        team_defense=None, league_avg_def=None,
+                        xstats_strength=0.0, xba_index=None):
     """Project every joined observation for one prop at its REAL book line.
 
     Returns a list of row dicts {player, projected, line, actual,
     empirical_over, game_date}, reusing project_and_empirical (which evaluates
-    the empirical over-rate at obs["line"], the book line).
+    the empirical over-rate at obs["line"], the book line). ``xstats_strength`` +
+    ``xba_index`` opt into the P2.4a xBA projection blend (batter_hits).
     """
     rows = []
     for obs in enriched:
         if obs["prop_key"] != prop_key:
             continue
         projected, emp = project_and_empirical(
-            obs, params, sport_key, team_defense, league_avg_def)
+            obs, params, sport_key, team_defense, league_avg_def,
+            xstats_strength=xstats_strength, xba_index=xba_index)
         if projected is None:
             continue
         rows.append({
