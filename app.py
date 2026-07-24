@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pricing_common
+import weather_factors
 
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2192,6 +2193,7 @@ if analyze_clicked and selected_game_labels:
         odds_futures = {}
         prop_odds_futures = {}
         team_schedule_futures = {}
+        weather_futures = {}
 
         for event in selected_events:
             eid = event["id"]
@@ -2226,6 +2228,14 @@ if analyze_clicked and selected_game_labels:
                 team_schedule_futures[away_espn["id"]] = pool.submit(
                     get_team_schedule, sport["espn_sport"], sport["espn_league"], away_espn["id"]
                 )
+
+            # Pre-game weather forecast (MLB only — park geo is MLB). Feeds the
+            # weather/wind projection nudge on batter_hits / pitcher_earned_runs;
+            # fails open to neutral inside get_game_weather (never raises).
+            if sport["key"] == "baseball_mlb":
+                weather_futures[eid] = pool.submit(
+                    weather_factors.get_game_weather,
+                    home, event.get("commence_time"))
 
         progress.progress(25, text="Loading team schedules...")
 
@@ -2267,6 +2277,15 @@ if analyze_clicked and selected_game_labels:
                 schedule_results[tid] = fut.result()
             except Exception:
                 schedule_results[tid] = []
+
+        # Per-event weather (MLB); get_game_weather already swallows errors, so a
+        # miss just yields a neutral dict the analyzer treats as no adjustment.
+        event_weather = {}
+        for eid, fut in weather_futures.items():
+            try:
+                event_weather[eid] = fut.result()
+            except Exception:
+                event_weather[eid] = None
 
         # Build a per-team avg-points-allowed lookup so the player-prop analyzer
         # can apply an opponent-defense weighting to historical games.
@@ -2447,7 +2466,8 @@ if analyze_clicked and selected_game_labels:
                                                   safe_mode=safe_mode,
                                                   safe_target=safe_target,
                                                   team_schedules=schedule_results,
-                                                  matchup_features=matchup_features)
+                                                  matchup_features=matchup_features,
+                                                  weather=event_weather.get(eid))
             for c in new_props:
                 c["event_id"] = eid
             all_props.extend(new_props)

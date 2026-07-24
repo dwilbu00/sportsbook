@@ -18,6 +18,7 @@ import odds_client
 import park_factors
 import props
 import recalibration
+import weather_factors
 from backtest_props import _rolling_splits
 from odds_client import parse_player_props
 from prop_filter import filter_player_gamelog
@@ -1576,6 +1577,230 @@ class ParkFactorProjectionTests(unittest.TestCase):
         on = self._run("Minnesota Twins", 1.0)  # same neutral park as baseline
         self.assertIsNone(on["park_factor"])
         self.assertAlmostEqual(on["avg_stat"], 1.0, places=2)
+
+
+class WeatherFactorGeoTests(unittest.TestCase):
+    """P1.3: static park geo table + wind out/in-to-CF projection."""
+
+    def test_geo_table_well_formed(self):
+        self.assertGreaterEqual(len(weather_factors.MLB_PARK_GEO), 28)
+        for name, geo in weather_factors.MLB_PARK_GEO.items():
+            self.assertIn(geo["roof"], ("open", "retractable", "dome"), name)
+            self.assertTrue(0 <= geo["cf_bearing"] < 360, name)
+            self.assertTrue(20.0 <= geo["lat"] <= 50.0, name)
+            self.assertTrue(-125.0 <= geo["lon"] <= -66.0, name)
+
+    def test_unsettled_venues_omitted(self):
+        # Athletics (Sacramento) + Rays (displaced) → neutral, mirroring park_factors.
+        self.assertIsNone(weather_factors.park_geo("Athletics"))
+        self.assertIsNone(weather_factors.park_geo("Oakland Athletics"))
+        self.assertIsNone(weather_factors.park_geo("Tampa Bay Rays"))
+
+    def test_park_geo_uses_park_factor_aliases(self):
+        self.assertIsNotNone(weather_factors.park_geo("Colorado Rockies"))
+        # "Arizona D-backs" normalizes (via park_factors._park_key) to the DBacks.
+        self.assertEqual(
+            weather_factors.park_geo("Arizona D-backs"),
+            weather_factors.park_geo("Arizona Diamondbacks"))
+        self.assertIsNone(weather_factors.park_geo("Nowhere FC"))
+
+    def test_wind_out_component_sign(self):
+        woc = weather_factors.wind_out_component
+        # CF bearing 0 (points N). Wind FROM the south blows OUT to a N-facing CF.
+        self.assertAlmostEqual(woc(10, 180, 0), 10.0, places=3)
+        # Wind FROM the north blows IN.
+        self.assertAlmostEqual(woc(10, 0, 0), -10.0, places=3)
+        # Crosswind (from due east) ≈ no out/in component.
+        self.assertAlmostEqual(woc(10, 90, 0), 0.0, places=3)
+        # Missing inputs → None.
+        self.assertIsNone(woc(None, 180, 0))
+        self.assertIsNone(woc(10, None, 0))
+        self.assertIsNone(woc(10, 180, None))
+
+
+class WeatherFactorMultTests(unittest.TestCase):
+    """P1.3: baseline-relative weather multiplier (props._weather_factor_mult)."""
+
+    def _w(self, temp_f=70.0, wind_out=0.0, dome=False):
+        return {"temp_f": temp_f, "wind_out_mph": wind_out, "dome": dome}
+
+    def test_hot_raises_cold_lowers(self):
+        hot, meta = props._weather_factor_mult("batter_hits", self._w(temp_f=90), 1.0)
+        self.assertGreater(hot, 1.0)
+        self.assertEqual(meta["kind"], "hits")
+        cold, _ = props._weather_factor_mult("batter_hits", self._w(temp_f=50), 1.0)
+        self.assertLess(cold, 1.0)
+
+    def test_wind_out_raises_in_lowers(self):
+        out, _ = props._weather_factor_mult("batter_hits", self._w(wind_out=10), 1.0)
+        self.assertGreater(out, 1.0)
+        inn, _ = props._weather_factor_mult("batter_hits", self._w(wind_out=-10), 1.0)
+        self.assertLess(inn, 1.0)
+
+    def test_runs_more_sensitive_than_hits(self):
+        w = self._w(temp_f=90, wind_out=10)
+        runs, _ = props._weather_factor_mult("pitcher_earned_runs", w, 1.0)
+        hits, _ = props._weather_factor_mult("batter_hits", w, 1.0)
+        self.assertGreater(runs, hits)
+
+    def test_dome_is_neutral(self):
+        self.assertEqual(
+            props._weather_factor_mult("batter_hits",
+                                       self._w(temp_f=95, wind_out=15, dome=True), 1.0),
+            (1.0, None))
+
+    def test_unmapped_prop_zero_strength_empty_neutral(self):
+        self.assertEqual(
+            props._weather_factor_mult("pitcher_strikeouts", self._w(temp_f=95), 1.0),
+            (1.0, None))
+        self.assertEqual(
+            props._weather_factor_mult("batter_hits", self._w(temp_f=95), 0.0),
+            (1.0, None))
+        self.assertEqual(
+            props._weather_factor_mult("batter_hits", None, 1.0), (1.0, None))
+        self.assertEqual(
+            props._weather_factor_mult("batter_hits", {}, 1.0), (1.0, None))
+        self.assertEqual(
+            props._weather_factor_mult(
+                "batter_hits", {"temp_f": None, "wind_out_mph": None}, 1.0),
+            (1.0, None))
+
+    def test_strength_scales(self):
+        full, _ = props._weather_factor_mult("batter_hits", self._w(wind_out=10), 1.0)
+        half, _ = props._weather_factor_mult("batter_hits", self._w(wind_out=10), 0.5)
+        self.assertAlmostEqual(half, 1.0 + 0.5 * (full - 1.0), places=4)
+
+    def test_bounds_clamp(self):
+        hi, _ = props._weather_factor_mult(
+            "pitcher_earned_runs", self._w(temp_f=200, wind_out=100), 1.0)
+        self.assertEqual(hi, props.WEATHER_FACTOR_BOUNDS[1])
+        lo, _ = props._weather_factor_mult(
+            "pitcher_earned_runs", self._w(temp_f=-100, wind_out=-100), 1.0)
+        self.assertEqual(lo, props.WEATHER_FACTOR_BOUNDS[0])
+
+
+class WeatherFactorProjectionTests(unittest.TestCase):
+    """P1.3: the weather nudge moves the projection through the runtime prop
+    pipeline. Same offline harness as ParkFactorProjectionTests (sport_key=None +
+    patched default strength; park stays off at its 0.0 default)."""
+
+    def _prop_data(self):
+        return {
+            "commence_time": "2026-07-20T23:10:00Z",
+            "home_team": "Chicago Cubs",
+            "away_team": "Houston Astros",
+            "game_id": "evt-wx",
+            "props": {
+                "batter_hits": {
+                    "Windy Will": {
+                        "line": 0.5, "over_implied": 0.5, "under_implied": 0.5,
+                        "over_price": -110, "under_price": -110,
+                        "over_book": "DK", "under_book": "DK",
+                    }
+                }
+            },
+        }
+
+    def _histories(self, n=12):
+        dates = [f"2026-06-{d:02d}" for d in range(1, 1 + n)]
+        return {
+            "Windy Will": {
+                "batter_hits": {
+                    "found": True,
+                    "values": [1.0] * n,
+                    "opponents": ["Minnesota Twins"] * n,
+                    "home_aways": [False] * n,
+                    "game_dates": list(reversed(dates)),
+                }
+            }
+        }
+
+    def _run(self, weather, strength):
+        with patch.object(props, "DEFAULT_PLAYER_PROP_WEATHER_STRENGTH", strength):
+            cands = props.analyze_player_props_value(
+                self._prop_data(), self._histories(),
+                threshold_pct=1.0, sport_key=None, weather=weather)
+        return cands[0]
+
+    def test_off_is_neutral(self):
+        off = self._run({"temp_f": 95, "wind_out_mph": 12, "dome": False}, 0.0)
+        self.assertIsNone(off["weather"])
+        self.assertAlmostEqual(off["avg_stat"], 1.0, places=2)
+
+    def test_hot_windy_raises_projection(self):
+        weather = {"temp_f": 90, "wind_out_mph": 10, "dome": False}
+        on = self._run(weather, 1.0)
+        self.assertIsNotNone(on["weather"])
+        self.assertGreater(on["avg_stat"], 1.0)
+        expected_mult = props._weather_factor_mult("batter_hits", weather, 1.0)[0]
+        self.assertAlmostEqual(on["avg_stat"], round(expected_mult, 2), places=2)
+
+    def test_no_weather_data_is_neutral(self):
+        on = self._run(None, 1.0)
+        self.assertIsNone(on["weather"])
+        self.assertAlmostEqual(on["avg_stat"], 1.0, places=2)
+
+
+class WeatherFetchTests(unittest.TestCase):
+    """P1.3: weather_factors.get_game_weather (hermetic — requests patched)."""
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    _PAYLOAD = {"hourly": {
+        "time": ["2026-07-24T19:00", "2026-07-24T20:00", "2026-07-24T21:00"],
+        "temperature_2m": [70, 80, 90],
+        "wind_speed_10m": [5, 10, 15],
+        "wind_direction_10m": [180, 180, 180],
+    }}
+
+    def test_nearest_hour_and_wind_out(self):
+        with patch("weather_factors.requests.get",
+                   return_value=self._Resp(self._PAYLOAD)) as mock_get:
+            # Coors (cf_bearing≈2, roof open); first pitch 20:10Z → 20:00 hour.
+            w = weather_factors.get_game_weather(
+                "Colorado Rockies", "2026-07-24T20:10:00Z", use_cache=False)
+        self.assertTrue(mock_get.called)
+        self.assertEqual(w["temp_f"], 80)
+        self.assertEqual(w["wind_mph"], 10)
+        self.assertFalse(w["dome"])
+        # Wind from due south into a ~north-facing CF → ~full 10 mph blowing out.
+        self.assertAlmostEqual(w["wind_out_mph"], 10.0, places=1)
+
+    def test_dome_skips_fetch(self):
+        with patch.object(weather_factors, "park_geo",
+                          return_value={"lat": 0.0, "lon": 0.0,
+                                        "cf_bearing": 0, "roof": "dome"}), \
+             patch("weather_factors.requests.get") as mock_get:
+            w = weather_factors.get_game_weather(
+                "Domed Team", "2026-07-24T20:10:00Z", use_cache=False)
+        self.assertTrue(w["dome"])
+        self.assertIsNone(w["wind_out_mph"])
+        self.assertFalse(mock_get.called)
+
+    def test_unknown_park_skips_fetch(self):
+        with patch("weather_factors.requests.get") as mock_get:
+            w = weather_factors.get_game_weather(
+                "Nowhere FC", "2026-07-24T20:10:00Z", use_cache=False)
+        self.assertFalse(mock_get.called)
+        self.assertIsNone(w["temp_f"])
+        self.assertFalse(w["dome"])
+
+    def test_network_error_fails_open(self):
+        with patch("weather_factors.requests.get",
+                   side_effect=requests.RequestException("boom")):
+            w = weather_factors.get_game_weather(
+                "Colorado Rockies", "2026-07-24T20:10:00Z", use_cache=False)
+        self.assertIsNone(w["temp_f"])
+        self.assertIsNone(w["wind_out_mph"])
+        self.assertFalse(w["dome"])
 
 
 if __name__ == "__main__":

@@ -1607,6 +1607,9 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
         "rest_adj": rest_adj,                # B2B / rest-days projection scaling
         "def_window": def_window,            # use only last N opp games for defense (None = season)
         "park_strength": park_strength,      # P1.2 ballpark road-context delta (MLB hits/ER)
+        # NB: no weather knob (P1.3). Weather (props._weather_factor_mult) is a
+        # LIVE-ONLY signal — there's no historical per-game weather to reconstruct,
+        # so a backtest variant would be a no-op. It ships gated on CLV instead.
     }
 
 

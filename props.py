@@ -284,6 +284,33 @@ DEFAULT_PLAYER_PROP_PARK_STRENGTH = 0.0  # off for sports with no park table
 PARK_FACTOR_BOUNDS = (0.85, 1.20)
 
 
+# ── Weather / wind adjustment (P1.3) ──
+# Strength of the pre-game weather nudge applied to the projection. Unlike park
+# factors this is an ABSOLUTE, baseline-relative adjustment (vs 70 F / no wind):
+# a player's ~15-game sample spans random weather, so its mean already reflects
+# typical conditions — no road-context delta or double-count. The per-game
+# forecast (temperature + out/in-to-CF wind) is fetched by the caller
+# (weather_factors.get_game_weather) and passed in; only props in
+# park_factors.PROP_PARK_KIND (batter_hits, pitcher_earned_runs) move. This
+# CANNOT be validated on the projection backtest (no historical weather stored),
+# so it ships ON at a CONSERVATIVE strength and is gated on CLV as forward data
+# accrues (like the sharp-book weights). 0.0 disables; per-prop override via
+# calibration JSON "weather_factor_strength".
+PLAYER_PROP_WEATHER_STRENGTH = {"baseball_mlb": 0.5}
+DEFAULT_PLAYER_PROP_WEATHER_STRENGTH = 0.0  # off for sports with no park geo
+# Bounds on the final weather multiplier (caps extreme temp/wind forecasts).
+WEATHER_FACTOR_BOUNDS = (0.88, 1.15)
+WEATHER_BASELINE_TEMP_F = 70.0
+# Per stat kind (park_factors.PROP_PARK_KIND): (fraction per F above baseline,
+# fraction per mph of out-to-CF wind). Judgment priors from standard sabermetric
+# rules of thumb — conservative, knob-tunable, refine on CLV. Runs (earned runs)
+# is more weather-sensitive than a single hit, so it carries larger coefficients.
+_WEATHER_COEF = {
+    "hits": (0.0010, 0.0030),
+    "runs": (0.0015, 0.0060),
+}
+
+
 # Per-sport override for the recency half-life *for player props specifically*.
 # When set, overrides the team-level RECENCY_HALF_LIFE for the player-prop
 # projection. Zero disables exponential decay; None inherits from
@@ -345,6 +372,13 @@ def _player_prop_park_strength(sport_key):
         sport_key, DEFAULT_PLAYER_PROP_PARK_STRENGTH)
 
 
+def _player_prop_weather_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_WEATHER_STRENGTH
+    return PLAYER_PROP_WEATHER_STRENGTH.get(
+        sport_key, DEFAULT_PLAYER_PROP_WEATHER_STRENGTH)
+
+
 def _park_factor_mult(prop_key, past_parks, past_weights, upcoming_park,
                       strength):
     """Road-context ballpark multiplier for an MLB player-prop projection.
@@ -401,6 +435,53 @@ def _park_factor_mult(prop_key, past_parks, past_weights, upcoming_park,
     }
 
 
+def _weather_factor_mult(prop_key, weather, strength):
+    """Baseline-relative weather multiplier for an MLB player-prop projection.
+
+    Scales the projection by tonight's forecast temperature + out/in-to-CF wind
+    relative to a NEUTRAL baseline (70 F, no wind). This is an ABSOLUTE adjustment,
+    not a road-context delta like park factors: a player's recent sample spans
+    random weather, so its mean ≈ typical conditions and only tonight's departure
+    from neutral should move the projection. 1.0 = no change.
+
+    Args:
+        prop_key: odds-API prop market key (maps to a stat kind via
+            park_factors.PROP_PARK_KIND; unmapped props → no effect).
+        weather: per-game forecast dict from weather_factors.get_game_weather
+            ({"temp_f","wind_out_mph","dome",...}); None/empty/dome → no effect.
+        strength: 0..1 fraction of the raw departure to apply.
+
+    Returns:
+        (multiplier, meta_dict or None). Fails closed to (1.0, None) when the prop
+        is park-neutral, strength<=0, the game is a dome, or no usable forecast.
+    """
+    kind = PROP_PARK_KIND.get(prop_key)
+    if not kind or not strength or strength <= 0 or not weather:
+        return 1.0, None
+    if weather.get("dome"):
+        return 1.0, None
+    temp_f = weather.get("temp_f")
+    wind_out = weather.get("wind_out_mph")
+    if temp_f is None and wind_out is None:
+        return 1.0, None
+    temp_coef, wind_coef = _WEATHER_COEF[kind]
+    raw = 1.0
+    if temp_f is not None:
+        raw += temp_coef * (temp_f - WEATHER_BASELINE_TEMP_F)
+    if wind_out is not None:
+        raw += wind_coef * wind_out
+    lo, hi = WEATHER_FACTOR_BOUNDS
+    mult = max(lo, min(hi, 1.0 + strength * (raw - 1.0)))
+    if mult == 1.0:
+        return 1.0, None
+    return mult, {
+        "kind": kind,
+        "temp_f": round(temp_f, 1) if temp_f is not None else None,
+        "wind_out_mph": round(wind_out, 1) if wind_out is not None else None,
+        "mult": round(mult, 3),
+    }
+
+
 def _player_prop_half_life(sport_key):
     """
     Per-sport override for the recency half-life applied to player props.
@@ -415,7 +496,8 @@ def _player_prop_half_life(sport_key):
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
-                               team_schedules=None, matchup_features=None):
+                               team_schedules=None, matchup_features=None,
+                               weather=None):
     """
     Compare player prop lines against historical stat values from ESPN.
 
@@ -473,6 +555,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_shrinkage_k = _player_prop_shrinkage_k(sport_key)
     default_market_prior_k = _player_prop_market_prior_k(sport_key)
     default_park_strength = _player_prop_park_strength(sport_key)
+    default_weather_strength = _player_prop_weather_strength(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -509,6 +592,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         shrinkage_k = _knob(prop_key, "shrinkage_k", default_shrinkage_k)
         market_prior_k = _knob(prop_key, "market_prior_k", default_market_prior_k)
         park_strength = _knob(prop_key, "park_factor_strength", default_park_strength)
+        weather_strength = _knob(prop_key, "weather_factor_strength", default_weather_strength)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -720,8 +804,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     prop_key, past_parks, weights, home_team_name,
                     park_strength)
 
+            # ── Weather / wind adjustment (P1.3) ──
+            # Baseline-relative (70 F / no wind) temperature + out/in-to-CF wind
+            # nudge for MLB batter_hits / pitcher_earned_runs. `weather` is the
+            # per-game forecast the caller (app.py) fetched via
+            # weather_factors.get_game_weather; None / dome / no forecast → 1.0.
+            weather_mult, weather_meta = _weather_factor_mult(
+                prop_key, weather, weather_strength)
+
             combined_mult = (output_def_mult * matchup_mult
-                             * lineup_mult * park_mult)
+                             * lineup_mult * park_mult * weather_mult)
 
             avg_stat = base_proj * combined_mult
             # When the projection is scaled, the over-rate calc shifts the
@@ -962,6 +1054,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "calibration": calibration_meta,
                     "recalibration": recal_meta,
                     "park_factor": park_meta,
+                    "weather": weather_meta,
                     "_values": list(values),
                     "_weights": list(weights),
                 })
@@ -1083,6 +1176,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "recalibration": recal_meta,
                 "market_prior": market_prior_meta,
                 "park_factor": park_meta,
+                "weather": weather_meta,
                 "_values": list(values),
                 "_weights": list(weights),
             })
