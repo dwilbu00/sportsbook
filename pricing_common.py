@@ -211,15 +211,25 @@ VENUE_MATCH_WEIGHTS = {
 DEFAULT_VENUE_WEIGHTS = (1.15, 0.90)
 
 
-def _venue_match_multiplier(past_is_home, upcoming_is_home, sport_key):
+def _venue_match_multiplier(past_is_home, upcoming_is_home, sport_key,
+                            strength=None):
     """
     Return a multiplier that up-weights past games played at the same venue
     type (home vs road) as the upcoming game. If either side's venue is
     unknown, return 1.0 (no adjustment).
+
+    ``strength`` (P2.1 parity fix): when a numeric half-spread is supplied, use
+    ``(1+strength, 1-strength)`` — IDENTICAL to backtest.venue_mult, so a
+    backtest-selected venue_strength behaves the same live as it was validated.
+    When None (default / team-level callers) fall back to the fixed per-sport
+    VENUE_MATCH_WEIGHTS (legacy behavior).
     """
     if past_is_home is None or upcoming_is_home is None:
         return 1.0
-    match_w, mismatch_w = VENUE_MATCH_WEIGHTS.get(sport_key, DEFAULT_VENUE_WEIGHTS)
+    if strength is not None:
+        match_w, mismatch_w = 1.0 + strength, 1.0 - strength
+    else:
+        match_w, mismatch_w = VENUE_MATCH_WEIGHTS.get(sport_key, DEFAULT_VENUE_WEIGHTS)
     return match_w if past_is_home == upcoming_is_home else mismatch_w
 
 

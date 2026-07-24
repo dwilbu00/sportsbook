@@ -761,9 +761,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         team_defense.get(opp), league_avg_def, defense_strength)
                 # Venue multiplier: a per-sport PLAYER_PROP_VENUE_STRENGTH of
                 # 0.0 disables it; None (default) inherits the team-level
-                # VENUE_MATCH_WEIGHTS via _venue_match_multiplier.
+                # VENUE_MATCH_WEIGHTS. P2.1 parity fix: a NUMERIC override applies
+                # the (1±s) half-spread the backtest validated (was silently using
+                # the fixed 1.40/0.60 regardless of the selected magnitude).
                 if venue_strength_override != 0.0:
-                    w *= _venue_match_multiplier(past_h, upcoming_is_home, sport_key)
+                    w *= _venue_match_multiplier(
+                        past_h, upcoming_is_home, sport_key,
+                        strength=venue_strength_override)
                 weights.append(w)
 
             # ── Output-side opponent-defense adjustment ──

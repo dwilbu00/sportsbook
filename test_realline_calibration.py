@@ -236,5 +236,75 @@ class RefitSportRealLinesTests(unittest.TestCase):
         save_mock.assert_not_called()
 
 
+class VariantGateTests(unittest.TestCase):
+    """P2.1: the variant confirmation gate (refit_calibration._variant_confirms)."""
+
+    def _score(self, method, brier):
+        return [{"method": method, "k": None, "brier": brier, "hit": 0.5}]
+
+    def test_accepts_when_candidate_beats_baseline_in_both_folds(self):
+        # 2 folds; per fold _variant_confirms scores candidate then baseline.
+        folds = [(["t"], ["s"]), (["t"], ["s"])]
+        seq = [self._score("C", 0.20), self._score("A", 0.25),   # fold 1: cand<base
+               self._score("C", 0.21), self._score("A", 0.24)]   # fold 2: cand<base
+        with patch.object(refit_calibration, "_chronological_folds",
+                          return_value=folds), \
+             patch.object(refit_calibration, "_score_calibration_methods",
+                          side_effect=seq):
+            self.assertTrue(refit_calibration._variant_confirms(
+                ["cand"], ["base"], "C"))
+
+    def test_rejects_when_candidate_loses_one_fold(self):
+        folds = [(["t"], ["s"]), (["t"], ["s"])]
+        seq = [self._score("C", 0.20), self._score("A", 0.25),   # fold 1: cand<base
+               self._score("C", 0.26), self._score("A", 0.24)]   # fold 2: cand>=base
+        with patch.object(refit_calibration, "_chronological_folds",
+                          return_value=folds), \
+             patch.object(refit_calibration, "_score_calibration_methods",
+                          side_effect=seq):
+            self.assertFalse(refit_calibration._variant_confirms(
+                ["cand"], ["base"], "C"))
+
+    def test_rejects_when_no_baseline_or_thin_data(self):
+        self.assertFalse(refit_calibration._variant_confirms(["c"], [], "C"))
+        with patch.object(refit_calibration, "_chronological_folds",
+                          return_value=[]):
+            self.assertFalse(refit_calibration._variant_confirms(
+                ["c"], ["b"], "C"))
+
+    def test_is_baseline_variant(self):
+        self.assertTrue(refit_calibration._is_baseline_variant(
+            "none/defadj0.0/ven0.0"))
+        self.assertFalse(refit_calibration._is_baseline_variant(
+            "hl15/defadj0.0/ven0.25"))
+        self.assertFalse(refit_calibration._is_baseline_variant(
+            "none/defadj1.0/ven0.0"))
+
+
+class VenueParityTests(unittest.TestCase):
+    """P2.1: runtime venue multiplier honors the numeric strength (== backtest)."""
+
+    def test_numeric_strength_matches_backtest_spread(self):
+        import pricing_common
+        f = pricing_common._venue_match_multiplier
+        # strength 0.25 -> (1.25 match, 0.75 mismatch), identical to backtest.venue_mult
+        self.assertAlmostEqual(f(True, True, "baseball_mlb", strength=0.25), 1.25)
+        self.assertAlmostEqual(f(True, False, "baseball_mlb", strength=0.25), 0.75)
+        self.assertAlmostEqual(f(False, False, "baseball_mlb", strength=0.40), 1.40)
+
+    def test_none_strength_keeps_legacy_fixed_weights(self):
+        import pricing_common
+        f = pricing_common._venue_match_multiplier
+        # No strength -> the fixed per-sport VENUE_MATCH_WEIGHTS (MLB 1.40/0.60).
+        self.assertAlmostEqual(f(True, True, "baseball_mlb"), 1.40)
+        self.assertAlmostEqual(f(True, False, "baseball_mlb"), 0.60)
+
+    def test_unknown_venue_is_neutral(self):
+        import pricing_common
+        self.assertEqual(
+            pricing_common._venue_match_multiplier(None, True, "baseball_mlb",
+                                                   strength=0.25), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

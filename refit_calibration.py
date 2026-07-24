@@ -236,6 +236,48 @@ def _cv_brier(obs, method):
     return round(sum(briers) / len(briers), 4)
 
 
+def _is_baseline_variant(vname):
+    """True for the all-knobs-off sweep cell (plain recency mean, no def/venue).
+    It is the floor the P2.1 variant gate measures candidates against, and is
+    always eligible WITHOUT the gate (so a winner always exists)."""
+    p = _parse_variant_name(vname)
+    return (bool(p) and not p.get("half_life") and not p.get("output_def_strength")
+            and not p.get("venue_strength") and not p.get("opp_defense_strength"))
+
+
+def _baseline_variant_obs(results, prop_key):
+    """calib_obs for the baseline (all-off) variant, for the variant gate."""
+    for vname, by_prop in results.items():
+        if _is_baseline_variant(vname):
+            return by_prop.get(prop_key, {}).get("calib_obs") or []
+    return []
+
+
+def _variant_confirms(cand_obs, base_obs, cand_method):
+    """P2.1: a non-baseline VARIANT (with its selected method) must beat the
+    BASELINE variant (method A — knobs off, empirical) out-of-sample in BOTH
+    chronological folds. Clones _confirms_over_baseline onto the knob axis: noise
+    that wins the single 50/50 split will not also beat the do-nothing baseline in
+    two independent later folds. Returns False when data is too thin to confirm
+    (→ the safe baseline is used instead)."""
+    if not base_obs:
+        return False
+    cand_folds = _chronological_folds(cand_obs)
+    base_folds = _chronological_folds(base_obs)
+    if not cand_folds or not base_folds or len(cand_folds) != len(base_folds):
+        return False
+    for (cf, cs), (bf, bs) in zip(cand_folds, base_folds):
+        ce = {e["method"]: e for e in _score_calibration_methods(cf, cs, ())
+              if e["k"] in (None, 0) and e["brier"] is not None}
+        be = {e["method"]: e for e in _score_calibration_methods(bf, bs, ())
+              if e["k"] in (None, 0) and e["brier"] is not None}
+        c = ce.get(cand_method)
+        b = be.get("A")
+        if not c or not b or c["brier"] >= b["brier"]:
+            return False
+    return True
+
+
 def _best_per_prop(results, props, k_values=(0,)):
     """
     For each prop, evaluate every (variant × method) on a chronological holdout
@@ -248,11 +290,13 @@ def _best_per_prop(results, props, k_values=(0,)):
     """
     winners = {}
     for prop_key in props:
+        base_obs = _baseline_variant_obs(results, prop_key)
         best = None
         for vname, by_prop in results.items():
             obs = by_prop[prop_key].get("calib_obs") or []
             if not obs:
                 continue
+            is_baseline = _is_baseline_variant(vname)
             evals = _evaluate_calibration_methods(obs, k_values, holdout=True)
             by_method = {}
             for e in evals:
@@ -272,6 +316,14 @@ def _best_per_prop(results, props, k_values=(0,)):
                         continue
                     if not _confirms_over_baseline(obs, method):
                         continue
+                # P2.1 variant gate: a non-baseline knob combo must ALSO beat the
+                # baseline variant out-of-sample in both folds — else it's likely a
+                # single-split winner's-curse and we keep the baseline (the floor).
+                # Only active when the sweep actually contains the baseline cell
+                # (always true in the real grid; skipped in narrow unit fixtures).
+                if (base_obs and not is_baseline
+                        and not _variant_confirms(obs, base_obs, method)):
+                    continue
                 if best is None or e["brier"] < best["brier"]:
                     best = {
                         "variant": vname,
@@ -282,6 +334,7 @@ def _best_per_prop(results, props, k_values=(0,)):
                                            if baseline else None),
                         "cv_brier": _cv_brier(obs, method),
                         "confirmed": method != "A",
+                        "variant_confirmed": not is_baseline,
                     }
         if best:
             winners[prop_key] = best
@@ -310,6 +363,9 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
         "baseline_brier": winner.get("baseline_brier"),
         "cv_brier": winner.get("cv_brier"),
         "confirmed": winner.get("confirmed", False),
+        # P2.1: whether the winning knob combo cleared the variant confirmation
+        # gate (beat the baseline variant in both folds). False = baseline (floor).
+        "variant_confirmed": winner.get("variant_confirmed", False),
     }
     cfg.update(fit)
     return cfg
