@@ -1053,6 +1053,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "matchup": matchup,
                 "player": player_name,
                 "team": player_team_name,
+                # Confirmed lineup slot (1-9) when posted, else None. Used by the
+                # auto-pick "top X value bets" rule that focuses hitter Overs on
+                # the top of the order; .get() (not the MLB-scoped local var) so
+                # non-MLB sports safely resolve to None.
+                "batting_order": history.get("batting_order"),
                 "prop": prop_key,
                 "prop_label": PROP_LABELS.get(prop_key, prop_key),
                 "line": line,

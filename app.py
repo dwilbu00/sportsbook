@@ -440,6 +440,54 @@ def _submit_selected_picks(ar):
     )
 
 
+# Auto-pick ranking-metric labels (UI) → bet_selector metric keys.
+_AUTO_PICK_METRICS = {
+    "Expected value (EV)": "ev",
+    "Edge %": "edge",
+    "Win probability": "prob",
+    "Balanced (EV + win prob)": "balanced",
+}
+
+
+def _auto_pick_top_bets(ar):
+    """Fill the checklist with the top-N rule-compliant value bets (EV-ranked by
+    default). Runs as a button callback — before the checkbox widgets re-instantiate
+    — so clearing then setting bet_selection:* keys is safe. REPLACES the current
+    selection (not auto-submitted): the user still adds/removes bets and sets the
+    stake before hitting Submit."""
+    import bet_selector
+    try:
+        n = int(st.session_state.get("auto_pick_count", 5) or 5)
+    except (TypeError, ValueError):
+        n = 5
+    n = max(1, n)
+    metric = _AUTO_PICK_METRICS.get(
+        st.session_state.get("auto_pick_metric"), "ev")
+    sport_key = ar.get("sport_key")
+    # Build the pool from the same source the Submit path uses, but drop spread /
+    # player-prop candidates with < 5 games sampled so every auto-pick has a real
+    # rendered checkbox (mirrors the results filter at the render site below).
+    pool = []
+    for sel_key, bet_type, side, cand in _iter_wager_candidates(ar):
+        if (bet_type in ("spread", "player_prop")
+                and (cand.get("games_sampled") or 0) < 5):
+            continue
+        pool.append((sel_key, bet_type, side, cand))
+    chosen = bet_selector.select_top_bets(pool, sport_key, n, metric=metric)
+    _clear_bet_selections()
+    for key in chosen:
+        st.session_state[key] = True
+    if chosen:
+        st.session_state["_submit_picks_msg"] = (
+            "success",
+            f"Replaced your selections with the top {len(chosen)} value bet(s) "
+            "— adjust below, then Submit.",
+        )
+    else:
+        st.session_state["_submit_picks_msg"] = (
+            "warning", "No value bets available to auto-pick.")
+
+
 def _render_selected_bet_checklist(entries, ar):
     msg = st.session_state.pop("_submit_picks_msg", None)
     selected = [
@@ -450,6 +498,32 @@ def _render_selected_bet_checklist(entries, ar):
         st.subheader("🧾 Selected DraftKings Bets")
         if msg:
             getattr(st, msg[0], st.info)(msg[1])
+        # Auto-pick row — rendered ABOVE the "nothing selected yet" guard so it's
+        # available before any box is ticked (the whole section only renders when
+        # value bets exist). Selects the top-N EV-ranked, rule-compliant value
+        # bets into the checklist; not auto-submitted.
+        auto_n = int(st.session_state.get("auto_pick_count", 5) or 5)
+        count_col, metric_col, pick_col = st.columns([1, 1.6, 1.4])
+        with count_col:
+            st.number_input(
+                "How many", min_value=1, max_value=25, value=5, step=1,
+                key="auto_pick_count",
+                help="Number of top value bets to auto-select.",
+            )
+        with metric_col:
+            st.selectbox(
+                "Rank by", list(_AUTO_PICK_METRICS.keys()),
+                key="auto_pick_metric",
+                help="Metric used to rank value bets before applying the parlay "
+                     "anti-correlation rules and MLB slate rules.",
+            )
+        with pick_col:
+            st.button(
+                f"🎯 Auto-pick top {auto_n}", key="auto_pick_btn",
+                width="stretch",
+                help="Replace your current selection with the top-ranked, "
+                     "rule-compliant value bets (not auto-submitted).",
+                on_click=_auto_pick_top_bets, args=(ar,))
         if not selected:
             st.caption(
                 "Select “Add to DraftKings bet list” on any value bet to build "
@@ -1532,7 +1606,8 @@ config = load_config()
 # which is a plain key Streamlit never garbage-collects.
 for _persist_key in list(st.session_state.keys()):
     if (_persist_key in ("sport", "markets", "props", "result_filter",
-                         "wager_unit_stake")
+                         "wager_unit_stake", "auto_pick_count",
+                         "auto_pick_metric")
             or str(_persist_key).startswith("bet_selection:")):
         st.session_state[_persist_key] = st.session_state[_persist_key]
 
