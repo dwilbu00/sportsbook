@@ -46,8 +46,34 @@ MIN_CALIB_BRIER_GAIN = 0.002
 # else it inherits the pooled method. Ships inert until a bucket earns it.
 LINE_CONDITIONAL_PROPS = {"batter_hits"}
 LINE_BUCKETS = [0.5, None]          # ascending max_line; None = open-ended top
-MIN_BUCKET_OBS = 150               # per-bucket floor before a bucket can flip
+# Per-bucket floor before a bucket can flip. Comfortably above the 2-fold
+# confirmation gate's own minimum (~60 obs to form the two expanding folds) for a
+# more robust confirmation, but below the whole-prop obs count so a higher-line
+# bucket can qualify as it accrues. The 2-fold gate is still the winner's-curse
+# safeguard: a bucket only flips if its winner beats empirical in BOTH folds AND
+# beats the pooled method on the bucket by >= MIN_CALIB_BRIER_GAIN.
+MIN_BUCKET_OBS = 100
 LINE_COND_XSTATS_STRENGTH = 0.5    # xBA weight used when scoring method D
+
+
+def _lc_bucket_counts(enriched, prop_key):
+    """{max_line_cap: n_obs} for a prop's line buckets (LINE_BUCKETS). A line
+    falls in the first bucket whose cap >= it (cap None = the open-ended top)."""
+    counts = {}
+    prev = None
+    for cap in LINE_BUCKETS:
+        n = 0
+        for o in enriched:
+            if not isinstance(o, dict) or o.get("prop_key") != prop_key:
+                continue
+            ln = o.get("line")
+            if ln is None:
+                continue
+            if (prev is None or ln > prev) and (cap is None or ln <= cap):
+                n += 1
+        counts[cap] = n
+        prev = cap
+    return counts
 
 
 def _lc_bucket_ready(enriched, target_props):
@@ -55,27 +81,13 @@ def _lc_bucket_ready(enriched, target_props):
     bucket with >= MIN_BUCKET_OBS observations — i.e. line-conditional selection
     could actually flip a bucket. Lets us skip the expensive raw-Statcast load on
     a plain --real-lines run until a higher-line bucket has earned a look."""
-    props_lc = LINE_CONDITIONAL_PROPS & set(target_props)
-    if not props_lc:
-        return False
-    for pk in props_lc:
-        prev = None
+    for pk in (LINE_CONDITIONAL_PROPS & set(target_props)):
+        counts = _lc_bucket_counts(enriched, pk)
         for i, cap in enumerate(LINE_BUCKETS):
             if i == 0:              # the primary bucket alone never triggers a flip
-                prev = cap
                 continue
-            n = 0
-            for o in enriched:
-                if not isinstance(o, dict) or o.get("prop_key") != pk:
-                    continue
-                ln = o.get("line")
-                if ln is None:
-                    continue
-                if (prev is None or ln > prev) and (cap is None or ln <= cap):
-                    n += 1
-            if n >= MIN_BUCKET_OBS:
+            if counts.get(cap, 0) >= MIN_BUCKET_OBS:
                 return True
-            prev = cap
     return False
 
 
@@ -685,6 +697,16 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     # gate) — so a plain --real-lines run doesn't pay the raw-Statcast load until
     # a higher-line bucket has earned a look. Independent of --xstats-strength.
     need_lc = _lc_bucket_ready(enriched, target_props)
+    # Surface per-bucket obs counts so it's visible whether line-conditional
+    # selection can engage (and, if not, how far the higher-line bucket has to go).
+    for _pk in (LINE_CONDITIONAL_PROPS & set(target_props)):
+        _counts = _lc_bucket_counts(enriched, _pk)
+        _pretty = ", ".join(
+            (f"<={cap}" if cap is not None else ">top") + f":{_counts[cap]}"
+            for cap in LINE_BUCKETS)
+        print(f"  [line-cond] {_pk} bucket obs: {_pretty} "
+              f"(need >={MIN_BUCKET_OBS} in a non-primary bucket to engage; "
+              f"{'ENGAGING' if need_lc else 'inert'})")
     xba_index = None
     lc_quality_index = None
     if (xstats_strength and xstats_strength > 0) or need_lc:
@@ -1101,6 +1123,17 @@ def main():
                    help="xBA blend weight for the --dist-diag xBA variants "
                         "(default 0.5).")
     args = p.parse_args()
+
+    # Target the SQL backend when the SQL_* secrets are configured (mirrors the
+    # app's boot promotion + forward_tracker; outside Streamlit these aren't in
+    # the env yet). Without this the offline refit's mark_predictions_refit
+    # (banner reset) would write the LOCAL log instead of prod SQL. Falls back to
+    # Blob/local when SQL isn't configured.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
 
     if args.dist_diag:
         diagnose_distributional(args.sport, store_label=args.store_label,
