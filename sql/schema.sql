@@ -33,9 +33,19 @@ CREATE TABLE dbo.prediction_log (
     outcome       INT,                             -- 1=over, 0=under, NULL=push/unresolved
     is_value      BIT,                             -- tri-state (NULL allowed)
     resolved      BIT NOT NULL CONSTRAINT df_prediction_resolved DEFAULT (0),
+    -- 0 when logged; set 1 after an offline calibration refit consumes the row
+    -- (powers the app's "enough new data to refit" banner).
+    refit_performed BIT NOT NULL CONSTRAINT df_prediction_refit DEFAULT (0),
     CONSTRAINT uq_prediction_identity
         UNIQUE (sport_key, event_key, prop_key, player, line)
 );
+GO
+-- Idempotent add for an EXISTING prediction_log (the CREATE TABLE above only runs
+-- on a fresh DB). Run this once against the live database.
+IF COL_LENGTH('dbo.prediction_log', 'refit_performed') IS NULL
+    ALTER TABLE dbo.prediction_log
+        ADD refit_performed BIT NOT NULL
+            CONSTRAINT df_prediction_refit DEFAULT (0);
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_prediction_sport_resolved'
@@ -43,7 +53,12 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_prediction_sport_resolved
     ON dbo.prediction_log (sport_key, resolved);
 GO
-
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_prediction_refit_pending'
+                 AND object_id = OBJECT_ID('dbo.prediction_log'))
+CREATE INDEX ix_prediction_refit_pending
+    ON dbo.prediction_log (resolved, refit_performed);
+GO
 --------------------------------------------------------------------------- wagers
 IF OBJECT_ID('dbo.wagers', 'U') IS NULL
 CREATE TABLE dbo.wagers (

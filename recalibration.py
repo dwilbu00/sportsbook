@@ -52,6 +52,10 @@ MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
 MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
 MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
+# New RESOLVED predictions (refit_performed=0) that make the app suggest an
+# OFFLINE calibration refit. Higher than the online Platt gate (that's a cheap
+# 2-param nudge; this triggers a full offline method re-selection).
+MIN_NEW_FOR_OFFLINE_REFIT = 200
 AUTO_MAINTENANCE_INTERVAL_SECONDS = 3600
 RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal blob
 
@@ -265,6 +269,51 @@ def mutate_prediction_log(mutator, max_retries=5, where=None):
         except _LogConflict:
             continue
     raise RuntimeError("Prediction log changed repeatedly; update was not saved")
+
+
+def count_pending_refit(sport_key=None):
+    """Count RESOLVED prediction-log rows not yet consumed by an offline refit
+    (refit_performed falsy). This is the app's "enough new labeled data to refit"
+    signal — cheap SQL COUNT on the SQL path, in-memory count on the Blob/local
+    path. Best-effort: returns 0 on any error (a banner must never break a page)."""
+    where = {"resolved": True, "refit_performed": False}
+    if sport_key:
+        where["sport_key"] = sport_key
+    try:
+        if _sql():
+            return _db.count_rows(_PRED_TABLE, where=where)
+        rows = _read_log()
+        return sum(1 for r in rows
+                   if r.get("resolved") and not r.get("refit_performed")
+                   and (not sport_key or r.get("sport_key") == sport_key))
+    except Exception:
+        return 0
+
+
+def mark_predictions_refit(sport_key):
+    """Flag a sport's RESOLVED prediction-log rows as consumed by an offline refit
+    (refit_performed -> True), resetting count_pending_refit. Call after a
+    completed offline calibration refit. Returns the number flagged; best-effort.
+
+    Surgical on the SQL path (WHERE resolved=1 AND refit_performed=0); the mutator
+    self-filters on resolved so the where-ignoring Blob path is also correct."""
+    where = {"sport_key": sport_key, "resolved": True, "refit_performed": False}
+
+    def apply(rows):
+        changed = 0
+        for r in rows:
+            if not r.get("resolved") or r.get("refit_performed"):
+                continue
+            if not _sql() and sport_key and r.get("sport_key") != sport_key:
+                continue    # Blob path ignores `where` -> self-filter by sport
+            r["refit_performed"] = True
+            changed += 1
+        return changed
+
+    try:
+        return mutate_prediction_log(apply, where=where)
+    except Exception:
+        return 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -810,13 +810,30 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
               f"baseline(A)={sel['baseline_brier']} cv={sel['cv_brier']} "
               f"n={sel['n_obs']}")
 
+    if dry_run:
+        if changed:
+            print(f"\n[dry-run] {len(changed)} prop(s) would be written "
+                  f"({sorted(changed.keys())}); nothing saved.")
+        else:
+            print("\n[dry-run] no props would be re-selected; nothing saved.")
+        return
+
+    # The refit evaluated the accumulated resolved data, so flag those
+    # prediction-log rows as consumed — this resets the app's "time to refit"
+    # banner. Done even when no method changed (the data WAS used), never on a
+    # dry-run. Best-effort: a flag-write failure must not fail the refit.
+    try:
+        import recalibration
+        flagged = recalibration.mark_predictions_refit(sport_key)
+        if flagged:
+            print(f"  [refit] flagged {flagged} resolved prediction(s) as "
+                  f"refit-used (banner reset)")
+    except Exception:
+        pass
+
     if not changed:
         print("\nNo props had enough real-line data to re-select. "
-              "Nothing written.")
-        return
-    if dry_run:
-        print(f"\n[dry-run] {len(changed)} prop(s) would be written "
-              f"({sorted(changed.keys())}); nothing saved.")
+              "Nothing written (calibration unchanged).")
         return
 
     save_calibration(

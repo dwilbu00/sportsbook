@@ -1677,6 +1677,33 @@ if not st.session_state.get("_wagers_prefetched"):
         # Best-effort: My Bets lazily grades on open as the backstop.
         pass
 
+# "Time to refit" nudge: once per session, count RESOLVED MLB predictions not yet
+# consumed by an offline calibration refit (refit_performed=0, now trackable since
+# SQL rows are stable). When enough have accrued, surface a banner pointing at the
+# offline refit command. Cheap COUNT, cached per session; best-effort (never
+# breaks a page). The count resets after `refit_calibration ... --real-lines`
+# flags those rows.
+if "_pending_refit_count" not in st.session_state:
+    try:
+        import recalibration as _recal
+        st.session_state["_pending_refit_count"] = _recal.count_pending_refit(
+            "baseball_mlb")
+        st.session_state["_pending_refit_threshold"] = \
+            _recal.MIN_NEW_FOR_OFFLINE_REFIT
+    except Exception:
+        st.session_state["_pending_refit_count"] = 0
+        st.session_state["_pending_refit_threshold"] = None
+_pending_refit = st.session_state.get("_pending_refit_count", 0)
+_refit_threshold = st.session_state.get("_pending_refit_threshold")
+if _refit_threshold and _pending_refit >= _refit_threshold:
+    st.info(
+        f"**{_pending_refit} new resolved predictions** have accumulated since "
+        f"the last MLB calibration refit — enough to re-tune the model. When "
+        f"convenient, run the offline refit (free; uses ESPN + the durable "
+        f"store):\n\n"
+        f"```\npython refit_calibration.py --sport mlb --real-lines\n```",
+        icon="📊")
+
 with st.sidebar:
     app_page = st.radio(
         "Navigate",

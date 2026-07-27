@@ -119,9 +119,14 @@ prediction_log = Table(
     Column("outcome", Integer),                          # 1=over, 0=under, NULL
     Column("is_value", Boolean),                         # tri-state
     Column("resolved", Boolean, nullable=False, default=False),
+    # 0 when logged; set 1 after an offline calibration refit consumes the row.
+    # Lets the app count new resolved-but-not-yet-refit records (the "time to
+    # refit" banner) now that SQL rows are stable (surgical writes, not rewrites).
+    Column("refit_performed", Boolean, nullable=False, default=False),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player", "line",
                      name="uq_prediction_identity"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
+    Index("ix_prediction_refit_pending", "resolved", "refit_performed"),
 )
 
 # Actual bets ledger — one row per wager_id.
@@ -266,7 +271,7 @@ _PREDICTION_SPEC = [
     ("line", _f), ("raw_prob", _f), ("final_prob", _f), ("projected", _f),
     ("actual", _f),
     ("price", _i), ("outcome", _i),
-    ("is_value", _b), ("resolved", _bexact),
+    ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
 
 _WAGER_SPEC = [
@@ -508,6 +513,28 @@ def read_rows(table_name, where=None, max_retries=3):
         try:
             with engine.connect() as conn:
                 return _select_rows(conn, cfg, where)
+        except OperationalError as exc:  # transient (cold resume / lock / timeout)
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + 2 * attempt)
+    raise last_exc
+
+
+def count_rows(table_name, where=None, max_retries=3):
+    """COUNT(*) for an NDJSON store's SQL table, optionally filtered by an
+    equality/IN ``where`` map — cheap (no row egress), for the app's "time to
+    refit" banner. Retries transient OperationalErrors like read_rows."""
+    cfg = _resolve(table_name)
+    engine = get_engine()
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                stmt = select(func.count()).select_from(cfg["table"])
+                clause = _where_clause(cfg["table"], where)
+                if clause is not None:
+                    stmt = stmt.where(clause)
+                return int(conn.execute(stmt).scalar() or 0)
         except OperationalError as exc:  # transient (cold resume / lock / timeout)
             last_exc = exc
             if attempt < max_retries - 1:

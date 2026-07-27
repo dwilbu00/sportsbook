@@ -562,5 +562,45 @@ class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertEqual(warehouse.storage_backend(), "Azure SQL")
 
 
+class RefitPerformedTests(_SqliteBackend, unittest.TestCase):
+    """refit_performed flag + count_rows + recalibration count/mark helpers that
+    power the app's 'time to refit' banner."""
+
+    def _seed(self):
+        rows = [("A", True, False), ("B", True, False),
+                ("C", False, False), ("D", True, True)]
+
+        def add(existing):
+            for player, resolved, refit in rows:
+                existing.append({
+                    "sport_key": "baseball_mlb", "event_id": "E1",
+                    "prop_key": "batter_hits", "player": player, "line": 0.5,
+                    "resolved": resolved, "refit_performed": refit})
+            return len(rows)
+        db_store.mutate("prediction_log", add)
+
+    def test_new_row_defaults_false(self):
+        self._seed()
+        rows = {r["player"]: r for r in db_store.read_rows("prediction_log")}
+        self.assertFalse(rows["A"]["refit_performed"])   # not-null default 0
+
+    def test_count_rows_filtered(self):
+        self._seed()
+        self.assertEqual(
+            db_store.count_rows("prediction_log",
+                                where={"resolved": True, "refit_performed": False}),
+            2)                                            # A, B only
+
+    def test_count_pending_and_mark(self):
+        import recalibration
+        self._seed()
+        self.assertEqual(recalibration.count_pending_refit("baseball_mlb"), 2)
+        self.assertEqual(recalibration.mark_predictions_refit("baseball_mlb"), 2)
+        self.assertEqual(recalibration.count_pending_refit("baseball_mlb"), 0)
+        rows = {r["player"]: r for r in db_store.read_rows("prediction_log")}
+        self.assertFalse(rows["C"]["refit_performed"])   # unresolved untouched
+        self.assertTrue(rows["D"]["refit_performed"])    # already-flagged kept
+
+
 if __name__ == "__main__":
     unittest.main()
