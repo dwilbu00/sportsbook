@@ -56,6 +56,14 @@ MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
 # OFFLINE calibration refit. Higher than the online Platt gate (that's a cheap
 # 2-param nudge; this triggers a full offline method re-selection).
 MIN_NEW_FOR_OFFLINE_REFIT = 200
+# A prediction whose game is at least this old AND whose player never played it
+# (a confirmed scratch/DNP) is permanently unresolvable → voided so it stops
+# re-attempting and clears out of forward-tracking's pending list. A played
+# game's box score posts within hours, so 24h is ample for the common case. The
+# one edge it doesn't preserve — a postponement replayed as a next-day makeup —
+# is a non-issue: DK voids that bet, and one throwaway makeup calibration label
+# is negligible.
+STALE_DNP_HOURS = 24
 AUTO_MAINTENANCE_INTERVAL_SECONDS = 3600
 RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal blob
 
@@ -930,6 +938,33 @@ def _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence):
         return None
 
 
+def _is_stale_dnp(sport_key, prop_key, player, game_date, commence):
+    """True when an unresolved MLB prop is a confirmed scratch/DNP whose game is
+    at least STALE_DNP_HOURS old — permanently unresolvable, so it's safe to void
+    (clears it from pending + stops re-attempting every tick). Gated on age so a
+    same-day data lag isn't voided; gated on is_confirmed_dnp so a genuine data
+    outage (missing log) keeps retrying. Never raises."""
+    if sport_key != "baseball_mlb":
+        return False
+    spec = _mlb_stat_spec(prop_key)
+    if not spec:
+        return False
+    try:
+        import mlb_starters
+        commence_dt = mlb_starters._parse_utc(commence)
+        if commence_dt is None:
+            return False
+        age_hours = ((datetime.now(timezone.utc) - commence_dt).total_seconds()
+                     / 3600.0)
+        if age_hours < STALE_DNP_HOURS:
+            return False
+        season = int(str(game_date)[:4])
+        return mlb_starters.is_confirmed_dnp(
+            player, commence, game_date, spec[0], season)
+    except Exception:
+        return False
+
+
 def _load_player_gamelog(espn_sport, espn_league, player):
     """(gamelog, {date: [(full_datetime, idx), ...]}) from ESPN, or (None, {}).
 
@@ -1057,13 +1092,16 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     if not by_player:
         return 0
 
-    resolved_count = 0
+    resolved_count = 0     # genuine resolutions (a real outcome) — the return value
+    void_count = 0         # stale scratch/DNP rows retired (no outcome)
     resolved_updates = {}
+    # Cap total statsapi/ESPN work per pass on genuine + void attempts alike (a
+    # DNP backlog must not spin resolve_one_prop/is_confirmed_dnp unbounded).
     for player, p_rows in by_player.items():
-        if resolved_count >= max_to_resolve:
+        if resolved_count + void_count >= max_to_resolve:
             break
         for r in p_rows:
-            if resolved_count >= max_to_resolve:
+            if resolved_count + void_count >= max_to_resolve:
                 break
             commence = r.get("commence_time")
             # Shared resolver: statsapi hard-ID first, then cached ESPN gamelog.
@@ -1071,6 +1109,19 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
                 sport_key, player, r["prop_key"], r.get("line"),
                 r["game_date"], commence)
             if actual is None:
+                # A confirmed scratch/DNP whose game is well past is permanently
+                # unresolvable → void it (resolved, no outcome) so it leaves
+                # pending and stops re-attempting. A still-live game (resolver
+                # returns the sentinel, not None) or a data outage is NOT voided.
+                if _is_stale_dnp(sport_key, r["prop_key"], player,
+                                 r["game_date"], commence):
+                    resolved_updates[prediction_row_key(r)] = {
+                        "actual": None,
+                        "outcome": None,
+                        "resolved": True,
+                        "resolved_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    void_count += 1
                 continue
             line = float(r["line"])
             if actual == line:
@@ -1098,9 +1149,15 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
         return changed
 
     try:
-        return mutate_prediction_log(apply_resolutions, where=unresolved)
+        mutate_prediction_log(apply_resolutions, where=unresolved)
     except Exception:
         return 0
+    if void_count:
+        print(f"  [resolve] voided {void_count} stale unresolvable "
+              f"(scratch/DNP) prediction(s) for {sport_key}")
+    # Return only GENUINE resolutions — voids carry no label and must not trip
+    # the Platt refit gate (maintain_sport keys on this count).
+    return resolved_count
 
 
 # ──────────────────────────────────────────────────────────────────────────────

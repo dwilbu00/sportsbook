@@ -1183,6 +1183,35 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     return by_pk[pk]
 
 
+def is_confirmed_dnp(name, commence_time, game_date, group, season,
+                     max_age=3600):
+    """True when the player HAS a season game log but no game on the forecast
+    date — a scratch/DNP, so a prop logged for that game is permanently
+    unresolvable. Returns False when we can't be sure — unknown/ambiguous player,
+    a position-group mismatch, an EMPTY log (possible data outage, keep retrying),
+    or a matching game DOES exist (not a DNP). Uses a cached gamelog read by
+    default since the resolver typically fetched it fresh in the same pass."""
+    found = find_player_id(name, season)
+    if not found:
+        return False
+    pid, is_pitcher = found
+    if (group == "pitching" and not is_pitcher) or (group == "hitting"
+                                                    and is_pitcher):
+        return False
+    pks = set()
+    for sp in _player_gamelog_splits(pid, group, season, max_age=max_age):
+        pk = (sp.get("game") or {}).get("gamePk") or sp.get("gamePk")
+        if pk is not None:
+            pks.add(str(pk))
+    if not pks:
+        return False   # no log at all -> possible data outage, keep retrying
+    for d in _candidate_dates(game_date):
+        for pk in get_schedule_index(d):
+            if pk in pks:
+                return False   # a matching game exists -> not a DNP
+    return True   # has games this season, but none on the forecast date -> DNP
+
+
 if __name__ == "__main__":
     # Smoke test against the live API.
     import datetime

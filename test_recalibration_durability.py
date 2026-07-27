@@ -443,5 +443,52 @@ class NdjsonReadCacheTests(unittest.TestCase):
             self.assertIsNone(rows2[0]["close_price"])  # cache untouched
 
 
+class StaleDnpVoidTests(unittest.TestCase):
+    """A stale, confirmed scratch/DNP prediction is voided out of pending;
+    anything not-confirmed-DNP (data outage / too recent) keeps retrying."""
+
+    def _row(self):
+        return {"ts": "2024-07-04T10:00:00Z", "sport_key": "baseball_mlb",
+                "prop_key": "batter_hits", "player": "Scratch Sam",
+                "game_date": "2024-07-04", "commence_time": "2024-07-04T23:05:00Z",
+                "line": 0.5, "resolved": False}
+
+    def _run(self, row, is_dnp):
+        def mutate(mutator, where=None):
+            return mutator([row])
+        with patch.object(recalibration, "_read_log", return_value=[row]), \
+             patch.object(recalibration, "resolve_one_prop", return_value=None), \
+             patch.object(recalibration, "_is_stale_dnp", return_value=is_dnp), \
+             patch.object(recalibration, "mutate_prediction_log",
+                          side_effect=mutate):
+            return recalibration.resolve_pending_outcomes("baseball_mlb")
+
+    def test_stale_dnp_is_voided(self):
+        row = self._row()
+        ret = self._run(row, is_dnp=True)
+        self.assertTrue(row["resolved"])          # cleared out of pending
+        self.assertIsNone(row["outcome"])         # no label -> excluded from calib
+        self.assertIsNone(row["actual"])
+        self.assertEqual(ret, 0)                  # voids don't count as resolved
+
+    def test_unresolvable_but_not_dnp_stays_pending(self):
+        row = self._row()
+        ret = self._run(row, is_dnp=False)        # e.g. data outage / not stale yet
+        self.assertFalse(row.get("resolved"))     # keeps retrying next pass
+        self.assertNotIn("outcome", row)          # untouched
+        self.assertEqual(ret, 0)
+
+    def test_is_stale_dnp_age_gate(self):
+        # Non-MLB and non-stale games are never voided (unit-level gate check).
+        self.assertFalse(recalibration._is_stale_dnp(
+            "basketball_nba", "player_points", "X", "2024-07-04",
+            "2024-07-04T23:05:00Z"))
+        from datetime import datetime, timezone
+        recent = datetime.now(timezone.utc).isoformat()
+        self.assertFalse(recalibration._is_stale_dnp(
+            "baseball_mlb", "batter_hits", "X",
+            recent[:10], recent))                 # game just now -> under the gate
+
+
 if __name__ == "__main__":
     unittest.main()
