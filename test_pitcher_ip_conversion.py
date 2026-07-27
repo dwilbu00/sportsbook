@@ -186,5 +186,70 @@ class ProjectionBacktestTests(unittest.TestCase):
             self.assertAlmostEqual(synth, 18.0)  # mean of 6.0 -> 18 priors
 
 
+class StrikeoutRoleGateTests(unittest.TestCase):
+    """pitcher_strikeouts / batter_strikeouts share the "K"/"SO" labels; the
+    props sweep must not leak a batter's strikeouts into the pitcher-K pool
+    (or vice-versa). Gated on the pitcher-exclusive 'IP' field."""
+
+    def test_prop_role(self):
+        self.assertEqual(backtest._prop_role("pitcher_strikeouts"), "pitching")
+        self.assertEqual(backtest._prop_role("pitcher_outs"), "pitching")
+        self.assertEqual(backtest._prop_role("batter_hits"), "hitting")
+        self.assertEqual(backtest._prop_role("batter_strikeouts"), "hitting")
+        self.assertIsNone(backtest._prop_role("player_points"))  # NBA: no role
+
+    def test_gamelog_is_pitcher(self):
+        self.assertTrue(backtest._gamelog_is_pitcher([{"IP": 6.0, "K": 7}]))
+        self.assertFalse(backtest._gamelog_is_pitcher([{"SO": 2, "H": 1}]))
+        self.assertFalse(backtest._gamelog_is_pitcher([]))
+
+    def test_role_matches_gamelog(self):
+        pit = [{"IP": 6.0, "K": 7}]
+        bat = [{"SO": 2, "H": 1}]
+        self.assertTrue(backtest._role_matches_gamelog("pitcher_strikeouts", pit))
+        self.assertFalse(backtest._role_matches_gamelog("pitcher_strikeouts", bat))
+        self.assertTrue(backtest._role_matches_gamelog("batter_strikeouts", bat))
+        self.assertFalse(backtest._role_matches_gamelog("batter_strikeouts", pit))
+        # Non-MLB prop: no role concept -> always matches.
+        self.assertTrue(backtest._role_matches_gamelog("player_points", bat))
+
+    def test_sweep_does_not_cross_contaminate_strikeout_pools(self):
+        # A pitcher (K + IP) and a batter (SO, no IP). Swept for BOTH strikeout
+        # props, each pool must contain ONLY its own role's games.
+        pit_gl = [{"K": (7 if i == 0 else 6), "IP": 6.0,
+                   "game_date": f"2025-07-{20 - i:02d}T18:00:00Z",
+                   "is_home": True, "opponent": "NYY"} for i in range(10)]
+        bat_gl = [{"SO": (2 if i == 0 else 1), "H": 1,
+                   "game_date": f"2025-07-{20 - i:02d}T18:00:00Z",
+                   "is_home": True, "opponent": "BOS"} for i in range(10)]
+        off = {"half_life": None, "venue_strength": 0.0,
+               "opp_defense_strength": 0.0, "def_adj": 0.0, "pace_adj": 0.0,
+               "park_strength": 0.0, "shrink_k": 0.0, "rest_adj": 0.0,
+               "use_minutes": False}
+        passthrough = lambda prior, sched, sk, **kw: {
+            "skip_prediction": False, "skip_reason": None,
+            "eligible_games": prior}
+        with patch.object(backtest, "fetch_player_data",
+                          return_value={"Pitcher": pit_gl, "Batter": bat_gl}), \
+             patch("prop_filter.filter_player_gamelog", side_effect=passthrough), \
+             patch.object(backtest, "get_all_teams", return_value={}), \
+             patch.object(backtest, "_team_defense_lookup",
+                          return_value=({}, {}, None)), \
+             patch.object(backtest, "_team_pace_lookup", return_value=({}, None)):
+            res = backtest.run_player_props_backtest(
+                "MLB", "baseball", "mlb", "baseball_mlb",
+                players=["Pitcher", "Batter"],
+                props=["pitcher_strikeouts", "batter_strikeouts"],
+                games_per_player=1, min_sample=3,
+                variants={"base": off}, calibrate=True)
+
+        pit_obs = res["base"]["pitcher_strikeouts"]["calib_obs"]
+        bat_obs = res["base"]["batter_strikeouts"]["calib_obs"]
+        self.assertTrue(pit_obs)   # the correct role still resolves
+        self.assertTrue(bat_obs)
+        self.assertEqual({o[0] for o in pit_obs}, {"Pitcher"})  # no Batter leak
+        self.assertEqual({o[0] for o in bat_obs}, {"Batter"})   # no Pitcher leak
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,121 @@ from espn_client import list_season_athletes
 # gets shipped and advertises an optimistic fit_brier. See P1.4.
 MIN_CALIB_BRIER_GAIN = 0.002
 
+# ── Data-gated line-conditional method selection (§2.4b-2 follow-up) ──
+# The best calibration method is line-dependent (diagnostic: C wins at line 0.5,
+# D dist:+xBA at >=1.5). refit_sport_real_lines picks the method PER LINE BUCKET
+# for these props, but a bucket adopts its own method only when it has enough obs
+# AND clears the confirmation gate AND beats the pooled method on that bucket —
+# else it inherits the pooled method. Ships inert until a bucket earns it.
+LINE_CONDITIONAL_PROPS = {"batter_hits"}
+LINE_BUCKETS = [0.5, None]          # ascending max_line; None = open-ended top
+MIN_BUCKET_OBS = 150               # per-bucket floor before a bucket can flip
+LINE_COND_XSTATS_STRENGTH = 0.5    # xBA weight used when scoring method D
+
+
+def _lc_bucket_ready(enriched, target_props):
+    """Cheap data gate: True iff some line-conditional prop has a NON-primary line
+    bucket with >= MIN_BUCKET_OBS observations — i.e. line-conditional selection
+    could actually flip a bucket. Lets us skip the expensive raw-Statcast load on
+    a plain --real-lines run until a higher-line bucket has earned a look."""
+    props_lc = LINE_CONDITIONAL_PROPS & set(target_props)
+    if not props_lc:
+        return False
+    for pk in props_lc:
+        prev = None
+        for i, cap in enumerate(LINE_BUCKETS):
+            if i == 0:              # the primary bucket alone never triggers a flip
+                prev = cap
+                continue
+            n = 0
+            for o in enriched:
+                if not isinstance(o, dict) or o.get("prop_key") != pk:
+                    continue
+                ln = o.get("line")
+                if ln is None:
+                    continue
+                if (prev is None or ln > prev) and (cap is None or ln <= cap):
+                    n += 1
+            if n >= MIN_BUCKET_OBS:
+                return True
+            prev = cap
+    return False
+
+
+def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
+                         league_avg_def, pooled_method, xba_index, quality_index):
+    """Per-line-bucket method selection for a line-conditional prop, or None.
+
+    Builds real-line rows carrying a leakage-safe distributional ``p_dist``,
+    buckets them by line (``LINE_BUCKETS``), and for each bucket runs the same
+    gated selection (``select_method_at_real_lines``, now D-aware). A bucket
+    adopts its OWN method only when: n >= MIN_BUCKET_OBS, the gate-confirmed
+    winner differs from the pooled method, AND it beats the pooled method on the
+    bucket's single holdout by >= MIN_CALIB_BRIER_GAIN. Otherwise the bucket
+    inherits the pooled method (no residuals stored). Returns a ``line_methods``
+    list only when at least one bucket adopts its own method, else None (inert)."""
+    import book_line_calibration as blc
+    from props import _DIST_HARDHIT_COEF, _DIST_BARREL_COEF
+
+    rows = []
+    for obs in enriched:
+        if not isinstance(obs, dict) or obs.get("prop_key") != prop_key:
+            continue
+        projected, emp = blc.project_and_empirical(
+            obs, params, sport_key, team_defense, league_avg_def)
+        if projected is None or emp is None:
+            continue
+        p_dist = blc.project_distributional(
+            obs, params, sport_key, team_defense, league_avg_def,
+            xba_index=xba_index, quality_index=quality_index,
+            xstats_strength=LINE_COND_XSTATS_STRENGTH)
+        if p_dist is None:
+            continue
+        rows.append({
+            "player": obs["player"], "projected": projected, "line": obs["line"],
+            "actual": obs["actual"], "empirical_over": emp,
+            "game_date": obs["game_date"], "p_dist": p_dist,
+        })
+    if not rows:
+        return None
+
+    line_methods, adopted_any, prev_cap = [], False, None
+    for cap in LINE_BUCKETS:
+        if cap is None:
+            bucket = [r for r in rows if prev_cap is None or r["line"] > prev_cap]
+        else:
+            bucket = [r for r in rows
+                      if (prev_cap is None or r["line"] > prev_cap)
+                      and r["line"] <= cap]
+        entry = {"max_line": cap, "method": pooled_method}   # default: inherit
+        if len(bucket) >= MIN_BUCKET_OBS:
+            sel_b = blc.select_method_at_real_lines(bucket)
+            single = (sel_b or {}).get("single_split") or {}
+            b_best = single.get((sel_b or {}).get("method"))
+            b_pooled = single.get(pooled_method)
+            if (sel_b and sel_b["confirmed"]
+                    and sel_b["method"] != pooled_method
+                    and b_best is not None and b_pooled is not None
+                    and b_pooled - b_best >= MIN_CALIB_BRIER_GAIN):
+                entry = {
+                    "max_line": cap, "method": sel_b["method"],
+                    "n_obs": sel_b["n_obs"], "fit_brier": sel_b["fit_brier"],
+                    "baseline_brier": sel_b["baseline_brier"],
+                    "cv_brier": sel_b["cv_brier"], "confirmed": True,
+                }
+                if sel_b["method"] == "D":
+                    entry.update({"xstats_strength": LINE_COND_XSTATS_STRENGTH,
+                                  "dist_hardhit_coef": _DIST_HARDHIT_COEF,
+                                  "dist_barrel_coef": _DIST_BARREL_COEF})
+                else:
+                    entry.update({"residual_mu": sel_b["residual_mu"],
+                                  "residual_sigma": sel_b["residual_sigma"],
+                                  "residual_ecdf": sel_b["residual_ecdf"]})
+                adopted_any = True
+        line_methods.append(entry)
+        prev_cap = cap
+    return line_methods if adopted_any else None
+
 
 def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
     """Resolve a broad, data-driven MLB calibration pool from cached seasons."""
@@ -565,12 +680,18 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     # as-of index (NOT the current-as-of SQL table) so a past-dated obs never
     # sees future data. xstats_strength=0 → byte-identical to the prior behavior.
     from props import PROP_XSTATS_KIND
+    # Build the as-of indices to score method D per bucket ONLY when a
+    # line-conditional prop has a deep-enough non-primary bucket (cheap data
+    # gate) — so a plain --real-lines run doesn't pay the raw-Statcast load until
+    # a higher-line bucket has earned a look. Independent of --xstats-strength.
+    need_lc = _lc_bucket_ready(enriched, target_props)
     xba_index = None
-    if xstats_strength and xstats_strength > 0:
+    lc_quality_index = None
+    if (xstats_strength and xstats_strength > 0) or need_lc:
         import savant_history as sh
         import backtest_props
         years = sorted({str(o["game_date"])[:4] for o in enriched
-                        if o.get("game_date")})
+                        if isinstance(o, dict) and o.get("game_date")})
         raw = []
         for y in years:
             try:
@@ -579,11 +700,14 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                 pass
         if raw:
             xba_index = backtest_props.build_batter_xba_index(raw)
-            print(f"  [xstats] as-of xBA index built from {len(raw)} pitch rows "
-                  f"over {years} (strength={xstats_strength})")
+            if need_lc:
+                lc_quality_index = backtest_props.build_batter_quality_index(raw)
+            print(f"  [xstats] as-of index(es) built from {len(raw)} pitch rows "
+                  f"over {years} (xstats_strength={xstats_strength}, "
+                  f"line_conditional={need_lc})")
         else:
             print("  [xstats] no Statcast days cached for the obs seasons — "
-                  "xBA blend inactive; refit falls back to the plain projection.")
+                  "xBA blend + line-conditional D inactive; plain projection.")
 
     changed = {}
     for prop_key in target_props:
@@ -607,51 +731,81 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             continue
 
         old_method = cfg.get("method")
+        # Data-gated line-conditional selection (batter_hits): may adopt a
+        # different method per line bucket. Computed against the POOLED method so
+        # a bucket only flips when it genuinely beats pooling on that bucket.
+        line_methods = None
+        if prop_key in LINE_CONDITIONAL_PROPS and need_lc:
+            line_methods = _select_line_methods(
+                prop_key, enriched, params, sport_key, team_defense,
+                league_avg_def, sel["method"], xba_index, lc_quality_index)
+
         # Normally only a genuine method FLIP is written (a same-method re-fit
         # would just churn the residuals onto a smaller real-line basis for no
         # runtime change). BUT when the PROJECTION BASIS changed (P2.4a xBA blend
-        # applied to this prop), the residuals MUST be re-fit even if the method
-        # stays the same — the "no runtime change" premise is false.
+        # applied to this prop) OR a line bucket adopts its own method, we must
+        # write.
         projection_changed = prop_xstats > 0
-        if sel["method"] == old_method and not projection_changed:
-            print(f"  [keep] {prop_key}: real-line eval confirms method "
-                  f"{old_method} (real-line brier={sel['fit_brier']}, "
-                  f"baseline(A)={sel['baseline_brier']}, n={sel['n_obs']})")
+        pooled_flip = sel["method"] != old_method or projection_changed
+        if not pooled_flip and not line_methods:
+            note = f"real-line eval confirms method {old_method}"
+            if "line_methods" not in cfg:
+                print(f"  [keep] {prop_key}: {note} (real-line "
+                      f"brier={sel['fit_brier']}, baseline(A)="
+                      f"{sel['baseline_brier']}, n={sel['n_obs']})")
+                continue
+            # A previously-written line_methods no longer qualifies → drop it.
+            new_cfg = dict(cfg)
+            new_cfg.pop("line_methods", None)
+            changed[prop_key] = new_cfg
+            print(f"  [{prop_key}] line_methods dropped (no bucket qualifies); "
+                  f"{note}")
             continue
 
         # Preserve variant params, shrinkage_k, variant_label, warmup, etc.;
         # overwrite only the method + its line-invariant residual distribution.
         new_cfg = dict(cfg)
-        new_cfg.update({
-            "method": sel["method"],
-            "residual_mu": sel["residual_mu"],
-            "residual_sigma": sel["residual_sigma"],
-            "residual_ecdf": sel["residual_ecdf"],
-            "n_obs": sel["n_obs"],
-            "fit_brier": sel["fit_brier"],
-            "baseline_brier": sel["baseline_brier"],
-            "cv_brier": sel["cv_brier"],
-            "confirmed": sel["confirmed"],
-        })
-        new_cfg.setdefault("warmup_games", warmup_games)
-        new_cfg.setdefault("shrinkage_k", cfg.get("shrinkage_k",
-                                                  shrinkage_k_default))
-        new_cfg["real_line_fit"] = {
-            "fit_at_real_lines": True,
-            "n_obs": sel["n_obs"],
-            "source": "historical_odds store",
-            "store_label": store_label or "default",
-            "xstats_strength": prop_xstats,
-        }
-        # Persist the xBA blend weight into the prop cfg so props._knob activates
-        # it in production at exactly the weight its residuals were re-fit under.
-        if prop_xstats > 0:
-            new_cfg["xstats_strength"] = prop_xstats
+        if pooled_flip:
+            new_cfg.update({
+                "method": sel["method"],
+                "residual_mu": sel["residual_mu"],
+                "residual_sigma": sel["residual_sigma"],
+                "residual_ecdf": sel["residual_ecdf"],
+                "n_obs": sel["n_obs"],
+                "fit_brier": sel["fit_brier"],
+                "baseline_brier": sel["baseline_brier"],
+                "cv_brier": sel["cv_brier"],
+                "confirmed": sel["confirmed"],
+            })
+            new_cfg.setdefault("warmup_games", warmup_games)
+            new_cfg.setdefault("shrinkage_k", cfg.get("shrinkage_k",
+                                                      shrinkage_k_default))
+            new_cfg["real_line_fit"] = {
+                "fit_at_real_lines": True,
+                "n_obs": sel["n_obs"],
+                "source": "historical_odds store",
+                "store_label": store_label or "default",
+                "xstats_strength": prop_xstats,
+            }
+            # Persist the xBA blend weight so props._knob activates it in
+            # production at exactly the weight its residuals were re-fit under.
+            if prop_xstats > 0:
+                new_cfg["xstats_strength"] = prop_xstats
+        # Attach (or refresh / drop) the per-line-bucket method map.
+        if line_methods:
+            new_cfg["line_methods"] = line_methods
+        else:
+            new_cfg.pop("line_methods", None)
         changed[prop_key] = new_cfg
         note = (f"{old_method}→{sel['method']} FLIP"
                 if sel["method"] != old_method
                 else (f"re-fit @xstats={prop_xstats}" if projection_changed
-                      else "unchanged"))
+                      else "pooled unchanged"))
+        if line_methods:
+            adopted = [f"<={b['max_line']}:{b['method']}" if b["max_line"]
+                       is not None else f">top:{b['method']}"
+                       for b in line_methods if b.get("confirmed")]
+            note += f"  +line_methods[{', '.join(adopted)}]"
         print(f"  [{prop_key}] method {note}  brier={sel['fit_brier']} "
               f"baseline(A)={sel['baseline_brier']} cv={sel['cv_brier']} "
               f"n={sel['n_obs']}")
@@ -675,6 +829,209 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     print(f"\n✓ Updated calibration/{sport_key}.json "
           f"({len(changed)} prop(s) re-selected at real book lines; "
           f"other props/blocks preserved)")
+
+
+def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
+    """§2.4b-2 diagnostic (NO WRITE): score the distributional batter_hits model
+    against the shipped method C on the SAME real-line chronological holdout.
+
+    Compares method A (empirical over-rate), method C (pooled residual ECDF — the
+    incumbent at real lines), and three distributional variants (empirical-rate
+    only; +xBA; +xBA+contact-quality). Reports out-of-sample Brier per variant and
+    whether the best distributional variant beats C by >= MIN_CALIB_BRIER_GAIN —
+    the go/no-go for wiring the auto-flip (the ship path then confirms under the
+    full 2-fold gate + re-seeds Platt). Leakage-safe per-game as-of xBA / quality
+    indices. OFFLINE + FREE (store + free ESPN gamelogs + cached raw Statcast
+    days). Batter_hits only; writes nothing."""
+    import book_line_calibration as blc
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key)
+    cfg = (existing or {}).get("batter_hits")
+    if not cfg:
+        print("No batter_hits calibration to compare against; run refit first.")
+        return
+    print(f"\n=== §2.4b-2 distributional diagnostic: {sport_key} batter_hits ===")
+    book_lines = blc.harvest_book_lines_from_store(
+        sport_key, ["batter_hits"], store_label)
+    print(f"  {len(book_lines)} store book lines")
+    if not book_lines:
+        print("  No real book lines in the store; nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league)
+        if o.get("prop_key") == "batter_hits"]
+    if not enriched:
+        print("  No batter_hits observations joined to actuals.")
+        return
+
+    # Weight-side opp-defense lookup only if the shipped variant uses it.
+    team_defense, league_avg_def = {}, None
+    if (cfg.get("opp_defense_strength") or 0.0) > 0:
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    # Leakage-safe as-of xBA + contact-quality indices from the raw pitch cache.
+    import savant_history as sh
+    import backtest_props
+    years = sorted({str(o["game_date"])[:4] for o in enriched if o.get("game_date")})
+    raw = []
+    for y in years:
+        try:
+            raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+        except Exception:
+            pass
+    if not raw:
+        print(f"  [warn] no raw Statcast days cached for {years} — the xBA / "
+              f"quality variants will fall back to the empirical rate.")
+    xba_index = backtest_props.build_batter_xba_index(raw) if raw else None
+    quality_index = backtest_props.build_batter_quality_index(raw) if raw else None
+
+    params = {
+        "half_life": cfg.get("half_life"),
+        "venue_strength": cfg.get("venue_strength", 0.0),
+        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+        "use_minutes": False,
+    }
+
+    import math
+    S = xstats_strength
+    D_VARIANTS = [
+        ("D dist: empirical", {}),
+        (f"D dist: +xBA (s={S})", {"xba_index": xba_index}),
+    ]
+
+    rows = []
+    for obs in enriched:
+        projected, emp = blc.project_and_empirical(
+            obs, params, sport_key, team_defense, league_avg_def)
+        if projected is None or emp is None:
+            continue
+        base = blc.project_distributional(
+            obs, params, sport_key, team_defense, league_avg_def,
+            xstats_strength=0.0)
+        if base is None:             # no usable AB -> exclude from all variants
+            continue
+        pv = {}
+        for name, kw in D_VARIANTS:
+            strength = 0.0 if "empirical" in name else S
+            p = blc.project_distributional(
+                obs, params, sport_key, team_defense, league_avg_def,
+                xstats_strength=strength, **kw)
+            pv[name] = p if p is not None else base   # fall back to empirical
+        rows.append({
+            "obs": obs, "game_date": obs["game_date"], "line": obs["line"],
+            "actual": obs["actual"], "projected": projected,
+            "empirical_over": emp, "pv": pv,
+        })
+
+    # Drop pushes; chronological holdout (mirror evaluate_calibration's split).
+    rows = [r for r in rows if r["actual"] != r["line"]]
+    if len(rows) < 40:
+        print(f"  Only {len(rows)} usable obs (<40) — too thin to judge.")
+        return
+    rows.sort(key=lambda r: r["game_date"])
+    split = len(rows) // 2
+    train, test = rows[:split], rows[split:]
+
+    # Pooled residual fit on TRAIN — methods B (Gaussian) and C (ECDF) share it.
+    resid = sorted(r["actual"] - r["projected"] for r in train)
+    mu = sum(resid) / len(resid)
+    var = sum((x - mu) ** 2 for x in resid) / len(resid)
+    sigma = math.sqrt(var) if var > 0 else 1e-6
+
+    for r in test:                        # attach outcome + every method's P(over)
+        r["o"] = 1 if r["actual"] > r["line"] else 0
+        corrected = r["projected"] + mu
+        r["m"] = {
+            "A empirical": max(0.0, min(1.0, r["empirical_over"])),
+            "B pooled Gaussian": blc._norm_cdf((corrected - r["line"]) / sigma),
+            "C residual ECDF (shipped)":
+                1.0 - blc._empirical_cdf(resid, r["line"] - corrected),
+        }
+        r["m"].update(r["pv"])
+
+    method_names = (["A empirical", "B pooled Gaussian",
+                     "C residual ECDF (shipped)"] + [n for n, _ in D_VARIANTS])
+
+    def _brier(subset, name):
+        if not subset:
+            return None
+        return sum((row["m"][name] - row["o"]) ** 2 for row in subset) / len(subset)
+
+    b05 = [r for r in test if abs(r["line"] - 0.5) < 1e-9]
+    buckets = [("all", test), ("line 0.5", b05),
+               ("line >=1.5", [r for r in test if r["line"] >= 1.5])]
+
+    # ── 1) Method × line-bucket Brier ──
+    print(f"  n_train={len(train)} n_test={len(test)}  "
+          f"(out-of-sample Brier by line bucket — lower is better)")
+    header = "    {:<32}".format("method")
+    for bname, bsub in buckets:
+        header += "{:>15}".format(f"{bname}(n={len(bsub)})")
+    print(header)
+    for name in method_names:
+        row_str = "    {:<32}".format(name)
+        for _, bsub in buckets:
+            br = _brier(bsub, name)
+            row_str += "{:>15}".format(f"{br:.4f}" if br is not None else "-")
+        print(row_str)
+    print()
+    for bname, bsub in buckets:
+        if not bsub:
+            continue
+        c_br = _brier(bsub, "C residual ECDF (shipped)")
+        best = min(method_names, key=lambda n: _brier(bsub, n))
+        best_br = _brier(bsub, best)
+        tag = ("C already best" if best.startswith("C")
+               else f"{best} beats C by {c_br - best_br:+.4f}")
+        print(f"  {bname:<11} n={len(bsub):<4} best: {best} ({best_br:.4f}); "
+              f"C={c_br:.4f} -> {tag}")
+
+    # ── 2) Home-team AB-reduction sweep (D dist: empirical, -delta AB on home) ──
+    print("\n  Home-team AB-reduction sweep (D dist: empirical; -delta AB on "
+          "home games; lower Brier = better):")
+    print("    {:<10}{:>14}{:>16}".format("home_dAB", "Brier(all)",
+                                          "Brier(line0.5)"))
+    for d in (0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0):
+        se_all = se_05 = 0.0
+        for r in test:
+            p = blc.project_distributional(
+                r["obs"], params, sport_key, team_defense, league_avg_def,
+                xstats_strength=0.0, home_ab_delta=-d)
+            if p is None:
+                p = r["m"]["D dist: empirical"]
+            e = (p - r["o"]) ** 2
+            se_all += e
+            if abs(r["line"] - 0.5) < 1e-9:
+                se_05 += e
+        br_all = se_all / len(test)
+        br_05 = se_05 / len(b05) if b05 else None
+        print("    {:<10}{:>14}{:>16}".format(
+            f"-{d}", f"{br_all:.4f}", f"{br_05:.4f}" if br_05 is not None else "-"))
+
+    # ── 3) Direction split at line 0.5 (the "exclude under 0.5" question) ──
+    # Brier is over/under symmetric, so it can't rank a direction. What answers
+    # "are under-0.5 picks worth taking" is the realized WIN RATE of the model's
+    # predicted side: predict OVER when P(over)>=0.5 (wins if >=1 hit), else UNDER
+    # (wins if 0 hits). Below the ~52.4% breakeven at -110, that side loses money.
+    if b05:
+        base_rate = sum(r["o"] for r in b05) / len(b05)
+        print(f"\n  Direction split at line 0.5 (n={len(b05)}, base rate P(>=1 "
+              f"hit)={base_rate:.1%}; breakeven ~52.4% @ -110):")
+        print("    {:<30}{:>20}{:>20}".format(
+            "method", "OVER pick n/win%", "UNDER pick n/win%"))
+        for name in ["C residual ECDF (shipped)", f"D dist: +xBA (s={S})"]:
+            over = [r for r in b05 if r["m"][name] >= 0.5]
+            under = [r for r in b05 if r["m"][name] < 0.5]
+            ow = (sum(1 for r in over if r["o"] == 1) / len(over)) if over else None
+            uw = (sum(1 for r in under if r["o"] == 0) / len(under)) if under else None
+            print("    {:<30}{:>20}{:>20}".format(
+                name,
+                f"{len(over)}/{ow:.1%}" if ow is not None else f"{len(over)}/-",
+                f"{len(under)}/{uw:.1%}" if uw is not None else f"{len(under)}/-"))
+
+    print("\n  (Diagnostic only — nothing written.)")
 
 
 def main():
@@ -720,7 +1077,18 @@ def main():
     p.add_argument("--dry-run", action="store_true",
                    help="With --real-lines, compute + print per-prop Brier but "
                         "write nothing (use to compare --xstats-strength values).")
+    p.add_argument("--dist-diag", action="store_true",
+                   help="§2.4b-2: score the distributional batter_hits model vs "
+                        "method C on the real-line holdout (no write).")
+    p.add_argument("--dist-xstats-strength", type=float, default=0.5,
+                   help="xBA blend weight for the --dist-diag xBA variants "
+                        "(default 0.5).")
     args = p.parse_args()
+
+    if args.dist_diag:
+        diagnose_distributional(args.sport, store_label=args.store_label,
+                                xstats_strength=args.dist_xstats_strength)
+        return
 
     if args.real_lines:
         refit_sport_real_lines(args.sport, store_label=args.store_label,

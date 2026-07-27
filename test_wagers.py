@@ -11,6 +11,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import db_store
 import game_results
 import pricing_common
 import recalibration
@@ -586,6 +587,92 @@ class ResetClvTests(unittest.TestCase):
             rows = {r["wager_id"]: r for r in wagers.read_wagers()}
             self.assertIsNone(rows["a"]["close_price"])
             self.assertEqual(rows["b"]["close_price"], -120)
+
+
+class _SqlLedger:
+    """Context manager: route wagers/recalibration onto a fresh in-memory SQL
+    store (so the ``where``-filtered read/mutate paths are actually exercised —
+    the local NDJSON path ignores ``where``)."""
+
+    def __enter__(self):
+        recalibration._NDJSON_CACHE.clear()
+        recalibration._LOAD_CACHE.clear()
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        return self
+
+    def __exit__(self, *exc):
+        db_store.configure_engine(None)
+        recalibration._NDJSON_CACHE.clear()
+        recalibration._LOAD_CACHE.clear()
+
+
+class FilteredWagerDmlSqlTests(unittest.TestCase):
+    """The by-id/IS-NULL ``where`` filters the wager DML now pass must produce
+    the same results on the SQL path as the (where-ignoring) Blob path."""
+
+    def _prop(self, wid_seq, team="Boston Red Sox"):
+        return wagers.build_wager_row("player_prop", None, {
+            "player": f"P{wid_seq}", "prop": "batter_hits", "prop_label": "Hits",
+            "line": 1.5, "direction": "OVER", "over_price": -110,
+            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "NYY @ BOS",
+            "team": team, "event_id": "E1"}, _meta(wid_seq))
+
+    def test_delete_targets_only_given_ids(self):
+        a, b, c = self._prop(0), self._prop(1), self._prop(2)
+        with _SqlLedger():
+            wagers.submit_wagers([a, b, c])
+            self.assertEqual(wagers.delete_wagers([b["wager_id"]]), 1)
+            self.assertEqual({r["wager_id"] for r in wagers.read_wagers()},
+                             {a["wager_id"], c["wager_id"]})
+            self.assertEqual(wagers.delete_wagers([b["wager_id"]]), 0)  # gone
+
+    def test_update_edits_only_the_targeted_pending_row(self):
+        a, b = self._prop(0), self._prop(1)
+        with _SqlLedger():
+            wagers.submit_wagers([a, b])
+            self.assertEqual(
+                wagers.update_wagers({a["wager_id"]: {"stake": 25.0}}), 1)
+            rows = {r["wager_id"]: r for r in wagers.read_wagers()}
+            self.assertEqual(rows[a["wager_id"]]["stake"], 25.0)
+            self.assertEqual(rows[b["wager_id"]]["stake"], 10.0)  # untouched
+
+    def test_regrade_resets_only_targeted_settled_row(self):
+        a, b = self._prop(0), self._prop(1)
+        now = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        with _SqlLedger():
+            wagers.submit_wagers([a, b])
+            with patch.object(recalibration, "resolve_one_prop", return_value=0.0):
+                wagers.resolve_pending_wagers(now=now)
+            rows = {r["wager_id"]: r for r in wagers.read_wagers()}
+            self.assertEqual(rows[a["wager_id"]]["status"], "lost")
+            self.assertEqual(wagers.regrade_wagers([a["wager_id"]]), 1)
+            rows = {r["wager_id"]: r for r in wagers.read_wagers()}
+            self.assertEqual(rows[a["wager_id"]]["status"], "pending")
+            self.assertEqual(rows[b["wager_id"]]["status"], "lost")  # untouched
+
+    def test_persist_clv_is_null_filter_fills_and_is_idempotent(self):
+        import warehouse
+        meta = {"sport_key": "baseball_mlb", "event_id": "E1",
+                "commence_time": "2026-07-21T02:30:00Z", "game_date": "2026-07-21",
+                "home_team": "H", "away_team": "A", "stake": 10.0,
+                "placed_at": "2026-07-20T12:00:00+00:00", "seq": 0}
+        row = wagers.build_wager_row("player_prop", None, {
+            "player": "Bat", "prop": "batter_hits", "prop_label": "Hits",
+            "line": 1.5, "direction": "OVER", "over_price": -110,
+            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
+            "team": "H", "event_id": "E1"}, meta)
+        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
+        with _SqlLedger():
+            wagers.submit_wagers([row])
+            with patch.object(warehouse, "closing_line_for",
+                              return_value={"price": -120, "implied_prob": 0.545,
+                                            "captured_at": "x"}):
+                # First pass fills the close_price IS NULL row via the SQL filter.
+                self.assertEqual(wagers.persist_clv(now=now), 1)
+                self.assertEqual(wagers.read_wagers()[0]["close_price"], -120)
+                # Second pass: the IS NULL filter now returns no rows -> no work.
+                self.assertEqual(wagers.persist_clv(now=now), 0)
 
 
 class SummaryTests(unittest.TestCase):

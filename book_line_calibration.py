@@ -394,6 +394,95 @@ def project_and_empirical(obs, params, sport_key,
     return projected, empirical_over
 
 
+def project_distributional(obs, params, sport_key, team_defense=None,
+                           league_avg_def=None, xba_index=None,
+                           quality_index=None, xstats_strength=0.0,
+                           hardhit_coef=None, barrel_coef=None,
+                           xba_window=None, xba_min_count=None,
+                           home_ab_delta=0.0):
+    """Distributional P(over) for a batter_hits obs at its REAL book line
+    (§2.4b-2 method "D"), or None if not applicable / too thin.
+
+    Mirrors project_and_empirical's recency×venue×opp_defense weighting, derives
+    the weighted per-AB hit rate + expected AB from the prior games, looks up the
+    batter's leakage-safe as-of xBA / contact-quality (per-game indices, strictly
+    before obs["game_date"]), and returns ``props._dist_p_over`` — the SAME
+    composite the runtime uses, so the two can't drift. Offline eval applies NO
+    output (park/weather/matchup) multipliers — rate_mult = exposure_mult = 1,
+    the same limitation the C-method real-line fit has. Fails open."""
+    if obs.get("prop_key") != "batter_hits":
+        return None
+    prior_games = obs["prior_games"]
+    if not prior_games:
+        return None
+    line = obs["line"]
+    upcoming_is_home = obs["test_game"].get("is_home")
+    prior_hits = [g.get("H") for g in prior_games]
+    prior_ab = [g.get("AB") for g in prior_games]
+    prior_home_aways = [g.get("is_home") for g in prior_games]
+    prior_opponents = [g.get("opponent") for g in prior_games]
+
+    base_w = _recency_weights(len(prior_games), params.get("half_life"))
+    venue_s = params.get("venue_strength", 0.0)
+    def_s = params.get("opp_defense_strength", 0.0)
+    weights = []
+    for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
+        w = bw * venue_mult(ph, upcoming_is_home, venue_s)
+        if def_s > 0 and team_defense:
+            opp_pa = _resolve_opp_pts_allowed(opp, team_defense)
+            w *= opp_defense_mult(opp_pa, league_avg_def, def_s)
+        weights.append(w)
+
+    hits_w = ab_w = w_valid = 0.0
+    for h, ab, w in zip(prior_hits, prior_ab, weights):
+        if ab is None or ab <= 0 or w <= 0 or h is None:
+            continue
+        hits_w += w * h
+        ab_w += w * ab
+        w_valid += w
+    if ab_w <= 0 or w_valid <= 0:
+        return None
+    r_emp = hits_w / ab_w
+    expected_ab = ab_w / w_valid
+    if expected_ab <= 0:
+        return None
+    # Experiment: home batters get slightly fewer plate appearances (the home
+    # team skips the bottom 9th when leading). ``home_ab_delta`` nudges the
+    # binomial n for a home game; 0.0 = off. Floored so n stays positive.
+    if home_ab_delta and obs.get("test_game", {}).get("is_home"):
+        expected_ab = max(0.5, expected_ab + home_ab_delta)
+
+    xba = hh = brl = None
+    try:
+        import mlb_starters
+        game_date = obs.get("game_date")
+        player = obs.get("player")
+        season = int(str(game_date)[:4]) if game_date else None
+        pid_info = (mlb_starters.find_player_id(player, season)
+                    if (player and season) else None)
+        if pid_info and pid_info[0] and not pid_info[1]:   # batter only
+            pid = str(pid_info[0])
+            if xba_index is not None:
+                if xba_window:            # rolling last-N-BBE xBA vs season-to-date
+                    xba = xba_index.asof_window_mean(
+                        pid, game_date, xba_window, xba_min_count or 1)
+                else:
+                    xba = xba_index.asof_mean(pid, game_date)
+            if quality_index is not None:
+                q = quality_index.asof(pid, game_date)
+                if q:
+                    hh = q.get("hard_hit_pct")
+                    brl = q.get("barrel_pct")
+    except Exception:
+        xba = hh = brl = None   # fail open
+
+    import props
+    p_over, _ = props._dist_p_over(
+        r_emp, expected_ab, xba, hh, brl, 1.0, 1.0, line,
+        xstats_strength, hardhit_coef, barrel_coef)
+    return p_over
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Step 4: forecaster comparison with chronological holdout
 # ──────────────────────────────────────────────────────────────────────────────
@@ -526,19 +615,24 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
 
 
 def _score_abc_real(train, test):
-    """Fit pooled residuals on `train`, score methods A/B/C on `test` at each
-    row's REAL book line. Returns ({"A","B","C": brier}, (mu, sigma, sorted)).
+    """Fit pooled residuals on `train`, score methods A/B/C (and D when present)
+    on `test` at each row's REAL book line. Returns ({method: brier}, (mu, sigma,
+    sorted)).
 
     A = empirical over-rate passthrough; B = pooled Gaussian residual;
-    C = pooled residual ECDF. Same math as evaluate_calibration, factored so the
-    single split and the confirmation folds share one implementation.
+    C = pooled residual ECDF. D (distributional, §2.4b-2) is scored only when
+    every test row carries a precomputed leakage-safe ``p_dist`` — D needs no
+    train fit (its prob is a closed form on each obs's own as-of stats), so a
+    row's ``p_dist`` is split-independent. Same math as evaluate_calibration,
+    factored so the single split and the confirmation folds share one impl.
     """
     resid = [r["actual"] - r["projected"] for r in train]
     mu = sum(resid) / len(resid)
     var = sum((x - mu) ** 2 for x in resid) / len(resid)
     sigma = math.sqrt(var) if var > 0 else 1e-6
     srt = sorted(resid)
-    pA, pB, pC, out = [], [], [], []
+    pA, pB, pC, pD, out = [], [], [], [], []
+    has_d = bool(test) and all(r.get("p_dist") is not None for r in test)
     for r in test:
         out.append(1 if r["actual"] > r["line"] else 0)
         pA.append(max(0.0, min(1.0, r["empirical_over"])))
@@ -546,8 +640,12 @@ def _score_abc_real(train, test):
         z = (corrected - r["line"]) / sigma if sigma > 0 else 0.0
         pB.append(_norm_cdf(z))
         pC.append(1.0 - _empirical_cdf(srt, r["line"] - corrected))
-    return ({"A": _brier(pA, out), "B": _brier(pB, out), "C": _brier(pC, out)},
-            (mu, sigma, srt))
+        if has_d:
+            pD.append(r["p_dist"])
+    scores = {"A": _brier(pA, out), "B": _brier(pB, out), "C": _brier(pC, out)}
+    if has_d:
+        scores["D"] = _brier(pD, out)
+    return scores, (mu, sigma, srt)
 
 
 def _real_line_folds(rows, min_set_n=20):
@@ -612,8 +710,14 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
         return all(fs.get("A") is not None and fs.get(method) is not None
                    and fs[method] < fs["A"] for fs in fold_scores)
 
+    # D (distributional) is a candidate only when the rows carry a leakage-safe
+    # p_dist (the per-bucket line-conditional path supplies it); the pooled A/B/C
+    # callers pass rows without it, so their behavior is unchanged.
+    candidate_methods = ["B", "C"]
+    if any(r.get("p_dist") is not None for r in usable):
+        candidate_methods.append("D")
     best_method, best_brier = "A", baseline
-    for method in ("B", "C"):
+    for method in candidate_methods:
         cand = single.get(method)
         if cand is None or baseline is None:
             continue
@@ -646,6 +750,9 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
         "residual_sigma": sigma,
         "residual_ecdf": sorted(resid),
         "n_obs": len(usable),
+        # Per-method Brier on the single holdout — lets a per-bucket caller
+        # compare its winner against the POOLED method on the same split.
+        "single_split": single,
     }
 
 

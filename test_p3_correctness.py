@@ -14,7 +14,43 @@
 import unittest
 
 import parlay
+import pricing_common
 import props
+
+
+class TolerantTeamDefenseLookupTests(unittest.TestCase):
+    """The runtime opp-defense lookup must tolerate name drift (feed name vs
+    team_defense key) instead of failing open — parity with the backtest sweep."""
+
+    DEF = {"New York Yankees": 4.1, "Los Angeles Angels": 5.2,
+           "Boston Red Sox": 4.7}
+
+    def test_exact_match(self):
+        self.assertEqual(
+            pricing_common._resolve_team_defense("New York Yankees", self.DEF), 4.1)
+
+    def test_last_token_match(self):
+        # feed says just "Yankees"; key is the full "New York Yankees".
+        self.assertEqual(
+            pricing_common._resolve_team_defense("Yankees", self.DEF), 4.1)
+
+    def test_substring_and_case_insensitive(self):
+        self.assertEqual(
+            pricing_common._resolve_team_defense("la angels", self.DEF), 5.2)
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(
+            pricing_common._resolve_team_defense("Toronto Blue Jays", self.DEF))
+
+    def test_empty_inputs_return_none(self):
+        self.assertIsNone(pricing_common._resolve_team_defense("", self.DEF))
+        self.assertIsNone(pricing_common._resolve_team_defense("Yankees", None))
+        self.assertIsNone(pricing_common._resolve_team_defense("Yankees", {}))
+
+    def test_backtest_alias_is_shared_impl(self):
+        import backtest
+        self.assertIs(backtest._resolve_opp_pts_allowed,
+                      pricing_common._resolve_team_defense)
 
 
 class OutputDefenseMultiplierClampTests(unittest.TestCase):

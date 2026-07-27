@@ -245,6 +245,20 @@ class AsOfIndex:
             return None
         return pref[i] / i
 
+    def asof_window_mean(self, key, as_of, window, min_count=1):
+        """Mean over the LAST ``window`` events (by count) strictly before
+        ``as_of`` — a rolling/trailing average vs asof_mean's season-to-date
+        cumulative. ``window <= 0`` falls back to the full history. Returns None
+        if fewer than ``min_count`` events fall in the window (so a low-sample
+        batter degrades to the same gate as the cumulative estimate)."""
+        dates, pref = self._prep(key)
+        i = bisect.bisect_left(dates, as_of)
+        lo = max(0, i - window) if (window and window > 0) else 0
+        cnt = i - lo
+        if cnt < min_count:
+            return None
+        return (pref[i] - pref[lo]) / cnt
+
 
 class AsOfPitcherKIndex:
     """Leakage-safe pitcher K/BF and average innings/start prefix index."""
@@ -305,6 +319,52 @@ def build_batter_xba_index(rows):
         xba = row.get("xba")
         if xba is not None and row.get("batter") and row.get("game_date"):
             idx.add(row["batter"], row["game_date"], xba)
+    return idx
+
+
+class BatterQualityIndex:
+    """Leakage-safe per-batter hard-hit% / barrel% over batted balls, keyed by
+    batter MLBAM id. Each batted ball contributes a 1.0/0.0 to a rate index, so
+    ``AsOfIndex.asof_mean`` (numerator over batted-ball count) IS the as-of rate.
+    Feeds the §2.4b-2 distributional batter_hits diagnostic's quality nudge."""
+
+    def __init__(self):
+        self._hh = AsOfIndex()    # 1.0 if hard-hit else 0.0
+        self._brl = AsOfIndex()   # 1.0 if barrel else 0.0
+
+    def add(self, batter, date, hardhit, barrel):
+        self._hh.add(batter, date, 1.0 if hardhit else 0.0)
+        self._brl.add(batter, date, 1.0 if barrel else 0.0)
+
+    def asof(self, batter, as_of, min_bbe=sh.MIN_BBE):
+        """{"hard_hit_pct", "barrel_pct"} over batted balls with date < as_of,
+        or None when the batter has < ``min_bbe`` prior batted balls."""
+        key = str(batter)
+        hh = self._hh.asof_mean(key, as_of, min_bbe=min_bbe)
+        brl = self._brl.asof_mean(key, as_of, min_bbe=min_bbe)
+        if hh is None and brl is None:
+            return None
+        return {"hard_hit_pct": hh, "barrel_pct": brl}
+
+
+def build_batter_quality_index(rows):
+    """As-of hard-hit% / barrel% a BATTER produced (keyed by batter MLBAM id).
+
+    Batted-ball events only (Statcast ``type == "X"``); mirrors
+    ``savant_history._accumulate_rates`` predicates (HARD_HIT_MPH, BARREL_LSA)
+    so runtime (statcast_asof) and this offline as-of index agree."""
+    idx = BatterQualityIndex()
+    for row in rows:
+        if row.get("type") != "X":            # batted ball only
+            continue
+        batter = row.get("batter")
+        date = row.get("game_date")
+        if not batter or not date:
+            continue
+        ls = row.get("launch_speed")
+        hardhit = ls is not None and ls >= sh.HARD_HIT_MPH
+        barrel = row.get("launch_speed_angle") == sh.BARREL_LSA
+        idx.add(str(batter), date, hardhit, barrel)
     return idx
 
 

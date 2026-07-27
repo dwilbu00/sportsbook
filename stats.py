@@ -149,6 +149,37 @@ def _weighted_std(values, weights, mean=None):
     return math.sqrt(var)
 
 
+def hits_at_least(k, n, p):
+    """P(X >= k) for X ~ Binomial(n, p) — pure-stdlib binomial survival.
+
+    Used by the distributional batter_hits model: with n = expected at-bats and
+    p = per-at-bat hit probability, a line of (k - 0.5) hits maps to
+    hits_at_least(k, n, p); the line-0.5 case P(>=1 hit) = 1 - (1 - p)^n.
+
+    Sums the lower tail via the ratio recurrence
+    C(n,i) p^i q^(n-i) = prev * (n - i + 1) / i * (p / q), so no factorials or
+    lgamma are needed and it stays exact for the small n (~3-6 at-bats) here.
+    ``n`` is coerced to a non-negative integer (the caller rounds expected AB)."""
+    k = int(k)
+    if k <= 0:
+        return 1.0
+    n = int(round(n))
+    if n <= 0 or p <= 0.0:
+        return 0.0
+    if k > n:                # can't get k successes in n trials — even if p == 1
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    q = 1.0 - p
+    term = q ** n          # i = 0 term: (1 - p)^n = P(X = 0)
+    cdf = term
+    ratio = p / q
+    for i in range(1, k):  # accumulate P(X <= k-1)
+        term *= (n - i + 1) / i * ratio
+        cdf += term
+    return max(0.0, min(1.0, 1.0 - cdf))
+
+
 def _normal_inv_cdf(p):
     """
     Inverse standard-normal CDF (probit). Acklam's rational approximation,

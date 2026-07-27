@@ -281,7 +281,11 @@ def delete_wagers(wager_ids):
         existing[:] = [r for r in existing if r.get("wager_id") not in ids]
         return before - len(existing)
 
-    return recalibration.mutate_ndjson_log(WAGERS_FILE, prune)
+    # SQL path: pull only the targeted rows so the surgical diff emits DELETEs for
+    # exactly them (the whole-ledger read is wasted egress here). The Blob path
+    # ignores ``where`` and prunes the full list — same result.
+    return recalibration.mutate_ndjson_log(
+        WAGERS_FILE, prune, where={"wager_id": list(ids)})
 
 
 def update_wagers(edits):
@@ -318,7 +322,10 @@ def update_wagers(edits):
                 changed += 1
         return changed
 
-    return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
+    # SQL path: read only the edited rows (the mutator still self-filters to
+    # pending). Blob path ignores ``where``.
+    return recalibration.mutate_ndjson_log(
+        WAGERS_FILE, apply, where={"wager_id": list(clean)})
 
 
 def regrade_wagers(wager_ids):
@@ -342,7 +349,10 @@ def regrade_wagers(wager_ids):
                 changed += 1
         return changed
 
-    return recalibration.mutate_ndjson_log(WAGERS_FILE, reset)
+    # SQL path: read only the targeted rows (mutator still self-filters to
+    # settled). Blob path ignores ``where``.
+    return recalibration.mutate_ndjson_log(
+        WAGERS_FILE, reset, where={"wager_id": list(ids)})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -556,7 +566,10 @@ def persist_clv(rows=None, now=None):
     them cheaply instead of re-hitting the warehouse every time. Returns the
     count newly persisted. Best-effort; never raises."""
     now = now or datetime.now(timezone.utc)
-    rows = read_wagers() if rows is None else rows
+    # CLV is only ever filled on rows whose close_price IS NULL, so pull just
+    # those from the durable store (SQL path) instead of the whole ledger; the
+    # commence-passed narrowing below still happens in Python.
+    rows = read_wagers(where={"close_price": None}) if rows is None else rows
     if not rows:
         return 0
     candidates = [r for r in rows
@@ -583,7 +596,10 @@ def persist_clv(rows=None, now=None):
         return changed
 
     try:
-        return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
+        # Only close_price-null rows can be filled, so restrict the SQL read to
+        # them (Blob path ignores ``where`` and the mutator self-filters anyway).
+        return recalibration.mutate_ndjson_log(
+            WAGERS_FILE, apply, where={"close_price": None})
     except Exception:
         return 0
 

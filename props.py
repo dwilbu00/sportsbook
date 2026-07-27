@@ -20,6 +20,7 @@ from pricing_common import (
     _expected_roi,
     _opponent_defense_multiplier,
     _prop_is_value,
+    _resolve_team_defense,
     _starter_adjustment,
     _venue_match_multiplier,
     et_local_date,
@@ -39,6 +40,7 @@ from stats import (
     _weighted_mean,
     _weighted_rate,
     _weighted_std,
+    hits_at_least,
 )
 
 
@@ -330,6 +332,29 @@ PROP_XSTATS_KIND = {"batter_hits": "xba"}
 XSTATS_MIN_N = 40
 
 
+# ── Recommendation filter: suppress model UNDER picks on cheap lines ──
+# §2.4b-2 direction-split diagnostic (2026-07-27): a model-predicted UNDER on a
+# batter_hits 0.5 line wins only ~43% out-of-sample (n=427) — below the ~52.4%
+# breakeven at -110 — because "player goes hitless" is an anti-predictive,
+# market-sharp event (recent cold form reverts). Such picks are never flagged as
+# value; the candidate is still returned (for display), just not recommended.
+# Map prop_key -> max line to block; raise the cap to widen, or drop the entry
+# (or set {} ) to disable.
+SUPPRESS_UNDER_MAX_LINE = {"batter_hits": 0.5}
+
+
+def _suppress_under(prop_key, line):
+    """True when a model UNDER pick on (prop_key, line) should be demoted from
+    recommendations (is_value forced False). See SUPPRESS_UNDER_MAX_LINE."""
+    cap = SUPPRESS_UNDER_MAX_LINE.get(prop_key)
+    if cap is None:
+        return False
+    try:
+        return float(line) <= cap
+    except (TypeError, ValueError):
+        return False
+
+
 def _xstats_blend(base_proj, xba, ab_per_game, strength):
     """Linear blend of the projection toward the xBA-implied per-game mean.
 
@@ -338,6 +363,165 @@ def _xstats_blend(base_proj, xba, ab_per_game, strength):
     w = max(0.0, min(1.0, strength))
     xstats_mean = xba * ab_per_game
     return (1.0 - w) * base_proj + w * xstats_mean, xstats_mean
+
+
+# ── §2.4b-2 distributional batter_hits model ──
+# Per-AB hit probability from a contact-quality composite -> binomial P(>=k
+# hits). A distribution (unlike the mean-count method C, whose residuals cluster
+# by integer outcome) responds smoothly to the rate at line 0.5, so xBA /
+# quality-of-contact signal actually flows into P(>=1 hit). Ships OFF: activated
+# only when a prop's calibration method is "D". League-average Statcast rates are
+# the quality-nudge denominators (priors — refresh occasionally; not fitted).
+_MLB_LEAGUE_QUALITY = {"hard_hit_pct": 0.39, "barrel_pct": 0.075}
+_DIST_HARDHIT_COEF = 0.10          # weight on relative hard-hit%
+_DIST_BARREL_COEF = 0.10           # weight on relative barrel%
+_DIST_QADJ_BOUNDS = (0.85, 1.20)   # bound the quality nudge
+_DIST_PAB_BOUNDS = (0.01, 0.85)    # bound the final per-AB hit prob
+
+
+def _dist_p_over(r_emp, expected_ab, xba, hh, brl, rate_mult, exposure_mult,
+                 line, xstats_strength, hardhit_coef=None, barrel_coef=None):
+    """Pure contact-quality composite → binomial P(over) for batter_hits.
+
+    Shared by the runtime (`_distributional_over_rate`) and the offline
+    diagnostic (`book_line_calibration.project_distributional`) so the two can't
+    drift. All Statcast inputs are optional (None → that term drops out):
+      level       = (1-s)·r_emp + s·xBA               (s = xstats_strength, xba≠None)
+      quality_adj = clamp(1 + a·(hh/LG-1) + b·(brl/LG-1))
+      p_AB        = clamp(level · quality_adj · rate_mult)
+      n           = round(expected_ab · exposure_mult); k = int(line)+1
+      P(over)     = hits_at_least(k, n, p_AB)
+    Returns (p_over, meta). ``expected_ab`` must be > 0."""
+    a = _DIST_HARDHIT_COEF if hardhit_coef is None else hardhit_coef
+    b = _DIST_BARREL_COEF if barrel_coef is None else barrel_coef
+    s = max(0.0, min(1.0, xstats_strength or 0.0)) if xba is not None else 0.0
+    level = (1.0 - s) * r_emp + s * xba if s else r_emp
+    q_adj = 1.0
+    lg_hh = _MLB_LEAGUE_QUALITY["hard_hit_pct"]
+    lg_brl = _MLB_LEAGUE_QUALITY["barrel_pct"]
+    if hh is not None and lg_hh > 0:
+        q_adj += a * (hh / lg_hh - 1.0)
+    if brl is not None and lg_brl > 0:
+        q_adj += b * (brl / lg_brl - 1.0)
+    lo_q, hi_q = _DIST_QADJ_BOUNDS
+    q_adj = max(lo_q, min(hi_q, q_adj))
+    lo_p, hi_p = _DIST_PAB_BOUNDS
+    p_ab = max(lo_p, min(hi_p, level * q_adj * (rate_mult or 1.0)))
+    n = max(1, int(round(expected_ab * (exposure_mult or 1.0))))
+    k = int(line) + 1                     # half-integer lines: OVER ⇔ hits >= k
+    p_over = hits_at_least(k, n, p_ab)
+    meta = {
+        "k": k,
+        "n_ab_expected": n,
+        "p_ab": round(p_ab, 4),
+        "r_emp": round(r_emp, 4),
+        "xba": round(xba, 3) if xba is not None else None,
+        "xba_weight": s,
+        "hard_hit_pct": round(hh, 3) if hh is not None else None,
+        "barrel_pct": round(brl, 3) if brl is not None else None,
+        "q_adj": round(q_adj, 3),
+        "rate_mult": round(rate_mult or 1.0, 3),
+        "exposure_mult": round(exposure_mult or 1.0, 3),
+    }
+    return p_over, meta
+
+
+def _distributional_over_rate(prop_key, line, values, at_bats, weights,
+                              rate_mult, exposure_mult, player_name,
+                              commence_iso, cfg, xstats_strength):
+    """P(over) for batter_hits as a binomial survival, or (None, None) to fall
+    back to the empirical over-rate (§2.4b-2).
+
+    p_AB = clamp( level · quality_adj · rate_mult ), with
+      level       = (1-s)·(weighted hits/AB) + s·xBA         (s = xstats_strength)
+      quality_adj = 1 + a·(hard_hit%/LG - 1) + b·(barrel%/LG - 1)   (bounded)
+    n = round(expected_AB · exposure_mult), k = int(line)+1, and
+    P(>=k) = stats.hits_at_least(k, n, p_AB).
+
+    Rate multipliers (opp-defense / starter matchup / park / weather) scale the
+    per-AB hit RATE; the batting-order EXPOSURE multiplier scales n (AB count) —
+    a binomial needs each on the right parameter. Fails OPEN (returns None) when
+    the prop isn't whitelisted or no usable AB history exists. xBA + quality
+    rates come from statcast_asof (fail-open to the empirical level / no nudge).
+    Built from the raw per-game hits/AB — NOT base_proj — so it never double-
+    counts the §2.4a mean blend."""
+    if PROP_XSTATS_KIND.get(prop_key) != "xba":   # whitelist: batter_hits only
+        return None, None
+    # Weighted per-AB hit rate + weighted mean AB/game from the player's games.
+    hits_w = ab_w = w_valid = 0.0
+    for v, ab, w in zip(values, at_bats, weights):
+        if ab is None or ab <= 0 or w is None or w <= 0 or v is None:
+            continue
+        hits_w += w * v
+        ab_w += w * ab
+        w_valid += w
+    if ab_w <= 0 or w_valid <= 0:
+        return None, None
+    r_emp = hits_w / ab_w
+    expected_ab = ab_w / w_valid
+    if expected_ab <= 0:
+        return None, None
+
+    xba = hh = brl = None
+    n_ab = 0
+    try:
+        import mlb_starters
+        import statcast_asof
+        season = int(str(commence_iso)[:4]) if commence_iso else None
+        if season:
+            pid_info = mlb_starters.find_player_id(player_name, season)
+            if pid_info and pid_info[0] and not pid_info[1]:   # batter only
+                rates = statcast_asof.get_rates(pid_info[0], season, "bat")
+                if rates and (rates.get("n_ab") or 0) >= XSTATS_MIN_N:
+                    xba = rates.get("xba")
+                    hh = rates.get("hard_hit_pct")
+                    brl = rates.get("barrel_pct")
+                    n_ab = rates.get("n_ab") or 0
+    except Exception:
+        xba = hh = brl = None    # fail open — never block a rec on Statcast
+
+    p_over, meta = _dist_p_over(
+        r_emp, expected_ab, xba, hh, brl, rate_mult, exposure_mult, line,
+        xstats_strength,
+        hardhit_coef=cfg.get("dist_hardhit_coef"),
+        barrel_coef=cfg.get("dist_barrel_coef"))
+    meta["n_ab_sample"] = n_ab
+    return p_over, meta
+
+
+def _method_cfg_for_line(prop_calib_cfg, line):
+    """Resolve (method, method_cfg) for a specific book line.
+
+    Data-gated line-conditional selection: when the offline refit has written a
+    ``line_methods`` list on a prop cfg (a bucket earned its own method), pick the
+    first bucket whose ``max_line`` covers ``line`` (max_line None/absent = the
+    open-ended top bucket) and return its method MERGED OVER the pooled cfg —
+    ``{**pooled, **bucket}``. The merge is essential: an INHERITED bucket is
+    written as a bare ``{max_line, method}`` (no residuals), and an adopted B/C
+    bucket carries only its own residuals (no warmup), so returning the bare
+    bucket alone would strip the pooled residual_ecdf / warmup and collapse
+    calibration (method C → constant 0.5). Merging lets an inherited bucket reuse
+    the pooled residuals + warmup, and an adopted bucket override just the fields
+    it supplies (its own residuals, or the D composite params). Falls back to the
+    pooled cfg when there is no ``line_methods``, no matching usable bucket, or
+    ``line`` is unusable — so a cfg without line_methods behaves exactly as
+    before."""
+    if not prop_calib_cfg:
+        return None, prop_calib_cfg
+    buckets = prop_calib_cfg.get("line_methods")
+    if buckets:
+        try:
+            ln = float(line)
+        except (TypeError, ValueError):
+            ln = None
+        if ln is not None:
+            for b in buckets:
+                cap = b.get("max_line")
+                if cap is None or ln <= cap:
+                    if b.get("method"):
+                        return b.get("method"), {**prop_calib_cfg, **b}
+                    break   # matched a malformed bucket -> fall back to pooled
+    return prop_calib_cfg.get("method"), prop_calib_cfg
 
 
 # Per-sport override for the recency half-life *for player props specifically*.
@@ -758,7 +942,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 w = bw
                 if team_defense and league_avg_def and defense_strength > 0:
                     w *= _opponent_defense_multiplier(
-                        team_defense.get(opp), league_avg_def, defense_strength)
+                        _resolve_team_defense(opp, team_defense),
+                        league_avg_def, defense_strength)
                 # Venue multiplier: a per-sport PLAYER_PROP_VENUE_STRENGTH of
                 # 0.0 disables it; None (default) inherits the team-level
                 # VENUE_MATCH_WEIGHTS. P2.1 parity fix: a NUMERIC override applies
@@ -780,7 +965,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     and upcoming_is_home is not None):
                 opp_name = away_team_name if upcoming_is_home else home_team_name
                 output_def_mult = _output_defense_multiplier(
-                    team_defense.get(opp_name), league_avg_def,
+                    _resolve_team_defense(opp_name, team_defense), league_avg_def,
                     output_def_strength)
 
             # ── Bayesian shrinkage toward unweighted prior mean ──
@@ -914,19 +1099,48 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # Early-season players (few current-season games) blend with the
             # prior-season warmup distribution.
             calibration_meta = None
+            dist_meta = None
             calibration_game_dates = history.get("game_dates") or []
             curr_games = count_current_season_games(calibration_game_dates, sport_key)
-            if prop_calib_cfg and prop_calib_cfg.get("method"):
+            # Line-conditional method selection: when the prop cfg carries a
+            # data-gated `line_methods` list, resolve the method + its sub-cfg for
+            # THIS line (else the pooled single method). Ships inert until the
+            # offline refit writes line_methods for a bucket that earned it.
+            method, method_cfg = _method_cfg_for_line(prop_calib_cfg, line)
+            if method == "D":
+                # §2.4b-2 distributional P(>=k hits) from a contact-quality
+                # composite. Whitelisted to batter_hits; fails open to the raw
+                # empirical over-rate. Rate multipliers (defense/matchup/park/
+                # weather) scale the per-AB hit RATE; the batting-order exposure
+                # multiplier scales the AB COUNT (n) — a binomial needs each on
+                # its own parameter, so they're passed separately (not the lumped
+                # combined_mult). The bucket cfg may override the xBA weight.
+                rate_mult = (output_def_mult * matchup_mult
+                             * park_mult * weather_mult)
+                dist_strength = (method_cfg.get("xstats_strength", xstats_strength)
+                                 if method_cfg else xstats_strength)
+                p_dist, dist_meta = _distributional_over_rate(
+                    prop_key, line, values, at_bats, weights,
+                    rate_mult, lineup_mult, player_name, commence_iso,
+                    method_cfg, dist_strength)
+                if p_dist is not None:
+                    over_rate = max(0.0, min(1.0, p_dist))
+                    calibration_meta = {
+                        "method": "D",
+                        "curr_games": curr_games,
+                        "empirical_over": round(empirical_over * 100, 2),
+                    }
+            elif method:
                 p_cal = apply_calibration_with_warmup(
-                    prop_calib_cfg, avg_stat, line, curr_games,
+                    method_cfg, avg_stat, line, curr_games,
                     empirical_over=empirical_over,
                 )
                 if p_cal is not None:
                     over_rate = max(0.0, min(1.0, p_cal))
-                    warmup_games = prop_calib_cfg.get("warmup_games", 10) or 1
+                    warmup_games = method_cfg.get("warmup_games", 10) or 1
                     blend_w = min(curr_games / float(warmup_games), 1.0)
                     calibration_meta = {
-                        "method": prop_calib_cfg.get("method"),
+                        "method": method,
                         "curr_games": curr_games,
                         "warmup_games": warmup_games,
                         "blend_weight": round(blend_w, 3),
@@ -1009,9 +1223,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         lambda v, t=effective_threshold_line: v > t,
                     )
                     raw_probability = empirical_adjusted
-                    if prop_calib_cfg and prop_calib_cfg.get("method"):
+                    # Resolve the line-conditional bucket by THIS threshold_line
+                    # (not the book line) for parity with the standard path. A
+                    # D-method bucket degrades to the empirical rate here — full
+                    # distributional P(>=k) inside the safe-threshold loop is a
+                    # deferred refinement (inert until line_methods ships).
+                    sm_method, sm_cfg = _method_cfg_for_line(
+                        prop_calib_cfg, threshold_line)
+                    if sm_method and sm_method != "D":
                         calibrated = apply_calibration_with_warmup(
-                            prop_calib_cfg,
+                            sm_cfg,
                             avg_stat,
                             threshold_line,
                             curr_games,
@@ -1141,6 +1362,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "park_factor": park_meta,
                     "weather": weather_meta,
                     "xstats": xstats_meta,
+                    "distributional": dist_meta,
                     "_values": list(values),
                     "_weights": list(weights),
                 })
@@ -1203,6 +1425,14 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # DraftKings price (see _prop_is_value / P1.1).
             is_value = _prop_is_value(edge, threshold, expected_roi)
 
+            # §2.4b-2 direction split: demote losing UNDER picks on cheap lines
+            # (batter_hits under 0.5 wins only ~43% OOS) from recommendations.
+            # The candidate is still returned; it just isn't flagged as value.
+            under_suppressed = False
+            if is_value and direction == "UNDER" and _suppress_under(prop_key, line):
+                is_value = False
+                under_suppressed = True
+
             # Log the published probability so future refits learn from it.
             # We log the *raw* (pre-Platt) probability — that's what Platt
             # was fit against and what subsequent refits should map.
@@ -1257,6 +1487,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "expected_roi_pct": (round(expected_roi * 100, 2)
                                       if expected_roi is not None else None),
                 "is_value": is_value,
+                "under_suppressed": under_suppressed,
                 "no_history": False,
                 "calibration": calibration_meta,
                 "recalibration": recal_meta,
@@ -1264,6 +1495,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "park_factor": park_meta,
                 "weather": weather_meta,
                 "xstats": xstats_meta,
+                "distributional": dist_meta,
                 "_values": list(values),
                 "_weights": list(weights),
             })

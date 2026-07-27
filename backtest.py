@@ -59,6 +59,7 @@ from odds_client import (
     devig_two_way,
 )
 from espn_client import get_pitcher_stats
+from pricing_common import _resolve_team_defense
 import historical_odds as hist_store
 from calibration_loader import (
     save_market_blend,
@@ -1177,6 +1178,10 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
         # Splits-based fallback — note: these rows carry NO game_date, so they
         # cannot be matched to a specific dated book line below.
         gamelog = get_pitcher_stats(espn_league, aid) or []
+    # Never resolve a pitcher prop from a batter's gamelog (or vice-versa): the
+    # "K"/"SO" strikeout labels collide across roles (see _role_matches_gamelog).
+    if not _role_matches_gamelog(prop_key, gamelog):
+        return []
     label = _stat_label_for(prop_key, gamelog)
     if not label:
         return []
@@ -1889,6 +1894,39 @@ def _stat_label_for(prop_key, gamelog):
     return None
 
 
+def _prop_role(prop_key):
+    """'pitching' / 'hitting' for MLB pitcher_*/batter_* props, else None (a
+    prop with no batter/pitcher role, e.g. NBA/NFL — no gate applies)."""
+    if prop_key.startswith("pitcher_"):
+        return "pitching"
+    if prop_key.startswith("batter_"):
+        return "hitting"
+    return None
+
+
+def _gamelog_is_pitcher(gamelog):
+    """True when a gamelog belongs to a pitcher — the only MLB log that carries
+    innings pitched. Same discriminator gamelog_store uses to tag rows."""
+    return any("IP" in g for g in gamelog)
+
+
+def _role_matches_gamelog(prop_key, gamelog):
+    """Guard against cross-role stat-label collisions in the props sweep.
+
+    The sweep applies EVERY prop to EVERY player's gamelog, and pitcher/batter
+    strikeouts share the ESPN labels "K"/"SO" (pitchers log "K", batters "SO"),
+    so ``_stat_label_for`` matches a batter's log for ``pitcher_strikeouts`` (via
+    the "SO" fallback) and a pitcher's for ``batter_strikeouts`` (via "K"). Left
+    ungated, a batter's strikeout games leak into the pitcher_strikeouts
+    calibration pool (and pitchers' stats into the batter props). A pitcher prop
+    must resolve only against a pitcher's gamelog, and vice-versa. Non-MLB props
+    (role None) always match — there is no role concept."""
+    role = _prop_role(prop_key)
+    if role is None:
+        return True
+    return (role == "pitching") == _gamelog_is_pitcher(gamelog)
+
+
 def cached_pace_factor(espn_sport, espn_league, team_id, season_year=None,
                        ttl_hours=24 * 7):
     """Cache the per-team pace factor (long TTL — only updated once per game)."""
@@ -2004,18 +2042,11 @@ def _resolve_opp_pa_asof(opp_name, test_date, team_series, window=None):
     return sum(prior) / len(prior)
 
 
-def _resolve_opp_pts_allowed(opp_name, team_defense):
-    """Tolerant lookup — try exact, then partial substring match."""
-    if not opp_name or not team_defense:
-        return None
-    if opp_name in team_defense:
-        return team_defense[opp_name]
-    lo = opp_name.lower()
-    for k, v in team_defense.items():
-        kl = k.lower()
-        if lo in kl or kl in lo or kl.split()[-1] == lo or lo.split()[-1] == kl.split()[-1]:
-            return v
-    return None
+# Canonical tolerant team-defense lookup now lives in pricing_common so the
+# runtime pricer (props.py) and this backtest agree on which matchups get the
+# defense adjustment. Kept under the historical name for existing importers
+# (book_line_calibration).
+_resolve_opp_pts_allowed = _resolve_team_defense
 
 
 def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
@@ -2132,8 +2163,16 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     reliability_skips = defaultdict(int)
 
     for name, gamelog in player_data.items():
+        is_pitcher_log = _gamelog_is_pitcher(gamelog)
         test_slice = gamelog[:games_per_player]
         for prop_key in props:
+            # Role gate: a pitcher prop must only resolve against a pitcher's
+            # gamelog (and a batter prop a batter's). Without this, the shared
+            # "K"/"SO" strikeout labels leak batters into pitcher_strikeouts (and
+            # vice-versa), inflating and corrupting the calibration pool.
+            role = _prop_role(prop_key)
+            if role is not None and (role == "pitching") != is_pitcher_log:
+                continue
             stat_label = _stat_label_for(prop_key, gamelog)
             if not stat_label:
                 continue

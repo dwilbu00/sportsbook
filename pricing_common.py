@@ -233,6 +233,29 @@ def _venue_match_multiplier(past_is_home, upcoming_is_home, sport_key,
     return match_w if past_is_home == upcoming_is_home else mismatch_w
 
 
+def _resolve_team_defense(opp_name, team_defense):
+    """Tolerant {team_name: value} lookup — exact, then partial substring match.
+
+    The opponent name on a gamelog/upcoming game (from the odds/ESPN feed) does
+    not always match the ``team_defense`` key verbatim (e.g. "Yankees" vs "New
+    York Yankees", "LA Angels" vs "Los Angeles Angels"). A plain ``dict.get``
+    fails open — the defense adjustment silently becomes 1.0 — so the runtime
+    quietly drops a feature the backtest validated. This mirrors the backtest's
+    ``_resolve_opp_pts_allowed`` so runtime pricing and the sweep agree on which
+    matchups actually get the adjustment. Returns None when nothing matches
+    (caller then applies no adjustment)."""
+    if not opp_name or not team_defense:
+        return None
+    if opp_name in team_defense:
+        return team_defense[opp_name]
+    lo = opp_name.lower()
+    for k, v in team_defense.items():
+        kl = k.lower()
+        if lo in kl or kl in lo or kl.split()[-1] == lo or lo.split()[-1] == kl.split()[-1]:
+            return v
+    return None
+
+
 def _opponent_defense_multiplier(opp_pts_allowed, league_avg_pts_allowed, strength=1.0):
     """
     Player-prop opponent-defense multiplier. A game against a defense that
