@@ -180,6 +180,79 @@ def harvest_book_lines_from_store(sport_key, target_props, label=""):
     return out
 
 
+def harvest_book_lines_from_prediction_log(sport_key, target_props):
+    """Harvest (player, prop, game) book lines from the app's own RESOLVED
+    prediction log — the lines it logged at analysis time. Unlike the
+    historical_odds backfill store (Odds-API credits, offline-only), this GROWS
+    for free with live analysis. Same shape as harvest_book_lines_from_store;
+    home/away/prices are absent (the calibration pipeline doesn't use them, and
+    join_book_lines_to_actuals re-derives the actual from the ESPN gamelog).
+    Resolved rows only — a completed game; a DNP-void (resolved, no game) simply
+    finds no game in the join and is skipped. Best-effort → [] on any error."""
+    try:
+        import recalibration
+        rows = recalibration._read_log(
+            where={"sport_key": sport_key, "resolved": True})
+    except Exception:
+        return []
+    target = set(target_props or [])
+    out = []
+    for r in rows:
+        if not r.get("resolved"):          # belt-and-suspenders (Blob path ignores where)
+            continue
+        pk = r.get("prop_key")
+        if pk not in target:
+            continue
+        player = r.get("player")
+        line = r.get("line")
+        gd = (r.get("game_date") or "")[:10]
+        if not player or line is None or not gd:
+            continue
+        out.append({
+            "sport_key": sport_key, "game_date": gd,
+            "home_team": None, "away_team": None,
+            "player": player, "prop_key": pk, "line": line,
+            "over_price": None, "under_price": None,
+        })
+    return out
+
+
+def _book_line_key(row):
+    """Dedup identity for a book line across sources: (player, prop, date, line)."""
+    try:
+        ln = round(float(row.get("line")), 1)
+    except (TypeError, ValueError):
+        ln = row.get("line")
+    return (row.get("player"), row.get("prop_key"), row.get("game_date"), ln)
+
+
+def harvest_real_line_book_lines(sport_key, target_props, label=""):
+    """Union of book lines from the historical_odds backfill store AND the app's
+    own RESOLVED prediction log, deduped by (player, prop, game_date, line). The
+    store is a broad historical backfill (Odds-API credits); the prediction log
+    grows for free with live analysis, so the calibration dataset — and the
+    line-conditional buckets — keep accumulating from usage. Prefers the store row
+    (richer: prices/teams) on a collision. Returns (book_lines, n_store, n_pred)."""
+    store_lines = harvest_book_lines_from_store(sport_key, target_props, label)
+    pred_lines = harvest_book_lines_from_prediction_log(sport_key, target_props)
+    seen, out = set(), []
+    for r in store_lines:              # store first → preferred on collision
+        k = _book_line_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    n_store = len(out)
+    for r in pred_lines:
+        k = _book_line_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    out.sort(key=lambda r: (r["game_date"], r["player"], r["prop_key"]))
+    return out, n_store, len(out) - n_store
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Step 2: join each book line to the player's actual stat in that game
 # ──────────────────────────────────────────────────────────────────────────────

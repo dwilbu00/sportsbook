@@ -164,12 +164,13 @@ class RefitSportRealLinesTests(unittest.TestCase):
         def _select(rows, shrinkage_k=15):
             pk = rows[0]["prop_key"] if rows else None
             return sel_map.get(pk)
+        _harvest = (harvest if harvest is not None
+                    else [{"prop_key": "batter_hits"}])
         with patch.object(refit_calibration, "load_calibration",
                           return_value=existing), \
              patch.object(refit_calibration, "save_calibration", save_mock), \
-             patch.object(blc, "harvest_book_lines_from_store",
-                          return_value=(harvest if harvest is not None
-                                        else [{"prop_key": "batter_hits"}])), \
+             patch.object(blc, "harvest_real_line_book_lines",
+                          return_value=(_harvest, len(_harvest), 0)), \
              patch.object(blc, "join_book_lines_to_actuals",
                           return_value=(join if join is not None else ["x"])), \
              patch.object(blc, "build_real_line_obs", side_effect=_build), \
@@ -304,6 +305,53 @@ class VenueParityTests(unittest.TestCase):
         self.assertEqual(
             pricing_common._venue_match_multiplier(None, True, "baseball_mlb",
                                                    strength=0.25), 1.0)
+
+
+class HarvestUnionTests(unittest.TestCase):
+    """Real-line obs now union the historical_odds backfill store with the app's
+    RESOLVED prediction log (grows with usage), deduped by player/prop/game/line."""
+
+    def _pred_rows(self):
+        return [
+            {"sport_key": "baseball_mlb", "prop_key": "batter_hits",
+             "player": "A", "game_date": "2026-07-25", "line": 0.5,
+             "resolved": True},
+            {"sport_key": "baseball_mlb", "prop_key": "batter_hits",
+             "player": "B", "game_date": "2026-07-25", "line": 1.5,
+             "resolved": True},
+            {"sport_key": "baseball_mlb", "prop_key": "pitcher_strikeouts",
+             "player": "C", "game_date": "2026-07-25", "line": 5.5,
+             "resolved": True},                                   # wrong prop
+            {"sport_key": "baseball_mlb", "prop_key": "batter_hits",
+             "player": "D", "game_date": "2026-07-26", "line": 0.5,
+             "resolved": False},                                  # unresolved
+        ]
+
+    def test_prediction_log_harvest_filters(self):
+        with patch("recalibration._read_log", return_value=self._pred_rows()):
+            out = blc.harvest_book_lines_from_prediction_log(
+                "baseball_mlb", ["batter_hits"])
+        self.assertEqual({(r["player"], r["line"]) for r in out},
+                         {("A", 0.5), ("B", 1.5)})   # C wrong-prop, D unresolved
+        self.assertIsNone(out[0]["over_price"])       # prices absent (unused)
+
+    def test_union_dedups_store_preferred(self):
+        store = [
+            {"sport_key": "baseball_mlb", "game_date": "2026-07-25", "player": "A",
+             "prop_key": "batter_hits", "line": 0.5, "over_price": -110,
+             "under_price": -110, "home_team": "H", "away_team": "X"},   # collides
+            {"sport_key": "baseball_mlb", "game_date": "2026-07-25", "player": "E",
+             "prop_key": "batter_hits", "line": 0.5, "over_price": -120,
+             "under_price": 100, "home_team": "H", "away_team": "X"},     # unique
+        ]
+        with patch.object(blc, "harvest_book_lines_from_store", return_value=store), \
+             patch("recalibration._read_log", return_value=self._pred_rows()):
+            out, n_store, n_pred = blc.harvest_real_line_book_lines(
+                "baseball_mlb", ["batter_hits"])
+        self.assertEqual(n_store, 2)
+        self.assertEqual(n_pred, 1)                    # only B is new (A collides)
+        a = next(r for r in out if r["player"] == "A")
+        self.assertEqual(a["over_price"], -110)        # store row preferred
 
 
 if __name__ == "__main__":

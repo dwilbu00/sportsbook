@@ -666,12 +666,13 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
 
     print(f"\n=== Re-selecting calibration method at REAL book lines for "
           f"{sport_key} ===")
-    book_lines = blc.harvest_book_lines_from_store(
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
         sport_key, target_props, store_label)
-    print(f"  {len(book_lines)} store book lines across {len(target_props)} "
-          f"calibrated props")
+    print(f"  {len(book_lines)} real-line book lines across {len(target_props)} "
+          f"calibrated props ({n_store} backfill store + {n_pred} new from the "
+          f"prediction log)")
     if not book_lines:
-        print("  No real book lines in the store; nothing to refit.")
+        print("  No real book lines (store or prediction log); nothing to refit.")
         return
     enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
     if not enriched:
@@ -891,11 +892,12 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
         print("No batter_hits calibration to compare against; run refit first.")
         return
     print(f"\n=== §2.4b-2 distributional diagnostic: {sport_key} batter_hits ===")
-    book_lines = blc.harvest_book_lines_from_store(
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
         sport_key, ["batter_hits"], store_label)
-    print(f"  {len(book_lines)} store book lines")
+    print(f"  {len(book_lines)} book lines ({n_store} backfill store + {n_pred} "
+          f"prediction log)")
     if not book_lines:
-        print("  No real book lines in the store; nothing to diagnose.")
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
         return
     enriched = [o for o in blc.join_book_lines_to_actuals(
         book_lines, espn_sport, espn_league)

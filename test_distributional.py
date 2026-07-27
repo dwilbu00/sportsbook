@@ -302,8 +302,8 @@ class DiagnoseDistributionalTests(unittest.TestCase):
         cfg = {"batter_hits": {"method": "C", "half_life": None,
                                "venue_strength": 0.0, "opp_defense_strength": 0.0}}
         with patch.object(refit_calibration, "load_calibration", return_value=cfg), \
-             patch.object(blc, "harvest_book_lines_from_store",
-                          return_value=[{"x": 1}]), \
+             patch.object(blc, "harvest_real_line_book_lines",
+                          return_value=([{"x": 1}], 1, 0)), \
              patch.object(blc, "join_book_lines_to_actuals",
                           return_value=self._enriched()), \
              patch("savant_history.load_days", return_value=[]), \
