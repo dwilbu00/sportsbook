@@ -185,10 +185,14 @@ def _local_log_lock():
         yield
 
 
-def _read_log_snapshot():
-    """Return (rows, version) from SQL, local disk, or the configured Azure blob."""
+def _read_log_snapshot(where=None):
+    """Return (rows, version) from SQL, local disk, or the configured Azure blob.
+
+    ``where`` (SQL path only) is an equality/IN {col: value} filter; the Blob/local
+    path ignores it (single-file NDJSON has no partial read) and the caller
+    self-filters in Python."""
     if _sql():
-        return _db.read_rows(_PRED_TABLE), None
+        return _db.read_rows(_PRED_TABLE, where=where), None
     blob_url = _prediction_log_blob_url()
     if blob_url:
         import requests
@@ -228,8 +232,12 @@ def _write_log_snapshot(rows, version=None):
     os.replace(tmp, LOG_PATH)
 
 
-def mutate_prediction_log(mutator, max_retries=5):
-    """Atomically mutate the prediction log; returns the mutator's result."""
+def mutate_prediction_log(mutator, max_retries=5, where=None):
+    """Atomically mutate the prediction log; returns the mutator's result.
+
+    ``where`` (SQL path only) restricts the rows read into the mutator to a subset
+    (see db_store.mutate) — for update-only passes like grading unresolved rows.
+    The Blob/local path ignores it (reads all); the mutator must self-filter."""
     if _sql():
         # Serialize with the module lock, mirroring the local path: SQL's
         # read->mutate->replace is a read-modify-write, so concurrent threads in
@@ -237,7 +245,7 @@ def mutate_prediction_log(mutator, max_retries=5):
         # update. db_store.mutate's transaction is the atomicity guarantee; this
         # lock is the in-process concurrency guard the blob ETag path provided.
         with _lock:
-            return _db.mutate(_PRED_TABLE, mutator)
+            return _db.mutate(_PRED_TABLE, mutator, where=where)
     if not _prediction_log_blob_url():
         with _lock:
             with _local_log_lock():
@@ -271,38 +279,45 @@ def _ndjson_local_path(filename):
     return os.path.join(PRED_DIR, filename)
 
 
-def _read_ndjson_blob(filename, use_cache=False):
+def _read_ndjson_blob(filename, use_cache=False, where=None):
     """Return (rows, version) for an NDJSON store, from Azure or local disk.
 
-    ``use_cache`` (read-only callers only) serves the Azure-blob read from a
-    short-TTL in-memory cache to avoid a full GET+parse on every rerun. Writers
+    ``use_cache`` (read-only callers only) serves the read from a short-TTL
+    in-memory cache to avoid a full read+parse on every rerun. Writers
     (mutate_ndjson_log) MUST leave it False so the read-modify-write always sees
-    the authoritative blob + its ETag."""
+    the authoritative store + its ETag.
+
+    ``where`` (SQL path only) is an equality/IN {col: value} filter that pulls only
+    matching rows — for reconciliation callers that need just the ungraded subset.
+    A filtered read never uses or populates the full-read cache (its result is a
+    subset), and the Blob/local path ignores it (a single NDJSON file has no
+    partial read; those callers self-filter in Python)."""
+    cacheable = use_cache and where is None
     if _sql():
-        if use_cache:
+        if cacheable:
             entry = _NDJSON_CACHE.get(filename)
             if entry and (time.time() - entry[2]) < _NDJSON_CACHE_TTL:
                 return copy.deepcopy(entry[0]), entry[1]
-        rows = _db.read_rows(_table_for(filename))
-        if use_cache:
+        rows = _db.read_rows(_table_for(filename), where=where)
+        if cacheable:
             _NDJSON_CACHE[filename] = (copy.deepcopy(rows), None, time.time())
         return rows, None
     blob_url = _blob_url_for(filename)
     if blob_url:
-        if use_cache:
+        if cacheable:
             entry = _NDJSON_CACHE.get(filename)
             if entry and (time.time() - entry[2]) < _NDJSON_CACHE_TTL:
                 return copy.deepcopy(entry[0]), entry[1]
         import requests
         response = requests.get(blob_url, timeout=30)
         if response.status_code == 404:
-            if use_cache:
+            if cacheable:
                 _NDJSON_CACHE[filename] = ([], None, time.time())
             return [], None
         response.raise_for_status()
         rows = _parse_log_text(response.text)
         version = response.headers.get("ETag")
-        if use_cache:
+        if cacheable:
             _NDJSON_CACHE[filename] = (copy.deepcopy(rows), version, time.time())
         return rows, version
     path = _ndjson_local_path(filename)
@@ -338,16 +353,21 @@ def _write_ndjson_blob(filename, rows, version=None):
     os.replace(tmp, path)
 
 
-def mutate_ndjson_log(filename, mutator, max_retries=5):
+def mutate_ndjson_log(filename, mutator, max_retries=5, where=None):
     """Atomically mutate an arbitrary NDJSON store; returns the mutator's result.
 
     Generalizes mutate_prediction_log to any sibling NDJSON file. The mutator
     receives the row list and mutates it in place; a falsy return skips the
     write. Blob-backed writers retry on ETag conflict; local writers hold an
-    inter-process file lock."""
+    inter-process file lock.
+
+    ``where`` (SQL path only) restricts the rows read into the mutator to a subset
+    (see db_store.mutate) — for update-only reconciliation passes. The Blob/local
+    path ignores it and reads all rows, so the mutator must be correct on the full
+    set (it self-filters)."""
     if _sql():
         with _lock:  # in-process serialization of read->mutate->replace
-            result = _db.mutate(_table_for(filename), mutator)
+            result = _db.mutate(_table_for(filename), mutator, where=where)
         if result:
             _NDJSON_CACHE.pop(filename, None)
         return result
@@ -564,9 +584,9 @@ def compact_prediction_log():
         return 0
 
 
-def _read_log():
+def _read_log(where=None):
     try:
-        rows, _ = _read_log_snapshot()
+        rows, _ = _read_log_snapshot(where)
         return rows
     except Exception:
         return []
@@ -965,7 +985,11 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     pair = SPORT_ESPN_MAP.get(sport_key)
     if not pair:
         return 0
-    rows = _read_log()
+    # Pull only this sport's UNRESOLVED rows out of the DB (settled rows are the
+    # bulk and are discarded anyway); the game_date<today refinement stays in
+    # Python below. The Blob/local path ignores the filter and self-filters.
+    unresolved = {"sport_key": sport_key, "resolved": False}
+    rows = _read_log(where=unresolved)
     if not rows:
         return 0
 
@@ -1025,7 +1049,7 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
         return changed
 
     try:
-        return mutate_prediction_log(apply_resolutions)
+        return mutate_prediction_log(apply_resolutions, where=unresolved)
     except Exception:
         return 0
 

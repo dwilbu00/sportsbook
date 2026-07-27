@@ -116,6 +116,13 @@ def seed_athlete_id(espn_sport, espn_league, player_name, athlete_id):
     No-op when `athlete_id` is falsy (nothing authoritative to pin)."""
     if not athlete_id:
         return
+    # Under SQL, cached_athlete_id reads from the durable gamelog_store cache, so
+    # a local-file seed would be a silent no-op — seed SQL instead to match.
+    if _sql():
+        import gamelog_store
+        gamelog_store.seed_athlete_id(
+            espn_sport, espn_league, player_name, athlete_id)
+        return
     path = _cache_key("athlete_id", espn_sport, espn_league, player_name.lower())
     with open(path, "w") as f:
         json.dump({"id": str(athlete_id)}, f)

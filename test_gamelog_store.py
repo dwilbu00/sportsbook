@@ -237,6 +237,30 @@ class AthleteIdCacheTests(_Backend, unittest.TestCase):
             self.assertIsNone(
                 gamelog_store.get_athlete_id("baseball", "mlb", "Nobody"))
 
+    def test_seed_pins_id_and_serves_without_search(self):
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Mookie Betts", "808")
+        with patch.object(espn_client, "search_athlete") as mock:
+            got = gamelog_store.get_athlete_id("baseball", "mlb", "Mookie Betts")
+            mock.assert_not_called()          # seeded → no lossy search
+        self.assertEqual(got["id"], "808")
+
+    def test_seed_overwrites_existing_key(self):
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Dupe", "1")
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Dupe", "2")
+        with patch.object(espn_client, "search_athlete") as mock:
+            got = gamelog_store.get_athlete_id("baseball", "mlb", "Dupe")
+            mock.assert_not_called()
+        self.assertEqual(got["id"], "2")      # authoritative overwrite
+
+    def test_seed_noop_on_falsy_id(self):
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Ghost", None)
+        with patch.object(espn_client, "search_athlete",
+                          return_value={"id": "9", "name": "Ghost",
+                                        "team_id": "1"}) as mock:
+            got = gamelog_store.get_athlete_id("baseball", "mlb", "Ghost")
+            mock.assert_called_once()          # nothing seeded → real lookup
+        self.assertEqual(got["id"], "9")
+
 
 class ConcurrencyTests(_Backend, unittest.TestCase):
 
@@ -298,6 +322,15 @@ class DispatchTests(_Backend, unittest.TestCase):
         self.assertTrue(hist["found"])
         self.assertEqual(hist["values"], [2.0, 1.0])
         self.assertEqual(hist["team_id"], "10")
+
+    def test_seed_athlete_id_routes_to_sql(self):
+        import espn_cache
+        espn_cache.seed_athlete_id("baseball", "mlb", "Seeded Star", "4242")
+        # cached_athlete_id (SQL path) now resolves without a lossy search.
+        with patch.object(espn_client, "search_athlete") as mock:
+            aid = espn_cache.cached_athlete_id("baseball", "mlb", "Seeded Star")
+            mock.assert_not_called()
+        self.assertEqual(aid, "4242")
 
 
 class SchemaParityTests(_Backend, unittest.TestCase):

@@ -10,6 +10,7 @@ Everything fails closed: a missing score or an outage returns None so grading
 simply stays pending and is retried later — it never raises into the app.
 """
 import os
+import time
 from datetime import date as _date, datetime, timedelta, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,8 +22,13 @@ _ESPN_MAP = {
     "icehockey_nhl": ("hockey", "nhl"),
 }
 
-# In-process memo so one grading pass reuses a date's scoreboard fetch.
-_SCORE_CACHE = {}  # (sport_key, game_date) -> [game dicts]
+# In-process memo so one grading pass reuses a date's scoreboard fetch. Value is
+# (fetched_at_epoch, [game dicts]): past dates are immutable (memoized for the
+# process lifetime), but a recent date may still be finalizing, so its memo
+# expires after a short TTL — otherwise a game that goes final mid-session stays
+# masked by the stale (final-only) slate that dropped it, stranding its bet.
+_SCORE_CACHE = {}
+_RECENT_MEMO_TTL = 20 * 60  # seconds
 
 
 def _team_key(name):
@@ -66,6 +72,23 @@ def _candidate_dates(game_date):
 # ──────────────────────────────────────────────────────────────────────────────
 # Grading
 # ──────────────────────────────────────────────────────────────────────────────
+
+def side_for_team(team, home_team, away_team):
+    """'home'/'away' for the side ``team`` is on, or None if it matches neither.
+
+    Lets the grader resolve which side a moneyline/spread bet is on from the
+    authoritative team names rather than a stored 'side' (which is set at submit
+    from home_away and would grade the wrong team if it were ever stale/flipped).
+    Uses the same normalization as score matching."""
+    tk = _team_key(team)
+    if not tk:
+        return None
+    if tk == _team_key(home_team):
+        return "home"
+    if tk == _team_key(away_team):
+        return "away"
+    return None
+
 
 def grade_team_bet(bet_type, side, point, home_score, away_score):
     """Grade one team-market bet given final scores.
@@ -120,7 +143,13 @@ def _mlb_scores_for_date(game_date):
     except Exception:
         return []
     cache = f"final_scores_mlb_{game_date}"
-    cached = mlb_starters._read_cache(cache, max_age=6 * 3600)
+    # Past dates are immutable; a current/future date may still have games in
+    # progress (the final-only list omits them), so trust its disk cache only
+    # briefly — else a stale slate that dropped the not-yet-final game strands the
+    # bet (or, via the ±1-day fallback, risks matching the wrong night of a series).
+    today = datetime.now(timezone.utc).date().isoformat()
+    max_age = 6 * 3600 if str(game_date)[:10] < today else 20 * 60
+    cached = mlb_starters._read_cache(cache, max_age=max_age)
     if cached is not None:
         return cached
     try:
@@ -198,14 +227,20 @@ def _espn_scores_for_date(espn_sport, espn_league, game_date):
 
 def _scores_for_date(sport_key, game_date):
     key = (sport_key, str(game_date)[:10])
-    if key in _SCORE_CACHE:
-        return _SCORE_CACHE[key]
+    today = datetime.now(timezone.utc).date().isoformat()
+    entry = _SCORE_CACHE.get(key)
+    if entry is not None:
+        fetched_at, out = entry
+        # Past dates are immutable → reuse forever; a recent date may still be
+        # finalizing, so re-fetch after the short memo TTL.
+        if key[1] < today or (time.time() - fetched_at) < _RECENT_MEMO_TTL:
+            return out
     if sport_key == "baseball_mlb":
         out = _mlb_scores_for_date(key[1])
     else:
         pair = _ESPN_MAP.get(sport_key)
         out = _espn_scores_for_date(pair[0], pair[1], key[1]) if pair else []
-    _SCORE_CACHE[key] = out
+    _SCORE_CACHE[key] = (time.time(), out)
     return out
 
 
@@ -220,7 +255,8 @@ def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
     hk, ak = _team_key(home_team), _team_key(away_team)
     if not hk or not ak:
         return None
-    candidates = []
+    day0 = str(game_date)[:10]
+    candidates = []          # (source_date, game_dict)
     seen = set()
     for d in _candidate_dates(game_date):
         for g in _scores_for_date(sport_key, d):
@@ -233,14 +269,31 @@ def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
             if marker in seen:
                 continue
             seen.add(marker)
-            candidates.append(g)
+            candidates.append((d, g))
     if not candidates:
         return None
-    if len(candidates) > 1:
-        target = _parse_utc(commence_time)
-        if target is not None:
-            candidates.sort(key=lambda g: abs(
-                ((_parse_utc(g.get("commence_time")) or target)
-                 - target).total_seconds()))
-    g = candidates[0]
+    target = _parse_utc(commence_time)
+    if target is not None:
+        def _delta(item):
+            gc = _parse_utc(item[1].get("commence_time"))
+            return (abs((gc - target).total_seconds())
+                    if gc is not None else float("inf"))
+        candidates.sort(key=_delta)
+        # The same matchup can appear on adjacent days (a series), or the exact-day
+        # game can be missing from a stale final-only slate. Grading the nearest
+        # match blindly would settle a bet on the WRONG night. If even the closest
+        # game starts >20h from this wager's first pitch, it's a different game →
+        # return None (stay pending, retry once fresh scores land). Legitimate
+        # UTC/local slippage is only a few hours, so the real game is never rejected.
+        if _delta(candidates[0]) > 20 * 3600:
+            return None
+    else:
+        # No commence to disambiguate: trust only an exact game_date match, and
+        # bail if the matchup is still ambiguous across the ±1-day window.
+        exact = [c for c in candidates if c[0] == day0]
+        if exact:
+            candidates = exact
+        if len(candidates) > 1:
+            return None
+    g = candidates[0][1]
     return (g["home_score"], g["away_score"])

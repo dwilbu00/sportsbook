@@ -179,6 +179,203 @@ class DbStoreOpsTests(_SqliteBackend, unittest.TestCase):
     def test_load_recal_missing_returns_none(self):
         self.assertIsNone(db_store.load_recal("no_such_sport"))
 
+    def test_read_rows_retries_transient_operational_error(self):
+        # A cold Azure SQL serverless resume can throw OperationalError on the
+        # first read; read_rows must retry (after a backoff) instead of letting
+        # the caller surface an empty store.
+        from sqlalchemy.exc import OperationalError
+        real_select = db_store._select_rows
+        calls = {"n": 0}
+
+        def flaky(conn, cfg, where=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OperationalError("SELECT 1", {}, Exception("resuming"))
+            return real_select(conn, cfg, where)
+
+        with patch.object(db_store, "_select_rows", side_effect=flaky), \
+                patch.object(db_store.time, "sleep") as sleep:
+            rows = db_store.read_rows("wagers")
+        self.assertEqual(rows, [])
+        self.assertEqual(calls["n"], 2)      # retried once after the failure
+        sleep.assert_called_once()           # backed off before the retry
+
+    def test_read_rows_reraises_after_exhausting_retries(self):
+        from sqlalchemy.exc import OperationalError
+        err = OperationalError("stmt", {}, Exception("down"))
+        with patch.object(db_store, "_select_rows", side_effect=err), \
+                patch.object(db_store.time, "sleep"):
+            with self.assertRaises(OperationalError):
+                db_store.read_rows("wagers", max_retries=2)
+
+
+class SurgicalMutateTests(_SqliteBackend, unittest.TestCase):
+    """mutate() writes only the delta (INSERT/UPDATE/DELETE), never delete-all +
+    insert-all. Proven by autoincrement id stability: a replace-all would renumber
+    every row; a surgical write keeps untouched rows' ids."""
+
+    def _add_wagers(self, n):
+        def add(rows):
+            rows.extend([{"wager_id": f"w{i}", "status": "pending", "stake": 1.0}
+                         for i in range(n)])
+            return n
+        db_store.mutate("wagers", add)
+
+    def _wager_pk(self):
+        """{wager_id: autoincrement id}."""
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(db_store.select(
+                db_store.wagers.c.wager_id, db_store.wagers.c.id)).all()
+        return {r[0]: r[1] for r in rows}
+
+    def test_update_is_surgical_keeps_other_ids(self):
+        self._add_wagers(3)
+        before = self._wager_pk()
+
+        def edit(rows):
+            for r in rows:
+                if r["wager_id"] == "w1":
+                    r["stake"] = 99.0
+            return 1
+        db_store.mutate("wagers", edit)
+        self.assertEqual(self._wager_pk(), before)       # every id stable
+        got = {r["wager_id"]: r["stake"] for r in db_store.read_rows("wagers")}
+        self.assertEqual(got["w1"], 99.0)
+        self.assertEqual(got["w0"], 1.0)                 # untouched row unchanged
+
+    def test_delete_is_surgical_keeps_other_ids(self):
+        self._add_wagers(3)
+        before = self._wager_pk()
+
+        def prune(rows):
+            rows[:] = [r for r in rows if r["wager_id"] != "w1"]
+            return 1
+        db_store.mutate("wagers", prune)
+        after = self._wager_pk()
+        self.assertNotIn("w1", after)
+        self.assertEqual(after["w0"], before["w0"])      # survivors keep ids
+        self.assertEqual(after["w2"], before["w2"])
+
+    def test_insert_appends_and_keeps_existing_ids(self):
+        self._add_wagers(2)
+        before = self._wager_pk()
+
+        def add_one(rows):
+            rows.append({"wager_id": "w9", "status": "pending", "stake": 5.0})
+            return 1
+        db_store.mutate("wagers", add_one)
+        after = self._wager_pk()
+        self.assertEqual(after["w0"], before["w0"])
+        self.assertEqual(after["w1"], before["w1"])
+        self.assertGreater(after["w9"], max(before.values()))   # appended after
+
+    def test_truthy_but_unchanged_writes_nothing(self):
+        # A mutator that reports a change but leaves every field equal emits no
+        # UPDATE (change detection compares coerced params) — ids untouched.
+        self._add_wagers(1)
+        before = self._wager_pk()
+        db_store.mutate("wagers", lambda rows: 1)
+        self.assertEqual(self._wager_pk(), before)
+
+    def test_duplicate_identity_in_mutation_raises_and_rolls_back(self):
+        # The diff must not silently collapse two same-identity rows (last-writer-
+        # wins); it fails loudly like the old delete-all+insert-all UNIQUE path.
+        def add_dupes(rows):
+            rows.append({"wager_id": "dup", "status": "pending", "stake": 1.0})
+            rows.append({"wager_id": "dup", "status": "won", "stake": 2.0})
+            return 1
+        with self.assertRaises(ValueError):
+            db_store.mutate("wagers", add_dupes)
+        self.assertEqual(db_store.read_rows("wagers"), [])   # rolled back
+
+    def test_read_rows_where_filters(self):
+        def add(rows):
+            rows.append({"wager_id": "p1", "status": "pending", "stake": 1.0})
+            rows.append({"wager_id": "s1", "status": "won", "stake": 1.0})
+            return 1
+        db_store.mutate("wagers", add)
+        pend = db_store.read_rows("wagers", where={"status": "pending"})
+        self.assertEqual([r["wager_id"] for r in pend], ["p1"])
+        both = db_store.read_rows("wagers", where={"status": ["pending", "won"]})
+        self.assertEqual({r["wager_id"] for r in both}, {"p1", "s1"})
+
+    def test_where_filtered_mutate_only_sees_and_touches_subset(self):
+        def add(rows):
+            rows.append({"wager_id": "p1", "status": "pending", "stake": 1.0})
+            rows.append({"wager_id": "s1", "status": "won", "stake": 1.0})
+            return 1
+        db_store.mutate("wagers", add)
+        before = self._wager_pk()
+
+        seen = {}
+
+        def grade(rows):
+            seen["ids"] = [r["wager_id"] for r in rows]   # only the subset
+            for r in rows:
+                r["status"] = "won"
+                r["profit"] = 2.0
+            return 1
+        db_store.mutate("wagers", grade, where={"status": "pending"})
+        self.assertEqual(seen["ids"], ["p1"])             # settled row not read
+        self.assertEqual(self._wager_pk(), before)        # no id churn
+        got = {r["wager_id"]: r for r in db_store.read_rows("wagers")}
+        self.assertEqual(got["p1"]["status"], "won")
+        self.assertEqual(got["p1"]["profit"], 2.0)
+
+    def test_prediction_resolve_updates_in_place(self):
+        def add(rows):
+            rows.append({"sport_key": "baseball_mlb", "event_id": "e1",
+                         "prop_key": "batter_hits", "player": "X",
+                         "game_date": "2026-07-20", "line": 0.5, "raw_prob": 0.6,
+                         "resolved": False})
+            return 1
+        db_store.mutate("prediction_log", add)
+        with db_store.get_engine().connect() as conn:
+            id_before = conn.execute(
+                db_store.select(db_store.prediction_log.c.id)).scalar()
+
+        def resolve(rows):
+            for r in rows:
+                r["actual"] = 2.0
+                r["outcome"] = 1
+                r["resolved"] = True
+            return 1
+        db_store.mutate("prediction_log", resolve,
+                        where={"resolved": False})
+        with db_store.get_engine().connect() as conn:
+            ids = conn.execute(
+                db_store.select(db_store.prediction_log.c.id)).all()
+        self.assertEqual([r[0] for r in ids], [id_before])   # updated, not reinserted
+        got = db_store.read_rows("prediction_log")[0]
+        self.assertEqual(got["outcome"], 1)
+        self.assertIs(got["resolved"], True)
+
+    def test_prediction_identity_null_event_id_uses_game_date(self):
+        # event_id NULL → identity keys on game_date; a later update must MATCH the
+        # existing row (UPDATE), not insert a duplicate.
+        def add(rows):
+            rows.append({"sport_key": "baseball_mlb", "event_id": None,
+                         "prop_key": "batter_hits", "player": "Y",
+                         "game_date": "2026-07-21", "line": 1.5, "raw_prob": 0.5,
+                         "resolved": False})
+            return 1
+        db_store.mutate("prediction_log", add)
+        with db_store.get_engine().connect() as conn:
+            id_before = conn.execute(
+                db_store.select(db_store.prediction_log.c.id)).scalar()
+
+        def resolve(rows):
+            for r in rows:
+                r["resolved"] = True
+                r["outcome"] = 0
+                r["actual"] = 1.0
+            return 1
+        db_store.mutate("prediction_log", resolve)
+        with db_store.get_engine().connect() as conn:
+            ids = conn.execute(
+                db_store.select(db_store.prediction_log.c.id)).all()
+        self.assertEqual([r[0] for r in ids], [id_before])   # no duplicate insert
+
 
 class SqlDispatchTests(_SqliteBackend, unittest.TestCase):
 

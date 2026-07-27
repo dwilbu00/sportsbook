@@ -1094,7 +1094,7 @@ class RecalibrationTests(unittest.TestCase):
             "resolved": False,
         }]
 
-        def mutate(mutator):
+        def mutate(mutator, where=None):
             return mutator(rows)
 
         # _resolve_mlb_actual -> None forces the ESPN fallback (and keeps this

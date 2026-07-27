@@ -304,6 +304,96 @@ class RoundTripAndGradeTests(unittest.TestCase):
             self.assertEqual(row["game_date"], "2026-07-20")  # healed to ET-local
 
 
+class TeamIdentityGradingTests(unittest.TestCase):
+    """A moneyline/spread bet must grade off the team it was placed on, even if
+    the stored `side` is stale/flipped (the Yankees-graded-as-Phillies bug)."""
+
+    def test_side_for_team(self):
+        self.assertEqual(game_results.side_for_team(
+            "New York Yankees", "Philadelphia Phillies", "New York Yankees"),
+            "away")
+        self.assertEqual(game_results.side_for_team(
+            "Philadelphia Phillies", "Philadelphia Phillies", "New York Yankees"),
+            "home")
+        self.assertIsNone(game_results.side_for_team(
+            "Boston Red Sox", "Philadelphia Phillies", "New York Yankees"))
+
+    def test_moneyline_grades_by_team_not_stale_side(self):
+        # Yankees (away) ML; final = Phillies 11, Yankees 4 → the bet LOST.
+        row = wagers.build_wager_row("moneyline", None, {
+            "team": "New York Yankees", "opponent": "Philadelphia Phillies",
+            "home_away": "AWAY", "best_price": 120, "event_id": "E1"},
+            {"sport_key": "baseball_mlb", "event_id": "E1",
+             "commence_time": "2026-07-26T23:20:00Z", "game_date": "2026-07-26",
+             "home_team": "Philadelphia Phillies",
+             "away_team": "New York Yankees", "stake": 10.0,
+             "placed_at": "2026-07-26T20:00:00+00:00", "seq": 0})
+        row["side"] = "home"   # simulate a stale/flipped stored side
+        with patch.object(game_results, "final_score", return_value=(11, 4)):
+            self.assertEqual(wagers._grade_wager(row), ("lost", "11-4"))
+
+
+class FinalScoreDisambiguationTests(unittest.TestCase):
+    """final_score must pick the exact night in a series and never settle a bet
+    off an adjacent-day game (stale-slate / series wrong-night bug)."""
+
+    def setUp(self):
+        game_results._SCORE_CACHE.clear()
+
+    def tearDown(self):
+        game_results._SCORE_CACHE.clear()
+
+    _SERIES = {
+        "2026-07-25": [{"home_team": "Philadelphia Phillies",
+                        "away_team": "New York Yankees", "home_score": 1.0,
+                        "away_score": 3.0,
+                        "commence_time": "2026-07-25T22:05:00Z"}],
+        "2026-07-26": [{"home_team": "Philadelphia Phillies",
+                        "away_team": "New York Yankees", "home_score": 11.0,
+                        "away_score": 4.0,
+                        "commence_time": "2026-07-26T23:20:00Z"}],
+    }
+
+    def test_picks_exact_night_in_series(self):
+        with patch.object(game_results, "_scores_for_date",
+                          side_effect=lambda sk, d: self._SERIES.get(str(d)[:10], [])):
+            score = game_results.final_score(
+                "baseball_mlb", "2026-07-26", "Philadelphia Phillies",
+                "New York Yankees", "2026-07-26T23:20:00Z")
+        self.assertEqual(score, (11.0, 4.0))     # the 7/26 game, not 7/25
+
+    def test_wrong_night_only_match_is_rejected(self):
+        # 7/26 missing from the slate; only 7/25 matches → >20h off → don't grade.
+        only_25 = {"2026-07-25": self._SERIES["2026-07-25"]}
+        with patch.object(game_results, "_scores_for_date",
+                          side_effect=lambda sk, d: only_25.get(str(d)[:10], [])):
+            score = game_results.final_score(
+                "baseball_mlb", "2026-07-26", "Philadelphia Phillies",
+                "New York Yankees", "2026-07-26T23:20:00Z")
+        self.assertIsNone(score)
+
+
+class ReadStatusTests(unittest.TestCase):
+    """read_wagers_with_status surfaces a backend outage so My Bets can show an
+    'unreachable' banner instead of 'no submitted picks yet'."""
+
+    def test_surfaces_backend_error(self):
+        with patch.object(recalibration, "_read_ndjson_blob",
+                          side_effect=RuntimeError("timeout")):
+            rows, err = wagers.read_wagers_with_status()
+            self.assertEqual(rows, [])
+            self.assertIsInstance(err, RuntimeError)
+            # Legacy read_wagers still swallows to [] for non-UI callers.
+            self.assertEqual(wagers.read_wagers(), [])
+
+    def test_ok_returns_rows_and_no_error(self):
+        with patch.object(recalibration, "_read_ndjson_blob",
+                          return_value=([{"wager_id": "w1"}], None)):
+            rows, err = wagers.read_wagers_with_status()
+        self.assertIsNone(err)
+        self.assertEqual(rows, [{"wager_id": "w1"}])
+
+
 class DeleteAndEditTests(unittest.TestCase):
     def _seed(self):
         prop = wagers.build_wager_row("player_prop", None, {

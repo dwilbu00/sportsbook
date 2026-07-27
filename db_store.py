@@ -34,11 +34,12 @@ tests connect to ``sqlite://`` and never touch it.
 
 import os
 import threading
+import time
 
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, Index, Integer, MetaData,
-    PrimaryKeyConstraint, String, Table, UniqueConstraint, create_engine,
-    delete, func, insert, select,
+    PrimaryKeyConstraint, String, Table, UniqueConstraint, and_, create_engine,
+    delete, func, insert, select, update,
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -299,10 +300,27 @@ def _prediction_derive(row):
     return {"event_key": (row.get("event_id") or row.get("game_date") or "")}
 
 
+def _prediction_identity(row):
+    # Mirrors uq_prediction_identity — the natural key used to diff rows for
+    # surgical writes (event_key coalesced exactly as _prediction_derive stores it).
+    return {
+        "sport_key": row.get("sport_key"),
+        "event_key": _prediction_derive(row)["event_key"],
+        "prop_key": row.get("prop_key"),
+        "player": row.get("player"),
+        "line": _f(row.get("line")),
+    }
+
+
+# ``identity`` returns the natural-key {col: value} map used to diff before/after
+# rows (surgical writes) and to build the UPDATE/DELETE WHERE — it matches each
+# table's UNIQUE constraint.
 _NDJSON_TABLES = {
     "prediction_log": {"table": prediction_log, "spec": _PREDICTION_SPEC,
-                       "derive": _prediction_derive},
-    "wagers": {"table": wagers, "spec": _WAGER_SPEC, "derive": lambda row: {}},
+                       "derive": _prediction_derive,
+                       "identity": _prediction_identity},
+    "wagers": {"table": wagers, "spec": _WAGER_SPEC, "derive": lambda row: {},
+               "identity": lambda row: {"wager_id": row.get("wager_id")}},
 }
 
 
@@ -400,7 +418,13 @@ def get_engine():
                 "sqlite://", connect_args={"check_same_thread": False},
                 poolclass=StaticPool)
         else:
-            _ENGINE = create_engine(url, pool_pre_ping=True, pool_recycle=1500)
+            # login_timeout/timeout give the driver time to ride out an Azure SQL
+            # serverless resume from auto-pause (the first connect after idle can
+            # take tens of seconds) rather than failing instantly; pool_pre_ping
+            # recycles connections the resume dropped.
+            _ENGINE = create_engine(
+                url, pool_pre_ping=True, pool_recycle=1500,
+                connect_args={"login_timeout": 60, "timeout": 60})
         return _ENGINE
 
 
@@ -431,48 +455,129 @@ def _row_to_params(cfg, row):
     return params
 
 
-def _select_rows(conn, cfg):
-    """Ordered row-dict list (only the store's declared fields)."""
+def _where_clause(table, where):
+    """ANDed equality/IN clause from a {col: value|list} map, or None if empty."""
+    if not where:
+        return None
+    conds = []
+    for col, val in where.items():
+        column = table.c[col]
+        conds.append(column.in_(list(val))
+                     if isinstance(val, (list, tuple, set))
+                     else column == val)
+    return and_(*conds)
+
+
+def _identity_where(cfg, row):
+    """WHERE matching one row on its natural identity (for surgical UPDATE/DELETE)."""
+    return and_(*(cfg["table"].c[col] == val
+                  for col, val in cfg["identity"](row).items()))
+
+
+def _key(cfg, row):
+    """Hashable natural-identity key for diffing before/after rows."""
+    return tuple(sorted(cfg["identity"](row).items()))
+
+
+def _select_rows(conn, cfg, where=None):
+    """Ordered row-dict list (only the store's declared fields), optionally
+    filtered by an equality/IN ``where`` map."""
     names = [name for name, _ in cfg["spec"]]
-    result = conn.execute(select(cfg["table"]).order_by(cfg["table"].c.id))
+    stmt = select(cfg["table"]).order_by(cfg["table"].c.id)
+    clause = _where_clause(cfg["table"], where)
+    if clause is not None:
+        stmt = stmt.where(clause)
+    result = conn.execute(stmt)
     return [{name: row._mapping[name] for name in names} for row in result]
 
 
-def read_rows(table_name):
-    """Return the row-dict list for an NDJSON store."""
-    cfg = _resolve(table_name)
-    with get_engine().connect() as conn:
-        return _select_rows(conn, cfg)
+def read_rows(table_name, where=None, max_retries=3):
+    """Return the row-dict list for an NDJSON store, optionally filtered by an
+    equality/IN ``where`` map (e.g. {"status": "pending"}) so a reconciliation
+    caller pulls only the rows it needs instead of the whole table.
 
-
-def _replace_rows(conn, cfg, rows):
-    conn.execute(delete(cfg["table"]))
-    if rows:
-        conn.execute(insert(cfg["table"]),
-                     [_row_to_params(cfg, row) for row in rows])
-
-
-def mutate(table_name, mutator, max_retries=3):
-    """Transactionally read → mutate → replace an NDJSON store.
-
-    The mutator receives the full row-dict list and mutates it in place, exactly
-    as the Blob/local path expects; a falsy return skips the write. The whole
-    thing runs in one transaction, so a constraint violation rolls back and
-    propagates (matching the Blob path, where user-initiated writes surface
-    failures). Returns the mutator's result."""
+    Retries transient OperationalErrors with a short backoff — chiefly an Azure
+    SQL serverless database resuming from auto-pause, whose first read after idle
+    can time out. Without this the caller (e.g. the wagers ledger) would surface
+    an empty store on the first page load and the user would have to click
+    Refresh once the DB woke up."""
     cfg = _resolve(table_name)
     engine = get_engine()
     last_exc = None
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                return _select_rows(conn, cfg, where)
+        except OperationalError as exc:  # transient (cold resume / lock / timeout)
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + 2 * attempt)
+    raise last_exc
+
+
+def mutate(table_name, mutator, where=None, max_retries=3):
+    """Transactionally read → mutate → write only the DELTA for an NDJSON store.
+
+    The mutator receives the current row-dict list and mutates it in place
+    (append / prune / edit), exactly as the Blob/local path expects; a falsy
+    return skips the write. Rather than rewriting the whole table, we diff the
+    before/after lists by each store's natural identity and emit only the changed
+    rows as surgical INSERT/UPDATE/DELETE — all in one transaction, so a
+    CHECK/UNIQUE violation rolls the whole thing back and propagates (matching the
+    Blob path). Returns the mutator's result (its change count), not the DB-op
+    count, so every caller is unchanged.
+
+    ``where`` (an equality/IN {col: value} map) restricts the rows read into the
+    mutator to a subset — used by update-only reconciliation passes (e.g. grade
+    only status='pending') to avoid pulling the whole table out of the DB. A
+    ``where``-filtered mutate MUST only update rows within that subset: it must not
+    append a row whose identity could collide with an unread row, nor depend on
+    rows outside the filter."""
+    cfg = _resolve(table_name)
+    table = cfg["table"]
+    engine = get_engine()
+    last_exc = None
+    for attempt in range(max_retries):
         try:
             with engine.begin() as conn:
-                rows = _select_rows(conn, cfg)
-                result = mutator(rows)
-                if result:
-                    _replace_rows(conn, cfg, rows)
+                before = _select_rows(conn, cfg, where)
+                before_by_key = {_key(cfg, r): r for r in before}
+                working = [dict(r) for r in before]   # rows are flat scalar dicts
+                result = mutator(working)
+                if not result:
+                    return result
+                after_by_key = {}
+                for r in working:
+                    k = _key(cfg, r)
+                    if k in after_by_key:
+                        # Two mutated rows share a natural identity. Delete-all +
+                        # insert-all would have surfaced this via the UNIQUE
+                        # constraint; the diff would otherwise silently drop one
+                        # (last-writer-wins). Fail loudly to keep that backstop.
+                        raise ValueError(
+                            f"{table_name}: duplicate identity {k} in mutated rows")
+                    after_by_key[k] = r
+                inserts = []
+                for k, row in after_by_key.items():
+                    prior = before_by_key.get(k)
+                    new_params = _row_to_params(cfg, row)
+                    if prior is None:
+                        inserts.append(new_params)
+                    elif new_params != _row_to_params(cfg, prior):
+                        conn.execute(update(table)
+                                     .where(_identity_where(cfg, prior))
+                                     .values(**new_params))
+                if inserts:
+                    conn.execute(insert(table), inserts)
+                for k, row in before_by_key.items():
+                    if k not in after_by_key:
+                        conn.execute(delete(table)
+                                     .where(_identity_where(cfg, row)))
                 return result
-        except OperationalError as exc:  # transient (lock/timeout) → retry
+        except OperationalError as exc:  # transient (cold resume/lock/timeout)
             last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + 2 * attempt)
     raise last_exc
 
 

@@ -203,7 +203,7 @@ class DoubleheaderPickTests(unittest.TestCase):
             {"game_date": "2024-07-04T23:10:00Z", "H": 2},   # game 2 (nightcap)
         ]
 
-        def mutate(mutator):
+        def mutate(mutator, where=None):
             return mutator([row])
 
         with patch.object(recalibration, "_read_log", return_value=[row]), \
@@ -227,7 +227,7 @@ class DoubleheaderPickTests(unittest.TestCase):
             "line": 6.5, "resolved": False,
         }
 
-        def mutate(mutator):
+        def mutate(mutator, where=None):
             return mutator([row])
 
         with patch.object(recalibration, "_read_log", return_value=[row]), \

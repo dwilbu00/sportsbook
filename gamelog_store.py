@@ -495,3 +495,39 @@ def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOU
                 if attempt == 2:
                     raise
     return athlete
+
+
+def seed_athlete_id(sport, league, name, athlete_id, team_ids=None):
+    """Pre-populate the durable name->id cache with a KNOWN id (the SQL analog of
+    espn_cache.seed_athlete_id).
+
+    Lets a caller that already holds an authoritative ESPN athlete id (e.g. the
+    calibration-pool builder, from the season statistics listing) pin it so a
+    later get_athlete_id skips search_athlete's lossy first-name match. Written
+    under the same (sport, league, name, team_key) key get_athlete_id reads, with
+    a fresh timestamp so it counts as a hit. Overwrites any existing row for that
+    key (the seed is authoritative). No-op on a falsy id."""
+    if not athlete_id:
+        return
+    name_lower = (name or "").lower()
+    team_key = "|".join(sorted(str(t) for t in team_ids if t)) if team_ids else ""
+    engine = db_store.get_engine()
+    with _key_lock(("athlete", sport, league, name_lower, team_key)):
+        for attempt in range(3):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(delete(athlete_id_cache).where(
+                        (athlete_id_cache.c.sport == sport)
+                        & (athlete_id_cache.c.league == league)
+                        & (athlete_id_cache.c.player_name_lower == name_lower)
+                        & (athlete_id_cache.c.team_key == team_key)))
+                    conn.execute(insert(athlete_id_cache), {
+                        "sport": sport, "league": league,
+                        "player_name_lower": name_lower, "team_key": team_key,
+                        "athlete_id": _s(athlete_id), "name": _s(name),
+                        "team_id": None, "fetched_at": _now(),
+                    })
+                return
+            except OperationalError:
+                if attempt == 2:
+                    raise

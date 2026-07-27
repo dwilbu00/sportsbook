@@ -8,6 +8,7 @@ import streamlit as st
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -382,10 +383,17 @@ def _iter_wager_candidates(ar):
             yield key, "player_prop", None, c
 
 
-def _submit_selected_picks(ar):
+def _submit_selected_picks(ar, valid_keys=None):
     """Record the checked value bets to the actual-bets ledger (flat unit stake,
-    model price). Runs as a button callback (before widgets re-instantiate), so
-    clearing the checkbox keys afterward is safe."""
+    model price). Runs as a (form-)button callback (before widgets re-instantiate),
+    so clearing the checkbox keys afterward is safe.
+
+    ``valid_keys`` is the set of selection keys in the CURRENTLY rendered
+    checklist; when given, only those are submitted. A checkbox key can linger
+    True in session_state after its bet leaves the list (search filter,
+    games_sampled drop, or a re-run producing a different slate), and those
+    phantom ticks would otherwise be written to the ledger even though the user
+    can no longer see or untick them."""
     import wagers
     stake = float(st.session_state.get("wager_unit_stake", 10.0) or 0.0)
     events = ar.get("events", {})
@@ -395,6 +403,8 @@ def _submit_selected_picks(ar):
     seq = 0
     for sel_key, bet_type, side, candidate in _iter_wager_candidates(ar):
         if not st.session_state.get(sel_key, False):
+            continue
+        if valid_keys is not None and sel_key not in valid_keys:
             continue
         meta = dict(events.get(candidate.get("event_id"), {}))
         meta.update({
@@ -546,21 +556,29 @@ def _render_selected_bet_checklist(entries, ar):
         # executed at the model's best price at submit (tracks REAL ROI). Both
         # buttons use on_click callbacks (fire before widgets re-instantiate), so
         # popping the checkbox keys is safe.
-        stake_col, submit_col, clear_col = st.columns([1, 1, 1])
-        with stake_col:
-            st.number_input(
-                "Unit stake ($)", min_value=0.0, value=10.0, step=1.0,
-                key="wager_unit_stake",
-                help="Flat dollar stake recorded for each submitted pick.",
-            )
-        with submit_col:
-            st.button(
-                "✅ Submit Picks", key="submit_picks", width="stretch",
-                help="Record the checked bets to your actual-bets ledger.",
-                on_click=_submit_selected_picks, args=(ar,))
-        with clear_col:
-            st.button("Clear selected bets", key="clear_selected_bets",
-                      width="stretch", on_click=_clear_bet_selections)
+        # Only the bets in the CURRENT checklist are submittable — the phantom-
+        # tick guard in _submit_selected_picks drops any stale/filtered-out ticks.
+        valid_keys = {entry["selection_key"] for entry in entries}
+        # Stake + Submit live in a form so editing the stake doesn't rerun the
+        # whole results page on every keystroke: the value is committed (and the
+        # picks written) only when Submit is pressed. The form-submit on_click
+        # still fires before widgets re-instantiate, so clearing the checkbox keys
+        # in the callback stays safe.
+        with st.form("submit_picks_form", clear_on_submit=False):
+            stake_col, submit_col = st.columns([1, 1])
+            with stake_col:
+                st.number_input(
+                    "Unit stake ($)", min_value=0.0, value=10.0, step=1.0,
+                    key="wager_unit_stake",
+                    help="Flat dollar stake recorded for each submitted pick.",
+                )
+            with submit_col:
+                st.form_submit_button(
+                    "✅ Submit Picks", width="stretch",
+                    help="Record the checked bets to your actual-bets ledger.",
+                    on_click=_submit_selected_picks, args=(ar, valid_keys))
+        st.button("Clear selected bets", key="clear_selected_bets",
+                  width="stretch", on_click=_clear_bet_selections)
 
 
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
@@ -1287,6 +1305,13 @@ def render_model_guide():
 # ──────────────────────────────────────────────────────────
 #  Page Config
 # ──────────────────────────────────────────────────────────
+# How long a grading pass stays "fresh" before My Bets auto-re-grades on open.
+# Replaces a permanent per-session "already graded" boolean, which never re-ran
+# for games that settled AFTER the app started — leaving the user to click
+# Refresh. A short TTL means opening My Bets picks up newly-final games itself.
+_GRADE_STALE_SECONDS = 300
+
+
 def render_my_bets():
     """Actual-bets ledger — realized ROI on the picks the user really placed."""
     import wagers
@@ -1313,17 +1338,31 @@ def render_my_bets():
     refresh = st.button("🔄 Refresh results",
                         help="Grade any newly settled bets now.")
     try:
-        if refresh or not st.session_state.get("_wagers_graded"):
+        graded_at = st.session_state.get("_wagers_graded_at", 0.0)
+        stale = (time.time() - graded_at) > _GRADE_STALE_SECONDS
+        if refresh or stale:
             with st.spinner("Grading settled bets..."):
                 graded = wagers.resolve_pending_wagers()
                 wagers.persist_clv()
-            st.session_state["_wagers_graded"] = True
+            st.session_state["_wagers_graded_at"] = time.time()
             if graded:
                 st.success(f"Graded {graded} newly settled bet(s).")
     except Exception:
         pass
 
-    rows = wagers.read_wagers()
+    rows, read_error = wagers.read_wagers_with_status()
+    if read_error is not None:
+        # Distinguish an unreachable durable store from an empty ledger so a
+        # transient outage never reads as "you have no bets".
+        st.warning(
+            "⚠️ Couldn't reach your bet ledger right now "
+            f"({type(read_error).__name__}). Your bets are safe — this is a read "
+            "timeout, not data loss. On Azure SQL serverless this usually means "
+            "the database is **resuming from auto-pause** (wait a few seconds and "
+            "click **🔄 Refresh results**), or the **monthly free compute is used "
+            "up** (it resets on the 1st of the month)."
+        )
+        return
     if not rows:
         st.info(
             "No submitted picks yet. On the 🎯 Value Finder page, check "
@@ -1571,7 +1610,7 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
     st.session_state["_wagers_flash"] = "Saved: " + ", ".join(parts) + "."
     # A re-grade must trigger a fresh grading pass on the rerun below.
     if n_regrade:
-        st.session_state["_wagers_graded"] = False
+        st.session_state["_wagers_graded_at"] = 0.0
     # Bump the editor nonce so both tables rebuild with fresh keys — clears the
     # ticked Delete/Re-grade boxes and reflects the new ledger — then rerun so
     # the summary metrics and tables recompute.
@@ -1617,8 +1656,9 @@ for _persist_key in list(st.session_state.keys()):
 # durable ledger). Runs above the st.stop() router + setup gate so it fires on
 # whichever page loads first, and needs no odds API key (grading uses free box
 # scores). Results persist to the blob, so this is a one-time cost per session.
-# A separate sentinel from _wagers_graded so the post-save regrade reset doesn't
-# re-trigger this block; setting _wagers_graded=True lets My Bets skip its pass.
+# A separate sentinel from the grade timestamp so the post-save regrade reset
+# doesn't re-trigger this block; stamping _wagers_graded_at=now lets My Bets skip
+# its own pass until the grade goes stale (_GRADE_STALE_SECONDS).
 if not st.session_state.get("_wagers_prefetched"):
     st.session_state["_wagers_prefetched"] = True
     try:
@@ -1626,7 +1666,7 @@ if not st.session_state.get("_wagers_prefetched"):
         with st.status("Updating your bet ledger…", expanded=False) as _status:
             _graded = _wagers.resolve_pending_wagers()
             _clv = _wagers.persist_clv()
-            st.session_state["_wagers_graded"] = True
+            st.session_state["_wagers_graded_at"] = time.time()
             _bits = ([f"{_graded} bet(s) graded"] if _graded else []) + \
                     ([f"CLV on {_clv} bet(s)"] if _clv else [])
             _status.update(

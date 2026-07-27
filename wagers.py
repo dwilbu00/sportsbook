@@ -207,14 +207,32 @@ def build_wager_row(bet_type, side, candidate, meta):
 # Store I/O
 # ──────────────────────────────────────────────────────────────────────────────
 
-def read_wagers():
-    """All ledger rows (best-effort snapshot).
+def read_wagers_with_status():
+    """(rows, error): like read_wagers but surfaces a backend failure.
 
-    Uses the short-TTL blob read cache: the ledger is read on every My Bets
-    rerun, and every writer invalidates the cache, so this avoids a full-ledger
-    GET+parse per rerun without risking staleness after an edit."""
+    Lets the UI tell an UNREACHABLE durable store (Azure SQL serverless resuming
+    from auto-pause, or its monthly free-tier compute exhausted → a connection
+    timeout) apart from a genuinely EMPTY ledger — both otherwise look like [].
+    ``error`` is None on success (``rows`` may still legitimately be [])."""
     try:
         rows, _ = recalibration._read_ndjson_blob(WAGERS_FILE, use_cache=True)
+        return rows, None
+    except Exception as exc:
+        return [], exc
+
+
+def read_wagers(where=None):
+    """All ledger rows (best-effort snapshot), or only those matching ``where``
+    (an equality/IN {col: value} map, SQL path only) so a reconciliation caller
+    pulls just the subset it needs instead of the whole ledger.
+
+    The unfiltered read uses the short-TTL cache (the ledger is read on every My
+    Bets rerun, and every writer invalidates the cache). A filtered read is
+    uncached — its subset is not the cached full snapshot."""
+    if where is None:
+        return read_wagers_with_status()[0]
+    try:
+        rows, _ = recalibration._read_ndjson_blob(WAGERS_FILE, where=where)
         return rows
     except Exception:
         return []
@@ -363,8 +381,20 @@ def _grade_wager(row):
     if score is None:
         return None
     home_score, away_score = score
+    side = row.get("side")
+    if bet_type in ("moneyline", "spread"):
+        # Grade by the bet's TEAM identity, not the stored side. `side` is set at
+        # submit from home_away; if that were ever stale/flipped it would settle
+        # the bet on the wrong team (a Yankees ML grading off the Phillies' win).
+        # final_score already matched the game on these exact home/away names, so
+        # the bet's team maps unambiguously to a side here; fall back to the stored
+        # side only if the team can't be matched (name drift → don't guess wrong).
+        resolved = game_results.side_for_team(
+            row.get("team"), row.get("home_team"), row.get("away_team"))
+        if resolved is not None:
+            side = resolved
     status = game_results.grade_team_bet(
-        bet_type, row.get("side"), row.get("point"), home_score, away_score)
+        bet_type, side, row.get("point"), home_score, away_score)
     if status is None:
         return None
     return status, f"{home_score:g}-{away_score:g}"
@@ -393,7 +423,10 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
 
     Returns the number newly graded. Best-effort; never raises."""
     now = now or datetime.now(timezone.utc)
-    rows = read_wagers()
+    # Pull only PENDING rows out of the DB — settled bets are the bulk and are
+    # skipped anyway. (Blob/local path ignores the filter and self-filters below.)
+    pending_only = {"status": "pending"}
+    rows = read_wagers(where=pending_only)
     if not rows:
         return 0
     updates = {}
@@ -439,7 +472,8 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
         return changed
 
     try:
-        return recalibration.mutate_ndjson_log(WAGERS_FILE, apply)
+        return recalibration.mutate_ndjson_log(WAGERS_FILE, apply,
+                                                where=pending_only)
     except Exception:
         return 0
 
