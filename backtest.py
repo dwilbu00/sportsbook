@@ -700,32 +700,187 @@ def _best_shrink(obs, step=0.05):
     return round(best_s, 2), best_brier, raw_brier
 
 
-def _write_shrink_calibration(sport_key, results):
+def _load_odds_store(sport_key, store_label, source):
+    """Return ``(store, source_used)`` for the team-market backtest.
+
+    ``source``: 'auto' (default) uses the SQL odds warehouse when it's enabled,
+    no --store-label was given, and it holds team-market games — else the local
+    historical_odds JSON; 'warehouse' forces the warehouse; 'store' forces the
+    local JSON. The warehouse store is assembled to the EXACT historical_odds
+    shape so the downstream grading path is identical."""
+    def _local():
+        return hist_store.load_store(sport_key, store_label), "store"
+
+    if source == "store":
+        return _local()
+    if source in ("auto", "warehouse"):
+        try:
+            import warehouse
+            wh = warehouse.load_team_market_store(sport_key)
+        except Exception:
+            wh = None
+        if source == "warehouse":
+            return (wh or {"sport_key": sport_key, "games": {}}), "warehouse"
+        # auto: warehouse only when it has games and no explicit local label.
+        if wh and wh.get("games") and not store_label:
+            return wh, "warehouse"
+        return _local()
+    return _local()
+
+
+def _market_log_supplement(sport_key, graded_keys, date_from=None, date_to=None):
+    """Extend the model-side holdout with resolved team-market forecasts the
+    warehouse did NOT already grade, read from the durable market_prediction_log.
+
+    Model-side only: a one-sided picked-side (raw_prob, outcome) row folds
+    identically into the raw/shrunk Brier as its home/over-side form (the shrink
+    transform and Brier are invariant under the side-flip (p,o)->(1-p,1-o)), so
+    it validly pools into _best_shrink — but it can't be devigged into a two-way
+    market prob, so it never touches market_brier or the blend weight.
+
+    ``date_from``/``date_to`` (inclusive game_date bounds) scope the log rows to
+    the same window the warehouse/store graded, so the pooled holdout and the
+    persisted shrink describe one coherent population (a --season/--limit scoped
+    run doesn't silently fold in all-time forward-log rows). When both are None
+    (unscoped run) no date filter is applied.
+
+    Returns {market: {'obs': [(raw_prob, outcome)],
+                      'roi': [(is_value, price, outcome)]}} over MARKETS.
+    Best-effort: empty buckets on any error (e.g. the SQL table isn't created)."""
+    out = {m: {"obs": [], "roi": []} for m in MARKETS}
+    try:
+        import recalibration
+        rows = recalibration._read_market_log(
+            where={"sport_key": sport_key, "resolved": True})
+    except Exception:
+        return out
+    bt_to_market = {"moneyline": "moneyline", "spread": "spreads",
+                    "total": "totals"}
+    seen = set()
+    scoped = date_from is not None or date_to is not None
+    for r in rows:
+        try:
+            if r.get("sport_key") != sport_key or not r.get("resolved"):
+                continue
+            if scoped:
+                gd = (r.get("game_date") or "")[:10]
+                if not gd:
+                    continue  # can't place it in the window → out of scope
+                if date_from is not None and gd < date_from:
+                    continue
+                if date_to is not None and gd > date_to:
+                    continue
+            market = bt_to_market.get(r.get("bet_type"))
+            if market is None:
+                continue
+            outcome = r.get("outcome")
+            if outcome not in (0, 1):
+                continue  # push / ungraded — drop (no clean Brier target)
+            ev_id = r.get("event_id")
+            gkey = hist_store.game_key(
+                r.get("commence_time"), r.get("home_team"), r.get("away_team"))
+            toks = (gkey, ev_id) if ev_id else (gkey,)
+            # Warehouse graded it (under either token) → warehouse wins (it also
+            # yields market_brier); skip so the event isn't double-counted.
+            if any((t, market) in graded_keys for t in toks):
+                continue
+            canon = ev_id or gkey            # one row per (event, market)
+            if (canon, market) in seen:
+                continue
+            seen.add((canon, market))
+            # Prefer raw_prob (pre-blend) so it matches --prob-shrink 1.0
+            # pure-model grading; fall back to the blended model_prob.
+            p = r.get("raw_prob")
+            if p is None:
+                p = r.get("model_prob")
+            try:
+                p = float(p)
+            except (TypeError, ValueError):
+                continue
+            if not (0.0 <= p <= 1.0):
+                continue
+            out[market]["obs"].append((p, int(outcome)))
+            price = r.get("price")
+            if price is not None:
+                try:
+                    out[market]["roi"].append(
+                        (bool(r.get("is_value")), int(price), int(outcome)))
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            continue
+    return out
+
+
+def _print_log_supplement_roi(supplement):
+    """Print the model-side ROI from the prediction-log supplement (model
+    is_value picks staked at their bet-time price), in a block labeled SEPARATELY
+    from the warehouse edge-vs-close ROI so the two ROI notions are never summed.
+    Not written to calibration."""
+    if not any(supplement[m]["roi"] for m in MARKETS):
+        return
+    print("\n[prediction-log supplement] model-side ROI — is_value picks at the "
+          "bet-time price (model-side holdout only; NOT written to calibration):")
+    hdr = f"  {'market':<10} {'obs':>5} {'bets':>5} {'ROI%':>8} {'P/L(u)':>8}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for market in MARKETS:
+        obs = supplement[market]["obs"]
+        bets, profit = 0, 0.0
+        for is_value, price, outcome in supplement[market]["roi"]:
+            if not is_value:
+                continue
+            bets += 1
+            profit += (american_to_decimal(price) - 1) if outcome else -1
+        roi = (100.0 * profit / bets) if bets else float("nan")
+        print(f"  {market:<10} {len(obs):>5} {bets:>5} {roi:>8.2f} {profit:>8.2f}")
+
+
+def _write_shrink_calibration(sport_key, results, extra_obs=None):
     """Fit and persist the Brier-optimal probability shrink per team market
-    (from the 'live' variant) to calibration/<sport>.json."""
+    (from the 'live' variant) to calibration/<sport>.json.
+
+    ``extra_obs`` (optional): {market: [(raw_prob, outcome)]} model-side rows from
+    the prediction-log supplement, folded into the shrink fit and the published
+    holdout Brier (see _market_log_supplement). market_brier and the blend weight
+    stay over warehouse-only rows (log rows have no market prob)."""
     from datetime import datetime, timezone
     variant = "live" if "live" in results else next(iter(results), None)
     if not variant:
         print("  [write-calibration] No variant to write.")
         return
+    extra_obs = extra_obs or {}
     shrink = {}
+    holdout = {}
     for market in MARKETS:
-        res = _best_shrink(results[variant][market]["blend"])
+        blend = results[variant][market]["blend"]
+        extra = [(p, None, o) for (p, o) in extra_obs.get(market, [])]
+        combined = blend + extra
+        res = _best_shrink(combined)
         if not res:
             continue
         best_s, best_brier, raw_brier = res
-        # Only persist when shrinking actually improves calibration.
+        # Publish the scored holdout for EVERY graded market (so the app shows a
+        # real Brier per market), regardless of whether shrink is applied below.
+        holdout[market] = {
+            "brier": round(best_brier, 4),
+            "raw_brier": round(raw_brier, 4),
+            "n": len(combined),
+            "n_warehouse": len(blend),
+            "n_log": len(extra),
+        }
+        # Only persist shrink when shrinking actually improves calibration.
         if best_s < 1.0 and best_brier < raw_brier - 1e-9:
             shrink[market] = round(best_s, 2)
-    if not shrink:
-        print("  [write-calibration] No market needed shrink; nothing written.")
+    if not shrink and not holdout:
+        print("  [write-calibration] No market graded; nothing written.")
         return
-    save_prob_shrink(sport_key, shrink, meta={
+    save_prob_shrink(sport_key, shrink, holdout=holdout, meta={
         "source": "odds backtest --engine live",
         "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
     print(f"\n  [write-calibration] Wrote prob_shrink to "
-          f"calibration/{sport_key}.json: {shrink}")
+          f"calibration/{sport_key}.json: shrink={shrink}, holdout={holdout}")
 
 
 def _inflate_samples(samples, weights, k):
@@ -845,7 +1000,8 @@ def _parse_seasons(spec):
 def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
                       min_sample=5, season_year=None, threshold_pct=5.0,
                       write_calibration=False, store_label="", variance_inflate=1.0,
-                      engine="live", prob_shrink=1.0):
+                      engine="live", prob_shrink=1.0, source="auto",
+                      supplement_log=True):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -864,16 +1020,23 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
     threshold = threshold_pct / 100.0
 
-    store = hist_store.load_store(sport_key, store_label)
+    store, source_used = _load_odds_store(sport_key, store_label, source)
+    print(f"\n[odds source: {source_used}]")
     if not store.get("games"):
-        cli = _SPORT_KEY_TO_CLI.get(sport_key, sport_key)
-        lbl = f" --label {store_label}" if store_label else ""
-        print(f"\nNo historical odds stored for {sport_key}"
-              f"{f' (label={store_label})' if store_label else ''}.")
-        print(f"Run:  python backfill_historical_odds.py --sport {cli} "
-              f"--days 60 --max-credits 5000{lbl}")
+        if source_used == "warehouse":
+            print(f"\nNo warehoused team-market lines for {sport_key} yet. The "
+                  "Azure odds warehouse fills automatically as you run analyses "
+                  "(every live event-odds fetch captures the closing lines).")
+            print("Force the local backfill store instead with --source store.")
+        else:
+            cli = _SPORT_KEY_TO_CLI.get(sport_key, sport_key)
+            lbl = f" --label {store_label}" if store_label else ""
+            print(f"\nNo historical odds stored for {sport_key}"
+                  f"{f' (label={store_label})' if store_label else ''}.")
+            print(f"Run:  python backfill_historical_odds.py --sport {cli} "
+                  f"--days 60 --max-credits 5000{lbl}")
         return
-    if store_label:
+    if store_label and source_used == "store":
         print(f"\n[store-label: {store_label}] grading ROI at the "
               f"{store.get('snapshot_time','labeled')} price, not the close.")
 
@@ -912,6 +1075,12 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
 
     results = {name: {m: _empty_market_bucket() for m in MARKETS}
                for name in variants}
+    # (event_key, market) pairs graded from the warehouse/store — the log
+    # supplement skips these so a warehouse-graded event is never double-counted.
+    graded_keys = set()
+    # Date span of matched games — bounds the log supplement to the same window
+    # this run graded (so a --season/--limit scoped fit stays coherent).
+    graded_lo = graded_hi = None
 
     matched = 0
     for game in all_games:
@@ -939,10 +1108,24 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         actual_total = game.get("total_score") or (game["home_score"] + game["away_score"])
         home_won = 1 if actual_margin > 0 else 0
         matched += 1
+        d10 = date[:10]
+        if graded_lo is None or d10 < graded_lo:
+            graded_lo = d10
+        if graded_hi is None or d10 > graded_hi:
+            graded_hi = d10
 
         # ── LIVE engine: grade the real production probabilities ──
         if engine == "live":
             r = results["live"]
+            # Record BOTH the event_id (when present) and the game_key so the
+            # log supplement dedups regardless of which the store carried:
+            # game_key always matches across sources for the same game, and
+            # event_id disambiguates same-day doubleheaders.
+            ev_id = entry.get("event_id")
+            gkey = hist_store.game_key(
+                entry.get("commence_time"), entry.get("home_team"),
+                entry.get("away_team"))
+            ekeys = (gkey, ev_id) if ev_id else (gkey,)
             matchup_features = _matchup_features_for(home, away, date[:10], sport_key)
             mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
@@ -951,6 +1134,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                 fair_home, price_home, price_away = ml
                 _grade(r["moneyline"], _shrink_prob(mwin, prob_shrink),
                        fair_home, home_won, price_home, price_away, threshold)
+                graded_keys.update((t, "moneyline") for t in ekeys)
             if sp and mhc is not None:
                 home_spread, fair_cover, price_h, price_a = sp
                 model_spread, model_cover = mhc
@@ -959,6 +1143,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     home_covers = 1 if (actual_margin + home_spread) > 0 else 0
                     _grade(r["spreads"], _shrink_prob(model_cover, prob_shrink),
                            fair_cover, home_covers, price_h, price_a, threshold)
+                    graded_keys.update((t, "spreads") for t in ekeys)
             if tot and mov is not None:
                 line, fair_over, price_o, price_u = tot
                 model_line, model_over = mov
@@ -967,6 +1152,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     over_hit = 1 if actual_total > line else 0
                     _grade(r["totals"], _shrink_prob(model_over, prob_shrink),
                            fair_over, over_hit, price_o, price_u, threshold)
+                    graded_keys.update((t, "totals") for t in ekeys)
             continue
 
         for variant_name, params in variants.items():
@@ -1013,13 +1199,23 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
           f"(threshold {threshold_pct:.1f}%).")
     _print_odds_results(results)
 
+    # Model-side holdout supplement from the durable prediction log (live only),
+    # scoped to the same game-date window this run graded.
+    supplement = None
+    if engine == "live" and supplement_log:
+        supplement = _market_log_supplement(sport_key, graded_keys,
+                                            date_from=graded_lo, date_to=graded_hi)
+        _print_log_supplement_roi(supplement)
+
     if write_calibration:
         if engine == "live":
             if abs(prob_shrink - 1.0) > 1e-9:
                 print("  [write-calibration] Re-run with --prob-shrink 1.0 to fit "
                       "shrink on raw model probabilities; skipping write.")
             else:
-                _write_shrink_calibration(sport_key, results)
+                extra_obs = ({m: supplement[m]["obs"] for m in MARKETS}
+                             if supplement else None)
+                _write_shrink_calibration(sport_key, results, extra_obs=extra_obs)
         else:
             _write_blend_calibration(sport_key, results)
 
@@ -3420,7 +3616,31 @@ def main():
                    help="(props mode) 'strict' (default) keeps only current-season "
                         "prior games per test observation; 'all' uses the full "
                         "ESPN gamelog regardless of season boundary.")
+    p.add_argument("--source", choices=["auto", "warehouse", "store"],
+                   default="auto",
+                   help="(odds mode) Closing-line source: 'auto' (default) uses "
+                        "the Azure odds warehouse when it's configured and has "
+                        "team-market games, else the local historical_odds JSON; "
+                        "'warehouse' forces the warehouse; 'store' forces the "
+                        "local JSON. Under 'auto', a --store-label forces the "
+                        "local JSON (the warehouse has no label concept).")
+    p.add_argument("--supplement-log", dest="supplement_log",
+                   action="store_true", default=True,
+                   help="(odds mode, live engine) Fold resolved market_prediction_"
+                        "log rows into the model-side holdout (default on).")
+    p.add_argument("--no-supplement-log", dest="supplement_log",
+                   action="store_false",
+                   help="Disable the prediction-log holdout supplement.")
     args = p.parse_args()
+
+    # Target the Azure SQL warehouse/logs when the SQL_* secrets are configured
+    # (outside Streamlit they aren't in the env yet). Guarded; a no-op when SQL
+    # isn't configured so --source auto/store still works offline.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
 
@@ -3470,7 +3690,8 @@ def main():
                           write_calibration=args.write_calibration,
                           store_label=args.store_label,
                           variance_inflate=args.variance_inflate,
-                          engine=args.engine, prob_shrink=args.prob_shrink)
+                          engine=args.engine, prob_shrink=args.prob_shrink,
+                          source=args.source, supplement_log=args.supplement_log)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,

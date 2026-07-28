@@ -108,6 +108,52 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_wager_status ON dbo.wagers (status);
 GO
 
+------------------------------------------------------- market_prediction_log
+-- Forward tracking for TEAM markets (moneyline / spread / total): the MODEL's
+-- pick per (game, market), logged independent of any wager and resolved against
+-- final box scores. The sibling of prediction_log (player props) — kept a
+-- separate table so the prop calibration/refit pipeline that reads
+-- prediction_log stays uncontaminated. One row = the favored side (ML/spread) or
+-- over/under lean (total) with its probability, price, and value flag.
+IF OBJECT_ID('dbo.market_prediction_log', 'U') IS NULL
+CREATE TABLE dbo.market_prediction_log (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    ts            NVARCHAR(40),
+    sport_key     NVARCHAR(64)  NOT NULL,
+    event_id      NVARCHAR(128),
+    event_key     NVARCHAR(160) NOT NULL,          -- event_id or game_date
+    commence_time NVARCHAR(40),
+    game_date     NVARCHAR(10),
+    bet_type      NVARCHAR(16)  NOT NULL,           -- moneyline|spread|total
+    home_team     NVARCHAR(128),
+    away_team     NVARCHAR(128),
+    team          NVARCHAR(128),
+    opponent      NVARCHAR(128),
+    home_away     NVARCHAR(8),
+    side          NVARCHAR(16)  NOT NULL,           -- home|away|over|under
+    matchup       NVARCHAR(256),
+    book          NVARCHAR(64),
+    actual        NVARCHAR(64),                     -- "home-away" final score string
+    resolved_at   NVARCHAR(40),
+    point         FLOAT,                            -- spread/total line; NULL for ML
+    model_prob    FLOAT,                            -- picked side prob (0-1)
+    raw_prob      FLOAT,                            -- pre-blend prob (0-1)
+    price         INT,
+    outcome       INT,                              -- 1=pick won, 0=lost, NULL=push/unresolved
+    is_value      BIT,                              -- tri-state (NULL allowed)
+    resolved      BIT NOT NULL
+        CONSTRAINT df_market_prediction_resolved DEFAULT (0),
+    CONSTRAINT uq_market_prediction_identity
+        UNIQUE (sport_key, event_key, bet_type)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_market_prediction_sport_resolved'
+                 AND object_id = OBJECT_ID('dbo.market_prediction_log'))
+CREATE INDEX ix_market_prediction_sport_resolved
+    ON dbo.market_prediction_log (sport_key, resolved);
+GO
+
 --------------------------------------------------------------- recalibration_params
 IF OBJECT_ID('dbo.recalibration_params', 'U') IS NULL
 CREATE TABLE dbo.recalibration_params (

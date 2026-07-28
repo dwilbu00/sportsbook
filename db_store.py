@@ -174,6 +174,40 @@ wagers = Table(
     Index("ix_wager_status", "status"),
 )
 
+# Team-market forward tracking — the MODEL's pick per (game, market). Sibling of
+# prediction_log; one row per (sport, event, bet_type) natural identity.
+market_prediction_log = Table(
+    "market_prediction_log", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", String(40)),
+    Column("sport_key", String(64), nullable=False),
+    Column("event_id", String(128)),
+    Column("event_key", String(160), nullable=False),   # event_id or game_date
+    Column("commence_time", String(40)),
+    Column("game_date", String(10)),
+    Column("bet_type", String(16), nullable=False),      # moneyline|spread|total
+    Column("home_team", String(128)),
+    Column("away_team", String(128)),
+    Column("team", String(128)),
+    Column("opponent", String(128)),
+    Column("home_away", String(8)),
+    Column("side", String(16), nullable=False),          # home|away|over|under
+    Column("matchup", String(256)),
+    Column("book", String(64)),
+    Column("actual", String(64)),                        # "home-away" score string
+    Column("resolved_at", String(40)),
+    Column("point", Float),                              # spread/total line; NULL for ML
+    Column("model_prob", Float),                         # picked side prob (0-1)
+    Column("raw_prob", Float),                           # pre-blend prob (0-1)
+    Column("price", Integer),
+    Column("outcome", Integer),                          # 1=won, 0=lost, NULL=push
+    Column("is_value", Boolean),                         # tri-state
+    Column("resolved", Boolean, nullable=False, default=False),
+    UniqueConstraint("sport_key", "event_key", "bet_type",
+                     name="uq_market_prediction_identity"),
+    Index("ix_market_prediction_sport_resolved", "sport_key", "resolved"),
+)
+
 # Learned Platt recalibration — scalar fit fields per (sport, prop) ...
 recalibration_params = Table(
     "recalibration_params", _META,
@@ -286,6 +320,17 @@ _WAGER_SPEC = [
     ("executed_price", _i), ("model_price", _i), ("close_price", _i),
 ]
 
+# Team-market forward-tracking columns (event_key is derived, like prediction).
+_MARKET_PREDICTION_SPEC = [
+    ("ts", _s), ("sport_key", _s), ("event_id", _s), ("commence_time", _s),
+    ("game_date", _s), ("bet_type", _s), ("home_team", _s), ("away_team", _s),
+    ("team", _s), ("opponent", _s), ("home_away", _s), ("side", _s),
+    ("matchup", _s), ("book", _s), ("actual", _s), ("resolved_at", _s),
+    ("point", _f), ("model_prob", _f), ("raw_prob", _f),
+    ("price", _i), ("outcome", _i),
+    ("is_value", _b), ("resolved", _bexact),
+]
+
 # Scalar recalibration-param fields (name, coercer) beyond the (sport, prop) key.
 _RECAL_PARAM_SPEC = [
     ("a", _f), ("b", _f), ("n_fit", _i), ("n_validation", _i),
@@ -317,6 +362,19 @@ def _prediction_identity(row):
     }
 
 
+def _market_prediction_derive(row):
+    return {"event_key": (row.get("event_id") or row.get("game_date") or "")}
+
+
+def _market_prediction_identity(row):
+    # Mirrors uq_market_prediction_identity — one row per (sport, event, market).
+    return {
+        "sport_key": row.get("sport_key"),
+        "event_key": _market_prediction_derive(row)["event_key"],
+        "bet_type": row.get("bet_type"),
+    }
+
+
 # ``identity`` returns the natural-key {col: value} map used to diff before/after
 # rows (surgical writes) and to build the UPDATE/DELETE WHERE — it matches each
 # table's UNIQUE constraint.
@@ -324,6 +382,10 @@ _NDJSON_TABLES = {
     "prediction_log": {"table": prediction_log, "spec": _PREDICTION_SPEC,
                        "derive": _prediction_derive,
                        "identity": _prediction_identity},
+    "market_prediction_log": {"table": market_prediction_log,
+                              "spec": _MARKET_PREDICTION_SPEC,
+                              "derive": _market_prediction_derive,
+                              "identity": _market_prediction_identity},
     "wagers": {"table": wagers, "spec": _WAGER_SPEC, "derive": lambda row: {},
                "identity": lambda row: {"wager_id": row.get("wager_id")}},
 }
@@ -830,3 +892,66 @@ def list_odds_snapshots(sport, game_date):
         "captured_at": r._mapping["captured_at"],
         "markets": r._mapping["markets"],
     } for r in rows]
+
+
+def team_market_lines(sport, dates=None, date_from=None, date_to=None,
+                      max_retries=3):
+    """Bulk-read warehoused team-market lines (moneyline/spread/total) for a
+    sport, joining each odds_line to its parent odds_snapshot.
+
+    Feeds the team-market backtest's closing-line store
+    (warehouse.load_team_market_store) from the growing Azure warehouse instead
+    of the local historical_odds JSON. Player props are excluded. Optional date
+    filter: ``dates`` (explicit game_date list) OR ``date_from``/``date_to``
+    (inclusive range). Ordered by (event_id, captured_at) so the assembler can
+    pick each event's closing snapshot. Retries transient OperationalErrors like
+    read_rows (Azure SQL serverless cold-resume safety). Returns row dicts."""
+    engine = get_engine()
+    joined = odds_line.join(odds_snapshot,
+                            odds_line.c.snapshot_id == odds_snapshot.c.id)
+    stmt = (
+        select(
+            odds_snapshot.c.event_id, odds_snapshot.c.game_date,
+            odds_snapshot.c.commence_time, odds_snapshot.c.home,
+            odds_snapshot.c.away, odds_snapshot.c.captured_at,
+            odds_snapshot.c.kind, odds_line.c.snapshot_id,
+            odds_line.c.bet_type, odds_line.c.selection, odds_line.c.point,
+            odds_line.c.price, odds_line.c.implied_prob,
+        )
+        .select_from(joined)
+        .where((odds_snapshot.c.sport == sport)
+               & odds_line.c.bet_type.in_(("moneyline", "spread", "total")))
+    )
+    if dates:
+        stmt = stmt.where(odds_snapshot.c.game_date.in_(list(dates)))
+    else:
+        if date_from is not None:
+            stmt = stmt.where(odds_snapshot.c.game_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(odds_snapshot.c.game_date <= date_to)
+    stmt = stmt.order_by(odds_snapshot.c.event_id, odds_snapshot.c.captured_at)
+
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(stmt).all()
+            return [{
+                "event_id": r._mapping["event_id"],
+                "game_date": r._mapping["game_date"],
+                "commence_time": r._mapping["commence_time"],
+                "home": r._mapping["home"], "away": r._mapping["away"],
+                "captured_at": r._mapping["captured_at"],
+                "kind": r._mapping["kind"],
+                "snapshot_id": r._mapping["snapshot_id"],
+                "bet_type": r._mapping["bet_type"],
+                "selection": r._mapping["selection"],
+                "point": r._mapping["point"],
+                "price": r._mapping["price"],
+                "implied_prob": r._mapping["implied_prob"],
+            } for r in rows]
+        except OperationalError as exc:  # transient (cold resume / lock / timeout)
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + 2 * attempt)
+    raise last_exc

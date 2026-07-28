@@ -399,6 +399,39 @@ class SqlDispatchTests(_SqliteBackend, unittest.TestCase):
         recalibration.log_prediction_rows([row])
         self.assertEqual(len(db_store.read_rows("prediction_log")), 1)
 
+    def test_market_prediction_log_routes_to_sql(self):
+        ar = {
+            "events": {"e1": {"commence_time": "2020-05-01T23:00:00Z",
+                              "game_date": "2020-05-01", "home_team": "Rockies",
+                              "away_team": "Astros"}},
+            "all_ml": [{"event_id": "e1", "team": "Astros", "opponent": "Rockies",
+                        "home_away": "AWAY", "blended_prob": 62.0,
+                        "model_prob": 60.0, "best_price": -140, "best_book": "DK",
+                        "is_value": True}],
+            "all_spreads": [{"event_id": "e1", "team": "Astros",
+                             "opponent": "Rockies", "home_away": "AWAY",
+                             "spread": -1.5, "cover_rate": 55.0,
+                             "model_cover_rate": 53.0, "price": -110,
+                             "is_value": False}],
+            "all_totals": [{"event_id": "e1", "matchup": "Astros @ Rockies",
+                            "line": 9.5, "over_hit_rate": 58.0,
+                            "model_over_hit_rate": 56.0, "over_price": -105,
+                            "under_price": -115, "is_over_value": True,
+                            "is_under_value": False}],
+        }
+        rows = recalibration.build_market_prediction_rows(ar, "baseball_mlb")
+        self.assertEqual(len(rows), 3)
+        recalibration.log_market_prediction_rows(rows)
+        stored = db_store.read_rows("market_prediction_log")
+        self.assertEqual(len(stored), 3)                       # in SQL
+        by_type = {r["bet_type"]: r for r in stored}
+        self.assertEqual(by_type["moneyline"]["side"], "away")
+        self.assertIs(by_type["moneyline"]["is_value"], True)
+        self.assertEqual(by_type["spread"]["point"], -1.5)
+        # Re-logging the same slate stays one row per (sport, event, market).
+        recalibration.log_market_prediction_rows(rows)
+        self.assertEqual(len(db_store.read_rows("market_prediction_log")), 3)
+
     def test_wagers_submit_read_update_delete_via_sql(self):
         row = {"wager_id": "w1", "placed_at": "2026-07-20T00:00:00+00:00",
                "sport_key": "baseball_mlb", "bet_type": "player_prop",
@@ -452,6 +485,12 @@ class SchemaParityTests(unittest.TestCase):
     def test_wager_spec_matches_table(self):
         table_cols = {c.name for c in db_store.wagers.columns}
         spec_cols = {n for n, _ in db_store._WAGER_SPEC} | {"id"}
+        self.assertEqual(spec_cols, table_cols)
+
+    def test_market_prediction_spec_matches_table(self):
+        table_cols = {c.name for c in db_store.market_prediction_log.columns}
+        spec_cols = ({n for n, _ in db_store._MARKET_PREDICTION_SPEC}
+                     | {"id", "event_key"})
         self.assertEqual(spec_cols, table_cols)
 
     def test_recal_param_spec_matches_table(self):
@@ -560,6 +599,113 @@ class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):
             selection="Rockies", commence_time="2026-07-22T23:00:00Z")
         self.assertEqual(close["price"], 122)          # best across books
         self.assertEqual(warehouse.storage_backend(), "Azure SQL")
+
+
+class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
+    """Phase B: bulk team-market reader (db_store.team_market_lines) + the
+    warehouse store assembler (warehouse.load_team_market_store)."""
+
+    def _meta(self, hour):
+        return {"sport": "baseball_mlb", "game_date": "2026-07-22",
+                "event_id": "e1", "kind": "team", "snapshot_hour": hour,
+                "captured_at": f"2026-07-22T{hour[-3:-1]}:00:00Z",
+                "commence_time": "2026-07-22T23:00:00Z",
+                "home": "Rockies", "away": "Astros", "regions": "us",
+                "markets": "h2h,spreads,totals", "bookmakers": None}
+
+    def _team_lines(self, ml_home, ml_away):
+        return [
+            {"bet_type": "moneyline", "selection": "Rockies", "price": ml_home,
+             "implied_prob": 0.5},
+            {"bet_type": "moneyline", "selection": "Astros", "price": ml_away,
+             "implied_prob": 0.5},
+            {"bet_type": "spread", "selection": "Rockies", "point": 1.5,
+             "price": -110, "implied_prob": 0.52},
+            {"bet_type": "spread", "selection": "Astros", "point": -1.5,
+             "price": -110, "implied_prob": 0.52},
+            {"bet_type": "total", "selection": "Over", "point": 9.5,
+             "price": -105, "implied_prob": 0.51},
+            {"bet_type": "total", "selection": "Under", "point": 9.5,
+             "price": -105, "implied_prob": 0.51},
+            # A prop line — MUST be excluded by team_market_lines.
+            {"bet_type": "player_prop", "selection": "Kris Bryant",
+             "player": "Kris Bryant", "prop_key": "batter_hits",
+             "direction": "OVER", "point": 0.5, "price": -120,
+             "implied_prob": 0.55},
+        ]
+
+    def test_excludes_props_and_filters_dates(self):
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"),
+                                       self._team_lines(100, -120))
+        rows = db_store.team_market_lines("baseball_mlb")
+        self.assertTrue(rows)
+        self.assertEqual({r["bet_type"] for r in rows},
+                         {"moneyline", "spread", "total"})   # no player_prop
+        self.assertTrue(all(r["event_id"] == "e1" for r in rows))
+        # Explicit-date filter.
+        self.assertEqual(
+            db_store.team_market_lines("baseball_mlb", dates=["2025-01-01"]), [])
+        self.assertTrue(
+            db_store.team_market_lines("baseball_mlb", dates=["2026-07-22"]))
+        # Range filter.
+        self.assertTrue(db_store.team_market_lines(
+            "baseball_mlb", date_from="2026-07-01", date_to="2026-07-31"))
+        self.assertEqual(
+            db_store.team_market_lines("baseball_mlb", date_from="2026-08-01"), [])
+
+    def test_store_shape_closing_pick_and_backtest_parity(self):
+        import warehouse
+        import backtest
+        # Early snapshot (18Z) then the closing one (22Z, nearest before 23Z).
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"),
+                                       self._team_lines(100, -120))
+        db_store.capture_odds_snapshot(self._meta("20260722T22Z"),
+                                       self._team_lines(130, -150))
+        store = warehouse.load_team_market_store("baseball_mlb")
+        self.assertEqual(len(store["games"]), 1)
+        entry = next(iter(store["games"].values()))
+        # Moneyline: both teams, from the CLOSING (22Z) snapshot.
+        self.assertEqual(entry["moneyline"]["Rockies"][0]["price"], 130)
+        self.assertEqual(entry["moneyline"]["Astros"][0]["price"], -150)
+        # Spread: mirrored home +1.5 / away -1.5.
+        self.assertEqual(entry["spreads"]["Rockies"][0]["spread"], 1.5)
+        self.assertEqual(entry["spreads"]["Astros"][0]["spread"], -1.5)
+        # Total: same line on both sides.
+        self.assertEqual(entry["totals"]["Over"][0]["line"], 9.5)
+        self.assertEqual(entry["totals"]["Under"][0]["line"], 9.5)
+        # Parity: the backtest market readers consume the entry unchanged.
+        self.assertIsNotNone(backtest._moneyline_market(entry))
+        self.assertIsNotNone(backtest._spread_market(entry))
+        self.assertIsNotNone(backtest._total_market(entry))
+
+    def test_store_empty_when_sql_off(self):
+        import warehouse
+        db_store.configure_engine(None)   # SQL disabled
+        try:
+            self.assertEqual(
+                warehouse.load_team_market_store("baseball_mlb")["games"], {})
+        finally:
+            db_store.configure_engine("sqlite://")
+            db_store.create_all()
+
+    def test_partial_entry_keeps_all_three_market_keys(self):
+        # A snapshot with ONLY a total (no moneyline, no mirrored spread) must
+        # still assemble an entry carrying moneyline/spreads/totals keys (={} for
+        # the absent markets) — the live analyzers hard-subscript all three, so a
+        # missing key would KeyError-abort the backtest.
+        import warehouse
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), [
+            {"bet_type": "total", "selection": "Over", "point": 9.5,
+             "price": -105, "implied_prob": 0.51},
+            {"bet_type": "total", "selection": "Under", "point": 9.5,
+             "price": -105, "implied_prob": 0.51}])
+        entry = next(iter(
+            warehouse.load_team_market_store("baseball_mlb")["games"].values()))
+        self.assertEqual(entry["moneyline"], {})
+        self.assertEqual(entry["spreads"], {})
+        self.assertTrue(entry["totals"])
+        for key in ("moneyline", "spreads", "totals"):
+            self.assertIn(key, entry)
 
 
 class RefitPerformedTests(_SqliteBackend, unittest.TestCase):

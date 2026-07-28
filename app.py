@@ -713,6 +713,14 @@ def _cached_prediction_summary():
     return prediction_performance_summary()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_market_prediction_summary():
+    """Team-market forward-log summary (moneyline/spread/total). Short TTL so the
+    Model Guide reflects newly-graded outcomes without a read on every rerun."""
+    from recalibration import market_prediction_performance_summary
+    return market_prediction_performance_summary()
+
+
 @st.cache_data(show_spinner=False)
 def load_config():
     # Cached: config.json + secrets + env are stable within a session, so this
@@ -996,6 +1004,7 @@ def render_model_guide():
         ):
             from recalibration import maintain_sport
             resolved_total = 0
+            market_total = 0
             with st.status("Resolving pending predictions…", expanded=True) as _drain:
                 for _sk, _sname in sport_names.items():
                     try:
@@ -1004,13 +1013,22 @@ def render_model_guide():
                         _drain.write(f"⚠️ {_sname}: {type(_exc).__name__}")
                         continue
                     _n = _res.get("newly_resolved", 0)
+                    _nm = _res.get("newly_resolved_markets", 0)
                     resolved_total += _n
-                    if _n:
-                        _drain.write(f"✓ {_sname}: resolved {_n}")
+                    market_total += _nm
+                    if _n or _nm:
+                        _parts = []
+                        if _n:
+                            _parts.append(f"{_n} prop")
+                        if _nm:
+                            _parts.append(f"{_nm} team-market")
+                        _drain.write(f"✓ {_sname}: resolved {', '.join(_parts)}")
                 _drain.update(
-                    label=f"Resolved {resolved_total} prediction(s).",
+                    label=(f"Resolved {resolved_total} prop + {market_total} "
+                           "team-market prediction(s)."),
                     state="complete")
             _cached_prediction_summary.clear()
+            _cached_market_prediction_summary.clear()
             st.rerun()
 
         if forward["total"]:
@@ -1077,6 +1095,64 @@ def render_model_guide():
                 "are resolved."
             )
 
+        st.subheader("Team-market forward tracking")
+        market_forward = _cached_market_prediction_summary()
+        market_type_labels = {
+            "moneyline": "Moneyline",
+            "spread": "Spread",
+            "total": "Total",
+        }
+        if market_forward["total"]:
+            mf_cols = st.columns(4)
+            mf_cols[0].metric("Logged predictions", market_forward["total"])
+            mf_cols[1].metric("Resolved", market_forward["resolved"])
+            _mhr = market_forward.get("hit_rate")
+            mf_cols[2].metric(
+                "Pick hit rate",
+                f"{_mhr * 100:.1f}%" if _mhr is not None else "Not enough data",
+            )
+            _mroi = market_forward.get("roi")
+            mf_cols[3].metric(
+                "Pick ROI",
+                f"{_mroi * 100:+.1f}%"
+                if _mroi is not None else "Awaiting priced results",
+            )
+            market_forward_rows = []
+            for row in market_forward["by_market"]:
+                _rhr = row.get("hit_rate")
+                _rbrier = row.get("brier")
+                _rroi = row.get("roi")
+                market_forward_rows.append({
+                    "Sport": sport_names.get(row["sport_key"], row["sport_key"]),
+                    "Market": market_type_labels.get(
+                        row["bet_type"],
+                        (row["bet_type"] or "Unknown").title()),
+                    "Logged": row["total"],
+                    "Resolved": row["resolved"],
+                    "Pending": row["pending"],
+                    "Pushes": row["pushes"],
+                    "Pick hit rate": (
+                        f"{_rhr * 100:.1f}%" if _rhr is not None else "—"),
+                    "Brier": (f"{_rbrier:.4f}" if _rbrier is not None else "—"),
+                    "Pick ROI": (
+                        f"{_rroi * 100:+.1f}%" if _rroi is not None else "—"),
+                    "Priced results": row["priced_resolved"],
+                })
+            st.dataframe(market_forward_rows, hide_index=True, width="stretch")
+            st.caption(
+                "The model's favored side per game and market (moneyline/spread/"
+                "total), logged on every analysis and graded against final "
+                "scores — independent of whether you placed the bet. Brier scores "
+                "the picked side's probability; ROI stakes each pick at its "
+                "logged price."
+            )
+        else:
+            st.info(
+                "No team-market predictions have been logged yet. They appear "
+                "here after moneyline/spread/total analyses are run and past "
+                "games are resolved."
+            )
+
         st.subheader("Team-market validation status")
         team_rows = []
         market_labels = {
@@ -1087,9 +1163,23 @@ def render_model_guide():
         for sport_key, sport_name in sport_names.items():
             blob = calibration_blobs.get(sport_key, {})
             shrink = blob.get("prob_shrink") or {}
-            source = ((blob.get("meta") or {}).get("prob_shrink") or {}).get("source")
+            meta = blob.get("meta") or {}
+            source = (meta.get("prob_shrink") or {}).get("source")
+            holdout = meta.get("prob_shrink_holdout") or {}
             for market_key, market_label in market_labels.items():
                 shrink_value = shrink.get(market_key)
+                hold = holdout.get(market_key) or {}
+                cal_brier = hold.get("brier")
+                raw_brier = hold.get("raw_brier")
+                n_hold = hold.get("n")
+                if isinstance(cal_brier, (int, float)):
+                    holdout_display = f"Brier {cal_brier:.4f}"
+                    if isinstance(raw_brier, (int, float)):
+                        holdout_display += f" (raw {raw_brier:.4f})"
+                    if n_hold:
+                        holdout_display += f", n={n_hold}"
+                else:
+                    holdout_display = "Not exported"
                 team_rows.append({
                     "Sport": sport_name,
                     "Prediction": market_label,
@@ -1098,13 +1188,15 @@ def render_model_guide():
                         f"{shrink_value:.3f}"
                         if isinstance(shrink_value, (int, float)) else "Not fitted"
                     ),
-                    "Published holdout accuracy": "Not exported",
+                    "Holdout Brier": holdout_display,
                 })
         st.dataframe(team_rows, hide_index=True, width="stretch")
         st.caption(
-            "The team-market calibration files currently persist fitted shrink weights but "
-            "not the complete scored holdout report. The app says ‘Not exported’ rather "
-            "than presenting an unsupported accuracy percentage."
+            "Holdout Brier is the scored backtest calibration error on held-out "
+            "games (lower is better; raw = before probability shrink). Markets "
+            "not yet backtested with `odds backtest --engine live` show ‘Not "
+            "exported’. This is the offline calibration report — live model-side "
+            "accuracy is in Team-market forward tracking above."
         )
 
     with safe_tab:
@@ -2592,6 +2684,16 @@ if analyze_clicked and selected_game_labels:
             for e in selected_events
         },
     }
+    # Forward-track the model's team-market picks (moneyline/spread/total),
+    # mirroring per-prop forward logging. Best-effort: no-ops gracefully until the
+    # market_prediction_log table exists, and never breaks analysis.
+    try:
+        import recalibration as _recal_mkt
+        _ar_mkt = st.session_state["analysis_results"]
+        _recal_mkt.log_market_prediction_rows(
+            _recal_mkt.build_market_prediction_rows(_ar_mkt, _ar_mkt["sport_key"]))
+    except Exception:
+        pass
     # Clear any previous parlay results
     st.session_state.pop("parlay_results", None)
 

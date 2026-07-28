@@ -803,6 +803,413 @@ def prediction_performance_summary(sport_key=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Team-market forward tracking (moneyline / spread / total)
+# ──────────────────────────────────────────────────────────────────────────────
+# Sibling of the player-prop prediction log: logs the MODEL's pick per
+# (game, market) so team markets get the same forward-tracked accuracy (hit rate,
+# Brier, ROI) props already have, and a durable model-side record survives a
+# deleted wager. Kept a SEPARATE store (its own table/file) so the prop
+# calibration/refit pipeline that reads prediction_log stays uncontaminated. One
+# row = the favored side (ML/spread) or over/under lean (total) with its
+# probability, price, and value flag. Resolution reuses the shared team graders
+# (game_results.final_score / side_for_team / grade_team_bet), exactly as
+# wagers._grade_wager.
+
+MARKET_PREDICTION_LOG_FILE = "market_prediction_log.jsonl"
+
+
+def market_prediction_identity(row):
+    """Stable per-(game, market) identity, with legacy pre-event-ID fallback."""
+    event_ref = row.get("event_id") or row.get("game_date")
+    return (row.get("sport_key"), event_ref, row.get("bet_type"))
+
+
+def market_prediction_row_key(row):
+    """Identity for updating one physical row, including its timestamp."""
+    return (row.get("ts"),) + market_prediction_identity(row)
+
+
+def mutate_market_prediction_log(mutator, max_retries=5, where=None):
+    """Atomically mutate the team-market prediction log (SQL/blob/local)."""
+    return mutate_ndjson_log(MARKET_PREDICTION_LOG_FILE, mutator,
+                             max_retries=max_retries, where=where)
+
+
+def _read_market_log(where=None):
+    try:
+        rows, _ = _read_ndjson_blob(MARKET_PREDICTION_LOG_FILE, where=where)
+        return rows
+    except Exception:
+        return []
+
+
+def read_market_prediction_log():
+    """Public read-only snapshot for maintenance tools."""
+    return _read_market_log()
+
+
+def _mkt_num(value, default=float("-inf")):
+    """Numeric key for picking the favored side; unusable values sort last."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _mkt_prob01(pct):
+    """A 0-100 percentage → a 0-1 probability, clamped; None if unusable."""
+    try:
+        p = float(pct) / 100.0
+    except (TypeError, ValueError):
+        return None
+    return min(max(p, 0.0), 1.0)
+
+
+def _mkt_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mkt_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mkt_bool(value):
+    return bool(value) if value is not None else None
+
+
+def _mkt_matchup(candidate, event_meta):
+    if candidate.get("matchup"):
+        return candidate["matchup"]
+    meta = event_meta or {}
+    home, away = meta.get("home_team"), meta.get("away_team")
+    return f"{away} @ {home}" if home and away else None
+
+
+def build_market_prediction_rows(ar, sport_key):
+    """Map an analysis result to one forecast row per (event, market): the model's
+    favored side (ML/spread) or over/under lean (total). Pure — no I/O, never
+    raises (returns [] on any malformed input so the caller logs best-effort)."""
+    if not ar or not sport_key:
+        return []
+    try:
+        events = ar.get("events") or {}
+        ts = datetime.now(timezone.utc).isoformat()
+        rows = []
+
+        def _common(event_id):
+            meta = events.get(event_id) or {}
+            game_date = meta.get("game_date")
+            return {
+                "ts": ts,
+                "sport_key": sport_key,
+                "event_id": event_id,
+                "commence_time": meta.get("commence_time"),
+                "game_date": str(game_date)[:10] if game_date else None,
+                "home_team": meta.get("home_team"),
+                "away_team": meta.get("away_team"),
+                "resolved": False,
+                "actual": None,
+                "outcome": None,
+                "resolved_at": None,
+            }
+
+        # Moneyline: the higher-blended_prob side per event.
+        ml_by_event = defaultdict(list)
+        for c in ar.get("all_ml") or []:
+            ml_by_event[c.get("event_id")].append(c)
+        for event_id, cands in ml_by_event.items():
+            if not event_id:
+                continue
+            pick = max(cands, key=lambda c: _mkt_num(c.get("blended_prob")))
+            model_prob = _mkt_prob01(pick.get("blended_prob"))
+            if model_prob is None:
+                continue
+            home_away = (pick.get("home_away") or "").upper()
+            row = _common(event_id)
+            row.update({
+                "bet_type": "moneyline",
+                "team": pick.get("team"),
+                "opponent": pick.get("opponent"),
+                "home_away": home_away,
+                "side": "home" if home_away == "HOME" else "away",
+                "matchup": _mkt_matchup(pick, events.get(event_id)),
+                "book": pick.get("best_book"),
+                "point": None,
+                "model_prob": model_prob,
+                "raw_prob": _mkt_prob01(pick.get("model_prob")),
+                "price": _mkt_int(pick.get("best_price")),
+                "is_value": _mkt_bool(pick.get("is_value")),
+            })
+            rows.append(row)
+
+        # Spread: the higher-cover_rate side per event.
+        sp_by_event = defaultdict(list)
+        for c in ar.get("all_spreads") or []:
+            sp_by_event[c.get("event_id")].append(c)
+        for event_id, cands in sp_by_event.items():
+            if not event_id:
+                continue
+            pick = max(cands, key=lambda c: _mkt_num(c.get("cover_rate")))
+            model_prob = _mkt_prob01(pick.get("cover_rate"))
+            point = _mkt_float(pick.get("spread"))
+            if model_prob is None or point is None:
+                continue
+            home_away = (pick.get("home_away") or "").upper()
+            row = _common(event_id)
+            row.update({
+                "bet_type": "spread",
+                "team": pick.get("team"),
+                "opponent": pick.get("opponent"),
+                "home_away": home_away,
+                "side": "home" if home_away == "HOME" else "away",
+                "matchup": _mkt_matchup(pick, events.get(event_id)),
+                "book": None,
+                "point": point,
+                "model_prob": model_prob,
+                "raw_prob": _mkt_prob01(pick.get("model_cover_rate")),
+                "price": _mkt_int(pick.get("price")),
+                "is_value": _mkt_bool(pick.get("is_value")),
+            })
+            rows.append(row)
+
+        # Total: over if over_hit_rate >= 50 else under.
+        for c in ar.get("all_totals") or []:
+            event_id = c.get("event_id")
+            if not event_id:
+                continue
+            over_hit = c.get("over_hit_rate")
+            point = _mkt_float(c.get("line"))
+            if over_hit is None or point is None:
+                continue
+            over = float(over_hit) >= 50.0
+            model_over = c.get("model_over_hit_rate")
+            raw_pct = (model_over if over
+                       else (None if model_over is None else 100.0 - model_over))
+            row = _common(event_id)
+            row.update({
+                "bet_type": "total",
+                "team": None,
+                "opponent": None,
+                "home_away": None,
+                "side": "over" if over else "under",
+                "matchup": _mkt_matchup(c, events.get(event_id)),
+                "book": None,
+                "point": point,
+                "model_prob": _mkt_prob01(over_hit if over else 100.0 - over_hit),
+                "raw_prob": _mkt_prob01(raw_pct),
+                "price": _mkt_int(c.get("over_price") if over
+                                  else c.get("under_price")),
+                "is_value": _mkt_bool(c.get("is_over_value") if over
+                                      else c.get("is_under_value")),
+            })
+            rows.append(row)
+
+        return rows
+    except Exception:
+        return []
+
+
+def log_market_prediction_rows(new_rows):
+    """Upsert team-market forecast rows by (sport, event, bet_type) identity.
+
+    The newest forecast supersedes a stale UNRESOLVED row (a re-analysis, even a
+    side flip or line move); a row already resolved is never overwritten so its
+    graded outcome survives. Best-effort: a missing SQL table (before the DDL is
+    run) or any backend error is swallowed so analysis is never broken. Returns
+    the number of rows added or changed."""
+    if not new_rows:
+        return 0
+    try:
+        def upsert(rows):
+            incoming = {}
+            for row in new_rows:
+                incoming[market_prediction_identity(row)] = row  # last wins
+            resolved_idents = {market_prediction_identity(r)
+                               for r in rows if r.get("resolved")}
+            # Keep other markets + any already-resolved rows; drop the stale
+            # UNRESOLVED rows we're re-logging (replaced below).
+            kept = [r for r in rows
+                    if market_prediction_identity(r) not in incoming
+                    or market_prediction_identity(r) in resolved_idents]
+            changes = 0
+            for ident, row in incoming.items():
+                if ident in resolved_idents:
+                    continue  # graded — never overwrite
+                kept.append(row)
+                changes += 1
+            rows[:] = kept
+            return changes
+        return mutate_market_prediction_log(upsert)
+    except Exception:
+        return 0
+
+
+def resolve_pending_market_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
+    """Grade past-dated unresolved team-market forecasts against final scores.
+
+    Mirrors resolve_pending_outcomes but team-shaped: uses the shared team graders
+    (game_results.final_score / side_for_team / grade_team_bet), exactly as
+    wagers._grade_wager. A still-live/unavailable game stays pending (retried once
+    scores land). Returns the number newly resolved. Best-effort; never raises."""
+    try:
+        import game_results
+    except Exception:
+        return 0
+    unresolved = {"sport_key": sport_key, "resolved": False}
+    rows = _read_market_log(where=unresolved)
+    if not rows:
+        return 0
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    resolved_updates = {}
+    resolved_count = 0
+    for r in rows:
+        if resolved_count >= max_to_resolve:
+            break
+        if r.get("sport_key") != sport_key or r.get("resolved"):
+            continue
+        game_date = (r.get("game_date") or "")[:10]
+        if not game_date or game_date >= today:
+            continue  # game hasn't happened yet
+        score = game_results.final_score(
+            sport_key, game_date, r.get("home_team"), r.get("away_team"),
+            r.get("commence_time"))
+        if score is None:
+            continue  # stay pending; retry once final scores land
+        home_score, away_score = score
+        bet_type = r.get("bet_type")
+        side = r.get("side")
+        if bet_type in ("moneyline", "spread"):
+            # Grade by TEAM identity, not the stored side (final_score already
+            # matched the game on these home/away names) — mirrors _grade_wager.
+            resolved_side = game_results.side_for_team(
+                r.get("team"), r.get("home_team"), r.get("away_team"))
+            if resolved_side is not None:
+                side = resolved_side
+        status = game_results.grade_team_bet(
+            bet_type, side, r.get("point"), home_score, away_score)
+        if status is None:
+            continue
+        outcome = 1 if status == "won" else (0 if status == "lost" else None)
+        resolved_updates[market_prediction_row_key(r)] = {
+            "actual": f"{home_score:g}-{away_score:g}",
+            "outcome": outcome,
+            "resolved": True,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        resolved_count += 1
+
+    if not resolved_updates:
+        return 0
+
+    def apply_resolutions(current_rows):
+        changed = 0
+        for row in current_rows:
+            update = resolved_updates.get(market_prediction_row_key(row))
+            if update and not row.get("resolved"):
+                row.update(update)
+                changed += 1
+        return changed
+
+    try:
+        mutate_market_prediction_log(apply_resolutions, where=unresolved)
+    except Exception:
+        return 0
+    return resolved_count
+
+
+def summarize_market_prediction_rows(rows, sport_key=None):
+    """Summarize deduplicated team-market forecasts without making API calls.
+
+    model_prob is the PICKED side's probability and outcome==1 means that pick
+    won, so the Brier is (model_prob - outcome)^2 directly. ROI stakes the pick
+    at its logged price (win: payout; loss: -1; push: 0)."""
+    unique = {}
+    for row in rows:
+        if sport_key and row.get("sport_key") != sport_key:
+            continue
+        identity = market_prediction_identity(row)
+        current = unique.get(identity)
+        if current and current.get("resolved") and not row.get("resolved"):
+            continue
+        unique[identity] = row
+    predictions = list(unique.values())
+
+    def metrics(group):
+        resolved = [r for r in group if r.get("resolved")]
+        graded = [r for r in resolved if r.get("outcome") in (0, 1)]
+        probabilities, outcomes, realized_returns = [], [], []
+        hits = 0
+        for r in graded:
+            outcome = int(r["outcome"])
+            if outcome == 1:
+                hits += 1
+            try:
+                prob = float(r.get("model_prob"))
+            except (TypeError, ValueError):
+                prob = None
+            if prob is not None and 0.0 <= prob <= 1.0:
+                probabilities.append(prob)
+                outcomes.append(outcome)
+            try:
+                price = int(r.get("price"))
+            except (TypeError, ValueError):
+                price = None
+            if price:
+                profit = (price / 100.0 if price > 0 else 100.0 / -price)
+                realized_returns.append(profit if outcome == 1 else -1.0)
+        # A resolved push returns the stake — include in priced ROI.
+        for r in resolved:
+            if r.get("outcome") is not None:
+                continue
+            try:
+                price = int(r.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if price:
+                realized_returns.append(0.0)
+        brier = (sum((p - y) ** 2 for p, y in zip(probabilities, outcomes))
+                 / len(outcomes) if outcomes else None)
+        return {
+            "total": len(group),
+            "resolved": len(resolved),
+            "pending": len(group) - len(resolved),
+            "pushes": len(resolved) - len(graded),
+            "graded": len(graded),
+            "hit_rate": (hits / len(graded)) if graded else None,
+            "brier": brier,
+            "priced_resolved": len(realized_returns),
+            "roi": (sum(realized_returns) / len(realized_returns)
+                    if realized_returns else None),
+        }
+
+    summary = metrics(predictions)
+    groups = defaultdict(list)
+    for row in predictions:
+        groups[(row.get("sport_key"), row.get("bet_type"))].append(row)
+    summary["by_market"] = [
+        {"sport_key": key[0], "bet_type": key[1], **metrics(group)}
+        for key, group in sorted(
+            groups.items(),
+            key=lambda item: tuple(str(v or "") for v in item[0]))
+    ]
+    summary["last_prediction_ts"] = max(
+        (row.get("ts") or "" for row in predictions), default="")
+    return summary
+
+
+def market_prediction_performance_summary(sport_key=None):
+    """Return current team-market forward-log status and resolved performance."""
+    return summarize_market_prediction_rows(_read_market_log(), sport_key=sport_key)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Outcome resolution against ESPN gamelogs
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1659,6 +2066,14 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
     (forward_tracker --resolve --max-resolve N) can pass a high value to clear a
     backlog in one run."""
     newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
+    # Team-market forecasts resolve alongside props but are kept OUT of the
+    # newly_resolved count (that gates the prop Platt refit; team markets have no
+    # Platt layer). Best-effort — never blocks prop maintenance.
+    try:
+        newly_resolved_markets = resolve_pending_market_outcomes(
+            sport_key, max_to_resolve=max_resolve)
+    except Exception:
+        newly_resolved_markets = 0
     # Gate on the last fit's timestamp from the durable store (blob-backed when
     # configured, else the local file's mtime). Using os.path.getmtime alone
     # would refit on every Cloud restart, since the ephemeral FS has no file.
@@ -1676,7 +2091,9 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
     # Opportunistically bound log growth from repeated same-slate logging.
     # Writes only when duplicates actually exist, so this is free on a clean log.
     compact_prediction_log()
-    return {"newly_resolved": newly_resolved, "refit": bool(fits)}
+    return {"newly_resolved": newly_resolved,
+            "newly_resolved_markets": newly_resolved_markets,
+            "refit": bool(fits)}
 
 
 def maybe_auto_refit(sport_key):

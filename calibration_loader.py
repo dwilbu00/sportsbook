@@ -230,7 +230,7 @@ def load_prob_shrink(sport_key):
     return _load_blob(sport_key).get("prob_shrink", {})
 
 
-def save_prob_shrink(sport_key, shrink, meta=None):
+def save_prob_shrink(sport_key, shrink, meta=None, holdout=None):
     """
     Persist per-market probability-shrink factors into calibration/<sport>.json,
     preserving the existing 'props' and 'market_blend' blocks.
@@ -239,6 +239,14 @@ def save_prob_shrink(sport_key, shrink, meta=None):
     so a partial fit (e.g. a moneyline-only run whose ESPN schedule can't grade
     the currently-stored spread/total games) updates only the markets it fit and
     leaves the others intact, instead of wiping them.
+
+    ``holdout`` (optional): per-market scored-holdout metrics
+    {market: {brier, raw_brier, n}} from the backtest. Persisted (additively,
+    merged like prob_shrink) under meta.prob_shrink_holdout so the app can publish
+    real team-market holdout accuracy instead of "Not exported". The backtest may
+    also include ``n_warehouse``/``n_log`` provenance keys (warehouse-graded vs
+    prediction-log-supplemented obs counts, n == n_warehouse + n_log); the app
+    reads ``brier``/``raw_brier``/``n`` and ignores the extra keys.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
     blob = _load_blob(sport_key)
@@ -251,12 +259,18 @@ def save_prob_shrink(sport_key, shrink, meta=None):
         blob["prob_shrink"] = merged
     else:
         blob["prob_shrink"] = shrink
+    if not isinstance(blob.get("meta"), dict):
+        blob["meta"] = {}
     if meta:
-        blob.setdefault("meta", {})
-        if isinstance(blob["meta"], dict):
-            blob["meta"]["prob_shrink"] = meta
+        blob["meta"]["prob_shrink"] = meta
+    if holdout:
+        existing_holdout = blob["meta"].get("prob_shrink_holdout")
+        if isinstance(existing_holdout, dict):
+            merged_holdout = dict(existing_holdout)
+            merged_holdout.update(holdout)
+            blob["meta"]["prob_shrink_holdout"] = merged_holdout
         else:
-            blob["meta"] = {"prob_shrink": meta}
+            blob["meta"]["prob_shrink_holdout"] = dict(holdout)
     with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 

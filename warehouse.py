@@ -573,6 +573,25 @@ def _extract_line(env, bet_type, selection, point=None, player=None,
     return None
 
 
+def _closing_sort_key(target_dt, captured_at):
+    """Order snapshots so the CLOSING one sorts first: nearest AT-OR-BEFORE the
+    commence time wins (smallest gap first), else nearest after.
+
+    ``target_dt`` is the parsed commence datetime (or None → newest first);
+    ``captured_at`` is a snapshot's capture timestamp (ISO str or datetime).
+    (Was -(gap) inside closing_line_for, which picked the farthest/opening
+    snapshot — a latent CLV bug surfaced by the Phase B tests.)"""
+    captured = (captured_at if isinstance(captured_at, datetime)
+                else _parse_utc(captured_at))
+    if captured is None:
+        return (2, 0.0)
+    if target_dt is None:
+        return (0, -captured.timestamp())
+    if captured <= target_dt:
+        return (0, (target_dt - captured).total_seconds())
+    return (1, (captured - target_dt).total_seconds())
+
+
 def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
                      commence_time=None, point=None, player=None,
                      prop_key=None, direction=None):
@@ -583,19 +602,7 @@ def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
     ``{'price','implied_prob','captured_at'}`` or None. Best-effort."""
     try:
         target = _parse_utc(commence_time)
-
-        def _order(snap):
-            captured = _parse_utc(snap.get("captured_at"))
-            if captured is None:
-                return (2, 0.0)
-            if target is None:
-                return (0, -captured.timestamp())
-            if captured <= target:
-                # Nearest AT-OR-BEFORE commence = the closing line (smallest gap
-                # sorts first). (Was -(gap), which picked the farthest/opening
-                # snapshot — a latent CLV bug surfaced by the Phase B tests.)
-                return (0, (target - captured).total_seconds())
-            return (1, (captured - target).total_seconds())
+        _order = lambda snap: _closing_sort_key(target, snap.get("captured_at"))
 
         if _sql():
             snaps = _db.odds_snapshots_for_event(sport, game_date, event_id)
@@ -667,6 +674,185 @@ def join_predictions_to_lines(sport, dates):
             "close_captured_at": captured[-1] if captured else None,
         })
     return joined
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Team-market backtest store (assembled from the SQL warehouse)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _wh_implied(price):
+    """American price → implied prob, or None. (Local import: no import cycle.)"""
+    try:
+        from odds_client import american_to_implied_prob
+        return american_to_implied_prob(int(price))
+    except (TypeError, ValueError, ImportError):
+        return None
+
+
+def _fill_moneyline(entry, snap_rows, home, away):
+    """Populate entry['moneyline'] = {team: [{price, implied_prob}]} for both
+    teams (best price per team), matching the historical_odds store shape."""
+    ml = {}
+    for r in snap_rows:
+        if r.get("bet_type") != "moneyline":
+            continue
+        team, price = r.get("selection"), r.get("price")
+        if team is None or price is None:
+            continue
+        cur = ml.get(team)
+        if cur is None or price > cur["price"]:
+            ml[team] = {"price": price,
+                        "implied_prob": r.get("implied_prob")}
+    if home in ml and away in ml:
+        entry["moneyline"] = {home: [ml[home]], away: [ml[away]]}
+
+
+def _fill_spreads(entry, snap_rows, home, away):
+    """Populate entry['spreads'] with the mirrored home ``p`` / away ``-p`` pair.
+
+    Groups each team's offers by point (best price per point), then picks the
+    mirrored pair with the tightest two-way overround (tiebreak smallest |p|).
+    Omits the market entirely when no mirrored pair exists — so _spread_market
+    only ever devigs a genuine two-way line."""
+    home_by_pt, away_by_pt = {}, {}
+    for r in snap_rows:
+        if r.get("bet_type") != "spread":
+            continue
+        team, price, point = r.get("selection"), r.get("price"), r.get("point")
+        if price is None or point is None:
+            continue
+        bucket = (home_by_pt if team == home
+                  else away_by_pt if team == away else None)
+        if bucket is None:
+            continue
+        if bucket.get(point) is None or price > bucket[point]:
+            bucket[point] = price
+    best = None  # (overround, |point|, point, home_price, away_price)
+    for point, hp in home_by_pt.items():
+        ap = away_by_pt.get(-point)
+        if ap is None:
+            continue
+        ih, ia = _wh_implied(hp), _wh_implied(ap)
+        if ih is None or ia is None:
+            continue
+        cand = (ih + ia, abs(point), point, hp, ap)
+        if best is None or cand < best:
+            best = cand
+    if best is not None:
+        _, _, point, hp, ap = best
+        entry["spreads"] = {home: [{"spread": point, "price": hp}],
+                            away: [{"spread": -point, "price": ap}]}
+
+
+def _fill_totals(entry, snap_rows):
+    """Populate entry['totals'] = {'Over'/'Under': [{line, price}]} for the same
+    line L on both sides — tiebreak tightest two-way overround, then line."""
+    over_by_pt, under_by_pt = {}, {}
+    for r in snap_rows:
+        if r.get("bet_type") != "total":
+            continue
+        sel, price, point = (r.get("selection") or ""), r.get("price"), r.get("point")
+        if price is None or point is None:
+            continue
+        low = sel.lower()
+        bucket = (over_by_pt if low == "over"
+                  else under_by_pt if low == "under" else None)
+        if bucket is None:
+            continue
+        if bucket.get(point) is None or price > bucket[point]:
+            bucket[point] = price
+    best = None  # (overround, line, over_price, under_price)
+    for point, op in over_by_pt.items():
+        up = under_by_pt.get(point)
+        if up is None:
+            continue
+        io, iu = _wh_implied(op), _wh_implied(up)
+        if io is None or iu is None:
+            continue
+        cand = (io + iu, point, op, up)
+        if best is None or cand < best:
+            best = cand
+    if best is not None:
+        _, line, op, up = best
+        entry["totals"] = {"Over": [{"line": line, "price": op}],
+                           "Under": [{"line": line, "price": up}]}
+
+
+def _assemble_team_entry(event_id, rows):
+    """Build one historical_odds-store entry (moneyline/spreads/totals) for an
+    event from its warehoused team-market line rows. Picks the closing snapshot
+    (nearest at-or-before commence via _closing_sort_key) and reads that
+    snapshot's lines. Returns the entry dict, or None if no market assembled."""
+    if not rows:
+        return None
+    first = rows[0]
+    commence = first.get("commence_time")
+    home, away = first.get("home"), first.get("away")
+    target = _parse_utc(commence)
+
+    by_snap, snap_captured = {}, {}
+    for r in rows:
+        sid = r.get("snapshot_id")
+        by_snap.setdefault(sid, []).append(r)
+        snap_captured[sid] = r.get("captured_at")
+    closing_sid = min(
+        by_snap, key=lambda sid: _closing_sort_key(target, snap_captured.get(sid)))
+    snap_rows = by_snap[closing_sid]
+
+    # Initialize the three market keys to {} — the historical_odds shape this
+    # reproduces (odds_client.parse_game_odds) ALWAYS carries them, and the
+    # default engine="live" analyzers hard-subscript game_odds["moneyline"/
+    # "spreads"/"totals"], so a missing key would KeyError-abort the backtest.
+    # _fill_* overwrite when a genuine two-way market is present.
+    entry = {"commence_time": commence, "home_team": home, "away_team": away,
+             "event_id": event_id, "props": {},
+             "moneyline": {}, "spreads": {}, "totals": {}}
+    _fill_moneyline(entry, snap_rows, home, away)
+    _fill_spreads(entry, snap_rows, home, away)
+    _fill_totals(entry, snap_rows)
+    if not (entry.get("moneyline") or entry.get("spreads")
+            or entry.get("totals")):
+        return None   # {} for all three is falsy → no usable market
+    return entry
+
+
+def load_team_market_store(sport_key, dates=None):
+    """Assemble a historical_odds-shaped store from the SQL warehouse's captured
+    team-market lines, for the team-market backtest.
+
+    Returns the exact shape historical_odds.load_store produces
+    ({'sport_key','bookmaker','games': {game_key: entry}}) so
+    backtest._build_odds_lookup / _moneyline_market / _spread_market /
+    _total_market consume it unchanged — one entry per event built from that
+    event's closing snapshot. SQL-only and best-effort: returns an empty store
+    when SQL is off or on any error."""
+    empty = {"sport_key": sport_key, "games": {},
+             "bookmaker": "warehouse (best-of-book, closing)"}
+    if not _sql():
+        return empty
+    try:
+        rows = _db.team_market_lines(sport_key, dates=dates)
+    except Exception:
+        return empty
+    if not rows:
+        return empty
+    try:
+        import historical_odds as store_mod
+    except Exception:
+        return empty
+    by_event = {}
+    for r in rows:
+        by_event.setdefault(r.get("event_id"), []).append(r)
+    games = {}
+    for event_id, ev_rows in by_event.items():
+        entry = _assemble_team_entry(event_id, ev_rows)
+        if entry is None:
+            continue
+        key = store_mod.game_key(entry.get("commence_time"),
+                                 entry.get("home_team"), entry.get("away_team"))
+        games[key] = entry
+    empty["games"] = games
+    return empty
 
 
 # ──────────────────────────────────────────────────────────────────────────────

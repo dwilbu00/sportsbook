@@ -1074,12 +1074,17 @@ class RecalibrationTests(unittest.TestCase):
         # old os.path.exists=False mock did before the gate became blob-aware.
         with patch.object(
                 recalibration, "resolve_pending_outcomes", return_value=25), patch.object(
+                recalibration, "resolve_pending_market_outcomes", return_value=0), patch.object(
                 recalibration, "_prediction_log_blob_url", return_value=""), patch.object(
                 recalibration, "_load_recal_cached", return_value=(None, {})), patch.object(
                 recalibration, "compact_prediction_log", return_value=0), patch.object(
                 recalibration, "refit_sport", return_value={"prop": (1, 0, 90)}) as refit:
             result = recalibration.maintain_sport("baseball_mlb")
-        self.assertEqual(result, {"newly_resolved": 25, "refit": True})
+        # Team-market resolution rides along but stays OUT of newly_resolved (that
+        # gates the prop Platt refit).
+        self.assertEqual(
+            result,
+            {"newly_resolved": 25, "newly_resolved_markets": 0, "refit": True})
         refit.assert_called_once_with(
             "baseball_mlb", resolve_first=False, newly_resolved=25)
 
