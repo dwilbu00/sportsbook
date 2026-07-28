@@ -21541,7 +21541,7 @@
     "n_players": 70,
     "prob_shrink": {
       "source": "odds backtest --engine live",
-      "fit_timestamp": "2026-07-09T17:59:05.051267Z"
+      "fit_timestamp": "2026-07-28T17:39:07.614387Z"
     },
     "starter_adjustment": {
       "team_markets": {
@@ -21792,6 +21792,29 @@
         "batter_hits"
       ],
       "store_label": "default"
+    },
+    "prob_shrink_holdout": {
+      "moneyline": {
+        "brier": 0.25,
+        "raw_brier": 0.2819,
+        "n": 45,
+        "n_warehouse": 45,
+        "n_log": 0
+      },
+      "spreads": {
+        "brier": 0.2357,
+        "raw_brier": 0.2358,
+        "n": 43,
+        "n_warehouse": 43,
+        "n_log": 0
+      },
+      "totals": {
+        "brier": 0.2484,
+        "raw_brier": 0.2604,
+        "n": 32,
+        "n_warehouse": 32,
+        "n_log": 0
+      }
     }
   },
   "prob_shrink": {
