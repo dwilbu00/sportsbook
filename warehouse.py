@@ -680,6 +680,13 @@ def join_predictions_to_lines(sport, dates):
 # Team-market backtest store (assembled from the SQL warehouse)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Per-offer book label. The warehouse stores the best price ACROSS books (it
+# doesn't record which one), so there's no real book name — but the live
+# analyzers (analyze_moneyline_value) read offer["book"], so every assembled
+# offer must carry the field to reproduce odds_client.parse_game_odds's shape.
+_WH_BOOK = "warehouse"
+
+
 def _wh_implied(price):
     """American price → implied prob, or None. (Local import: no import cycle.)"""
     try:
@@ -701,7 +708,7 @@ def _fill_moneyline(entry, snap_rows, home, away):
             continue
         cur = ml.get(team)
         if cur is None or price > cur["price"]:
-            ml[team] = {"price": price,
+            ml[team] = {"book": _WH_BOOK, "price": price,
                         "implied_prob": r.get("implied_prob")}
     if home in ml and away in ml:
         entry["moneyline"] = {home: [ml[home]], away: [ml[away]]}
@@ -740,8 +747,9 @@ def _fill_spreads(entry, snap_rows, home, away):
             best = cand
     if best is not None:
         _, _, point, hp, ap = best
-        entry["spreads"] = {home: [{"spread": point, "price": hp}],
-                            away: [{"spread": -point, "price": ap}]}
+        entry["spreads"] = {
+            home: [{"book": _WH_BOOK, "spread": point, "price": hp}],
+            away: [{"book": _WH_BOOK, "spread": -point, "price": ap}]}
 
 
 def _fill_totals(entry, snap_rows):
@@ -774,8 +782,9 @@ def _fill_totals(entry, snap_rows):
             best = cand
     if best is not None:
         _, line, op, up = best
-        entry["totals"] = {"Over": [{"line": line, "price": op}],
-                           "Under": [{"line": line, "price": up}]}
+        entry["totals"] = {
+            "Over": [{"book": _WH_BOOK, "line": line, "price": op}],
+            "Under": [{"book": _WH_BOOK, "line": line, "price": up}]}
 
 
 def _assemble_team_entry(event_id, rows):

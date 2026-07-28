@@ -165,6 +165,34 @@ class ShrinkCalibrationExtraObsTests(unittest.TestCase):
         self.assertEqual(ml["n_warehouse"], 2)
         self.assertEqual(ml["n_log"], 1)
 
+    def test_thin_sample_withholds_shrink_but_publishes_holdout(self):
+        # A blend where shrinking clearly helps (overconfident + wrong), but the
+        # sample is below the guard → shrink withheld, holdout still published.
+        results = self._results([(0.9, 0.55, 0)] * 5)
+        captured = {}
+
+        def fake_save(sport_key, shrink, holdout=None, meta=None):
+            captured["shrink"] = shrink
+            captured["holdout"] = holdout
+
+        with patch.object(backtest, "save_prob_shrink", fake_save):
+            backtest._write_shrink_calibration("baseball_mlb", results,
+                                               min_shrink_n=100)
+        self.assertEqual(captured["shrink"], {})            # withheld (n=5<100)
+        self.assertIn("moneyline", captured["holdout"])     # holdout still published
+
+    def test_shrink_persisted_when_sample_meets_min(self):
+        results = self._results([(0.9, 0.55, 0)] * 5)
+        captured = {}
+
+        def fake_save(sport_key, shrink, holdout=None, meta=None):
+            captured["shrink"] = shrink
+
+        with patch.object(backtest, "save_prob_shrink", fake_save):
+            backtest._write_shrink_calibration("baseball_mlb", results,
+                                               min_shrink_n=5)
+        self.assertEqual(captured["shrink"].get("moneyline"), 0.0)  # n=5>=5
+
     def test_flip_symmetry_of_best_shrink(self):
         # (p, o) folds into the same raw/shrunk Brier as its flip (1-p, 1-o) —
         # equal up to float summation noise, so compare with tolerance.

@@ -192,16 +192,23 @@ def _filter_to_current_season(prior_games, test_date, sport_key):
 # ────────────────────────────────────────────────────────────────
 
 
-def cached_schedule(espn_sport, espn_league, team_id, season_year=None, ttl_hours=24 * 7):
+def cached_schedule(espn_sport, espn_league, team_id, season_year=None,
+                    ttl_hours=24 * 7, current_ttl_hours=12):
     """
     Cached wrapper around get_team_schedule. Historical seasons get a long TTL
-    (results don't change). Current season uses a shorter TTL.
+    (results don't change). The current season uses a SHORT TTL
+    (``current_ttl_hours``, default 12h) so recently-completed games surface
+    promptly: the team-market odds backtest grades warehoused closing lines
+    against these finals, and a multi-day cache would hide the last few days of
+    results — leaving freshly-captured (upcoming-then-completed) games
+    ungradeable until the cache expired.
     """
     path = _cache_key("schedule", espn_sport, espn_league, team_id, season_year or "current")
     if os.path.exists(path):
         age = time.time() - os.path.getmtime(path)
-        # Historical seasons (specified explicitly) are immutable — long TTL
-        effective_ttl = (ttl_hours * 24) if season_year else ttl_hours
+        # Historical seasons (specified explicitly) are immutable — long TTL;
+        # the current season refreshes within current_ttl_hours.
+        effective_ttl = (ttl_hours * 24) if season_year else current_ttl_hours
         if age < effective_ttl * 3600:
             with open(path) as f:
                 return json.load(f)
@@ -836,14 +843,25 @@ def _print_log_supplement_roi(supplement):
         print(f"  {market:<10} {len(obs):>5} {bets:>5} {roi:>8.2f} {profit:>8.2f}")
 
 
-def _write_shrink_calibration(sport_key, results, extra_obs=None):
+MIN_SHRINK_N = 200  # min graded obs before a fitted shrink factor is persisted
+
+
+def _write_shrink_calibration(sport_key, results, extra_obs=None,
+                              min_shrink_n=MIN_SHRINK_N):
     """Fit and persist the Brier-optimal probability shrink per team market
     (from the 'live' variant) to calibration/<sport>.json.
 
     ``extra_obs`` (optional): {market: [(raw_prob, outcome)]} model-side rows from
     the prediction-log supplement, folded into the shrink fit and the published
     holdout Brier (see _market_log_supplement). market_brier and the blend weight
-    stay over warehouse-only rows (log rows have no market prob)."""
+    stay over warehouse-only rows (log rows have no market prob).
+
+    ``min_shrink_n`` guards the LIVE shrink factors: a factor is persisted only
+    when the market has >= min_shrink_n graded obs, so a thin warehouse sample
+    (early on, or a narrow --season/--limit run) can't clobber an established fit
+    with noise (e.g. a 45-game sample driving moneyline shrink to 0.0). The
+    holdout Brier is published for EVERY graded market regardless — it's
+    informational (fills the app column) and never changes live behavior."""
     from datetime import datetime, timezone
     variant = "live" if "live" in results else next(iter(results), None)
     if not variant:
@@ -852,6 +870,7 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None):
     extra_obs = extra_obs or {}
     shrink = {}
     holdout = {}
+    withheld = []
     for market in MARKETS:
         blend = results[variant][market]["blend"]
         extra = [(p, None, o) for (p, o) in extra_obs.get(market, [])]
@@ -869,9 +888,17 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None):
             "n_warehouse": len(blend),
             "n_log": len(extra),
         }
-        # Only persist shrink when shrinking actually improves calibration.
+        # Persist shrink only when it improves calibration AND the sample is big
+        # enough to trust (else keep the existing factor untouched).
         if best_s < 1.0 and best_brier < raw_brier - 1e-9:
-            shrink[market] = round(best_s, 2)
+            if len(combined) >= min_shrink_n:
+                shrink[market] = round(best_s, 2)
+            else:
+                withheld.append((market, round(best_s, 2), len(combined)))
+    if withheld:
+        print("  [write-calibration] shrink withheld (thin sample, "
+              f"need n>={min_shrink_n}; existing factor kept): "
+              + ", ".join(f"{m} s={s} n={n}" for m, s, n in withheld))
     if not shrink and not holdout:
         print("  [write-calibration] No market graded; nothing written.")
         return
@@ -1001,7 +1028,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       min_sample=5, season_year=None, threshold_pct=5.0,
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
-                      supplement_log=True):
+                      supplement_log=True, min_shrink_n=MIN_SHRINK_N):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1215,7 +1242,8 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
             else:
                 extra_obs = ({m: supplement[m]["obs"] for m in MARKETS}
                              if supplement else None)
-                _write_shrink_calibration(sport_key, results, extra_obs=extra_obs)
+                _write_shrink_calibration(sport_key, results, extra_obs=extra_obs,
+                                          min_shrink_n=min_shrink_n)
         else:
             _write_blend_calibration(sport_key, results)
 
@@ -3631,6 +3659,13 @@ def main():
     p.add_argument("--no-supplement-log", dest="supplement_log",
                    action="store_false",
                    help="Disable the prediction-log holdout supplement.")
+    p.add_argument("--min-shrink-n", type=int, default=MIN_SHRINK_N,
+                   help="(odds mode) Min graded obs before a fitted team-market "
+                        f"shrink factor is persisted (default {MIN_SHRINK_N}). "
+                        "Below this, only the informational holdout Brier is "
+                        "written; the existing shrink factor is kept so a thin "
+                        "sample can't clobber a good fit. The Holdout Brier "
+                        "column still fills.")
     args = p.parse_args()
 
     # Target the Azure SQL warehouse/logs when the SQL_* secrets are configured
@@ -3691,7 +3726,8 @@ def main():
                           store_label=args.store_label,
                           variance_inflate=args.variance_inflate,
                           engine=args.engine, prob_shrink=args.prob_shrink,
-                          source=args.source, supplement_log=args.supplement_log)
+                          source=args.source, supplement_log=args.supplement_log,
+                          min_shrink_n=args.min_shrink_n)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,

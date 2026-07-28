@@ -677,6 +677,14 @@ class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertIsNotNone(backtest._moneyline_market(entry))
         self.assertIsNotNone(backtest._spread_market(entry))
         self.assertIsNotNone(backtest._total_market(entry))
+        # Every offer must carry the parse_game_odds fields the LIVE analyzers
+        # read — notably "book" (analyze_moneyline_value uses best_offer["book"]).
+        for team in (entry["moneyline"]["Rockies"] + entry["moneyline"]["Astros"]):
+            self.assertEqual(set(team), {"book", "price", "implied_prob"})
+        for team in (entry["spreads"]["Rockies"] + entry["spreads"]["Astros"]):
+            self.assertEqual(set(team), {"book", "spread", "price"})
+        for side in (entry["totals"]["Over"] + entry["totals"]["Under"]):
+            self.assertEqual(set(side), {"book", "line", "price"})
 
     def test_store_empty_when_sql_off(self):
         import warehouse
