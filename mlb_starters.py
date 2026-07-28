@@ -989,18 +989,44 @@ _SCHEDULE_LIVE_TTL = 900        # 15 min while any game is not Final
 _SCHEDULE_FINAL_TTL = 24 * 3600  # 1 day once all games are Final
 
 
+# statsapi can report abstractGameState "Final" for a game that never truly
+# completed: a postponed/suspended/cancelled game may surface as "Final" with a
+# 0-0 or partial box score, which would wrongly grade bets (a rained-out game's
+# over bets settling as WIN off a bogus line). A rain-SHORTENED but OFFICIAL game
+# reads detailedState "Completed Early" and MUST still grade, so exclude only the
+# genuine non-completion states.
+_NON_FINAL_DETAILED = ("postpon", "suspend", "cancel")
+
+
+def _is_genuine_final(info):
+    """True when a schedule-index entry is a real, gradable completion: abstract
+    state "Final" AND a detailedState that isn't postponed/suspended/cancelled.
+    A missing detailedState (older cached index, pre-upgrade) trusts
+    abstractGameState so stale caches keep resolving."""
+    info = info or {}
+    if info.get("status") != "Final":
+        return False
+    detailed = str(info.get("detailedState") or "").lower()
+    return not any(bad in detailed for bad in _NON_FINAL_DETAILED)
+
+
 def _all_final(index):
-    """True when every game in a schedule index is Final (schedule is static)."""
+    """True when every game in a schedule index is a genuine completion (schedule
+    is static). A postponed/suspended game reads as not-final so its date keeps
+    refreshing on the short TTL and picks up the eventual makeup."""
     return bool(index) and all(
-        (info or {}).get("status") == "Final" for info in index.values())
+        _is_genuine_final(info) for info in index.values())
 
 
 def get_schedule_index(date):
-    """{str(gamePk): {gameDate, gameNumber, doubleHeader, home, away, status}}
-    for one calendar date (YYYY-MM-DD). gamePk is the hard game id; gameDate is
-    the UTC start used to disambiguate doubleheaders against a forecast's
-    commence_time; ``status`` is the statsapi abstractGameState ('Final',
-    'Live', 'Preview') used to gate outcome resolution to completed games.
+    """{str(gamePk): {gameDate, gameNumber, doubleHeader, home, away, status,
+    detailedState}} for one calendar date (YYYY-MM-DD). gamePk is the hard game
+    id; gameDate is the UTC start used to disambiguate doubleheaders against a
+    forecast's commence_time; ``status`` is the statsapi abstractGameState
+    ('Final', 'Live', 'Preview') and ``detailedState`` the finer status
+    ('Postponed', 'Suspended', 'Completed Early', …) — together they gate outcome
+    resolution to genuine completions via ``_is_genuine_final`` (a postponed game
+    can report abstractGameState 'Final').
 
     Adaptive cache: a date whose games are all Final is static and cached for a
     day; a date with any non-final game refreshes every ~15 min so live status
@@ -1029,6 +1055,7 @@ def get_schedule_index(date):
                 "home": ((teams.get("home") or {}).get("team") or {}).get("name"),
                 "away": ((teams.get("away") or {}).get("team") or {}).get("name"),
                 "status": (g.get("status") or {}).get("abstractGameState"),
+                "detailedState": (g.get("status") or {}).get("detailedState"),
             }
     _write_cache(cache, out)
     return out
@@ -1143,15 +1170,14 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     # date — so the true game can live under game_date-1. Collect every candidate
     # and choose by nearest scheduled start, never first-date-wins (which would
     # bind an everyday hitter to the following day's game).
-    candidates = []  # (gamePk, scheduled_start_dt_or_None, status)
+    candidates = []  # (gamePk, scheduled_start_dt_or_None, info)
     seen = set()
     for d in _candidate_dates(game_date):
         for pk, info in get_schedule_index(d).items():
             if pk in by_pk and pk not in seen:
                 seen.add(pk)
                 candidates.append(
-                    (pk, _parse_utc(info.get("gameDate")),
-                     (info or {}).get("status")))
+                    (pk, _parse_utc(info.get("gameDate")), info))
     if not candidates:
         return None
 
@@ -1160,25 +1186,28 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     # what stops a doubleheader's already-final leg from grading a bet on the
     # still-live leg.
     if len(candidates) == 1:
-        _, _, status = candidates[0]
-        pk = candidates[0][0]
+        pk, _, info = candidates[0]
     else:
         # Multiple nearby games (doubleheader or date slippage): without a
         # commence_time we can't choose safely.
         if target is None:
             return None
-        best = None  # (delta_seconds, gamePk, status)
-        for cand_pk, gdt, status in candidates:
+        best = None  # (delta_seconds, gamePk, info)
+        for cand_pk, gdt, cand_info in candidates:
             if gdt is None:
                 continue
             delta = abs((gdt - target).total_seconds())
             if best is None or delta < best[0]:
-                best = (delta, cand_pk, status)
+                best = (delta, cand_pk, cand_info)
         if best is None:
             return None
-        _, pk, status = best
+        _, pk, info = best
 
-    if status != "Final":
+    # A suspended game carries a PARTIAL box score with the player's gamePk (so it
+    # reaches here) yet reports abstractGameState "Final"; _is_genuine_final also
+    # rejects postponed/cancelled. Keep the bet pending rather than grade a bogus
+    # line — DK voids these, and the stale-DNP sweep clears a permanent no-show.
+    if not _is_genuine_final(info):
         return GAME_NOT_FINAL
     return by_pk[pk]
 

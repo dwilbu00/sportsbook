@@ -163,6 +163,14 @@ def _mlb_scores_for_date(game_date):
             status = g.get("status", {}) or {}
             if status.get("abstractGameState") != "Final":
                 continue
+            # A postponed/suspended/cancelled game can report abstractGameState
+            # "Final" with a 0-0 or partial score; excluding those keeps a
+            # rained-out game's team bets pending (DK voids them) instead of
+            # settling off a bogus box score. A rain-shortened OFFICIAL game reads
+            # detailedState "Completed Early" and is intentionally NOT excluded.
+            detailed = str(status.get("detailedState") or "").lower()
+            if any(b in detailed for b in mlb_starters._NON_FINAL_DETAILED):
+                continue
             teams = g.get("teams", {}) or {}
             home = teams.get("home") or {}
             away = teams.get("away") or {}

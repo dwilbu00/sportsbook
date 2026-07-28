@@ -129,6 +129,8 @@ class SeedWarmupSeasonCountTests(unittest.TestCase):
             return None
 
         with patch.object(blc, "harvest_book_lines_from_store", return_value=[]), \
+             patch.object(blc, "harvest_book_lines_from_prediction_log",
+                          return_value=[]), \
              patch.object(blc, "harvest_book_lines", return_value=[1]), \
              patch.object(blc, "join_book_lines_to_actuals", return_value=[obs]), \
              patch.object(blc, "project_and_empirical", return_value=(22.0, 0.6)), \

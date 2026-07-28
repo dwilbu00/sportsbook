@@ -1414,7 +1414,7 @@ def render_my_bets():
         st.subheader("By bet type")
         st.dataframe([
             {
-                "Bet type": (b["bet_type"] or "—").title(),
+                "Bet type": b.get("label") or (b["bet_type"] or "—").title(),
                 "Settled": b["resolved"],
                 "W–L–P": f"{b['won']}–{b['lost']}–{b['push']}",
                 "Staked": f"${b['total_staked']:.2f}",

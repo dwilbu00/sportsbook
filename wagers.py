@@ -666,8 +666,36 @@ def _metrics(group):
     }
 
 
+def _bet_type_group_key(row):
+    """Group key for the by-bet-type split. Player props split by market
+    (prop_key) so ROI is visible per prop type; other markets group by bet_type.
+    Returns (bet_type, sub) where sub is the prop_key for props else ''."""
+    bt = row.get("bet_type")
+    if bt == "player_prop":
+        return ("player_prop", row.get("prop_key") or "")
+    return (bt, "")
+
+
+def _bet_type_group_label(key, group):
+    """Human label for a by-bet-type group. Player props read
+    'Player Prop — <Prop Label>' (prefers the stored prop_label, falls back to a
+    prettified prop_key); other markets use the title-cased bet type."""
+    bt, sub = key
+    if bt == "player_prop":
+        for r in group:
+            if r.get("prop_label"):
+                return f"Player Prop — {r['prop_label']}"
+        pretty = (sub or "prop").replace("_", " ").title()
+        return f"Player Prop — {pretty}"
+    return (bt or "—").title()
+
+
 def summarize_wagers(rows):
-    """Stake-weighted realized ROI summary with by-sport / by-bet-type splits."""
+    """Stake-weighted realized ROI summary with by-sport / by-bet-type splits.
+
+    The by-bet-type split reports each player-prop MARKET separately (batter
+    hits, pitcher strikeouts, …) rather than one pooled 'Player Prop' row, so the
+    user sees ROI per market; team markets stay pooled by bet type."""
     summary = _metrics(rows)
     summary["pending_stake"] = sum(
         _num(r.get("stake")) for r in rows if r.get("status") == "pending")
@@ -675,13 +703,15 @@ def summarize_wagers(rows):
     by_type = defaultdict(list)
     for row in rows:
         by_sport[row.get("sport_key")].append(row)
-        by_type[row.get("bet_type")].append(row)
+        by_type[_bet_type_group_key(row)].append(row)
     summary["by_sport"] = [
         {"sport_key": key, **_metrics(group)}
         for key, group in sorted(by_sport.items(), key=lambda kv: str(kv[0]))
     ]
     summary["by_bet_type"] = [
-        {"bet_type": key, **_metrics(group)}
-        for key, group in sorted(by_type.items(), key=lambda kv: str(kv[0]))
+        {"bet_type": key[0], "prop_key": key[1] or None,
+         "label": _bet_type_group_label(key, group), **_metrics(group)}
+        for key, group in sorted(
+            by_type.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1])))
     ]
     return summary

@@ -701,6 +701,34 @@ class SummaryTests(unittest.TestCase):
         self.assertTrue(summary["by_bet_type"])
         self.assertTrue(summary["by_sport"])
 
+    def test_by_bet_type_splits_props_by_market(self):
+        rows = [
+            {"sport_key": "baseball_mlb", "bet_type": "player_prop",
+             "prop_key": "batter_hits", "prop_label": "Batter Hits",
+             "status": "won", "stake": 10.0, "profit": 9.0},
+            {"sport_key": "baseball_mlb", "bet_type": "player_prop",
+             "prop_key": "pitcher_strikeouts", "prop_label": "Pitcher Ks",
+             "status": "lost", "stake": 10.0, "profit": -10.0},
+            {"sport_key": "baseball_mlb", "bet_type": "spread",
+             "status": "won", "stake": 10.0, "profit": 9.0},
+        ]
+        by_type = wagers.summarize_wagers(rows)["by_bet_type"]
+        labels = {b["label"] for b in by_type}
+        # Two DISTINCT prop markets, not one pooled "Player Prop" bucket.
+        self.assertIn("Player Prop — Batter Hits", labels)
+        self.assertIn("Player Prop — Pitcher Ks", labels)
+        self.assertIn("Spread", labels)
+        hits = next(b for b in by_type if b["label"] == "Player Prop — Batter Hits")
+        self.assertEqual(hits["prop_key"], "batter_hits")
+        self.assertEqual((hits["won"], hits["lost"]), (1, 0))
+
+    def test_by_bet_type_prop_label_falls_back_to_prop_key(self):
+        rows = [{"sport_key": "baseball_mlb", "bet_type": "player_prop",
+                 "prop_key": "batter_total_bases", "status": "won",
+                 "stake": 10.0, "profit": 9.0}]
+        by_type = wagers.summarize_wagers(rows)["by_bet_type"]
+        self.assertEqual(by_type[0]["label"], "Player Prop — Batter Total Bases")
+
 
 if __name__ == "__main__":
     unittest.main()

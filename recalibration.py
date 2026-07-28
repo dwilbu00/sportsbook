@@ -1026,16 +1026,29 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
             return None
         idx = _pick_candidate(by_date.get(game_date), commence)
         if idx is None:
-            # ±1 day fallback for timezone slippage
+            # ±1 day fallback for timezone slippage: the bet's real game is
+            # labeled game_date but ESPN filed it a calendar day off (UTC/local).
+            # Genuine slippage keeps the SAME start time, so require the matched
+            # row within ~20h of commence — otherwise this is a DIFFERENT game on
+            # the adjacent day (e.g. a postponed game's bet matching the prior
+            # night's game), which must stay pending, never grade.
+            target = _parse_dt(commence)
             for delta in (-1, 1):
                 try:
                     alt = (datetime.fromisoformat(game_date)
                            + timedelta(days=delta)).date().isoformat()
                 except Exception:
                     continue
-                idx = _pick_candidate(by_date.get(alt), commence)
-                if idx is not None:
-                    break
+                cand = _pick_candidate(by_date.get(alt), commence)
+                if cand is None:
+                    continue
+                if target is not None:
+                    row_dt = _parse_dt((gamelog[cand] or {}).get("game_date"))
+                    if row_dt is not None and abs(
+                            (row_dt - target).total_seconds()) > 20 * 3600:
+                        continue
+                idx = cand
+                break
         if idx is None:
             return None
         # Completion gate: a same-day-or-later ESPN row may be a live game with a
@@ -1699,7 +1712,7 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
     Returns dict {prop_key: (a, b, n_fit)} actually fit & saved.
     """
     from book_line_calibration import (
-        harvest_book_lines, harvest_book_lines_from_store,
+        harvest_book_lines, harvest_real_line_book_lines,
         join_book_lines_to_actuals, project_and_empirical, _team_defense_lookup,
     )
     from calibration_loader import (
@@ -1710,13 +1723,19 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
     # module import cycle; by call time both modules are fully loaded.
     from props import (
         _player_prop_half_life, _player_prop_defense_strength,
-        _player_prop_venue_strength,
+        _player_prop_venue_strength, _method_cfg_for_line,
     )
 
-    # Prefer the DURABLE historical_odds store (backfill output); fall back to
-    # the ephemeral cache/*.json HTTP cache for backward compatibility.
-    book_lines = harvest_book_lines_from_store(sport_key, target_props)
-    if not book_lines:
+    # Union the DURABLE historical_odds backfill store with the app's own
+    # RESOLVED prediction log (deduped) so the seed dataset — and its line
+    # buckets — keep growing for free with live usage, not just paid backfill
+    # credits. Fall back to the ephemeral HTTP odds cache when the union is empty.
+    book_lines, n_store, n_pred = harvest_real_line_book_lines(
+        sport_key, target_props)
+    if book_lines:
+        print(f"[seed] {len(book_lines)} real-line obs "
+              f"({n_store} store + {n_pred} prediction-log) for {sport_key}")
+    else:
         book_lines = harvest_book_lines(sport_key, target_props)
     if not book_lines:
         return {}
@@ -1778,8 +1797,14 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         if projected is None or emp is None:
             continue
         prop_cfg = cal.get(obs["prop_key"]) or {}
+        # Resolve the per-LINE method/cfg (line_methods bucket) so the seed fits
+        # Platt on the SAME raw distribution runtime emits for that line: a prop
+        # whose ≥1.5 bucket adopted method B must be seeded with B's raw there,
+        # not the pooled method's. A cfg without line_methods → the pooled method
+        # (unchanged behavior).
+        method, method_cfg = _method_cfg_for_line(prop_cfg, obs["line"])
         raw = emp
-        if prop_cfg.get("method"):
+        if method:
             # Match runtime warmup blending: count only the player's prior games
             # inside the observation's *current season*, not every historical
             # game — otherwise the current-season fit is over-weighted and the
@@ -1793,7 +1818,7 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
             curr_games = count_current_season_games(
                 prior_dates, sport_key, now=obs_now)
             p_cal = apply_calibration_with_warmup(
-                prop_cfg, projected, obs["line"], curr_games,
+                method_cfg, projected, obs["line"], curr_games,
                 empirical_over=emp,
             )
             if p_cal is not None:
