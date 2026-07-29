@@ -668,8 +668,9 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
           f"{sport_key} ===")
     book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
         sport_key, target_props, store_label)
-    print(f"  {len(book_lines)} real-line book lines across {len(target_props)} "
-          f"calibrated props ({n_store} backfill store + {n_pred} new from the "
+    print(f"  Harvested {len(book_lines):,} real book lines for "
+          f"{len(target_props)} calibrated prop(s) "
+          f"({n_store:,} from the backfill store + {n_pred:,} from the "
           f"prediction log)")
     if not book_lines:
         print("  No real book lines (store or prediction log); nothing to refit.")
@@ -703,11 +704,11 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     for _pk in (LINE_CONDITIONAL_PROPS & set(target_props)):
         _counts = _lc_bucket_counts(enriched, _pk)
         _pretty = ", ".join(
-            (f"<={cap}" if cap is not None else ">top") + f":{_counts[cap]}"
+            (f"line<={cap}" if cap is not None else "higher lines") + f": {_counts[cap]}"
             for cap in LINE_BUCKETS)
-        print(f"  [line-cond] {_pk} bucket obs: {_pretty} "
-              f"(need >={MIN_BUCKET_OBS} in a non-primary bucket to engage; "
-              f"{'ENGAGING' if need_lc else 'inert'})")
+        print(f"  [line-cond] {_pk}: obs by line bucket ({_pretty}) — per-line-bucket "
+              f"method selection {'ON' if need_lc else 'OFF'} "
+              f"(needs >={MIN_BUCKET_OBS} obs above the primary line)")
     xba_index = None
     lc_quality_index = None
     if (xstats_strength and xstats_strength > 0) or need_lc:
@@ -725,14 +726,18 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             xba_index = backtest_props.build_batter_xba_index(raw)
             if need_lc:
                 lc_quality_index = backtest_props.build_batter_quality_index(raw)
-            print(f"  [xstats] as-of index(es) built from {len(raw)} pitch rows "
-                  f"over {years} (xstats_strength={xstats_strength}, "
-                  f"line_conditional={need_lc})")
+            print(f"  [xstats] built leakage-safe Statcast index from "
+                  f"{len(raw):,} pitches ({', '.join(years)}) for method-D "
+                  f"scoring (xBA blend weight={xstats_strength}, "
+                  f"per-line-bucket={'on' if need_lc else 'off'})")
         else:
             print("  [xstats] no Statcast days cached for the obs seasons — "
                   "xBA blend + line-conditional D inactive; plain projection.")
 
     changed = {}
+    _change_notes = {}   # prop_key -> short human-readable what-changed note
+    kept = []       # method confirmed at real lines; nothing rewritten
+    skipped = []    # too few real-line obs; synthetic fit preserved
     for prop_key in target_props:
         cfg = existing.get(prop_key) or {}
         params = {
@@ -748,9 +753,10 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             xstats_strength=prop_xstats, xba_index=xba_index)
         sel = blc.select_method_at_real_lines(rows)
         if sel is None:
-            print(f"  [skip] {prop_key}: {len(rows)} real-line obs "
-                  f"(<20 usable) — keeping synthetic fit "
-                  f"(method={cfg.get('method')})")
+            skipped.append(prop_key)
+            print(f"  [skip]   {prop_key}: only {len(rows)} real-line obs "
+                  f"(need >=20) — keeping the synthetic-line fit "
+                  f"(method {cfg.get('method')})")
             continue
 
         old_method = cfg.get("method")
@@ -773,15 +779,18 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         if not pooled_flip and not line_methods:
             note = f"real-line eval confirms method {old_method}"
             if "line_methods" not in cfg:
-                print(f"  [keep] {prop_key}: {note} (real-line "
-                      f"brier={sel['fit_brier']}, baseline(A)="
+                kept.append(prop_key)
+                print(f"  [keep]   {prop_key}: method {old_method} confirmed at "
+                      f"real lines (brier {sel['fit_brier']} vs baseline-A "
                       f"{sel['baseline_brier']}, n={sel['n_obs']})")
                 continue
             # A previously-written line_methods no longer qualifies → drop it.
             new_cfg = dict(cfg)
             new_cfg.pop("line_methods", None)
             changed[prop_key] = new_cfg
-            print(f"  [{prop_key}] line_methods dropped (no bucket qualifies); "
+            _change_notes[prop_key] = (f"removed stale per-line-bucket override; "
+                                       f"method {old_method} confirmed")
+            print(f"  [update] {prop_key}: removed stale per-line-bucket override; "
                   f"{note}")
             continue
 
@@ -820,18 +829,30 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         else:
             new_cfg.pop("line_methods", None)
         changed[prop_key] = new_cfg
-        note = (f"{old_method}→{sel['method']} FLIP"
+        note = (f"method {old_method}->{sel['method']} FLIP"
                 if sel["method"] != old_method
-                else (f"re-fit @xstats={prop_xstats}" if projection_changed
-                      else "pooled unchanged"))
+                else (f"same method, re-fit on real lines (xBA blend "
+                      f"{prop_xstats})" if projection_changed
+                      else "pooled method unchanged"))
         if line_methods:
-            adopted = [f"<={b['max_line']}:{b['method']}" if b["max_line"]
-                       is not None else f">top:{b['method']}"
+            adopted = [f"line<={b['max_line']}:{b['method']}" if b["max_line"]
+                       is not None else f"higher:{b['method']}"
                        for b in line_methods if b.get("confirmed")]
-            note += f"  +line_methods[{', '.join(adopted)}]"
-        print(f"  [{prop_key}] method {note}  brier={sel['fit_brier']} "
-              f"baseline(A)={sel['baseline_brier']} cv={sel['cv_brier']} "
-              f"n={sel['n_obs']}")
+            note += f" + per-line-bucket [{', '.join(adopted)}]"
+        _change_notes[prop_key] = note
+        print(f"  [update] {prop_key}: {note}  (brier {sel['fit_brier']} vs "
+              f"baseline-A {sel['baseline_brier']}, cv {sel['cv_brier']}, "
+              f"n={sel['n_obs']})")
+
+    # ── At-a-glance recap ──
+    total = len(target_props)
+    print(f"\n  Summary ({total} prop{'s' if total != 1 else ''} evaluated at real "
+          f"book lines): {len(changed)} updated, {len(kept)} confirmed unchanged, "
+          f"{len(skipped)} skipped for too little real-line data.")
+    for pk in sorted(changed):
+        print(f"    updated  {pk}: {_change_notes.get(pk, 're-selected')}")
+    if skipped:
+        print(f"    skipped: {', '.join(skipped)}")
 
     if dry_run:
         if changed:
@@ -849,8 +870,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         import recalibration
         flagged = recalibration.mark_predictions_refit(sport_key)
         if flagged:
-            print(f"  [refit] flagged {flagged} resolved prediction(s) as "
-                  f"refit-used (banner reset)")
+            print(f"  Marked {flagged:,} resolved prediction(s) as used by this "
+                  f"refit (resets the app's 'time to refit' banner).")
     except Exception:
         pass
 

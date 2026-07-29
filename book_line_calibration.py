@@ -264,6 +264,18 @@ def _stat_label_for(prop_key, gamelog):
     return None
 
 
+# Short current-season gamelog TTL for the calibration join. The default
+# cached_gamelog TTL is 30 days, so recent games (the last week+) are absent from
+# a "fresh" cache — which silently drops every book line for a game newer than the
+# cache. That's fatal for props whose ONLY data is the live prediction log /
+# warehouse (recent games), e.g. pitcher_outs / pitcher_earned_runs, which
+# otherwise join to zero obs. 6h guarantees a morning refit picks up the prior
+# night's finalized games (games finalize overnight; gamelog_store keeps stored
+# rows on a failed refetch, so a short TTL is safe). Past seasons are unaffected
+# (their bucket TTL stays immutably long).
+CALIB_GAMELOG_TTL_HOURS = 6
+
+
 def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
     For each book line, resolve the player's athlete_id, pull their gamelog,
@@ -284,7 +296,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         if not aid:
             skipped_no_player += len(rows)
             continue
-        gamelog = cached_gamelog(espn_sport, espn_league, aid)
+        gamelog = cached_gamelog(espn_sport, espn_league, aid,
+                                 ttl_hours=CALIB_GAMELOG_TTL_HOURS)
         if not gamelog:
             skipped_no_player += len(rows)
             continue
@@ -346,9 +359,9 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
                 "prior_games": prior_games,
             })
 
-    print(f"  joined {len(enriched)} (player, prop, game) observations; "
-          f"skipped {skipped_no_player} (no player resolved), "
-          f"{skipped_no_game} (no game/stat match).")
+    print(f"  Matched {len(enriched):,} book lines to actual results "
+          f"(one per player-prop-game); dropped {skipped_no_player:,} "
+          f"(player not found) and {skipped_no_game:,} (no matching game/stat).")
     return enriched
 
 
