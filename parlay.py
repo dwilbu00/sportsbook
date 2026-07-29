@@ -492,6 +492,68 @@ def _same_team_prop_count(legs):
     return max(team_prop_counts.values()) if team_prop_counts else 0
 
 
+# ── Same-game-parlay (SGP) diversification penalty ─────────────────────────
+# A soft nudge, applied in both scoring stages, so the generator prefers
+# diversified cross-game parlays over ones that stack multiple legs in the same
+# game. Rationale: books price leg correlation out of SGP payouts (so the naive
+# product overstates the real slip), and concentrating a parlay in one game
+# concentrates the risk. This is NOT a hard block — a sufficiently +value SGP
+# can still win when no comparable cross-game alternative exists (see the
+# in-loop value gate in `generate_parlays`). The penalty scales with the number
+# of same-game leg *pairs*, so it grows with how same-game the parlay is.
+SGP_PAIR_PENALTY = 4.0    # value / safe_value modes (percentage-point score scale)
+SGP_SAFE_PENALTY = 30.0   # safe mode (joint * 1000 probability score scale)
+
+
+def _same_game_pair_count(legs):
+    """Number of leg pairs that share a game_key (same-game / SGP overlap).
+
+    Cross-game parlay → 0; two legs in one game → 1; three legs in one game → 3;
+    two games with two legs each → 2. Concentration scales the count, so the
+    diversification penalty grows with how concentrated the parlay is.
+    """
+    counts = {}
+    for leg in legs:
+        gk = leg.get("game_key")
+        counts[gk] = counts.get(gk, 0) + 1
+    return sum(n * (n - 1) // 2 for n in counts.values() if n > 1)
+
+
+def _same_game_penalty(legs, mode):
+    """Soft additive score penalty (<= 0) demoting same-game parlays.
+
+    Returns 0.0 for a fully cross-game parlay. Scaled to each mode's score
+    units (`SGP_SAFE_PENALTY` for the joint*1000 "safe" score, `SGP_PAIR_PENALTY`
+    for the percentage-point "value"/"safe_value" scores).
+    """
+    pairs = _same_game_pair_count(legs)
+    if not pairs:
+        return 0.0
+    per_pair = SGP_SAFE_PENALTY if mode == "safe" else SGP_PAIR_PENALTY
+    return -per_pair * pairs
+
+
+def _parlay_expected_roi(legs, joint):
+    """Correlation-aware expected ROI fraction at the legs' real prices.
+
+    Uses the same SGP-neutralized pricing as the returned parlay's value gate: a
+    same-game parlay is priced against the INDEPENDENT joint (the book removes
+    leg correlation from SGP payouts), a cross-game parlay against the copula
+    `joint`. Mirrors the post-loop `expected_roi_pct` so the in-loop value gate
+    (which keeps the SGP penalty soft) and the surfaced figure agree.
+    """
+    combined_hist_indep = 1.0
+    decimal_product = 1.0
+    for leg in legs:
+        combined_hist_indep *= leg["hist_prob"]
+        price = leg.get("odds_price")
+        decimal_product *= american_to_decimal(price if price is not None else -110)
+    game_keys = [leg.get("game_key") for leg in legs]
+    has_sgp = len(game_keys) != len(set(game_keys))
+    payout_joint = _parlay_value_joint(joint, combined_hist_indep, has_sgp)
+    return payout_joint * decimal_product - 1.0
+
+
 def _score_parlay(legs, sport_key, mode="value"):
     """
     Score a parlay combination. Higher is better.
@@ -511,21 +573,24 @@ def _score_parlay(legs, sport_key, mode="value"):
     usage_penalty = 0
     if same_team_count > 2:
         usage_penalty = -5.0 * (same_team_count - 2)
-    
+
+    # Soft diversification penalty: prefer cross-game parlays (see SGP_*).
+    sgp_penalty = _same_game_penalty(legs, mode)
+
     # Combined probabilities
     combined_hist = 1.0
     combined_implied = 1.0
     for leg in legs:
         combined_hist *= leg["hist_prob"]
         combined_implied *= leg["implied_prob"]
-    
+
     if mode == "safe":
         # Prioritize highest combined probability of hitting
         # Scale hist_prob heavily so it dominates the score
         prob_score = combined_hist * 1000
         # Still consider edge but weighted much less
         total_edge = sum(leg["edge_pct"] for leg in legs) * 0.1
-        return prob_score + total_edge + correlation_score + usage_penalty
+        return prob_score + total_edge + correlation_score + usage_penalty + sgp_penalty
     elif mode == "safe_value":
         # "Value parlays" built from safe-mode candidates.
         # Every alt leg has an exact fetched price, so maximize estimated return
@@ -536,12 +601,12 @@ def _score_parlay(legs, sport_key, mode="value"):
             price = leg.get("odds_price")
             payout_product *= american_to_decimal(price) if price is not None else 1.91
         expected_roi = combined_hist * payout_product - 1.0
-        return (expected_roi * 100) + correlation_score + usage_penalty
+        return (expected_roi * 100) + correlation_score + usage_penalty + sgp_penalty
     else:
         # Prioritize edge value
         total_edge = sum(leg["edge_pct"] for leg in legs)
         parlay_edge = (combined_hist - combined_implied) * 100
-        return total_edge + correlation_score + usage_penalty + parlay_edge
+        return total_edge + correlation_score + usage_penalty + parlay_edge + sgp_penalty
 
 
 def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode="value"):
@@ -676,8 +741,11 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 return_shrink=True,
             )
 
+            # Soft diversification penalty: prefer cross-game parlays (see SGP_*).
+            sgp_penalty = _same_game_penalty(combo_list, effective_mode)
+
             if effective_mode == "safe":
-                score = joint * 1000 + combined_edge * 0.1
+                score = joint * 1000 + combined_edge * 0.1 + sgp_penalty
             elif effective_mode == "safe_value":
                 # Re-rank by correlation-adjusted expected return at the exact
                 # fetched price for every leg.
@@ -685,9 +753,18 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 for leg in combo_list:
                     price = leg.get("odds_price")
                     payout_product *= american_to_decimal(price) if price is not None else 1.91
-                score = (joint * payout_product - 1.0) * 100
+                score = (joint * payout_product - 1.0) * 100 + sgp_penalty
             else:
-                score = combined_edge + (joint - combined_implied) * 100
+                score = combined_edge + (joint - combined_implied) * 100 + sgp_penalty
+
+            # Keep the same-game penalty SOFT: it must not promote a non-value
+            # parlay into the slot and thereby drop a size that has a valid
+            # +value combo. For value modes, only +EV combos can win the slot
+            # (this also removes a latent bug where a top-scoring but -EV combo
+            # could shadow a lower-scoring +EV one and blank out the whole size).
+            if (effective_mode in ("value", "safe_value")
+                    and _parlay_expected_roi(combo_list, joint) <= 0):
+                continue
 
             if score > best_score:
                 best_score = score

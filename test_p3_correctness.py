@@ -269,5 +269,77 @@ class ParlayRuleAlignmentTests(unittest.TestCase):
             parlay._pair_correlation(er, k, "baseball_mlb"), -0.20)
 
 
+class SameGamePairCountTests(unittest.TestCase):
+    """`_same_game_pair_count` scales with how concentrated a parlay is in one
+    game; `_same_game_penalty` turns that into a mode-scaled soft score haircut."""
+
+    @staticmethod
+    def _legs(*keys):
+        return [{"game_key": k} for k in keys]
+
+    def test_all_cross_game_is_zero(self):
+        self.assertEqual(parlay._same_game_pair_count(self._legs("a", "b", "c")), 0)
+
+    def test_two_in_one_game_is_one_pair(self):
+        self.assertEqual(parlay._same_game_pair_count(self._legs("a", "a", "c")), 1)
+
+    def test_three_in_one_game_is_three_pairs(self):
+        self.assertEqual(parlay._same_game_pair_count(self._legs("a", "a", "a")), 3)
+
+    def test_two_games_two_each_is_two_pairs(self):
+        self.assertEqual(
+            parlay._same_game_pair_count(self._legs("a", "a", "b", "b")), 2)
+
+    def test_penalty_zero_for_cross_game(self):
+        self.assertEqual(parlay._same_game_penalty(self._legs("a", "b"), "value"), 0.0)
+
+    def test_penalty_scales_and_is_mode_aware(self):
+        one_pair = self._legs("a", "a", "c")
+        self.assertEqual(parlay._same_game_penalty(one_pair, "value"),
+                         -parlay.SGP_PAIR_PENALTY)
+        self.assertEqual(parlay._same_game_penalty(one_pair, "safe_value"),
+                         -parlay.SGP_PAIR_PENALTY)
+        self.assertEqual(parlay._same_game_penalty(one_pair, "safe"),
+                         -parlay.SGP_SAFE_PENALTY)
+
+
+class SameGamePenaltyBehaviorTests(unittest.TestCase):
+    """The generator prefers diversified cross-game parlays but never hard-blocks
+    a same-game parlay when it is the only valid option."""
+
+    def test_cross_game_preferred_over_same_game_tie(self):
+        # Pool: two batter_hits OVERs in one game (e1) + three cross-game MLs.
+        # Every leg has identical value, so the ONLY thing separating a
+        # same-game 3-combo from a cross-game one is the diversification
+        # penalty. The winning 3-leg parlay must be cross-game.
+        b1 = _prop_cand("B1", "batter_hits", "OVER", "e1", "Home",
+                        batting_order=1, over_rate=70.0)
+        b2 = _prop_cand("B2", "batter_hits", "OVER", "e1", "Home",
+                        batting_order=2, over_rate=70.0)
+        m2 = _ml_cand("T2", "o2", "e2")
+        m3 = _ml_cand("T3", "o3", "e3")
+        m4 = _ml_cand("T4", "o4", "e4")
+        results = parlay.generate_parlays(
+            [m2, m3, m4], [], [], [b1, b2], "baseball_mlb", mode="value")
+        self.assertIn(3, results)
+        self.assertFalse(results[3]["has_sgp"],
+                         "expected the cross-game parlay to win the 3-leg slot")
+
+    def test_same_game_parlay_still_allowed_when_only_option(self):
+        # Only three legs, all in one game: the penalty applies but there is no
+        # cross-game alternative, so the +value SGP is still returned (soft, not
+        # a hard block).
+        b1 = _prop_cand("B1", "batter_hits", "OVER", "e1", "Home",
+                        batting_order=1, over_rate=70.0)
+        b2 = _prop_cand("B2", "batter_hits", "OVER", "e1", "Home",
+                        batting_order=2, over_rate=70.0)
+        b3 = _prop_cand("B3", "batter_hits", "OVER", "e1", "Home",
+                        batting_order=3, over_rate=70.0)
+        results = parlay.generate_parlays(
+            [], [], [], [b1, b2, b3], "baseball_mlb", mode="value")
+        self.assertIn(3, results)
+        self.assertTrue(results[3]["has_sgp"])
+
+
 if __name__ == "__main__":
     unittest.main()
