@@ -18,7 +18,7 @@ Usage:
 import argparse
 import math
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from backtest import (
     SPORT_MAP, DEFAULT_STARTERS, DEFAULT_PROPS, VARIANT_PRESETS,
@@ -169,7 +169,7 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
 def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
     """Resolve a broad, data-driven MLB calibration pool from cached seasons."""
     if not season:
-        season = datetime.utcnow().year
+        season = datetime.now(timezone.utc).year
     try:
         import mlb_starters
         from backtest_props import frequent_batter_ids, starter_ids
@@ -215,7 +215,7 @@ def _nba_player_pool(season, max_players=150, min_games=15):
     the 18-star fallback).
     """
     if not season:
-        season = datetime.utcnow().year
+        season = datetime.now(timezone.utc).year
     try:
         athletes = list_season_athletes("basketball", "nba", season)
     except Exception as exc:
@@ -532,7 +532,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 nba_max_players=150, nba_min_games=15):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     if sport in ("mlb", "nba") and season is None:
-        season = datetime.utcnow().year
+        season = datetime.now(timezone.utc).year
     if players is None and sport == "mlb":
         players = _mlb_player_pool(
             season, max_batters=mlb_max_batters,

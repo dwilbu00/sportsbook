@@ -282,7 +282,7 @@ def _season_start_iso(now=None, sport_key=None):
     First day of the current season for `sport_key`. NBA/NHL: Oct 1 of the
     last year the season started. MLB: Mar 1. NFL: Sep 1. Default: Jan 1.
     """
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc)
     start_month = SPORT_SEASON_START_MONTH.get(sport_key)
     if not start_month:
         return f"{now.year}-01-01"
