@@ -123,6 +123,10 @@ prediction_log = Table(
     # Lets the app count new resolved-but-not-yet-refit records (the "time to
     # refit" banner) now that SQL rows are stable (surgical writes, not rewrites).
     Column("refit_performed", Boolean, nullable=False, default=False),
+    # Rule inputs the pick-rules ROI lens re-derives the recommended slate from.
+    # Nullable (pre-feature rows are NULL → team-based rules reported skipped).
+    Column("team", String(160)),
+    Column("batting_order", Integer),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player", "line",
                      name="uq_prediction_identity"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
@@ -304,7 +308,8 @@ _PREDICTION_SPEC = [
     ("book", _s), ("resolved_at", _s),
     ("line", _f), ("raw_prob", _f), ("final_prob", _f), ("projected", _f),
     ("actual", _f),
-    ("price", _i), ("outcome", _i),
+    ("price", _i), ("outcome", _i), ("batting_order", _i),
+    ("team", _s),
     ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
 

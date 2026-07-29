@@ -721,6 +721,25 @@ def _cached_market_prediction_summary():
     return market_prediction_performance_summary()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_pickrules_summaries():
+    """Per-sport pick-rules ROI lens: the recommended SLATE (bet_selector rules
+    re-derived over each day's logged value picks) vs the raw is_value POOL,
+    graded on real outcomes (flat 1u/pick). Reads both forward logs once and
+    computes every sport with resolved value picks. Short TTL so newly-graded
+    outcomes surface without a read on every rerun."""
+    import pickrules_roi
+    import recalibration
+    preds = recalibration.read_prediction_log()
+    markets = recalibration.read_market_prediction_log()
+    out = {}
+    for sport_key in recalibration.SPORT_ESPN_MAP:
+        result = pickrules_roi.slate_vs_pool(preds, markets, sport_key)
+        if result["combined"]["pool"]["total"]:
+            out[sport_key] = result
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def load_config():
     # Cached: config.json + secrets + env are stable within a session, so this
@@ -1029,6 +1048,7 @@ def render_model_guide():
                     state="complete")
             _cached_prediction_summary.clear()
             _cached_market_prediction_summary.clear()
+            _cached_pickrules_summaries.clear()
             st.rerun()
 
         if forward["total"]:
@@ -1151,6 +1171,56 @@ def render_model_guide():
                 "No team-market predictions have been logged yet. They appear "
                 "here after moneyline/spread/total analyses are run and past "
                 "games are resolved."
+            )
+
+        st.subheader("Pick-rules ROI (recommended slate vs value pool)")
+        pickrules = _cached_pickrules_summaries()
+        if pickrules:
+            pr_rows = []
+            for _sk, _res in pickrules.items():
+                for _label, _summ in (("Value pool", _res["combined"]["pool"]),
+                                      ("Rule slate", _res["combined"]["slate"])):
+                    _hr, _roi = _summ.get("hit_rate"), _summ.get("roi")
+                    pr_rows.append({
+                        "Sport": sport_names.get(_sk, _sk),
+                        "Set": _label,
+                        "Picks": _summ["total"],
+                        "Resolved": _summ["resolved"],
+                        "Priced": _summ["priced_resolved"],
+                        "Hit rate": f"{_hr * 100:.1f}%" if _hr is not None else "—",
+                        "ROI": f"{_roi * 100:+.1f}%" if _roi is not None else "—",
+                    })
+            st.dataframe(pr_rows, hide_index=True, width="stretch")
+            for _sk, _res in pickrules.items():
+                _d = _res["delta"]["roi"]
+                _sroi = _res["combined"]["slate"].get("roi")
+                _proi = _res["combined"]["pool"].get("roi")
+                if _d is not None:
+                    st.caption(
+                        f"**{sport_names.get(_sk, _sk)}**: rule slate ROI "
+                        f"{_sroi * 100:+.1f}% vs pool {_proi * 100:+.1f}% "
+                        f"(Δ {_d * 100:+.1f}pp); the pick rules dropped "
+                        f"{_res['n_dropped']} pick(s).")
+            if any(_res["rules_skipped"] for _res in pickrules.values()):
+                st.caption(
+                    "⚠️ Team-based rules (Rule-of-3, opposing-team, batting-order) "
+                    "aren't fully replayable on rows logged before team/batting-"
+                    "order capture; they replay in full as new predictions accrue."
+                )
+            st.caption(
+                "Grades the RECOMMENDED SLATE — the pick rules (is_value, "
+                "under-0.5 suppression, Rule-of-3, batting-order, L1/L2/L3, ER/K) "
+                "re-derived over each ET game-date's logged value picks — against "
+                "the raw is_value POOL, on real outcomes at the logged price "
+                "(flat 1 unit/pick). The delta is what the pick rules bought. "
+                "Distinct from the backtest's edge-vs-close ROI and the actual-bet "
+                "ledger; neither set grades both sides of a line."
+            )
+        else:
+            st.info(
+                "No resolved value picks yet to grade the pick rules against. "
+                "This fills in as player-prop / team-market analyses are run and "
+                "past games are resolved."
             )
 
         st.subheader("Team-market validation status")

@@ -82,6 +82,28 @@ class DbStoreOpsTests(_SqliteBackend, unittest.TestCase):
         self.assertIsNone(pending["outcome"])
         self.assertIs(pending["resolved"], False)
 
+    def test_prediction_team_and_batting_order_roundtrip(self):
+        # Rule inputs the pick-rules ROI lens re-derives the slate from. Nullable:
+        # a row logged without them (pre-feature) round-trips as None.
+        def add(rows):
+            rows.append({"sport_key": "baseball_mlb", "event_id": "e1",
+                         "prop_key": "batter_hits", "player": "With Team",
+                         "game_date": "2026-07-20", "line": 0.5, "raw_prob": 0.6,
+                         "direction": "OVER", "team": "Yankees",
+                         "batting_order": 3, "is_value": True, "resolved": False})
+            rows.append({"sport_key": "baseball_mlb", "event_id": "e1",
+                         "prop_key": "batter_hits", "player": "No Team",
+                         "game_date": "2026-07-20", "line": 1.5, "raw_prob": 0.6,
+                         "direction": "OVER", "is_value": True, "resolved": False})
+            return 2
+        db_store.mutate("prediction_log", add)
+        by_player = {r["player"]: r for r in db_store.read_rows("prediction_log")}
+        self.assertEqual(by_player["With Team"]["team"], "Yankees")
+        self.assertEqual(by_player["With Team"]["batting_order"], 3)
+        self.assertIsInstance(by_player["With Team"]["batting_order"], int)
+        self.assertIsNone(by_player["No Team"]["team"])
+        self.assertIsNone(by_player["No Team"]["batting_order"])
+
     def test_status_check_constraint_rolls_back(self):
         def bad(rows):
             rows.append({"wager_id": "x", "status": "bogus", "stake": 1.0})

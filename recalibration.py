@@ -529,8 +529,14 @@ def _write_json_blob(filename, obj, version=None):
 def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
                    projected=None, direction=None, price=None, book=None,
                    final_prob=None, event_id=None, commence_time=None,
-                   is_value=None, write=True):
-    """Build and optionally append one prediction row. Best-effort, never raises."""
+                   is_value=None, team=None, batting_order=None, write=True):
+    """Build and optionally append one prediction row. Best-effort, never raises.
+
+    ``team`` and ``batting_order`` are the rule inputs the pick-rules ROI lens
+    (pickrules_roi.py) re-derives the recommended slate from — they are not used
+    by calibration. Both are optional; older rows logged without them leave the
+    lens's team-based rules (Rule-of-3, opposing-team L3) reported as skipped.
+    """
     if not sport_key or not prop_key or not player or game_date is None:
         return
     try:
@@ -541,6 +547,12 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         price = int(price) if price is not None else None
     except (TypeError, ValueError):
         return
+    # Auxiliary lens input: a malformed batting_order must not drop the whole
+    # forecast (which calibration needs) — coerce to int-or-None best-effort.
+    try:
+        batting_order = int(batting_order) if batting_order is not None else None
+    except (TypeError, ValueError):
+        batting_order = None
     if not (0.0 <= raw_prob <= 1.0):
         return
     if final_prob is not None and not (0.0 <= final_prob <= 1.0):
@@ -561,6 +573,8 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "direction": direction,
         "price": price,
         "book": book,
+        "team": team or None,
+        "batting_order": batting_order,
         "is_value": bool(is_value) if is_value is not None else None,
         "resolved": False,
         "actual": None,

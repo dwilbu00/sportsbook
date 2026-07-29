@@ -36,6 +36,12 @@ CREATE TABLE dbo.prediction_log (
     -- 0 when logged; set 1 after an offline calibration refit consumes the row
     -- (powers the app's "enough new data to refit" banner).
     refit_performed BIT NOT NULL CONSTRAINT df_prediction_refit DEFAULT (0),
+    -- Rule inputs the pick-rules ROI lens (pickrules_roi.py) needs to RE-DERIVE
+    -- the recommended slate from logged forecasts. Nullable: pre-feature rows
+    -- have NULL and their team-based rules (Rule-of-3, opposing-team L3) are
+    -- reported as skipped rather than replayed.
+    team          NVARCHAR(160),
+    batting_order INT,
     CONSTRAINT uq_prediction_identity
         UNIQUE (sport_key, event_key, prop_key, player, line)
 );
@@ -46,6 +52,12 @@ IF COL_LENGTH('dbo.prediction_log', 'refit_performed') IS NULL
     ALTER TABLE dbo.prediction_log
         ADD refit_performed BIT NOT NULL
             CONSTRAINT df_prediction_refit DEFAULT (0);
+GO
+IF COL_LENGTH('dbo.prediction_log', 'team') IS NULL
+    ALTER TABLE dbo.prediction_log ADD team NVARCHAR(160);
+GO
+IF COL_LENGTH('dbo.prediction_log', 'batting_order') IS NULL
+    ALTER TABLE dbo.prediction_log ADD batting_order INT;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_prediction_sport_resolved'

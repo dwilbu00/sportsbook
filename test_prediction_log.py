@@ -43,6 +43,40 @@ class _InMemoryLog:
         return mutator(self.rows)
 
 
+class LogPredictionFieldTests(unittest.TestCase):
+    """log_prediction persists the pick-rules ROI lens inputs (team,
+    batting_order) without changing the forecast identity."""
+
+    def _build(self, **extra):
+        return recalibration.log_prediction(
+            sport_key="baseball_mlb", prop_key="batter_hits", player="Slugger",
+            game_date="2026-07-20", line=0.5, raw_prob=0.6, direction="OVER",
+            price=-110, event_id="e1", write=False, **extra)
+
+    def test_team_and_batting_order_persisted(self):
+        row = self._build(team="Yankees", batting_order=3)
+        self.assertEqual(row["team"], "Yankees")
+        self.assertEqual(row["batting_order"], 3)
+
+    def test_missing_fields_default_to_none(self):
+        row = self._build()
+        self.assertIsNone(row["team"])
+        self.assertIsNone(row["batting_order"])
+
+    def test_non_numeric_batting_order_nulls_field_not_row(self):
+        # A malformed batting_order must NOT drop the forecast (calibration needs
+        # it); the auxiliary field just nulls out.
+        row = self._build(batting_order="not-a-number")
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["batting_order"])
+
+    def test_identity_unaffected_by_new_fields(self):
+        row = self._build(team="Yankees", batting_order=3)
+        self.assertEqual(
+            recalibration.prediction_identity(row),
+            ("baseball_mlb", "e1", "batter_hits", "Slugger", 0.5))
+
+
 class UpsertDeduplicationTests(unittest.TestCase):
     def test_relogging_supersedes_stale_unresolved_duplicate(self):
         rows = []

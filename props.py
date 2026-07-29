@@ -1452,6 +1452,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     price=dk_price,
                     book=dk_book,
                     is_value=is_value,
+                    team=player_team_name,
+                    batting_order=history.get("batting_order"),
                     write=False,
                 )
                 if prediction_row:
