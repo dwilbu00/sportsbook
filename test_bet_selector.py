@@ -235,5 +235,30 @@ class DoubleheaderTests(unittest.TestCase):
             bet_selector.select_top_bets(pool, MLB, 5, "ev"), ["a", "b"])
 
 
+class EarnedRunsStrikeoutsConflictTests(unittest.TestCase):
+    """ER-over + K-over on the same pitcher are self-cancelling (negatively
+    correlated); the shared _pair_correlation entry must block co-selection."""
+
+    def test_same_pitcher_er_over_and_k_over_not_both_selected(self):
+        pool = [
+            _prop("er", "e1", "H", "pitcher_earned_runs", "OVER", 12.0,
+                  player="P"),
+            _prop("k", "e1", "H", "pitcher_strikeouts", "OVER", 11.0,
+                  player="P"),
+        ]
+        picks = bet_selector.select_top_bets(pool, MLB, 5, "ev")
+        self.assertEqual(picks, ["er"])   # higher EV kept; K dropped as conflict
+
+    def test_different_pitchers_er_and_k_both_allowed(self):
+        pool = [
+            _prop("er", "e1", "H", "pitcher_earned_runs", "OVER", 12.0,
+                  player="P"),
+            _prop("k", "e1", "A", "pitcher_strikeouts", "OVER", 11.0,
+                  player="Q"),
+        ]
+        self.assertEqual(
+            sorted(bet_selector.select_top_bets(pool, MLB, 5, "ev")), ["er", "k"])
+
+
 if __name__ == "__main__":
     unittest.main()

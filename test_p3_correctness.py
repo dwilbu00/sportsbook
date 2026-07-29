@@ -154,5 +154,120 @@ class MissingPriceParlayTests(unittest.TestCase):
         self.assertNotIn(3, results)
 
 
+def _ml_cand(team, opp, event_id, home_away="HOME", price=-110, edge=8.0):
+    return {
+        "is_value": True, "edge_pct": edge, "home_away": home_away,
+        "team": team, "opponent": opp, "event_id": event_id,
+        "best_edge_pct": edge, "best_price": price,
+        "blended_prob": 70.0, "hist_prob": 70.0,
+        "best_book_implied_prob": 50.0, "book_implied_prob": 50.0,
+    }
+
+
+def _prop_cand(player, prop, direction, event_id, team, matchup="Away @ Home",
+               price=-110, edge=8.0, over_rate=65.0, batting_order=1, line=0.5):
+    return {
+        "is_value": True, "no_history": False, "edge_pct": edge,
+        "games_sampled": 20, "direction": direction, "prop": prop,
+        "player": player, "matchup": matchup, "team": team,
+        "event_id": event_id, "prop_label": prop, "line": line,
+        "over_rate": over_rate, "over_implied": 50.0, "under_implied": 50.0,
+        "best_price": price, "over_price": price, "under_price": price,
+        "batting_order": batting_order,
+    }
+
+
+def _total_cand(event_id, matchup, side="OVER", price=-110, over_hit=60.0):
+    return {
+        "matchup": matchup, "event_id": event_id, "line": 8.5,
+        "is_over_value": side == "OVER", "is_under_value": side == "UNDER",
+        "over_hit_rate": over_hit, "over_edge_pct": 8.0, "under_edge_pct": 8.0,
+        "over_price": price, "under_price": price,
+        "over_implied": 50.0, "under_implied": 50.0,
+    }
+
+
+class ParlayRuleAlignmentTests(unittest.TestCase):
+    """The parlay generator must obey the SAME cross-bet rules as the single-bet
+    auto-pick (bet_selector): L2 anti-correlation, L3 MLB contradictions, the
+    Rule-of-3 team cap, the batting-order gate, event_id doubleheader identity,
+    and the ER-over/K-over contradiction. Each test builds a 3-leg pool whose
+    only combo either is or isn't rule-legal (mirrors MissingPriceParlayTests)."""
+
+    def _gen(self, ml=None, spreads=None, totals=None, props=None):
+        return parlay.generate_parlays(ml or [], spreads or [], totals or [],
+                                       props or [], "baseball_mlb", mode="value")
+
+    def test_anti_correlation_pair_blocked(self):
+        # pitcher K OVER + game total OVER (same game) = -0.30 → blocked.
+        k = _prop_cand("P", "pitcher_strikeouts", "OVER", "e1", "Home")
+        tot = _total_cand("e1", "Away @ Home", side="OVER")
+        ml = _ml_cand("C", "c", "e2")
+        self.assertNotIn(3, self._gen(ml=[ml], totals=[tot], props=[k]))
+        # Control: K OVER + total UNDER = +0.35 → allowed.
+        tot_u = _total_cand("e1", "Away @ Home", side="UNDER")
+        self.assertIn(3, self._gen(ml=[ml], totals=[tot_u], props=[k]))
+
+    def test_l3_total_over_plus_prop_under_blocked(self):
+        tot = _total_cand("e1", "Away @ Home", side="OVER")
+        under = _prop_cand("B", "batter_hits", "UNDER", "e1", "Home", line=1.5)
+        ml = _ml_cand("C", "c", "e2")
+        self.assertNotIn(3, self._gen(ml=[ml], totals=[tot], props=[under]))
+
+    def test_l3_pitcher_under_plus_opposing_hitter_under_blocked(self):
+        pu = _prop_cand("P", "pitcher_strikeouts", "UNDER", "e1", "HomeTeam")
+        hu = _prop_cand("B", "batter_hits", "UNDER", "e1", "AwayTeam", line=1.5)
+        ml = _ml_cand("C", "c", "e2")
+        self.assertNotIn(3, self._gen(ml=[ml], props=[pu, hu]))
+
+    def test_er_over_plus_k_over_same_pitcher_blocked(self):
+        er = _prop_cand("P", "pitcher_earned_runs", "OVER", "e1", "Home")
+        k = _prop_cand("P", "pitcher_strikeouts", "OVER", "e1", "Home")
+        ml = _ml_cand("C", "c", "e2")
+        self.assertNotIn(3, self._gen(ml=[ml], props=[er, k]))
+        # Control: different pitchers (both starters) → allowed.
+        k_other = _prop_cand("Q", "pitcher_strikeouts", "OVER", "e1", "Away")
+        self.assertIn(3, self._gen(ml=[ml], props=[er, k_other]))
+
+    def test_rule_of_three_caps_batter_hits_overs(self):
+        # 4 batter_hits OVER on one team → no 4-leg parlay; a 3-leg is fine.
+        hits = [_prop_cand(f"B{i}", "batter_hits", "OVER", f"e{i}", "Yankees")
+                for i in range(4)]
+        results = parlay.generate_parlays([], [], [], hits, "baseball_mlb",
+                                          mode="value")
+        self.assertIn(3, results)
+        self.assertNotIn(4, results)
+
+    def test_batting_order_gate_drops_off_slot_hits_over(self):
+        # A confirmed slot-7 batter_hits OVER is dropped → only 2 legs → nothing.
+        off = _prop_cand("Deep", "batter_hits", "OVER", "e1", "T", batting_order=7)
+        a = _ml_cand("A", "a", "e2")
+        b = _ml_cand("B", "b", "e3")
+        self.assertFalse(self._gen(ml=[a, b], props=[off]))
+        # Control: slot 3 stays → 3 legs → a parlay is produced.
+        ok = _prop_cand("Top", "batter_hits", "OVER", "e1", "T", batting_order=3)
+        self.assertIn(3, self._gen(ml=[a, b], props=[ok]))
+
+    def test_doubleheader_not_collapsed_by_event_id(self):
+        # Same matchup string, two events (doubleheader): ML on each side must
+        # NOT be treated as a same-game opposite-ML conflict.
+        # Both legs normalize to the SAME matchup string "Red Sox @ Yankees"
+        # (HOME → "opp @ team"; AWAY → "team @ opp"); only event_id separates
+        # them. With team-name game keys this pair would be a false opposite-ML
+        # conflict and no 3-leg parlay could form.
+        g1 = _ml_cand("Yankees", "Red Sox", "g1", home_away="HOME")
+        g2 = _ml_cand("Red Sox", "Yankees", "g2", home_away="AWAY")
+        c = _ml_cand("Cubs", "Sox", "e3")
+        self.assertIn(3, self._gen(ml=[g1, g2, c]))
+
+    def test_pair_correlation_er_k_is_blocking(self):
+        er = {"game_key": "e1", "bet_type": "player_prop_over", "team": "H",
+              "player": "P", "prop_key": "pitcher_earned_runs"}
+        k = {"game_key": "e1", "bet_type": "player_prop_over", "team": "H",
+             "player": "P", "prop_key": "pitcher_strikeouts"}
+        self.assertLessEqual(
+            parlay._pair_correlation(er, k, "baseball_mlb"), -0.20)
+
+
 if __name__ == "__main__":
     unittest.main()

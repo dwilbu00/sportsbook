@@ -137,13 +137,28 @@ def _gaussian_copula_joint_prob(probs, corr_matrix, n_samples=5000, seed=42,
     return _ret(hits / n_samples, applied_shrink)
 
 
-def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
+def _rec_view(cand, raw_bt, side, game_key):
+    """A bet_selector rec ``{bet_type, side, cand, leg}`` for a parlay leg, so the
+    parlay can apply the SAME single-bet selection rules (bet_selector's
+    _passes_standalone / _pair_conflict / _team_hits_over_cap_hit). ``game_key``
+    (event_id-based) is forced onto the leg view for doubleheader-safe same-game
+    scoping. Lazy import: cycle-safe (bet_selector imports parlay at load)."""
+    import bet_selector
+    leg = bet_selector._leg(raw_bt, side, cand)
+    leg["game_key"] = game_key
+    return {"bet_type": raw_bt, "side": side, "cand": cand, "leg": leg}
+
+
+def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
     """
     Convert all analysis results into a uniform leg format for parlay building.
-    Only include legs that passed their analyzer's value recommendation filter.
-    
+    Only include legs that passed their analyzer's value recommendation filter,
+    then apply the per-leg single-bet rule (batting-order gate). Each leg also
+    carries a "_rec" bet_selector view (for the pairwise conflict + Rule-of-3
+    filters in generate_parlays) and an event_id-based "game_key".
+
     Each leg dict has:
-        game_key: str (e.g., "Team A @ Team B" or matchup)
+        game_key: str (event_id when present, else the matchup string)
         team: str or None
         bet_type: str (moneyline, spread, total_over, total_under, player_prop_over, player_prop_under)
         label: str (human readable description)
@@ -153,13 +168,16 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
         odds_price: int or None (American odds)
         hist_prob: float (0-1, historical probability)
         implied_prob: float (0-1, book implied probability)
+        _rec: dict (bet_selector rec view for rule checks)
     """
+    import bet_selector  # lazy: cycle-safe (bet_selector imports parlay at load)
     legs = []
     
     for c in all_ml:
         if not c.get("is_value") or c["edge_pct"] <= 0:
             continue
-        game_key = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
+        matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
+        game_key = c.get("event_id") or matchup
         legs.append({
             "game_key": game_key,
             "team": c["team"],
@@ -171,6 +189,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "odds_price": c.get("best_price"),
             "hist_prob": c.get("blended_prob", c["hist_prob"]) / 100.0,
             "implied_prob": c.get("best_book_implied_prob", c["book_implied_prob"]) / 100.0,
+            "_rec": _rec_view(c, "moneyline", None, game_key),
         })
     
     for c in all_spreads:
@@ -178,7 +197,8 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
         if (not c.get("is_value") or c["edge_pct"] <= 0
                 or c.get("games_sampled", 0) < 5):
             continue
-        game_key = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
+        matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
+        game_key = c.get("event_id") or matchup
         legs.append({
             "game_key": game_key,
             "team": c["team"],
@@ -190,12 +210,14 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "odds_price": c.get("price"),
             "hist_prob": c["cover_rate"] / 100.0,
             "implied_prob": c.get("implied_prob", 50.0) / 100.0,
+            "_rec": _rec_view(c, "spread", None, game_key),
         })
     
     for c in all_totals:
+        game_key = c.get("event_id") or c["matchup"]
         if c.get("is_over_value"):
             legs.append({
-                "game_key": c["matchup"],
+                "game_key": game_key,
                 "team": None,
                 "bet_type": "total_over",
                 "label": f"OVER {c['line']} ({c['matchup']})",
@@ -205,10 +227,11 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "odds_price": c.get("over_price"),
                 "hist_prob": c["over_hit_rate"] / 100.0,
                 "implied_prob": c.get("over_implied", 50.0) / 100.0,
+                "_rec": _rec_view(c, "total", "OVER", game_key),
             })
         if c.get("is_under_value"):
             legs.append({
-                "game_key": c["matchup"],
+                "game_key": game_key,
                 "team": None,
                 "bet_type": "total_under",
                 "label": f"UNDER {c['line']} ({c['matchup']})",
@@ -218,6 +241,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
                 "odds_price": c.get("under_price"),
                 "hist_prob": (100.0 - c["over_hit_rate"]) / 100.0,
                 "implied_prob": c.get("under_implied", 50.0) / 100.0,
+                "_rec": _rec_view(c, "total", "UNDER", game_key),
             })
     
     for c in all_props:
@@ -246,8 +270,14 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             hp = (1.0 - c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
             ip = (c["under_implied"] / 100.0) if c.get("under_implied") is not None else 0.5
 
+        game_key = c.get("event_id") or c["matchup"]
+        rec = _rec_view(c, "player_prop", direction, game_key)
+        # Per-leg single-bet rule: drop a batter_hits OVER when the confirmed
+        # batting-order slot > 4 (unconfirmed/None fails open).
+        if not bet_selector._passes_standalone(sport_key, rec):
+            continue
         leg = {
-            "game_key": c["matchup"],
+            "game_key": game_key,
             "team": c.get("team"),
             "bet_type": bt,
             "label": label,
@@ -257,6 +287,7 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props):
             "odds_price": price,
             "hist_prob": hp,
             "implied_prob": ip,
+            "_rec": rec,
         }
         if c.get("safe_mode"):
             # Extra fields used by the "value parlays in safe mode" ranker / UI.
@@ -380,6 +411,16 @@ def _pair_correlation(leg_a, leg_b, sport_key):
             return -0.10
 
     elif sport_key == "baseball_mlb":
+        # Same pitcher: earned-runs OVER vs strikeouts OVER pull against each
+        # other (a dominant start = high K / low ER; a blowup = low K / high ER),
+        # so co-selecting both is self-cancelling. <= -0.20 → the shared L2 block
+        # suppresses the pair in BOTH the auto-pick slate and the parlay.
+        if ("player_prop_over" in ta and "player_prop_over" in tb
+                and leg_a.get("player")
+                and leg_a.get("player") == leg_b.get("player")
+                and {leg_a.get("prop_key"), leg_b.get("prop_key")}
+                == {"pitcher_earned_runs", "pitcher_strikeouts"}):
+            return -0.35
         if ("player_prop_over" in ta and leg_a.get("prop_key") == "pitcher_strikeouts"
                 and tb == "total_under"):
             return 0.35
@@ -519,9 +560,10 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
         dict: {3: parlay_dict, 4: parlay_dict, 5: parlay_dict}
     """
     from itertools import combinations
-    
-    legs = _normalize_legs(all_ml, all_spreads, all_totals, all_props)
-    
+    import bet_selector  # lazy: cycle-safe (bet_selector imports parlay at load)
+
+    legs = _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key)
+
     if len(legs) < 3:
         return {}
 
@@ -567,15 +609,29 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
         for combo in combinations(candidates, size):
             combo_list = list(combo)
 
+            # Rule-legal? Apply the SAME cross-bet rules as the single-bet
+            # auto-pick (bet_selector): L1 hard conflicts + L2 anti-correlation
+            # (<= -0.20) + L3 MLB contradictions, then the Rule-of-3 team cap on
+            # batter_hits OVERs. Legs carry a bet_selector "_rec" view for these.
+            recs = [leg["_rec"] for leg in combo_list]
             has_conflict = False
-            for i in range(len(combo_list)):
-                for j in range(i + 1, len(combo_list)):
-                    if _has_hard_conflict(combo_list[i], combo_list[j]):
+            for i in range(len(recs)):
+                for j in range(i + 1, len(recs)):
+                    if bet_selector._pair_conflict(sport_key, recs[i], recs[j]):
                         has_conflict = True
                         break
                 if has_conflict:
                     break
             if has_conflict:
+                continue
+            # Rule of 3: never more than 3 batter_hits OVER from one team.
+            cap_hit, kept = False, []
+            for rec in recs:
+                if bet_selector._team_hits_over_cap_hit(sport_key, rec, kept):
+                    cap_hit = True
+                    break
+                kept.append(rec)
+            if cap_hit:
                 continue
 
             # Value / safe_value parlays are gated on EV computed from the real
