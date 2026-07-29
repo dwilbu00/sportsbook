@@ -334,7 +334,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
             skipped_no_player += len(rows)
             continue
         gamelog = cached_gamelog(espn_sport, espn_league, aid,
-                                 ttl_hours=CALIB_GAMELOG_TTL_HOURS)
+                                 ttl_hours=CALIB_GAMELOG_TTL_HOURS,
+                                 player_name=player)
         if not gamelog:
             skipped_no_player += len(rows)
             continue
@@ -348,6 +349,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         date_idx = {}
         date_counts = {}
         for i, g in enumerate(gamelog):
+            if g.get("completed") is False:
+                continue             # in-progress/partial game: not a gradeable box score
             d = (g.get("game_date") or "")[:10]
             if not d:
                 continue

@@ -192,17 +192,23 @@ def _sport_has_table(sport):
     return sport in ("baseball", "basketball")
 
 
-def _fetch_espn(sport, league, athlete_id, season_year):
-    """Fetch the raw gamelog exactly as espn_cache does (incl. the dormant MLB
-    pitcher-splits fallback). Returns (rows, via_pitcher_fallback)."""
+def _fetch_espn(sport, league, athlete_id, season_year, player_name=None):
+    """Fetch the raw gamelog exactly as espn_cache does. Returns
+    (rows, via_pitcher_fallback).
+
+    For MLB, an empty standard gamelog (pitchers have none) falls back to the
+    per-game log: TRUE StatsAPI data when ``player_name`` is known, else the
+    synthesized ESPN season-splits. ``player_name=None`` -> synth only, matching
+    the historical behavior byte-for-byte."""
     from espn_client import get_athlete_gamelog
     gamelog = get_athlete_gamelog(sport, league, athlete_id,
                                   season_year=season_year)
     via_pitcher = False
     if not gamelog and sport == "baseball":
         try:
-            from espn_client import get_pitcher_stats
-            gamelog = get_pitcher_stats(league, athlete_id, season=season_year)
+            import mlb_starters
+            gamelog = mlb_starters._pitcher_gamelog_or_synth(
+                league, athlete_id, player_name, season_year)
         except Exception:
             gamelog = []
         via_pitcher = True
@@ -314,10 +320,21 @@ def _completed_count(rows):
 
 
 def _should_replace(stored_rows, new_rows):
-    """True unless a same-season fetch returned FEWER completed games than are
-    stored (a transient partial that must not clobber the durable log). A
-    different season is a legitimate rollover -> always replace."""
-    if _rows_season(new_rows) != _rows_season(stored_rows):
+    """True unless the fetch would DEGRADE the durable log:
+      * a dateless refetch must never clobber a stored DATED log — dated rows
+        are strictly richer (real-line calibration + as-of slicing need
+        game_date), and a dateless set is the synth fallback that fires when the
+        real StatsAPI log is momentarily unavailable; or
+      * a same-season fetch returned FEWER completed games than are stored (a
+        transient partial).
+    A different (dated) season is a legitimate rollover -> always replace. Note a
+    dateless->dated fetch (the synth->real migration) still replaces, since the
+    stored side is then dateless and this guard only protects a dated store."""
+    new_season = _rows_season(new_rows)
+    stored_season = _rows_season(stored_rows)
+    if new_season is None and stored_season is not None:
+        return False                          # dateless synth must not clobber dated real
+    if new_season != stored_season:
         return True
     return _completed_count(new_rows) >= _completed_count(stored_rows)
 
@@ -373,15 +390,18 @@ def _resolve_ttl(ttl_hours, bucket):
 # ──────────────────────────────────────────────────────────────────────────────
 # Public ops
 # ──────────────────────────────────────────────────────────────────────────────
-def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None):
+def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None,
+                player_name=None):
     """Durable, TTL-gated replacement for espn_cache.cached_gamelog.
 
     Returns the full gamelog (most-recent-first, same shape as
     get_athlete_gamelog); the caller applies any [:n] slice. Sports without a
     fact table (NFL/other) pass through to the direct ESPN fetch with no
-    persistence."""
+    persistence. ``player_name`` (optional) enables the TRUE StatsAPI per-game
+    pitcher log fallback for MLB; omitted -> synthesized splits as before."""
     if not _sport_has_table(sport):
-        rows, _ = _fetch_espn(sport, league, athlete_id, season_year)
+        rows, _ = _fetch_espn(sport, league, athlete_id, season_year,
+                              player_name=player_name)
         return rows
 
     bucket = int(season_year) if season_year else 0
@@ -401,7 +421,8 @@ def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None):
             if _meta_fresh(meta, ttl_hours):
                 return _read_rows(conn, meta["player_type"], athlete_id, bucket)
 
-        rows, via_pitcher = _fetch_espn(sport, league, athlete_id, season_year)
+        rows, via_pitcher = _fetch_espn(sport, league, athlete_id, season_year,
+                                        player_name=player_name)
         player_type = _classify(sport, rows, via_pitcher)
 
         for attempt in range(3):

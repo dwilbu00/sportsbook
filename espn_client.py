@@ -1015,7 +1015,8 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
             return result
         result["athlete_id"] = athlete["id"]
         result["team_id"] = athlete.get("team_id")
-        gamelog = gamelog_store.get_gamelog(sport, league, athlete["id"])
+        gamelog = gamelog_store.get_gamelog(sport, league, athlete["id"],
+                                            player_name=player_name)
         if not gamelog:
             return result
     else:
@@ -1028,11 +1029,13 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
 
         gamelog = get_athlete_gamelog(sport, league, athlete["id"])
 
-        # For MLB pitchers, the gamelog endpoint returns empty.
-        # Fall back to the splits-based pitcher stats.
+        # For MLB pitchers, the gamelog endpoint returns empty. Prefer the TRUE
+        # StatsAPI per-game log (real variance + game_date); fall back to the
+        # synthesized ESPN splits when the name can't be resolved.
         if not gamelog and sport == "baseball":
-            gamelog = get_pitcher_stats(league, athlete["id"])
-            # Also try for batter props if gamelog was empty (unlikely but safe)
+            import mlb_starters
+            gamelog = mlb_starters._pitcher_gamelog_or_synth(
+                league, athlete["id"], player_name, None)
 
         if not gamelog:
             return result

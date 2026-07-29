@@ -129,7 +129,7 @@ def seed_athlete_id(espn_sport, espn_league, player_name, athlete_id):
 
 
 def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
-                   season_year=None):
+                   season_year=None, player_name=None):
     """
     Cached gamelog fetch. Historical games are immutable, so a long TTL
     (default 30 days) is safe; the most recent games may lag by up to
@@ -139,13 +139,16 @@ def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
     season and the cache file is keyed by season so different seasons
     don't collide.
 
+    `player_name` (optional) enables the TRUE StatsAPI per-game pitcher log for
+    MLB; omitted -> synthesized ESPN splits, byte-identical to before.
+
     Set ODI_GAMELOG_TTL_HOURS env var to override (e.g., "8760" for a year).
     """
     if _sql():
         import gamelog_store
         return gamelog_store.get_gamelog(
             espn_sport, espn_league, athlete_id, season_year=season_year,
-            ttl_hours=ttl_hours)
+            ttl_hours=ttl_hours, player_name=player_name)
     env_ttl = os.environ.get("ODI_GAMELOG_TTL_HOURS")
     if env_ttl:
         try:
@@ -166,13 +169,14 @@ def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
             return cached
     gamelog = get_athlete_gamelog(espn_sport, espn_league, athlete_id,
                                   season_year=season_year)
-    # MLB pitcher fallback: the standard gamelog endpoint returns nothing
-    # for pitchers; the splits endpoint approximates per-game stats.
+    # MLB pitcher fallback: the standard gamelog endpoint returns nothing for
+    # pitchers. Prefer the TRUE StatsAPI per-game log when the name is known;
+    # otherwise fall back to the synthesized ESPN splits (per-game approximation).
     if not gamelog and espn_sport == "baseball":
         try:
-            from espn_client import get_pitcher_stats
-            gamelog = get_pitcher_stats(espn_league, athlete_id,
-                                        season=season_year)
+            import mlb_starters
+            gamelog = mlb_starters._pitcher_gamelog_or_synth(
+                espn_league, athlete_id, player_name, season_year)
         except Exception:
             gamelog = []
     with open(path, "w") as f:

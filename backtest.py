@@ -58,7 +58,6 @@ from odds_client import (
     american_to_implied_prob,
     devig_two_way,
 )
-from espn_client import get_pitcher_stats
 from pricing_common import _resolve_team_defense
 import historical_odds as hist_store
 from calibration_loader import (
@@ -1396,12 +1395,15 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
     aid = cached_athlete_id(espn_sport, espn_league, name)
     if not aid:
         return []
-    gamelog = cached_gamelog(espn_sport, espn_league, aid) or []
+    gamelog = cached_gamelog(espn_sport, espn_league, aid, player_name=name) or []
     if not gamelog and espn_sport == "baseball" and prop_key in (
             "pitcher_outs", "pitcher_strikeouts", "pitcher_earned_runs"):
-        # Splits-based fallback — note: these rows carry NO game_date, so they
-        # cannot be matched to a specific dated book line below.
-        gamelog = get_pitcher_stats(espn_league, aid) or []
+        # Real StatsAPI per-game log (dated) when the name resolves; otherwise the
+        # synthesized ESPN splits, whose dateless rows are dropped by the
+        # (date, value) filter below.
+        import mlb_starters
+        gamelog = mlb_starters._pitcher_gamelog_or_synth(
+            espn_league, aid, name, None) or []
     # Never resolve a pitcher prop from a batter's gamelog (or vice-versa): the
     # "K"/"SO" strikeout labels collide across roles (see _role_matches_gamelog).
     if not _role_matches_gamelog(prop_key, gamelog):
@@ -1411,6 +1413,8 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
         return []
     out = []
     for g in gamelog:
+        if g.get("completed") is False:
+            continue                # in-progress/partial game -> not a final value
         d = g.get("game_date")
         val = g.get(label)
         if not d or val is None:
@@ -2099,7 +2103,7 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
             print(f"  [skip] {name}: athlete not found")
             continue
         gamelog = cached_gamelog(espn_sport, espn_league, aid,
-                                 season_year=season_year)
+                                 season_year=season_year, player_name=name)
         if not gamelog:
             print(f"  [skip] {name}: empty gamelog")
             continue
@@ -2357,6 +2361,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     # (P1.2). Needed to resolve the player's own home park from their team_id,
     # mirroring the production id_to_name lookup.
     team_id_to_name = {}
+    pitcher_team_name = {}
     needs_park = any(
         (p.get("park_strength", 0.0) or 0.0) > 0 for p in variants.values())
     if needs_park:
@@ -2366,6 +2371,24 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             if info.get("id")
         }
         print(f"Built team-name map for park factors ({len(team_id_to_name)} teams).")
+        # Pitchers' real StatsAPI logs carry no ESPN team_id (StatsAPI ids are
+        # MLBAM), so their home starts would drop out of the park baseline and
+        # a home upcoming start would get no park adjustment. Resolve each
+        # pitcher's team from the athlete record — mirroring production
+        # props.py, which reads the pitcher's park from athlete.team_id, not
+        # from per-game rows.
+        for _nm, _gl in player_data.items():
+            if not _gamelog_is_pitcher(_gl):
+                continue
+            try:
+                _ath = search_athlete(espn_sport, espn_league, _nm)
+            except Exception:
+                _ath = None
+            _ptid = _ath.get("team_id") if _ath else None
+            if _ptid and str(_ptid) in team_id_to_name:
+                pitcher_team_name[_nm] = team_id_to_name[str(_ptid)]
+        if pitcher_team_name:
+            print(f"Resolved park teams for {len(pitcher_team_name)} pitchers.")
 
     # results[variant][prop] = {errors, n, hits, decisive, safe[offset]={"hits":, "n":}}
     # When calibrate=True, also collect per-observation tuples for residual-
@@ -2402,6 +2425,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 continue
 
             for i, test_game in enumerate(test_slice):
+                # An in-progress game (real pitcher logs mark today's live start
+                # completed=False) is a partial line, not a final box score —
+                # grading it would bias the pool. Skip it as a test game; it is
+                # never in a prior_games slice (it's the newest row).
+                if test_game.get("completed") is False:
+                    continue
                 actual = test_game.get(stat_label)
                 if actual is None:
                     continue
@@ -2427,6 +2456,10 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 )
                 player_team_name = (team_id_to_name.get(str(tid))
                                     if tid else None)
+                if player_team_name is None:
+                    # Pitcher logs carry no team_id; fall back to the athlete-
+                    # record team so home-game parks stay in the baseline.
+                    player_team_name = pitcher_team_name.get(name)
                 schedule = (team_schedules_for_filter.get(str(tid))
                             if tid else None)
                 filt = filter_player_gamelog(
