@@ -38,6 +38,7 @@ from backtest import (
     _per_player_stats, _shrunk,
 )
 from espn_client import PROP_STAT_MAP, ip_to_outs
+from pricing_common import et_local_date  # UTC at rest, ET on read
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,7 +154,8 @@ def harvest_book_lines_from_store(sport_key, target_props, label=""):
     target = set(target_props or [])
     out = []
     for entry in (store.get("games") or {}).values():
-        date = (entry.get("commence_time") or "")[:10]
+        commence = entry.get("commence_time")
+        date = et_local_date(commence)   # UTC at rest, ET on read
         if not date:
             continue
         home = entry.get("home_team")
@@ -168,6 +170,8 @@ def harvest_book_lines_from_store(sport_key, target_props, label=""):
                 out.append({
                     "sport_key": sport_key,
                     "game_date": date,
+                    "commence_time": commence,
+                    "event_id": entry.get("event_id"),   # local store: usually None
                     "home_team": home,
                     "away_team": away,
                     "player": player,
@@ -205,11 +209,16 @@ def harvest_book_lines_from_prediction_log(sport_key, target_props):
             continue
         player = r.get("player")
         line = r.get("line")
-        gd = (r.get("game_date") or "")[:10]
+        commence = r.get("commence_time")
+        # UTC at rest, ET on read: derive the calendar date in Eastern, falling
+        # back to the stored game_date only when commence is absent.
+        gd = et_local_date(commence) or (r.get("game_date") or "")[:10]
         if not player or line is None or not gd:
             continue
         out.append({
             "sport_key": sport_key, "game_date": gd,
+            "commence_time": commence,
+            "event_id": r.get("event_id"),   # present on the pred-log row
             "home_team": None, "away_team": None,
             "player": player, "prop_key": pk, "line": line,
             "over_price": None, "under_price": None,
@@ -227,30 +236,58 @@ def _book_line_key(row):
 
 
 def harvest_real_line_book_lines(sport_key, target_props, label=""):
-    """Union of book lines from the historical_odds backfill store AND the app's
-    own RESOLVED prediction log, deduped by (player, prop, game_date, line). The
-    store is a broad historical backfill (Odds-API credits); the prediction log
-    grows for free with live analysis, so the calibration dataset — and the
-    line-conditional buckets — keep accumulating from usage. Prefers the store row
-    (richer: prices/teams) on a collision. Returns (book_lines, n_store, n_pred)."""
-    store_lines = harvest_book_lines_from_store(sport_key, target_props, label)
+    """Union of real book lines for calibration, deduped by (player, prop,
+    ET-date, line), preferring the primary (richer: prices/teams) on a collision.
+
+    Primary source = the Azure ``odds_line`` warehouse (durable, grows with every
+    live analysis) when SQL is enabled and no ``label`` is forced; else the local
+    historical_odds JSON store (offline fallback). The RESOLVED prediction log is
+    unioned as a BACKSTOP — it covers analyses that ran on cached/credit-exhausted
+    odds (no fresh fetch → no warehouse capture). True same-day doubleheaders are
+    dropped from both sources by event_id (ambiguous box-score attribution).
+    Returns (book_lines, n_primary, n_pred)."""
+    target = set(target_props or [])
+    try:
+        import warehouse
+    except Exception:
+        warehouse = None
+    use_warehouse = False
+    if warehouse is not None and not label:
+        try:
+            import db_store
+            use_warehouse = db_store.enabled()
+        except Exception:
+            use_warehouse = False
+    if use_warehouse:
+        primary = [r for r in warehouse.load_prop_lines(sport_key)
+                   if r.get("prop_key") in target]
+    else:
+        primary = harvest_book_lines_from_store(sport_key, target_props, label)
     pred_lines = harvest_book_lines_from_prediction_log(sport_key, target_props)
-    seen, out = set(), []
-    for r in store_lines:              # store first → preferred on collision
-        k = _book_line_key(r)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(r)
-    n_store = len(out)
-    for r in pred_lines:
-        k = _book_line_key(r)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(r)
+
+    # Drop true same-day doubleheaders (detected from the team-carrying primary
+    # rows; game_date is ET so consecutive-day series games are NOT flagged).
+    dh_events = warehouse.doubleheader_event_ids(primary) if warehouse else set()
+
+    seen, out, dropped_dh = set(), [], 0
+    for src in (primary, pred_lines):   # primary first → preferred on collision
+        for r in src:
+            eid = r.get("event_id")
+            if eid and eid in dh_events:
+                dropped_dh += 1
+                continue
+            k = _book_line_key(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+        if src is primary:
+            n_primary = len(out)
     out.sort(key=lambda r: (r["game_date"], r["player"], r["prop_key"]))
-    return out, n_store, len(out) - n_store
+    if dropped_dh:
+        print(f"  Dropped {dropped_dh} doubleheader line(s) "
+              f"(ambiguous box-score attribution).")
+    return out, n_primary, len(out) - n_primary
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -303,12 +340,21 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
             continue
         gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
 
-        # Build a date → game-index lookup
+        # Build a date → game-index lookup. A date carrying MORE THAN ONE gamelog
+        # entry is a doubleheader: first-wins would mis-bind a book line to the
+        # wrong game's box score, so track those dates and skip them in the match
+        # below (belt-and-suspenders; true doubleheaders are already dropped
+        # upstream in harvest_real_line_book_lines).
         date_idx = {}
+        date_counts = {}
         for i, g in enumerate(gamelog):
             d = (g.get("game_date") or "")[:10]
-            if d and d not in date_idx:
+            if not d:
+                continue
+            date_counts[d] = date_counts.get(d, 0) + 1
+            if d not in date_idx:
                 date_idx[d] = i
+        dup_dates = {d for d, c in date_counts.items() if c > 1}
 
         for row in rows:
             stat_label = _stat_label_for(row["prop_key"], gamelog)
@@ -318,22 +364,26 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
             # so date-only match is usually accurate. Also try ±1 day in case
             # of timezone slippage.
             d = row["game_date"]
-            idx = date_idx.get(d)
-            if idx is None:
+            matched_d = d if d in date_idx else None
+            if matched_d is None:
                 from datetime import date as _date, timedelta
                 try:
                     d0 = _date.fromisoformat(d)
                     for delta in (-1, 1):
                         alt = (d0 + timedelta(days=delta)).isoformat()
                         if alt in date_idx:
-                            idx = date_idx[alt]
+                            matched_d = alt
                             break
                 except ValueError:
                     pass
-            if idx is None:
+            if matched_d is None:
+                skipped_no_game += 1
+                continue
+            if matched_d in dup_dates:   # doubleheader → can't attribute cleanly
                 skipped_no_game += 1
                 continue
 
+            idx = date_idx[matched_d]
             test_game = gamelog[idx]
             actual = test_game.get(stat_label)
             if actual is None:

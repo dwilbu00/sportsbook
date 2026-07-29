@@ -666,11 +666,20 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
 
     print(f"\n=== Re-selecting calibration method at REAL book lines for "
           f"{sport_key} ===")
-    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
         sport_key, target_props, store_label)
+    # Primary source label mirrors harvest's choice (Azure warehouse when SQL is
+    # on and no --store-label is forced, else the local backfill store).
+    primary_src = "backfill store"
+    try:
+        import db_store
+        if db_store.enabled() and not store_label:
+            primary_src = "Azure odds warehouse"
+    except Exception:
+        pass
     print(f"  Harvested {len(book_lines):,} real book lines for "
           f"{len(target_props)} calibrated prop(s) "
-          f"({n_store:,} from the backfill store + {n_pred:,} from the "
+          f"({n_primary:,} from the {primary_src} + {n_pred:,} from the "
           f"prediction log)")
     if not book_lines:
         print("  No real book lines (store or prediction log); nothing to refit.")

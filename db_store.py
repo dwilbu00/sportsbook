@@ -955,3 +955,70 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
             if attempt < max_retries - 1:
                 time.sleep(1 + 2 * attempt)
     raise last_exc
+
+
+def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
+                      max_retries=3):
+    """Bulk-read warehoused player-prop lines for a sport, joining each odds_line
+    to its parent odds_snapshot.
+
+    Sibling of team_market_lines: same join/retry, but selects bet_type=
+    'player_prop' and carries the prop descriptor (player, prop_key, direction).
+    Feeds the offline real-line calibration refit (warehouse.load_prop_lines)
+    from the growing Azure warehouse instead of the local historical_odds JSON.
+    Optional date filter: ``dates`` (explicit game_date list) OR
+    ``date_from``/``date_to`` (inclusive range). Ordered by (event_id,
+    captured_at) so the assembler can pick each event's closing snapshot. Retries
+    transient OperationalErrors like read_rows. Returns row dicts."""
+    engine = get_engine()
+    joined = odds_line.join(odds_snapshot,
+                            odds_line.c.snapshot_id == odds_snapshot.c.id)
+    stmt = (
+        select(
+            odds_snapshot.c.event_id, odds_snapshot.c.game_date,
+            odds_snapshot.c.commence_time, odds_snapshot.c.home,
+            odds_snapshot.c.away, odds_snapshot.c.captured_at,
+            odds_snapshot.c.kind, odds_line.c.snapshot_id,
+            odds_line.c.selection, odds_line.c.player, odds_line.c.prop_key,
+            odds_line.c.direction, odds_line.c.point, odds_line.c.price,
+            odds_line.c.implied_prob,
+        )
+        .select_from(joined)
+        .where((odds_snapshot.c.sport == sport)
+               & (odds_line.c.bet_type == "player_prop"))
+    )
+    if dates:
+        stmt = stmt.where(odds_snapshot.c.game_date.in_(list(dates)))
+    else:
+        if date_from is not None:
+            stmt = stmt.where(odds_snapshot.c.game_date >= date_from)
+        if date_to is not None:
+            stmt = stmt.where(odds_snapshot.c.game_date <= date_to)
+    stmt = stmt.order_by(odds_snapshot.c.event_id, odds_snapshot.c.captured_at)
+
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(stmt).all()
+            return [{
+                "event_id": r._mapping["event_id"],
+                "game_date": r._mapping["game_date"],
+                "commence_time": r._mapping["commence_time"],
+                "home": r._mapping["home"], "away": r._mapping["away"],
+                "captured_at": r._mapping["captured_at"],
+                "kind": r._mapping["kind"],
+                "snapshot_id": r._mapping["snapshot_id"],
+                "selection": r._mapping["selection"],
+                "player": r._mapping["player"],
+                "prop_key": r._mapping["prop_key"],
+                "direction": r._mapping["direction"],
+                "point": r._mapping["point"],
+                "price": r._mapping["price"],
+                "implied_prob": r._mapping["implied_prob"],
+            } for r in rows]
+        except OperationalError as exc:  # transient (cold resume / lock / timeout)
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + 2 * attempt)
+    raise last_exc

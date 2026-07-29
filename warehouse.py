@@ -864,6 +864,106 @@ def load_team_market_store(sport_key, dates=None):
     return empty
 
 
+def _assemble_prop_entries(event_id, rows, sport_key):
+    """One closing-line harvest row per (player, prop_key) for an event: pick the
+    closing snapshot (nearest at-or-before commence via _closing_sort_key) and
+    combine that snapshot's OVER/UNDER rows into {line, over_price, under_price}.
+    ``game_date`` is left None here and set to the US-Eastern date by the caller.
+    Returns a list of harvest-shaped dicts (may be empty)."""
+    if not rows:
+        return []
+    first = rows[0]
+    commence = first.get("commence_time")
+    home, away = first.get("home"), first.get("away")
+    target = _parse_utc(commence)
+
+    by_snap, snap_captured = {}, {}
+    for r in rows:
+        sid = r.get("snapshot_id")
+        by_snap.setdefault(sid, []).append(r)
+        snap_captured[sid] = r.get("captured_at")
+    closing_sid = min(
+        by_snap, key=lambda sid: _closing_sort_key(target, snap_captured.get(sid)))
+
+    combined = {}   # (player, prop_key) -> {line, over_price, under_price}
+    for r in by_snap[closing_sid]:
+        player, prop_key = r.get("player"), r.get("prop_key")
+        point = r.get("point")
+        if not player or not prop_key or point is None:
+            continue
+        e = combined.setdefault((player, prop_key),
+                                {"line": point, "over_price": None,
+                                 "under_price": None})
+        direction = (r.get("direction") or "").upper()
+        if direction == "OVER":
+            e["over_price"] = r.get("price")
+        elif direction == "UNDER":
+            e["under_price"] = r.get("price")
+
+    return [{
+        "sport_key": sport_key, "game_date": None, "commence_time": commence,
+        "home_team": home, "away_team": away, "event_id": event_id,
+        "player": player, "prop_key": prop_key, "line": e["line"],
+        "over_price": e["over_price"], "under_price": e["under_price"],
+    } for (player, prop_key), e in combined.items()]
+
+
+def load_prop_lines(sport_key, dates=None):
+    """Assemble player-prop closing-line rows from the SQL warehouse for the
+    offline real-line calibration refit.
+
+    Returns the shape book_line_calibration.harvest_book_lines_from_store emits,
+    plus ``event_id``/``commence_time``:
+    {sport_key, game_date(ET), commence_time, home_team, away_team, event_id,
+     player, prop_key, line, over_price, under_price} — one CLOSING line per
+    (event, player, prop_key). ``game_date`` is the US-Eastern calendar date
+    (UTC at rest, ET on read; see pricing_common.et_local_date). SQL-only and
+    best-effort: returns [] when SQL is off or on any error."""
+    if not _sql():
+        return []
+    try:
+        rows = _db.player_prop_lines(sport_key, dates=dates)
+    except Exception:
+        return []
+    if not rows:
+        return []
+    try:
+        from pricing_common import et_local_date
+    except Exception:
+        def et_local_date(c):
+            return (str(c)[:10] if c else None)
+    by_event = {}
+    for r in rows:
+        by_event.setdefault(r.get("event_id"), []).append(r)
+    out = []
+    for event_id, ev_rows in by_event.items():
+        for row in _assemble_prop_entries(event_id, ev_rows, sport_key):
+            row["game_date"] = et_local_date(row.get("commence_time"))
+            out.append(row)
+    return out
+
+
+def doubleheader_event_ids(rows):
+    """The event ids belonging to a true same-day doubleheader — a
+    (game_date, home_team, away_team) matchup carrying >1 distinct event_id on one
+    calendar date (game_date must already be in US Eastern so consecutive-day
+    series games, which differ by ET date, are NOT flagged). Calibration drops
+    these: a doubleheader's two lines can't be cleanly attributed to the right box
+    score, and game 2 is mis-projected (same pre-doubleheader inputs). Returns a
+    set of event_ids."""
+    by_matchup = {}
+    for r in rows:
+        key = (r.get("game_date"), r.get("home_team"), r.get("away_team"))
+        eid = r.get("event_id")
+        if eid:
+            by_matchup.setdefault(key, set()).add(eid)
+    dh = set()
+    for ev_ids in by_matchup.values():
+        if len(ev_ids) > 1:
+            dh |= ev_ids
+    return dh
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Seed from the existing historical_odds store
 # ──────────────────────────────────────────────────────────────────────────────

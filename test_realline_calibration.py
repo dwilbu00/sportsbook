@@ -354,5 +354,90 @@ class HarvestUnionTests(unittest.TestCase):
         self.assertEqual(a["over_price"], -110)        # store row preferred
 
 
+class WarehouseHarvestTests(unittest.TestCase):
+    """harvest_real_line_book_lines with the Azure warehouse as primary source:
+    prediction-log backstop, event_id-based doubleheader drop, alt-line survival.
+    Mocks the warehouse/pred-log seams (no SQL/network)."""
+
+    def _wh_row(self, event_id, player, line, gd="2026-07-24",
+                home="Reds", away="Guardians", pk="batter_hits"):
+        return {"sport_key": "baseball_mlb", "game_date": gd,
+                "commence_time": f"{gd}T23:00:00Z", "home_team": home,
+                "away_team": away, "event_id": event_id, "player": player,
+                "prop_key": pk, "line": line, "over_price": -110,
+                "under_price": -110}
+
+    def _pred_row(self, event_id, player, line, gd="2026-07-24",
+                  pk="batter_hits"):
+        return {"sport_key": "baseball_mlb", "game_date": gd,
+                "commence_time": f"{gd}T23:00:00Z", "event_id": event_id,
+                "home_team": None, "away_team": None, "player": player,
+                "prop_key": pk, "line": line, "over_price": None,
+                "under_price": None}
+
+    def _harvest(self, wh_rows, pred_rows):
+        with patch("db_store.enabled", return_value=True), \
+             patch("warehouse.load_prop_lines", return_value=wh_rows), \
+             patch("book_line_calibration.harvest_book_lines_from_prediction_log",
+                   return_value=pred_rows):
+            return blc.harvest_real_line_book_lines("baseball_mlb",
+                                                    ["batter_hits"])
+
+    def test_warehouse_primary_pred_backstop_and_dedup(self):
+        wh = [self._wh_row("e1", "A", 0.5)]
+        pred = [self._pred_row("e1", "A", 0.5),   # dup of wh → deduped away
+                self._pred_row("e2", "B", 0.5)]   # backstop (not in wh) → kept
+        out, n_primary, n_pred = self._harvest(wh, pred)
+        self.assertEqual(sorted(r["player"] for r in out), ["A", "B"])
+        self.assertEqual(n_primary, 1)
+        self.assertEqual(n_pred, 1)
+
+    def test_doubleheader_dropped_from_both_sources(self):
+        wh = [self._wh_row("g1", "A", 0.5), self._wh_row("g2", "A", 0.5)]
+        pred = [self._pred_row("g2", "A", 0.5)]   # same dh event in the log too
+        out, _n_primary, _n_pred = self._harvest(wh, pred)
+        self.assertEqual(out, [])                 # both games dropped
+
+    def test_alt_lines_both_survive(self):
+        wh = [self._wh_row("e1", "A", 0.5), self._wh_row("e1", "A", 1.5)]
+        out, _n_primary, _n_pred = self._harvest(wh, [])
+        self.assertEqual(sorted(r["line"] for r in out), [0.5, 1.5])
+
+
+class JoinToActualsTests(unittest.TestCase):
+    """Exercise the REAL join_book_lines_to_actuals (not mocked): idx binding,
+    prior_games, and the doubleheader date guard. Mocks only the ESPN fetch."""
+
+    def _gamelog(self, dates_hits):
+        return [{"game_date": f"{d}T23:00:00Z", "H": h} for d, h in dates_hits]
+
+    def _book_row(self, gd="2026-07-24", line=0.5):
+        return {"sport_key": "baseball_mlb", "game_date": gd,
+                "commence_time": f"{gd}T23:00:00Z", "event_id": "e1",
+                "home_team": "Reds", "away_team": "Guardians",
+                "player": "A. Batter", "prop_key": "batter_hits", "line": line,
+                "over_price": -110, "under_price": -110}
+
+    def _join(self, book_rows, gamelog):
+        with patch("book_line_calibration.cached_athlete_id",
+                   return_value="123"), \
+             patch("book_line_calibration.cached_gamelog", return_value=gamelog):
+            return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
+
+    def test_join_attaches_actual_and_prior_games(self):
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
+                           + [("2026-07-24", 2)])
+        out = self._join([self._book_row()], gl)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["actual"], 2.0)
+        self.assertEqual(out[0]["stat_label"], "H")
+        self.assertGreaterEqual(len(out[0]["prior_games"]), 10)
+
+    def test_join_skips_doubleheader_date(self):
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
+                           + [("2026-07-24", 2), ("2026-07-24", 0)])
+        self.assertEqual(self._join([self._book_row()], gl), [])
+
+
 if __name__ == "__main__":
     unittest.main()

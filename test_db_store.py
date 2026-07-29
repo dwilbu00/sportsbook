@@ -716,6 +716,83 @@ class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
             self.assertIn(key, entry)
 
 
+class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
+    """Player-prop bulk reader (db_store.player_prop_lines) + warehouse
+    closing-line assembler (load_prop_lines) + doubleheader detection."""
+
+    def _meta(self, hour, event_id="e1", commence="2026-07-22T23:00:00Z",
+              home="Rockies", away="Astros", game_date="2026-07-22"):
+        return {"sport": "baseball_mlb", "game_date": game_date,
+                "event_id": event_id, "kind": "props", "snapshot_hour": hour,
+                "captured_at": f"2026-07-22T{hour[-3:-1]}:00:00Z",
+                "commence_time": commence, "home": home, "away": away,
+                "regions": "us", "markets": "batter_hits", "bookmakers": None}
+
+    def _prop_lines(self, over_price, under_price, line=0.5,
+                    player="Kris Bryant", prop_key="batter_hits"):
+        return [
+            {"bet_type": "player_prop", "selection": player, "player": player,
+             "prop_key": prop_key, "direction": "OVER", "point": line,
+             "price": over_price, "implied_prob": 0.55},
+            {"bet_type": "player_prop", "selection": player, "player": player,
+             "prop_key": prop_key, "direction": "UNDER", "point": line,
+             "price": under_price, "implied_prob": 0.45},
+            # a team line the prop reader MUST exclude
+            {"bet_type": "moneyline", "selection": "Rockies", "price": 120,
+             "implied_prob": 0.45},
+        ]
+
+    def test_reader_excludes_team_and_carries_prop_fields(self):
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"),
+                                       self._prop_lines(-110, -110))
+        rows = db_store.player_prop_lines("baseball_mlb")
+        self.assertTrue(rows)
+        self.assertTrue(all(r["prop_key"] == "batter_hits" for r in rows))
+        self.assertEqual({r["direction"] for r in rows}, {"OVER", "UNDER"})
+        self.assertTrue(all(r["player"] == "Kris Bryant" for r in rows))
+
+    def test_load_prop_lines_closing_pick_combine_and_et_date(self):
+        import warehouse
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"),
+                                       self._prop_lines(-105, -115))
+        db_store.capture_odds_snapshot(self._meta("20260722T22Z"),
+                                       self._prop_lines(120, -140))
+        rows = warehouse.load_prop_lines("baseball_mlb")
+        self.assertEqual(len(rows), 1)          # one (event, player, prop)
+        r = rows[0]
+        self.assertEqual(r["line"], 0.5)
+        self.assertEqual(r["over_price"], 120)  # from the CLOSING (22Z) snapshot
+        self.assertEqual(r["under_price"], -140)
+        self.assertEqual(r["event_id"], "e1")
+        self.assertEqual(r["game_date"], "2026-07-22")   # ET (23:00Z → 19:00 EDT)
+
+    def test_load_prop_lines_et_date_crosses_utc_midnight(self):
+        import warehouse
+        # commence 00:30Z on the 23rd = 20:30 EDT on the 22nd → ET date 07-22,
+        # while the stored (UTC) game_date is 07-23 (UTC at rest, ET on read).
+        db_store.capture_odds_snapshot(
+            self._meta("20260722T20Z", commence="2026-07-23T00:30:00Z",
+                       game_date="2026-07-23"),
+            self._prop_lines(-110, -110))
+        rows = warehouse.load_prop_lines("baseball_mlb")
+        self.assertEqual(rows[0]["game_date"], "2026-07-22")
+
+    def test_doubleheader_detection_vs_consecutive_day(self):
+        import warehouse
+        dh = [  # same ET date + teams, two event_ids → doubleheader
+            {"game_date": "2026-07-28", "home_team": "Reds",
+             "away_team": "Guardians", "event_id": "g1"},
+            {"game_date": "2026-07-28", "home_team": "Reds",
+             "away_team": "Guardians", "event_id": "g2"}]
+        self.assertEqual(warehouse.doubleheader_event_ids(dh), {"g1", "g2"})
+        consec = [  # distinct ET dates → NOT a doubleheader
+            {"game_date": "2026-07-24", "home_team": "Rangers",
+             "away_team": "Mariners", "event_id": "a1"},
+            {"game_date": "2026-07-25", "home_team": "Rangers",
+             "away_team": "Mariners", "event_id": "a2"}]
+        self.assertEqual(warehouse.doubleheader_event_ids(consec), set())
+
+
 class RefitPerformedTests(_SqliteBackend, unittest.TestCase):
     """refit_performed flag + count_rows + recalibration count/mark helpers that
     power the app's 'time to refit' banner."""
