@@ -1105,6 +1105,592 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
     print("\n  (Diagnostic only — nothing written.)")
 
 
+# ── Conditional-calibration ("reliability by prediction stratum") report ──
+# Answers, market-free: "when the model says 60%, does it happen 60%?" and "does
+# the model systematically over/under-project in a given line/projection band?"
+# — then overlays edge/ROI vs the harvested consensus prices. NO WRITE.
+_CC_LINE_BANDS = ["0.5", "1.5", "2.5+"]
+_CC_PROJ_BANDS = ["proj<0.75", "0.75-1.25", "1.25-1.75", "proj>=1.75"]
+
+
+def _cc_num_or_none(x):
+    """Coerce a book price to float, or None if missing / non-numeric."""
+    try:
+        return None if x is None else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cc_wilson_ci(k, n, z=1.96):
+    """Wilson score 95% CI for a binomial proportion (pure stdlib).
+    k = successes (overs), n = trials. Returns (lo, hi, phat)."""
+    if n <= 0:
+        return (0.0, 1.0, 0.0)
+    import math
+    phat = k / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (phat + z2 / (2.0 * n)) / denom
+    half = (z / denom) * math.sqrt(phat * (1.0 - phat) / n + z2 / (4.0 * n * n))
+    return (max(0.0, center - half), min(1.0, center + half), phat)
+
+
+def _cc_line_band(line):
+    if abs(line - 0.5) < 1e-9:
+        return "0.5"
+    if abs(line - 1.5) < 1e-9:
+        return "1.5"
+    return "2.5+"
+
+
+def _cc_proj_band(proj):
+    if proj < 0.75:
+        return "proj<0.75"
+    if proj < 1.25:
+        return "0.75-1.25"
+    if proj < 1.75:
+        return "1.25-1.75"
+    return "proj>=1.75"
+
+
+def _cc_stratum_table(rowset, pkey, key_name, band_fn, band_order, min_cell_n):
+    """Print one stratified summary table: per band -> N, predicted vs realized
+    mean (+gap = pred-real, so >0 means the model over-projects), the market edge
+    overlay (mean model P(over) - devigged consensus, +coverage), and realized
+    ROI/hit-rate for a DIRECTION-AWARE unit-stake strategy that backs the +edge
+    side each row (over if p_model > devigged mkt_over, else under). Consensus
+    prices (incl. DK @ wt 1), NOT the DK-executable close."""
+    print("     {:<11}{:>5}{:>8}{:>8}{:>8}{:>9}{:>11}{:>16}{:>7}".format(
+        "band", "N", "pred", "real", "gap", "edge", "cov", "ROI+-(nbets)", "hit"))
+    for band in band_order:
+        cell = [r for r in rowset if band_fn(r[key_name]) == band]
+        n = len(cell)
+        if n == 0:
+            continue
+        pred = sum(r["projected"] for r in cell) / n
+        real = sum(r["actual"] for r in cell) / n
+        gap = pred - real
+        priced = [r for r in cell if r["mkt_over"] is not None]
+        edge = (sum(r[pkey] - r["mkt_over"] for r in priced) / len(priced)
+                if priced else None)
+        # Back the +edge side: over if p_model > devigged mkt_over, else under.
+        # Skip exact-parity rows (zero edge, no side). Needs both prices.
+        bets = [r for r in cell if r["mkt_over"] is not None
+                and r["over_dec"] is not None and r["under_dec"] is not None
+                and abs(r[pkey] - r["mkt_over"]) > 1e-9]
+        if bets:
+            pnl = won = 0.0
+            for r in bets:
+                if r[pkey] > r["mkt_over"]:          # +edge on the OVER
+                    win = (r["o"] == 1)
+                    pnl += (r["over_dec"] - 1.0) if win else -1.0
+                else:                                # +edge on the UNDER
+                    win = (r["o"] == 0)
+                    pnl += (r["under_dec"] - 1.0) if win else -1.0
+                won += 1.0 if win else 0.0
+            roi = pnl / len(bets)
+            hit = won / len(bets)
+        else:
+            roi = hit = None
+        flag = " [THIN]" if n < min_cell_n else ""
+        edge_s = f"{edge:+.3f}" if edge is not None else "-"
+        roi_s = f"{roi * 100:+.1f}%({len(bets)})" if roi is not None else "-"
+        hit_s = f"{hit * 100:.1f}%" if hit is not None else "-"
+        print("     {:<11}{:>5}{:>8.3f}{:>8.3f}{:>+8.3f}{:>9}{:>11}{:>16}{:>7}{}"
+              .format(band, n, pred, real, gap, edge_s, f"{len(priced)}/{n}",
+                      roi_s, hit_s, flag))
+
+
+def _cc_reliability(label, sub, pkey, min_cell_n):
+    """Reliability sub-table: bin P(over) into deciles, show empirical over-freq
+    and its Wilson 95% CI per bin. Deciles fragment the cell, so flag n<25."""
+    print(f"     reliability — {label} (n={len(sub)})")
+    print("       {:<12}{:>5}{:>8}{:>20}{:>8}".format(
+        "p(over)bin", "n", "emp", "95% CI (Wilson)", "flag"))
+    for b in range(10):
+        binrows = [r for r in sub
+                   if min(9, max(0, int(r[pkey] * 10 + 1e-9))) == b]
+        n = len(binrows)
+        if n == 0:
+            continue
+        k = sum(r["o"] for r in binrows)
+        lo, hi, phat = _cc_wilson_ci(k, n)
+        flag = "[THIN]" if n < 25 else ""
+        print("       {:<12}{:>5}{:>8.3f}{:>20}{:>8}".format(
+            f"{b / 10:.1f}-{(b + 1) / 10:.1f}", n, phat,
+            f"[{lo:.3f}, {hi:.3f}]", flag))
+
+
+def _cc_report_lens(title, rowset, pkey, min_cell_n):
+    print(f"\n  ── {title} ──")
+    print("   by LINE band:")
+    _cc_stratum_table(rowset, pkey, "line", _cc_line_band,
+                      _CC_LINE_BANDS, min_cell_n)
+    print('   by PROJECTION band (model projected hit count):')
+    _cc_stratum_table(rowset, pkey, "projected", _cc_proj_band,
+                      _CC_PROJ_BANDS, min_cell_n)
+    print("   reliability (empirical over-freq per P(over) decile; Wilson 95% CI):")
+    _cc_reliability("all", rowset, pkey, min_cell_n)
+    for lb in _CC_LINE_BANDS:
+        sub = [r for r in rowset if _cc_line_band(r["line"]) == lb]
+        if sub:
+            _cc_reliability(f"line {lb}", sub, pkey, min_cell_n)
+
+
+def _cc_load_scored_rows(sport, store_label=""):
+    """Shared chronological loader for --reliability and --recalibrate.
+
+    Harvests real book lines, joins to actuals, builds one leaner obs per row
+    (point projection + method-A empirical over-rate, both leakage-safe / as-of;
+    no distributional/xBA machinery, so no AB-gate row loss -> maximal N), drops
+    pushes, sorts chronologically, and stamps the binary outcome.
+
+    Prints the harvest/join diagnostics. Returns (sport_key, cfg, rows) where each
+    row carries game_date / line / actual / projected / empirical_over / mkt_over /
+    over_dec / under_dec / o. Returns rows=None (after printing the reason) on any
+    hard miss; cfg=None if there is no batter_hits calibration."""
+    import book_line_calibration as blc
+    from odds_client import (american_to_implied_prob, devig_two_way,
+                             american_to_decimal)
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key)
+    cfg = (existing or {}).get("batter_hits")
+    if not cfg:
+        print("No batter_hits calibration to compare against; run refit first.")
+        return sport_key, None, None
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, ["batter_hits"], store_label)
+    print(f"  {len(book_lines)} book lines ({n_store} backfill store + {n_pred} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to report.")
+        return sport_key, cfg, None
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league)
+        if o.get("prop_key") == "batter_hits"]
+    if not enriched:
+        print("  No batter_hits observations joined to actuals.")
+        return sport_key, cfg, None
+
+    # Weight-side opp-defense lookup only if the shipped variant uses it.
+    team_defense, league_avg_def = {}, None
+    if (cfg.get("opp_defense_strength") or 0.0) > 0:
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+    params = {
+        "half_life": cfg.get("half_life"),
+        "venue_strength": cfg.get("venue_strength", 0.0),
+        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+        "use_minutes": False,
+    }
+
+    rows = []
+    for obs in enriched:
+        projected, emp = blc.project_and_empirical(
+            obs, params, sport_key, team_defense, league_avg_def)
+        if projected is None or emp is None:
+            continue
+        op = _cc_num_or_none(obs.get("over_price"))
+        up = _cc_num_or_none(obs.get("under_price"))
+        mkt_over = over_dec = under_dec = None
+        if op is not None and up is not None:
+            mkt_over = devig_two_way(american_to_implied_prob(op),
+                                     american_to_implied_prob(up))[0]
+            over_dec = american_to_decimal(op)
+            under_dec = american_to_decimal(up)
+        rows.append({
+            "game_date": obs["game_date"], "line": obs["line"],
+            "actual": obs["actual"], "projected": projected,
+            "empirical_over": max(0.0, min(1.0, emp)),
+            "mkt_over": mkt_over, "over_dec": over_dec, "under_dec": under_dec,
+        })
+
+    rows = [r for r in rows if r["actual"] != r["line"]]   # drop pushes
+    rows.sort(key=lambda r: r["game_date"])
+    for r in rows:
+        r["o"] = 1 if r["actual"] > r["line"] else 0
+    return sport_key, cfg, rows
+
+
+def diagnose_conditional_calibration(sport, store_label="", min_cell_n=50):
+    """Conditional-calibration ("reliability by prediction stratum") report for
+    MLB batter_hits (NO WRITE). For each LINE band (0.5 / 1.5 / 2.5+) and each
+    model PROJECTED-count band, report N, predicted vs realized mean (the
+    over/under-projection gap), a reliability sub-table (empirical over-frequency
+    per P(over) decile with a Wilson 95% CI), and a market EDGE + realized-ROI
+    overlay priced at the harvested CONSENSUS book prices (NOT DK-executable).
+
+    Two lenses:
+      - Method C (residual-ECDF, shipped) on the chronological TEST half — the
+        honest out-of-sample reliability of the production probability.
+      - Method A (recency-weighted empirical over-rate) on the FULL sample —
+        leakage-safe (as-of prior games only), higher N, the base the model wraps.
+
+    Leakage-safe: chronological split, residual pool fit on TRAIN only. OFFLINE +
+    free (durable store / prediction log + free ESPN gamelogs). Writes nothing."""
+    import book_line_calibration as blc
+
+    print(f"\n=== Conditional calibration: {SPORT_MAP[sport][2]} batter_hits ===")
+    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label)
+    if not cfg or rows is None:
+        return
+    if len(rows) < 40:
+        print(f"  Only {len(rows)} usable obs (<40) — too thin to report.")
+        return
+    split = len(rows) // 2
+    train, test = rows[:split], rows[split:]
+
+    # Method C (shipped): residual pool fit on TRAIN, applied OOS to TEST — mirror
+    # diagnose_distributional's construction (mu shift + residual ECDF tail).
+    resid = sorted(r["actual"] - r["projected"] for r in train)
+    mu = sum(resid) / len(resid)
+    for r in test:
+        corrected = r["projected"] + mu
+        r["p_C"] = 1.0 - blc._empirical_cdf(resid, r["line"] - corrected)
+    for r in rows:                       # method A on the full sample (o preset)
+        r["p_A"] = r["empirical_over"]
+
+    n_priced = sum(1 for r in rows if r["mkt_over"] is not None)
+    print(f"  n_total={len(rows)}  n_train={len(train)}  n_test={len(test)}  "
+          f"min_cell_n={min_cell_n}  price_coverage={n_priced}/{len(rows)} "
+          f"({100.0 * n_priced / len(rows):.1f}%)  train_residual_mu={mu:+.3f}")
+    print("  edge/ROI priced at harvested CONSENSUS book prices (incl. DK @ wt 1),"
+          " NOT the DK-executable close. Cells with n<min_cell_n flagged [THIN].")
+    print("  ROI+- = unit-stake, backs the +edge side each row (over if p>mkt_over,"
+          " else under); hit = win rate of that side.")
+    print("  gap = pred_mean - real_mean  (>0 => model over-projects this stratum).")
+
+    _cc_report_lens("Method C — residual ECDF (shipped), OUT-OF-SAMPLE test half",
+                    test, "p_C", min_cell_n)
+    _cc_report_lens("Method A — recency-weighted empirical over-rate, FULL sample "
+                    "(leakage-safe, as-of)", rows, "p_A", min_cell_n)
+    print("\n  (Diagnostic only — nothing written.)")
+
+
+# ── Recalibration: fit a post-hoc map that fixes the over-dispersion the ──
+# reliability report surfaced (low P too low, high P too high). Two candidate
+# maps, fit on TRAIN, all metrics on held-out TEST, NO WRITE:
+#   Platt   — q = sigmoid(a*logit(p) + b). a<1 shrinks p toward the base rate
+#             (the exact correction for over-dispersion); 2 params, low variance.
+#   Isotonic— nonparametric monotone (pool-adjacent-violators); higher variance,
+#             catches non-sigmoidal shape. Winner chosen by OOS log-loss.
+def _rc_clamp01(p, eps=1e-6):
+    return max(eps, min(1.0 - eps, p))
+
+
+def _rc_logit(p):
+    import math
+    p = _rc_clamp01(p)
+    return math.log(p / (1.0 - p))
+
+
+def _rc_sigmoid(z):
+    import math
+    if z >= 0.0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+def _rc_fit_platt(ps, os, iters=100):
+    """Platt scaling: fit q = sigmoid(a*logit(p) + b) by Newton's method on the
+    Bernoulli NLL (1-feature logistic regression, feature = logit(p)). Returns
+    (a, b). a<1 => probabilities shrunk toward the base rate (over-dispersion fix),
+    a>1 => sharpened. Ridge-stabilised; converges in a handful of steps."""
+    xs = [_rc_logit(p) for p in ps]
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        g_a = g_b = h_aa = h_ab = h_bb = 0.0
+        for x, o in zip(xs, os):
+            q = _rc_sigmoid(a * x + b)
+            d = q - o
+            w = q * (1.0 - q)
+            g_a += d * x
+            g_b += d
+            h_aa += w * x * x
+            h_ab += w * x
+            h_bb += w
+        h_aa += 1e-6
+        h_bb += 1e-6                     # ridge for a well-conditioned Hessian
+        det = h_aa * h_bb - h_ab * h_ab
+        if abs(det) < 1e-12:
+            break
+        da = (g_a * h_bb - g_b * h_ab) / det
+        db = (h_aa * g_b - h_ab * g_a) / det
+        a -= da
+        b -= db
+        if abs(da) < 1e-9 and abs(db) < 1e-9:
+            break
+    return a, b
+
+
+def _rc_apply_platt(p, a, b):
+    return _rc_sigmoid(a * _rc_logit(p) + b)
+
+
+def _rc_fit_isotonic(ps, os):
+    """Isotonic regression via pool-adjacent-violators. Returns (kx, ky), both
+    non-decreasing, for monotone linear-interpolation prediction."""
+    pairs = sorted(zip(ps, os), key=lambda t: t[0])
+    blocks = []                          # each: [sum_y, count, right_x]
+    for x, o in pairs:
+        blocks.append([float(o), 1, x])
+        while (len(blocks) > 1 and
+               blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]):
+            sy = blocks[-1][0] + blocks[-2][0]
+            c = blocks[-1][1] + blocks[-2][1]
+            rx = blocks[-1][2]
+            blocks.pop()
+            blocks[-1] = [sy, c, rx]
+    kx = [rx for _, _, rx in blocks]
+    ky = [sy / c for sy, c, _ in blocks]
+    return kx, ky
+
+
+def _rc_apply_isotonic(p, knots):
+    import bisect
+    kx, ky = knots
+    if not kx:
+        return p
+    if p <= kx[0]:
+        return ky[0]
+    if p >= kx[-1]:
+        return ky[-1]
+    j = bisect.bisect_right(kx, p)       # kx[j-1] <= p < kx[j]
+    i = j - 1
+    x0, x1 = kx[i], kx[i + 1] if i + 1 < len(kx) else kx[i]
+    y0, y1 = ky[i], ky[i + 1] if i + 1 < len(ky) else ky[i]
+    if x1 <= x0:
+        return y1
+    t = (p - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+
+
+def _rc_metrics(rows, pget):
+    """OOS scoring for a probability accessor pget(row): Brier, log-loss, and
+    expected calibration error (ECE) over deciles. Lower is better for all."""
+    import math
+    n = len(rows)
+    if n == 0:
+        return {"n": 0, "brier": None, "logloss": None, "ece": None}
+    brier = sum((pget(r) - r["o"]) ** 2 for r in rows) / n
+    ll = 0.0
+    for r in rows:
+        p = _rc_clamp01(pget(r))
+        ll -= math.log(p) if r["o"] == 1 else math.log(1.0 - p)
+    ll /= n
+    ece = 0.0
+    for b in range(10):
+        binrows = [r for r in rows
+                   if min(9, max(0, int(pget(r) * 10 + 1e-9))) == b]
+        if not binrows:
+            continue
+        mp = sum(pget(r) for r in binrows) / len(binrows)
+        mo = sum(r["o"] for r in binrows) / len(binrows)
+        ece += (len(binrows) / n) * abs(mp - mo)
+    return {"n": n, "brier": brier, "logloss": ll, "ece": ece}
+
+
+def _rc_edge_summary(rows, pget):
+    """Edge-vs-consensus distribution + realized +edge-side ROI for accessor pget,
+    over the priced test rows. Shows how far the fake big edges collapse."""
+    priced = [r for r in rows if r["mkt_over"] is not None]
+    if not priced:
+        return None
+    edges = [pget(r) - r["mkt_over"] for r in priced]
+    absmean = sum(abs(e) for e in edges) / len(edges)
+    out = {"n": len(priced), "absmean": absmean,
+           "c05": sum(1 for e in edges if abs(e) > 0.05),
+           "c10": sum(1 for e in edges if abs(e) > 0.10),
+           "c20": sum(1 for e in edges if abs(e) > 0.20),
+           "max": max(abs(e) for e in edges)}
+    bets = [r for r in priced if r["over_dec"] is not None
+            and r["under_dec"] is not None
+            and abs(pget(r) - r["mkt_over"]) > 1e-9]
+    if bets:
+        pnl = won = 0.0
+        for r in bets:
+            if pget(r) > r["mkt_over"]:
+                win = (r["o"] == 1)
+                pnl += (r["over_dec"] - 1.0) if win else -1.0
+            else:
+                win = (r["o"] == 0)
+                pnl += (r["under_dec"] - 1.0) if win else -1.0
+            won += 1.0 if win else 0.0
+        out["roi"] = pnl / len(bets)
+        out["hit"] = won / len(bets)
+        out["nbets"] = len(bets)
+    else:
+        out["roi"] = out["hit"] = None
+        out["nbets"] = 0
+    return out
+
+
+def _rc_method_for_line(line, line_methods, default_method):
+    """Reproduce the runtime per-line-bucket method pick: the finite bucket with
+    the smallest max_line >= line, else the catch-all (max_line == null)."""
+    if not line_methods:
+        return default_method
+    finite = sorted((b for b in line_methods if b.get("max_line") is not None),
+                    key=lambda b: b["max_line"])
+    for b in finite:
+        if line <= b["max_line"] + 1e-9:
+            return b.get("method", default_method)
+    for b in line_methods:
+        if b.get("max_line") is None:
+            return b.get("method", default_method)
+    return default_method
+
+
+def _rc_run_bucket(name, method, brows, blc, min_cell_n):
+    """Fit + OOS-evaluate a recal map on one shipped line-bucket. Method A raw p
+    is the as-of empirical over-rate (2-way chronological split); method C raw p
+    is the residual-ECDF tail fit on an OLDER pool (3-way split). brows is already
+    chronological. Prints before/after; writes nothing."""
+    n = len(brows)
+    print(f"\n  ── {name}: shipped method {method}, n={n} ──")
+    if method == "A":
+        if n < 120:
+            print(f"     too thin (n={n} < 120) to split + fit; skipped.")
+            return
+        split = n // 2
+        train, test = brows[:split], brows[split:]
+        for r in train + test:
+            r["p_raw"] = r["empirical_over"]
+        print(f"     split: train={len(train)}  test={len(test)} (2-way, "
+              f"as-of empirical over-rate)")
+    elif method == "C":
+        if n < 180:
+            print(f"     too thin (n={n} < 180) for a 3-way pool/train/test "
+                  f"split; skipped.")
+            return
+        t1, t2 = n // 3, 2 * n // 3
+        pool, train, test = brows[:t1], brows[t1:t2], brows[t2:]
+        resid = sorted(r["actual"] - r["projected"] for r in pool)
+        mu = sum(resid) / len(resid)
+        for r in train + test:
+            r["p_raw"] = 1.0 - blc._empirical_cdf(
+                resid, r["line"] - (r["projected"] + mu))
+        print(f"     split: pool={len(pool)} (residual ECDF, mu={mu:+.3f})  "
+              f"train={len(train)}  test={len(test)} (3-way)")
+    else:
+        print(f"     method {method} unsupported for recalibration; skipped.")
+        return
+
+    ps = [r["p_raw"] for r in train]
+    osv = [r["o"] for r in train]
+    a, b = _rc_fit_platt(ps, osv)
+    knots = _rc_fit_isotonic(ps, osv)
+    base = sum(osv) / len(osv)
+    if a <= 0.0:
+        shrink = "INVERTS ordering — overfit, disqualified"
+    elif a < 1.0:
+        shrink = "shrinks toward base"
+    else:
+        shrink = "sharpens"
+    print(f"     Platt: a={a:.3f} ({shrink}), b={b:+.3f}; train over-rate={base:.3f}")
+
+    def _raw(r):
+        return r["p_raw"]
+
+    def _pl(r):
+        return _rc_apply_platt(r["p_raw"], a, b)
+
+    def _is(r):
+        return _rc_apply_isotonic(r["p_raw"], knots)
+
+    m_raw, m_pl, m_is = (_rc_metrics(test, _raw), _rc_metrics(test, _pl),
+                         _rc_metrics(test, _is))
+    print("     OOS test metrics (lower = better):")
+    print("       {:<10}{:>9}{:>10}{:>8}".format("map", "brier", "logloss", "ece"))
+    for lbl, m in [("raw", m_raw), ("platt", m_pl), ("isotonic", m_is)]:
+        print("       {:<10}{:>9.4f}{:>10.4f}{:>8.4f}".format(
+            lbl, m["brier"], m["logloss"], m["ece"]))
+    # Candidate set INCLUDES raw so a map that loses OOS is never displayed as
+    # "AFTER" (also blunts winner's-curse: a genuinely-null map can't win by
+    # noise). A Platt fit with a<=0 is disqualified — a monotone-DECREASING map
+    # inverts the probability ordering, which is always noise-fitting on a thin
+    # slice, never a legitimate recalibration.
+    cands = [("raw", m_raw, _raw), ("isotonic", m_is, _is)]
+    if a > 0.0:
+        cands.append(("platt", m_pl, _pl))
+    win_lbl, win_m, win_get = min(cands, key=lambda t: t[1]["logloss"])
+    if win_lbl == "raw":
+        print(f"     winner (OOS log-loss): raw — no map beats raw "
+              f"(logloss {m_raw['logloss']:.4f}, ECE {m_raw['ece']:.4f}); "
+              f"leave this bucket as-is")
+        return
+    print(f"     winner (OOS log-loss): {win_lbl} — improves raw "
+          f"({m_raw['logloss']:.4f} -> {win_m['logloss']:.4f}, "
+          f"ECE {m_raw['ece']:.4f} -> {win_m['ece']:.4f})")
+
+    for r in test:
+        r["p_before"] = _raw(r)
+        r["p_after"] = win_get(r)
+    print("     reliability BEFORE (raw):")
+    _cc_reliability(f"{name} raw", test, "p_before", min_cell_n)
+    print(f"     reliability AFTER ({win_lbl}):")
+    _cc_reliability(f"{name} {win_lbl}", test, "p_after", min_cell_n)
+
+    e_b, e_a = _rc_edge_summary(test, _raw), _rc_edge_summary(test, win_get)
+    if e_b and e_a:
+        print("     edge vs consensus on priced test rows (fake-edge collapse):")
+        print("       {:<10}{:>8}{:>8}{:>9}{:>9}{:>8}{:>14}".format(
+            "map", "mean|e|", "|e|>5%", "|e|>10%", "|e|>20%", "max|e|",
+            "ROI+-(n)"))
+        for lbl, e in [("raw", e_b), (win_lbl, e_a)]:
+            roi_s = (f"{e['roi'] * 100:+.1f}%({e['nbets']})"
+                     if e["roi"] is not None else "-")
+            print("       {:<10}{:>8.3f}{:>8}{:>9}{:>9}{:>8.3f}{:>14}".format(
+                lbl, e["absmean"], e["c05"], e["c10"], e["c20"], e["max"],
+                roi_s))
+
+
+def diagnose_recalibration(sport, store_label="", min_cell_n=50):
+    """Fit a post-hoc recalibration map (Platt shrinkage + isotonic) on the
+    SHIPPED per-line-bucket batter_hits probability, evaluate it OUT-OF-SAMPLE,
+    and show the reliability curve flatten and the fake edges collapse (NO WRITE).
+
+    The raw probability reconstructs exactly what production emits per line bucket
+    (method A: as-of empirical over-rate; method C: residual-ECDF tail on an older
+    pool). Each bucket is split chronologically, the map is fit on TRAIN only, and
+    every metric (Brier / log-loss / ECE / reliability / edge) is measured on the
+    held-out TEST slice. Leakage-safe. OFFLINE + free. Writes nothing."""
+    import book_line_calibration as blc
+
+    print(f"\n=== Recalibration (Platt shrinkage + isotonic): "
+          f"{SPORT_MAP[sport][2]} batter_hits ===")
+    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label)
+    if not cfg or rows is None:
+        return
+    if len(rows) < 120:
+        print(f"  Only {len(rows)} usable obs (<120) — too thin to recalibrate.")
+        return
+    line_methods = cfg.get("line_methods")
+    default_method = cfg.get("method", "A")
+    shipped = ([(bk.get("max_line"), bk.get("method")) for bk in line_methods]
+               if line_methods else default_method)
+    print(f"  n_total={len(rows)}  shipped line_methods={shipped}")
+    print("  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal "
+          "map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.")
+    print("  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.")
+
+    groups = {}
+    for r in rows:
+        m = _rc_method_for_line(r["line"], line_methods, default_method)
+        groups.setdefault(m, []).append(r)      # subset preserves chronology
+    for m in sorted(groups, key=lambda k: (k != "A", k)):  # dominant A first
+        brows = groups[m]
+        lines = sorted(set(r["line"] for r in brows))
+        band = ("line 0.5" if lines == [0.5]
+                else f"lines {min(lines):g}-{max(lines):g}")
+        _rc_run_bucket(band, m, brows, blc, min_cell_n)
+
+    print("\n  (Diagnostic only — nothing written. To deploy: store the winning "
+          "map per line-bucket and apply g(p) after calibrate_prob.)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Refit persistent calibration files")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), required=True)
@@ -1154,6 +1740,21 @@ def main():
     p.add_argument("--dist-xstats-strength", type=float, default=0.5,
                    help="xBA blend weight for the --dist-diag xBA variants "
                         "(default 0.5).")
+    p.add_argument("--reliability", action="store_true",
+                   help="Conditional-calibration report for batter_hits: "
+                        "reliability (are 60-percent predictions right 60 percent "
+                        "of the time?), realized vs predicted mean, and a market "
+                        "edge/ROI overlay, stratified by line and projected-count "
+                        "band (no write).")
+    p.add_argument("--min-cell-n", type=int, default=50,
+                   help="Minimum obs per stratum before a --reliability cell is "
+                        "trusted; smaller cells are still printed and flagged "
+                        "[THIN].")
+    p.add_argument("--recalibrate", action="store_true",
+                   help="Fit a post-hoc recalibration map (Platt shrinkage + "
+                        "isotonic) on the SHIPPED per-line-bucket batter_hits "
+                        "probability and show, OUT-OF-SAMPLE, the reliability curve "
+                        "flatten and the fake edges collapse (no write).")
     args = p.parse_args()
 
     # Target the SQL backend when the SQL_* secrets are configured (mirrors the
@@ -1170,6 +1771,16 @@ def main():
     if args.dist_diag:
         diagnose_distributional(args.sport, store_label=args.store_label,
                                 xstats_strength=args.dist_xstats_strength)
+        return
+
+    if args.reliability:
+        diagnose_conditional_calibration(args.sport, store_label=args.store_label,
+                                         min_cell_n=args.min_cell_n)
+        return
+
+    if args.recalibrate:
+        diagnose_recalibration(args.sport, store_label=args.store_label,
+                               min_cell_n=args.min_cell_n)
         return
 
     if args.real_lines:
