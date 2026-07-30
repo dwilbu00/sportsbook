@@ -1,36 +1,36 @@
 {
   "sport_key": "baseball_mlb",
-  "fit_timestamp": "2026-07-28T13:21:50.480384+00:00",
+  "fit_timestamp": "2026-07-30T17:34:28.021880+00:00",
   "props": {
-    "batter_hits": {
-      "a": 0.66818,
-      "b": 0.07693,
-      "n_fit": 938,
-      "n_validation": 402,
+    "batter_hits@le_0.5": {
+      "a": 0.37526,
+      "b": 0.19425,
+      "n_fit": 2144,
+      "n_validation": 889,
       "n_validation_folds": 2,
-      "holdout_start": "2026-07-17",
-      "holdout_raw_brier": 0.241116,
-      "holdout_calibrated_brier": 0.23971,
-      "holdout_raw_log_loss": 0.675815,
-      "holdout_calibrated_log_loss": 0.672449,
+      "holdout_start": "2026-07-26",
+      "holdout_raw_brier": 0.245348,
+      "holdout_calibrated_brier": 0.242147,
+      "holdout_raw_log_loss": 0.684341,
+      "holdout_calibrated_log_loss": 0.677324,
       "holdout_metric_scope": "fold_cross_validation",
       "deploy_fit_scope": "all_observations",
       "validation_folds": [
         {
-          "holdout_start": "2026-07-17",
-          "n_validation": 210,
-          "raw_brier": 0.2463835201521655,
-          "calibrated_brier": 0.24385549060846623,
-          "raw_log_loss": 0.6872197788865149,
-          "calibrated_log_loss": 0.6810513425387681
+          "holdout_start": "2026-07-26",
+          "n_validation": 389,
+          "raw_brier": 0.23928310655356608,
+          "calibrated_brier": 0.23863966514986445,
+          "raw_log_loss": 0.671232772890307,
+          "calibrated_log_loss": 0.6701625805174698
         },
         {
-          "holdout_start": "2026-07-19",
-          "n_validation": 192,
-          "raw_brier": 0.2353541863671287,
-          "calibrated_brier": 0.23517680978425445,
-          "raw_log_loss": 0.6633404424291542,
-          "calibrated_log_loss": 0.6630398614067038
+          "holdout_start": "2026-07-28",
+          "n_validation": 500,
+          "raw_brier": 0.25006734034186234,
+          "calibrated_brier": 0.24487522259607813,
+          "raw_log_loss": 0.6945398126438761,
+          "calibrated_log_loss": 0.682896236428689
         }
       ],
       "validated": true,
