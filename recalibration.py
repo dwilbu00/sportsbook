@@ -52,6 +52,14 @@ MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
 MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
 MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
+# A self-learned (loop) fit may override a *seeded* prop only after clearing this
+# obs floor and beating the seed out-of-sample (the "wait longer" gate). Well
+# above the base fit gate (MIN_FIT_SAMPLES + 2*MIN_VALIDATION_SAMPLES = 90).
+MIN_OBS_FOR_OVERRIDE = 300
+# Prior strength (× the seed's n_fit) in the seed↔loop shrinkage blend weight
+# w = n_loop / (n_loop + RECAL_SEED_TRUST*n_seed). Higher = slower takeover, so a
+# single loop never moves the applied map drastically off the book-line seed.
+RECAL_SEED_TRUST = 1.0
 # New RESOLVED predictions (refit_performed=0) that make the app suggest an
 # OFFLINE calibration refit. Higher than the online Platt gate (that's a cheap
 # 2-param nudge; this triggers a full offline method re-selection).
@@ -1715,7 +1723,7 @@ def _probability_scores(probabilities, outcomes):
     return brier, log_loss
 
 
-def fit_platt_chronological(records):
+def fit_platt_chronological(records, incumbent=None):
     """
     Validate Platt scaling on two expanding-window chronological folds before
     fitting the final parameters on all observations. `records` contains
@@ -1724,6 +1732,13 @@ def fit_platt_chronological(records):
     Returns a parameter/metric dict, or None when the calibrated probabilities
     do not improve both Brier score and log loss in every untouched later fold.
     Rows sharing a date always stay in the same side of a boundary.
+
+    `incumbent` is an optional (a, b) seed map for this key (the committed
+    book-line prior). When given, this is a *champion gate*: the loop fit must
+    additionally clear MIN_OBS_FOR_OVERRIDE observations and beat the seed map
+    (not just raw) on both metrics in every fold, or it does not override the
+    seed. `incumbent=None` (offline seeding, loop-only props) keeps the original
+    beat-raw behavior unchanged.
     """
     rows = sorted(
         (str(date), float(raw), int(outcome))
@@ -1731,6 +1746,8 @@ def fit_platt_chronological(records):
         if raw is not None and outcome in (0, 1)
     )
     if len(rows) < MIN_FIT_SAMPLES + 2 * MIN_VALIDATION_SAMPLES:
+        return None
+    if incumbent is not None and len(rows) < MIN_OBS_FOR_OVERRIDE:
         return None
 
     cut1 = rows[int(len(rows) * 0.6)][0]
@@ -1761,6 +1778,14 @@ def fit_platt_chronological(records):
         cal_brier, cal_log_loss = _probability_scores(holdout_cal, holdout_y)
         if cal_brier >= raw_brier or cal_log_loss >= raw_log_loss:
             return None
+        if incumbent is not None:
+            # Champion gate: the loop fit must beat the *seed* map on this
+            # untouched later window, not merely raw, to earn an override.
+            a_s, b_s = incumbent
+            seed_cal = [apply_platt(raw, a_s, b_s) for raw in holdout_raw]
+            seed_brier, seed_log_loss = _probability_scores(seed_cal, holdout_y)
+            if cal_brier >= seed_brier or cal_log_loss >= seed_log_loss:
+                return None
         n_holdout = len(holdout)
         for i, score in enumerate((raw_brier, cal_brier,
                                    raw_log_loss, cal_log_loss)):
@@ -1812,11 +1837,12 @@ def fit_platt_chronological(records):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
-    """Persist a Platt fit. Always writes the local file (provenance + the
-    git-committed bootstrap that ships to Cloud). When `to_blob` and a blob
-    backend is configured, also durably persists to Azure so runtime refits
-    survive Cloud restarts. Offline seeding passes `to_blob=False` so local
-    runs never write the production blob."""
+    """Persist a Platt fit. Offline seeding (`to_blob=False`) writes the local
+    git-committed file (the seed/prior that ships to Cloud). A runtime SQL refit
+    (`to_blob=True` and `_sql()`) persists to Azure SQL *only* and deliberately
+    leaves the local seed untouched, so it stays a pristine prior for the per-key
+    merge/champion-gate in `_load_recal_cached`/`refit_sport`. Legacy blob and
+    pure-local dev (no SQL) still write the local file."""
     _ensure_dirs()
     blob = {
         "sport_key": sport_key,
@@ -1825,11 +1851,13 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
     }
     if meta:
         blob["meta"] = meta
-    # Local write (atomic swap) — always.
-    tmp = recalibration_path(sport_key) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(blob, f, indent=2)
-    os.replace(tmp, recalibration_path(sport_key))
+    # Local write (atomic swap). A runtime SQL refit skips this so it cannot
+    # clobber the committed seed (which the merge/gate read back as the prior).
+    if not (to_blob and _sql()):
+        tmp = recalibration_path(sport_key) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, indent=2)
+        os.replace(tmp, recalibration_path(sport_key))
     # Durable Blob write — best-effort last-writer-wins with If-Match retry.
     # A transient blob failure leaves the local file intact; the next refit
     # retries. Swallowing keeps the free loop (maybe_auto_refit) crash-proof.
@@ -1895,6 +1923,35 @@ def _read_local_recal(sport_key):
     return _parse_recal_blob(blob)
 
 
+def _blend_recal(seed_cfg, loop_cfg):
+    """Precision-weighted shrinkage of a self-learned (loop) fit toward the
+    committed seed prior. Platt is affine in logit space, so averaging (a, b) is
+    exactly averaging the calibrated logits — a principled blend, not a hack. The
+    loop's weight grows with its evidence:
+        w = n_loop / (n_loop + RECAL_SEED_TRUST * n_seed)
+    Returns a cfg identical to `loop_cfg` (keeps validated + holdout provenance)
+    but with the blended a/b and a blend audit trail. Degrades to the loop fit if
+    the weights are unusable."""
+    n_seed = seed_cfg.get("n_fit") or 0
+    n_loop = loop_cfg.get("n_fit") or 0
+    if n_seed <= 0:
+        n_seed = MIN_FIT_SAMPLES  # anchor a count-less seed rather than ignore it
+    denom = n_loop + RECAL_SEED_TRUST * n_seed
+    if denom <= 0:
+        return loop_cfg
+    w = n_loop / denom
+    a = round(w * loop_cfg["a"] + (1.0 - w) * seed_cfg["a"], 5)
+    b = round(w * loop_cfg["b"] + (1.0 - w) * seed_cfg["b"], 5)
+    return {
+        **loop_cfg,
+        "a": a,
+        "b": b,
+        "blend_weight": round(w, 4),
+        "blend_seed": {
+            "a": seed_cfg["a"], "b": seed_cfg["b"], "n_fit": seed_cfg.get("n_fit")},
+    }
+
+
 def _load_recal_cached(sport_key):
     """
     Return (fit_ts_epoch_or_None, validated_props).
@@ -1920,9 +1977,23 @@ def _load_recal_cached(sport_key):
                 cached["fetched_at"] = now
                 return cached["fit_ts"], cached["props"]
             return _read_local_recal(sport_key)
-        fit_ts, props = _parse_recal_blob(cfg) if cfg else (None, {})
-        if not props:
-            fit_ts, props = _read_local_recal(sport_key)
+        sql_fit_ts, sql_props = _parse_recal_blob(cfg) if cfg else (None, {})
+        seed_fit_ts, seed_props = _read_local_recal(sport_key)
+        if sql_props:
+            # Per-key overlay: the seed is the prior for every key it holds, and a
+            # self-learned SQL fit for a key blends toward it (shrinkage). Seed-only
+            # keys survive untouched — one prop's first SQL fit no longer erases the
+            # rest of the committed seed (the old all-or-nothing fallback bug).
+            merged = dict(seed_props)
+            for key, loop_cfg in sql_props.items():
+                seed_cfg = seed_props.get(key)
+                merged[key] = _blend_recal(seed_cfg, loop_cfg) if seed_cfg else loop_cfg
+            # fit_ts keys on the PRE-merge sql_props: `merged` is always non-empty
+            # once a seed exists, so keying on it would mask "no SQL fit yet" from
+            # the maintain_sport gate (last_fit_ts=None) and refit every tick.
+            fit_ts, props = sql_fit_ts, merged
+        else:
+            fit_ts, props = seed_fit_ts, seed_props
         _LOAD_CACHE[sport_key] = {
             "fetched_at": now, "etag": None, "fit_ts": fit_ts, "props": props}
         return fit_ts, props
@@ -2001,6 +2072,12 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
     from calibration_loader import load_calibration
     cal = load_calibration(sport_key) or {}
 
+    # The committed seed is the prior for the champion gate: a loop fit overrides
+    # a seeded key only if it beats that seed out-of-sample (see refit loop). In
+    # prod the local file stays pristine (save_recalibration skips it for SQL
+    # refits), so this is always the book-line seed, never the loop's own output.
+    _, seed_props = _read_local_recal(sport_key)
+
     def _line_methods_for(prop_key):
         return (cal.get(prop_key) or {}).get("line_methods")
 
@@ -2034,7 +2111,9 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
     fits = {}
     per_prop_params = {}
     for fit_key, records in by_prop_records.items():
-        result = fit_platt_chronological(records)
+        seed_cfg = seed_props.get(fit_key)
+        incumbent = (seed_cfg["a"], seed_cfg["b"]) if seed_cfg else None
+        result = fit_platt_chronological(records, incumbent=incumbent)
         if result is None:
             continue
         a, b = result["a"], result["b"]

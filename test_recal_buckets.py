@@ -162,6 +162,8 @@ def _make_rows(prop_key, line, n, over_dispersion=0.45, seed=0):
 
 def test_refit_buckets_by_composite_key():
     # line 0.5: plenty of rows -> passes; line 1.5: thin (<90) -> gate rejects.
+    # Patch the seed to empty so this stays a pure bucketing test (incumbent=None);
+    # the champion gate against a real seed is covered in test_recal_blend.py.
     log_rows = (_make_rows("batter_hits", 0.5, 300, seed=1)
                 + _make_rows("batter_hits", 1.5, 30, seed=2))
     captured = {}
@@ -171,6 +173,7 @@ def test_refit_buckets_by_composite_key():
 
     cal = {"batter_hits": {"method": "C", "line_methods": LM}}
     with mock.patch.object(recalibration, "_read_log", return_value=log_rows), \
+         mock.patch.object(recalibration, "_read_local_recal", return_value=(None, {})), \
          mock.patch.object(recalibration, "save_recalibration", side_effect=fake_save), \
          mock.patch("calibration_loader.load_calibration", return_value=cal):
         recalibration._LOAD_CACHE.pop("baseball_mlb", None)

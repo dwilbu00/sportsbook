@@ -486,11 +486,37 @@ class SqlDispatchTests(_SqliteBackend, unittest.TestCase):
                 # After a validated SQL fit, SQL wins over the baseline.
                 recalibration._LOAD_CACHE.pop("baseball_mlb", None)
                 per_prop = {"pitcher_strikeouts": {"a": 0.7, "b": 0.1,
+                                                   "n_fit": 300,
                                                    "validated": True}}
                 recalibration.save_recalibration("baseball_mlb", per_prop,
                                                  to_blob=True)
                 props2 = recalibration.load_recalibration("baseball_mlb")
                 self.assertIn("pitcher_strikeouts", props2)
+
+                # Per-key merge: a seed holding a seed-only key AND a key the loop
+                # also fit. The seed-only key survives (no whole-map erasure); the
+                # shared key blends toward the seed; blend weight is recorded.
+                recalibration._LOAD_CACHE.pop("baseball_mlb", None)
+                seed = (2.0, {
+                    "batter_hits@le_0.5": {"a": 0.40, "b": 0.20,
+                                           "n_fit": 900, "validated": True},
+                    "pitcher_strikeouts": {"a": 0.30, "b": 0.05,
+                                           "n_fit": 300, "validated": True},
+                })
+                with patch.object(recalibration, "_read_local_recal",
+                                  return_value=seed):
+                    merged = recalibration.load_recalibration("baseball_mlb")
+                # seed-only key preserved untouched
+                self.assertIn("batter_hits@le_0.5", merged)
+                self.assertEqual(merged["batter_hits@le_0.5"]["a"], 0.40)
+                self.assertNotIn("blend_weight", merged["batter_hits@le_0.5"])
+                # shared key blended: a strictly between seed 0.30 and loop 0.70
+                # (n_seed==n_loop==300, RECAL_SEED_TRUST 1.0 → w=0.5 → a=0.50)
+                blended = merged["pitcher_strikeouts"]
+                self.assertGreater(blended["a"], 0.30)
+                self.assertLess(blended["a"], 0.70)
+                self.assertAlmostEqual(blended["a"], 0.50, places=5)
+                self.assertAlmostEqual(blended["blend_weight"], 0.5, places=4)
 
 
 class SchemaParityTests(unittest.TestCase):
