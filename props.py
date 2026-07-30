@@ -489,6 +489,36 @@ def _distributional_over_rate(prop_key, line, values, at_bats, weights,
     return p_over, meta
 
 
+def _resolve_line_bucket(prop_calib_cfg, line):
+    """Resolve (bucket_key, bucket_dict) for a specific book line — the single
+    source of truth for line -> ``line_methods`` bucket matching, shared by
+    ``_method_cfg_for_line`` (base calibration) and the online recalibration
+    composite key (``_composite_recal_key`` / ``_resolve_recal_cfg``). Both the
+    fit side and the apply side derive their bucket from THIS function so they can
+    never disagree.
+
+    First-match on ``ln <= max_line`` (``max_line`` None/absent = the open-ended
+    top bucket), mirroring the original ``_method_cfg_for_line`` loop. The
+    canonical key is ``"top"`` for the open bucket, else ``f"le_{cap:g}"`` (e.g.
+    ``"le_0.5"``). Returns ``(None, None)`` when there is no ``line_methods``, no
+    matching bucket, or ``line`` is unusable."""
+    if not prop_calib_cfg:
+        return None, None
+    buckets = prop_calib_cfg.get("line_methods")
+    if not buckets:
+        return None, None
+    try:
+        ln = float(line)
+    except (TypeError, ValueError):
+        return None, None
+    for b in buckets:
+        cap = b.get("max_line")
+        if cap is None or ln <= cap:
+            key = "top" if cap is None else f"le_{cap:g}"
+            return key, b
+    return None, None
+
+
 def _method_cfg_for_line(prop_calib_cfg, line):
     """Resolve (method, method_cfg) for a specific book line.
 
@@ -505,23 +535,69 @@ def _method_cfg_for_line(prop_calib_cfg, line):
     it supplies (its own residuals, or the D composite params). Falls back to the
     pooled cfg when there is no ``line_methods``, no matching usable bucket, or
     ``line`` is unusable — so a cfg without line_methods behaves exactly as
-    before."""
+    before.
+
+    Bucket matching is delegated to ``_resolve_line_bucket`` (shared with the
+    online recalibration key) so fit and apply never diverge."""
     if not prop_calib_cfg:
         return None, prop_calib_cfg
-    buckets = prop_calib_cfg.get("line_methods")
-    if buckets:
-        try:
-            ln = float(line)
-        except (TypeError, ValueError):
-            ln = None
-        if ln is not None:
-            for b in buckets:
-                cap = b.get("max_line")
-                if cap is None or ln <= cap:
-                    if b.get("method"):
-                        return b.get("method"), {**prop_calib_cfg, **b}
-                    break   # matched a malformed bucket -> fall back to pooled
+    _, bucket = _resolve_line_bucket(prop_calib_cfg, line)
+    if bucket is not None and bucket.get("method"):
+        return bucket.get("method"), {**prop_calib_cfg, **bucket}
+    # No line_methods, no usable/matching bucket, or a matched-but-malformed
+    # bucket (no method) -> fall back to the pooled cfg, exactly as before.
     return prop_calib_cfg.get("method"), prop_calib_cfg
+
+
+def _composite_recal_key(prop_key, line, line_methods):
+    """Key for the online Platt recalibration map (``recalibration_<sport>.json``).
+
+    The map is a FLAT ``{key: fit}`` dict. A prop WITHOUT ``line_methods`` keeps
+    its bare ``prop_key`` (unchanged behavior). A prop WITH ``line_methods`` is fit
+    and applied per line bucket under ``f"{prop_key}@{bucket_key}"`` (e.g.
+    ``batter_hits@le_0.5``, ``batter_hits@top``). Returns ``None`` when the prop
+    has ``line_methods`` but ``line`` resolves to no bucket — the fit side then
+    skips that record and the apply side applies no recal, keeping the two sides
+    symmetric. ``line_methods`` is the base-calibration cfg's list; a real
+    ``prop_key`` never contains ``"@"``, so composite keys never collide with a
+    bare prop key."""
+    if not line_methods:
+        return prop_key
+    bkey, _ = _resolve_line_bucket({"line_methods": line_methods}, line)
+    if bkey is None:
+        return None
+    return f"{prop_key}@{bkey}"
+
+
+def _resolve_recal_cfg(recal_map, prop_key, line, prop_calib_cfg):
+    """Select the online recal fit to apply for (prop, line) from the loaded map.
+
+    - No ``line_methods`` on the prop -> the bare ``prop_key`` fit (flat, exactly
+      today's behavior; covers all NBA/NFL and most MLB props).
+    - ``line_methods`` present and this line's ``prop_key@bucket`` fit exists ->
+      that fit.
+    - ``line_methods`` present, this bucket has no fit, but SOME ``prop_key@…``
+      composite key exists (a post-migration per-bucket map) -> ``None``: the
+      bucket earned no valid map, so leave the base-calibration prob untouched
+      rather than borrow another bucket's shrinkage.
+    - ``line_methods`` present but the map has NO composite key for this prop (a
+      pre-migration flat blob still in the overlay) -> fall back to the bare
+      ``prop_key`` fit, so behavior is unchanged until the first per-bucket refit
+      rewrites the overlay."""
+    if not recal_map:
+        return None
+    line_methods = (prop_calib_cfg or {}).get("line_methods")
+    if line_methods:
+        bkey, _ = _resolve_line_bucket(prop_calib_cfg, line)
+        if bkey is not None:
+            hit = recal_map.get(f"{prop_key}@{bkey}")
+            if hit is not None:
+                return hit
+        prefix = prop_key + "@"
+        if any(k.startswith(prefix) for k in recal_map):
+            return None
+        # Pre-migration flat map: no composite keys for this prop yet.
+    return recal_map.get(prop_key)
 
 
 # Per-sport override for the recency half-life *for player props specifically*.
@@ -1152,21 +1228,25 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # Safe Mode branches. Safe Mode previously exited before this step,
             # so its displayed confidence did not have parity with standard props.
             raw_over_rate = over_rate
-            recal_cfg = recalibration.get(prop_key) if recalibration else None
+            # Per-line-bucket recal: a prop with line_methods gets its bucket's
+            # Platt fit (or none, if that bucket earned no valid map); a prop
+            # without line_methods keeps its single pooled fit (unchanged).
+            recal_cfg = _resolve_recal_cfg(
+                recalibration, prop_key, line, prop_calib_cfg)
 
-            def _apply_final_recalibration(probability):
-                if not recal_cfg or recal_cfg.get("a") is None:
+            def _apply_final_recalibration(probability, cfg):
+                if not cfg or cfg.get("a") is None:
                     return probability
                 adjusted = apply_platt(
                     probability,
-                    recal_cfg.get("a"),
-                    recal_cfg.get("b"),
+                    cfg.get("a"),
+                    cfg.get("b"),
                 )
                 if adjusted is None:
                     return probability
                 return max(0.0, min(1.0, adjusted))
 
-            over_rate = _apply_final_recalibration(over_rate)
+            over_rate = _apply_final_recalibration(over_rate, recal_cfg)
             recal_meta = None
             if over_rate != raw_over_rate:
                 recal_meta = {
@@ -1240,7 +1320,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         )
                         if calibrated is not None:
                             raw_probability = max(0.0, min(1.0, calibrated))
-                    return historical, _apply_final_recalibration(raw_probability)
+                    # Recalibrate by the bucket for THIS threshold_line (the alt
+                    # line Safe Mode actually prices), matching the base-cfg
+                    # bucket resolved just above — not the book-line bucket.
+                    sm_recal_cfg = _resolve_recal_cfg(
+                        recalibration, prop_key, threshold_line, prop_calib_cfg)
+                    return historical, _apply_final_recalibration(
+                        raw_probability, sm_recal_cfg)
 
                 historical_at_safe, p_at_safe = _probability_at_threshold(safe_threshold)
 

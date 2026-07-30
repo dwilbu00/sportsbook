@@ -1986,11 +1986,23 @@ def load_recalibration(sport_key):
 def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNCH,
                 newly_resolved=None):
     """Resolve pending outcomes, then refit Platt for every prop with enough
-    resolved entries. Returns dict {prop_key: (a, b, n_fit)}."""
+    resolved entries. Returns dict {fit_key: (a, b, n_fit)} where fit_key is the
+    bare prop_key, or "<prop>@<bucket>" for props with a line_methods cfg."""
     if resolve_first:
         newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
     elif newly_resolved is None:
         newly_resolved = 0
+
+    # Per-line-bucket recal: fit each line_methods bucket separately so a prop
+    # whose line regimes have different base rates (e.g. batter_hits 0.5 vs 1.5)
+    # is not miscalibrated by a single pooled map. Lazily imported to avoid the
+    # props <-> recalibration import cycle (same pattern as the seed path).
+    from props import _composite_recal_key
+    from calibration_loader import load_calibration
+    cal = load_calibration(sport_key) or {}
+
+    def _line_methods_for(prop_key):
+        return (cal.get(prop_key) or {}).get("line_methods")
 
     rows = _read_log()
     # Repeated app launches can log the same published player/game/line more
@@ -2012,18 +2024,22 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
     for r in unique_rows.values():
         o = r["outcome"]
         order_key = r.get("game_date") or r.get("ts") or ""
-        by_prop_records[r["prop_key"]].append(
+        rec_key = _composite_recal_key(
+            r["prop_key"], r.get("line"), _line_methods_for(r["prop_key"]))
+        if rec_key is None:
+            continue
+        by_prop_records[rec_key].append(
             (order_key, float(r["raw_prob"]), int(o)))
 
     fits = {}
     per_prop_params = {}
-    for prop_key, records in by_prop_records.items():
+    for fit_key, records in by_prop_records.items():
         result = fit_platt_chronological(records)
         if result is None:
             continue
         a, b = result["a"], result["b"]
-        fits[prop_key] = (a, b, result["n_fit"])
-        per_prop_params[prop_key] = {
+        fits[fit_key] = (a, b, result["n_fit"])
+        per_prop_params[fit_key] = {
             "a": round(a, 5),
             "b": round(b, 5),
             "n_fit": result["n_fit"],
@@ -2155,6 +2171,7 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
     from props import (
         _player_prop_half_life, _player_prop_defense_strength,
         _player_prop_venue_strength, _method_cfg_for_line,
+        _composite_recal_key,
     )
 
     # Union the DURABLE historical_odds backfill store with the app's own
@@ -2259,18 +2276,26 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         if actual == line:
             continue
         y = 1 if actual > line else 0
-        by_prop_records[obs["prop_key"]].append(
+        # Per-line-bucket key: a prop with line_methods is fit per bucket under
+        # "<prop>@<bucket>" (matching the runtime apply); a prop without it keeps
+        # the bare prop_key (pooled, unchanged). A line that resolves to no bucket
+        # -> None -> skip (symmetric with the apply side).
+        rec_key = _composite_recal_key(
+            obs["prop_key"], line, prop_cfg.get("line_methods"))
+        if rec_key is None:
+            continue
+        by_prop_records[rec_key].append(
             (obs.get("game_date") or "", raw, y))
 
     fits = {}
     per_prop_params = {}
-    for prop_key, records in by_prop_records.items():
+    for fit_key, records in by_prop_records.items():
         result = fit_platt_chronological(records)
         if result is None:
             continue
         a, b = result["a"], result["b"]
-        fits[prop_key] = (a, b, result["n_fit"])
-        per_prop_params[prop_key] = {
+        fits[fit_key] = (a, b, result["n_fit"])
+        per_prop_params[fit_key] = {
             "a": round(a, 5),
             "b": round(b, 5),
             "n_fit": result["n_fit"],
