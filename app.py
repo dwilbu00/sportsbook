@@ -1599,6 +1599,7 @@ def render_my_bets():
         st.dataframe([
             {
                 "Bet type": b.get("label") or (b["bet_type"] or "—").title(),
+                "Pending": b["pending"],
                 "Settled": b["resolved"],
                 "W–L–P": f"{b['won']}–{b['lost']}–{b['push']}",
                 "Staked": f"${b['total_staked']:.2f}",
