@@ -2350,6 +2350,19 @@ def _main_cli():
                    help="Print current recalibration params for the sport.")
     args = p.parse_args()
 
+    # Target the durable SQL/Blob backend when the SQL_*/Blob secrets are
+    # configured (mirrors the app's boot promotion + refit_calibration.main;
+    # outside Streamlit these aren't in the env yet). Without this, --seed/--refit
+    # read the odds_line warehouse + prediction log via _sql()/db_store.enabled(),
+    # both False -> fall back to the empty local JSON store -> "Nothing fit."
+    # --seed still writes local-only (save_recalibration to_blob=False); --refit
+    # updates the durable overlay, as intended. Falls back to local when unset.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
+
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
     target_props = PROPS_BY_SPORT.get(args.sport, [])
 
