@@ -524,6 +524,17 @@ def get_remaining_credits():
     return _remaining_credits
 
 
+def reset_remaining_credits():
+    """Forget the last known remaining-credit balance (e.g. after an API-key
+    change) so the pre-flight budget gate treats it as unknown and lets the next
+    analysis run. The first live call under the new key repopulates the count
+    from the ``x-requests-remaining`` response header. Without this, an exhausted
+    old key leaves this module global at 0 and the gate ``st.stop()``s before any
+    call can refresh it — deadlocking a freshly-entered, funded key."""
+    global _remaining_credits
+    _remaining_credits = None
+
+
 def is_event_cached(sport, event_id, regions="us", markets="h2h", bookmakers=None):
     """Check if odds for a specific event/market combo are cached and fresh.
 

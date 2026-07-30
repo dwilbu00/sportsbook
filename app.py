@@ -47,6 +47,7 @@ from odds_client import (
     parse_alt_team_lines,
     build_market_comparisons,
     get_remaining_credits,
+    reset_remaining_credits,
     is_event_cached,
     american_to_decimal,
     american_to_implied_prob,
@@ -300,15 +301,30 @@ def _render_market_comparison(
         st.caption(f"🏈 {better_side} reaches or crosses NFL key number {keys}.")
 
 
-def _clear_bet_selections():
-    # Delete (don't just set False) the checkbox keys: writing to a widget key
-    # promotes it to a durable session_state entry and defeats Streamlit's
-    # automatic garbage-collection of keys not rendered on the latest run, so
-    # the bet_selection:* namespace would grow unbounded across sport switches
-    # and re-analyses. Called only from callbacks / pre-render points, so the
-    # widgets are not yet instantiated this run and pop is safe.
+def _clear_bet_selections(rendered_keys=None):
+    # Reset every bet-selection checkbox. Two Streamlit facts pull in opposite
+    # directions:
+    #   1. Popping a widget key does NOT reliably uncheck a checkbox that
+    #      re-renders on the same run — Streamlit restores it from its retained
+    #      widget value, so the box comes back ticked and the bet reappears. A
+    #      keyed widget is reset reliably only by WRITING its value False before
+    #      it instantiates.
+    #   2. But writing False promotes the key to a durable session_state entry
+    #      that escapes Streamlit's GC of unrendered keys, so the bet_selection:*
+    #      namespace would grow unbounded across sport switches / re-analyses.
+    # Resolve both: set the keys that WILL re-render this run (`rendered_keys` —
+    # the current slate's selection keys) to False, and pop everything else.
+    # Always called from a callback / pre-render point, so no bet_selection
+    # widget is instantiated yet this run and both writes are safe. With no
+    # rendered_keys (e.g. sport change / new analyze that drops analysis_results)
+    # nothing re-renders, so the plain pop-all is correct.
+    rendered = set(rendered_keys or ())
     for key in list(st.session_state):
-        if str(key).startswith("bet_selection:"):
+        if not str(key).startswith("bet_selection:"):
+            continue
+        if key in rendered:
+            st.session_state[key] = False
+        else:
             st.session_state.pop(key, None)
 
 
@@ -443,7 +459,9 @@ def _submit_selected_picks(ar, valid_keys=None):
             "selections were kept — try again.",
         )
         return
-    _clear_bet_selections()
+    # Uncheck the just-submitted boxes reliably: the same slate re-renders this
+    # run, so pass its keys to be written False (not merely popped).
+    _clear_bet_selections(valid_keys)
     st.session_state["_submit_picks_msg"] = (
         "success",
         f"Submitted {added} pick(s) to your bet ledger — track ROI on "
@@ -485,7 +503,9 @@ def _auto_pick_top_bets(ar):
             continue
         pool.append((sel_key, bet_type, side, cand))
     chosen = bet_selector.select_top_bets(pool, sport_key, n, metric=metric)
-    _clear_bet_selections()
+    # Reset every on-screen box to False (reliable uncheck of the prior group),
+    # then tick the chosen ones — order matters so chosen end up True.
+    _clear_bet_selections({key for key, *_ in _iter_wager_candidates(ar)})
     for key in chosen:
         st.session_state[key] = True
     if chosen:
@@ -568,8 +588,8 @@ def _render_selected_bet_checklist(entries, ar):
             stake_col, submit_col = st.columns([1, 1])
             with stake_col:
                 st.number_input(
-                    "Unit stake ($)", min_value=0.0, value=10.0, step=1.0,
-                    key="wager_unit_stake",
+                    "Unit stake ($)", min_value=0.0, value=10.0, step=0.01,
+                    format="%.2f", key="wager_unit_stake",
                     help="Flat dollar stake recorded for each submitted pick.",
                 )
             with submit_col:
@@ -578,7 +598,8 @@ def _render_selected_bet_checklist(entries, ar):
                     help="Record the checked bets to your actual-bets ledger.",
                     on_click=_submit_selected_picks, args=(ar, valid_keys))
         st.button("Clear selected bets", key="clear_selected_bets",
-                  width="stretch", on_click=_clear_bet_selections)
+                  width="stretch", on_click=_clear_bet_selections,
+                  args=(valid_keys,))
 
 
 def _render_alt_ladder(ladder, direction="over", title="Alt lines (DK)", around_line=None, n_around=3, line_style="decimal", prob_fn=None):
@@ -832,6 +853,7 @@ def show_setup_wizard():
     if st.button("💾 Save API Key", type="primary", width='stretch'):
         if new_key and len(new_key) > 10 and new_key != "YOUR_API_KEY_HERE":
             save_api_key(new_key)
+            reset_remaining_credits()  # start the new key with an unknown (ungated) balance
             st.success("API key saved! The app will now reload...")
             st.balloons()
             st.rerun()
@@ -1635,7 +1657,7 @@ def render_my_bets():
                         "Line", help="The line you placed at", step=0.5,
                         format="%.1f"),
                     "Stake": st.column_config.NumberColumn(
-                        "Stake", help="Dollar stake", min_value=0.0, step=1.0,
+                        "Stake", help="Dollar stake", min_value=0.0, step=0.01,
                         format="$%.2f"),
                 },
             )
@@ -2009,7 +2031,9 @@ with st.sidebar:
                                 placeholder="Enter new key...")
         if st.button("Update Key"):
             if new_key and len(new_key) > 10:
-                save_api_key(new_key)
+                save_api_key(new_key)          # writes config.json + load_config.clear()
+                reset_remaining_credits()      # lift the exhausted-credit gate for the new key
+                fetch_events.clear()           # drop events cached under the old key
                 st.success("Key updated!")
                 st.rerun()
             else:
@@ -2155,7 +2179,11 @@ with col_safe:
 # Clear stale parlays as soon as a new Analyze is requested so they don't
 # render below this point before the analysis block runs.
 if analyze_clicked and selected_game_labels:
-    _clear_bet_selections()
+    # Defer the selection reset to the results block (after the new slate's
+    # entries are known, before the checkboxes render) so any re-rendered boxes
+    # are written False — reliable even on a same-slate re-analyze, where pop()
+    # alone would let Streamlit restore the old ticks.
+    st.session_state["_reset_bet_selections"] = True
     st.session_state.pop("parlay_results", None)
     st.session_state.pop("parlay_mode", None)
 
@@ -2812,6 +2840,12 @@ if "analysis_results" in st.session_state:
     all_props = [c for c in ar["all_props"] if c.get("no_history") or c.get("games_sampled", 0) >= 5]
     checklist_entries = _value_bet_checklist_entries(
         all_ml, all_spreads, all_totals, all_props)
+    # A fresh Analyze deferred its selection reset to here — now that the new
+    # slate's entries are known and before the checkboxes render below, write
+    # their keys False (reliable uncheck) and pop any leftover from a prior slate.
+    if st.session_state.pop("_reset_bet_selections", False):
+        _clear_bet_selections(
+            {entry["selection_key"] for entry in checklist_entries})
 
     st.divider()
 
