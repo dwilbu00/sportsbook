@@ -205,13 +205,41 @@ def _fetch_csv(url):
     return list(csv.DictReader(io.StringIO(text)))
 
 
+def _dedup_by_anchor(rows, anchor, prefer="mlb_id"):
+    """Collapse rows sharing the same UNIQUE anchor to one so a duplicate id in the
+    SFBB feed can't violate the table's UNIQUE constraint. SFBB occasionally ships
+    two rows for one IDPLAYER (e.g. a retired player listed twice — the 'burneaj01'
+    duplicate that crashed the first bulk load). Keeps the first occurrence, but
+    upgrades to a later row that carries ``prefer`` (mlb_id — the key the whole
+    pipeline joins on) when the kept one lacks it. Deterministic in CSV order."""
+    by, order = {}, []
+    for r in rows:
+        k = r.get(anchor)
+        if k not in by:
+            by[k] = r
+            order.append(k)
+        elif prefer and not by[k].get(prefer) and r.get(prefer):
+            by[k] = r
+    return [by[k] for k in order]
+
+
 def _parse_player_rows(csv_rows, fetched_at):
-    """SFBB player CSV rows → player_id_map insert params. Anchored on IDPLAYER
-    (never blank); a row with no usable name is dropped (name_norm is NOT NULL)."""
+    """SFBB player CSV rows → player_id_map insert params, one per IDPLAYER.
+
+    Anchored on IDPLAYER (never blank); a row with no usable name is dropped
+    (name_norm is NOT NULL). Explicitly-inactive rows (ACTIVE=N) are dropped: a
+    retired player is noise for a live-slate bettor and, decisively, SFBB reuses
+    /duplicates IDPLAYER across some of them (two inactive 'burneaj01' rows), which
+    violates uq_player_id_map. A blank/unknown ACTIVE flag is KEPT — never drop a
+    possibly-current player on a malformed flag. A final dedup on IDPLAYER makes
+    the write bulletproof even against an active/active duplicate."""
     out = []
     for r in csv_rows:
         sfbb_id = _s(r.get("IDPLAYER"))
         if not sfbb_id:
+            continue
+        active = _active(r.get("ACTIVE"))
+        if active is False:                 # drop only confirmed-retired players
             continue
         name = _s(r.get("PLAYERNAME")) or _s(r.get("MLBNAME"))
         name_norm = db_store.normalize_name(name)
@@ -231,11 +259,11 @@ def _parse_player_rows(csv_rows, fetched_at):
             "bats": _s(r.get("BATS")),
             "throws": _s(r.get("THROWS")),
             "dk_name": _s(r.get("DRAFTKINGSNAME")),
-            "active": _active(r.get("ACTIVE")),
+            "active": active,
             "source": "sfbb",
             "fetched_at": fetched_at,
         })
-    return out
+    return _dedup_by_anchor(out, "sfbb_id")
 
 
 def _parse_team_rows(csv_rows, fetched_at):
@@ -258,7 +286,9 @@ def _parse_team_rows(csv_rows, fetched_at):
             "source": "sfbb",
             "fetched_at": fetched_at,
         })
-    return out
+    # Dedup on the UNIQUE anchor for symmetry/robustness (teams have no mlb_id, so
+    # this is a plain keep-first — 30 unique codes in practice, but cheap insurance).
+    return _dedup_by_anchor(out, "sfbb_code", prefer=None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

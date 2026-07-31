@@ -17,9 +17,14 @@ import player_id_map
 # on the header exercises the utf-8-sig decode. Cases embedded:
 #   * Mike Trout        — unique, active (round-trip anchor)
 #   * Will Smith ×2      — two ACTIVE namesakes, different MLBIDs → ambiguous → None
-#   * Jose Ramirez ×2    — active + inactive namesake → active wins (accent-folded)
+#   * Jose Ramirez ×2    — active + inactive namesake → inactive dropped, active resolves
 #   * Shohei Ohtani ×2   — two-way: two rows, SAME MLBID → resolves (not ambiguous)
-#   * Prospect Guy       — blank MLBID → mlb lookups None, name still stored
+#   * Prospect Guy       — active, blank MLBID → mlb lookups None, name still stored
+#   * Retired Guy        — ACTIVE=N → dropped entirely (active-only load)
+#   * Burn Dupe ×2       — the real 'burneaj01' crash: two rows, SAME IDPLAYER, BOTH
+#                          inactive → both dropped (so they can't collide on UNIQUE)
+#   * Twin Guy ×2        — two rows, SAME IDPLAYER, BOTH active → deduped to one,
+#                          keeping the MLBID-bearing row (defensive UNIQUE guard)
 _PLAYERS_CSV = "﻿" + "\n".join([
     "IDPLAYER,PLAYERNAME,MLBNAME,MLBID,ESPNID,BREFID,IDFANGRAPHS,TEAM,POS,ALLPOS,BATS,THROWS,DRAFTKINGSNAME,ACTIVE",
     "sfbb001,Mike Trout,Mike Trout,545361,30836,troutmi01,10155,LAA,OF,OF,R,R,Mike Trout,Y",
@@ -29,7 +34,12 @@ _PLAYERS_CSV = "﻿" + "\n".join([
     "sfbb005,Jose Ramirez,Jose Ramirez,000001,9999,ramirjo99,99999,FA,P,P,R,R,Jose Ramirez,N",
     "sfbb006,Shohei Ohtani,Shohei Ohtani,660271,39832,ohtansh01,19755,LAD,DH,DH,L,R,Shohei Ohtani,Y",
     "sfbb007,Shohei Ohtani,Shohei Ohtani,660271,39832,ohtansh01,19755,LAD,P,P,L,R,Shohei Ohtani,Y",
-    "sfbb008,Prospect Guy,Prospect Guy,,88888,,,SD,SS,SS,R,R,Prospect Guy,N",
+    "sfbb008,Prospect Guy,Prospect Guy,,88888,,,SD,SS,SS,R,R,Prospect Guy,Y",
+    "sfbb009,Retired Guy,Retired Guy,400001,44444,retgu01,40001,FA,OF,OF,R,R,Retired Guy,N",
+    "burndup1,Burn Dupe,Burn Dupe,410001,45001,burndup1,41001,FA,P,P,R,R,,N",
+    "burndup1,Burn Dupe,Burn Dupe,410002,45002,burndup1,41002,FA,P,P,R,R,,N",
+    "twindup1,Twin Guy,Twin Guy,,46001,twindup1,42001,NYY,OF,OF,R,R,Twin Guy,Y",
+    "twindup1,Twin Guy,Twin Guy,777001,46002,twindup1,42002,NYY,OF,OF,R,R,Twin Guy,Y",
 ])
 
 # Real SFBB team headers (subset). CLE nickname is deliberately the stale "Indians";
@@ -120,7 +130,11 @@ class FetchParseTests(_Backend, unittest.TestCase):
                 select(func.count()).select_from(player_id_map.player_id_map)).scalar()
             n_teams = conn.execute(
                 select(func.count()).select_from(player_id_map.team_id_map)).scalar()
-        self.assertEqual(n_players, 8)       # all rows incl. the blank-MLBID one
+        # 13 CSV rows → 8 stored: 4 inactive dropped (Jose 000001, Retired Guy, and
+        # both Burn Dupe rows), the two active Twin Guy rows deduped to one. Trout,
+        # both Will Smiths, active Jose, both Ohtani rows, Prospect Guy (active,
+        # blank MLBID), and the deduped Twin Guy remain.
+        self.assertEqual(n_players, 8)
         self.assertEqual(n_teams, 6)
         # BOM stripped → the first row's IDPLAYER key is clean, so Trout is found.
         self.assertEqual(player_id_map.mlb_id_for_name("Mike Trout"), "545361")
@@ -149,7 +163,8 @@ class PlayerLookupTests(_Backend, unittest.TestCase):
         self.assertIsNone(player_id_map.mlb_id_for_name("Will Smith"))
 
     def test_active_wins_over_inactive_namesake(self):
-        # Active Jose Ramirez wins; accented odds spelling still folds to a match.
+        # The inactive Jose Ramirez (000001) is dropped at load, so only the active
+        # 608070 row remains; the accented odds spelling still folds to that match.
         self.assertEqual(player_id_map.mlb_id_for_name("José Ramírez"),
                          "608070")
 
@@ -158,8 +173,29 @@ class PlayerLookupTests(_Backend, unittest.TestCase):
         self.assertEqual(player_id_map.mlb_id_for_name("Shohei Ohtani"), "660271")
 
     def test_blank_mlb_id_is_none_but_espn_present(self):
+        # Prospect Guy is active with a blank MLBID → stored (name/espn resolve),
+        # but mlb lookups return None.
         self.assertIsNone(player_id_map.mlb_id_for_name("Prospect Guy"))
         self.assertEqual(player_id_map.espn_id_for_name("Prospect Guy"), "88888")
+
+    def test_inactive_players_are_not_stored(self):
+        # ACTIVE=N rows (retired) are dropped at load: noise for a live-slate
+        # bettor, and SFBB duplicates some retired IDPLAYERs (the crash guarded
+        # against below). Retired Guy has a real MLBID yet must not resolve.
+        self.assertIsNone(player_id_map.mlb_id_for_name("Retired Guy"))
+        self.assertIsNone(player_id_map.get_row("Retired Guy"))
+
+    def test_inactive_duplicate_idplayer_does_not_crash_load(self):
+        # The real 'burneaj01' case: two rows share one IDPLAYER and are BOTH
+        # inactive. The active filter drops them before they can collide on
+        # uq_player_id_map — _load in setUp would have raised on write otherwise.
+        self.assertIsNone(player_id_map.mlb_id_for_name("Burn Dupe"))
+
+    def test_active_duplicate_idplayer_deduped_preferring_mlb_id(self):
+        # Two ACTIVE rows share one IDPLAYER; the write anchors UNIQUE on it, so the
+        # loader collapses them to one, keeping the MLBID-bearing row so the pipeline
+        # key survives. Regressing the dedup would raise a UNIQUE violation on write.
+        self.assertEqual(player_id_map.mlb_id_for_name("Twin Guy"), "777001")
 
     def test_espn_mlb_bridge_round_trip(self):
         self.assertEqual(player_id_map.espn_id_for_mlb_id("545361"), "30836")
