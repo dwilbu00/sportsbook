@@ -534,23 +534,56 @@ def _build_odds_lookup(store, espn_teams):
     """
     Index a historical-odds store by (date10, espn_home, espn_away) using
     ESPN-normalized team names so it can be joined to ESPN schedule games.
+
+    Additionally emits an id-keyed entry ("id", date10, home_code, away_code)
+    whenever both canonical SFBB team codes resolve — from the codes surfaced by
+    the SQL warehouse, else player_id_map.team_code_for_name. This lets the join
+    prefer stable codes over the lossy exact→ci→substring name match (fixing
+    franchise renames like Indians→Guardians). Fail-open: a code miss leaves only
+    the name key, reproducing today's behavior.
     """
+    try:
+        import player_id_map
+    except Exception:
+        player_id_map = None
     lookup = {}
     unmatched = 0
     for entry in store.get("games", {}).values():
+        date10 = (entry.get("commence_time") or "")[:10]
+        if player_id_map is not None:
+            try:
+                hc = entry.get("home_code") or player_id_map.team_code_for_name(
+                    entry.get("home_team"))
+                ac = entry.get("away_code") or player_id_map.team_code_for_name(
+                    entry.get("away_team"))
+                if hc and ac:
+                    lookup[("id", date10, hc, ac)] = entry
+            except Exception:
+                pass
         eh = _match_espn_name(espn_teams, entry.get("home_team"))
         ea = _match_espn_name(espn_teams, entry.get("away_team"))
         if not eh or not ea:
             unmatched += 1
             continue
-        date10 = (entry.get("commence_time") or "")[:10]
         lookup[(date10, eh, ea)] = entry
     return lookup, unmatched
 
 
 def _lookup_game_odds(lookup, date10, home, away):
-    """Find a stored game by date (±1 day) and ESPN team names."""
+    """Find a stored game by date (±1 day), preferring canonical SFBB team codes
+    (robust to franchise renames / name-spelling drift) and falling back to the
+    ESPN team-name key. Fail-open on the code resolution."""
+    try:
+        import player_id_map
+        hc = player_id_map.team_code_for_name(home)
+        ac = player_id_map.team_code_for_name(away)
+    except Exception:
+        hc = ac = None
     for d in (date10, _shift_date(date10, -1), _shift_date(date10, 1)):
+        if hc and ac:
+            hit = lookup.get(("id", d, hc, ac))
+            if hit:
+                return hit
         hit = lookup.get((d, home, away))
         if hit:
             return hit
