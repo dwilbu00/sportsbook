@@ -1326,16 +1326,24 @@ def resolve_player_game_stat(name, commence_time, game_date, group, stat_key,
     # date — so the true game can live under game_date-1. Collect every candidate
     # and choose by nearest scheduled start, never first-date-wins (which would
     # bind an everyday hitter to the following day's game).
-    candidates = []  # (gamePk, scheduled_start_dt_or_None, info)
-    seen = set()
+    # One entry per physical gamePk. A postponed game keeps its ORIGINAL gamePk
+    # when it's made up, so the same pk surfaces under both its original date
+    # (detailedState 'Postponed') and its makeup date (genuine Final). Dedup by pk
+    # but PREFER the genuine-final occurrence — otherwise the earlier 'Postponed'
+    # entry wins the dedup and a made-up game strands forever (never grades, and
+    # never voids either, since is_confirmed_dnp sees the pk still in the schedule).
+    by_pk_cand = {}  # gamePk -> (scheduled_start_dt_or_None, info)
     for d in _candidate_dates(game_date):
         for pk, info in get_schedule_index(d).items():
-            if pk in by_pk and pk not in seen:
-                seen.add(pk)
-                candidates.append(
-                    (pk, _parse_utc(info.get("gameDate")), info))
-    if not candidates:
+            if pk not in by_pk:
+                continue
+            existing = by_pk_cand.get(pk)
+            if existing is None or (not _is_genuine_final(existing[1])
+                                    and _is_genuine_final(info)):
+                by_pk_cand[pk] = (_parse_utc(info.get("gameDate")), info)
+    if not by_pk_cand:
         return None
+    candidates = [(pk, gdt, info) for pk, (gdt, info) in by_pk_cand.items()]
 
     # Identify WHICH physical game the bet is on (nearest scheduled start to
     # commence_time), THEN gate on that game's status. Picking the game first is

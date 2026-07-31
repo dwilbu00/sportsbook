@@ -91,6 +91,62 @@ class ResolvePlayerGameStatGateTests(unittest.TestCase):
         self.assertEqual(self._resolve("Final"), 1.0)
 
 
+class MadeUpGameGradesTests(unittest.TestCase):
+    """A postponed game keeps its ORIGINAL gamePk when made up, so the same pk
+    surfaces under both its original date (detailedState 'Postponed') and its
+    makeup date (genuine Final). The resolver must dedup by pk PREFERRING the
+    genuine-final occurrence — else the earlier 'Postponed' entry wins the dedup
+    and the made-up game strands forever (GAME_NOT_FINAL, and is_confirmed_dnp
+    won't void it because the pk is still in the schedule)."""
+
+    SPLITS = [{"game": {"gamePk": 777}, "stat": {"strikeOuts": 9}}]
+
+    def _resolve(self, by_date_index):
+        with patch.object(mlb_starters, "find_player_id",
+                          return_value=("123", True)), \
+             patch.object(mlb_starters, "_player_gamelog_splits",
+                          return_value=self.SPLITS), \
+             patch.object(mlb_starters, "get_schedule_index",
+                          side_effect=lambda d: by_date_index.get(d, {})):
+            return mlb_starters.resolve_player_game_stat(
+                "P. Ace", "2025-07-01T23:00:00Z", "2025-07-01",
+                "pitching", "strikeOuts", 2025)
+
+    def test_postponed_then_made_up_next_day_grades(self):
+        # Original date processed FIRST (Postponed); makeup (game_date+1) later.
+        index = {
+            "2025-07-01": {"777": {"gameDate": "2025-07-01T23:00:00Z",
+                                   "status": "Final",
+                                   "detailedState": "Postponed"}},
+            "2025-07-02": {"777": {"gameDate": "2025-07-02T23:00:00Z",
+                                   "status": "Final",
+                                   "detailedState": "Final"}},
+        }
+        self.assertEqual(self._resolve(index), 9.0)
+
+    def test_final_not_clobbered_by_later_postponed_entry(self):
+        # Genuine-final entry seen first must not be overwritten by a stale
+        # 'Postponed' copy of the same pk under an adjacent date.
+        index = {
+            "2025-07-01": {"777": {"gameDate": "2025-07-01T23:00:00Z",
+                                   "status": "Final",
+                                   "detailedState": "Final"}},
+            "2025-07-02": {"777": {"gameDate": "2025-07-02T23:00:00Z",
+                                   "status": "Final",
+                                   "detailedState": "Postponed"}},
+        }
+        self.assertEqual(self._resolve(index), 9.0)
+
+    def test_postponed_everywhere_stays_pending(self):
+        # Not yet made up within the ±1-day window -> keep pending, don't grade.
+        index = {
+            "2025-07-01": {"777": {"gameDate": "2025-07-01T23:00:00Z",
+                                   "status": "Final",
+                                   "detailedState": "Postponed"}},
+        }
+        self.assertIs(self._resolve(index), mlb_starters.GAME_NOT_FINAL)
+
+
 class MlbScoresExcludePostponedTests(unittest.TestCase):
     """The team-market score reader drops postponed/suspended games so a
     rained-out game's moneyline/spread/total bets stay pending."""
