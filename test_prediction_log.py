@@ -71,10 +71,13 @@ class LogPredictionFieldTests(unittest.TestCase):
         self.assertIsNone(row["batting_order"])
 
     def test_identity_unaffected_by_new_fields(self):
+        # The pick-rules fields (team, batting_order) never shift identity; the
+        # player component is the hybrid player_key — here "name:<norm>" since no
+        # MLBAM id resolved (SQL/map off in tests) — not the raw display name.
         row = self._build(team="Yankees", batting_order=3)
         self.assertEqual(
             recalibration.prediction_identity(row),
-            ("baseball_mlb", "e1", "batter_hits", "Slugger", 0.5))
+            ("baseball_mlb", "e1", "batter_hits", "name:slugger", 0.5))
 
 
 class UpsertDeduplicationTests(unittest.TestCase):

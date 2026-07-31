@@ -83,6 +83,35 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_prediction_refit_pending
     ON dbo.prediction_log (resolved, refit_performed);
 GO
+-- ── Phase 4: hybrid-identity swap (player name → player_key) ──
+-- The hybrid player_key ("mlb:<id>" else "name:<norm>") becomes the UNIQUE forecast
+-- identity, replacing the raw player name so accent variants / namesakes of one
+-- player collapse to a single row. ORDERING IS THE CRUX: run backfill_player_ids.py
+-- FIRST — it populates player_key on every row and merges any spelling collisions.
+-- This block is a guarded NO-OP until then: it fires only when no prediction_log row
+-- has a NULL player_key, which also prevents SQL Server's "every NULL is equal" rule
+-- from failing the new UNIQUE. Safe + idempotent to re-run (fresh empty DB included).
+IF NOT EXISTS (SELECT 1 FROM dbo.prediction_log WHERE player_key IS NULL)
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.prediction_log')
+                 AND name = 'player_key' AND is_nullable = 1)
+        ALTER TABLE dbo.prediction_log
+            ALTER COLUMN player_key NVARCHAR(200) NOT NULL;
+
+    IF EXISTS (SELECT 1 FROM sys.key_constraints
+               WHERE name = 'uq_prediction_identity'
+                 AND parent_object_id = OBJECT_ID('dbo.prediction_log'))
+        ALTER TABLE dbo.prediction_log DROP CONSTRAINT uq_prediction_identity;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.key_constraints
+                   WHERE name = 'uq_prediction_identity_v2'
+                     AND parent_object_id = OBJECT_ID('dbo.prediction_log'))
+        ALTER TABLE dbo.prediction_log
+            ADD CONSTRAINT uq_prediction_identity_v2
+                UNIQUE (sport_key, event_key, prop_key, player_key, line);
+END
+GO
 --------------------------------------------------------------------------- wagers
 IF OBJECT_ID('dbo.wagers', 'U') IS NULL
 CREATE TABLE dbo.wagers (

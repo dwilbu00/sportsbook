@@ -703,11 +703,20 @@ def read_prediction_log():
 
 
 def prediction_identity(row):
-    """Stable forecast identity, with legacy fallback for pre-event-ID rows."""
+    """Stable forecast identity, keyed on the hybrid player_key (mlb:<id> else
+    name:<norm>) so two spellings of one player collapse to a single forecast.
+
+    Must stay in lockstep with db_store._prediction_identity — both compute the
+    key via db_store.player_key so the mutator's dedup and the surgical-diff
+    layer agree. On the Blob/local path (SQLAlchemy absent, ``_db`` is None) we
+    fall back to the raw player name: those stores were never re-keyed and the
+    id columns don't exist there (the id-based identity is a SQL-only invariant).
+    Legacy fallback for pre-event-ID rows preserved via event_ref."""
     event_ref = row.get("event_id") or row.get("game_date")
+    player = _db.player_key(row) if _db is not None else row.get("player")
     return (
         row.get("sport_key"), event_ref, row.get("prop_key"),
-        row.get("player"), row.get("line"),
+        player, row.get("line"),
     )
 
 

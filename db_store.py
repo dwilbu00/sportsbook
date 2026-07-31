@@ -164,9 +164,9 @@ prediction_log = Table(
     # ("mlb:<id>" or "name:<norm>") that becomes the UNIQUE key in Phase 4.
     Column("player_mlb_id", String(32)),
     Column("team_code", String(16)),
-    Column("player_key", String(200)),
-    UniqueConstraint("sport_key", "event_key", "prop_key", "player", "line",
-                     name="uq_prediction_identity"),
+    Column("player_key", String(200), nullable=False),
+    UniqueConstraint("sport_key", "event_key", "prop_key", "player_key", "line",
+                     name="uq_prediction_identity_v2"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
     Index("ix_prediction_refit_pending", "resolved", "refit_performed"),
 )
@@ -410,17 +410,26 @@ _RECAL_FOLD_SPEC = [
 
 
 def _prediction_derive(row):
-    return {"event_key": (row.get("event_id") or row.get("game_date") or "")}
+    # event_key + the hybrid player_key are both DERIVED (recomputed on every
+    # write) so the stored columns can never drift from the row's source fields.
+    return {
+        "event_key": (row.get("event_id") or row.get("game_date") or ""),
+        "player_key": player_key(row),
+    }
 
 
 def _prediction_identity(row):
-    # Mirrors uq_prediction_identity — the natural key used to diff rows for
-    # surgical writes (event_key coalesced exactly as _prediction_derive stores it).
+    # Mirrors uq_prediction_identity_v2 — the natural key used to diff rows for
+    # surgical writes. Keyed on the hybrid player_key (mlb:<id> else name:<norm>),
+    # RECOMPUTED from the row (not read from the stored column) so before/after
+    # rows key identically whether or not player_key is materialized yet — this
+    # self-heals legacy rows that predate the backfill. event_key is coalesced
+    # exactly as _prediction_derive stores it.
     return {
         "sport_key": row.get("sport_key"),
         "event_key": _prediction_derive(row)["event_key"],
         "prop_key": row.get("prop_key"),
-        "player": row.get("player"),
+        "player_key": player_key(row),
         "line": _f(row.get("line")),
     }
 

@@ -41,6 +41,7 @@ _TEAMS_CSV = "\n".join([
     "ATH,ATH,ATH,ATH,ATH,SAC,Athletics",
     "WAS,WAS,WSH,WSN,WAS,WAS,Nationals",
     "CHW,CWS,CHW,CHW,CHW,CHA,White Sox",
+    "LAA,LAA,LAA,LAA,LAA,ANA,Angels",
 ])
 
 
@@ -120,7 +121,7 @@ class FetchParseTests(_Backend, unittest.TestCase):
             n_teams = conn.execute(
                 select(func.count()).select_from(player_id_map.team_id_map)).scalar()
         self.assertEqual(n_players, 8)       # all rows incl. the blank-MLBID one
-        self.assertEqual(n_teams, 5)
+        self.assertEqual(n_teams, 6)
         # BOM stripped → the first row's IDPLAYER key is clean, so Trout is found.
         self.assertEqual(player_id_map.mlb_id_for_name("Mike Trout"), "545361")
 
