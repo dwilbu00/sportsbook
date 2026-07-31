@@ -1008,9 +1008,10 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
             odds_snapshot.c.event_id, odds_snapshot.c.game_date,
             odds_snapshot.c.commence_time, odds_snapshot.c.home,
             odds_snapshot.c.away, odds_snapshot.c.captured_at,
-            odds_snapshot.c.kind, odds_line.c.snapshot_id,
+            odds_snapshot.c.kind, odds_snapshot.c.home_code,
+            odds_snapshot.c.away_code, odds_line.c.snapshot_id,
             odds_line.c.bet_type, odds_line.c.selection, odds_line.c.point,
-            odds_line.c.price, odds_line.c.implied_prob,
+            odds_line.c.price, odds_line.c.implied_prob, odds_line.c.team_code,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
@@ -1035,6 +1036,8 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
                 "game_date": r._mapping["game_date"],
                 "commence_time": r._mapping["commence_time"],
                 "home": r._mapping["home"], "away": r._mapping["away"],
+                "home_code": r._mapping["home_code"],
+                "away_code": r._mapping["away_code"],
                 "captured_at": r._mapping["captured_at"],
                 "kind": r._mapping["kind"],
                 "snapshot_id": r._mapping["snapshot_id"],
@@ -1043,6 +1046,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
                 "point": r._mapping["point"],
                 "price": r._mapping["price"],
                 "implied_prob": r._mapping["implied_prob"],
+                "team_code": r._mapping["team_code"],
             } for r in rows]
         except OperationalError as exc:  # transient (cold resume / lock / timeout)
             last_exc = exc
@@ -1075,7 +1079,7 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
             odds_snapshot.c.kind, odds_line.c.snapshot_id,
             odds_line.c.selection, odds_line.c.player, odds_line.c.prop_key,
             odds_line.c.direction, odds_line.c.point, odds_line.c.price,
-            odds_line.c.implied_prob,
+            odds_line.c.implied_prob, odds_line.c.player_mlb_id,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
@@ -1105,6 +1109,7 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                 "snapshot_id": r._mapping["snapshot_id"],
                 "selection": r._mapping["selection"],
                 "player": r._mapping["player"],
+                "player_mlb_id": r._mapping["player_mlb_id"],
                 "prop_key": r._mapping["prop_key"],
                 "direction": r._mapping["direction"],
                 "point": r._mapping["point"],

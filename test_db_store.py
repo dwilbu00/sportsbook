@@ -860,6 +860,24 @@ class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
         for key in ("moneyline", "spreads", "totals"):
             self.assertIn(key, entry)
 
+    def test_reader_and_entry_carry_team_codes(self):
+        import warehouse
+        meta = self._meta("20260722T18Z")
+        meta["home_code"], meta["away_code"] = "COL", "HOU"
+        lines = self._team_lines(100, -120)
+        for ln in lines:
+            if ln["bet_type"] in ("moneyline", "spread"):
+                ln["team_code"] = "COL" if ln["selection"] == "Rockies" else "HOU"
+        db_store.capture_odds_snapshot(meta, lines)
+        rows = db_store.team_market_lines("baseball_mlb")
+        self.assertTrue(any(r.get("team_code") == "COL" for r in rows))
+        self.assertTrue(all(r.get("home_code") == "COL" for r in rows))
+        self.assertTrue(all(r.get("away_code") == "HOU" for r in rows))
+        entry = next(iter(
+            warehouse.load_team_market_store("baseball_mlb")["games"].values()))
+        self.assertEqual(entry["home_code"], "COL")
+        self.assertEqual(entry["away_code"], "HOU")
+
 
 class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
     """Player-prop bulk reader (db_store.player_prop_lines) + warehouse
@@ -895,6 +913,19 @@ class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertTrue(all(r["prop_key"] == "batter_hits" for r in rows))
         self.assertEqual({r["direction"] for r in rows}, {"OVER", "UNDER"})
         self.assertTrue(all(r["player"] == "Kris Bryant" for r in rows))
+
+    def test_reader_and_assembler_carry_player_mlb_id(self):
+        import warehouse
+        lines = self._prop_lines(-110, -110)
+        for ln in lines:
+            if ln["bet_type"] == "player_prop":
+                ln["player_mlb_id"] = "665742"
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), lines)
+        rows = db_store.player_prop_lines("baseball_mlb")
+        self.assertTrue(rows)
+        self.assertTrue(all(r.get("player_mlb_id") == "665742" for r in rows))
+        r = warehouse.load_prop_lines("baseball_mlb")[0]
+        self.assertEqual(r.get("player_mlb_id"), "665742")
 
     def test_load_prop_lines_closing_pick_combine_and_et_date(self):
         import warehouse

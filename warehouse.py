@@ -847,6 +847,8 @@ def _assemble_team_entry(event_id, rows):
     # "spreads"/"totals"], so a missing key would KeyError-abort the backtest.
     # _fill_* overwrite when a genuine two-way market is present.
     entry = {"commence_time": commence, "home_team": home, "away_team": away,
+             "home_code": first.get("home_code"),
+             "away_code": first.get("away_code"),
              "event_id": event_id, "props": {},
              "moneyline": {}, "spreads": {}, "totals": {}}
     _fill_moneyline(entry, snap_rows, home, away)
@@ -918,7 +920,7 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     closing_sid = min(
         by_snap, key=lambda sid: _closing_sort_key(target, snap_captured.get(sid)))
 
-    combined = {}   # (player, prop_key) -> {line, over_price, under_price}
+    combined = {}   # (player, prop_key) -> {line, over_price, under_price, mlb_id}
     for r in by_snap[closing_sid]:
         player, prop_key = r.get("player"), r.get("prop_key")
         point = r.get("point")
@@ -926,7 +928,9 @@ def _assemble_prop_entries(event_id, rows, sport_key):
             continue
         e = combined.setdefault((player, prop_key),
                                 {"line": point, "over_price": None,
-                                 "under_price": None})
+                                 "under_price": None, "player_mlb_id": None})
+        if e.get("player_mlb_id") is None:
+            e["player_mlb_id"] = r.get("player_mlb_id")   # first non-None wins
         direction = (r.get("direction") or "").upper()
         if direction == "OVER":
             e["over_price"] = r.get("price")
@@ -936,7 +940,8 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     return [{
         "sport_key": sport_key, "game_date": None, "commence_time": commence,
         "home_team": home, "away_team": away, "event_id": event_id,
-        "player": player, "prop_key": prop_key, "line": e["line"],
+        "player": player, "player_mlb_id": e.get("player_mlb_id"),
+        "prop_key": prop_key, "line": e["line"],
         "over_price": e["over_price"], "under_price": e["under_price"],
     } for (player, prop_key), e in combined.items()]
 
