@@ -59,6 +59,18 @@ GO
 IF COL_LENGTH('dbo.prediction_log', 'batting_order') IS NULL
     ALTER TABLE dbo.prediction_log ADD batting_order INT;
 GO
+-- SFBB cross-map enrichment (Phase 3): MLBAM id + canonical team code + the hybrid
+-- player_key. All nullable now; player_key becomes the UNIQUE identity in Phase 4
+-- (backfill populates it + merges collisions BEFORE the unique swap).
+IF COL_LENGTH('dbo.prediction_log', 'player_mlb_id') IS NULL
+    ALTER TABLE dbo.prediction_log ADD player_mlb_id NVARCHAR(32);
+GO
+IF COL_LENGTH('dbo.prediction_log', 'team_code') IS NULL
+    ALTER TABLE dbo.prediction_log ADD team_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.prediction_log', 'player_key') IS NULL
+    ALTER TABLE dbo.prediction_log ADD player_key NVARCHAR(200);
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_prediction_sport_resolved'
                  AND object_id = OBJECT_ID('dbo.prediction_log'))
@@ -119,6 +131,22 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.wagers'))
 CREATE INDEX ix_wager_status ON dbo.wagers (status);
 GO
+-- SFBB cross-map enrichment (Phase 3): id-based joins. All nullable/best-effort.
+IF COL_LENGTH('dbo.wagers', 'player_mlb_id') IS NULL
+    ALTER TABLE dbo.wagers ADD player_mlb_id NVARCHAR(32);
+GO
+IF COL_LENGTH('dbo.wagers', 'team_code') IS NULL
+    ALTER TABLE dbo.wagers ADD team_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.wagers', 'opponent_code') IS NULL
+    ALTER TABLE dbo.wagers ADD opponent_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.wagers', 'home_code') IS NULL
+    ALTER TABLE dbo.wagers ADD home_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.wagers', 'away_code') IS NULL
+    ALTER TABLE dbo.wagers ADD away_code NVARCHAR(16);
+GO
 
 ------------------------------------------------------- market_prediction_log
 -- Forward tracking for TEAM markets (moneyline / spread / total): the MODEL's
@@ -164,6 +192,19 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.market_prediction_log'))
 CREATE INDEX ix_market_prediction_sport_resolved
     ON dbo.market_prediction_log (sport_key, resolved);
+GO
+-- SFBB cross-map enrichment (Phase 3): canonical team codes. All nullable.
+IF COL_LENGTH('dbo.market_prediction_log', 'team_code') IS NULL
+    ALTER TABLE dbo.market_prediction_log ADD team_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.market_prediction_log', 'opponent_code') IS NULL
+    ALTER TABLE dbo.market_prediction_log ADD opponent_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.market_prediction_log', 'home_code') IS NULL
+    ALTER TABLE dbo.market_prediction_log ADD home_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.market_prediction_log', 'away_code') IS NULL
+    ALTER TABLE dbo.market_prediction_log ADD away_code NVARCHAR(16);
 GO
 
 --------------------------------------------------------------- recalibration_params
@@ -243,6 +284,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_odds_snapshot_event
     ON dbo.odds_snapshot (sport, game_date, event_id);
 GO
+-- SFBB cross-map enrichment (Phase 3): canonical team codes. All nullable.
+IF COL_LENGTH('dbo.odds_snapshot', 'home_code') IS NULL
+    ALTER TABLE dbo.odds_snapshot ADD home_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.odds_snapshot', 'away_code') IS NULL
+    ALTER TABLE dbo.odds_snapshot ADD away_code NVARCHAR(16);
+GO
 
 ----------------------------------------------------------------------- odds_line
 -- One row per extracted line within a snapshot. price/implied reproduce
@@ -266,6 +314,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_odds_line_snapshot'
                  AND object_id = OBJECT_ID('dbo.odds_line'))
 CREATE INDEX ix_odds_line_snapshot ON dbo.odds_line (snapshot_id);
+GO
+-- SFBB cross-map enrichment (Phase 3): id-based joins. All nullable/best-effort.
+IF COL_LENGTH('dbo.odds_line', 'player_mlb_id') IS NULL
+    ALTER TABLE dbo.odds_line ADD player_mlb_id NVARCHAR(32);
+GO
+IF COL_LENGTH('dbo.odds_line', 'team_code') IS NULL
+    ALTER TABLE dbo.odds_line ADD team_code NVARCHAR(16);
 GO
 
 -- ═══════════════════════════════════════════════════════════════════════════

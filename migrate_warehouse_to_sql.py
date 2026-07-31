@@ -87,6 +87,7 @@ def _migrate(pairs, dry_run):
                 continue
             lines = warehouse._enumerate_lines(
                 env["payload"], env.get("format"), kind)
+            meta, lines = warehouse._enrich_ids(meta.get("sport"), meta, lines)
             if db_store.capture_odds_snapshot(meta, lines):
                 written += 1
     return read, written

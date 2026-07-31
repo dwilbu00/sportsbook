@@ -105,6 +105,21 @@ def normalize_name(name):
     return "".join(c for c in n.lower() if c.isalnum() or c.isspace()).strip()
 
 
+def player_key(row):
+    """Hybrid, collision-proof player identity for a durable row: the MLBAM id when
+    the row carries one ("mlb:<id>"), else the normalized name ("name:<norm>").
+
+    The prefix guarantees an id can never collide with a name. ``player`` is
+    NOT NULL upstream so the key is always non-NULL — important because SQL Server
+    treats every NULL in a UNIQUE column as equal, which would collapse unrelated
+    rows. This keeps the id-based identity total across NBA / historical / unmapped
+    rows (which simply fall back to the name key, exactly today's behavior)."""
+    mid = row.get("player_mlb_id")
+    if mid:
+        return f"mlb:{mid}"
+    return f"name:{normalize_name(row.get('player') or '')}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Schema (SQLAlchemy Core metadata; mirrors sql/schema.sql exactly)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,6 +159,12 @@ prediction_log = Table(
     # Nullable (pre-feature rows are NULL → team-based rules reported skipped).
     Column("team", String(160)),
     Column("batting_order", Integer),
+    # SFBB cross-map enrichment (Phase 3, all nullable/best-effort): the MLBAM id +
+    # canonical team code for id-based joins, and player_key = the hybrid identity
+    # ("mlb:<id>" or "name:<norm>") that becomes the UNIQUE key in Phase 4.
+    Column("player_mlb_id", String(32)),
+    Column("team_code", String(16)),
+    Column("player_key", String(200)),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player", "line",
                      name="uq_prediction_identity"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
@@ -187,6 +208,12 @@ wagers = Table(
     Column("executed_price", Integer),
     Column("model_price", Integer),
     Column("close_price", Integer),
+    # SFBB cross-map enrichment (Phase 3, nullable/best-effort): id-based joins.
+    Column("player_mlb_id", String(32)),
+    Column("team_code", String(16)),
+    Column("opponent_code", String(16)),
+    Column("home_code", String(16)),
+    Column("away_code", String(16)),
     UniqueConstraint("wager_id", name="uq_wager_id"),
     CheckConstraint(
         "status IN ('pending','won','lost','push','void')",
@@ -224,6 +251,11 @@ market_prediction_log = Table(
     Column("outcome", Integer),                          # 1=won, 0=lost, NULL=push
     Column("is_value", Boolean),                         # tri-state
     Column("resolved", Boolean, nullable=False, default=False),
+    # SFBB cross-map enrichment (Phase 3, nullable/best-effort): canonical team codes.
+    Column("team_code", String(16)),
+    Column("opponent_code", String(16)),
+    Column("home_code", String(16)),
+    Column("away_code", String(16)),
     UniqueConstraint("sport_key", "event_key", "bet_type",
                      name="uq_market_prediction_identity"),
     Index("ix_market_prediction_sport_resolved", "sport_key", "resolved"),
@@ -292,6 +324,9 @@ odds_snapshot = Table(
     Column("regions", String(64)),
     Column("markets", String(256)),
     Column("bookmakers", String(256)),
+    # SFBB cross-map enrichment (Phase 3, nullable/best-effort): canonical team codes.
+    Column("home_code", String(16)),
+    Column("away_code", String(16)),
     UniqueConstraint("sport", "game_date", "event_id", "kind", "snapshot_hour",
                      name="uq_odds_snapshot"),   # write-once per hour bucket
     Index("ix_odds_snapshot_event", "sport", "game_date", "event_id"),
@@ -313,6 +348,9 @@ odds_line = Table(
     Column("direction", String(8)),
     Column("price", Integer),
     Column("implied_prob", Float),
+    # SFBB cross-map enrichment (Phase 3, nullable/best-effort): id-based joins.
+    Column("player_mlb_id", String(32)),
+    Column("team_code", String(16)),
     Index("ix_odds_line_snapshot", "snapshot_id"),
 )
 
@@ -326,7 +364,7 @@ _PREDICTION_SPEC = [
     ("line", _f), ("raw_prob", _f), ("final_prob", _f), ("projected", _f),
     ("actual", _f),
     ("price", _i), ("outcome", _i), ("batting_order", _i),
-    ("team", _s),
+    ("team", _s), ("player_mlb_id", _s), ("team_code", _s), ("player_key", _s),
     ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
 
@@ -340,6 +378,8 @@ _WAGER_SPEC = [
     ("point", _f), ("line", _f), ("stake", _f), ("model_prob", _f),
     ("model_edge", _f), ("close_line", _f), ("clv_pct", _f), ("profit", _f),
     ("executed_price", _i), ("model_price", _i), ("close_price", _i),
+    ("player_mlb_id", _s), ("team_code", _s), ("opponent_code", _s),
+    ("home_code", _s), ("away_code", _s),
 ]
 
 # Team-market forward-tracking columns (event_key is derived, like prediction).
@@ -350,6 +390,7 @@ _MARKET_PREDICTION_SPEC = [
     ("matchup", _s), ("book", _s), ("actual", _s), ("resolved_at", _s),
     ("point", _f), ("model_prob", _f), ("raw_prob", _f),
     ("price", _i), ("outcome", _i),
+    ("team_code", _s), ("opponent_code", _s), ("home_code", _s), ("away_code", _s),
     ("is_value", _b), ("resolved", _bexact),
 ]
 
@@ -797,7 +838,8 @@ def save_recal(sport_key, cfg):
 # ──────────────────────────────────────────────────────────────────────────────
 
 _ODDS_LINE_COLS = ("bet_type", "selection", "point", "player", "prop_key",
-                   "direction", "price", "implied_prob")
+                   "direction", "price", "implied_prob",
+                   "player_mlb_id", "team_code")
 
 
 def capture_odds_snapshot(meta, lines):
@@ -820,6 +862,8 @@ def capture_odds_snapshot(meta, lines):
                 "commence_time": _s(meta.get("commence_time")),
                 "home": _s(meta.get("home")),
                 "away": _s(meta.get("away")),
+                "home_code": _s(meta.get("home_code")),
+                "away_code": _s(meta.get("away_code")),
                 "regions": _s(meta.get("regions")),
                 "markets": _s(meta.get("markets")),
                 "bookmakers": _s(meta.get("bookmakers")),
@@ -836,6 +880,8 @@ def capture_odds_snapshot(meta, lines):
                     "direction": _s(ln.get("direction")),
                     "price": _i(ln.get("price")),
                     "implied_prob": _f(ln.get("implied_prob")),
+                    "player_mlb_id": _s(ln.get("player_mlb_id")),
+                    "team_code": _s(ln.get("team_code")),
                 } for ln in lines])
         return True
     except IntegrityError:

@@ -105,12 +105,38 @@ def _blank_row(bet_type, meta):
     }
 
 
+def _enrich_ids(row):
+    """Best-effort: stamp SFBB canonical team codes (+ the player's MLBAM id for
+    props) onto a wager row for id-based joins. MLB-only — team_code_for_name
+    returns None for other sports, and player_mlb_id is resolved only for baseball
+    (a non-MLB name could otherwise collide with an MLB player). Fail-open, never
+    raises; mutates ``row`` in place."""
+    if not (row.get("sport_key") or "").startswith("baseball"):
+        return row
+    try:
+        import player_id_map
+    except Exception:                       # pragma: no cover - import guard
+        return row
+    try:
+        tc = player_id_map.team_code_for_name
+        row["home_code"] = tc(row.get("home_team")) if row.get("home_team") else None
+        row["away_code"] = tc(row.get("away_team")) if row.get("away_team") else None
+        row["team_code"] = tc(row.get("team")) if row.get("team") else None
+        row["opponent_code"] = tc(row.get("opponent")) if row.get("opponent") else None
+        if row.get("player"):
+            row["player_mlb_id"] = player_id_map.mlb_id_for_name(row.get("player"))
+    except Exception:                       # pragma: no cover - never break submit
+        pass
+    return row
+
+
 def build_wager_row(bet_type, side, candidate, meta):
     """Build one ledger row from an analysis candidate. Returns None on failure.
 
     Flat unit stake (meta['stake']); executed price = the model's best price at
-    submit for the chosen side. Pure function — the app supplies event metadata
-    (commence/game_date/home/away) so grading needs no live re-fetch."""
+    submit for the chosen side. The event metadata the app supplies
+    (commence/game_date/home/away) lets grading run with no live re-fetch, and is
+    enriched best-effort with SFBB canonical team codes / the player's MLBAM id."""
     try:
         row = _blank_row(bet_type, meta)
         if not row["event_id"]:
@@ -198,7 +224,7 @@ def build_wager_row(bet_type, side, candidate, meta):
             })
         else:
             return None
-        return row
+        return _enrich_ids(row)
     except Exception:
         return None
 

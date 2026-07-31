@@ -588,8 +588,34 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "actual": None,
         "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
     }
+    _enrich_prediction_ids(row)
     if write:
         log_prediction_rows([row])
+    return row
+
+
+def _enrich_prediction_ids(row):
+    """Best-effort: stamp the SFBB MLBAM id + canonical team code onto a prediction
+    row, then compute its hybrid player_key. MLB-only (an id-space that exists only
+    for baseball; other sports keep player_mlb_id/team_code NULL and player_key
+    falls back to name:<norm>). Fail-open — a missing map / SQL-off / unknown or
+    ambiguous name leaves the id columns NULL. Never raises (log_prediction is
+    best-effort); mutates ``row`` in place and returns it."""
+    row.setdefault("player_mlb_id", None)
+    row.setdefault("team_code", None)
+    try:
+        if (row.get("sport_key") or "").startswith("baseball"):
+            import player_id_map
+            row["player_mlb_id"] = player_id_map.mlb_id_for_name(row.get("player"))
+            if row.get("team"):
+                row["team_code"] = player_id_map.team_code_for_name(row.get("team"))
+    except Exception:                       # pragma: no cover - never break logging
+        pass
+    try:
+        import db_store
+        row["player_key"] = db_store.player_key(row)
+    except Exception:                       # pragma: no cover
+        row["player_key"] = None
     return row
 
 
@@ -1032,9 +1058,30 @@ def build_market_prediction_rows(ar, sport_key):
             })
             rows.append(row)
 
+        for row in rows:
+            _enrich_market_ids(row)
         return rows
     except Exception:
         return []
+
+
+def _enrich_market_ids(row):
+    """Best-effort: stamp SFBB canonical team codes onto a team-market forecast row
+    (home/away + picked team/opponent) for id-based joins. MLB-only — the SFBB team
+    map covers baseball and returns None elsewhere. Fail-open, never raises; mutates
+    ``row`` in place."""
+    if not (row.get("sport_key") or "").startswith("baseball"):
+        return row
+    try:
+        import player_id_map
+        tc = player_id_map.team_code_for_name
+        row["home_code"] = tc(row.get("home_team")) if row.get("home_team") else None
+        row["away_code"] = tc(row.get("away_team")) if row.get("away_team") else None
+        row["team_code"] = tc(row.get("team")) if row.get("team") else None
+        row["opponent_code"] = tc(row.get("opponent")) if row.get("opponent") else None
+    except Exception:                       # pragma: no cover - never break logging
+        pass
+    return row
 
 
 def log_market_prediction_rows(new_rows):

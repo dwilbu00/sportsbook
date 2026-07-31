@@ -104,6 +104,29 @@ class DbStoreOpsTests(_SqliteBackend, unittest.TestCase):
         self.assertIsNone(by_player["No Team"]["team"])
         self.assertIsNone(by_player["No Team"]["batting_order"])
 
+    def test_prediction_id_enrichment_roundtrip(self):
+        # SFBB cross-map enrichment columns (Phase 3): the MLBAM id, canonical team
+        # code, and hybrid player_key round-trip; a row without them stays NULL.
+        def add(rows):
+            rows.append({"sport_key": "baseball_mlb", "event_id": "e1",
+                         "prop_key": "batter_hits", "player": "Mike Trout",
+                         "game_date": "2026-07-20", "line": 0.5, "raw_prob": 0.6,
+                         "player_mlb_id": "545361", "team_code": "LAA",
+                         "player_key": "mlb:545361", "resolved": False})
+            rows.append({"sport_key": "basketball_nba", "event_id": "e2",
+                         "prop_key": "points", "player": "Some Guy",
+                         "game_date": "2026-07-20", "line": 20.5, "raw_prob": 0.6,
+                         "player_key": "name:some guy", "resolved": False})
+            return 2
+        db_store.mutate("prediction_log", add)
+        by_player = {r["player"]: r for r in db_store.read_rows("prediction_log")}
+        self.assertEqual(by_player["Mike Trout"]["player_mlb_id"], "545361")
+        self.assertEqual(by_player["Mike Trout"]["team_code"], "LAA")
+        self.assertEqual(by_player["Mike Trout"]["player_key"], "mlb:545361")
+        self.assertIsNone(by_player["Some Guy"]["player_mlb_id"])
+        self.assertIsNone(by_player["Some Guy"]["team_code"])
+        self.assertEqual(by_player["Some Guy"]["player_key"], "name:some guy")
+
     def test_status_check_constraint_rolls_back(self):
         def bad(rows):
             rows.append({"wager_id": "x", "status": "bogus", "stake": 1.0})
@@ -558,13 +581,26 @@ class SchemaParityTests(unittest.TestCase):
             {c.name for c in db_store.odds_snapshot.columns},
             {"id", "sport", "game_date", "event_id", "kind", "snapshot_hour",
              "captured_at", "commence_time", "home", "away", "regions",
-             "markets", "bookmakers"})
+             "markets", "bookmakers", "home_code", "away_code"})
 
     def test_odds_line_columns(self):
         self.assertEqual(
             {c.name for c in db_store.odds_line.columns},
             {"id", "snapshot_id", "bet_type", "selection", "point", "player",
-             "prop_key", "direction", "price", "implied_prob"})
+             "prop_key", "direction", "price", "implied_prob",
+             "player_mlb_id", "team_code"})
+
+    def test_player_key_prefers_mlb_id(self):
+        self.assertEqual(
+            db_store.player_key({"player_mlb_id": "545361", "player": "Mike Trout"}),
+            "mlb:545361")
+
+    def test_player_key_falls_back_to_normalized_name(self):
+        # No MLBAM id (NBA / historical / unmapped) → accent-folded name key.
+        self.assertEqual(
+            db_store.player_key({"player": "José Ramírez"}), "name:jose ramirez")
+        self.assertEqual(db_store.player_key({"player_mlb_id": "", "player": "X Y"}),
+                         "name:x y")
 
 
 class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):

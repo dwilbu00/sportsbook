@@ -333,6 +333,32 @@ def _enumerate_lines(payload, fmt, kind):
     return lines
 
 
+def _enrich_ids(sport, meta, lines):
+    """Populate SFBB id/code columns on the snapshot meta + its lines (in place).
+
+    MLB-gated, O(1) in-process lookups, fully fail-open: a map miss / SQL-off /
+    non-MLB sport leaves the fields unset (None), never breaking the never-raise
+    capture contract. Team lines resolve ``team_code`` off the selection (a team
+    name; "Over"/"Under" totals fall through to None); prop lines resolve
+    ``player_mlb_id`` off the player name; the snapshot gets home/away codes."""
+    try:
+        if not (sport or "").startswith("baseball"):
+            return meta, lines
+        import player_id_map
+        meta["home_code"] = player_id_map.team_code_for_name(meta.get("home"))
+        meta["away_code"] = player_id_map.team_code_for_name(meta.get("away"))
+        for ln in lines:
+            if (ln.get("bet_type") or "") == "player_prop":
+                ln["player_mlb_id"] = player_id_map.mlb_id_for_name(
+                    ln.get("player"))
+            else:
+                ln["team_code"] = player_id_map.team_code_for_name(
+                    ln.get("selection"))
+    except Exception:
+        pass
+    return meta, lines
+
+
 def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
                        captured_at=None):
     """Archive one fetched event-odds payload. Best-effort; never raises.
@@ -352,7 +378,7 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
         captured_at = captured_at or _now_iso()
         kind = _kind_for_markets(markets)
         if _sql():
-            _db.capture_odds_snapshot({
+            _snap, _lines = _enrich_ids(sport, {
                 "sport": sport, "game_date": game_date, "event_id": event_id,
                 "kind": kind, "snapshot_hour": _hour_bucket(captured_at),
                 "captured_at": captured_at, "commence_time": commence,
@@ -360,6 +386,7 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
                 "regions": regions, "markets": markets,
                 "bookmakers": _books_str(bookmakers),
             }, _enumerate_lines(payload, "the-odds-api-v4-event-odds", kind))
+            _db.capture_odds_snapshot(_snap, _lines)
             return
         name = snapshot_name(sport, game_date, event_id, kind, captured_at)
         envelope = {
@@ -1006,14 +1033,15 @@ def seed_from_store(sport_key, label=""):
             "payload": payload,
         }
         if _sql():
-            if _db.capture_odds_snapshot({
+            _snap, _lines = _enrich_ids(sport_key, {
                 "sport": sport_key, "game_date": game_date,
                 "event_id": event_id, "kind": "seed",
                 "snapshot_hour": _hour_bucket(captured_at),
                 "captured_at": captured_at, "commence_time": commence,
                 "home": entry.get("home_team"), "away": entry.get("away_team"),
                 "regions": None, "markets": "seed", "bookmakers": None,
-            }, _enumerate_lines(payload, "historical_odds_store", "seed")):
+            }, _enumerate_lines(payload, "historical_odds_store", "seed"))
+            if _db.capture_odds_snapshot(_snap, _lines):
                 written += 1
             continue
         name = snapshot_name(sport_key, game_date, event_id, "seed", captured_at)
