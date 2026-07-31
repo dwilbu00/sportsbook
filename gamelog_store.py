@@ -462,9 +462,33 @@ def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None,
     return rows
 
 
+def _mlb_espn_id(name):
+    """Authoritative ESPN athlete id for an MLB player via the SFBB cross-map, or
+    None. Tries the name directly, then bridges name -> MLBAM -> ESPN. Fail-open:
+    a missing map / SQL-off / ambiguous name simply returns None so the caller
+    falls back to search_athlete."""
+    try:
+        import player_id_map
+    except Exception:                       # pragma: no cover - import guard
+        return None
+    try:
+        eid = player_id_map.espn_id_for_name(name)
+        if eid:
+            return eid
+        mid = player_id_map.mlb_id_for_name(name)
+        if mid:
+            return player_id_map.espn_id_for_mlb_id(mid)
+    except Exception:                       # pragma: no cover - never break lookup
+        return None
+    return None
+
+
 def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOURS):
     """Durable name->id lookup. Returns {'id','name','team_id'} or None, matching
-    espn_client.search_athlete. Works for all sports (sport-agnostic cache)."""
+    espn_client.search_athlete. Works for all sports (sport-agnostic cache).
+
+    For MLB, an authoritative ESPN id is seeded from the SFBB cross-map on a cache
+    miss (skipping search_athlete's lossy first-name match entirely)."""
     name_lower = (name or "").lower()
     team_key = "|".join(sorted(str(t) for t in team_ids if t)) if team_ids else ""
     engine = db_store.get_engine()
@@ -489,6 +513,15 @@ def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOU
             m = row._mapping
             return ({"id": m["athlete_id"], "name": m["name"] or name,
                      "team_id": m["team_id"]} if m["athlete_id"] else None)
+
+    # MLB: seed the AUTHORITATIVE ESPN athlete id from the SFBB cross-map before
+    # falling back to search_athlete's lossy first-name match (the "two Will
+    # Smiths" bug). Fail-open — any miss/unavailable map drops through to search.
+    if sport == "baseball":
+        eid = _mlb_espn_id(name)
+        if eid:
+            seed_athlete_id(sport, league, name, eid, team_ids=team_ids)
+            return {"id": str(eid), "name": name, "team_id": None}
 
     from espn_client import search_athlete
     athlete = search_athlete(sport, league, name, team_ids=team_ids)

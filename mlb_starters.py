@@ -1092,11 +1092,60 @@ def _player_index(season):
     return index
 
 
+_PITCHER_BY_ID_CACHE = {}  # season -> {str(mlbam_id): is_pitcher}
+
+
+def _is_pitcher_index(season):
+    """{str(mlbam_id): is_pitcher} for a season, inverted from _player_index (the
+    same cached statsapi payload — no extra fetch)."""
+    cached = _PITCHER_BY_ID_CACHE.get(season)
+    if cached is not None:
+        return cached
+    idx = {}
+    for matches in _player_index(season).values():
+        for pid, is_pitcher in matches:
+            idx[str(pid)] = is_pitcher
+    _PITCHER_BY_ID_CACHE[season] = idx
+    return idx
+
+
+def _player_id_map():
+    """Lazily import the SFBB id-map module, or None if unavailable (missing
+    SQLAlchemy / import error). Guarded like the other optional SQL backends so the
+    pricing core keeps working without it."""
+    try:
+        import player_id_map
+        return player_id_map
+    except Exception:                          # pragma: no cover - import guard
+        return None
+
+
+def _resolve_is_pitcher(mid, season, row):
+    """is_pitcher for an MLBAM id. The statsapi season roster is authoritative (so
+    two-way players like Ohtani keep their statsapi position); the SFBB map's ALLPOS
+    is used only when the id isn't in the roster (e.g. a mid-season callup absent
+    from the cached payload)."""
+    idx = _is_pitcher_index(season)
+    if str(mid) in idx:
+        return idx[str(mid)]
+    allpos = ((row or {}).get("allpos") or "").upper().replace(",", "/")
+    return "P" in [p.strip() for p in allpos.split("/")]
+
+
 def find_player_id(name, season):
     """(mlbam_id, is_pitcher) for a UNIQUE exact full-name match, else None.
 
-    The forecast row carries no team, so a non-unique name is skipped rather
+    Resolves via the SFBB player id-map FIRST — it disambiguates namesakes the
+    statsapi unique-exact match drops (preferring the single active player) and
+    folds accents — then falls back to the statsapi season roster's unique-exact
+    name match. is_pitcher stays statsapi-authoritative. The forecast row carries
+    no team, so a STILL-ambiguous name (two active namesakes) is skipped rather
     than risk binding a prop to the wrong player and poisoning the fit."""
+    pim = _player_id_map()
+    if pim is not None:
+        mid = pim.mlb_id_for_name(name)
+        if mid:
+            return (mid, _resolve_is_pitcher(mid, season, pim.get_row(name)))
     matches = _player_index(season).get(_norm(name))
     if not matches or len(matches) != 1:
         return None

@@ -41,7 +41,19 @@ _SLATE_FINAL_TTL = 24 * 3600    # complete slate on disk: immutable → trust a 
 
 
 def _team_key(name):
-    """Normalize a team name for matching (mirrors backtest_market_consensus)."""
+    """Normalize a team name for matching. For MLB, canonicalize through the SFBB
+    team map (abbreviation / nickname / ESPN-code aware) so divergent feed spellings
+    collapse to one stable 3-letter code; any miss (non-MLB name, SQL off, map
+    unavailable) falls back to the alnum-lower normalization + curated aliases used
+    across the whole grading/backtest infra. This is the single shared team key —
+    backtest_market_consensus imports it."""
+    try:
+        import player_id_map
+        code = player_id_map.team_code_for_name(name)
+        if code:
+            return code
+    except Exception:            # fail open — map unavailable / not an MLB name
+        pass
     normalized = "".join(ch for ch in (name or "").lower() if ch.isalnum())
     aliases = {
         "oaklandathletics": "athletics",

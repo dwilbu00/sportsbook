@@ -44,6 +44,7 @@ from odds_client import (
     get_remaining_credits,
 )
 from espn_client import get_all_teams, get_team_schedule
+from game_results import _team_key      # single shared team key (SFBB-map aware)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -206,17 +207,6 @@ def _same_point(a, b):
         return abs(float(a) - float(b)) < 1e-9
     except (TypeError, ValueError):
         return False
-
-
-def _team_key(name):
-    normalized = "".join(ch for ch in (name or "").lower() if ch.isalnum())
-    aliases = {
-        "oaklandathletics": "athletics",
-        "theathletics": "athletics",
-        "laclippers": "clippers",
-        "losangelesclippers": "clippers",
-    }
-    return aliases.get(normalized, normalized)
 
 
 def _market_offer(game, bookmaker, market_key):
