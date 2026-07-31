@@ -35,6 +35,7 @@ tests connect to ``sqlite://`` and never touch it.
 import os
 import threading
 import time
+import unicodedata
 
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, Index, Integer, MetaData,
@@ -86,6 +87,22 @@ def _b(v):
 
 def _bexact(v):
     return bool(v)  # NOT-NULL boolean: absent/None → False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Identity helpers (leaf functions importable everywhere, so db_store's surgical
+# diff, recalibration's identity, player_id_map, and the backfill all compute the
+# same key and can never drift). ``normalize_name`` == mlb_starters._norm.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize_name(name):
+    """Cross-source name key: NFKD-fold accents to ASCII, lowercase, keep alnum +
+    spaces, strip edges. Identical to mlb_starters._norm so a normalized odds-feed
+    name matches the SFBB map's stored name_norm (which folds the same way)."""
+    if not name:
+        return ""
+    n = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode()
+    return "".join(c for c in n.lower() if c.isalnum() or c.isspace()).strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

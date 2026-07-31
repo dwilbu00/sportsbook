@@ -431,3 +431,97 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_statcast_player_asof_player
     ON dbo.statcast_player_asof (player_id, season_bucket, role);
 GO
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Smart Fantasy Baseball ID cross-maps (data-integrity backbone). Two authoritative
+-- maps, refreshed from smartfantasybaseball.com, that finally LINK the id-spaces the
+-- app already stores but never connected: the betting `player` NAME, the ESPN
+-- athlete_id (gamelog tables), and the MLBAM id (statcast_player_asof / statsapi).
+-- Mirrors player_id_map.py (test_player_id_map.py::SchemaParityTests enforces it).
+-- Refreshed by `python player_id_map.py --refresh` (and lazily, TTL-gated, in-app).
+-- Replace-all per map (fully rebuildable); ids stored as text like the other tables.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+------------------------------------------------------------------- player_id_map
+-- One row per SFBB player. Anchor = sfbb_id (IDPLAYER; always present, unlike the
+-- occasionally-blank MLBID). mlb_id = MLBID = the MLBAM id used by BOTH statsapi
+-- and Statcast, so one numeric key covers the whole MLB player pipeline; espn_id
+-- bridges to the ESPN gamelog tables. name_norm = normalize_name(PLAYERNAME).
+IF OBJECT_ID('dbo.player_id_map', 'U') IS NULL
+CREATE TABLE dbo.player_id_map (
+    id           INT IDENTITY(1,1) PRIMARY KEY,
+    sfbb_id      NVARCHAR(32)  NOT NULL,          -- IDPLAYER (SFBB stable key)
+    mlb_id       NVARCHAR(32),                    -- MLBID = MLBAM (statsapi/Statcast)
+    espn_id      NVARCHAR(32),                    -- ESPNID
+    bref_id      NVARCHAR(32),                    -- BREFID
+    fangraphs_id NVARCHAR(32),                    -- IDFANGRAPHS
+    name         NVARCHAR(160),                   -- PLAYERNAME
+    name_norm    NVARCHAR(160) NOT NULL,          -- normalize_name(PLAYERNAME)
+    team         NVARCHAR(16),                    -- TEAM (SFBB code)
+    pos          NVARCHAR(16),                    -- POS
+    allpos       NVARCHAR(64),                    -- ALLPOS
+    bats         NVARCHAR(8),
+    throws       NVARCHAR(8),
+    dk_name      NVARCHAR(160),                   -- DRAFTKINGSNAME (DK-only bettor)
+    active       BIT,
+    source       NVARCHAR(64),
+    fetched_at   FLOAT,                           -- epoch seconds
+    CONSTRAINT uq_player_id_map UNIQUE (sfbb_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_player_id_map_mlb'
+                 AND object_id = OBJECT_ID('dbo.player_id_map'))
+CREATE INDEX ix_player_id_map_mlb ON dbo.player_id_map (mlb_id);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_player_id_map_espn'
+                 AND object_id = OBJECT_ID('dbo.player_id_map'))
+CREATE INDEX ix_player_id_map_espn ON dbo.player_id_map (espn_id);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_player_id_map_name'
+                 AND object_id = OBJECT_ID('dbo.player_id_map'))
+CREATE INDEX ix_player_id_map_name ON dbo.player_id_map (name_norm);
+GO
+
+--------------------------------------------------------------------- team_id_map
+-- 30 clubs; per-source abbreviations/nicknames (no numeric ids). Canonical key =
+-- the stable 3-letter SFBBTEAM code. nickname (FANGRAPHSTEAM) is DISPLAY-ONLY and
+-- can be stale (shows "Indians" for CLE) → canonicalize off the abbr columns, never
+-- the nickname; the app layer curates full-name aliases (incl. a CLE→Guardians fix).
+IF OBJECT_ID('dbo.team_id_map', 'U') IS NULL
+CREATE TABLE dbo.team_id_map (
+    id             INT IDENTITY(1,1) PRIMARY KEY,
+    sfbb_code      NVARCHAR(16) NOT NULL,         -- SFBBTEAM (canonical)
+    dk_code        NVARCHAR(16),                  -- DKTEAM
+    espn_code      NVARCHAR(16),                  -- ESPNTEAM
+    bbref_code     NVARCHAR(16),                  -- BBREFTEAM
+    fangraphs_abbr NVARCHAR(16),                  -- FANGRAPHSABBR
+    retrosheet     NVARCHAR(16),                  -- RETROSHEET
+    nickname       NVARCHAR(64),                  -- FANGRAPHSTEAM (display; may be stale)
+    name_norm      NVARCHAR(64) NOT NULL,         -- normalize_name(nickname)
+    source         NVARCHAR(64),
+    fetched_at     FLOAT,
+    CONSTRAINT uq_team_id_map UNIQUE (sfbb_code)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_team_id_map_name'
+                 AND object_id = OBJECT_ID('dbo.team_id_map'))
+CREATE INDEX ix_team_id_map_name ON dbo.team_id_map (name_norm);
+GO
+
+--------------------------------------------------------------------- id_map_meta
+-- TTL gate (mirror gamelog_fetch_meta): one row per map, last successful refresh +
+-- row count. Lets the lazy in-app refresh serve a stale in-memory index when the
+-- source is briefly unavailable rather than blocking.
+IF OBJECT_ID('dbo.id_map_meta', 'U') IS NULL
+CREATE TABLE dbo.id_map_meta (
+    id              INT IDENTITY(1,1) PRIMARY KEY,
+    map_name        NVARCHAR(16) NOT NULL,        -- 'player' | 'team'
+    last_fetched_at FLOAT,                         -- epoch seconds
+    row_count       INT,
+    CONSTRAINT uq_id_map_meta UNIQUE (map_name)
+);
+GO
