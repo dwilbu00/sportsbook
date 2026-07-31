@@ -911,22 +911,34 @@ def odds_snapshots_for_event(sport, game_date, event_id):
 
 
 def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
-                     player=None, prop_key=None, direction=None):
+                     player=None, prop_key=None, direction=None,
+                     player_mlb_id=None, team_code=None):
     """The stored line for a descriptor within one snapshot, or None.
 
     Reproduces _extract_line's matching: props key on (prop_key, player,
     direction); team markets on (selection[, point]) with a fall back to the best
-    price across points when the exact point isn't stored."""
+    price across points when the exact point isn't stored.
+
+    When a canonical id is supplied (``player_mlb_id`` for props, ``team_code``
+    for moneyline/spread) the identity prefers the id — matching enriched rows by
+    id (fixing accents/namesakes) while un-enriched historical rows (id IS NULL)
+    still match by name. A None id degrades to the exact name-only behavior."""
     table = odds_line
     bt = (bet_type or "").lower()
     with get_engine().connect() as conn:
         if bt == "player_prop":
+            if player_mlb_id:
+                ident = ((table.c.player_mlb_id == player_mlb_id)
+                         | (table.c.player_mlb_id.is_(None)
+                            & (table.c.player == player)))
+            else:
+                ident = (table.c.player == player)
             row = conn.execute(
                 select(table.c.price, table.c.implied_prob).where(
                     (table.c.snapshot_id == snapshot_id)
                     & (table.c.bet_type == "player_prop")
                     & (table.c.prop_key == prop_key)
-                    & (table.c.player == player)
+                    & ident
                     & (table.c.direction == ((direction or "OVER").upper())))
             ).first()
             return {"price": row[0], "implied_prob": row[1]} if row else None
@@ -936,8 +948,13 @@ def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
                 "totals": "total", "total": "total"}.get(bt, bt)
         sel = ("Under" if norm == "total" and (selection or "").lower() == "under"
                else "Over" if norm == "total" else selection)
+        if team_code and norm in ("moneyline", "spread"):
+            ident = ((table.c.team_code == team_code)
+                     | (table.c.team_code.is_(None) & (table.c.selection == sel)))
+        else:
+            ident = (table.c.selection == sel)
         base = ((table.c.snapshot_id == snapshot_id)
-                & (table.c.bet_type == norm) & (table.c.selection == sel))
+                & (table.c.bet_type == norm) & ident)
         if point is not None:
             row = conn.execute(
                 select(table.c.price, table.c.implied_prob).where(

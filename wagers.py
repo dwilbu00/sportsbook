@@ -553,7 +553,8 @@ def attach_clv(rows):
                 close = warehouse.closing_line_for(
                     bet_type="player_prop", player=row.get("player"),
                     prop_key=row.get("prop_key"), direction=row.get("direction"),
-                    point=row.get("line"), **common)
+                    point=row.get("line"),
+                    player_mlb_id=row.get("player_mlb_id"), **common)
             elif bet_type == "total":
                 close = warehouse.closing_line_for(
                     bet_type="total", selection=row.get("side"),
@@ -561,7 +562,8 @@ def attach_clv(rows):
             else:  # moneyline / spread — selection is the team
                 close = warehouse.closing_line_for(
                     bet_type=bet_type, selection=row.get("team"),
-                    point=row.get("point"), **common)
+                    point=row.get("point"),
+                    team_code=row.get("team_code"), **common)
             if not close or close.get("implied_prob") is None:
                 continue
             row["close_price"] = close.get("price")

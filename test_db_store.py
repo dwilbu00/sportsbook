@@ -684,6 +684,67 @@ class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertEqual(close["price"], 122)          # best across books
         self.assertEqual(warehouse.storage_backend(), "Azure SQL")
 
+    def _prop_line(self, player, player_mlb_id=None):
+        return {"bet_type": "player_prop", "selection": player, "player": player,
+                "prop_key": "batter_hits", "direction": "OVER", "point": 0.5,
+                "price": -120, "implied_prob": 0.55,
+                "player_mlb_id": player_mlb_id}
+
+    def _sid(self):
+        return db_store.odds_snapshots_for_event(
+            "baseball_mlb", "2026-07-22", "e1")[0]["id"]
+
+    def test_prop_lookup_prefers_id_despite_accent(self):
+        # Stored under the accented spelling + canonical id; a differently-spelled
+        # query still matches by id.
+        db_store.capture_odds_snapshot(
+            self._meta("20260722T18Z", kind="prop"),
+            [self._prop_line("José Ramírez", player_mlb_id="608070")])
+        hit = db_store.odds_line_lookup(
+            self._sid(), "player_prop", player="Jose Ramirez",
+            prop_key="batter_hits", direction="OVER", player_mlb_id="608070")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["price"], -120)
+
+    def test_prop_lookup_name_fallback_when_no_id(self):
+        # An un-enriched row (player_mlb_id NULL) still matches by name — whether
+        # the query carries an id (legacy row via the id-IS-NULL arm) or not.
+        db_store.capture_odds_snapshot(
+            self._meta("20260722T18Z", kind="prop"),
+            [self._prop_line("Kris Bryant", player_mlb_id=None)])
+        sid = self._sid()
+        by_name = db_store.odds_line_lookup(
+            sid, "player_prop", player="Kris Bryant",
+            prop_key="batter_hits", direction="OVER")
+        self.assertEqual(by_name["price"], -120)
+        legacy = db_store.odds_line_lookup(
+            sid, "player_prop", player="Kris Bryant",
+            prop_key="batter_hits", direction="OVER", player_mlb_id="999999")
+        self.assertEqual(legacy["price"], -120)
+
+    def test_prop_lookup_none_id_does_not_match_by_null(self):
+        # Footgun guard: a None player_mlb_id must NOT compile to IS NULL and
+        # match every un-enriched row regardless of name.
+        db_store.capture_odds_snapshot(
+            self._meta("20260722T18Z", kind="prop"),
+            [self._prop_line("José Ramírez", player_mlb_id=None)])
+        miss = db_store.odds_line_lookup(
+            self._sid(), "player_prop", player="Someone Else",
+            prop_key="batter_hits", direction="OVER", player_mlb_id=None)
+        self.assertIsNone(miss)
+
+    def test_team_lookup_prefers_code(self):
+        # Stored under the old franchise spelling + canonical code; a query using
+        # the new spelling matches by code.
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), [
+            {"bet_type": "moneyline", "selection": "Cleveland Guardians",
+             "price": 120, "implied_prob": 0.45, "team_code": "CLE"}])
+        hit = db_store.odds_line_lookup(
+            self._sid(), "moneyline", selection="Cleveland Indians",
+            team_code="CLE")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["price"], 120)
+
 
 class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
     """Phase B: bulk team-market reader (db_store.team_market_lines) + the

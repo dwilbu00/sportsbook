@@ -621,12 +621,17 @@ def _closing_sort_key(target_dt, captured_at):
 
 def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
                      commence_time=None, point=None, player=None,
-                     prop_key=None, direction=None):
+                     prop_key=None, direction=None, player_mlb_id=None,
+                     team_code=None):
     """Closing line (best price + implied prob) for a bet, for CLV.
 
     Picks the snapshot for this event captured nearest at-or-before commence
     (else the nearest after), and extracts the bet's price. Returns
-    ``{'price','implied_prob','captured_at'}`` or None. Best-effort."""
+    ``{'price','implied_prob','captured_at'}`` or None. Best-effort.
+
+    ``player_mlb_id``/``team_code`` (SQL path only) let the odds-line lookup
+    prefer the canonical id over the name; the Blob/JSON fallback has no id
+    columns and stays name-based."""
     try:
         target = _parse_utc(commence_time)
         _order = lambda snap: _closing_sort_key(target, snap.get("captured_at"))
@@ -636,7 +641,8 @@ def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
             for snap in sorted(snaps, key=_order):
                 line = _db.odds_line_lookup(
                     snap["id"], bet_type, selection=selection, point=point,
-                    player=player, prop_key=prop_key, direction=direction)
+                    player=player, prop_key=prop_key, direction=direction,
+                    player_mlb_id=player_mlb_id, team_code=team_code)
                 if line is not None:
                     line["captured_at"] = snap.get("captured_at")
                     return line

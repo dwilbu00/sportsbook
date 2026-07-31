@@ -569,6 +569,29 @@ class AttachClvTests(unittest.TestCase):
         self.assertEqual(row["close_price"], -120)
         self.assertIsNotNone(row["clv_pct"])
 
+    def test_forwards_canonical_ids_to_warehouse(self):
+        # attach_clv threads the row's precomputed ids so the odds-line lookup can
+        # prefer id over name (props -> player_mlb_id, ml/spread -> team_code).
+        import warehouse
+        seen = {}
+
+        def fake_closing(**kwargs):
+            seen[kwargs.get("bet_type")] = kwargs
+            return {"price": -120, "implied_prob": 0.545, "captured_at": "x"}
+
+        prop = {"bet_type": "player_prop", "sport_key": "baseball_mlb",
+                "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
+                "direction": "OVER", "line": 1.5, "player_mlb_id": "608070",
+                "commence_time": "2026-07-21T02:30:00Z", "executed_price": -110}
+        ml = {"bet_type": "moneyline", "sport_key": "baseball_mlb",
+              "event_id": "E2", "team": "Cleveland Guardians", "point": None,
+              "team_code": "CLE", "commence_time": "2026-07-21T02:30:00Z",
+              "executed_price": -110}
+        with patch.object(warehouse, "closing_line_for", side_effect=fake_closing):
+            wagers.attach_clv([prop, ml])
+        self.assertEqual(seen["player_prop"].get("player_mlb_id"), "608070")
+        self.assertEqual(seen["moneyline"].get("team_code"), "CLE")
+
 
 class PersistClvTests(unittest.TestCase):
     def _prop(self, commence, seq=0):
