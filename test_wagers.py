@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import db_store
 import game_results
@@ -372,6 +372,64 @@ class FinalScoreDisambiguationTests(unittest.TestCase):
                 "baseball_mlb", "2026-07-26", "Philadelphia Phillies",
                 "New York Yankees", "2026-07-26T23:20:00Z")
         self.assertIsNone(score)
+
+
+class SlateCompletenessCacheTests(unittest.TestCase):
+    """A slate is memoized for the process lifetime only once COMPLETE. An
+    incomplete slate (games still live) must re-fetch after the short memo TTL so
+    a game that goes final is picked up — the UTC-vs-Eastern immutability bug that
+    stranded late games' bets and forecasts as 'pending' until a process restart."""
+
+    def setUp(self):
+        game_results._SCORE_CACHE.clear()
+
+    def tearDown(self):
+        game_results._SCORE_CACHE.clear()
+
+    _PARTIAL = [{"home_team": "A", "away_team": "B", "home_score": 1.0,
+                 "away_score": 2.0, "commence_time": "2026-07-30T23:00:00Z"}]
+    _FULL = _PARTIAL + [{"home_team": "C", "away_team": "D", "home_score": 4.0,
+                         "away_score": 3.0, "commence_time": "2026-07-31T02:00:00Z"}]
+
+    def _run(self, slates, times):
+        """Drive _scores_for_date over a scripted [(games, complete), ...] fetch
+        sequence and a scripted clock; return (results, fetch_count)."""
+        calls = []
+
+        def fake_slate(_gd):
+            calls.append(_gd)
+            return slates[min(len(calls) - 1, len(slates) - 1)]
+
+        clock = {"t": 0.0}
+        fake_time = MagicMock()
+        fake_time.time.side_effect = lambda: clock["t"]
+        results = []
+        with patch.object(game_results, "_mlb_slate_for_date",
+                          side_effect=fake_slate), \
+             patch.object(game_results, "time", fake_time):
+            for t in times:
+                clock["t"] = t
+                results.append(
+                    game_results._scores_for_date("baseball_mlb", "2026-07-30"))
+        return results, len(calls)
+
+    def test_incomplete_slate_refetches_after_ttl(self):
+        ttl = game_results._RECENT_MEMO_TTL
+        results, fetches = self._run(
+            slates=[(self._PARTIAL, False), (self._FULL, True)],
+            times=[1000.0, 1000.0 + ttl - 1, 1000.0 + ttl + 1])
+        self.assertEqual(results[0], self._PARTIAL)   # first fetch: still partial
+        self.assertEqual(results[1], self._PARTIAL)   # within TTL: served from memo
+        self.assertEqual(results[2], self._FULL)      # past TTL: re-fetched → full
+        self.assertEqual(fetches, 2)                  # exactly one re-fetch
+
+    def test_complete_slate_never_refetches(self):
+        results, fetches = self._run(
+            slates=[(self._FULL, True)],
+            times=[1000.0, 1000.0 + game_results._RECENT_MEMO_TTL * 100])
+        self.assertEqual(results[0], self._FULL)
+        self.assertEqual(results[1], self._FULL)
+        self.assertEqual(fetches, 1)                  # complete → cached indefinitely
 
 
 class ReadStatusTests(unittest.TestCase):

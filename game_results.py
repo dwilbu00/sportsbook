@@ -23,12 +23,21 @@ _ESPN_MAP = {
 }
 
 # In-process memo so one grading pass reuses a date's scoreboard fetch. Value is
-# (fetched_at_epoch, [game dicts]): past dates are immutable (memoized for the
-# process lifetime), but a recent date may still be finalizing, so its memo
-# expires after a short TTL — otherwise a game that goes final mid-session stays
-# masked by the stale (final-only) slate that dropped it, stranding its bet.
+# (fetched_at_epoch, [game dicts], complete): a slate is memoized for the process
+# lifetime only once COMPLETE — every game on the date has reached a terminal
+# state, so the slate can no longer change. While any game is still scheduled or
+# live the memo expires after a short TTL, so a game that finishes mid-session is
+# never masked forever by the earlier (partial) slate that dropped it.
+#
+# COMPLETENESS — not the calendar date — is what makes a slate immutable. Keying
+# immutability off "date < today (UTC)" was wrong: an MLB game_date is US-Eastern,
+# so the moment UTC passed midnight (8pm ET) that evening's still-in-progress
+# slate already looked "past" and its partial scores were cached forever, leaving
+# every late game's bet/forecast pending until the process restarted.
 _SCORE_CACHE = {}
-_RECENT_MEMO_TTL = 20 * 60  # seconds
+_RECENT_MEMO_TTL = 20 * 60      # incomplete slate: re-fetch this often (in-process)
+_SLATE_LIVE_TTL = 20 * 60       # incomplete slate on disk: trust only briefly
+_SLATE_FINAL_TTL = 24 * 3600    # complete slate on disk: immutable → trust a day
 
 
 def _team_key(name):
@@ -133,43 +142,70 @@ def grade_team_bet(bet_type, side, point, home_score, away_score):
 # Per-date final-score fetch
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _mlb_scores_for_date(game_date):
-    """List of FINAL MLB games on ``game_date`` (YYYY-MM-DD) with scores.
+def _unwrap_slate(cached):
+    """(games, complete) from a cached slate payload.
 
-    Uses the free statsapi schedule with a linescore hydrate as a run fallback.
-    Cached on disk (results are immutable once final)."""
+    New caches store ``{"games": [...], "complete": bool}``; a legacy bare-list
+    cache has unknown completeness, so treat it as incomplete — it then rides the
+    short freshness window and self-heals into the new format on the next fetch."""
+    if isinstance(cached, dict):
+        return list(cached.get("games") or []), bool(cached.get("complete"))
+    if isinstance(cached, list):
+        return cached, False
+    return [], False
+
+
+def _mlb_slate_for_date(game_date):
+    """(games, complete) for one MLB date (YYYY-MM-DD).
+
+    ``games`` is the list of genuine-final games with scores; ``complete`` is True
+    only when EVERY scheduled game that day has reached a terminal state, so the
+    slate can no longer change and is safe to cache indefinitely. A still-live or
+    postponed/suspended game keeps ``complete`` False, so the date keeps
+    refreshing on the short window until it truly settles — this is what a bare
+    "date < today (UTC)" check got wrong for late US (Eastern) games.
+
+    Uses the free statsapi schedule with a linescore hydrate as a run fallback."""
     try:
         import mlb_starters
     except Exception:
-        return []
+        return [], False
     cache = f"final_scores_mlb_{game_date}"
-    # Past dates are immutable; a current/future date may still have games in
-    # progress (the final-only list omits them), so trust its disk cache only
-    # briefly — else a stale slate that dropped the not-yet-final game strands the
-    # bet (or, via the ±1-day fallback, risks matching the wrong night of a series).
-    today = datetime.now(timezone.utc).date().isoformat()
-    max_age = 6 * 3600 if str(game_date)[:10] < today else 20 * 60
-    cached = mlb_starters._read_cache(cache, max_age=max_age)
+    # A complete slate is immutable → trust the day-long cache; an incomplete one
+    # (some games still live) is trusted only for the short live window so the
+    # not-yet-final games are picked up as they end.
+    cached = mlb_starters._read_cache(cache, max_age=_SLATE_FINAL_TTL)
     if cached is not None:
-        return cached
+        games, complete = _unwrap_slate(cached)
+        if complete:
+            return games, True
+    fresh = mlb_starters._read_cache(cache, max_age=_SLATE_LIVE_TTL)
+    if fresh is not None:
+        return _unwrap_slate(fresh)
     try:
         data = mlb_starters._get(
             "schedule", {"sportId": 1, "date": game_date, "hydrate": "linescore"})
     except Exception:
-        return []
+        return [], False
     games = []
+    total = 0
+    all_final = True
     for d in data.get("dates", []) or []:
         for g in d.get("games", []) or []:
+            total += 1
             status = g.get("status", {}) or {}
-            if status.get("abstractGameState") != "Final":
-                continue
             # A postponed/suspended/cancelled game can report abstractGameState
             # "Final" with a 0-0 or partial score; excluding those keeps a
             # rained-out game's team bets pending (DK voids them) instead of
             # settling off a bogus box score. A rain-shortened OFFICIAL game reads
             # detailedState "Completed Early" and is intentionally NOT excluded.
             detailed = str(status.get("detailedState") or "").lower()
-            if any(b in detailed for b in mlb_starters._NON_FINAL_DETAILED):
+            postponed = any(b in detailed for b in mlb_starters._NON_FINAL_DETAILED)
+            if status.get("abstractGameState") != "Final" or postponed:
+                # Still live/scheduled (or postponed): the slate can still change,
+                # so it is not immutable yet. A postponed game never becomes a
+                # gradable score on THIS date, so its bet simply stays pending.
+                all_final = False
                 continue
             teams = g.get("teams", {}) or {}
             home = teams.get("home") or {}
@@ -183,6 +219,7 @@ def _mlb_scores_for_date(game_date):
                 as_ = (((g.get("linescore") or {}).get("teams", {}) or {}).get(
                     "away", {}) or {}).get("runs")
             if not isinstance(hs, (int, float)) or not isinstance(as_, (int, float)):
+                all_final = False  # final but no score yet → still settling
                 continue
             games.append({
                 "home_team": (home.get("team") or {}).get("name"),
@@ -191,12 +228,22 @@ def _mlb_scores_for_date(game_date):
                 "away_score": float(as_),
                 "commence_time": g.get("gameDate"),
             })
-    mlb_starters._write_cache(cache, games)
-    return games
+    complete = total > 0 and all_final
+    mlb_starters._write_cache(cache, {"games": games, "complete": complete})
+    return games, complete
 
 
-def _espn_scores_for_date(espn_sport, espn_league, game_date):
-    """List of completed ESPN games on ``game_date`` (YYYY-MM-DD) with scores."""
+def _mlb_scores_for_date(game_date):
+    """List of genuine-final MLB games on ``game_date`` (back-compat shim)."""
+    return _mlb_slate_for_date(game_date)[0]
+
+
+def _espn_slate_for_date(espn_sport, espn_league, game_date):
+    """(games, complete) for one ESPN date (YYYY-MM-DD).
+
+    ``complete`` is True only when there is at least one event and EVERY event on
+    the scoreboard is completed, so the slate is immutable; a live or postponed
+    event keeps it False so the date keeps refreshing until it truly settles."""
     import requests
     yyyymmdd = str(game_date)[:10].replace("-", "")
     url = (f"https://site.api.espn.com/apis/site/v2/sports/"
@@ -206,22 +253,28 @@ def _espn_scores_for_date(espn_sport, espn_league, game_date):
         resp.raise_for_status()
         data = resp.json()
     except Exception:
-        return []
+        return [], False
     games = []
+    total = 0
+    all_complete = True
     for event in data.get("events", []) or []:
+        total += 1
         comp = (event.get("competitions") or [{}])[0]
         status = ((comp.get("status") or {}).get("type") or {})
         if not status.get("completed"):
+            all_complete = False
             continue
         competitors = comp.get("competitors") or []
         home = next((c for c in competitors if c.get("homeAway") == "home"), None)
         away = next((c for c in competitors if c.get("homeAway") == "away"), None)
         if not home or not away:
+            all_complete = False
             continue
         try:
             hs = float(home.get("score"))
             as_ = float(away.get("score"))
         except (TypeError, ValueError):
+            all_complete = False
             continue
         games.append({
             "home_team": (home.get("team") or {}).get("displayName"),
@@ -230,25 +283,33 @@ def _espn_scores_for_date(espn_sport, espn_league, game_date):
             "away_score": as_,
             "commence_time": event.get("date"),
         })
-    return games
+    return games, (total > 0 and all_complete)
+
+
+def _espn_scores_for_date(espn_sport, espn_league, game_date):
+    """List of completed ESPN games on ``game_date`` (back-compat shim)."""
+    return _espn_slate_for_date(espn_sport, espn_league, game_date)[0]
 
 
 def _scores_for_date(sport_key, game_date):
     key = (sport_key, str(game_date)[:10])
-    today = datetime.now(timezone.utc).date().isoformat()
     entry = _SCORE_CACHE.get(key)
     if entry is not None:
-        fetched_at, out = entry
-        # Past dates are immutable → reuse forever; a recent date may still be
-        # finalizing, so re-fetch after the short memo TTL.
-        if key[1] < today or (time.time() - fetched_at) < _RECENT_MEMO_TTL:
+        fetched_at, out, complete = entry
+        # Reuse for the process lifetime only once the slate is COMPLETE (every
+        # game final → immutable); while any game is still live, re-fetch after
+        # the short memo TTL so a game that finishes mid-session isn't masked by
+        # the earlier partial slate. (Completeness, not the calendar date: a late
+        # Eastern game's UTC date rolls over while it is still being played.)
+        if complete or (time.time() - fetched_at) < _RECENT_MEMO_TTL:
             return out
     if sport_key == "baseball_mlb":
-        out = _mlb_scores_for_date(key[1])
+        out, complete = _mlb_slate_for_date(key[1])
     else:
         pair = _ESPN_MAP.get(sport_key)
-        out = _espn_scores_for_date(pair[0], pair[1], key[1]) if pair else []
-    _SCORE_CACHE[key] = (time.time(), out)
+        out, complete = (_espn_slate_for_date(pair[0], pair[1], key[1])
+                         if pair else ([], False))
+    _SCORE_CACHE[key] = (time.time(), out, complete)
     return out
 
 

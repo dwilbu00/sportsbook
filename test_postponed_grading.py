@@ -103,12 +103,49 @@ class MlbScoresExcludePostponedTests(unittest.TestCase):
             "gameDate": "2025-07-01T23:00:00Z",
         }
 
+    def _live_game(self, hs, as_):
+        return {
+            "status": {"abstractGameState": "Live", "detailedState": "In Progress"},
+            "teams": {"home": {"team": {"name": "Dodgers"}, "score": hs},
+                      "away": {"team": {"name": "Padres"}, "score": as_}},
+            "gameDate": "2025-07-02T02:00:00Z",  # late (west-coast) game
+        }
+
     def _scores(self, *games):
         data = {"dates": [{"games": list(games)}]}
         with patch.object(mlb_starters, "_read_cache", return_value=None), \
              patch.object(mlb_starters, "_write_cache", return_value=None), \
              patch.object(mlb_starters, "_get", return_value=data):
             return game_results._mlb_scores_for_date("2025-07-01")
+
+    def _slate(self, *games):
+        data = {"dates": [{"games": list(games)}]}
+        with patch.object(mlb_starters, "_read_cache", return_value=None), \
+             patch.object(mlb_starters, "_write_cache", return_value=None), \
+             patch.object(mlb_starters, "_get", return_value=data):
+            return game_results._mlb_slate_for_date("2025-07-01")
+
+    def test_slate_complete_when_all_final(self):
+        games, complete = self._slate(self._game("Final", 5, 3))
+        self.assertTrue(complete)          # every game final → immutable slate
+        self.assertEqual(len(games), 1)
+
+    def test_slate_incomplete_when_a_game_is_live(self):
+        games, complete = self._slate(self._game("Final", 5, 3),
+                                      self._live_game(2, 1))
+        self.assertFalse(complete)         # a live game → slate can still change
+        self.assertEqual(len(games), 1)    # only the final game has a usable score
+
+    def test_slate_incomplete_when_postponed(self):
+        games, complete = self._slate(self._game("Postponed", 0, 0),
+                                      self._game("Final", 5, 3))
+        self.assertFalse(complete)         # postponed makeup lands on another date
+        self.assertEqual(len(games), 1)
+
+    def test_empty_slate_is_not_complete(self):
+        games, complete = self._slate()
+        self.assertEqual(games, [])
+        self.assertFalse(complete)         # no games ≠ immutable (guards bad fetch)
 
     def test_postponed_excluded(self):
         rows = self._scores(self._game("Postponed", 0, 0))

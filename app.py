@@ -1628,7 +1628,9 @@ def render_my_bets():
             {
                 "wager_id": r.get("wager_id"),
                 "Delete": False,
-                "Placed": (r.get("placed_at") or "")[:10],
+                # ET, not raw UTC: a bet placed after ~8pm ET has a UTC date one
+                # day ahead, which would display tomorrow's date on tonight's bet.
+                "Placed": pricing_common.et_local_date(r.get("placed_at")) or "",
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
                 "Bet": _bet_label(r),
                 "Matchup": r.get("matchup"),
@@ -1679,7 +1681,9 @@ def render_my_bets():
                 "wager_id": r.get("wager_id"),
                 "Delete": False,
                 "Re-grade": False,
-                "Placed": (r.get("placed_at") or "")[:10],
+                # ET, not raw UTC (see the pending table): an evening-ET placement
+                # otherwise shows the next calendar day in the settled ledger.
+                "Placed": pricing_common.et_local_date(r.get("placed_at")) or "",
                 "Sport": sport_labels.get(r.get("sport_key"), r.get("sport_key")),
                 "Bet": _bet_label(r),
                 "Matchup": r.get("matchup"),
