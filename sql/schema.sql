@@ -99,17 +99,25 @@ BEGIN
         ALTER TABLE dbo.prediction_log
             ALTER COLUMN player_key NVARCHAR(200) NOT NULL;
 
-    IF EXISTS (SELECT 1 FROM sys.key_constraints
-               WHERE name = 'uq_prediction_identity'
-                 AND parent_object_id = OBJECT_ID('dbo.prediction_log'))
-        ALTER TABLE dbo.prediction_log DROP CONSTRAINT uq_prediction_identity;
+    -- Swap the unique ATOMICALLY: create v2 BEFORE dropping the old one, both inside
+    -- one XACT_ABORT transaction. If ADD v2 fails (e.g. an un-merged residual
+    -- duplicate slipped past the backfill), the whole swap rolls back and the old
+    -- uq_prediction_identity stays in place — the table is NEVER left with no forecast-
+    -- identity guard. Both ALTERs stay existence-guarded, so re-running is idempotent.
+    SET XACT_ABORT ON;
+    BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM sys.key_constraints
+                       WHERE name = 'uq_prediction_identity_v2'
+                         AND parent_object_id = OBJECT_ID('dbo.prediction_log'))
+            ALTER TABLE dbo.prediction_log
+                ADD CONSTRAINT uq_prediction_identity_v2
+                    UNIQUE (sport_key, event_key, prop_key, player_key, line);
 
-    IF NOT EXISTS (SELECT 1 FROM sys.key_constraints
-                   WHERE name = 'uq_prediction_identity_v2'
+        IF EXISTS (SELECT 1 FROM sys.key_constraints
+                   WHERE name = 'uq_prediction_identity'
                      AND parent_object_id = OBJECT_ID('dbo.prediction_log'))
-        ALTER TABLE dbo.prediction_log
-            ADD CONSTRAINT uq_prediction_identity_v2
-                UNIQUE (sport_key, event_key, prop_key, player_key, line);
+            ALTER TABLE dbo.prediction_log DROP CONSTRAINT uq_prediction_identity;
+    COMMIT TRANSACTION;
 END
 GO
 --------------------------------------------------------------------------- wagers
