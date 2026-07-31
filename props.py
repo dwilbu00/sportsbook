@@ -41,6 +41,7 @@ from stats import (
     _weighted_rate,
     _weighted_std,
     hits_at_least,
+    negbin_at_least,
 )
 
 
@@ -344,6 +345,14 @@ DEFAULT_PLAYER_PROP_XSTATS_STRENGTH = 0.0
 PROP_XSTATS_KIND = {"batter_hits": "xba"}
 # Minimum official ABs behind the as-of xBA before it is trusted (mirrors MIN_BBE).
 XSTATS_MIN_N = 40
+# §2.2: props eligible for the Negative-Binomial count method ("E"). Low-count
+# non-negative-integer outcomes where a continuous Gaussian residual (method B)
+# misfits the floor. Limited to the currently-calibrated count props — the offline
+# refit only re-selects methods for props already in calibration/<sport>.json.
+# Widening this needs an espn_client.PROP_STAT_MAP entry + a synthetic refit first.
+PROP_NEGBIN_ELIGIBLE = {
+    "pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs", "batter_hits",
+}
 
 
 # ── Recommendation filter: suppress model UNDER picks on cheap lines ──
@@ -507,6 +516,27 @@ def _distributional_over_rate(prop_key, line, values, at_bats, weights,
         barrel_coef=cfg.get("dist_barrel_coef"))
     meta["n_ab_sample"] = n_ab
     return p_over, meta
+
+
+def _negbin_over_rate(avg_stat, mean_scale, dispersion, line):
+    """§2.2 method "E": P(over) for a low-count integer prop as a Negative-Binomial
+    survival, or None to fall back (fail-open).
+
+    The count mean is the adjusted projection ``avg_stat`` (= base_proj *
+    combined_mult, the SAME quantity method B calibrates), scaled by the offline-fit
+    multiplicative bias ``mean_scale``; ``dispersion`` (phi >= 0) is the fitted
+    over-dispersion (variance = mean + phi*mean^2). A half-integer line L maps to
+    P(X >= int(L)+1), the same continuity convention the binomial method D uses.
+    Returns None when the projection is unusable so the caller keeps the empirical
+    over-rate."""
+    try:
+        mean = avg_stat * (mean_scale if mean_scale else 1.0)
+    except (TypeError, ValueError):
+        return None
+    if mean is None or mean <= 0:
+        return None
+    k = int(line) + 1                     # OVER <=> count >= k (matches _dist_p_over)
+    return negbin_at_least(k, mean, dispersion or 0.0)
 
 
 def _resolve_line_bucket(prop_calib_cfg, line):
@@ -1225,6 +1255,25 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     calibration_meta = {
                         "method": "D",
                         "curr_games": curr_games,
+                        "empirical_over": round(empirical_over * 100, 2),
+                    }
+            elif method == "E":
+                # §2.2 Negative-Binomial count model. The mean is `avg_stat` (the
+                # same adjusted projection method B calibrates), scaled by the
+                # offline-fit `mean_scale`; `dispersion` is the fitted over-
+                # dispersion. No warmup block (like D). Fails open to the empirical
+                # over-rate when dispersion/mean_scale are absent or the mean is
+                # unusable.
+                p_nb = _negbin_over_rate(
+                    avg_stat, method_cfg.get("mean_scale"),
+                    method_cfg.get("dispersion"), line)
+                if p_nb is not None:
+                    over_rate = max(0.0, min(1.0, p_nb))
+                    calibration_meta = {
+                        "method": "E",
+                        "curr_games": curr_games,
+                        "mean_scale": method_cfg.get("mean_scale"),
+                        "dispersion": method_cfg.get("dispersion"),
                         "empirical_over": round(empirical_over * 100, 2),
                     }
             elif method:

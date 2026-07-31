@@ -30,6 +30,7 @@ from analysis import (
     _norm_cdf, _half_life_for, _recency_weights, _weighted_rate,
     _weighted_std, _normal_inv_cdf,
 )
+from stats import negbin_at_least, fit_negbin_dispersion  # §2.2 method "E"
 from backtest import (
     cached_gamelog, cached_athlete_id,
     SPORT_MAP, VARIANT_PRESETS, _empirical_cdf, _brier, _logloss, _hit_rate,
@@ -788,24 +789,52 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
     return rows
 
 
-def _score_abc_real(train, test):
-    """Fit pooled residuals on `train`, score methods A/B/C (and D when present)
-    on `test` at each row's REAL book line. Returns ({method: brier}, (mu, sigma,
-    sorted)).
+def _fit_negbin_real(rows):
+    """Fit the §2.2 NegBin method-"E" params on a set of real-line obs:
+    ``(mean_scale, dispersion)`` or None when unusable.
+
+    ``mean_scale = sum(actual) / sum(projected)`` clamped to [0.5, 2.0] — the MLE
+    mean-scale for a proportional count mean and the multiplicative analog of
+    method B's additive ``residual_mu`` (multiplicative keeps the mean > 0 at low
+    counts, where an additive shift could go negative and break the NegBin
+    variance=mean+phi*mean^2 link). ``dispersion`` is fit by
+    ``stats.fit_negbin_dispersion`` on the SCALED means. Leakage-safe: the caller
+    fits on the train split (or all usable obs for the deployed params) and scores
+    on the held-out split, exactly like the B/C residual fit."""
+    usable = [r for r in rows if r.get("projected") and r["projected"] > 0]
+    if not usable:
+        return None
+    sp = sum(r["projected"] for r in usable)
+    if sp <= 0:
+        return None
+    sa = sum(r["actual"] for r in usable)
+    mean_scale = max(0.5, min(2.0, sa / sp))
+    disp = fit_negbin_dispersion(
+        [(mean_scale * r["projected"], r["actual"]) for r in usable])
+    return mean_scale, disp
+
+
+def _score_abc_real(train, test, negbin_eligible=False):
+    """Fit pooled residuals on `train`, score methods A/B/C (and D/E when
+    applicable) on `test` at each row's REAL book line. Returns ({method: brier},
+    (mu, sigma, sorted)).
 
     A = empirical over-rate passthrough; B = pooled Gaussian residual;
     C = pooled residual ECDF. D (distributional, §2.4b-2) is scored only when
     every test row carries a precomputed leakage-safe ``p_dist`` — D needs no
     train fit (its prob is a closed form on each obs's own as-of stats), so a
-    row's ``p_dist`` is split-independent. Same math as evaluate_calibration,
-    factored so the single split and the confirmation folds share one impl.
-    """
+    row's ``p_dist`` is split-independent. E (§2.2 Negative Binomial) IS train-fit
+    (mean_scale + dispersion on `train`, like B/C), scored only when
+    ``negbin_eligible`` — a count prop whitelisted by the caller. Same math as
+    evaluate_calibration, factored so the single split and the confirmation folds
+    share one impl."""
     resid = [r["actual"] - r["projected"] for r in train]
     mu = sum(resid) / len(resid)
     var = sum((x - mu) ** 2 for x in resid) / len(resid)
     sigma = math.sqrt(var) if var > 0 else 1e-6
     srt = sorted(resid)
-    pA, pB, pC, pD, out = [], [], [], [], []
+    nb = _fit_negbin_real(train) if negbin_eligible else None
+    pA, pB, pC, pD, pE, out = [], [], [], [], [], []
     has_d = bool(test) and all(r.get("p_dist") is not None for r in test)
     for r in test:
         out.append(1 if r["actual"] > r["line"] else 0)
@@ -816,9 +845,15 @@ def _score_abc_real(train, test):
         pC.append(1.0 - _empirical_cdf(srt, r["line"] - corrected))
         if has_d:
             pD.append(r["p_dist"])
+        if nb is not None:
+            mean_scale, disp = nb
+            mean = max(1e-9, mean_scale * r["projected"])
+            pE.append(negbin_at_least(int(r["line"]) + 1, mean, disp))
     scores = {"A": _brier(pA, out), "B": _brier(pB, out), "C": _brier(pC, out)}
     if has_d:
         scores["D"] = _brier(pD, out)
+    if nb is not None:
+        scores["E"] = _brier(pE, out)
     return scores, (mu, sigma, srt)
 
 
@@ -849,18 +884,24 @@ def _real_line_folds(rows, min_set_n=20):
     return folds
 
 
-def select_method_at_real_lines(rows, shrinkage_k=15):
+def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False):
     """Choose the deployed A/B/C method at REAL book lines, gated like refit.
 
     Method A (empirical) is the safe baseline and always eligible. A non-empirical
-    method (B/C) is chosen only if it beats A on the single chronological holdout
-    by >= MIN_CALIB_BRIER_GAIN AND beats A in BOTH expanding confirmation folds
-    (defeats winner's-curse). Residuals for the winner are fit on ALL usable obs
-    (the deployed distribution), matching refit_calibration._fit_residuals.
+    method (B/C, and E when ``negbin_eligible``) is chosen only if it beats A on
+    the single chronological holdout by >= MIN_CALIB_BRIER_GAIN AND beats A in BOTH
+    expanding confirmation folds (defeats winner's-curse). Residuals for the winner
+    are fit on ALL usable obs (the deployed distribution), matching
+    refit_calibration._fit_residuals; when E wins, its ``mean_scale``/``dispersion``
+    are likewise fit on ALL usable obs and returned.
+
+    ``negbin_eligible`` admits the §2.2 Negative-Binomial count method "E" as a
+    candidate (a count prop whitelisted by the caller via
+    props.PROP_NEGBIN_ELIGIBLE). Off by default so existing callers are unchanged.
 
     Returns None if fewer than 20 usable (actual != line) observations, else:
       {method, fit_brier, baseline_brier, cv_brier, confirmed,
-       residual_mu, residual_sigma, residual_ecdf, n_obs}
+       residual_mu, residual_sigma, residual_ecdf, n_obs[, mean_scale, dispersion]}
     """
     from refit_calibration import MIN_CALIB_BRIER_GAIN  # single source of truth
 
@@ -869,14 +910,15 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
         return None
     usable.sort(key=lambda r: r["game_date"])
 
-    # Single chronological holdout: baseline (A) + candidate (B/C) Briers.
+    # Single chronological holdout: baseline (A) + candidate (B/C/E) Briers.
     split = len(usable) // 2
-    single, _ = _score_abc_real(usable[:split], usable[split:])
+    single, _ = _score_abc_real(usable[:split], usable[split:], negbin_eligible)
     baseline = single["A"]
 
     # Two-fold out-of-sample confirmation for non-empirical methods.
     folds = _real_line_folds(usable)
-    fold_scores = [_score_abc_real(tr, te)[0] for tr, te in folds] if folds else []
+    fold_scores = ([_score_abc_real(tr, te, negbin_eligible)[0]
+                    for tr, te in folds] if folds else [])
 
     def _confirms(method):
         if not fold_scores:
@@ -886,10 +928,13 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
 
     # D (distributional) is a candidate only when the rows carry a leakage-safe
     # p_dist (the per-bucket line-conditional path supplies it); the pooled A/B/C
-    # callers pass rows without it, so their behavior is unchanged.
+    # callers pass rows without it, so their behavior is unchanged. E (NegBin) is a
+    # candidate only when the caller whitelists this count prop.
     candidate_methods = ["B", "C"]
     if any(r.get("p_dist") is not None for r in usable):
         candidate_methods.append("D")
+    if negbin_eligible:
+        candidate_methods.append("E")
     best_method, best_brier = "A", baseline
     for method in candidate_methods:
         cand = single.get(method)
@@ -914,7 +959,7 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
         if all(v is not None for v in vals):
             cv_brier = round(sum(vals) / len(vals), 4)
 
-    return {
+    result = {
         "method": best_method,
         "fit_brier": round(best_brier, 4) if best_brier is not None else None,
         "baseline_brier": round(baseline, 4) if baseline is not None else None,
@@ -928,6 +973,14 @@ def select_method_at_real_lines(rows, shrinkage_k=15):
         # compare its winner against the POOLED method on the same split.
         "single_split": single,
     }
+    # When E wins, its deployed params are fit on ALL usable obs (mirrors the
+    # residual block above). Always fit when eligible so the diagnostic can report
+    # them even for a prop that doesn't flip.
+    if negbin_eligible:
+        nb = _fit_negbin_real(usable)
+        if nb is not None:
+            result["mean_scale"], result["dispersion"] = nb
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────

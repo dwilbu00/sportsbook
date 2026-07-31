@@ -180,6 +180,115 @@ def hits_at_least(k, n, p):
     return max(0.0, min(1.0, 1.0 - cdf))
 
 
+def negbin_at_least(k, mean, dispersion):
+    """P(X >= k) for X ~ Negative Binomial with variance = mean + dispersion*mean^2.
+
+    The count analog of ``hits_at_least`` for props whose outcome is an
+    over-dispersed non-negative integer (strikeouts, outs, earned runs, hits).
+    Parameterized by the ``mean`` (the projected count) and a dispersion phi >= 0:
+        size = 1/phi,  success_p = size/(size + mean),  variance = mean + phi*mean^2.
+    ``dispersion <= 0`` degrades to the Poisson limit (variance = mean). A
+    half-integer line L maps to ``negbin_at_least(int(L)+1, ...)`` (OVER <=> X >= k),
+    the same continuity convention ``hits_at_least`` uses (an integer line L excludes
+    the push mass P(X = L), since OVER means X >= L+1).
+
+    Sums only the lower tail P(X <= k-1) via the ratio recurrence
+      P(X=s) = P(X=s-1) * (s-1+size)/s * failure_p      (NegBin), or
+      P(X=s) = P(X=s-1) * mean/s                         (Poisson),
+    so it is O(k) with no factorials/lgamma. Mirrors the PMF recurrence in
+    ``mlb_starters.negative_binomial_margin_probability``."""
+    k = int(k)
+    if k <= 0:                    # OVER a sub-zero threshold is certain
+        return 1.0
+    if mean <= 0.0:               # a zero-mean count can't clear a >= 1 line
+        return 0.0
+    if dispersion <= 0.0:
+        # Poisson limit: P(X=0) = e^-mean; ratio term mean/s.
+        term = math.exp(-mean)
+        cdf = term
+        for s in range(1, k):
+            term *= mean / s
+            cdf += term
+        return max(0.0, min(1.0, 1.0 - cdf))
+    size = 1.0 / dispersion
+    success_p = size / (size + mean)
+    failure_p = 1.0 - success_p
+    term = success_p ** size      # s = 0 term: P(X = 0)
+    cdf = term
+    for s in range(1, k):         # accumulate P(X <= k-1)
+        term *= (s - 1.0 + size) / s * failure_p
+        cdf += term
+    return max(0.0, min(1.0, 1.0 - cdf))
+
+
+def _negbin_nll(actual, mean, dispersion):
+    """Negative log-likelihood of a single count ``actual`` under a Negative
+    Binomial with variance = mean + dispersion*mean^2.
+
+    Inlined stdlib copy of ``backtest_starters._negative_binomial_score_nll`` kept
+    here so ``stats`` stays a pure leaf (no cross-imports); a unit test guards the
+    two against drift. ``dispersion <= 0`` -> the Poisson NLL limit."""
+    mean = max(1e-9, mean)
+    if dispersion <= 0.0:
+        return mean - actual * math.log(mean) + math.lgamma(actual + 1.0)
+    size = 1.0 / dispersion
+    success_p = size / (size + mean)
+    return -(
+        math.lgamma(actual + size)
+        - math.lgamma(size)
+        - math.lgamma(actual + 1.0)
+        + size * math.log(success_p)
+        + actual * math.log1p(-success_p)
+    )
+
+
+def fit_negbin_dispersion(pairs, cap=2.0):
+    """Fit the NegBin dispersion phi from ``pairs = [(mean_i, actual_i)]`` by
+    bounded 1-D MLE (minimize the summed ``_negbin_nll`` over [0, cap]), pure stdlib.
+
+    A method-of-moments estimate phi0 = (sum (a-m)^2 - sum m) / sum m^2 guards the
+    search: phi0 <= 0 (the sample is not over-dispersed) -> return 0.0 (Poisson).
+    Otherwise a coarse grid over [0, cap] then a local refine finds the MLE without
+    scipy. Empty / degenerate input or any error -> 0.0 (fail to Poisson, never
+    crash the refit). ``mean_i`` are assumed already bias-corrected by the caller."""
+    try:
+        pts = [(float(m), float(a)) for m, a in pairs
+               if m is not None and a is not None and float(m) > 0]
+        if len(pts) < 2:
+            return 0.0
+        sum_m = sum(m for m, _ in pts)
+        sum_m2 = sum(m * m for m, _ in pts)
+        sum_sq = sum((a - m) ** 2 for m, a in pts)
+        if sum_m2 <= 0:
+            return 0.0
+        mom = (sum_sq - sum_m) / sum_m2
+        if mom <= 0:                       # under-dispersed -> Poisson is best
+            return 0.0
+
+        def total_nll(phi):
+            return sum(_negbin_nll(a, m, phi) for m, a in pts)
+
+        steps = 40
+        best_phi, best = 0.0, total_nll(0.0)
+        for i in range(1, steps + 1):
+            phi = cap * i / steps
+            v = total_nll(phi)
+            if v < best:
+                best, best_phi = v, phi
+        # Local refine around the best coarse cell.
+        span = cap / steps
+        lo = max(0.0, best_phi - span)
+        hi = min(cap, best_phi + span)
+        for i in range(1, 21):
+            phi = lo + (hi - lo) * i / 20.0
+            v = total_nll(phi)
+            if v < best:
+                best, best_phi = v, phi
+        return max(0.0, min(cap, best_phi))
+    except Exception:
+        return 0.0
+
+
 def _normal_inv_cdf(p):
     """
     Inverse standard-normal CDF (probit). Acklam's rational approximation,

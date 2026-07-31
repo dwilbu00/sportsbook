@@ -34,6 +34,21 @@ JSON schema per prop entry:
       "n_obs": ...
   }
 }
+
+Count-distribution methods (D, E) do NOT use the residual block or warmup and are
+NOT dispatched through calibrate_prob() below — props.py routes them directly at
+the projection seam:
+  * method "D" (§2.4b) — binomial contact-quality count model (batter_hits); needs
+    no persisted params (its P(over) is a closed form on each obs's own as-of AB/p).
+  * method "E" (§2.2) — over-dispersed Negative Binomial count model for low-count
+    integer props (variance = mean + dispersion*mean^2). Persists two extra fields
+    instead of the residual block:
+        "method": "E",
+        "mean_scale": 1.03,   # multiplicative mean bias correction, clamped [0.5, 2.0]
+        "dispersion": 0.18,   # 0.0 => Poisson limit
+    Runtime mean = avg_stat * mean_scale; P(over) = negbin_at_least(int(line)+1,
+    mean, dispersion). Selected only when it clears the real-line confirmation gate
+    (see book_line_calibration.select_method_at_real_lines).
 """
 import json
 import math

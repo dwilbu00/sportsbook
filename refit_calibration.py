@@ -702,7 +702,7 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     # applies to props in props.PROP_XSTATS_KIND (batter_hits). Uses a per-game
     # as-of index (NOT the current-as-of SQL table) so a past-dated obs never
     # sees future data. xstats_strength=0 → byte-identical to the prior behavior.
-    from props import PROP_XSTATS_KIND
+    from props import PROP_XSTATS_KIND, PROP_NEGBIN_ELIGIBLE
     # Build the as-of indices to score method D per bucket ONLY when a
     # line-conditional prop has a deep-enough non-primary bucket (cheap data
     # gate) — so a plain --real-lines run doesn't pay the raw-Statcast load until
@@ -760,7 +760,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         rows = blc.build_real_line_obs(
             enriched, params, sport_key, prop_key, team_defense, league_avg_def,
             xstats_strength=prop_xstats, xba_index=xba_index)
-        sel = blc.select_method_at_real_lines(rows)
+        sel = blc.select_method_at_real_lines(
+            rows, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE))
         if sel is None:
             skipped.append(prop_key)
             print(f"  [skip]   {prop_key}: only {len(rows)} real-line obs "
@@ -818,6 +819,12 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                 "cv_brier": sel["cv_brier"],
                 "confirmed": sel["confirmed"],
             })
+            # §2.2 method "E" (NegBin) ships two extra count-model params instead
+            # of consuming the residual distribution above; dispatched at the props
+            # seam, not via calibrate_prob/warmup. Persist them when E won.
+            if sel["method"] == "E":
+                new_cfg["mean_scale"] = sel.get("mean_scale")
+                new_cfg["dispersion"] = sel.get("dispersion")
             new_cfg.setdefault("warmup_games", warmup_games)
             new_cfg.setdefault("shrinkage_k", cfg.get("shrinkage_k",
                                                       shrinkage_k_default))
@@ -1103,6 +1110,103 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
                 f"{len(under)}/{uw:.1%}" if uw is not None else f"{len(under)}/-"))
 
     print("\n  (Diagnostic only — nothing written.)")
+
+
+def diagnose_negbin(sport, store_label=""):
+    """§2.2 diagnostic (NO WRITE): for each Negative-Binomial-eligible count prop
+    that is already calibrated, score method "E" against A/B/C on the SAME real-line
+    chronological holdout the ship path uses, and report whether E beats the
+    incumbent by >= MIN_CALIB_BRIER_GAIN and whether it would clear the full 2-fold
+    confirmation gate.
+
+    This is the roadmap's mandated "benchmark NegBin against the incumbent
+    (empirical-C / Gaussian-B) before adopting" — go/no-go for a `--real-lines`
+    flip. It reuses book_line_calibration.select_method_at_real_lines(...,
+    negbin_eligible=True) verbatim, so the diagnostic and the ship path share ONE
+    scoring/gate impl (no drift). OFFLINE + FREE (store + free ESPN gamelogs);
+    writes nothing."""
+    import book_line_calibration as blc
+    from props import PROP_NEGBIN_ELIGIBLE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = [pk for pk in existing if pk in PROP_NEGBIN_ELIGIBLE]
+    if not props_to_check:
+        print(f"No NegBin-eligible calibrated props in calibration/{sport_key}.json "
+              f"(eligible: {sorted(PROP_NEGBIN_ELIGIBLE)}); run refit first.")
+        return
+
+    print(f"\n=== §2.2 Negative-Binomial (method E) diagnostic: {sport_key} ===")
+    print(f"  Eligible + calibrated: {', '.join(sorted(props_to_check))}")
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    print(f"  {len(book_lines):,} real book lines "
+          f"({n_primary:,} store + {n_pred:,} prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    # Weight-side opponent-defense lookup only if some eligible prop's variant uses
+    # it (mirrors refit_sport_real_lines' gating so the projection basis matches).
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    for prop_key in sorted(props_to_check):
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        # Plain projection basis (no xBA blend) — E's mean is avg_stat, so this is
+        # the like-for-like basis for A/B/C/E; note it if the shipped prop uses xBA.
+        rows = blc.build_real_line_obs(
+            enriched, params, sport_key, prop_key, team_defense, league_avg_def,
+            xstats_strength=0.0, xba_index=None)
+        sel = blc.select_method_at_real_lines(rows, negbin_eligible=True)
+        n_usable = len([r for r in rows if r["actual"] != r["line"]])
+        if sel is None:
+            print(f"\n  {prop_key}: only {n_usable} usable real-line obs (need "
+                  f">=20) — can't score E.")
+            continue
+        ss = sel.get("single_split", {})
+        folds = blc._real_line_folds(
+            sorted([r for r in rows if r["actual"] != r["line"]],
+                   key=lambda r: r["game_date"]))
+        print(f"\n  {prop_key} (incumbent={incumbent}, n_usable={n_usable}, "
+              f"folds={len(folds)}):")
+        print("    holdout Brier — " + "  ".join(
+            f"{m}={ss[m]:.4f}" for m in ("A", "B", "C", "D", "E") if m in ss))
+        e_br = ss.get("E")
+        inc_br = ss.get(incumbent)
+        if e_br is not None and inc_br is not None:
+            gain = inc_br - e_br
+            verdict = (f"E beats incumbent {incumbent} by {gain:+.4f} "
+                       f"(>= {MIN_CALIB_BRIER_GAIN} threshold: "
+                       f"{'YES' if gain >= MIN_CALIB_BRIER_GAIN else 'no'})")
+        else:
+            verdict = "E or incumbent Brier unavailable on this split"
+        gate = ("E CONFIRMED under the full 2-fold gate — would flip"
+                if sel["method"] == "E"
+                else f"gate keeps method {sel['method']} (E not confirmed)")
+        ms, disp = sel.get("mean_scale"), sel.get("dispersion")
+        params_str = (f"mean_scale={ms:.3f}, dispersion={disp:.4f}"
+                      if ms is not None and disp is not None else "n/a")
+        print(f"    {verdict}")
+        print(f"    fitted E params (all usable obs): {params_str}")
+        print(f"    {gate}")
+
+    print("\n  (Diagnostic only — nothing written. Run --real-lines to apply the "
+          "gate for real.)")
 
 
 # ── Conditional-calibration ("reliability by prediction stratum") report ──
@@ -1740,6 +1844,11 @@ def main():
     p.add_argument("--dist-xstats-strength", type=float, default=0.5,
                    help="xBA blend weight for the --dist-diag xBA variants "
                         "(default 0.5).")
+    p.add_argument("--negbin-diag", action="store_true",
+                   help="§2.2: score the Negative-Binomial count model (method E) "
+                        "vs A/B/C on the real-line holdout for each eligible count "
+                        "prop, and report whether E would clear the ship gate (no "
+                        "write).")
     p.add_argument("--reliability", action="store_true",
                    help="Conditional-calibration report for batter_hits: "
                         "reliability (are 60-percent predictions right 60 percent "
@@ -1771,6 +1880,10 @@ def main():
     if args.dist_diag:
         diagnose_distributional(args.sport, store_label=args.store_label,
                                 xstats_strength=args.dist_xstats_strength)
+        return
+
+    if args.negbin_diag:
+        diagnose_negbin(args.sport, store_label=args.store_label)
         return
 
     if args.reliability:

@@ -163,7 +163,7 @@ class RefitSportRealLinesTests(unittest.TestCase):
         def _build(enriched, params, sport_key, prop_key, td=None, la=None,
                    xstats_strength=0.0, xba_index=None):
             return [{"prop_key": prop_key}]
-        def _select(rows, shrinkage_k=15):
+        def _select(rows, shrinkage_k=15, negbin_eligible=False):
             pk = rows[0]["prop_key"] if rows else None
             return sel_map.get(pk)
         _harvest = (harvest if harvest is not None
