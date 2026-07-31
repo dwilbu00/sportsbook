@@ -2604,6 +2604,7 @@ if analyze_clicked and selected_game_labels:
         # Degrades to None (existing model) if anything is unavailable.
         matchup_features = None
         confirmed_lineup = None
+        probable_starters = None
         if sport["key"] == "baseball_mlb":
             import mlb_starters
             game_date = event.get("commence_time", "")[:10]
@@ -2624,6 +2625,13 @@ if analyze_clicked and selected_game_labels:
                     home, away, game_date)
             except Exception as e:
                 warnings.append(f"Lineup data unavailable for {away} @ {home}: {e}")
+            # §2.5A: announced probable starters (available days ahead) gate
+            # pitcher props all day; confirmed_lineup gates batter props once
+            # posted. Both feed mlb_starters.player_start_status below.
+            try:
+                probable_starters = mlb_starters.get_probable_starters(game_date)
+            except Exception as e:
+                warnings.append(f"Probable starters unavailable for {away} @ {home}: {e}")
         elif sport["key"] == "americanfootball_nfl":
             # NFL EPA edge (net EPA/play, season-to-date) — feeds ML + spreads
             # via the same generic starter_edge margin hook. Degrades to None.
@@ -2720,6 +2728,14 @@ if analyze_clicked and selected_game_labels:
                             confirmed_lineup, player_name)
                         if lineup_context:
                             history["batting_order"] = lineup_context["batting_order"]
+                    # §2.5A tri-state availability. Batter props gate on the
+                    # confirmed lineup; pitcher props on the announced probable.
+                    # Fails open to "unknown" — props.py only acts on "out".
+                    if sport["key"] == "baseball_mlb":
+                        history["lineup_status"] = mlb_starters.player_start_status(
+                            prop_key, player_name, home, away,
+                            confirmed_lineup or {}, probable_starters or {},
+                            int(game_date[:4]))
                     player_histories[player_name][prop_key] = history
             new_props = analyze_player_props_value(prop_data, player_histories, threshold,
                                                   sport_key=sport["key"],
@@ -3067,6 +3083,15 @@ if "analysis_results" in st.session_state:
             """Display bet as 'Points {N}+' instead of 'OVER 9.5' in safe mode."""
             return f"{c['prop_label']} {c['safe_threshold']}+"
 
+        def _lineup_badge(c):
+            """§2.5A confirmed/OUT badge; '' when unknown (lineup not yet posted)."""
+            status = c.get("lineup_status")
+            if status == "in":
+                return "✓ confirmed lineup"
+            if status == "out":
+                return "⚠ OUT — not in posted lineup"
+            return ""
+
         if value_props:
             st.success(f"**{len(value_props)} prop value bet(s) found!**")
 
@@ -3127,11 +3152,13 @@ if "analysis_results" in st.session_state:
                             payout_help = "Payout for the OVER at the standard book line on DraftKings. Alt-line fetch is disabled or no alt was offered at the suggested threshold — DK's actual alt price will differ."
                         cols[7].metric(payout_label, p_val, delta=p_delta,
                                        delta_color="off", help=payout_help)
+                        badge = _lineup_badge(c)
                         st.caption(
                             f"Matchup: {c['matchup']}"
                             f"  |  Projected average: {c['avg_stat']}"
                             f"  |  Model probability at book line: {c['model_hit_at_line']}%"
                             f"  |  Line gap: {c['line_gap']:+.2f}"
+                            + (f"  |  {badge}" if badge else "")
                         )
                         if fetch_alt_lines and c.get("alt_ladder"):
                             _render_alt_ladder(c["alt_ladder"], direction="over",
@@ -3165,11 +3192,13 @@ if "analysis_results" in st.session_state:
                                   "all U.S. books; Expected ROI is at this DK price."),
                         )
                         line_gap = c["avg_stat"] - c["line"]
+                        badge = _lineup_badge(c)
                         st.caption(
                             f"Matchup: {c['matchup']}"
                             f"  |  Book line: {c['line']}"
                             f"  |  Projected average: {c['avg_stat']}"
                             f"  |  Line gap: {line_gap:+.2f}"
+                            + (f"  |  {badge}" if badge else "")
                         )
                         # DK only offers OVER alt lines for player props.
                         if fetch_alt_lines and c["direction"] == "OVER" and c.get("alt_ladder"):
@@ -3194,6 +3223,7 @@ if "analysis_results" in st.session_state:
                             "Edge": f"{c['edge_pct']:+.2f}%",
                             "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                              if c.get("expected_roi_pct") is not None else "n/a"),
+                            "Lineup": _lineup_badge(c) or "—",
                         })
                     else:
                         hit_prob = c["over_rate"] if c["direction"] == "OVER" else round(100.0 - c["over_rate"], 2)
@@ -3209,6 +3239,7 @@ if "analysis_results" in st.session_state:
                             "Edge": f"{c['edge_pct']:+.2f}%",
                             "Expected ROI": (f"{c['expected_roi_pct']:+.2f}%"
                                              if c.get("expected_roi_pct") is not None else "n/a"),
+                            "Lineup": _lineup_badge(c) or "—",
                         })
                 st.table(rows)
 

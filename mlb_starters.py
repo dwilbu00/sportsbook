@@ -610,6 +610,79 @@ def lineup_player_context(lineup, player_name):
     return dict(player)
 
 
+def player_start_status(prop_key, player_name, home_team, away_team,
+                        confirmed_lineup, probable_starters, season=None):
+    """Tri-state pre-game availability for a prop's player.
+
+    Returns one of:
+      "out"     -- high-confidence NOT playing this game in the prop's role. The
+                   bet is dead; the caller suppresses the recommendation AND skips
+                   the calibration log (a label that would never resolve).
+      "in"      -- confirmed present (in the posted lineup / announced probable).
+      "unknown" -- not yet determinable -> the caller FAILS OPEN (current behavior).
+
+    Batter props gate on the confirmed batting lineup; pitcher props gate on the
+    announced probable starter. The gate only ever ACTS on a confident "out";
+    missing data, non-MLB, or any error all degrade to "unknown". A positive
+    ``season`` lets the batter/pitcher "out" arms confirm identity via
+    ``find_player_id`` before ruling a player out, guarding against name-spelling
+    drift between the odds feed and the Stats API; pass ``season=None`` to use the
+    name-only logic (unit tests).
+    """
+    try:
+        if not player_name:
+            return "unknown"
+        key = _norm(player_name)
+
+        # --- Pitcher prop: announced probable starters (available all day). ---
+        if str(prop_key or "").startswith("pitcher_"):
+            probs = probable_starters or {}
+            sides = [probs.get(_norm(home_team)), probs.get(_norm(away_team))]
+            announced = [s for s in sides if s and s.get("pitcher_id")]
+            if not announced:
+                return "unknown"
+            pid = None
+            if season is not None:
+                resolved = find_player_id(player_name, season)
+                if resolved:
+                    pid = resolved[0]
+            for s in announced:
+                if _norm(s.get("name")) == key or (
+                        pid is not None and str(s.get("pitcher_id")) == str(pid)):
+                    return "in"
+            # Not an announced starter. Only OUT when BOTH sides are announced
+            # AND we positively resolved his id (guards a false out on a name
+            # the probable feed spells differently); a TBD side stays unknowable.
+            if len(announced) == 2 and pid is not None:
+                return "out"
+            return "unknown"
+
+        # --- Batter prop: confirmed batting lineup. ---
+        lineup = confirmed_lineup or {}
+        players = lineup.get("players") or {}
+        rec = players.get(key)
+        if rec:
+            side = rec.get("side")
+            return "in" if lineup.get(f"{side}_confirmed") else "unknown"
+        # Absent by name. This can only become "out" once BOTH 9-man lineups are
+        # posted (he's in neither); a single posted side can't rule him out.
+        if not (lineup.get("home_confirmed") and lineup.get("away_confirmed")):
+            return "unknown"
+        # Both lineups posted -> confirm his identity by id before ruling OUT
+        # (the odds feed may spell him differently than the Stats API).
+        if season is not None:
+            resolved = find_player_id(player_name, season)
+            if resolved:
+                pid = resolved[0]
+                for p in players.values():
+                    if str(p.get("player_id")) == str(pid):
+                        side = p.get("side")
+                        return "in" if lineup.get(f"{side}_confirmed") else "unknown"
+        return "out"
+    except Exception:
+        return "unknown"
+
+
 def _names_match(left, right):
     """Tolerant normalized team-name comparison."""
     if not left or not right:

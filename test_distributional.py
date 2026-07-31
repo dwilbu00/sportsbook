@@ -578,5 +578,77 @@ class SelectLineMethodsTests(unittest.TestCase):
         self.assertFalse(refit_calibration._lc_bucket_ready(deep, {"pitcher_outs"}))
 
 
+class LineupGatingTests(unittest.TestCase):
+    """§2.5A: a confirmed-OUT player's prop is demoted from recommendations AND
+    skipped from the calibration log (the label would never resolve); "in" and
+    "unknown" leave both behaviors unchanged. The status rides in on `history`,
+    exactly like `batting_order`."""
+
+    def _prop_data(self):
+        # over_implied LOW so a strong hitter's OVER clears the value gate (mirrors
+        # UnderHalfSuppressionTests.test_over_half_value_unaffected).
+        return {
+            "commence_time": "2026-07-20T18:00:00Z", "home_team": "H",
+            "away_team": "A", "game_id": "e1",
+            "props": {"batter_hits": {"Hot Hal": {
+                "line": 0.5, "over_implied": 0.25, "under_implied": 0.75,
+                "over_price": -110, "under_price": -110,
+                "over_book": "DK", "under_book": "DK",
+                "dk_over_price": -110, "dk_under_price": -110,
+                "dk_over_book": "DK", "dk_under_book": "DK"}}},
+        }
+
+    def _hist(self, status):
+        dates = [f"2026-07-{d:02d}" for d in range(1, 16)]
+        h = {"found": True, "values": [1.0] * 15,
+             "game_dates": list(reversed(dates))}
+        if status is not None:
+            h["lineup_status"] = status
+        return {"Hot Hal": {"batter_hits": h}}
+
+    def _run(self, status, sport_key="baseball_mlb"):
+        rates = {"xba": 0.30, "hard_hit_pct": 0.42, "barrel_pct": 0.08,
+                 "n_ab": 120}
+        with patch.object(props, "load_calibration", return_value={}), \
+             patch.object(props, "load_recalibration", return_value={}), \
+             patch.object(props, "maybe_auto_refit"), \
+             patch.object(props, "log_prediction_rows"), \
+             patch.object(props, "log_prediction") as log, \
+             patch.object(mlb_starters, "find_player_id",
+                          return_value=("1", False)), \
+             patch.object(statcast_asof, "get_rates", return_value=rates):
+            cand = props.analyze_player_props_value(
+                self._prop_data(), self._hist(status), threshold_pct=1.0,
+                sport_key=sport_key)[0]
+        return cand, log
+
+    def test_out_demotes_and_skips_log(self):
+        cand, log = self._run("out")
+        self.assertEqual(cand["direction"], "OVER")
+        self.assertFalse(cand["is_value"])          # demoted from recs
+        self.assertEqual(cand["lineup_status"], "out")
+        log.assert_not_called()                      # no corrupt label logged
+
+    def test_unknown_is_value_and_logged(self):
+        cand, log = self._run("unknown")
+        self.assertTrue(cand["is_value"])            # fail open
+        self.assertEqual(cand["lineup_status"], "unknown")
+        log.assert_called()
+
+    def test_in_is_value_and_logged(self):
+        cand, log = self._run("in")
+        self.assertTrue(cand["is_value"])
+        self.assertEqual(cand["lineup_status"], "in")
+        log.assert_called()
+
+    def test_gate_disabled_restores_value(self):
+        # With MLB removed from the gate map the same "out" is ignored -> the gate
+        # was the only thing flipping value (and logging resumes).
+        with patch.object(props, "PLAYER_PROP_LINEUP_GATING", {}):
+            cand, log = self._run("out")
+        self.assertTrue(cand["is_value"])
+        log.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

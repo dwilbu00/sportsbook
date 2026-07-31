@@ -241,6 +241,20 @@ PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = {
 DEFAULT_PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = 0.0  # off by default for unknown sports
 
 
+# Per-sport toggle for confirmed-lineup / probable-starter gating of player props
+# (§2.5A). When a player is high-confidence NOT playing in the prop's role (a
+# benched batter once BOTH lineups are posted, or a pitcher who isn't the
+# announced starter) the prop is demoted from recommendations AND skipped from the
+# calibration log — a dead bet whose label would never resolve. Tri-state and
+# FAIL-OPEN: only a confident "out" acts; "in"/"unknown" leave behavior unchanged.
+# MLB-only — lineup/probable data comes from mlb_starters; other sports fall
+# through untouched (no lineup_status is ever set for them).
+PLAYER_PROP_LINEUP_GATING = {
+    "baseball_mlb": True,
+}
+DEFAULT_PLAYER_PROP_LINEUP_GATING = False
+
+
 # Bayesian shrinkage of the recency-weighted projection toward the unweighted
 # (season-long) prior mean. `k` is in pseudo-observations:
 #   projection = (eff_n * weighted_mean + k * unweighted_mean) / (eff_n + k)
@@ -353,6 +367,12 @@ def _suppress_under(prop_key, line):
         return float(line) <= cap
     except (TypeError, ValueError):
         return False
+
+
+def _lineup_gating_enabled(sport_key):
+    """True when confirmed-lineup / probable-starter gating applies (§2.5A)."""
+    return PLAYER_PROP_LINEUP_GATING.get(
+        sport_key, DEFAULT_PLAYER_PROP_LINEUP_GATING)
 
 
 def _xstats_blend(base_proj, xba, ab_per_game, strength):
@@ -929,6 +949,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     "direction": None,
                     "is_value": False,
                     "no_history": True,
+                    "lineup_status": (history or {}).get("lineup_status"),
                 })
                 continue
 
@@ -1519,10 +1540,21 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 is_value = False
                 under_suppressed = True
 
+            # §2.5A confirmed-lineup / probable-starter gate. A high-confidence
+            # "out" (benched batter once both lineups are posted, or a pitcher who
+            # isn't the announced starter) is a dead bet: demote it from
+            # recommendations and skip the log below — the label would never
+            # resolve. Tri-state and fail-open: "in"/"unknown" change nothing.
+            lineup_status = history.get("lineup_status")
+            lineup_out = (_lineup_gating_enabled(sport_key)
+                          and lineup_status == "out")
+            if lineup_out:
+                is_value = False
+
             # Log the published probability so future refits learn from it.
             # We log the *raw* (pre-Platt) probability — that's what Platt
             # was fit against and what subsequent refits should map.
-            if log_game_date and sport_key:
+            if log_game_date and sport_key and not lineup_out:
                 prediction_row = log_prediction(
                     sport_key=sport_key,
                     event_id=prop_data.get("game_id"),
@@ -1555,6 +1587,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 # the top of the order; .get() (not the MLB-scoped local var) so
                 # non-MLB sports safely resolve to None.
                 "batting_order": history.get("batting_order"),
+                # §2.5A tri-state availability ("in"/"out"/"unknown"/None) for the
+                # UI badge. "out" props are demoted from recs above; kept in the
+                # candidate list so they still surface (as non-value "other props").
+                "lineup_status": lineup_status,
                 "prop": prop_key,
                 "prop_label": PROP_LABELS.get(prop_key, prop_key),
                 "line": line,

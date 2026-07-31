@@ -173,6 +173,135 @@ class StarterAdjustmentTests(unittest.TestCase):
             mlb_starters.lineup_player_context(lineup, "Away Player 1"))
 
 
+class PlayerStartStatusTests(unittest.TestCase):
+    """§2.5A tri-state pre-game availability gate (mlb_starters.player_start_status).
+
+    Only a confident "out" acts; everything uncertain fails open to "unknown".
+    Batter props gate on the confirmed lineup, pitcher props on the announced
+    probable. ``season=None`` exercises the pure name-based logic; a positive
+    season enables the id-confirmation arms (find_player_id patched)."""
+
+    def _lineup(self, home_names, away_names, home_conf=True, away_conf=True):
+        game = {"lineups": {
+            "homePlayers": [{"id": i, "fullName": n}
+                            for i, n in enumerate(home_names, 1)],
+            "awayPlayers": [{"id": 100 + i, "fullName": n}
+                            for i, n in enumerate(away_names, 1)],
+        }}
+        return {"home_confirmed": home_conf, "away_confirmed": away_conf,
+                "players": mlb_starters._lineup_players(game)}
+
+    def _probables(self, home_name=None, away_name=None,
+                   home_id=111, away_id=222):
+        out = {}
+        if home_name:
+            out[mlb_starters._norm("Guardians")] = {
+                "pitcher_id": home_id, "name": home_name, "team_id": 1}
+        if away_name:
+            out[mlb_starters._norm("Tigers")] = {
+                "pitcher_id": away_id, "name": away_name, "team_id": 2}
+        return out
+
+    # ---- batter arm ----
+    def test_batter_in_confirmed_side(self):
+        lineup = self._lineup(
+            ["José Ramírez"] + [f"H{i}" for i in range(2, 10)],
+            [f"A{i}" for i in range(1, 10)])
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "Jose Ramirez", "Guardians", "Tigers",
+            lineup, {}, season=None), "in")
+
+    def test_batter_present_but_side_unconfirmed_is_unknown(self):
+        lineup = self._lineup(
+            ["José Ramírez"] + [f"H{i}" for i in range(2, 10)],
+            [f"A{i}" for i in range(1, 10)], home_conf=False)
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "Jose Ramirez", "Guardians", "Tigers",
+            lineup, {}, season=None), "unknown")
+
+    def test_batter_absent_both_confirmed_is_out(self):
+        lineup = self._lineup([f"H{i}" for i in range(1, 10)],
+                              [f"A{i}" for i in range(1, 10)])
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "Benched Regular", "Guardians", "Tigers",
+            lineup, {}, season=None), "out")
+
+    def test_batter_absent_one_side_unconfirmed_is_unknown(self):
+        lineup = self._lineup([f"H{i}" for i in range(1, 10)],
+                              [f"A{i}" for i in range(1, 9)], away_conf=False)
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "Benched Regular", "Guardians", "Tigers",
+            lineup, {}, season=None), "unknown")
+
+    def test_batter_absent_by_name_but_id_matches_is_in(self):
+        # Odds-feed spelling differs, but the id resolves to a posted player
+        # (home slot 1, id=1) -> NOT out. Guards a false out on spelling drift.
+        lineup = self._lineup(
+            ["José Ramírez"] + [f"H{i}" for i in range(2, 10)],
+            [f"A{i}" for i in range(1, 10)])
+        with patch.object(mlb_starters, "find_player_id",
+                          return_value=(1, False)):
+            self.assertEqual(mlb_starters.player_start_status(
+                "batter_hits", "J Ram odds spelling", "Guardians", "Tigers",
+                lineup, {}, season=2025), "in")
+
+    # ---- pitcher arm ----
+    def test_pitcher_matches_probable_is_in(self):
+        probs = self._probables("Shane Bieber", "Tarik Skubal")
+        self.assertEqual(mlb_starters.player_start_status(
+            "pitcher_strikeouts", "Shane Bieber", "Guardians", "Tigers",
+            {}, probs, season=None), "in")
+
+    def test_pitcher_not_announced_both_sides_is_out(self):
+        probs = self._probables("Shane Bieber", "Tarik Skubal")
+        with patch.object(mlb_starters, "find_player_id",
+                          return_value=(999, True)):
+            self.assertEqual(mlb_starters.player_start_status(
+                "pitcher_strikeouts", "Some Reliever", "Guardians", "Tigers",
+                {}, probs, season=2025), "out")
+
+    def test_pitcher_one_side_tbd_is_unknown(self):
+        probs = self._probables("Shane Bieber", None)  # away starter TBD
+        with patch.object(mlb_starters, "find_player_id",
+                          return_value=(999, True)):
+            self.assertEqual(mlb_starters.player_start_status(
+                "pitcher_strikeouts", "Some Reliever", "Guardians", "Tigers",
+                {}, probs, season=2025), "unknown")
+
+    def test_pitcher_id_match_when_name_differs_is_in(self):
+        probs = self._probables("Shane Bieber", "Tarik Skubal")
+        with patch.object(mlb_starters, "find_player_id",
+                          return_value=(111, True)):
+            self.assertEqual(mlb_starters.player_start_status(
+                "pitcher_strikeouts", "S Bieber odds", "Guardians", "Tigers",
+                {}, probs, season=2025), "in")
+
+    def test_pitcher_no_probables_is_unknown(self):
+        self.assertEqual(mlb_starters.player_start_status(
+            "pitcher_strikeouts", "Shane Bieber", "Guardians", "Tigers",
+            {}, {}, season=None), "unknown")
+
+    def test_pitcher_unresolvable_name_not_ruled_out(self):
+        # Both probables announced but this pitcher's id can't be resolved
+        # (find_player_id -> None) -> stay "unknown", never a false out.
+        probs = self._probables("Shane Bieber", "Tarik Skubal")
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            self.assertEqual(mlb_starters.player_start_status(
+                "pitcher_strikeouts", "Mystery Arm", "Guardians", "Tigers",
+                {}, probs, season=2025), "unknown")
+
+    # ---- fail-open ----
+    def test_empty_inputs_are_unknown(self):
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "Nobody", "Guardians", "Tigers",
+            {}, {}, season=None), "unknown")
+
+    def test_missing_player_name_is_unknown(self):
+        self.assertEqual(mlb_starters.player_start_status(
+            "batter_hits", "", "Guardians", "Tigers",
+            {}, {}, season=None), "unknown")
+
+
 class ExpectedRunsTests(unittest.TestCase):
     def setUp(self):
         analysis._EXPECTED_RUNS_CACHE.clear()
