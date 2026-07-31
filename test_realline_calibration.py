@@ -14,7 +14,9 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 import book_line_calibration as blc
+import player_id_map
 import refit_calibration
+from test_backfill_player_ids import _Backend
 
 
 def _day(i):
@@ -403,6 +405,31 @@ class WarehouseHarvestTests(unittest.TestCase):
         out, _n_primary, _n_pred = self._harvest(wh, [])
         self.assertEqual(sorted(r["line"] for r in out), [0.5, 1.5])
 
+    def test_id_key_dedups_accent_variants_across_sources(self):
+        # Same player, two spellings, SAME player_mlb_id, one game/prop/line. The
+        # name key keeps them distinct (accents differ), but the id key collapses
+        # them → a single pooled obs (no double-count of one game).
+        wh = [self._wh_row("e1", "Jose Ramirez", 0.5)]
+        wh[0]["player_mlb_id"] = "608070"
+        pred = [self._pred_row("e1", "José Ramírez", 0.5)]
+        pred[0]["player_mlb_id"] = "608070"
+        out, n_primary, n_pred = self._harvest(wh, pred)
+        self.assertEqual(len(out), 1)              # id collapses the variant
+        self.assertEqual(n_primary, 1)
+        self.assertEqual(n_pred, 0)               # pred row was the id-dup
+        self.assertEqual(out[0]["player"], "Jose Ramirez")   # primary preferred
+
+    def test_name_key_still_dedups_when_only_one_source_has_id(self):
+        # Asymmetric enrichment (only the pred row carries an id): the id key can't
+        # match (wh id-key is None), but the shared odds-feed NAME still dedups →
+        # no regression during the manual-runbook transition window.
+        wh = [self._wh_row("e1", "A", 0.5)]                    # un-enriched
+        pred = [self._pred_row("e1", "A", 0.5)]
+        pred[0]["player_mlb_id"] = "608070"                   # only pred enriched
+        out, n_primary, n_pred = self._harvest(wh, pred)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(n_pred, 0)
+
 
 class JoinToActualsTests(unittest.TestCase):
     """Exercise the REAL join_book_lines_to_actuals (not mocked): idx binding,
@@ -437,6 +464,80 @@ class JoinToActualsTests(unittest.TestCase):
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
                            + [("2026-07-24", 2), ("2026-07-24", 0)])
         self.assertEqual(self._join([self._book_row()], gl), [])
+
+
+class JoinIdBridgeTests(_Backend, unittest.TestCase):
+    """join_book_lines_to_actuals pivots athlete-id resolution onto the book
+    line's player_mlb_id via the SFBB bridge (MLBAM→ESPN), bypassing the
+    name-based cache entirely; same-id spellings pool into ONE gamelog fetch.
+    Uses the map-seeding mixin so espn_id_for_mlb_id resolves for real."""
+
+    def _gamelog(self, dates_hits):
+        return [{"game_date": f"{d}T23:00:00Z", "H": h} for d, h in dates_hits]
+
+    def _row(self, player, line=0.5, mlb_id="608070", gd="2026-07-24"):
+        return {"sport_key": "baseball_mlb", "game_date": gd,
+                "commence_time": f"{gd}T23:00:00Z", "event_id": "e1",
+                "home_team": "Reds", "away_team": "Guardians",
+                "player": player, "player_mlb_id": mlb_id,
+                "prop_key": "batter_hits", "line": line,
+                "over_price": -110, "under_price": -110}
+
+    def test_id_resolves_aid_and_skips_name_search(self):
+        # The book row's name is a garbage spelling the name cache would miss, but
+        # the correct player_mlb_id resolves the ESPN athlete_id via the bridge.
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
+                           + [("2026-07-24", 2)])
+        seen = {}
+
+        def fake_gamelog(sport, league, aid, **kw):
+            seen["aid"] = aid
+            return gl
+
+        with patch("book_line_calibration.cached_athlete_id") as m_name, \
+             patch("book_line_calibration.cached_gamelog",
+                   side_effect=fake_gamelog):
+            out = blc.join_book_lines_to_actuals(
+                [self._row("Totally Wrong Spelling")], "baseball", "mlb")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["actual"], 2.0)
+        m_name.assert_not_called()                 # name cache bypassed
+        self.assertEqual(seen["aid"],
+                         player_id_map.espn_id_for_mlb_id("608070"))
+
+    def test_same_id_two_spellings_pool_one_fetch(self):
+        # Two alt-line rows for the same player under different spellings: grouped
+        # by id → a single ESPN gamelog fetch, both lines still join.
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
+                           + [("2026-07-24", 2)])
+        calls = []
+
+        def fake_gamelog(sport, league, aid, **kw):
+            calls.append(aid)
+            return gl
+
+        rows = [self._row("Jose Ramirez", line=0.5),
+                self._row("José Ramírez", line=1.5)]
+        with patch("book_line_calibration.cached_athlete_id") as m_name, \
+             patch("book_line_calibration.cached_gamelog",
+                   side_effect=fake_gamelog):
+            out = blc.join_book_lines_to_actuals(rows, "baseball", "mlb")
+        self.assertEqual(len(calls), 1)            # pooled: ONE fetch
+        m_name.assert_not_called()
+        self.assertEqual(sorted(r["line"] for r in out), [0.5, 1.5])
+
+    def test_falls_back_to_name_when_id_unresolved(self):
+        # An unmapped id must not strand the row: the join falls back to the
+        # name-based cache (zero regression for un-enriched / unknown players).
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
+                           + [("2026-07-24", 2)])
+        with patch("book_line_calibration.cached_athlete_id",
+                   return_value="999") as m_name, \
+             patch("book_line_calibration.cached_gamelog", return_value=gl):
+            out = blc.join_book_lines_to_actuals(
+                [self._row("A. Batter", mlb_id="000404")], "baseball", "mlb")
+        self.assertEqual(len(out), 1)
+        m_name.assert_called_once()                # id miss → name path
 
 
 if __name__ == "__main__":

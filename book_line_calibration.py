@@ -220,19 +220,37 @@ def harvest_book_lines_from_prediction_log(sport_key, target_props):
             "commence_time": commence,
             "event_id": r.get("event_id"),   # present on the pred-log row
             "home_team": None, "away_team": None,
-            "player": player, "prop_key": pk, "line": line,
+            "player": player, "player_mlb_id": r.get("player_mlb_id"),
+            "prop_key": pk, "line": line,
             "over_price": None, "under_price": None,
         })
     return out
 
 
+def _round_line(row):
+    try:
+        return round(float(row.get("line")), 1)
+    except (TypeError, ValueError):
+        return row.get("line")
+
+
 def _book_line_key(row):
     """Dedup identity for a book line across sources: (player, prop, date, line)."""
-    try:
-        ln = round(float(row.get("line")), 1)
-    except (TypeError, ValueError):
-        ln = row.get("line")
-    return (row.get("player"), row.get("prop_key"), row.get("game_date"), ln)
+    return (row.get("player"), row.get("prop_key"), row.get("game_date"),
+            _round_line(row))
+
+
+def _book_line_id_key(row):
+    """Id-based dedup dimension: (player_mlb_id, prop, date, line), or None when
+    the row carries no canonical id. Collapses spelling/accent variants of one
+    player that the name key would keep as distinct rows. Because both harvest
+    sources carry the same odds-feed name, the name key still catches the case
+    where only one source has been id-enriched — so adding this key only ever
+    removes true duplicates, never inflates obs."""
+    mlb_id = row.get("player_mlb_id")
+    if not mlb_id:
+        return None
+    return (mlb_id, row.get("prop_key"), row.get("game_date"), _round_line(row))
 
 
 def harvest_real_line_book_lines(sport_key, target_props, label=""):
@@ -269,7 +287,7 @@ def harvest_real_line_book_lines(sport_key, target_props, label=""):
     # rows; game_date is ET so consecutive-day series games are NOT flagged).
     dh_events = warehouse.doubleheader_event_ids(primary) if warehouse else set()
 
-    seen, out, dropped_dh = set(), [], 0
+    seen, seen_ids, out, dropped_dh = set(), set(), [], 0
     for src in (primary, pred_lines):   # primary first → preferred on collision
         for r in src:
             eid = r.get("event_id")
@@ -277,9 +295,12 @@ def harvest_real_line_book_lines(sport_key, target_props, label=""):
                 dropped_dh += 1
                 continue
             k = _book_line_key(r)
-            if k in seen:
+            idk = _book_line_id_key(r)
+            if k in seen or (idk is not None and idk in seen_ids):
                 continue
             seen.add(k)
+            if idk is not None:
+                seen_ids.add(idk)
             out.append(r)
         if src is primary:
             n_primary = len(out)
@@ -319,17 +340,31 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     locate the game on `game_date`, and attach `actual` + `prior_games`.
     Returns a list of enriched dicts (skipping unjoinable rows).
     """
-    # Group by player so we only fetch each gamelog once
+    # Group by canonical id (falling back to name) so spelling variants of one
+    # player pool into a single gamelog fetch.
     by_player = defaultdict(list)
     for row in book_lines:
-        by_player[row["player"]].append(row)
+        by_player[row.get("player_mlb_id") or row["player"]].append(row)
 
     enriched = []
     skipped_no_player = 0
     skipped_no_game = 0
 
-    for player, rows in by_player.items():
-        aid = cached_athlete_id(espn_sport, espn_league, player)
+    for _, rows in by_player.items():
+        player = rows[0].get("player")
+        mlb_id = rows[0].get("player_mlb_id")
+        # Prefer the book line's authoritative MLBAM id → ESPN athlete_id (name-
+        # independent; handles accents/namesakes), falling back to the name-based
+        # cache lookup for un-enriched / unmapped / non-baseball rows.
+        aid = None
+        if mlb_id and espn_sport == "baseball":
+            try:
+                import player_id_map
+                aid = player_id_map.espn_id_for_mlb_id(mlb_id)
+            except Exception:
+                aid = None
+        if not aid:
+            aid = cached_athlete_id(espn_sport, espn_league, player)
         if not aid:
             skipped_no_player += len(rows)
             continue
