@@ -21,3 +21,6 @@ warehouse/
 
 # Local-only sql scripts
 clear_tables.sql
+
+# Web resources for Claude
+.webresources

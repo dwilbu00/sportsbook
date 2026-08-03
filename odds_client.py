@@ -501,6 +501,21 @@ def get_historical_event_odds(api_key, sport, event_id, date, regions="us",
     return snapshot["data"], snapshot["timestamp"]
 
 
+def is_historical_event_cached(sport, event_id, date, regions="us",
+                               markets="h2h", bookmakers=None):
+    """True if this exact historical event-odds snapshot is already in the
+    permanent cache — a re-fetch would return instantly and cost 0 credits.
+
+    Mirrors the cache-key construction in get_historical_event_odds so a
+    budget-guarded caller can treat cache hits (and cached 404s) as free instead
+    of charging them against a credit cap."""
+    date = _normalize_snapshot_date(date)
+    books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
+    cache_path = _cache_key("hist_event_odds", sport, event_id, date, regions,
+                            markets, books_key)
+    return os.path.exists(cache_path)
+
+
 def devig_two_way(implied_a, implied_b):
     """
     Remove the bookmaker margin (vig) from a two-outcome market by normalizing
@@ -829,6 +844,52 @@ def _dk_offer(side_offers, book_key="draftkings"):
         if book_key in str(offer.get("book", "")).lower():
             return offer
     return None
+
+
+def dk_prop_lines(game_data, prop_key, book_key="draftkings"):
+    """Every line DraftKings posts for one prop market in an event-odds payload,
+    WITHOUT the consensus-modal-line collapse parse_player_props applies.
+
+    Returns a list of ``{"player", "line", "over_price", "under_price"}`` — one
+    entry per (player, line) DK offers, with a side's price None when DK only
+    posts the opposite side at that line. The DK closing-line CLV backfill
+    (backfill_dk_clv.py) needs DK's price at the *exact* line a bet was placed
+    on, which the single consensus line from parse_player_props can't provide.
+    Only the DraftKings bookmaker is read (matched on key or title). Pure and
+    hermetic; never raises."""
+    out = []
+    try:
+        for bookmaker in game_data.get("bookmakers", []) or []:
+            key = str(bookmaker.get("key") or "").lower()
+            title = str(bookmaker.get("title") or "").lower()
+            if book_key not in key and book_key not in title:
+                continue
+            for market in bookmaker.get("markets", []) or []:
+                if market.get("key") != prop_key:
+                    continue
+                # (player, line) -> {"Over": price, "Under": price}
+                by_pl = {}
+                for outcome in market.get("outcomes", []) or []:
+                    player = outcome.get("description")
+                    side = outcome.get("name")
+                    if not player or side not in ("Over", "Under"):
+                        continue
+                    line = (0.5 if prop_key == "player_anytime_td"
+                            else outcome.get("point"))
+                    price = outcome.get("price")
+                    if line is None or price is None:
+                        continue
+                    by_pl.setdefault((player, line), {})[side] = price
+                for (player, line), sides in by_pl.items():
+                    out.append({
+                        "player": player,
+                        "line": line,
+                        "over_price": sides.get("Over"),
+                        "under_price": sides.get("Under"),
+                    })
+    except Exception:
+        return out
+    return out
 
 
 # ── De-vig consensus quality (P1.1c) ──

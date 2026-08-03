@@ -125,9 +125,16 @@ def main():
         return
 
     # Recompute CLV against the corrected closing snapshot (the _order bugfix).
-    reset = wagers.reset_clv()
+    # Only TEAM markets (moneyline/spread/total) derive from the warehouse, so
+    # reset only those. Player-prop CLV now comes from DraftKings via
+    # backfill_dk_clv.py and persist_clv can't recompute it — a blanket
+    # reset_clv() would wipe real DK-backfilled prop CLV and leave it blank.
+    team_ids = [r.get("wager_id") for r in wagers.read_wagers()
+                if r.get("bet_type") != "player_prop" and r.get("wager_id")]
+    reset = wagers.reset_clv(wager_ids=team_ids)
     recomputed = wagers.persist_clv()
-    print(f"CLV: cleared {reset} stale row(s); recomputed {recomputed}.")
+    print(f"CLV: cleared {reset} stale team-market row(s); recomputed "
+          f"{recomputed} (player-prop CLV left to backfill_dk_clv.py).")
 
 
 if __name__ == "__main__":

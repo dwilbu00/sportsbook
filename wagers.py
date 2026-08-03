@@ -570,7 +570,14 @@ def attach_clv(rows):
     """Fill close_line/close_price/clv_pct from warehoused closing lines.
 
     Positive CLV = the executed price implied a lower probability (better odds)
-    than the closing line. Mutates and returns ``rows``. Best-effort."""
+    than the closing line. Mutates and returns ``rows``. Best-effort.
+
+    Player props are DELIBERATELY skipped here: the user bets only at DraftKings,
+    but the warehouse stores best-of-book / de-vigged consensus (not DK) and its
+    prop lookup ignores the line, so a warehouse close is neither DK-vs-DK nor
+    same-line. Prop CLV is filled exclusively by the DK closing-line backfill
+    (backfill_dk_clv.py), which fetches DraftKings' historical close at the exact
+    bet line. Team markets (moneyline/spread/total) keep the warehouse path."""
     try:
         import warehouse
     except Exception:
@@ -580,6 +587,8 @@ def attach_clv(rows):
             continue
         try:
             bet_type = row.get("bet_type")
+            if bet_type == "player_prop":
+                continue  # DK-only prop CLV — filled by backfill_dk_clv.py
             commence = row.get("commence_time")
             # The warehouse partitions snapshots by the UTC commence date
             # (commence[:10]); the row's game_date is now US-local, so a late
@@ -589,13 +598,7 @@ def attach_clv(rows):
             common = dict(sport=row.get("sport_key"), game_date=wh_date,
                           event_id=row.get("event_id"),
                           commence_time=commence)
-            if bet_type == "player_prop":
-                close = warehouse.closing_line_for(
-                    bet_type="player_prop", player=row.get("player"),
-                    prop_key=row.get("prop_key"), direction=row.get("direction"),
-                    point=row.get("line"),
-                    player_mlb_id=row.get("player_mlb_id"), **common)
-            elif bet_type == "total":
+            if bet_type == "total":
                 close = warehouse.closing_line_for(
                     bet_type="total", selection=row.get("side"),
                     point=row.get("point"), **common)
@@ -651,6 +654,18 @@ def persist_clv(rows=None, now=None):
         for r in candidates
         if r.get("wager_id") and r.get("close_price") is not None
     }
+    return apply_clv_updates(filled)
+
+
+def apply_clv_updates(filled):
+    """Write close_price/close_line/clv_pct for the given wagers durably.
+
+    ``filled`` maps wager_id -> {close_price, close_line, clv_pct}. Only rows
+    whose close_price IS NULL are updated, so re-runs are idempotent (the SQL
+    read is restricted to them; the Blob path ignores ``where`` and the mutator
+    self-filters). Shared by persist_clv (team-market warehouse fill on render)
+    and the DK closing-line prop backfill. Returns the count persisted.
+    Best-effort; never raises."""
     if not filled:
         return 0
 
@@ -664,8 +679,6 @@ def persist_clv(rows=None, now=None):
         return changed
 
     try:
-        # Only close_price-null rows can be filled, so restrict the SQL read to
-        # them (Blob path ignores ``where`` and the mutator self-filters anyway).
         return recalibration.mutate_ndjson_log(
             WAGERS_FILE, apply, where={"close_price": None})
     except Exception:
@@ -678,10 +691,17 @@ def reset_clv(wager_ids=None):
     Use after a closing-line correction (e.g. the _order bugfix that had CLV
     computed against the opening snapshot): persist_clv only fills rows whose
     close_price IS NULL, so already-filled (stale) values must be cleared first.
-    Limited to ``wager_ids`` when given, else every row that has a CLV value.
+    Limited to ``wager_ids`` when given, else (``wager_ids is None``) every row
+    that has a CLV value. An explicitly EMPTY selection clears nothing — never
+    everything — so a caller that computed "the rows to reset" and got none
+    (e.g. a ledger with only player props) can't accidentally wipe the ledger.
     Returns the count cleared. Raises on a storage failure so callers can surface
     it."""
-    ids = {wid for wid in (wager_ids or []) if wid} or None
+    ids = None
+    if wager_ids is not None:
+        ids = {wid for wid in wager_ids if wid}
+        if not ids:
+            return 0
 
     def clear(rows):
         changed = 0

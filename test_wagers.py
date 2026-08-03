@@ -622,12 +622,13 @@ class AttachClvTests(unittest.TestCase):
     def test_clv_queries_warehouse_by_utc_commence_date(self):
         # The row's game_date is US-local (7/20) but the warehouse partitions by
         # the UTC commence date (7/21). attach_clv must query by the UTC date or
-        # it misses the snapshot folder and CLV never populates.
+        # it misses the snapshot folder and CLV never populates. (Team markets
+        # still use the warehouse; props are backfilled from DraftKings instead.)
         import warehouse
         row = {
-            "bet_type": "player_prop", "sport_key": "baseball_mlb",
-            "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
-            "direction": "OVER", "line": 1.5, "point": 1.5,
+            "bet_type": "total", "sport_key": "baseball_mlb",
+            "event_id": "E1", "side": "over",
+            "point": 8.5, "line": 8.5,
             "game_date": "2026-07-20",
             "commence_time": "2026-07-21T02:30:00Z",
             "executed_price": -110,
@@ -644,9 +645,27 @@ class AttachClvTests(unittest.TestCase):
         self.assertEqual(row["close_price"], -120)
         self.assertIsNotNone(row["clv_pct"])
 
+    def test_skips_player_props(self):
+        # Props are DK-only now: attach_clv must NOT fill them from the consensus
+        # warehouse (they are filled by backfill_dk_clv.py instead). Even when the
+        # warehouse would return a line, a prop row stays blank.
+        import warehouse
+        prop = {"bet_type": "player_prop", "sport_key": "baseball_mlb",
+                "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
+                "direction": "OVER", "line": 1.5, "point": 1.5,
+                "player_mlb_id": "608070",
+                "commence_time": "2026-07-21T02:30:00Z", "executed_price": -110}
+        with patch.object(warehouse, "closing_line_for",
+                          return_value={"price": -120, "implied_prob": 0.545}) as m:
+            wagers.attach_clv([prop])
+            m.assert_not_called()  # prop never touches the warehouse
+        self.assertIsNone(prop.get("close_price"))
+        self.assertIsNone(prop.get("clv_pct"))
+
     def test_forwards_canonical_ids_to_warehouse(self):
         # attach_clv threads the row's precomputed ids so the odds-line lookup can
-        # prefer id over name (props -> player_mlb_id, ml/spread -> team_code).
+        # prefer id over name for team markets (ml/spread -> team_code). Props are
+        # skipped entirely.
         import warehouse
         seen = {}
 
@@ -664,11 +683,23 @@ class AttachClvTests(unittest.TestCase):
               "executed_price": -110}
         with patch.object(warehouse, "closing_line_for", side_effect=fake_closing):
             wagers.attach_clv([prop, ml])
-        self.assertEqual(seen["player_prop"].get("player_mlb_id"), "608070")
+        self.assertNotIn("player_prop", seen)  # prop skipped
         self.assertEqual(seen["moneyline"].get("team_code"), "CLE")
 
 
 class PersistClvTests(unittest.TestCase):
+    def _total(self, commence, seq=0):
+        # A team market — persist_clv fills these from the warehouse. (Props are
+        # DK-only now and are backfilled by backfill_dk_clv.py, not persist_clv.)
+        meta = {"sport_key": "baseball_mlb", "event_id": "E1",
+                "commence_time": commence, "game_date": commence[:10],
+                "home_team": "H", "away_team": "A", "stake": 10.0,
+                "placed_at": "2026-07-20T12:00:00+00:00", "seq": seq}
+        return wagers.build_wager_row("total", "OVER", {
+            "line": 8.5, "over_price": -110, "under_price": -105,
+            "over_hit_rate": 55.0, "over_edge_pct": 6.0,
+            "matchup": "A @ H", "event_id": "E1"}, meta)
+
     def _prop(self, commence, seq=0):
         meta = {"sport_key": "baseball_mlb", "event_id": "E1",
                 "commence_time": commence, "game_date": commence[:10],
@@ -682,7 +713,7 @@ class PersistClvTests(unittest.TestCase):
 
     def test_persists_clv_for_started_game_and_is_idempotent(self):
         import warehouse
-        row = self._prop("2026-07-21T02:30:00Z")
+        row = self._total("2026-07-21T02:30:00Z")
         now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)  # after commence
         with _LocalLedger():
             wagers.submit_wagers([row])
@@ -698,7 +729,7 @@ class PersistClvTests(unittest.TestCase):
 
     def test_skips_pregame_rows(self):
         import warehouse
-        row = self._prop("2026-07-21T02:30:00Z")
+        row = self._total("2026-07-21T02:30:00Z")
         now = datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc)  # before commence
         with _LocalLedger():
             wagers.submit_wagers([row])
@@ -710,11 +741,26 @@ class PersistClvTests(unittest.TestCase):
 
     def test_returns_zero_when_warehouse_has_no_line(self):
         import warehouse
-        row = self._prop("2026-07-21T02:30:00Z")
+        row = self._total("2026-07-21T02:30:00Z")
         now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
         with _LocalLedger():
             wagers.submit_wagers([row])
             with patch.object(warehouse, "closing_line_for", return_value=None):
+                self.assertEqual(wagers.persist_clv(now=now), 0)
+            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
+
+    def test_does_not_persist_player_props(self):
+        # Props are DK-only: persist_clv (the render path) must leave a started
+        # prop blank even when the warehouse has a line, so the only prop CLV that
+        # ever shows is the DK-vs-DK, same-line value from backfill_dk_clv.py.
+        import warehouse
+        row = self._prop("2026-07-21T02:30:00Z")
+        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)  # after commence
+        with _LocalLedger():
+            wagers.submit_wagers([row])
+            with patch.object(warehouse, "closing_line_for",
+                              return_value={"price": -120, "implied_prob": 0.545,
+                                            "captured_at": "x"}):
                 self.assertEqual(wagers.persist_clv(now=now), 0)
             self.assertIsNone(wagers.read_wagers()[0]["close_price"])
 
@@ -743,6 +789,17 @@ class ResetClvTests(unittest.TestCase):
             rows = {r["wager_id"]: r for r in wagers.read_wagers()}
             self.assertIsNone(rows["a"]["close_price"])
             self.assertEqual(rows["b"]["close_price"], -120)
+
+    def test_reset_empty_id_list_clears_nothing(self):
+        # An explicitly EMPTY selection must clear NOTHING (not everything) —
+        # a caller that computed "rows to reset" and got none (e.g. migrate on a
+        # props-only ledger) must not accidentally wipe every CLV value.
+        with _LocalLedger():
+            wagers.submit_wagers([
+                {"wager_id": "a", "status": "won", "close_price": -110,
+                 "clv_pct": 1.0}])
+            self.assertEqual(wagers.reset_clv([]), 0)
+            self.assertEqual(wagers.read_wagers()[0]["close_price"], -110)
 
 
 class _SqlLedger:
@@ -813,11 +870,12 @@ class FilteredWagerDmlSqlTests(unittest.TestCase):
                 "commence_time": "2026-07-21T02:30:00Z", "game_date": "2026-07-21",
                 "home_team": "H", "away_team": "A", "stake": 10.0,
                 "placed_at": "2026-07-20T12:00:00+00:00", "seq": 0}
-        row = wagers.build_wager_row("player_prop", None, {
-            "player": "Bat", "prop": "batter_hits", "prop_label": "Hits",
-            "line": 1.5, "direction": "OVER", "over_price": -110,
-            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
-            "team": "H", "event_id": "E1"}, meta)
+        # A team market — persist_clv fills these from the warehouse (props are
+        # DK-only and backfilled by backfill_dk_clv.py, not persist_clv).
+        row = wagers.build_wager_row("total", "OVER", {
+            "line": 8.5, "over_price": -110, "under_price": -105,
+            "over_hit_rate": 55.0, "over_edge_pct": 6.0,
+            "matchup": "A @ H", "event_id": "E1"}, meta)
         now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
         with _SqlLedger():
             wagers.submit_wagers([row])
