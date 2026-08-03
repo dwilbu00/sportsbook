@@ -436,6 +436,39 @@ def _grade_wager(row):
     return status, f"{home_score:g}-{away_score:g}"
 
 
+def _dnp_void_update(row, now):
+    """A void update for a player prop whose player is a confirmed, stale DNP, or
+    None if the row isn't one.
+
+    Mirrors the prediction resolver's stale-DNP sweep: a player who was listed but
+    never took the field leaves no game log to intersect, so ``resolve_one_prop``
+    returns None forever. Once the game is at least ``STALE_DNP_HOURS`` old the
+    scratch is permanent, so we void the bet (stake refunded, ROI-neutral) instead
+    of leaving it pending every tick. The age gate lives in ``_is_stale_dnp``, so a
+    same-day data lag is never voided. Never raises."""
+    if row.get("bet_type") != "player_prop":
+        return None
+    game_date = (row.get("game_date") or "")[:10]
+    try:
+        stale = recalibration._is_stale_dnp(
+            row.get("sport_key"), row.get("prop_key"), row.get("player"),
+            game_date, row.get("commence_time"))
+    except Exception:
+        return None
+    if not stale:
+        return None
+    update = {
+        "status": "void",
+        "actual": None,
+        "profit": 0.0,  # stake refunded — a void is ROI-neutral
+        "resolved_at": now.isoformat(),
+    }
+    healed = pricing_common.et_local_date(row.get("commence_time"))
+    if healed:
+        update["game_date"] = healed
+    return update
+
+
 def _maybe_finished(row, now):
     """True when the wager's game has plausibly ended (commence + sport buffer).
 
@@ -476,6 +509,13 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
             continue  # game hasn't plausibly finished yet
         graded = _grade_wager(row)
         if graded is None:
+            # Not gradable. If it's a confirmed, stale DNP (player never played),
+            # it will never become gradable — void it so it stops stranding as
+            # pending. Otherwise leave it pending to retry next tick.
+            void = _dnp_void_update(row, now)
+            if void is not None:
+                updates[row.get("wager_id")] = void
+                count += 1
             continue
         status, actual = graded
         won = None if status == "push" else (status == "won")
@@ -671,24 +711,31 @@ def _num(value):
 
 
 def _metrics(group):
-    settled = [r for r in group if r.get("status") in ("won", "lost", "push")]
-    staked = sum(_num(r.get("stake")) for r in settled)
-    realized = sum(_num(r.get("profit")) for r in settled)
-    won = sum(1 for r in settled if r.get("status") == "won")
-    lost = sum(1 for r in settled if r.get("status") == "lost")
-    push = sum(1 for r in settled if r.get("status") == "push")
+    # A VOID (scratch/DNP refund) is RESOLVED but ROI-neutral: the stake is
+    # returned, so it carries no won/lost/push, no staked amount, and no realized
+    # P/L — but it must NOT sit in the pending bucket (a voided bet is settled, and
+    # leaving it as pending would misreport it as still-open forever).
+    graded = [r for r in group if r.get("status") in ("won", "lost", "push")]
+    voided = sum(1 for r in group if r.get("status") == "void")
+    staked = sum(_num(r.get("stake")) for r in graded)
+    realized = sum(_num(r.get("profit")) for r in graded)
+    won = sum(1 for r in graded if r.get("status") == "won")
+    lost = sum(1 for r in graded if r.get("status") == "lost")
+    push = sum(1 for r in graded if r.get("status") == "push")
     clvs = [_num(r.get("clv_pct")) for r in group if r.get("clv_pct") is not None]
     decided = won + lost
+    resolved = len(graded) + voided
     return {
         "total": len(group),
-        "resolved": len(settled),
-        "pending": len(group) - len(settled),
+        "resolved": resolved,
+        "pending": len(group) - resolved,
         "total_staked": staked,
         "realized_profit": realized,
         "roi": (realized / staked) if staked else None,
         "won": won,
         "lost": lost,
         "push": push,
+        "void": voided,
         "hit_rate": (won / decided) if decided else None,
         "avg_clv_pct": (sum(clvs) / len(clvs)) if clvs else None,
     }

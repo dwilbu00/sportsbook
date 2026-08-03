@@ -305,6 +305,81 @@ class RoundTripAndGradeTests(unittest.TestCase):
             self.assertEqual(row["game_date"], "2026-07-20")  # healed to ET-local
 
 
+class DnpAutoVoidTests(unittest.TestCase):
+    """A player prop whose player is a confirmed, stale DNP (listed but never
+    played) is un-gradable forever. resolve_pending_wagers must VOID it (stake
+    refunded, ROI-neutral) instead of stranding it as pending every tick — the
+    same stale-DNP sweep the prediction resolver already does."""
+
+    def _dnp_prop(self, seq=0):
+        # Commence is comfortably past the 3h MLB buffer relative to the test
+        # clock, so the row reaches _grade_wager (the age gate lives inside the
+        # mocked _is_stale_dnp, so this fixture doesn't depend on wall time).
+        return wagers.build_wager_row("player_prop", None, {
+            "player": "Reynaldo Lopez", "prop": "pitcher_outs",
+            "prop_label": "Outs", "line": 15.5, "direction": "UNDER",
+            "under_price": -110, "under_rate": 55.0, "edge_pct": 5.0,
+            "matchup": "WSH @ ATL", "team": "Atlanta Braves", "event_id": "E1"},
+            {"sport_key": "baseball_mlb", "event_id": "E1",
+             "commence_time": "2026-08-01T23:16:00Z", "game_date": "2026-08-01",
+             "home_team": "Atlanta Braves", "away_team": "Washington Nationals",
+             "stake": 10.0, "placed_at": "2026-08-01T20:00:00+00:00", "seq": seq})
+
+    def _now(self):
+        return datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc)  # ~38h later
+
+    def test_confirmed_stale_dnp_is_voided(self):
+        with _LocalLedger():
+            wagers.submit_wagers([self._dnp_prop()])
+            with patch.object(recalibration, "resolve_one_prop",
+                              return_value=None), \
+                 patch.object(recalibration, "_is_stale_dnp", return_value=True):
+                self.assertEqual(wagers.resolve_pending_wagers(now=self._now()), 1)
+            row = wagers.read_wagers()[0]
+            self.assertEqual(row["status"], "void")
+            self.assertIsNone(row["actual"])
+            self.assertAlmostEqual(row["profit"], 0.0)  # stake refunded
+            self.assertIsNotNone(row["resolved_at"])
+
+    def test_not_yet_stale_dnp_stays_pending(self):
+        # Un-gradable but NOT yet a confirmed stale DNP (same-day data lag): the
+        # resolver returns None and the void gate says "not stale" -> stay pending
+        # and retry next tick, never void prematurely.
+        with _LocalLedger():
+            wagers.submit_wagers([self._dnp_prop()])
+            with patch.object(recalibration, "resolve_one_prop",
+                              return_value=None), \
+                 patch.object(recalibration, "_is_stale_dnp", return_value=False):
+                self.assertEqual(wagers.resolve_pending_wagers(now=self._now()), 0)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
+    def test_void_survives_the_sql_where_filtered_path(self):
+        with _SqlLedger():
+            wagers.submit_wagers([self._dnp_prop()])
+            with patch.object(recalibration, "resolve_one_prop",
+                              return_value=None), \
+                 patch.object(recalibration, "_is_stale_dnp", return_value=True):
+                self.assertEqual(wagers.resolve_pending_wagers(now=self._now()), 1)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "void")
+
+    def test_team_bet_never_auto_voids(self):
+        # The DNP void path is player-prop-only; a team market that can't resolve
+        # (no final score) stays pending, it is never voided as a scratch.
+        row = wagers.build_wager_row("moneyline", None, {
+            "team": "Atlanta Braves", "opponent": "Washington Nationals",
+            "home_away": "HOME", "best_price": 120, "event_id": "E1"},
+            {"sport_key": "baseball_mlb", "event_id": "E1",
+             "commence_time": "2026-08-01T23:16:00Z", "game_date": "2026-08-01",
+             "home_team": "Atlanta Braves", "away_team": "Washington Nationals",
+             "stake": 10.0, "placed_at": "2026-08-01T20:00:00+00:00", "seq": 0})
+        with _LocalLedger():
+            wagers.submit_wagers([row])
+            with patch.object(game_results, "final_score", return_value=None), \
+                 patch.object(recalibration, "_is_stale_dnp", return_value=True):
+                self.assertEqual(wagers.resolve_pending_wagers(now=self._now()), 0)
+            self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
+
+
 class TeamIdentityGradingTests(unittest.TestCase):
     """A moneyline/spread bet must grade off the team it was placed on, even if
     the stored `side` is stale/flipped (the Yankees-graded-as-Phillies bug)."""
@@ -781,6 +856,35 @@ class SummaryTests(unittest.TestCase):
         self.assertAlmostEqual(summary["pending_stake"], 10.0)
         self.assertTrue(summary["by_bet_type"])
         self.assertTrue(summary["by_sport"])
+
+    def test_void_counts_as_resolved_but_roi_neutral(self):
+        # A voided (scratch/DNP) bet is SETTLED, not pending, and refunds the
+        # stake: it carries no won/lost/push, no staked amount, and no realized
+        # P/L, but it must not sit in the pending bucket forever.
+        rows = [
+            {"sport_key": "baseball_mlb", "bet_type": "player_prop",
+             "status": "won", "stake": 10.0, "profit": 9.0},
+            {"sport_key": "baseball_mlb", "bet_type": "player_prop",
+             "prop_key": "pitcher_outs", "status": "void", "stake": 10.0,
+             "profit": 0.0},
+            {"sport_key": "baseball_mlb", "bet_type": "moneyline",
+             "status": "pending", "stake": 10.0, "profit": None},
+        ]
+        summary = wagers.summarize_wagers(rows)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["resolved"], 2)   # won + void
+        self.assertEqual(summary["pending"], 1)     # the void is NOT pending
+        self.assertEqual(summary["void"], 1)
+        self.assertAlmostEqual(summary["total_staked"], 10.0)   # void excluded
+        self.assertAlmostEqual(summary["realized_profit"], 9.0)  # void excluded
+        self.assertEqual((summary["won"], summary["lost"], summary["push"]),
+                         (1, 0, 0))
+        self.assertAlmostEqual(summary["pending_stake"], 10.0)   # only the pending
+        # The void surfaces in its own by-bet-type bucket as resolved, not pending.
+        void_bucket = next(b for b in summary["by_bet_type"]
+                           if b.get("prop_key") == "pitcher_outs")
+        self.assertEqual((void_bucket["resolved"], void_bucket["pending"],
+                          void_bucket["void"]), (1, 0, 1))
 
     def test_by_bet_type_splits_props_by_market(self):
         rows = [
