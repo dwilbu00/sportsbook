@@ -1234,6 +1234,249 @@ def diagnose_negbin(sport, store_label=""):
           "gate for real.)")
 
 
+# ── ROI diagnostic: profitability lens on calibration-method selection ──
+# Method selection is Brier-only; a method can narrowly FAIL the Brier gate yet
+# lift betting ROI ("throwing away a beneficial result"). --roi-diag replays each
+# method (A/B/C/D/E) through the LIVE edge+EV recommendation gate at best-of-book
+# prices and reports realized flat-1u ROI ALONGSIDE Brier, so both numbers are
+# visible before a method is chosen. Read-only; informs, never automates. NO WRITE.
+def _roi_sim_method(rows, prob_of, threshold):
+    """Replay the live edge+EV recommendation gate for ONE calibration method over
+    the priced rows and tally flat-1-unit ROI.
+
+    Mirrors props.analyze_player_props_value's decision exactly: the edge is
+    measured against the de-vigged consensus (``mkt_over``), the model backs the
+    higher-edge side, and the bet is taken only when ``_prop_is_value(edge,
+    threshold, expected_roi)`` holds — the edge clears ``threshold`` AND the bet is
+    +EV at the price. Those two legs make this the RECOMMENDATION gate, not just
+    "back any +edge side" like _cc_stratum_table. With de-vigged consensus
+    ``under_implied == 1 - mkt_over``, so picking the higher-edge side reduces to
+    ``sign(p - mkt_over)``. Payoff is the codebase-universal flat unit
+    (win = decimal-1, loss = -1). Unpriced rows are skipped. ``prob_of(row)`` is the
+    method's P(over) for that row.
+
+    Returns {n_bets, pnl, roi, hit, avg_edge} (roi/hit/avg_edge None at n_bets=0)."""
+    from pricing_common import _expected_roi, _prop_is_value
+    pnl = won = sum_edge = 0.0
+    n_bets = 0
+    for r in rows:
+        if (r["mkt_over"] is None or r["over_dec"] is None
+                or r["under_dec"] is None):
+            continue
+        p = prob_of(r)
+        over_edge = p - r["mkt_over"]
+        if over_edge > 0.0:                       # back the OVER (higher-edge side)
+            side_prob, price, dec, edge, over = (
+                p, r["over_price"], r["over_dec"], over_edge, True)
+        else:                                     # back the UNDER (ties -> under)
+            side_prob, price, dec, edge, over = (
+                1.0 - p, r["under_price"], r["under_dec"], -over_edge, False)
+        expected_roi = _expected_roi(side_prob, price)
+        if not _prop_is_value(edge, threshold, expected_roi):
+            continue
+        win = (r["o"] == 1) if over else (r["o"] == 0)
+        pnl += (dec - 1.0) if win else -1.0
+        won += 1.0 if win else 0.0
+        sum_edge += edge
+        n_bets += 1
+    return {
+        "n_bets": n_bets, "pnl": pnl,
+        "roi": (pnl / n_bets) if n_bets else None,
+        "hit": (won / n_bets) if n_bets else None,
+        "avg_edge": (sum_edge / n_bets) if n_bets else None,
+    }
+
+
+def _roi_build_rows(enriched, params, sport_key, prop_key,
+                    team_defense=None, league_avg_def=None):
+    """Per-prop rows for the ROI sim: the leakage-safe as-of point projection +
+    method-A empirical over-rate (blc.project_and_empirical), BOTH american book
+    prices, and the de-vigged consensus ``mkt_over`` + decimal payouts. A prop-
+    generic clone of _cc_load_scored_rows' row loop that also keeps the raw ``obs``
+    (method D reads it) and neither drops pushes nor sorts (the caller does that per
+    prop). Unpriced rows are kept with ``mkt_over=None`` so price coverage is
+    honest; the sim skips them."""
+    import book_line_calibration as blc
+    from odds_client import (american_to_implied_prob, devig_two_way,
+                             american_to_decimal)
+    rows = []
+    for obs in enriched:
+        if obs.get("prop_key") != prop_key:
+            continue
+        projected, emp = blc.project_and_empirical(
+            obs, params, sport_key, team_defense, league_avg_def)
+        if projected is None or emp is None:
+            continue
+        op = _cc_num_or_none(obs.get("over_price"))
+        up = _cc_num_or_none(obs.get("under_price"))
+        mkt_over = over_dec = under_dec = None
+        if op is not None and up is not None:
+            mkt_over = devig_two_way(american_to_implied_prob(op),
+                                     american_to_implied_prob(up))[0]
+            over_dec = american_to_decimal(op)
+            under_dec = american_to_decimal(up)
+        rows.append({
+            "obs": obs, "game_date": obs["game_date"], "line": obs["line"],
+            "actual": obs["actual"], "projected": projected,
+            "empirical_over": max(0.0, min(1.0, emp)),
+            "over_price": op, "under_price": up,
+            "mkt_over": mkt_over, "over_dec": over_dec, "under_dec": under_dec,
+        })
+    return rows
+
+
+def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
+    """Profitability lens (NO WRITE): for each calibrated prop, replay methods
+    A/B/C/D/E through the LIVE edge+EV recommendation gate at BEST-OF-BOOK consensus
+    prices and report realized flat-1u ROI ALONGSIDE holdout Brier, so a method that
+    narrowly FAILS the Brier gate but lifts ROI becomes visible.
+
+    Same population + chronological 50/50 split the Brier gate uses (params fit on
+    TRAIN; P(over) + betting simulated on the TEST half), so ROI is comparable to
+    Brier method-for-method. Prices come from the harvested real lines — the odds
+    warehouse never stores DraftKings, so this is best-of-book / de-vigged
+    consensus: OPTIMISTIC vs the DK price the user actually bets and NOT DK-specific;
+    the price is common across methods per obs, so the RELATIVE ranking is sound.
+    INFORMS the method choice, never automates it. OFFLINE + FREE; writes nothing."""
+    import book_line_calibration as blc
+    from props import PROP_NEGBIN_ELIGIBLE, PROP_XSTATS_KIND
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = sorted(existing.keys())
+    if not props_to_check:
+        print(f"No calibrated props in calibration/{sport_key}.json; run refit first.")
+        return
+
+    print(f"\n=== ROI diagnostic (profitability lens): {sport_key} ===")
+    print("  ⚠ ROI is priced at BEST-OF-BOOK / de-vigged consensus from the")
+    print("    harvested real lines (the warehouse never stores DraftKings). This is")
+    print("    OPTIMISTIC vs the DK price you actually bet and is NOT a DK claim; the")
+    print("    price is common across methods per obs, so the RELATIVE method")
+    print("    ranking holds but the ABSOLUTE ROI does not transfer to DK.")
+    print("  ⚠ Method params (B/C residuals, E negbin) are fit on the TRAIN half")
+    print("    only; the DEPLOYED calibration fits on ALL usable obs, so these")
+    print("    out-of-sample numbers won't equal shipped params (the honest basis).")
+    print("  ⚠ A/B/C/E score PLAIN projections (no xBA unless --roi-xstats-strength")
+    print("    >0); D applies no park/weather/matchup multipliers. No gate; no write.")
+
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    print(f"  {len(book_lines):,} real book lines "
+          f"({n_primary:,} store + {n_pred:,} prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    # Weight-side opp-defense lookup only if some prop's variant uses it (mirror
+    # diagnose_negbin so the projection basis matches the shipped fit).
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    # Leakage-safe as-of xBA index for method D, only if requested (mirror
+    # diagnose_distributional). Default 0.0 keeps the diag free (no Statcast pull).
+    xba_index = None
+    if xstats_strength > 0:
+        import savant_history as sh
+        import backtest_props
+        years = sorted({str(o["game_date"])[:4]
+                        for o in enriched if o.get("game_date")})
+        raw = []
+        for y in years:
+            try:
+                raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+            except Exception:
+                pass
+        xba_index = backtest_props.build_batter_xba_index(raw) if raw else None
+        if xba_index is None:
+            print(f"  [warn] no raw Statcast cached for {years}; method D falls "
+                  f"back to plain projections.")
+
+    threshold = threshold_pct / 100.0
+    for prop_key in props_to_check:
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        rows = _roi_build_rows(enriched, params, sport_key, prop_key,
+                               team_defense, league_avg_def)
+        rows = [r for r in rows if r["actual"] != r["line"]]     # drop pushes
+        if len(rows) < 40:
+            print(f"\n  {prop_key}: only {len(rows)} usable obs (<40) — too thin.")
+            continue
+        rows.sort(key=lambda r: r["game_date"])
+        split = len(rows) // 2
+        train, test = rows[:split], rows[split:]
+
+        # Pooled residual fit on TRAIN (methods B/C); NegBin fit on TRAIN (method E).
+        resid = sorted(r["actual"] - r["projected"] for r in train)
+        mu = sum(resid) / len(resid)
+        var = sum((x - mu) ** 2 for x in resid) / len(resid)
+        sigma = math.sqrt(var) if var > 0 else 1e-6
+        nb = (blc._fit_negbin_real(train)
+              if prop_key in PROP_NEGBIN_ELIGIBLE else None)
+
+        # Per-obs A/B/C/D/E P(over) on TEST — same math as _score_abc_real, exposed
+        # per row (clone of diagnose_distributional's r["m"] block, extended w/ D/E).
+        for r in test:
+            r["o"] = 1 if r["actual"] > r["line"] else 0
+            corrected = r["projected"] + mu
+            m = {
+                "A": max(0.0, min(1.0, r["empirical_over"])),
+                "B": blc._norm_cdf((corrected - r["line"]) / sigma),
+                "C": 1.0 - blc._empirical_cdf(resid, r["line"] - corrected),
+            }
+            if prop_key == "batter_hits":
+                p_d = blc.project_distributional(
+                    r["obs"], params, sport_key, team_defense, league_avg_def,
+                    xstats_strength=xstats_strength, xba_index=xba_index)
+                if p_d is not None:
+                    m["D"] = p_d
+            if nb is not None:
+                ms, disp = nb
+                mean = max(1e-9, ms * r["projected"])
+                m["E"] = blc.negbin_at_least(int(r["line"]) + 1, mean, disp)
+            r["m"] = m
+
+        n_priced = sum(1 for r in test if r["mkt_over"] is not None)
+        print(f"\n  {prop_key} (incumbent={incumbent}, n_usable={len(rows)}, "
+              f"n_test={len(test)}, priced={n_priced}/{len(test)}):")
+        ship_xstats = cfg.get("xstats_strength") or 0.0
+        if ship_xstats > 0 and prop_key in PROP_XSTATS_KIND:
+            print(f"    ⚠ shipped {prop_key} blends xBA (s={ship_xstats:.2f}); "
+                  f"A/B/C/E here run on PLAIN projections — Brier is directional.")
+        print("    {:<7}{:>7}{:>9}{:>8}{:>9}{:>8}{:>10}".format(
+            "method", "n", "Brier", "n_bets", "ROI%", "hit%", "avg_edge"))
+        method_order = [k for k in ("A", "B", "C", "D", "E")
+                        if any(k in r["m"] for r in test)]
+        for k in method_order:
+            scored = [r for r in test if k in r["m"]]
+            br = blc._brier([r["m"][k] for r in scored],
+                            [r["o"] for r in scored])
+            sim = _roi_sim_method(scored, lambda r, _k=k: r["m"][_k], threshold)
+            tag = "  <- incumbent" if k == incumbent else ""
+            br_s = f"{br:.4f}" if br is not None else "-"
+            roi_s = f"{sim['roi'] * 100:+.1f}" if sim["roi"] is not None else "-"
+            hit_s = f"{sim['hit'] * 100:.1f}" if sim["hit"] is not None else "-"
+            edge_s = (f"{sim['avg_edge']:+.3f}"
+                      if sim["avg_edge"] is not None else "-")
+            print("    {:<7}{:>7}{:>9}{:>8}{:>9}{:>8}{:>10}{}".format(
+                k, len(scored), br_s, sim["n_bets"], roi_s, hit_s, edge_s, tag))
+
+    print("\n  (Diagnostic only — nothing written.)")
+
+
 # ── Conditional-calibration ("reliability by prediction stratum") report ──
 # Answers, market-free: "when the model says 60%, does it happen 60%?" and "does
 # the model systematically over/under-project in a given line/projection band?"
@@ -1874,6 +2117,20 @@ def main():
                         "vs A/B/C on the real-line holdout for each eligible count "
                         "prop, and report whether E would clear the ship gate (no "
                         "write).")
+    p.add_argument("--roi-diag", action="store_true",
+                   help="Profitability lens: for each calibrated prop, replay the "
+                        "live edge+EV recommendation gate at BEST-OF-BOOK consensus "
+                        "prices and report flat-1u ROI per method (A/B/C/D/E) "
+                        "alongside holdout Brier, so a method that narrowly fails "
+                        "the Brier gate but lifts ROI is visible (no write).")
+    p.add_argument("--roi-threshold-pct", type=float, default=5.0,
+                   help="Edge threshold (percent) the --roi-diag gate requires, "
+                        "matching props.analyze_player_props_value (default 5.0).")
+    p.add_argument("--roi-xstats-strength", type=float, default=0.0,
+                   help="xBA blend weight for method D under --roi-diag. >0 builds "
+                        "the leakage-safe as-of xBA index (needs cached raw "
+                        "Statcast); 0 (default) scores D on plain projections and "
+                        "keeps the diagnostic free.")
     p.add_argument("--reliability", action="store_true",
                    help="Conditional-calibration report for batter_hits: "
                         "reliability (are 60-percent predictions right 60 percent "
@@ -1909,6 +2166,12 @@ def main():
 
     if args.negbin_diag:
         diagnose_negbin(args.sport, store_label=args.store_label)
+        return
+
+    if args.roi_diag:
+        diagnose_roi(args.sport, store_label=args.store_label,
+                     threshold_pct=args.roi_threshold_pct,
+                     xstats_strength=args.roi_xstats_strength)
         return
 
     if args.reliability:
