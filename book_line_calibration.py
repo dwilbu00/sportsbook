@@ -785,6 +785,11 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
             "actual": obs["actual"],
             "empirical_over": emp,
             "game_date": obs["game_date"],
+            # Book prices (de-vigged consensus) for the ROI tiebreaker; None when
+            # the obs is prediction-log-sourced. select_method_at_real_lines uses
+            # them only inside the noise band and no-ops when absent.
+            "over_price": obs.get("over_price"),
+            "under_price": obs.get("under_price"),
         })
     return rows
 
@@ -817,7 +822,11 @@ def _fit_negbin_real(rows):
 def _score_abc_real(train, test, negbin_eligible=False):
     """Fit pooled residuals on `train`, score methods A/B/C (and D/E when
     applicable) on `test` at each row's REAL book line. Returns ({method: brier},
-    (mu, sigma, sorted)).
+    (mu, sigma, sorted), {method: [p per test row]}, [0/1 outcome per test row]).
+
+    The per-row ``probs`` + ``out`` are the same P(over) vectors used to compute
+    the Briers, exposed so the caller can replay them through the ROI tiebreaker
+    (single source of truth for the prob math — no duplication in the ROI path).
 
     A = empirical over-rate passthrough; B = pooled Gaussian residual;
     C = pooled residual ECDF. D (distributional, §2.4b-2) is scored only when
@@ -850,11 +859,14 @@ def _score_abc_real(train, test, negbin_eligible=False):
             mean = max(1e-9, mean_scale * r["projected"])
             pE.append(negbin_at_least(int(r["line"]) + 1, mean, disp))
     scores = {"A": _brier(pA, out), "B": _brier(pB, out), "C": _brier(pC, out)}
+    probs = {"A": pA, "B": pB, "C": pC}
     if has_d:
         scores["D"] = _brier(pD, out)
+        probs["D"] = pD
     if nb is not None:
         scores["E"] = _brier(pE, out)
-    return scores, (mu, sigma, srt)
+        probs["E"] = pE
+    return scores, (mu, sigma, srt), probs, out
 
 
 def _real_line_folds(rows, min_set_n=20):
@@ -884,7 +896,73 @@ def _real_line_folds(rows, min_set_n=20):
     return folds
 
 
-def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False):
+def _roi_tiebreak(test, single_probs, single_out, tie_methods, brier_leader,
+                  threshold, min_bets, min_roi_gain):
+    """Break a Brier near-tie between calibration methods by realized flat-1u ROI.
+
+    Replays each tied method's P(over) vector — already computed on the SAME
+    holdout that produced the Brier scores (leakage-consistent) — through the LIVE
+    edge+EV recommendation gate (refit_calibration._roi_sim_method) at de-vigged
+    CONSENSUS prices. An override is recommended ONLY when the ROI winner differs
+    from ``brier_leader``, both clear ``min_bets`` simulated value bets, and it
+    beats the leader's ROI by >= ``min_roi_gain``. Consensus prices mean only the
+    RELATIVE ranking is trusted, never the absolute ROI.
+
+    Returns a record dict {ran, winner, applied, rois, n_bets} for the caller to
+    act on and log, or None when there are no usable prices (tiebreak inert)."""
+    from refit_calibration import _roi_sim_method
+    from odds_client import (american_to_implied_prob, devig_two_way,
+                             american_to_decimal)
+
+    # Price each test row once (shared across methods); carry the row index so a
+    # method's precomputed P(over) is looked up per row inside the sim.
+    priced = []
+    for i, r in enumerate(test):
+        op, up = r.get("over_price"), r.get("under_price")
+        if op is None or up is None:
+            continue
+        priced.append({
+            "_i": i,
+            "o": single_out[i],
+            "mkt_over": devig_two_way(american_to_implied_prob(op),
+                                      american_to_implied_prob(up))[0],
+            "over_price": op, "under_price": up,
+            "over_dec": american_to_decimal(op),
+            "under_dec": american_to_decimal(up),
+        })
+    if not priced:
+        return None
+
+    sims = {}
+    for m in tie_methods:
+        pv = single_probs.get(m)
+        if pv is None:
+            continue
+        sims[m] = _roi_sim_method(priced, lambda r, _pv=pv: _pv[r["_i"]], threshold)
+
+    record = {
+        "ran": True, "brier_leader": brier_leader, "winner": brier_leader,
+        "applied": False,
+        "rois": {m: (sims[m]["roi"] if m in sims else None) for m in tie_methods},
+        "n_bets": {m: (sims[m]["n_bets"] if m in sims else 0) for m in tie_methods},
+    }
+    leader = sims.get(brier_leader)
+    if not leader or leader["roi"] is None or leader["n_bets"] < min_bets:
+        return record  # leader itself untradeable on this split -> keep Brier pick
+
+    best_m, best_roi = brier_leader, leader["roi"]
+    for m, s in sims.items():
+        if m == brier_leader or s["roi"] is None or s["n_bets"] < min_bets:
+            continue
+        if s["roi"] > best_roi:
+            best_m, best_roi = m, s["roi"]
+    if best_m != brier_leader and best_roi - leader["roi"] >= min_roi_gain:
+        record["winner"], record["applied"] = best_m, True
+    return record
+
+
+def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
+                                roi_tiebreak=True):
     """Choose the deployed A/B/C method at REAL book lines, gated like refit.
 
     Method A (empirical) is the safe baseline and always eligible. A non-empirical
@@ -899,20 +977,30 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False):
     candidate (a count prop whitelisted by the caller via
     props.PROP_NEGBIN_ELIGIBLE). Off by default so existing callers are unchanged.
 
+    ``roi_tiebreak`` (default True) breaks a Brier near-tie (methods within
+    MIN_CALIB_BRIER_GAIN of each other on the single holdout, all confirmed
+    out-of-sample) by realized ROI through the live edge+EV gate — see
+    _roi_tiebreak. Pass False for a pure-Brier view (e.g. diagnose_negbin).
+
     Returns None if fewer than 20 usable (actual != line) observations, else:
       {method, fit_brier, baseline_brier, cv_brier, confirmed,
-       residual_mu, residual_sigma, residual_ecdf, n_obs[, mean_scale, dispersion]}
+       residual_mu, residual_sigma, residual_ecdf, n_obs, single_split,
+       roi_tiebreak[, mean_scale, dispersion]}
     """
-    from refit_calibration import MIN_CALIB_BRIER_GAIN  # single source of truth
+    from refit_calibration import (  # single source of truth
+        MIN_CALIB_BRIER_GAIN, ROI_TIEBREAK_MIN_BETS, ROI_TIEBREAK_MIN_ROI_GAIN,
+        ROI_TIEBREAK_THRESHOLD)
 
     usable = [r for r in rows if r["actual"] != r["line"]]
     if len(usable) < 20:
         return None
     usable.sort(key=lambda r: r["game_date"])
 
-    # Single chronological holdout: baseline (A) + candidate (B/C/E) Briers.
+    # Single chronological holdout: baseline (A) + candidate (B/C/E) Briers, plus
+    # the per-method P(over) vectors + outcomes (reused by the ROI tiebreak).
     split = len(usable) // 2
-    single, _ = _score_abc_real(usable[:split], usable[split:], negbin_eligible)
+    single, _, single_probs, single_out = _score_abc_real(
+        usable[:split], usable[split:], negbin_eligible)
     baseline = single["A"]
 
     # Two-fold out-of-sample confirmation for non-empirical methods.
@@ -947,6 +1035,29 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False):
         if best_brier is None or cand < best_brier:
             best_method, best_brier = method, cand
 
+    # ROI tiebreak within the Brier noise band. Eligible = A + every candidate that
+    # PASSED 2-fold confirmation (never an unconfirmed method). When >=2 of those
+    # land within MIN_CALIB_BRIER_GAIN of the best eligible Brier, realized ROI
+    # arbitrates — this can rescue a confirmed method that beat A in both folds but
+    # missed the single-split margin (best_method is provably always in tie_set).
+    roi_record = None
+    if roi_tiebreak:
+        eligible = ["A"] + [m for m in candidate_methods
+                            if single.get(m) is not None and _confirms(m)]
+        b_min = min(single[m] for m in eligible)
+        tie_set = [m for m in eligible if single[m] - b_min < MIN_CALIB_BRIER_GAIN]
+        if len(tie_set) >= 2:
+            rec = _roi_tiebreak(
+                usable[split:], single_probs, single_out, tie_set, best_method,
+                ROI_TIEBREAK_THRESHOLD, ROI_TIEBREAK_MIN_BETS,
+                ROI_TIEBREAK_MIN_ROI_GAIN)
+            if rec:
+                rec["tie_set"] = tie_set
+                roi_record = rec
+                if rec["applied"]:
+                    best_method = rec["winner"]
+                    best_brier = single.get(best_method, best_brier)
+
     # Deployed residual distribution: fit on ALL usable obs.
     resid = [r["actual"] - r["projected"] for r in usable]
     mu = sum(resid) / len(resid)
@@ -972,6 +1083,9 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False):
         # Per-method Brier on the single holdout — lets a per-bucket caller
         # compare its winner against the POOLED method on the same split.
         "single_split": single,
+        # ROI-tiebreak audit trail (None when it didn't run): {ran, winner,
+        # applied, rois, n_bets, tie_set}. Diagnostic only — not persisted to JSON.
+        "roi_tiebreak": roi_record,
     }
     # When E wins, its deployed params are fit on ALL usable obs (mirrors the
     # residual block above). Always fit when eligible so the diagnostic can report

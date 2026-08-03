@@ -52,6 +52,24 @@ def _signal_rows(n_main=114, n_outlier=6):
     return rows
 
 
+def _bet_rows(n=20, price=-110):
+    """n priced test rows for a direct `_roi_tiebreak` call. Only over/under
+    price matter to the helper; the P(over) vector and outcomes are supplied
+    separately, positionally aligned by index."""
+    return [{"over_price": price, "under_price": price} for _ in range(n)]
+
+
+def _priced_rows(n=120, price=-110):
+    """n dated rows carrying identical book prices, used by the tiebreak
+    integration tests which patch `_score_abc_real` to control the Brier scene.
+    All are usable (actual != line) and n>=100 so two confirmation folds form;
+    row *content* is irrelevant under the patch — prices + dates are what the
+    tiebreak path reads."""
+    return [{"player": f"P{i}", "projected": 1.0, "line": 0.0, "actual": 1.0,
+             "empirical_over": 0.5, "game_date": _day(i),
+             "over_price": price, "under_price": price} for i in range(n)]
+
+
 class SelectMethodAtRealLinesTests(unittest.TestCase):
 
     def test_confirmed_residual_method_beats_empirical(self):
@@ -163,7 +181,8 @@ class RefitSportRealLinesTests(unittest.TestCase):
         def _build(enriched, params, sport_key, prop_key, td=None, la=None,
                    xstats_strength=0.0, xba_index=None):
             return [{"prop_key": prop_key}]
-        def _select(rows, shrinkage_k=15, negbin_eligible=False):
+        def _select(rows, shrinkage_k=15, negbin_eligible=False,
+                    roi_tiebreak=True):
             pk = rows[0]["prop_key"] if rows else None
             return sel_map.get(pk)
         _harvest = (harvest if harvest is not None
@@ -538,6 +557,134 @@ class JoinIdBridgeTests(_Backend, unittest.TestCase):
                 [self._row("A. Batter", mlb_id="000404")], "baseball", "mlb")
         self.assertEqual(len(out), 1)
         m_name.assert_called_once()                # id miss → name path
+
+
+class RoiTiebreakUnitTests(unittest.TestCase):
+    """Direct tests of the `_roi_tiebreak` decision logic (guardrail branches).
+
+    At -110/-110 the de-vigged consensus is 0.50 and a bet fires when
+    |p - 0.5| >= 0.05 and the leg is +EV (p >= ~0.524). So p=0.6 backs the OVER
+    (wins when o==1) and p=0.4 backs the UNDER (wins when o==0); p=0.51 clears
+    neither edge nor is placed. Winning pays decimal-1 (~0.909), losing -1.
+    """
+
+    def _out(self, n=20):
+        return [1, 0] * (n // 2)
+
+    def test_override_applies(self):
+        out = self._out(20)
+        # C always backs the winning side (100% hit); A always bets OVER (~50%).
+        probs = {"A": [0.6] * 20, "C": [0.6 if o else 0.4 for o in out]}
+        rec = blc._roi_tiebreak(_bet_rows(20), probs, out, ["A", "C"], "A",
+                                threshold=0.05, min_bets=15, min_roi_gain=0.02)
+        self.assertTrue(rec["applied"])
+        self.assertEqual(rec["winner"], "C")
+        self.assertEqual(rec["brier_leader"], "A")
+        self.assertEqual(rec["n_bets"]["A"], 20)
+        self.assertEqual(rec["n_bets"]["C"], 20)
+        self.assertGreater(rec["rois"]["C"], rec["rois"]["A"])
+
+    def test_no_override_when_roi_margin_not_met(self):
+        out = self._out(20)
+        probs = {"A": [0.6] * 20, "C": [0.6 if o else 0.4 for o in out]}
+        # Same clear ROI edge, but demand an impossibly large margin.
+        rec = blc._roi_tiebreak(_bet_rows(20), probs, out, ["A", "C"], "A",
+                                threshold=0.05, min_bets=15, min_roi_gain=2.0)
+        self.assertFalse(rec["applied"])
+        self.assertEqual(rec["winner"], "A")
+
+    def test_no_override_when_winner_below_bet_floor(self):
+        out = self._out(20)
+        # C never clears the edge (0.51 -> no bets); leader A trades fine.
+        probs = {"A": [0.6] * 20, "C": [0.51] * 20}
+        rec = blc._roi_tiebreak(_bet_rows(20), probs, out, ["A", "C"], "A",
+                                threshold=0.05, min_bets=15, min_roi_gain=0.02)
+        self.assertFalse(rec["applied"])
+        self.assertEqual(rec["n_bets"]["C"], 0)
+        self.assertEqual(rec["winner"], "A")
+
+    def test_no_override_when_leader_untradeable(self):
+        out = self._out(20)
+        # Leader A places no bets on this split -> keep the Brier pick, no flip.
+        probs = {"A": [0.51] * 20, "C": [0.6 if o else 0.4 for o in out]}
+        rec = blc._roi_tiebreak(_bet_rows(20), probs, out, ["A", "C"], "A",
+                                threshold=0.05, min_bets=15, min_roi_gain=0.02)
+        self.assertFalse(rec["applied"])
+        self.assertEqual(rec["n_bets"]["A"], 0)
+        self.assertEqual(rec["winner"], "A")
+
+    def test_no_prices_returns_none(self):
+        out = self._out(20)
+        probs = {"A": [0.6] * 20, "C": [0.6 if o else 0.4 for o in out]}
+        unpriced = [{"over_price": None, "under_price": None} for _ in range(20)]
+        self.assertIsNone(
+            blc._roi_tiebreak(unpriced, probs, out, ["A", "C"], "A",
+                              threshold=0.05, min_bets=15, min_roi_gain=0.02))
+
+
+class RoiTiebreakSelectionTests(unittest.TestCase):
+    """`select_method_at_real_lines` wiring: tie_set construction (confirmed +
+    within-band), the override, the `roi_tiebreak=False` opt-out, and the
+    "clear Brier winner -> ROI never consulted" case. `_score_abc_real` is
+    patched to script the Brier scene deterministically (call 0 = single
+    holdout, calls 1..2 = the two confirmation folds)."""
+
+    def _patch(self, single_scores, single_probs, single_out, fold_scores):
+        calls = {"n": 0}
+
+        def _se(train, test, negbin_eligible=False):
+            i = calls["n"]
+            calls["n"] += 1
+            if i == 0:
+                return (single_scores, (0.0, 1.0, []), single_probs, single_out)
+            return (fold_scores, (0.0, 1.0, []), {}, [])
+
+        return patch.object(blc, "_score_abc_real", side_effect=_se)
+
+    def _scene(self):
+        # 60 test rows (single holdout of 120 usable). C backs the winning side
+        # (100% hit); A always bets OVER (~50%). C's single-split Brier misses
+        # the 0.002 margin over A (0.001) but confirms in both folds -> ROI can
+        # rescue it (tie_set == [A, C]).
+        out = [1, 0] * 30
+        probs = {"A": [0.6] * 60, "B": [0.5] * 60,
+                 "C": [0.6 if o else 0.4 for o in out]}
+        single = {"A": 0.250, "B": 0.260, "C": 0.249}
+        folds = {"A": 0.25, "B": 0.26, "C": 0.24}   # C<A both folds; B does not
+        return single, probs, out, folds
+
+    def test_roi_rescues_confirmed_within_band_of_A(self):
+        single, probs, out, folds = self._scene()
+        with self._patch(single, probs, out, folds):
+            sel = blc.select_method_at_real_lines(_priced_rows(120))
+        self.assertEqual(sel["method"], "C")
+        self.assertTrue(sel["confirmed"])
+        rt = sel["roi_tiebreak"]
+        self.assertTrue(rt["applied"])
+        self.assertEqual(rt["winner"], "C")
+        self.assertEqual(rt["brier_leader"], "A")
+        self.assertCountEqual(rt["tie_set"], ["A", "C"])
+
+    def test_opt_out_keeps_brier_pick(self):
+        single, probs, out, folds = self._scene()
+        with self._patch(single, probs, out, folds):
+            sel = blc.select_method_at_real_lines(_priced_rows(120),
+                                                  roi_tiebreak=False)
+        self.assertEqual(sel["method"], "A")     # Brier gate keeps A (0.001<margin)
+        self.assertIsNone(sel["roi_tiebreak"])
+
+    def test_clear_brier_winner_not_consulted(self):
+        # C beats A by 0.05 (well past the margin) -> C wins on Brier alone and
+        # A falls out of the band, so the tiebreak never runs.
+        out = [1, 0] * 30
+        probs = {"A": [0.6] * 60, "B": [0.5] * 60,
+                 "C": [0.6 if o else 0.4 for o in out]}
+        single = {"A": 0.250, "B": 0.260, "C": 0.200}
+        folds = {"A": 0.25, "B": 0.26, "C": 0.20}
+        with self._patch(single, probs, out, folds):
+            sel = blc.select_method_at_real_lines(_priced_rows(120))
+        self.assertEqual(sel["method"], "C")
+        self.assertIsNone(sel["roi_tiebreak"])   # tie_set == [C]; never ran
 
 
 if __name__ == "__main__":

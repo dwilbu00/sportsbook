@@ -38,6 +38,21 @@ from espn_client import list_season_athletes
 # gets shipped and advertises an optimistic fit_brier. See P1.4.
 MIN_CALIB_BRIER_GAIN = 0.002
 
+# ── ROI tiebreaker within the Brier noise band (§2.6-adjacent) ──
+# When >=2 calibration methods land within MIN_CALIB_BRIER_GAIN of each other on
+# the single holdout (i.e. Brier can't tell them apart — including a confirmed
+# method within the band of empirical A), break the tie by realized flat-1u ROI
+# through the LIVE edge+EV recommendation gate (refit_calibration._roi_sim_method).
+# Brier stays primary and every anti-winner's-curse guard is intact: only methods
+# that already pass the 2-fold OOS confirmation are ROI-eligible, and an override
+# fires only when the ROI winner clears a bet floor AND beats the Brier leader's
+# ROI by a real margin (no flip-flopping on ROI noise). Prices are de-vigged
+# CONSENSUS (best-of-book), so only the RELATIVE method ranking is trusted, never
+# the absolute ROI. Unpriced obs -> the tiebreak no-ops and Brier decides.
+ROI_TIEBREAK_MIN_BETS = 15         # min simulated value-bets on the test half for a method's ROI to count
+ROI_TIEBREAK_MIN_ROI_GAIN = 0.02   # ROI winner must beat the Brier leader's ROI by >= this (flat-unit ROI)
+ROI_TIEBREAK_THRESHOLD = 0.05      # edge threshold for the sim (matches diagnose_roi's default / live gate)
+
 # ── Data-gated line-conditional method selection (§2.4b-2 follow-up) ──
 # The best calibration method is line-dependent (diagnostic: C wins at line 0.5,
 # D dist:+xBA at >=1.5). refit_sport_real_lines picks the method PER LINE BUCKET
@@ -92,7 +107,8 @@ def _lc_bucket_ready(enriched, target_props):
 
 
 def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
-                         league_avg_def, pooled_method, xba_index, quality_index):
+                         league_avg_def, pooled_method, xba_index, quality_index,
+                         roi_tiebreak=True):
     """Per-line-bucket method selection for a line-conditional prop, or None.
 
     Builds real-line rows carrying a leakage-safe distributional ``p_dist``,
@@ -124,6 +140,10 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
             "player": obs["player"], "projected": projected, "line": obs["line"],
             "actual": obs["actual"], "empirical_over": emp,
             "game_date": obs["game_date"], "p_dist": p_dist,
+            # Book prices for the ROI tiebreaker (None when unpriced); harmless to
+            # existing consumers, used only inside select_method_at_real_lines.
+            "over_price": obs.get("over_price"),
+            "under_price": obs.get("under_price"),
         })
     if not rows:
         return None
@@ -144,7 +164,8 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
             # returns None -> the merge silently DROPS a live override). With it,
             # a bucket can also legitimately adopt E on its own.
             sel_b = blc.select_method_at_real_lines(
-                bucket, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE))
+                bucket, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE),
+                roi_tiebreak=roi_tiebreak)
             single = (sel_b or {}).get("single_split") or {}
             b_best = single.get((sel_b or {}).get("method"))
             b_pooled = single.get(pooled_method)
@@ -642,7 +663,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 
 def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                            shrinkage_k_default=0, xstats_strength=0.0,
-                           dry_run=False):
+                           dry_run=False, roi_tiebreak=True):
     """Re-select each prop's calibration METHOD at REAL book lines (roadmap 0.3).
 
     The synthetic-line sweep (`refit_sport`) chooses each prop's A/B/C method by
@@ -770,7 +791,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             enriched, params, sport_key, prop_key, team_defense, league_avg_def,
             xstats_strength=prop_xstats, xba_index=xba_index)
         sel = blc.select_method_at_real_lines(
-            rows, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE))
+            rows, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE),
+            roi_tiebreak=roi_tiebreak)
         if sel is None:
             skipped.append(prop_key)
             print(f"  [skip]   {prop_key}: only {len(rows)} real-line obs "
@@ -786,7 +808,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         if prop_key in LINE_CONDITIONAL_PROPS and need_lc:
             line_methods = _select_line_methods(
                 prop_key, enriched, params, sport_key, team_defense,
-                league_avg_def, sel["method"], xba_index, lc_quality_index)
+                league_avg_def, sel["method"], xba_index, lc_quality_index,
+                roi_tiebreak=roi_tiebreak)
 
         # Normally only a genuine method FLIP is written (a same-method re-fit
         # would just churn the residuals onto a smaller real-line basis for no
@@ -864,6 +887,13 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                        is not None else f"higher:{b['method']}"
                        for b in line_methods if b.get("confirmed")]
             note += f" + per-line-bucket [{', '.join(adopted)}]"
+        rt = sel.get("roi_tiebreak")
+        if rt and rt.get("applied"):
+            w, lead = rt["winner"], rt["brier_leader"]
+            rw, rl = rt["rois"].get(w), rt["rois"].get(lead)
+            note += (f" [ROI tiebreak: {w} over Brier-pick {lead} within noise "
+                     f"band {rt.get('tie_set')} — roi {rw:+.3f} vs {rl:+.3f}, "
+                     f"n_bets {rt['n_bets'].get(w)}]")
         _change_notes[prop_key] = note
         print(f"  [update] {prop_key}: {note}  (brier {sel['fit_brier']} vs "
               f"baseline-A {sel['baseline_brier']}, cv {sel['cv_brier']}, "
@@ -1191,7 +1221,8 @@ def diagnose_negbin(sport, store_label=""):
         rows = blc.build_real_line_obs(
             enriched, params, sport_key, prop_key, team_defense, league_avg_def,
             xstats_strength=0.0, xba_index=None)
-        sel = blc.select_method_at_real_lines(rows, negbin_eligible=True)
+        sel = blc.select_method_at_real_lines(rows, negbin_eligible=True,
+                                              roi_tiebreak=False)
         n_usable = len([r for r in rows if r["actual"] != r["line"]])
         if sel is None:
             print(f"\n  {prop_key}: only {n_usable} usable real-line obs (need "
@@ -2098,6 +2129,11 @@ def main():
     p.add_argument("--store-label", default="",
                    help="historical_odds store label to read real book lines "
                         "from with --real-lines (default: the unlabeled store).")
+    p.add_argument("--no-roi-tiebreak", action="store_true",
+                   help="With --real-lines, DISABLE the ROI tiebreaker (methods "
+                        "within the Brier noise band fall back to A / lowest "
+                        "Brier). Default: ROI breaks ties. Use to A/B a run "
+                        "against the pure-Brier selection.")
     p.add_argument("--xstats-strength", type=float, default=0.0,
                    help="P2.4a: with --real-lines, re-fit batter_hits residuals "
                         "under the Statcast xBA projection blend at this weight "
@@ -2189,7 +2225,8 @@ def main():
                                warmup_games=args.warmup_games,
                                shrinkage_k_default=args.shrinkage_k,
                                xstats_strength=args.xstats_strength,
-                               dry_run=args.dry_run)
+                               dry_run=args.dry_run,
+                               roi_tiebreak=not args.no_roi_tiebreak)
         return
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None
