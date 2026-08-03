@@ -104,7 +104,7 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
     inherits the pooled method (no residuals stored). Returns a ``line_methods``
     list only when at least one bucket adopts its own method, else None (inert)."""
     import book_line_calibration as blc
-    from props import _DIST_HARDHIT_COEF, _DIST_BARREL_COEF
+    from props import _DIST_HARDHIT_COEF, _DIST_BARREL_COEF, PROP_NEGBIN_ELIGIBLE
 
     rows = []
     for obs in enriched:
@@ -138,7 +138,13 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                       and r["line"] <= cap]
         entry = {"max_line": cap, "method": pooled_method}   # default: inherit
         if len(bucket) >= MIN_BUCKET_OBS:
-            sel_b = blc.select_method_at_real_lines(bucket)
+            # Thread negbin_eligible so E is scored per-bucket: without it a
+            # pooled method of "E" is unscorable here (single.get("E") is None
+            # -> the adopt guard below fails for EVERY bucket -> line_methods
+            # returns None -> the merge silently DROPS a live override). With it,
+            # a bucket can also legitimately adopt E on its own.
+            sel_b = blc.select_method_at_real_lines(
+                bucket, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE))
             single = (sel_b or {}).get("single_split") or {}
             b_best = single.get((sel_b or {}).get("method"))
             b_pooled = single.get(pooled_method)
@@ -156,6 +162,9 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                     entry.update({"xstats_strength": LINE_COND_XSTATS_STRENGTH,
                                   "dist_hardhit_coef": _DIST_HARDHIT_COEF,
                                   "dist_barrel_coef": _DIST_BARREL_COEF})
+                elif sel_b["method"] == "E":
+                    entry.update({"mean_scale": sel_b.get("mean_scale"),
+                                  "dispersion": sel_b.get("dispersion")})
                 else:
                     entry.update({"residual_mu": sel_b["residual_mu"],
                                   "residual_sigma": sel_b["residual_sigma"],
@@ -1158,9 +1167,18 @@ def diagnose_negbin(sport, store_label=""):
         team_defense, _, league_avg_def = _team_defense_lookup(
             espn_sport, espn_league)
 
+    from props import PROP_XSTATS_KIND
     for prop_key in sorted(props_to_check):
         cfg = existing[prop_key]
         incumbent = cfg.get("method")
+        # xBA caveat: E's mean is avg_stat, so this diag MUST score A/B/C/E on the
+        # plain projection basis (xstats_strength=0.0) for a like-for-like compare.
+        # But if the SHIPPED prop blends xBA (xstats_strength > 0 and xstats-kind),
+        # the incumbent's live Brier is measured on a DIFFERENT (xBA) basis than the
+        # A/B/C numbers here -> the gap below understates the incumbent. Warn so the
+        # reader knows this diag is directional only and --real-lines is the decider.
+        ship_xstats = cfg.get("xstats_strength") or 0.0
+        xba_shipped = ship_xstats > 0 and prop_key in PROP_XSTATS_KIND
         params = {
             "half_life": cfg.get("half_life"),
             "venue_strength": cfg.get("venue_strength", 0.0),
@@ -1168,7 +1186,8 @@ def diagnose_negbin(sport, store_label=""):
             "use_minutes": cfg.get("use_minutes", False),
         }
         # Plain projection basis (no xBA blend) — E's mean is avg_stat, so this is
-        # the like-for-like basis for A/B/C/E; note it if the shipped prop uses xBA.
+        # the like-for-like basis for A/B/C/E (the xba_shipped caveat below flags
+        # when the incumbent's live basis differs).
         rows = blc.build_real_line_obs(
             enriched, params, sport_key, prop_key, team_defense, league_avg_def,
             xstats_strength=0.0, xba_index=None)
@@ -1184,6 +1203,12 @@ def diagnose_negbin(sport, store_label=""):
                    key=lambda r: r["game_date"]))
         print(f"\n  {prop_key} (incumbent={incumbent}, n_usable={n_usable}, "
               f"folds={len(folds)}):")
+        if xba_shipped:
+            print(f"    ⚠ CAVEAT: shipped {prop_key} blends xBA "
+                  f"(xstats_strength={ship_xstats:.2f}); this diag scores A/B/C/E "
+                  f"on PLAIN projections, so the incumbent's Brier here is NOT its "
+                  f"live basis — treat the E-vs-{incumbent} gap as directional and "
+                  f"let --real-lines decide.")
         print("    holdout Brier — " + "  ".join(
             f"{m}={ss[m]:.4f}" for m in ("A", "B", "C", "D", "E") if m in ss))
         e_br = ss.get("E")

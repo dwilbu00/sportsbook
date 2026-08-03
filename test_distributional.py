@@ -543,7 +543,7 @@ class SelectLineMethodsTests(unittest.TestCase):
                         "_proj": 1.5, "_emp": 0.5, "_pdist": 0.98 if o else 0.02})
         return obs
 
-    def _run(self, enriched):
+    def _run(self, enriched, pooled="C"):
         def _pe(o, params, sk, td=None, la=None):
             return o["_proj"], o["_emp"]
         def _pd(o, params, sk, td=None, la=None, xba_index=None,
@@ -553,7 +553,7 @@ class SelectLineMethodsTests(unittest.TestCase):
              patch.object(blc, "project_distributional", side_effect=_pd):
             return refit_calibration._select_line_methods(
                 "batter_hits", enriched, {}, "baseball_mlb", {}, None,
-                "C", object(), object())
+                pooled, object(), object())
 
     def test_deep_bucket_adopts_d(self):
         lm = self._run(self._enriched(n_top=160))
@@ -576,6 +576,48 @@ class SelectLineMethodsTests(unittest.TestCase):
         self.assertTrue(refit_calibration._lc_bucket_ready(deep, {"batter_hits"}))
         self.assertFalse(refit_calibration._lc_bucket_ready(thin, {"batter_hits"}))
         self.assertFalse(refit_calibration._lc_bucket_ready(deep, {"pitcher_outs"}))
+
+    def test_pooled_E_does_not_drop_confirmed_override(self):
+        """Audit finding #1 regression: when the POOLED method is E, the bucket
+        selector must still score E per-bucket (negbin_eligible threaded) so the
+        deep bucket's confirmed D winner is adopted. Without the flag, single.get
+        ('E') is None -> the adopt guard fails for every bucket -> line_methods
+        returns None -> the merge SILENTLY DROPS a live override."""
+        lm = self._run(self._enriched(n_top=160), pooled="E")
+        self.assertIsNotNone(lm)                       # NOT dropped
+        self.assertEqual(lm[1]["method"], "D")         # deep bucket keeps its winner
+        self.assertTrue(lm[1]["confirmed"])
+
+    def test_bucket_adopts_E_stores_negbin_params(self):
+        """A bucket that adopts method E persists mean_scale + dispersion (and no
+        residual block), so the runtime `_method_cfg_for_line` merge can dispatch
+        it. Force an E winner via the selector to keep the assertion deterministic."""
+        e_win = {
+            "method": "E", "confirmed": True, "n_obs": 160,
+            "fit_brier": 0.10, "baseline_brier": 0.25, "cv_brier": 0.10,
+            "mean_scale": 1.05, "dispersion": 0.30,
+            "single_split": {"A": 0.25, "C": 0.24, "E": 0.10},
+        }
+
+        def _pe(o, params, sk, td=None, la=None):
+            return o["_proj"], o["_emp"]
+
+        def _pd(o, params, sk, td=None, la=None, xba_index=None,
+                quality_index=None, xstats_strength=0.0):
+            return o["_pdist"]
+
+        with patch.object(blc, "project_and_empirical", side_effect=_pe), \
+             patch.object(blc, "project_distributional", side_effect=_pd), \
+             patch.object(blc, "select_method_at_real_lines", return_value=e_win):
+            lm = refit_calibration._select_line_methods(
+                "batter_hits", self._enriched(n_top=160), {}, "baseball_mlb",
+                {}, None, "C", object(), object())
+        self.assertIsNotNone(lm)
+        top = lm[1]
+        self.assertEqual(top["method"], "E")
+        self.assertEqual(top["mean_scale"], 1.05)
+        self.assertEqual(top["dispersion"], 0.30)
+        self.assertNotIn("residual_ecdf", top)         # E carries no residual block
 
 
 class LineupGatingTests(unittest.TestCase):

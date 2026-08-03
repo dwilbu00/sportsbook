@@ -7,9 +7,11 @@ offline real-line selection gate admitting E only when eligible and it wins. All
 hermetic (no live ESPN / Statcast / SQL).
 """
 
+import io
 import math
 import random
 import unittest
+from contextlib import redirect_stdout
 from math import lgamma
 from unittest.mock import patch
 
@@ -17,6 +19,7 @@ import backtest_starters
 import book_line_calibration as blc
 import mlb_starters
 import props
+import refit_calibration
 import stats
 
 
@@ -280,6 +283,51 @@ class SelectMethodECandidateTests(unittest.TestCase):
     def test_too_few_obs_returns_none(self):
         self.assertIsNone(blc.select_method_at_real_lines(
             _overdispersed_rows(n=10), negbin_eligible=True))
+
+
+class DiagnoseNegbinCaveatTests(unittest.TestCase):
+    """Audit finding #2: diagnose_negbin scores A/B/C/E on PLAIN projections, so
+    when a shipped prop blends xBA it must emit a caveat that the incumbent's live
+    basis differs (else the E-vs-incumbent gap silently misleads)."""
+
+    def _run_diag(self, cfg):
+        """Drive diagnose_negbin with a canned cfg through hermetic patches, return
+        captured stdout."""
+        sel = {"method": "A", "single_split": {"A": 0.24, "E": 0.235},
+               "mean_scale": 1.0, "dispersion": 0.1}
+        rows = [{"actual": 2, "line": 1.5, "game_date": "2026-01-01"}]
+        buf = io.StringIO()
+        with patch.object(refit_calibration, "load_calibration", return_value=cfg), \
+             patch.object(blc, "harvest_real_line_book_lines",
+                          return_value=([{}], 1, 0)), \
+             patch.object(blc, "join_book_lines_to_actuals", return_value=[{}]), \
+             patch.object(blc, "build_real_line_obs", return_value=rows), \
+             patch.object(blc, "select_method_at_real_lines", return_value=sel), \
+             patch.object(blc, "_real_line_folds", return_value=[1, 2]), \
+             redirect_stdout(buf):
+            refit_calibration.diagnose_negbin("mlb")
+        return buf.getvalue()
+
+    def test_caveat_emitted_when_shipped_prop_blends_xba(self):
+        # batter_hits is both NegBin-eligible AND xstats-kind; a positive
+        # xstats_strength means the live incumbent runs on an xBA basis.
+        out = self._run_diag({"batter_hits": {"method": "A",
+                                              "xstats_strength": 0.6}})
+        self.assertIn("CAVEAT", out)
+        self.assertIn("xBA", out)
+
+    def test_no_caveat_when_prop_does_not_ship_xba(self):
+        # xstats_strength None (the live batter_hits today) -> plain basis matches.
+        out = self._run_diag({"batter_hits": {"method": "A",
+                                              "xstats_strength": None}})
+        self.assertNotIn("CAVEAT", out)
+
+    def test_no_caveat_for_non_xstats_prop(self):
+        # pitcher_outs is NegBin-eligible but NOT xstats-kind: even a stray
+        # xstats_strength must not trip the caveat.
+        out = self._run_diag({"pitcher_outs": {"method": "A",
+                                               "xstats_strength": 0.6}})
+        self.assertNotIn("CAVEAT", out)
 
 
 if __name__ == "__main__":
