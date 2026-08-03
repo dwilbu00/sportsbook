@@ -904,9 +904,12 @@ def _roi_tiebreak(test, single_probs, single_out, tie_methods, brier_leader,
     holdout that produced the Brier scores (leakage-consistent) — through the LIVE
     edge+EV recommendation gate (refit_calibration._roi_sim_method) at de-vigged
     CONSENSUS prices. An override is recommended ONLY when the ROI winner differs
-    from ``brier_leader``, both clear ``min_bets`` simulated value bets, and it
-    beats the leader's ROI by >= ``min_roi_gain``. Consensus prices mean only the
-    RELATIVE ranking is trusted, never the absolute ROI.
+    from ``brier_leader``, both clear ``min_bets`` simulated value bets, it beats
+    the leader's ROI by >= ``min_roi_gain``, AND the winner is itself projected
+    profitable (roi > 0). The last guard means a Brier-tie is never broken toward
+    a money-losing method: when no tied method is profitable there is nothing to
+    select FOR, so calibration (Brier) keeps the pick. Consensus prices mean only
+    the RELATIVE ranking is trusted, never the absolute ROI.
 
     Returns a record dict {ran, winner, applied, rois, n_bets} for the caller to
     act on and log, or None when there are no usable prices (tiebreak inert)."""
@@ -956,7 +959,8 @@ def _roi_tiebreak(test, single_probs, single_out, tie_methods, brier_leader,
             continue
         if s["roi"] > best_roi:
             best_m, best_roi = m, s["roi"]
-    if best_m != brier_leader and best_roi - leader["roi"] >= min_roi_gain:
+    if (best_m != brier_leader and best_roi - leader["roi"] >= min_roi_gain
+            and best_roi > 0.0):
         record["winner"], record["applied"] = best_m, True
     return record
 
