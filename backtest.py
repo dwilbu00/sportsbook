@@ -60,6 +60,7 @@ from odds_client import (
 )
 from pricing_common import _resolve_team_defense
 import historical_odds as hist_store
+import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from calibration_loader import (
     save_market_blend,
     save_prob_shrink,
@@ -1858,7 +1859,7 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             opp_defense_strength=0.0, use_minutes=False,
             pace_adj=0.0, def_adj=0.0,
             shrink_k=0.0, rest_adj=0.0, def_window=None,
-            park_strength=0.0):
+            park_strength=0.0, rest_strength=0.0):
     return {
         "half_life": half_life,
         "opp_strength": opp_strength,
@@ -1873,6 +1874,7 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
         "rest_adj": rest_adj,                # B2B / rest-days projection scaling
         "def_window": def_window,            # use only last N opp games for defense (None = season)
         "park_strength": park_strength,      # P1.2 ballpark road-context delta (MLB hits/ER)
+        "rest_strength": rest_strength,      # §2.6 rest/days-off candidate feature (prop_features)
         # NB: no weather knob (P1.3). Weather (props._weather_factor_mult) is a
         # LIVE-ONLY signal — there's no historical per-game weather to reconstruct,
         # so a backtest variant would be a no-op. It ships gated on CLV instead.
@@ -1943,9 +1945,9 @@ def _build_sweep_grid():
 
 def _build_props_sweep_grid():
     """
-    Cross-product for player-props sweep mode (P2.1b expanded).
+    Cross-product for player-props sweep mode (P2.1b expanded, §2.6 rest axis).
 
-    Sweeps the five knobs that each have a RUNTIME counterpart in
+    Sweeps knobs/features that each have a RUNTIME counterpart in
     props.analyze_player_props_value, so a knob the confirmation gate enables
     behaves live EXACTLY as it was validated. NBA-only preset knobs
     (use_minutes / pace_adj / rest_adj) are deliberately excluded — they have no
@@ -1955,20 +1957,32 @@ def _build_props_sweep_grid():
       • def_adj               (output-side opponent-defense scaling)
       • shrink_k              (Bayesian shrinkage toward the season mean)  [P2.1b]
       • venue                 (venue-match reweighting)
+      • rest_strength         (§2.6 rest/days-off candidate feature, prop_features)
 
-    The all-off cell 'none/opp0.0/defadj0.0/shrink0/ven0.0' is the baseline the
-    P2.1 variant gate measures every candidate against (refit_calibration), so
-    the sweep can never ship worse than plain recency (baseline = the floor).
-    Grid size: 4×3×3×4×2 = 288 variants — bounded for the offline refit; the
-    fetch happens once and each variant is a pure re-projection pass. The current
-    shipped selections (hl∈{None,15}, ven∈{0.0,0.25}, all other knobs 0) all lie
-    inside this grid, so §2.1b cannot regress a prop by dropping its winner.
+    The all-off cell 'none/opp0.0/defadj0.0/shrink0/ven0.0/rest0.0' is the
+    baseline the P2.1 variant gate measures every candidate against
+    (refit_calibration), so the sweep can never ship worse than plain recency
+    (baseline = the floor). Grid size: 4×3×3×4×2×2 = 576 variants — bounded for
+    the offline refit; the fetch happens once and each variant is a pure
+    re-projection pass. The current shipped selections (hl∈{None,15},
+    ven∈{0.0,0.25}, all other knobs 0) all lie inside this grid, so neither
+    §2.1b nor §2.6 can regress a prop by dropping its winner.
+
+    §2.6 rest axis note: rest is a GLOBAL {0.0, 1.0} axis, but prop_features
+    restricts it to {pitcher_outs, pitcher_strikeouts, batter_hits} — for every
+    OTHER prop rest_multiplier returns 1.0, so its rest1.0 cell is a byte-exact
+    duplicate of its rest0.0 cell. `rest` is the INNERMOST loop so that, for any
+    given knob combo, the rest0.0 variant is inserted immediately before its
+    rest1.0 twin; _best_per_prop breaks ties with a strict `<` (first-seen wins),
+    so an excluded prop can never persist rest_strength=1.0, and rest is adopted
+    only where it strictly beats the gate.
     """
     half_lifes = [None, 5, 10, 15]
     opp_defenses = [0.0, 0.5, 1.0]
     def_adjs = [0.0, 0.5, 1.0]
     shrink_ks = [0, 5, 10, 15]
     venue_strengths = [0.0, 0.25]
+    rest_strengths = [0.0, 1.0]   # §2.6 candidate feature; 0.0 first (tie-break)
 
     variants = {}
     for hl in half_lifes:
@@ -1976,12 +1990,14 @@ def _build_props_sweep_grid():
             for da in def_adjs:
                 for sk in shrink_ks:
                     for vs in venue_strengths:
-                        hl_label = "none" if hl is None else f"hl{hl}"
-                        name = (f"{hl_label}/opp{opp}/defadj{da}/"
-                                f"shrink{sk}/ven{vs}")
-                        variants[name] = _preset(
-                            half_life=hl, opp_defense_strength=opp,
-                            def_adj=da, shrink_k=sk, venue_strength=vs)
+                        for rs in rest_strengths:
+                            hl_label = "none" if hl is None else f"hl{hl}"
+                            name = (f"{hl_label}/opp{opp}/defadj{da}/"
+                                    f"shrink{sk}/ven{vs}/rest{rs}")
+                            variants[name] = _preset(
+                                half_life=hl, opp_defense_strength=opp,
+                                def_adj=da, shrink_k=sk, venue_strength=vs,
+                                rest_strength=rs)
     return variants
 
 
@@ -2633,6 +2649,27 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                             prop_key, past_parks, weights, upcoming_park, park_s)
                         projected *= park_mult
 
+                    # ── §2.6 candidate-feature multiplier (rest/days-off, …) ──
+                    # ONE source shared with the runtime + real-line diagnostic
+                    # (prop_features). Scales the projection here (moves methods
+                    # B/C/E) and — in the calib_obs block below — shifts the
+                    # empirical line by its inverse (moves method A), exactly like
+                    # production combined_mult / effective_line. A hard no-op (1.0)
+                    # for props the feature doesn't apply to and for rest 0, so the
+                    # all-off grid stays byte-identical to production. Uses only the
+                    # per-game game_date strictly before the a-priori upcoming_date
+                    # (no leakage).
+                    feat_strengths = prop_features.strengths_from_params(params)
+                    feat_mult = 1.0
+                    if feat_strengths:
+                        fm = prop_features.projection_multiplier(
+                            prop_key, feat_strengths,
+                            [g.get("game_date") for g in prior_games],
+                            upcoming_date)
+                        if fm and fm != 1.0:
+                            feat_mult = fm
+                            projected *= feat_mult
+
                     err = projected - actual
                     cell = results[vname][prop_key]
                     cell["errors"].append(err)
@@ -2659,8 +2696,17 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     # empirical-CDF vs residual-calibrated forecasters later.
                     if calibrate and cell["calib_obs"] is not None:
                         if sum(weights) > 0:
+                            # §2.6: the empirical (method-A) over-rate reads the
+                            # feature-shifted line (line / feat_mult), while the
+                            # stored line stays the raw synthetic_line so the
+                            # OUTCOME + methods B/C/E use it as the fixed target —
+                            # the exact split production uses (effective_line for
+                            # A, real line for B/C/E). feat_mult==1.0 → identical
+                            # to production.
+                            line_eff = (synthetic_line / feat_mult
+                                        if feat_mult != 1.0 else synthetic_line)
                             empirical_over = _weighted_rate(
-                                prior_values, weights, lambda v: v > synthetic_line)
+                                prior_values, weights, lambda v: v > line_eff)
                         else:
                             empirical_over = 0.5
                         cell["calib_obs"].append(

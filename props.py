@@ -26,6 +26,7 @@ from pricing_common import (
     et_local_date,
 )
 from prop_filter import filter_player_gamelog
+import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from recalibration import (
     apply_platt,
     load_recalibration,
@@ -345,6 +346,18 @@ DEFAULT_PLAYER_PROP_XSTATS_STRENGTH = 0.0
 PROP_XSTATS_KIND = {"batter_hits": "xba"}
 # Minimum official ABs behind the as-of xBA before it is trusted (mirrors MIN_BBE).
 XSTATS_MIN_N = 40
+# ── Rest / days-off candidate feature (§2.6) ──
+# Strength of the bounded rest/days-off projection multiplier from
+# prop_features.rest_multiplier (the ONE source shared with the offline
+# confirmation gate + synthetic sweep). Sized by a single per-prop knob the gate
+# writes (calibration JSON "rest_strength"). Default 0.0 EVERYWHERE — the live
+# path is byte-identical to production until the offline refit adopts rest for a
+# prop, at which point live behaves EXACTLY as the gate validated (same
+# prop_features math, same projection-scale + line-shift). prop_features'
+# registry restricts WHICH props it can move (pitcher_outs / pitcher_strikeouts /
+# batter_hits), so a stray knob on any other prop no-ops.
+PLAYER_PROP_REST_STRENGTH = {}  # no sport-level default-on; gate writes per-prop
+DEFAULT_PLAYER_PROP_REST_STRENGTH = 0.0
 # §2.2: props eligible for the Negative-Binomial count method ("E"). Low-count
 # non-negative-integer outcomes where a continuous Gaussian residual (method B)
 # misfits the floor. Limited to the currently-calibrated count props — the offline
@@ -725,6 +738,13 @@ def _player_prop_xstats_strength(sport_key):
         sport_key, DEFAULT_PLAYER_PROP_XSTATS_STRENGTH)
 
 
+def _player_prop_rest_strength(sport_key):
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_REST_STRENGTH
+    return PLAYER_PROP_REST_STRENGTH.get(
+        sport_key, DEFAULT_PLAYER_PROP_REST_STRENGTH)
+
+
 def _park_factor_mult(prop_key, past_parks, past_weights, upcoming_park,
                       strength):
     """Road-context ballpark multiplier for an MLB player-prop projection.
@@ -903,6 +923,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_park_strength = _player_prop_park_strength(sport_key)
     default_weather_strength = _player_prop_weather_strength(sport_key)
     default_xstats_strength = _player_prop_xstats_strength(sport_key)
+    default_rest_strength = _player_prop_rest_strength(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -941,6 +962,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         park_strength = _knob(prop_key, "park_factor_strength", default_park_strength)
         weather_strength = _knob(prop_key, "weather_factor_strength", default_weather_strength)
         xstats_strength = _knob(prop_key, "xstats_strength", default_xstats_strength)
+        rest_strength = _knob(prop_key, "rest_strength", default_rest_strength)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -1211,8 +1233,23 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             weather_mult, weather_meta = _weather_factor_mult(
                 prop_key, weather, weather_strength)
 
+            # ── Rest / days-off candidate feature (§2.6) ──
+            # Bounded projection multiplier from prop_features — the SAME source
+            # the offline confirmation gate + synthetic sweep validate against, so
+            # live behaves exactly as the gate measured. Default rest_strength=0.0
+            # → 1.0 (no-op), keeping the live path byte-identical to production
+            # until the refit adopts rest for this prop. projection_multiplier
+            # enforces the registry applies-to filter (a stray knob on a
+            # non-eligible prop no-ops), and is leakage-safe: only the eligible
+            # prior games' dates (strictly before commence) feed it.
+            rest_mult = 1.0
+            if rest_strength and rest_strength > 0:
+                rest_mult = prop_features.projection_multiplier(
+                    prop_key, {"rest": rest_strength},
+                    [g.get("game_date") for g in eligible], commence_iso)
+
             combined_mult = (output_def_mult * matchup_mult
-                             * lineup_mult * park_mult * weather_mult)
+                             * lineup_mult * park_mult * weather_mult * rest_mult)
 
             avg_stat = base_proj * combined_mult
             # When the projection is scaled, the over-rate calc shifts the

@@ -275,9 +275,9 @@ def _parse_variant_name(name):
     """
     Parse a sweep variant key into
     {half_life, opp_defense_strength, output_def_strength, shrink_k,
-     venue_strength}. Returns None if the format isn't recognized.
+     venue_strength, rest_strength}. Returns None if the format isn't recognized.
 
-    Two formats are accepted so legacy committed labels stay parseable:
+    Three formats are accepted so legacy committed labels stay parseable:
       • legacy 3-part 'hl15/defadj1.0/ven0.25'
           — the pre-P2.1b grid; opp_defense_strength defaults to 0.0 and shrink_k
             to None (== "unspecified" → _build_prop_cfg falls back to the CLI
@@ -286,11 +286,23 @@ def _parse_variant_name(name):
           — adds the weight-side opponent-defense and Bayesian-shrinkage knobs
             (both have a props.py runtime, so an enabled knob behaves live as
             validated). shrink_k is an explicit float here — a swept 0 is honored.
+      • §2.6 6-part   'hl15/opp0.5/defadj1.0/shrink5/ven0.25/rest1.0'
+          — appends a candidate-FEATURE axis (rest/days-off, prop_features). The
+            token is optional; 3/5-part labels get rest_strength 0.0 (off).
     """
     parts = name.split("/")
-    if len(parts) not in (3, 5):
+    if len(parts) not in (3, 5, 6):
         return None
+    rest_s = 0.0
     try:
+        # Optional trailing /rest<r> feature token (§2.6); trim then reuse the
+        # 3/5-part parse below unchanged.
+        if len(parts) == 6:
+            rest_part = parts[5]
+            if not rest_part.startswith("rest"):
+                return None
+            rest_s = float(rest_part[len("rest"):])
+            parts = parts[:5]
         # _build_props_sweep_grid emits "none" or "hl<N>" for the half-life.
         hl_part = parts[0]
         if hl_part == "none":
@@ -321,6 +333,7 @@ def _parse_variant_name(name):
         "output_def_strength": da,
         "shrink_k": shrink,
         "venue_strength": ven,
+        "rest_strength": rest_s,
     }
 
 
@@ -420,7 +433,7 @@ def _is_baseline_variant(vname):
     p = _parse_variant_name(vname)
     return (bool(p) and not p.get("half_life") and not p.get("output_def_strength")
             and not p.get("venue_strength") and not p.get("opp_defense_strength")
-            and not p.get("shrink_k"))
+            and not p.get("shrink_k") and not p.get("rest_strength"))
 
 
 def _baseline_variant_obs(results, prop_key):
@@ -539,6 +552,8 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
         "opp_defense_strength": parsed.get("opp_defense_strength", 0.0),
         "output_def_strength": parsed.get("output_def_strength", 0.0),
         "shrinkage_k": shrinkage_k,
+        # §2.6 candidate-feature axis (0.0 = off; props.py reads this knob).
+        "rest_strength": parsed.get("rest_strength", 0.0),
         "variant_label": vname,
         "fit_brier": round(winner["brier"], 4),
         "fit_hit_pct": round(winner["hit"], 2) if winner["hit"] is not None else None,
@@ -784,6 +799,10 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             "venue_strength": cfg.get("venue_strength", 0.0),
             "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
             "use_minutes": cfg.get("use_minutes", False),
+            # §2.6: forward an adopted feature knob so the real-line method
+            # re-selection scores the SAME (feature-adjusted) projection the
+            # synthetic sweep chose. 0.0 (default) → byte-identical no-op.
+            "rest_strength": cfg.get("rest_strength", 0.0),
         }
         prop_xstats = (xstats_strength if (xba_index is not None
                        and prop_key in PROP_XSTATS_KIND) else 0.0)
@@ -1641,6 +1660,208 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
     print("\n  (Diagnostic only — nothing written.)")
 
 
+# ── §2.6 candidate-feature evaluation harness (NO WRITE) ──
+# Generalizes the confirmation-gate philosophy across a curated FEATURE set
+# (prop_features.FEATURE_REGISTRY): for each calibrated prop and each candidate
+# feature that applies, score the prop's methods on the SAME real-line holdout
+# the ship path uses, at each feature strength, and report whether turning the
+# feature on clears the gate. Consensus ROI of the gate-selected method is a
+# co-signal beside Brier. Reuses blc.select_method_at_real_lines verbatim; the
+# feature is injected via params['features'] and threaded into the projection by
+# prop_features.strengths_from_params, so strength 0 == production bit-for-bit.
+def _roi_by_method(enriched, params, sport_key, prop_key, elig,
+                   team_defense, league_avg_def, threshold):
+    """Consensus-priced ROI per method (A/B/C/E) for one prop under ``params``.
+
+    Mirrors diagnose_roi's fit + per-row-P(over) block (chronological 50/50
+    split; residual + NegBin fit on TRAIN; P(over) on TEST) but returns
+    {method: roi_sim_dict} so the caller can pull the ROI of whatever method the
+    Brier gate selects. De-vigged best-of-book consensus (NOT DK); relative
+    ranking only. Method D is omitted (needs the Statcast xBA index; this diag
+    runs plain + free). Returns {} when too thin to price (<40 usable)."""
+    import book_line_calibration as blc
+    rows = _roi_build_rows(enriched, params, sport_key, prop_key,
+                           team_defense, league_avg_def)
+    rows = [r for r in rows if r["actual"] != r["line"]]     # drop pushes
+    if len(rows) < 40:
+        return {}
+    rows.sort(key=lambda r: r["game_date"])
+    split = len(rows) // 2
+    train, test = rows[:split], rows[split:]
+    resid = sorted(r["actual"] - r["projected"] for r in train)
+    mu = sum(resid) / len(resid)
+    var = sum((x - mu) ** 2 for x in resid) / len(resid)
+    sigma = math.sqrt(var) if var > 0 else 1e-6
+    nb = blc._fit_negbin_real(train) if elig else None
+    for r in test:
+        r["o"] = 1 if r["actual"] > r["line"] else 0
+        corrected = r["projected"] + mu
+        m = {
+            "A": max(0.0, min(1.0, r["empirical_over"])),
+            "B": blc._norm_cdf((corrected - r["line"]) / sigma),
+            "C": 1.0 - blc._empirical_cdf(resid, r["line"] - corrected),
+        }
+        if nb is not None:
+            ms, disp = nb
+            mean = max(1e-9, ms * r["projected"])
+            m["E"] = blc.negbin_at_least(int(r["line"]) + 1, mean, disp)
+        r["m"] = m
+    out = {}
+    for k in ("A", "B", "C", "E"):
+        scored = [r for r in test if k in r["m"]]
+        if scored:
+            out[k] = _roi_sim_method(
+                scored, lambda r, _k=k: r["m"][_k], threshold)
+    return out
+
+
+def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
+    """Candidate-feature evaluation harness (roadmap §2.6, NO WRITE).
+
+    For each calibrated prop and each registered candidate feature that applies
+    to it, score the prop's calibration methods on the SAME real-line
+    chronological holdout the ship path uses, once per feature STRENGTH, and
+    report whether turning the feature on clears the confirmation gate (the
+    incumbent's single-split Brier improves by >= MIN_CALIB_BRIER_GAIN, and does
+    the 2-fold-gated method selection change). Consensus-priced ROI of the
+    gate-selected method is printed ALONGSIDE Brier as a co-signal — Brier
+    decides; true DK CLV is blocked on data accrual.
+
+    Reuses blc.build_real_line_obs + blc.select_method_at_real_lines verbatim
+    (roi_tiebreak off) so this shares ONE scoring/gate impl with the ship path.
+    The feature is injected via params['features'] = {name: strength}; strength 0
+    reproduces production bit-for-bit (a built-in self-check). OFFLINE + FREE.
+
+    ``feature`` restricts to one registered feature; ``prop_filter`` to props."""
+    import book_line_calibration as blc
+    import prop_features
+    from props import PROP_NEGBIN_ELIGIBLE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = sorted(existing)
+    if prop_filter:
+        props_to_check = [pk for pk in props_to_check if pk in prop_filter]
+
+    feats = [f for f in prop_features.FEATURE_REGISTRY
+             if feature is None or f["name"] == feature]
+    if feature is not None and not feats:
+        print(f"Unknown feature '{feature}'. Registered: "
+              f"{', '.join(f['name'] for f in prop_features.FEATURE_REGISTRY)}")
+        return
+    props_to_check = [pk for pk in props_to_check
+                      if any(prop_features.feature_applies(f["name"], pk)
+                             for f in feats)]
+    if not props_to_check:
+        print(f"No calibrated props in calibration/{sport_key}.json that a "
+              f"registered feature applies to"
+              + (f" (feature={feature})" if feature else "")
+              + "; run refit first.")
+        return
+
+    print(f"\n=== Candidate-feature diagnostic (§2.6): {sport_key} ===")
+    print(f"  Features: {', '.join(f['name'] for f in feats)}")
+    print(f"  Props:    {', '.join(props_to_check)}")
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    print(f"  {len(book_lines):,} real book lines "
+          f"({n_primary:,} store + {n_pred:,} prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    threshold = 0.05   # edge threshold for the ROI sim (matches diagnose_roi)
+    for prop_key in props_to_check:
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        elig = prop_key in PROP_NEGBIN_ELIGIBLE
+        base_params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        for f in feats:
+            if not prop_features.feature_applies(f["name"], prop_key):
+                continue
+            strengths = list(f["strengths"])
+            off = strengths[0]
+            sels, rois = {}, {}
+            for s in strengths:
+                params = dict(base_params, features={f["name"]: s})
+                rows = blc.build_real_line_obs(
+                    enriched, params, sport_key, prop_key, team_defense,
+                    league_avg_def, xstats_strength=0.0, xba_index=None)
+                sels[s] = blc.select_method_at_real_lines(
+                    rows, negbin_eligible=elig, roi_tiebreak=False)
+                rois[s] = _roi_by_method(enriched, params, sport_key, prop_key,
+                                         elig, team_defense, league_avg_def,
+                                         threshold)
+            # n_usable is strength-invariant (pushes = actual==raw line), so all
+            # strengths return None together when too thin.
+            if sels[off] is None:
+                print(f"\n  {prop_key} [{f['name']}]: too few usable real-line "
+                      f"obs (need >=20) — can't score.")
+                continue
+
+            ss_off = sels[off].get("single_split", {})
+            methods = [m for m in ("A", "B", "C", "D", "E")
+                       if any(m in (sels[s].get("single_split", {}) or {})
+                              for s in strengths)]
+            print(f"\n  {prop_key} [{f['name']}] (incumbent={incumbent}):")
+            print("    holdout Brier by method:")
+            print(f"    {'strength':>8}  " + "  ".join(f"{m:>8}" for m in methods))
+            for s in strengths:
+                ss = sels[s].get("single_split", {})
+                cells = "  ".join(
+                    (f"{ss[m]:8.4f}" if m in ss else f"{'—':>8}") for m in methods)
+                print(f"    {s:>8.2f}  {cells}")
+
+            inc_off = ss_off.get(incumbent)
+            for s in strengths:
+                if s == off:
+                    continue
+                inc_s = sels[s].get("single_split", {}).get(incumbent)
+                if inc_off is not None and inc_s is not None:
+                    gain = inc_off - inc_s
+                    passes = gain >= MIN_CALIB_BRIER_GAIN
+                    print(f"    incumbent {incumbent} @ strength {s:.2f}: "
+                          f"off={inc_off:.4f} on={inc_s:.4f} (gain {gain:+.4f}; "
+                          f">= {MIN_CALIB_BRIER_GAIN} gate: "
+                          f"{'YES' if passes else 'no'})")
+                if sels[s].get("method") != sels[off].get("method"):
+                    print(f"      gate pick: off={sels[off].get('method')} -> "
+                          f"strength{s:.2f}={sels[s].get('method')} "
+                          f"(selection would change)")
+
+            print("    consensus-ROI of the gate-selected method "
+                  "(de-vigged best-of-book; relative only):")
+            print(f"    {'strength':>8}{'method':>8}{'n_bets':>8}{'ROI%':>9}")
+            for s in strengths:
+                mth = sels[s].get("method")
+                sim = rois[s].get(mth)
+                if sim and sim.get("roi") is not None:
+                    print(f"    {s:>8.2f}{mth:>8}{sim['n_bets']:>8}"
+                          f"{sim['roi'] * 100:>8.1f}%")
+                else:
+                    print(f"    {s:>8.2f}{mth:>8}{'—':>8}{'—':>9}")
+
+    print(f"\n  (Diagnostic only — nothing written. Strengths are injected into "
+          f"the offline projection via prop_features; strength 0 == production. A "
+          f"feature auto-adopts only if a prop clears the same 2-fold + "
+          f"{MIN_CALIB_BRIER_GAIN} gate on the next --refit.)")
+
+
 # ── Conditional-calibration ("reliability by prediction stratum") report ──
 # Answers, market-free: "when the model says 60%, does it happen 60%?" and "does
 # the model systematically over/under-project in a given line/projection band?"
@@ -2294,6 +2515,19 @@ def main():
     p.add_argument("--center-prop", default=None,
                    help="Restrict --center-diag to these prop_key(s), "
                         "comma-separated (e.g. pitcher_strikeouts).")
+    p.add_argument("--feature-diag", action="store_true",
+                   help="§2.6 feature-eval harness: for each calibrated prop and "
+                        "each registered candidate feature (prop_features, e.g. "
+                        "rest/days-off), re-score the prop's methods on the "
+                        "real-line holdout at each feature strength and report "
+                        "whether it clears the ship gate, with consensus ROI "
+                        "alongside Brier (no write).")
+    p.add_argument("--feature", default=None,
+                   help="Restrict --feature-diag to one registered feature "
+                        "(e.g. rest).")
+    p.add_argument("--feature-prop", default=None,
+                   help="Restrict --feature-diag to these prop_key(s), "
+                        "comma-separated (e.g. pitcher_outs,pitcher_strikeouts).")
     p.add_argument("--roi-diag", action="store_true",
                    help="Profitability lens: for each calibrated prop, replay the "
                         "live edge+EV recommendation gate at BEST-OF-BOOK consensus "
@@ -2350,6 +2584,13 @@ def main():
                        if args.center_prop else None)
         diagnose_center(args.sport, prop_filter=prop_filter,
                         store_label=args.store_label)
+        return
+
+    if args.feature_diag:
+        prop_filter = ([p.strip() for p in args.feature_prop.split(",")]
+                       if args.feature_prop else None)
+        diagnose_features(args.sport, feature=args.feature,
+                          prop_filter=prop_filter, store_label=args.store_label)
         return
 
     if args.roi_diag:

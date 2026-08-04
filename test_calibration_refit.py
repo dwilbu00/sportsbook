@@ -124,25 +124,29 @@ class SweepGridTests(unittest.TestCase):
         self.grid = backtest._build_props_sweep_grid()
 
     def test_size_and_baseline_cell(self):
-        # 4 half_lives × 3 opp × 3 def_adj × 4 shrink × 2 venue = 288
-        self.assertEqual(len(self.grid), 288)
-        self.assertIn("none/opp0.0/defadj0.0/shrink0/ven0.0", self.grid)
+        # 4 half_lives × 3 opp × 3 def_adj × 4 shrink × 2 venue × 2 rest = 576
+        # (§2.6 appended the rest/days-off candidate-feature axis {0.0, 1.0}).
+        self.assertEqual(len(self.grid), 576)
+        self.assertIn("none/opp0.0/defadj0.0/shrink0/ven0.0/rest0.0", self.grid)
 
     def test_contains_current_shipped_selections(self):
         # Baseline-is-the-floor requires the grid to still contain every knob
-        # combo the live MLB calibration currently ships — else §2.1b could
-        # regress a prop by dropping its winner from the grid.
+        # combo the live MLB calibration currently ships — else §2.1b/§2.6 could
+        # regress a prop by dropping its winner from the grid. §2.6 appends the
+        # rest axis, so each shipped combo survives as its rest0.0 variant.
         for cell in (
-            "none/opp0.0/defadj0.0/shrink0/ven0.0",    # batter_hits, pitcher_outs
-            "none/opp0.0/defadj0.0/shrink0/ven0.25",   # pitcher_K, batter_K
-            "hl15/opp0.0/defadj0.0/shrink0/ven0.25",   # pitcher_earned_runs
+            "none/opp0.0/defadj0.0/shrink0/ven0.0/rest0.0",   # batter_hits, pitcher_outs
+            "none/opp0.0/defadj0.0/shrink0/ven0.25/rest0.0",  # pitcher_K, batter_K
+            "hl15/opp0.0/defadj0.0/shrink0/ven0.25/rest0.0",  # pitcher_earned_runs
         ):
             self.assertIn(cell, self.grid)
 
     def test_only_runtime_backed_knobs_are_set(self):
         # No NBA-only preset knob (use_minutes / pace_adj / rest_adj / def_window)
         # is ever turned on — those have no props.py runtime, so selecting one for
-        # MLB would be a silent no-op (the trap P2.1 exists to avoid).
+        # MLB would be a silent no-op (the trap P2.1 exists to avoid). NB the
+        # §2.6 rest/days-off feature IS runtime-backed (props.py rest_strength),
+        # so its axis is legitimately swept — distinct from the NBA rest_adj knob.
         for name, preset in self.grid.items():
             self.assertFalse(preset["use_minutes"], name)
             self.assertEqual(preset["pace_adj"], 0.0, name)
@@ -150,12 +154,13 @@ class SweepGridTests(unittest.TestCase):
             self.assertIsNone(preset["def_window"], name)
 
     def test_preset_values_match_label(self):
-        p = self.grid["hl10/opp0.5/defadj1.0/shrink5/ven0.25"]
+        p = self.grid["hl10/opp0.5/defadj1.0/shrink5/ven0.25/rest0.0"]
         self.assertEqual(p["half_life"], 10)
         self.assertEqual(p["opp_defense_strength"], 0.5)
         self.assertEqual(p["def_adj"], 1.0)
         self.assertEqual(p["shrink_k"], 5)
         self.assertEqual(p["venue_strength"], 0.25)
+        self.assertEqual(p["rest_strength"], 0.0)
 
     def test_every_label_parses_and_roundtrips(self):
         for name, preset in self.grid.items():
@@ -171,15 +176,29 @@ class SweepGridTests(unittest.TestCase):
 
 
 class ParseVariantNameTests(unittest.TestCase):
-    """P2.1b: dual-format variant-name parser (legacy 3-part + new 5-part)."""
+    """Variant-name parser: legacy 3-part + P2.1b 5-part + §2.6 6-part."""
 
     def test_five_part_new_format(self):
+        # A 5-part label carries no rest token → rest_strength defaults to 0.0.
         p = refit_calibration._parse_variant_name(
             "hl15/opp0.5/defadj1.0/shrink10/ven0.25")
         self.assertEqual(p, {
             "half_life": 15, "opp_defense_strength": 0.5,
             "output_def_strength": 1.0, "shrink_k": 10.0,
-            "venue_strength": 0.25})
+            "venue_strength": 0.25, "rest_strength": 0.0})
+
+    def test_six_part_rest_feature_format(self):
+        # §2.6 appends an optional /rest<r> candidate-feature token.
+        p = refit_calibration._parse_variant_name(
+            "hl15/opp0.5/defadj1.0/shrink10/ven0.25/rest1.0")
+        self.assertEqual(p, {
+            "half_life": 15, "opp_defense_strength": 0.5,
+            "output_def_strength": 1.0, "shrink_k": 10.0,
+            "venue_strength": 0.25, "rest_strength": 1.0})
+
+    def test_bad_rest_token_returns_none(self):
+        self.assertIsNone(refit_calibration._parse_variant_name(
+            "hl15/opp0.5/defadj1.0/shrink10/ven0.25/xxx1.0"))
 
     def test_legacy_three_part_defers_shrink_to_cli(self):
         # Legacy label carries no shrink token → shrink_k is None (unspecified),

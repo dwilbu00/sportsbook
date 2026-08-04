@@ -40,6 +40,7 @@ from backtest import (
 )
 from espn_client import PROP_STAT_MAP, ip_to_outs
 from pricing_common import et_local_date  # UTC at rest, ET on read
+import prop_features  # §2.6 candidate-feature registry (rest/days-off, ...)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -587,9 +588,26 @@ def project_and_empirical(obs, params, sport_key,
         except Exception:
             pass  # fail open — never let the xBA lookup break the refit
 
-    # Empirical over-probability AT THE BOOK LINE
+    # ── Candidate-feature multiplier (roadmap §2.6) ──
+    # Bounded projection multiplier (e.g. rest/days-off) from prop_features — the
+    # ONE source shared with the runtime + synthetic sweep. Empty / all-off ->
+    # 1.0, so the projection AND the line stay byte-identical to production (the
+    # self-check the diagnostic relies on). Mirrors props.py combined_mult: scale
+    # the projection AND divide the line, so methods A-E all move (unlike the
+    # `center` operator, which only touched the mean).
+    feat_strengths = prop_features.strengths_from_params(params)
+    line_eff = line
+    if feat_strengths:
+        feat_mult = prop_features.projection_multiplier(
+            obs.get("prop_key"), feat_strengths,
+            [g.get("game_date") for g in prior_games], obs.get("game_date"))
+        if feat_mult and feat_mult != 1.0:
+            projected *= feat_mult
+            line_eff = line / feat_mult
+
+    # Empirical over-probability AT THE (feature-shifted) BOOK LINE
     empirical_over = _weighted_rate(
-        prior_values, weights, lambda v: v > line)
+        prior_values, weights, lambda v: v > line_eff)
 
     return projected, empirical_over
 
