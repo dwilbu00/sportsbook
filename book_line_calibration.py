@@ -28,7 +28,7 @@ from collections import defaultdict
 
 from analysis import (
     _norm_cdf, _half_life_for, _recency_weights, _weighted_rate,
-    _weighted_std, _normal_inv_cdf,
+    _weighted_std, _normal_inv_cdf, _weighted_quantile,
 )
 from stats import negbin_at_least, fit_negbin_dispersion  # §2.2 method "E"
 from backtest import (
@@ -458,6 +458,26 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
 #  Step 3: produce projected stat + empirical_over for each observation
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _center_estimate(values, weights, center="mean"):
+    """Central-tendency of prior-game values under the harness's recency weights.
+
+    ``center="mean"`` (default) reproduces production exactly — the recency-weighted
+    mean (EWMA). ``center="median"`` returns the recency-weighted 0.5-quantile
+    (same weights, only the operator changes): robust to blow-up games and — the
+    hypothesis under test — a less positively-biased center for right-skewed count
+    stats. Falls back to the weighted mean if the quantile is undefined. Weights are
+    guaranteed to sum > 0 by the caller (project_and_empirical returns early on
+    sum(weights) <= 0), so the mean branch matches the prior inline formula bit-for-bit."""
+    if center == "median":
+        m = _weighted_quantile(values, weights, 0.5)
+        if m is not None:
+            return m
+    tw = sum(weights)
+    if tw <= 0:
+        return sum(values) / len(values) if values else 0.0
+    return sum(v * w for v, w in zip(values, weights)) / tw
+
+
 def project_and_empirical(obs, params, sport_key,
                           team_defense=None, league_avg_def=None,
                           xstats_strength=0.0, xba_index=None):
@@ -521,6 +541,11 @@ def project_and_empirical(obs, params, sport_key,
     if sum(weights) <= 0:
         return None, None
 
+    # Central-tendency operator (P2.x mean-vs-median experiment): "mean" (default)
+    # reproduces production; "median" swaps to the recency-weighted 0.5-quantile.
+    # The per-minute RATE path (NBA use_minutes) stays a mean — a rate is already a
+    # ratio and its median is a different construct; the knob targets count props.
+    center = params.get("center", "mean")
     if params.get("use_minutes"):
         rates = [v / m for v, m in zip(prior_values, prior_minutes) if m and m > 0]
         rate_weights = [w for w, m in zip(weights, prior_minutes) if m and m > 0]
@@ -529,9 +554,9 @@ def project_and_empirical(obs, params, sport_key,
             proj_min = sum(m * w for m, w in zip(prior_minutes, weights)) / sum(weights)
             projected = per_min_rate * proj_min
         else:
-            projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+            projected = _center_estimate(prior_values, weights, center)
     else:
-        projected = sum(v * w for v, w in zip(prior_values, weights)) / sum(weights)
+        projected = _center_estimate(prior_values, weights, center)
 
     # ── Statcast xBA blend (P2.4a, leakage-safe as-of) ──
     # Shrink the projection toward the batter's own as-of xBA × recent AB/game,

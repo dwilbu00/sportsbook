@@ -1265,6 +1265,139 @@ def diagnose_negbin(sport, store_label=""):
           "gate for real.)")
 
 
+def diagnose_center(sport, prop_filter=None, store_label=""):
+    """Mean-vs-median central-tendency diagnostic (NO WRITE).
+
+    A reader suggested that for count stats (which can't go negative) the mean is a
+    positively-biased center and the MEDIAN might predict better. This scores every
+    calibrated prop's incumbent method on the SAME real-line chronological holdout
+    the ship path uses, once with the production recency-weighted MEAN center and
+    once with a recency-weighted MEDIAN center (same weights, only the operator
+    changes — book_line_calibration._center_estimate), and reports the per-method
+    Brier under each and whether MEDIAN beats MEAN on the incumbent by
+    >= MIN_CALIB_BRIER_GAIN.
+
+    Reuses book_line_calibration.select_method_at_real_lines verbatim (roi_tiebreak
+    off) so this shares ONE scoring/gate impl with the ship path. OFFLINE + FREE
+    (store + free ESPN gamelogs); writes nothing.
+
+    Self-check: method A never reads ``projected`` (it returns the empirical
+    over-rate at the book line), so A's Brier is IDENTICAL under both centers — a
+    built-in proof the harness is isolating the center. Only methods B/C/E (which
+    center a distribution on the projection) can move. So a mean->median swap is a
+    literal no-op for a prop shipped on method A (e.g. pitcher_earned_runs,
+    pitcher_outs) — it only bites the projection-centered methods."""
+    import book_line_calibration as blc
+    from props import PROP_NEGBIN_ELIGIBLE, PROP_XSTATS_KIND
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = sorted(existing)
+    if prop_filter:
+        props_to_check = [pk for pk in props_to_check if pk in prop_filter]
+    if not props_to_check:
+        print(f"No calibrated props to check in calibration/{sport_key}.json"
+              + (f" matching {sorted(prop_filter)}" if prop_filter else "")
+              + "; run refit first.")
+        return
+
+    print(f"\n=== Mean-vs-median center diagnostic: {sport_key} ===")
+    print(f"  Checking: {', '.join(props_to_check)}")
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    print(f"  {len(book_lines):,} real book lines "
+          f"({n_primary:,} store + {n_pred:,} prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _team_defense_lookup(
+            espn_sport, espn_league)
+
+    for prop_key in props_to_check:
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        elig = prop_key in PROP_NEGBIN_ELIGIBLE
+        # Plain projection basis (no xBA blend) so mean vs median differ only in the
+        # operator. Warn when the shipped prop blends xBA — then the live basis
+        # differs from what we score here (directional only).
+        ship_xstats = cfg.get("xstats_strength") or 0.0
+        xba_shipped = ship_xstats > 0 and prop_key in PROP_XSTATS_KIND
+        base_params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+
+        sels = {}
+        for center in ("mean", "median"):
+            params = dict(base_params, center=center)
+            rows = blc.build_real_line_obs(
+                enriched, params, sport_key, prop_key, team_defense,
+                league_avg_def, xstats_strength=0.0, xba_index=None)
+            sels[center] = (rows, blc.select_method_at_real_lines(
+                rows, negbin_eligible=elig, roi_tiebreak=False))
+
+        rows_mean, sel_mean = sels["mean"]
+        rows_med, sel_med = sels["median"]
+        n_usable = len([r for r in rows_mean if r["actual"] != r["line"]])
+        if sel_mean is None or sel_med is None:
+            print(f"\n  {prop_key}: only {n_usable} usable real-line obs "
+                  f"(need >=20) — can't score.")
+            continue
+
+        ss_mean = sel_mean.get("single_split", {})
+        ss_med = sel_med.get("single_split", {})
+        print(f"\n  {prop_key} (incumbent={incumbent}, n_usable={n_usable}):")
+        if xba_shipped:
+            print(f"    ⚠ CAVEAT: shipped {prop_key} blends xBA "
+                  f"(xstats_strength={ship_xstats:.2f}); scored here on PLAIN "
+                  f"projections, so treat as directional.")
+        methods = [m for m in ("A", "B", "C", "D", "E")
+                   if m in ss_mean or m in ss_med]
+        print("    holdout Brier by method:")
+        print("      center  " + "  ".join(f"{m:>8}" for m in methods))
+        for center, ss in (("mean", ss_mean), ("median", ss_med)):
+            cells = "  ".join(
+                (f"{ss[m]:8.4f}" if m in ss else f"{'—':>8}") for m in methods)
+            print(f"      {center:<6}  {cells}")
+
+        # Incumbent-method comparison (the live-relevant number).
+        mean_br = ss_mean.get(incumbent)
+        med_br = ss_med.get(incumbent)
+        if mean_br is not None and med_br is not None:
+            gain = mean_br - med_br  # positive => median better
+            passes = gain >= MIN_CALIB_BRIER_GAIN
+            print(f"    incumbent {incumbent}: mean={mean_br:.4f} "
+                  f"median={med_br:.4f}  (median gain {gain:+.4f}; "
+                  f">= {MIN_CALIB_BRIER_GAIN} gate: {'YES' if passes else 'no'})")
+            if incumbent == "A":
+                print("    note: method A ignores the projected center — a "
+                      "mean/median swap is a no-op here by construction.")
+        else:
+            print(f"    incumbent {incumbent} Brier unavailable on this split.")
+
+        # Did the GATE's chosen method change under median?
+        if sel_mean.get("method") != sel_med.get("method"):
+            print(f"    gate pick: mean-center={sel_mean.get('method')} -> "
+                  f"median-center={sel_med.get('method')} (selection would change)")
+        else:
+            print(f"    gate pick unchanged ({sel_mean.get('method')}) under "
+                  f"either center.")
+
+    print("\n  (Diagnostic only — nothing written. This adds a `center` param to "
+          "the offline harness; the live prediction path is untouched until we "
+          "wire it into props.py.)")
+
+
 # ── ROI diagnostic: profitability lens on calibration-method selection ──
 # Method selection is Brier-only; a method can narrowly FAIL the Brier gate yet
 # lift betting ROI ("throwing away a beneficial result"). --roi-diag replays each
@@ -2153,6 +2286,14 @@ def main():
                         "vs A/B/C on the real-line holdout for each eligible count "
                         "prop, and report whether E would clear the ship gate (no "
                         "write).")
+    p.add_argument("--center-diag", action="store_true",
+                   help="Mean-vs-median: re-score each calibrated prop's incumbent "
+                        "method on the real-line holdout with a recency-weighted "
+                        "MEDIAN center vs the production MEAN center, and report "
+                        "whether median beats mean by >= the ship gate (no write).")
+    p.add_argument("--center-prop", default=None,
+                   help="Restrict --center-diag to these prop_key(s), "
+                        "comma-separated (e.g. pitcher_strikeouts).")
     p.add_argument("--roi-diag", action="store_true",
                    help="Profitability lens: for each calibrated prop, replay the "
                         "live edge+EV recommendation gate at BEST-OF-BOOK consensus "
@@ -2202,6 +2343,13 @@ def main():
 
     if args.negbin_diag:
         diagnose_negbin(args.sport, store_label=args.store_label)
+        return
+
+    if args.center_diag:
+        prop_filter = ([p.strip() for p in args.center_prop.split(",")]
+                       if args.center_prop else None)
+        diagnose_center(args.sport, prop_filter=prop_filter,
+                        store_label=args.store_label)
         return
 
     if args.roi_diag:
