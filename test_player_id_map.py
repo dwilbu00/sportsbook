@@ -231,6 +231,13 @@ class TeamLookupTests(_Backend, unittest.TestCase):
                          "ARI")
         self.assertEqual(player_id_map.team_code_for_name("Diamondbacks"), "ARI")
 
+    def test_two_word_nickname_full_name(self):
+        # "Chicago White Sox": bare last word "sox" is NOT a key; the last-TWO-word
+        # fallback ("white sox") must resolve it. Same class as Red Sox / Blue Jays.
+        self.assertEqual(player_id_map.team_code_for_name("Chicago White Sox"),
+                         "CHW")
+        self.assertEqual(player_id_map.team_code_for_name("White Sox"), "CHW")
+
     def test_cle_guardians_override(self):
         # Stale nickname "Indians" still resolves; the current "Guardians" too.
         self.assertEqual(player_id_map.team_code_for_name("Indians"), "CLE")
@@ -292,6 +299,206 @@ class LazyRefreshTests(_Backend, unittest.TestCase):
         with patch.object(player_id_map.requests, "get",
                           side_effect=AssertionError("must not fetch when fresh")):
             self.assertEqual(player_id_map.mlb_id_for_name("Mike Trout"), "545361")
+
+
+# Fixture for suffix-strip + team-context disambiguation. The odds feed keeps
+# generational suffixes ("Ronald Acuna Jr.") and canonicalizes names, while SFBB
+# stores the bare "Ronald Acuna"; the feed also carries NO player id — only a name
+# string plus the event's home/away teams. Cases embedded:
+#   * Ronald Acuna     — stored WITHOUT "Jr", unique. Odds "Ronald Acuna Jr."
+#                        recovers via suffix-strip. Team ATL is deliberately unlike
+#                        any hint we pass, to prove a UNIQUE match ignores team
+#                        (the stale-team trap: a just-traded star's map team lags).
+#   * Luis Garcia ×2   — two active namesakes stored WITHOUT "Jr" (472610 on CHW
+#                        WITH a DraftKings name; 671277 on WAS with NONE). Mirrors
+#                        the real Luis Garcia Jr.: a dk_name tiebreak would bind the
+#                        WRONG player, so team context must decide — and the correct
+#                        infielder, which has no dk_name, must still resolve. 472610
+#                        sits on CHW (a TWO-word "White Sox" nickname) on purpose:
+#                        its full odds name must canonicalize, or a namesake tie in a
+#                        CHW/BOS/TOR game would silently bind the wrong player.
+_SUFFIX_PLAYERS_CSV = "\n".join([
+    "IDPLAYER,PLAYERNAME,MLBNAME,MLBID,ESPNID,BREFID,IDFANGRAPHS,TEAM,POS,ALLPOS,BATS,THROWS,DRAFTKINGSNAME,ACTIVE",
+    "sfx001,Ronald Acuna,Ronald Acuna,660670,44444,acunaro01,18401,ATL,OF,OF,R,R,,Y",
+    "sfx002,Luis Garcia,Luis Garcia,472610,5555,garcilu01,15001,CHW,P,P,R,R,Luis Garcia,Y",
+    "sfx003,Luis Garcia,Luis Garcia,671277,6666,garcilu02,15002,WAS,2B,2B,R,R,,Y",
+])
+
+# CHW carries the TWO-word "White Sox" nickname on purpose: the odds feed sends the
+# full "Chicago White Sox", whose bare last word ("sox") is NOT a by_name key, so
+# team_code_for_name must fall back to the last TWO words. ARI stays for the Acuna
+# stale-team test (a valid code the unique match must ignore).
+_SUFFIX_TEAMS_CSV = "\n".join([
+    "SFBBTEAM,DKTEAM,ESPNTEAM,BBREFTEAM,FANGRAPHSABBR,RETROSHEET,FANGRAPHSTEAM",
+    "ATL,ATL,ATL,ATL,ATL,ATL,Braves",
+    "WAS,WAS,WSH,WSN,WAS,WAS,Nationals",
+    "ARI,ARI,ARI,ARI,ARI,ARI,Diamondbacks",
+    "CHW,CWS,CHW,CHW,CHW,CHA,White Sox",
+])
+
+
+class SuffixStripTests(_Backend, unittest.TestCase):
+    """Suffix-strip FALLBACK in _rows_for_name: an odds "…Jr." reaches the map's
+    bare name, but only on an exact miss (never broadens an exact match)."""
+
+    def setUp(self):
+        super().setUp()
+        self._load(players=_SUFFIX_PLAYERS_CSV, teams=_SUFFIX_TEAMS_CSV)
+
+    def test_suffix_strip_recovers_unique_id(self):
+        self.assertEqual(player_id_map.mlb_id_for_name("Ronald Acuna Jr."),
+                         "660670")
+        self.assertEqual(player_id_map.espn_id_for_name("Ronald Acuna Jr."),
+                         "44444")
+
+    def test_accented_suffix_also_recovers(self):
+        # normalize_name folds the accent AND the strip removes "Jr." together.
+        self.assertEqual(player_id_map.mlb_id_for_name("Ronald Acuña Jr."),
+                         "660670")
+
+    def test_exact_name_unaffected(self):
+        # The bare name still resolves directly (fallback only fires on a miss).
+        self.assertEqual(player_id_map.mlb_id_for_name("Ronald Acuna"), "660670")
+
+    def test_get_row_recovers_via_suffix(self):
+        row = player_id_map.get_row("Ronald Acuna Jr.")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["mlb_id"], "660670")
+
+    def test_unknown_name_with_no_strippable_tokens_is_none(self):
+        self.assertIsNone(player_id_map.mlb_id_for_name("Nobody Here Jr."))
+
+
+class TeamDisambigTests(_Backend, unittest.TestCase):
+    """Team-context tiebreak for genuine namesakes (odds carry no id, only the
+    event's home/away). The tiebreak fires ONLY when a name is ambiguous, never on
+    a unique match; dk_name is deliberately not consulted."""
+
+    def setUp(self):
+        super().setUp()
+        self._load(players=_SUFFIX_PLAYERS_CSV, teams=_SUFFIX_TEAMS_CSV)
+
+    def test_unique_match_ignores_stale_or_wrong_team(self):
+        # Acuna is unique (one id). A VALID-but-wrong team code (ARI) must NOT
+        # filter him out, and an UNKNOWN team (Astros → no code) must not either —
+        # the map's single team snapshot can lag reality (the LaMonte Wade trap).
+        self.assertEqual(
+            player_id_map.mlb_id_for_name("Ronald Acuna Jr.",
+                                          teams="Arizona Diamondbacks"), "660670")
+        self.assertEqual(
+            player_id_map.mlb_id_for_name("Ronald Acuna Jr.",
+                                          teams="Houston Astros"), "660670")
+
+    def test_ambiguous_without_team_is_none(self):
+        # Two namesakes, no hint → refuse. (Also: only 472610 carries a dk_name,
+        # yet that does NOT break the tie — dk_name is not a disambiguator.)
+        self.assertIsNone(player_id_map.mlb_id_for_name("Luis Garcia Jr."))
+
+    def test_team_resolves_correct_player_without_dk_name(self):
+        # The correct infielder (671277, WAS) has NO dk_name; a dk_name heuristic
+        # would misbind to 472610. Team context binds the right player.
+        self.assertEqual(
+            player_id_map.mlb_id_for_name("Luis Garcia Jr.",
+                                          teams="Washington Nationals"), "671277")
+
+    def test_team_selects_by_team_not_by_dk_name(self):
+        # Hinting the OTHER team (the two-word "Chicago White Sox") selects 472610 —
+        # proving TEAM, not the presence of a dk_name, decides, AND that the full
+        # two-word-nickname name canonicalizes (bare last word "sox" is not a key).
+        self.assertEqual(
+            player_id_map.mlb_id_for_name("Luis Garcia Jr.",
+                                          teams="Chicago White Sox"), "472610")
+
+    def test_home_away_tuple_one_side_matches(self):
+        # The odds event's (home, away): only WAS holds a namesake → unique.
+        self.assertEqual(
+            player_id_map.mlb_id_for_name(
+                "Luis Garcia Jr.",
+                teams=("Washington Nationals", "Atlanta Braves")), "671277")
+
+    def test_home_away_tuple_both_namesakes_match_is_none(self):
+        # Both namesakes' teams are the two in the game → the hint can't
+        # disambiguate → fail-open rather than guess. REGRESSION: the away team here
+        # is a TWO-word nickname ("Chicago White Sox"); if its full name failed to
+        # canonicalize, the want-set would collapse to {WAS} and confidently (and
+        # wrongly) bind 671277 instead of failing open.
+        self.assertIsNone(
+            player_id_map.mlb_id_for_name(
+                "Luis Garcia Jr.",
+                teams=("Washington Nationals", "Chicago White Sox")))
+
+    def test_partial_tuple_resolution_fails_closed(self):
+        # REGRESSION (invariant C): if ANY hinted team fails to canonicalize, do NOT
+        # narrow on the survivors — the unresolved team could be the bet player's, so
+        # a namesake tie must fail open. Here WAS resolves and holds 671277, but the
+        # unmappable co-team forbids binding it.
+        self.assertIsNone(
+            player_id_map.mlb_id_for_name(
+                "Luis Garcia Jr.",
+                teams=("Washington Nationals", "Narnia Snowmen")))
+
+    def test_team_hint_matching_no_namesake_is_none(self):
+        self.assertIsNone(
+            player_id_map.mlb_id_for_name("Luis Garcia Jr.",
+                                          teams="Atlanta Braves"))
+
+    def test_unknown_team_hint_on_ambiguous_is_none(self):
+        # A team with no SFBB code yields no want-set → stays ambiguous → None.
+        self.assertIsNone(
+            player_id_map.mlb_id_for_name("Luis Garcia Jr.",
+                                          teams="Houston Astros"))
+
+    def test_espn_path_stays_fail_closed_on_ambiguity(self):
+        # espn_id_for_name takes no team hint → ambiguous namesakes stay None.
+        self.assertIsNone(player_id_map.espn_id_for_name("Luis Garcia Jr."))
+
+
+class EnrichThreadingTests(_Backend, unittest.TestCase):
+    """The team hint is actually threaded by the write/backfill callers — not just
+    available on the resolver."""
+
+    def setUp(self):
+        super().setUp()
+        self._load(players=_SUFFIX_PLAYERS_CSV, teams=_SUFFIX_TEAMS_CSV)
+
+    def test_recalibration_enrich_uses_row_team(self):
+        import recalibration
+        row = {"sport_key": "baseball_mlb", "player": "Luis Garcia Jr.",
+               "team": "Washington Nationals"}
+        recalibration._enrich_prediction_ids(row)
+        self.assertEqual(row["player_mlb_id"], "671277")
+        self.assertEqual(row["player_key"], "mlb:671277")
+
+    def test_recalibration_enrich_without_team_stays_name_key(self):
+        import recalibration
+        row = {"sport_key": "baseball_mlb", "player": "Luis Garcia Jr.",
+               "team": None}
+        recalibration._enrich_prediction_ids(row)
+        self.assertIsNone(row["player_mlb_id"])
+        self.assertTrue(row["player_key"].startswith("name:"))
+
+    def test_warehouse_enrich_uses_home_away(self):
+        import warehouse
+        meta = {"home": "Washington Nationals", "away": "Atlanta Braves"}
+        lines = [{"bet_type": "player_prop", "player": "Luis Garcia Jr."}]
+        warehouse._enrich_ids("baseball_mlb", meta, lines)
+        self.assertEqual(lines[0]["player_mlb_id"], "671277")
+
+    def test_warehouse_enrich_both_teams_are_namesakes_is_none(self):
+        # The away team is the two-word "Chicago White Sox" — the tuple caller most
+        # exposed to the misbind. Both namesakes are in the game → fail open.
+        import warehouse
+        meta = {"home": "Washington Nationals", "away": "Chicago White Sox"}
+        lines = [{"bet_type": "player_prop", "player": "Luis Garcia Jr."}]
+        warehouse._enrich_ids("baseball_mlb", meta, lines)
+        self.assertIsNone(lines[0]["player_mlb_id"])
+
+    def test_backfill_mlb_id_threads_team(self):
+        import backfill_player_ids
+        self.assertEqual(
+            backfill_player_ids._mlb_id("Luis Garcia Jr.",
+                                        teams="Washington Nationals"), "671277")
+        self.assertIsNone(backfill_player_ids._mlb_id("Luis Garcia Jr."))
 
 
 if __name__ == "__main__":

@@ -347,10 +347,11 @@ def _enrich_ids(sport, meta, lines):
         import player_id_map
         meta["home_code"] = player_id_map.team_code_for_name(meta.get("home"))
         meta["away_code"] = player_id_map.team_code_for_name(meta.get("away"))
+        prop_teams = (meta.get("home"), meta.get("away"))
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
                 ln["player_mlb_id"] = player_id_map.mlb_id_for_name(
-                    ln.get("player"))
+                    ln.get("player"), teams=prop_teams)
             else:
                 ln["team_code"] = player_id_map.team_code_for_name(
                     ln.get("selection"))

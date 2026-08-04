@@ -606,7 +606,8 @@ def _enrich_prediction_ids(row):
     try:
         if (row.get("sport_key") or "").startswith("baseball"):
             import player_id_map
-            row["player_mlb_id"] = player_id_map.mlb_id_for_name(row.get("player"))
+            row["player_mlb_id"] = player_id_map.mlb_id_for_name(
+                row.get("player"), teams=row.get("team"))
             if row.get("team"):
                 row["team_code"] = player_id_map.team_code_for_name(row.get("team"))
     except Exception:                       # pragma: no cover - never break logging

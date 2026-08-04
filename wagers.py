@@ -124,7 +124,8 @@ def _enrich_ids(row):
         row["team_code"] = tc(row.get("team")) if row.get("team") else None
         row["opponent_code"] = tc(row.get("opponent")) if row.get("opponent") else None
         if row.get("player"):
-            row["player_mlb_id"] = player_id_map.mlb_id_for_name(row.get("player"))
+            row["player_mlb_id"] = player_id_map.mlb_id_for_name(
+                row.get("player"), teams=row.get("team"))
     except Exception:                       # pragma: no cover - never break submit
         pass
     return row

@@ -1205,18 +1205,20 @@ def _resolve_is_pitcher(mid, season, row):
     return "P" in [p.strip() for p in allpos.split("/")]
 
 
-def find_player_id(name, season):
+def find_player_id(name, season, teams=None):
     """(mlbam_id, is_pitcher) for a UNIQUE exact full-name match, else None.
 
     Resolves via the SFBB player id-map FIRST — it disambiguates namesakes the
-    statsapi unique-exact match drops (preferring the single active player) and
-    folds accents — then falls back to the statsapi season roster's unique-exact
-    name match. is_pitcher stays statsapi-authoritative. The forecast row carries
-    no team, so a STILL-ambiguous name (two active namesakes) is skipped rather
-    than risk binding a prop to the wrong player and poisoning the fit."""
+    statsapi unique-exact match drops (preferring the single active player), folds
+    accents, and strips generational suffixes ("Jazz Chisholm Jr." → the map's
+    "Jazz Chisholm") — then falls back to the statsapi season roster's unique-exact
+    name match. is_pitcher stays statsapi-authoritative. ``teams`` (the game's
+    home/away, when the caller has them) breaks a genuine namesake tie by the
+    player's team; without it a STILL-ambiguous name is skipped rather than risk
+    binding a prop to the wrong player and poisoning the fit."""
     pim = _player_id_map()
     if pim is not None:
-        mid = pim.mlb_id_for_name(name)
+        mid = pim.mlb_id_for_name(name, teams=teams)
         if mid:
             return (mid, _resolve_is_pitcher(mid, season, pim.get_row(name)))
     matches = _player_index(season).get(_norm(name))

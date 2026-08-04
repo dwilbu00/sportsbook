@@ -489,25 +489,100 @@ def _team_idx():
 # ──────────────────────────────────────────────────────────────────────────────
 # Fail-open lookups (return None/{} on miss, SQL-off, or error)
 # ──────────────────────────────────────────────────────────────────────────────
+# Generational suffixes the odds feed keeps ("Ronald Acuna Jr.") but SFBB's stored
+# names drop ("Ronald Acuna"). Stripped only as a FALLBACK when the exact normalized
+# name misses, so a name that already resolves is never broadened.
+_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
+
+def _suffix_stripped_norm(name):
+    """normalize_name with any trailing generational suffix tokens removed, or ""."""
+    toks = db_store.normalize_name(name).split()
+    while toks and toks[-1] in _NAME_SUFFIXES:
+        toks.pop()
+    return " ".join(toks)
+
+
 def _rows_for_name(name):
-    idx = _player_idx()
-    return idx["by_name"].get(db_store.normalize_name(name)) or []
+    """Map rows for a name: exact normalized match first, then a suffix-stripped
+    fallback (so an odds "Jazz Chisholm Jr." reaches the map's "Jazz Chisholm").
+    The fallback runs ONLY on an exact miss, so it can never broaden a name that
+    already resolves — nor collide it with a distinct suffixed namesake."""
+    by_name = _player_idx()["by_name"]
+    rows = by_name.get(db_store.normalize_name(name))
+    if rows:
+        return rows
+    stripped = _suffix_stripped_norm(name)
+    if stripped:
+        return by_name.get(stripped) or []
+    return []
 
 
-def _unique_id(rows, field):
+def _iter_team_hints(teams):
+    """Yield the individual team strings in a hint that may be a single str or an
+    iterable of str (e.g. the odds event's (home, away))."""
+    if not teams:
+        return
+    if isinstance(teams, str):
+        yield teams
+        return
+    try:
+        for t in teams:
+            if t:
+                yield t
+    except TypeError:
+        yield teams
+
+
+def _unique_id(rows, field, teams=None):
     """The single distinct non-empty ``field`` across ``rows`` (preferring active
     rows), or None when zero or ambiguous — mirrors find_player_id's refusal to
     bind a non-unique name. Two rows for one two-way player (same id) still resolve;
-    two genuine namesakes (two ids) do not."""
+    two genuine namesakes (two ids) do not.
+
+    ``teams`` is an optional team hint (a team name/abbr, or an iterable such as the
+    odds event's home/away) used ONLY to break a genuine namesake tie: when the
+    active pool still holds >1 distinct id, candidates are narrowed to those whose
+    SFBB team matches one of the hinted teams (compared as canonical codes). The
+    tie is broken ONLY when EVERY hinted team canonicalizes: if any hint fails to
+    resolve (e.g. a name the team map doesn't know), the bet player could be on that
+    unresolved team, so we fail open rather than narrow onto the survivors. A
+    UNIQUE match is returned as-is and is NEVER filtered by team — the map's team is
+    a single, sometimes-stale snapshot, so applying it to an already-unique name
+    could wrongly reject a valid recovery (e.g. a just-traded star). dk_name is
+    deliberately NOT used to break ties: among namesakes only the DK-listed one
+    carries a dk_name, but that is not necessarily the player being bet (a namesake
+    reliever can carry the dk_name while the bet is on the infielder), so it would
+    misbind."""
     active = [r for r in rows if r.get("active")]
     pool = active or rows
     ids = {r.get(field) for r in pool if r.get(field)}
-    return next(iter(ids)) if len(ids) == 1 else None
+    if len(ids) == 1:
+        return next(iter(ids))
+    if len(ids) > 1 and teams:
+        hints = list(_iter_team_hints(teams))
+        codes = [team_code_for_name(t) for t in hints]
+        # Only narrow when EVERY hinted team canonicalizes. A hint set is the full
+        # context (a single team, or the game's home+away); if any member fails to
+        # resolve, a namesake could belong to THAT unresolved team, so narrowing on
+        # the remainder could bind the wrong player — fail open instead. (A bare
+        # ``want`` set that just dropped the unresolved codes would collapse onto
+        # the surviving side and confidently mis-bind.)
+        if hints and all(codes):
+            want = set(codes)
+            narrowed = [r for r in pool
+                        if team_code_for_name(r.get("team")) in want]
+            nids = {r.get(field) for r in narrowed if r.get(field)}
+            if len(nids) == 1:
+                return next(iter(nids))
+    return None
 
 
-def mlb_id_for_name(name):
-    """MLBAM id for a name, or None if unknown/ambiguous. Fail-open."""
-    return _unique_id(_rows_for_name(name), "mlb_id")
+def mlb_id_for_name(name, teams=None):
+    """MLBAM id for a name, or None if unknown/ambiguous. ``teams`` (a team
+    name/abbr or an iterable like the odds home/away) breaks a namesake tie by the
+    player's team; see _unique_id. Fail-open."""
+    return _unique_id(_rows_for_name(name), "mlb_id", teams=teams)
 
 
 def espn_id_for_name(name):
@@ -552,9 +627,9 @@ def team_code_for_abbr(abbr):
 
 def team_code_for_name(name):
     """Canonical SFBBTEAM code for a team name/abbr (odds feed or box score), or
-    None. Tries, in order: exact abbr → full nickname/name_norm → last word
-    (city+nickname → nickname). Fail-open; a miss lets the caller keep its own
-    normalization + alias fallback."""
+    None. Tries, in order: exact abbr → full nickname/name_norm → trailing
+    nickname (city+nickname → nickname). Fail-open; a miss lets the caller keep
+    its own normalization + alias fallback."""
     if not name:
         return None
     idx = _team_idx()
@@ -567,8 +642,16 @@ def team_code_for_name(name):
         return None
     if norm in idx["by_name"]:
         return idx["by_name"][norm]
-    last = norm.rsplit(" ", 1)[-1]
-    return idx["by_name"].get(last)
+    # City + nickname → nickname. by_name is keyed on the bare nickname, which can
+    # be TWO words (Red Sox / White Sox / Blue Jays), so try the last two words
+    # before the last one — the bare last word ("sox"/"jays") is not a key, and a
+    # last-word-only fallback silently fails for exactly those three teams.
+    parts = norm.split()
+    if len(parts) >= 3:
+        code = idx["by_name"].get(" ".join(parts[-2:]))
+        if code:
+            return code
+    return idx["by_name"].get(parts[-1]) if parts else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -44,9 +44,9 @@ def _is_baseball(sport):
     return (sport or "").startswith("baseball")
 
 
-def _mlb_id(name):
+def _mlb_id(name, teams=None):
     try:
-        return player_id_map.mlb_id_for_name(name)
+        return player_id_map.mlb_id_for_name(name, teams=teams)
     except Exception:
         return None
 
@@ -71,7 +71,7 @@ def _backfill_predictions(conn, dry_run):
     # 1. Enrich every row's id/code/player_key columns in place (MLB-gated).
     for r in rows:
         if _is_baseball(r.get("sport_key")):
-            r["player_mlb_id"] = _mlb_id(r.get("player"))
+            r["player_mlb_id"] = _mlb_id(r.get("player"), teams=r.get("team"))
             r["team_code"] = _team_code(r.get("team"))
         else:
             r.setdefault("player_mlb_id", None)
@@ -139,7 +139,8 @@ def _backfill_team_codes(conn, table, dry_run, player_col=None):
             "opponent_code": db_store._s(_team_code(r.get("opponent"))),
         }
         if player_col and r.get(player_col):
-            values["player_mlb_id"] = db_store._s(_mlb_id(r.get(player_col)))
+            values["player_mlb_id"] = db_store._s(
+                _mlb_id(r.get(player_col), teams=r.get("team")))
         if not dry_run:
             conn.execute(update(t).where(t.c.id == r["id"]).values(**values))
         changed += 1
@@ -153,12 +154,14 @@ def _backfill_odds(conn, dry_run):
     line = db_store.odds_line
     snaps = [dict(m._mapping) for m in conn.execute(select(snap)).all()]
     sport_by_id, baseball_ids = {}, set()
+    snap_teams = {}                       # snapshot id -> (home, away) for prop tiebreak
     snap_changed = 0
     for r in snaps:
         sport_by_id[r["id"]] = r.get("sport")
         if not _is_baseball(r.get("sport")):
             continue
         baseball_ids.add(r["id"])
+        snap_teams[r["id"]] = (r.get("home"), r.get("away"))
         values = {"home_code": db_store._s(_team_code(r.get("home"))),
                   "away_code": db_store._s(_team_code(r.get("away")))}
         if not dry_run:
@@ -171,7 +174,8 @@ def _backfill_odds(conn, dry_run):
         if r.get("snapshot_id") not in baseball_ids:
             continue
         if (r.get("bet_type") or "") == "player_prop":
-            values = {"player_mlb_id": db_store._s(_mlb_id(r.get("player")))}
+            values = {"player_mlb_id": db_store._s(
+                _mlb_id(r.get("player"), teams=snap_teams.get(r.get("snapshot_id"))))}
         else:
             values = {"team_code": db_store._s(_team_code(r.get("selection")))}
         if not dry_run:

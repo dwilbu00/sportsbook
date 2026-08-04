@@ -457,7 +457,7 @@ def _dist_p_over(r_emp, expected_ab, xba, hh, brl, rate_mult, exposure_mult,
 
 def _distributional_over_rate(prop_key, line, values, at_bats, weights,
                               rate_mult, exposure_mult, player_name,
-                              commence_iso, cfg, xstats_strength):
+                              commence_iso, cfg, xstats_strength, teams=None):
     """P(over) for batter_hits as a binomial survival, or (None, None) to fall
     back to the empirical over-rate (§2.4b-2).
 
@@ -498,7 +498,7 @@ def _distributional_over_rate(prop_key, line, values, at_bats, weights,
         import statcast_asof
         season = int(str(commence_iso)[:4]) if commence_iso else None
         if season:
-            pid_info = mlb_starters.find_player_id(player_name, season)
+            pid_info = mlb_starters.find_player_id(player_name, season, teams=teams)
             if pid_info and pid_info[0] and not pid_info[1]:   # batter only
                 rates = statcast_asof.get_rates(pid_info[0], season, "bat")
                 if rates and (rates.get("n_ab") or 0) >= XSTATS_MIN_N:
@@ -1121,7 +1121,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     import mlb_starters
                     import statcast_asof
                     season = int(str(commence_iso)[:4])
-                    pid_info = mlb_starters.find_player_id(player_name, season)
+                    pid_info = mlb_starters.find_player_id(
+                        player_name, season,
+                        teams=(home_team_name, away_team_name))
                     if pid_info and pid_info[0] and not pid_info[1]:  # batter only
                         xba, n_ab = statcast_asof.get_batter_xba(pid_info[0], season)
                         ab_valid = [(ab, w) for ab, w in zip(at_bats, weights)
@@ -1249,7 +1251,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 p_dist, dist_meta = _distributional_over_rate(
                     prop_key, line, values, at_bats, weights,
                     rate_mult, lineup_mult, player_name, commence_iso,
-                    method_cfg, dist_strength)
+                    method_cfg, dist_strength,
+                    teams=(home_team_name, away_team_name))
                 if p_dist is not None:
                     over_rate = max(0.0, min(1.0, p_dist))
                     calibration_meta = {
