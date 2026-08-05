@@ -452,6 +452,58 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     print(f"  Matched {len(enriched):,} book lines to actual results "
           f"(one per player-prop-game); dropped {skipped_no_player:,} "
           f"(player not found) and {skipped_no_game:,} (no matching game/stat).")
+    _attach_gamecontext(enriched, espn_sport)
+    return enriched
+
+
+def _attach_gamecontext(enriched, espn_sport):
+    """Attach each obs's own-side GameContext gc_factor forms (roadmap §3.1).
+
+    Groups obs by (home_team, away_team, game_date), builds the shared, cached,
+    leakage-safe GameContext once per game (mlb_starters.build_game_context —
+    run inputs come ONLY from the as-of get_expected_runs_team_factors, never a
+    season-to-date source), and writes ``obs["gc_factor"] = {full, own, opp}``
+    for the batter's OWN side (test_game.is_home). MLB only.
+
+    Fail-open, never raises: rows whose home_team/away_team is None (prediction-
+    log-sourced, no game frame) or whose context is incomplete are left WITHOUT
+    gc_factor, so the gamecontext feature no-ops to 1.0 and the obs stays in the
+    sample at baseline (not dropped). A GameContext failure must never break the
+    refit. Runs once per join (diagnose_features reuses the enriched list across
+    all feature strengths), so the cost is one as-of fetch per distinct game-date,
+    memoized in mlb_starters._GC_CACHE."""
+    if espn_sport != "baseball":
+        return enriched
+    try:
+        import mlb_starters
+    except Exception:
+        return enriched
+    team_index_by_season = {}
+    for obs in enriched:
+        home = obs.get("home_team")
+        away = obs.get("away_team")
+        gd = obs.get("game_date")
+        if not home or not away or not gd:
+            continue                      # fail-open: no game frame -> gc absent
+        try:
+            season = int(str(gd)[:4])
+        except (TypeError, ValueError):
+            continue
+        if season not in team_index_by_season:
+            try:
+                team_index_by_season[season] = mlb_starters.get_team_index(season)
+            except Exception:
+                team_index_by_season[season] = None
+        try:
+            gc = mlb_starters.build_game_context(
+                home, away, gd, season,
+                team_index=team_index_by_season[season])
+        except Exception:
+            continue
+        if not gc or not gc.get("complete"):
+            continue
+        side = "home" if obs.get("test_game", {}).get("is_home") else "away"
+        obs["gc_factor"] = gc["gc_factor"][side]
     return enriched
 
 
@@ -600,7 +652,8 @@ def project_and_empirical(obs, params, sport_key,
     if feat_strengths:
         feat_mult = prop_features.projection_multiplier(
             obs.get("prop_key"), feat_strengths,
-            [g.get("game_date") for g in prior_games], obs.get("game_date"))
+            [g.get("game_date") for g in prior_games], obs.get("game_date"),
+            gamecontext_factors=obs.get("gc_factor"))
         if feat_mult and feat_mult != 1.0:
             projected *= feat_mult
             line_eff = line / feat_mult

@@ -96,6 +96,43 @@ def _rest_fn(ctx, strength):
                            ctx.get("graded_date"), strength)
 
 
+# ── gamecontext feature (roadmap §3.1) ───────────────────────────────────────
+# A per-batter MEAN multiplier from the shared, cached, leakage-safe GameContext
+# (mlb_starters.build_game_context): the batter's own team run-scoring environment
+# (own offense vs the OPPOSING bullpen; the opposing STARTER is pinned neutral,
+# owned by matchup_mult) mapped to a hits nudge. The raw gc_factor is already
+# bounded to +/-GC_RUN_CAP and computed offline/leakage-safe upstream; here it is
+# only strength-scaled and re-clamped, exactly mirroring rest's shape. Registered
+# in THREE ablation forms (full / own-offense-only / opposing-bullpen-only) so a
+# single free --feature-diag prints all three verdicts, each measured MARGINAL
+# over the already-SHIPPED opp_defense (which the gate's base_params carry), to
+# resolve empirically which term (if any) clears the gate. Whitelisted to
+# batter_hits; a hard no-op everywhere else and whenever the factor is absent
+# (incomplete context / None-team obs / non-MLB) -> strength-0 byte parity.
+GC_FEAT_CAP = 0.08   # hard bound on the gamecontext multiplier: [1-CAP, 1+CAP]
+
+
+def _gamecontext_fn(form):
+    """Build the registry fn for gamecontext ablation ``form`` (full/own/opp).
+
+    Reads the batter's own-side gc_factor forms threaded in as
+    ``ctx["gamecontext_factors"]`` (a {full, own, opp} dict, or None). Returns
+    1.0 (no-op) when strength<=0 or the factor is absent, so both strength-0 and
+    missing context reproduce production bit-for-bit."""
+    def fn(ctx, strength):
+        if not strength or strength <= 0:
+            return 1.0
+        factors = ctx.get("gamecontext_factors")
+        if not factors:
+            return 1.0
+        gc = factors.get(form)
+        if not gc:
+            return 1.0
+        mult = 1.0 + strength * (gc - 1.0)
+        return max(1.0 - GC_FEAT_CAP, min(1.0 + GC_FEAT_CAP, mult))
+    return fn
+
+
 # ── registry ────────────────────────────────────────────────────────────────
 # Each entry is plain data. ``props`` restricts where the feature applies (None =
 # all props); a feature is a hard no-op elsewhere. ``strengths`` is the sweep /
@@ -108,6 +145,27 @@ FEATURE_REGISTRY = [
         "strengths": (0.0, 0.5, 1.0),
         "runtime_knob": "rest_strength",
         "fn": _rest_fn,
+    },
+    {
+        "name": "gamecontext",              # own offense AND opposing bullpen
+        "props": frozenset({"batter_hits"}),
+        "strengths": (0.0, 0.5, 1.0),
+        "runtime_knob": "gamecontext_strength",
+        "fn": _gamecontext_fn("full"),
+    },
+    {
+        "name": "gamecontext_own",          # ablation: own offense only
+        "props": frozenset({"batter_hits"}),
+        "strengths": (0.0, 0.5, 1.0),
+        "runtime_knob": "gamecontext_own_strength",
+        "fn": _gamecontext_fn("own"),
+    },
+    {
+        "name": "gamecontext_opp",          # ablation: opposing bullpen only
+        "props": frozenset({"batter_hits"}),
+        "strengths": (0.0, 0.5, 1.0),
+        "runtime_knob": "gamecontext_opp_strength",
+        "fn": _gamecontext_fn("opp"),
     },
 ]
 
@@ -142,14 +200,19 @@ def strengths_from_params(params):
 
 
 def projection_multiplier(prop_key, feature_strengths, prior_game_dates,
-                          graded_date):
+                          graded_date, gamecontext_factors=None):
     """Combined projection multiplier over all registered features that apply to
     ``prop_key``, at the strengths in ``feature_strengths`` ({name: strength}).
+
+    ``gamecontext_factors`` — the batter's own-side {full, own, opp} gc_factor
+    dict for this game (from mlb_starters.build_game_context), or None; threaded
+    to the gamecontext feature fns. Absent -> those fns no-op to 1.0.
 
     Returns 1.0 when nothing applies — so an all-off / empty map is a no-op."""
     if not feature_strengths:
         return 1.0
-    ctx = {"prior_game_dates": prior_game_dates, "graded_date": graded_date}
+    ctx = {"prior_game_dates": prior_game_dates, "graded_date": graded_date,
+           "gamecontext_factors": gamecontext_factors}
     mult = 1.0
     for name, strength in feature_strengths.items():
         f = _BY_NAME.get(name)

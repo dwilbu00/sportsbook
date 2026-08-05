@@ -13,7 +13,9 @@ import math
 import unittest
 from unittest.mock import MagicMock, patch
 
+import book_line_calibration as blc
 import mlb_starters
+import prop_features as pf
 
 
 # ── byte-parity reference recursions (mirror the documented _run_pmf formula) ──
@@ -248,6 +250,134 @@ class GamecontextFactorTest(unittest.TestCase):
         with patch.object(mlb_starters, "get_team_index", return_value=None):
             self.assertEqual(
                 mlb_starters.gamecontext_factor("x", "y", "2024-07-01", 2024), 1.0)
+
+
+# ── Phase 2: prop_features gamecontext registry + projection threading ────────
+class GamecontextRegistryTest(unittest.TestCase):
+    FACTORS = {"full": 1.06, "own": 1.04, "opp": 0.97}
+
+    def test_applies_only_to_batter_hits(self):
+        for name in ("gamecontext", "gamecontext_own", "gamecontext_opp"):
+            self.assertTrue(pf.feature_applies(name, "batter_hits"))
+            for pk in ("pitcher_outs", "pitcher_strikeouts",
+                       "pitcher_earned_runs", "player_points"):
+                self.assertFalse(pf.feature_applies(name, pk))
+
+    def test_strengths_from_params_reads_gc_knobs(self):
+        self.assertEqual(
+            pf.strengths_from_params({"gamecontext_strength": 1.0}),
+            {"gamecontext": 1.0})
+        self.assertEqual(
+            pf.strengths_from_params({"gamecontext_own_strength": 0.5}),
+            {"gamecontext_own": 0.5})
+        self.assertEqual(
+            pf.strengths_from_params({"gamecontext_opp_strength": 0.0}), {})
+
+    def test_each_form_reads_its_own_key_and_scales(self):
+        for name, key in (("gamecontext", "full"),
+                          ("gamecontext_own", "own"),
+                          ("gamecontext_opp", "opp")):
+            gc = self.FACTORS[key]
+            for s in (0.5, 1.0):
+                m = pf.projection_multiplier(
+                    "batter_hits", {name: s}, [], "2025-06-01",
+                    gamecontext_factors=self.FACTORS)
+                self.assertAlmostEqual(m, 1.0 + s * (gc - 1.0), places=12)
+
+    def test_strength_zero_and_absent_factors_are_noop(self):
+        # strength 0 -> production; missing form / None factors -> 1.0.
+        self.assertEqual(pf.projection_multiplier(
+            "batter_hits", {"gamecontext": 0.0}, [], "2025-06-01",
+            gamecontext_factors=self.FACTORS), 1.0)
+        self.assertEqual(pf.projection_multiplier(
+            "batter_hits", {"gamecontext": 1.0}, [], "2025-06-01",
+            gamecontext_factors=None), 1.0)
+        self.assertEqual(pf.projection_multiplier(
+            "batter_hits", {"gamecontext": 1.0}, [], "2025-06-01",
+            gamecontext_factors={"own": 1.05}), 1.0)  # no "full" key
+
+    def test_cap_bounds(self):
+        blown = {"full": 5.0}  # far past the cap
+        m = pf.projection_multiplier(
+            "batter_hits", {"gamecontext": 1.0}, [], "2025-06-01",
+            gamecontext_factors=blown)
+        self.assertAlmostEqual(m, 1.0 + pf.GC_FEAT_CAP, places=12)
+
+    def test_excluded_prop_is_noop(self):
+        self.assertEqual(pf.projection_multiplier(
+            "pitcher_outs", {"gamecontext": 1.0}, [], "2025-06-01",
+            gamecontext_factors=self.FACTORS), 1.0)
+
+    def test_legacy_4arg_call_still_works(self):
+        # The added kwarg is optional -> old callers (rest) are byte-identical.
+        dates = ["2025-05-20", "2025-05-21", "2025-05-22", "2025-05-23",
+                 "2025-05-24"]
+        self.assertEqual(
+            pf.projection_multiplier("batter_hits", {"rest": 1.0}, dates,
+                                     "2025-05-30"),
+            pf.projection_multiplier("batter_hits", {"rest": 1.0}, dates,
+                                     "2025-05-30", gamecontext_factors=None))
+
+
+# ── Phase 2: _attach_gamecontext fail-open plumbing ───────────────────────────
+def _gc_ret(complete=True):
+    forms = {"full": 1.05, "own": 1.03, "opp": 0.98}
+    return {"complete": complete,
+            "gc_factor": {"home": dict(forms),
+                          "away": {"full": 0.96, "own": 0.97, "opp": 1.01}}}
+
+
+class AttachGamecontextTest(unittest.TestCase):
+    def _enriched(self, **over):
+        row = {"prop_key": "batter_hits", "home_team": "HomeTown",
+               "away_team": "AwayTown", "game_date": "2024-07-01",
+               "test_game": {"is_home": True}}
+        row.update(over)
+        return [row]
+
+    def test_complete_attaches_own_side(self):
+        with patch.object(mlb_starters, "get_team_index", return_value={"x": 1}), \
+             patch.object(mlb_starters, "build_game_context",
+                          return_value=_gc_ret(True)):
+            enr = self._enriched(**{"test_game": {"is_home": True}})
+            blc._attach_gamecontext(enr, "baseball")
+            self.assertEqual(enr[0]["gc_factor"]["full"], 1.05)   # home side
+            enr = self._enriched(**{"test_game": {"is_home": False}})
+            blc._attach_gamecontext(enr, "baseball")
+            self.assertEqual(enr[0]["gc_factor"]["full"], 0.96)   # away side
+
+    def test_none_teams_fail_open(self):
+        with patch.object(mlb_starters, "get_team_index", return_value={"x": 1}), \
+             patch.object(mlb_starters, "build_game_context",
+                          return_value=_gc_ret(True)) as bgc:
+            enr = self._enriched(home_team=None, away_team=None)
+            blc._attach_gamecontext(enr, "baseball")
+            self.assertNotIn("gc_factor", enr[0])
+            bgc.assert_not_called()
+
+    def test_incomplete_context_not_attached(self):
+        with patch.object(mlb_starters, "get_team_index", return_value={"x": 1}), \
+             patch.object(mlb_starters, "build_game_context",
+                          return_value=_gc_ret(False)):
+            enr = self._enriched()
+            blc._attach_gamecontext(enr, "baseball")
+            self.assertNotIn("gc_factor", enr[0])
+
+    def test_non_baseball_is_noop(self):
+        with patch.object(mlb_starters, "build_game_context",
+                          return_value=_gc_ret(True)) as bgc:
+            enr = self._enriched()
+            blc._attach_gamecontext(enr, "basketball")
+            self.assertNotIn("gc_factor", enr[0])
+            bgc.assert_not_called()
+
+    def test_build_exception_fails_open(self):
+        with patch.object(mlb_starters, "get_team_index", return_value={"x": 1}), \
+             patch.object(mlb_starters, "build_game_context",
+                          side_effect=RuntimeError("boom")):
+            enr = self._enriched()
+            blc._attach_gamecontext(enr, "baseball")  # must not raise
+            self.assertNotIn("gc_factor", enr[0])
 
 
 if __name__ == "__main__":
