@@ -1,5 +1,6 @@
 """Tests for the DraftKings closing-line CLV backfill (backfill_dk_clv.py) and
-the odds_client.dk_prop_lines per-line DK extractor.
+the odds_client DK extractors (dk_prop_lines for props, dk_game_lines for the
+featured team markets).
 
 Run: PYTHONIOENCODING=utf-8 python test_backfill_dk_clv.py
 """
@@ -12,7 +13,7 @@ from unittest.mock import patch, Mock
 import backfill_dk_clv as bk
 import db_store
 import wagers
-from odds_client import dk_prop_lines, american_to_implied_prob
+from odds_client import dk_prop_lines, dk_game_lines, american_to_implied_prob
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -77,6 +78,67 @@ class DkPropLinesTests(unittest.TestCase):
         self.assertEqual(dk_prop_lines({}, "batter_hits"), [])
 
 
+# ── dk_game_lines (odds_client, team markets) ───────────────────────────────
+
+def _team_oc(name, price, point=None):
+    oc = {"name": name, "price": price}
+    if point is not None:
+        oc["point"] = point
+    return oc
+
+
+DK_TEAM_BOOK = {
+    "key": "draftkings", "title": "DraftKings",
+    "markets": [
+        _mkt("h2h", [_team_oc("Home Team", -130), _team_oc("Away Team", 110)]),
+        _mkt("spreads", [_team_oc("Home Team", -105, -1.5),
+                         _team_oc("Away Team", -115, 1.5)]),
+        _mkt("totals", [_team_oc("Over", -110, 8.5),
+                        _team_oc("Under", -105, 8.5)]),
+    ],
+}
+FD_TEAM_BOOK = {  # a non-DK book that must never leak into dk_game_lines
+    "key": "fanduel", "title": "FanDuel",
+    "markets": [_mkt("h2h", [_team_oc("Home Team", -150),
+                             _team_oc("Away Team", 130)])],
+}
+
+
+class DkGameLinesTests(unittest.TestCase):
+    def test_splits_all_three_markets(self):
+        out = dk_game_lines(_game([DK_TEAM_BOOK]))
+        self.assertEqual(out["moneyline"],
+                         [{"team": "Home Team", "price": -130},
+                          {"team": "Away Team", "price": 110}])
+        self.assertEqual(out["spreads"],
+                         [{"team": "Home Team", "point": -1.5, "price": -105},
+                          {"team": "Away Team", "point": 1.5, "price": -115}])
+        self.assertEqual(out["totals"],
+                         [{"side": "Over", "point": 8.5, "price": -110},
+                          {"side": "Under", "point": 8.5, "price": -105}])
+
+    def test_ignores_non_dk_books(self):
+        # FanDuel posts a different moneyline — dk_game_lines returns only DK's.
+        out = dk_game_lines(_game([FD_TEAM_BOOK, DK_TEAM_BOOK]))
+        self.assertEqual([o["price"] for o in out["moneyline"]], [-130, 110])
+
+    def test_spread_without_point_dropped(self):
+        dk = {"key": "draftkings", "title": "DraftKings", "markets": [
+            _mkt("spreads", [{"name": "Home Team", "price": -110}])]}
+        self.assertEqual(dk_game_lines(_game([dk]))["spreads"], [])
+
+    def test_total_non_over_under_dropped(self):
+        dk = {"key": "draftkings", "title": "DraftKings", "markets": [
+            _mkt("totals", [{"name": "Yes", "point": 8.5, "price": -110}])]}
+        self.assertEqual(dk_game_lines(_game([dk]))["totals"], [])
+
+    def test_absent_book_is_empty(self):
+        self.assertEqual(dk_game_lines(_game([FD_TEAM_BOOK])),
+                         {"moneyline": [], "spreads": [], "totals": []})
+        self.assertEqual(dk_game_lines({}),
+                         {"moneyline": [], "spreads": [], "totals": []})
+
+
 # ── dk_close_for_wager (selection + CLV math) ───────────────────────────────
 
 class DkCloseForWagerTests(unittest.TestCase):
@@ -132,6 +194,79 @@ class DkCloseForWagerTests(unittest.TestCase):
         self.assertEqual((price, line), (-115, 1.5))
 
 
+# ── dk_close_for_team_wager (team-market selection + CLV math) ───────────────
+
+class DkCloseForTeamWagerTests(unittest.TestCase):
+    def _lines(self):
+        return {
+            "moneyline": [{"team": "Home Team", "price": -130},
+                          {"team": "Away Team", "price": 110}],
+            "spreads": [{"team": "Home Team", "point": -1.5, "price": -105},
+                        {"team": "Away Team", "point": 1.5, "price": -115}],
+            "totals": [{"side": "Over", "point": 8.5, "price": -110},
+                       {"side": "Under", "point": 8.5, "price": -105}],
+        }
+
+    def test_moneyline_matches_team_no_line(self):
+        row = {"bet_type": "moneyline", "team": "Home Team", "line": None,
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual((price, line), (-130, None))  # moneyline has no line
+        expect = round((american_to_implied_prob(-130)
+                        - american_to_implied_prob(-110)) * 100.0, 2)
+        self.assertEqual(clv, expect)
+
+    def test_moneyline_folds_name_case_and_accents(self):
+        row = {"bet_type": "moneyline", "team": "home team",
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual(price, -130)
+
+    def test_moneyline_team_absent_returns_none(self):
+        row = {"bet_type": "moneyline", "team": "Nobody FC",
+               "executed_price": -110}
+        self.assertIsNone(bk.dk_close_for_team_wager(self._lines(), row))
+
+    def test_spread_exact_point_matches(self):
+        row = {"bet_type": "spread", "team": "Away Team", "line": 1.5,
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual((price, line), (-115, 1.5))
+
+    def test_spread_line_moved_returns_none(self):
+        # DK's featured close carries Home at -1.5, not the -2.5 that was bet.
+        row = {"bet_type": "spread", "team": "Home Team", "line": -2.5,
+               "executed_price": -110}
+        self.assertIsNone(bk.dk_close_for_team_wager(self._lines(), row))
+
+    def test_total_over_exact_point(self):
+        row = {"bet_type": "total", "direction": "OVER", "line": 8.5,
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual((price, line), (-110, 8.5))
+
+    def test_total_under_uses_direction(self):
+        row = {"bet_type": "total", "direction": "UNDER", "line": 8.5,
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual((price, line), (-105, 8.5))
+
+    def test_total_falls_back_to_side_when_no_direction(self):
+        row = {"bet_type": "total", "side": "under", "line": 8.5,
+               "executed_price": -110}
+        price, line, clv = bk.dk_close_for_team_wager(self._lines(), row)
+        self.assertEqual(price, -105)
+
+    def test_total_line_moved_returns_none(self):
+        row = {"bet_type": "total", "direction": "OVER", "line": 9.5,
+               "executed_price": -110}
+        self.assertIsNone(bk.dk_close_for_team_wager(self._lines(), row))
+
+    def test_unknown_bet_type_returns_none(self):
+        row = {"bet_type": "parlay", "executed_price": -110}
+        self.assertIsNone(bk.dk_close_for_team_wager(self._lines(), row))
+
+
 # ── tiny helpers ────────────────────────────────────────────────────────────
 
 class HelperTests(unittest.TestCase):
@@ -146,6 +281,17 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(bk._lines_equal(0.5, 1.5))
         self.assertFalse(bk._lines_equal(None, 1.5))
 
+    def test_market_key(self):
+        self.assertEqual(bk._market_key({"bet_type": "moneyline"}), "h2h")
+        self.assertEqual(bk._market_key({"bet_type": "spread"}), "spreads")
+        self.assertEqual(bk._market_key({"bet_type": "total"}), "totals")
+        self.assertEqual(
+            bk._market_key({"bet_type": "player_prop",
+                            "prop_key": "batter_hits"}), "batter_hits")
+        # A prop missing its prop_key can't be fetched -> None (skipped upstream).
+        self.assertIsNone(bk._market_key({"bet_type": "player_prop"}))
+        self.assertIsNone(bk._market_key({"bet_type": "parlay"}))
+
 
 # ── CLI main() end-to-end (no network) ──────────────────────────────────────
 
@@ -155,6 +301,36 @@ def _wager(wid, eid, prop, player, direction, line, commence):
             "player": player, "direction": direction, "line": line,
             "executed_price": -110, "commence_time": commence,
             "close_price": None}
+
+
+def _ml_wager(wid, eid, team, commence):
+    return {"wager_id": wid, "bet_type": "moneyline",
+            "sport_key": "baseball_mlb", "event_id": eid, "team": team,
+            "line": None, "point": None, "executed_price": -110,
+            "commence_time": commence, "close_price": None}
+
+
+def _spread_wager(wid, eid, team, line, commence):
+    return {"wager_id": wid, "bet_type": "spread", "sport_key": "baseball_mlb",
+            "event_id": eid, "team": team, "line": line, "point": line,
+            "executed_price": -110, "commence_time": commence,
+            "close_price": None}
+
+
+def _total_wager(wid, eid, direction, line, commence):
+    return {"wager_id": wid, "bet_type": "total", "sport_key": "baseball_mlb",
+            "event_id": eid, "team": "Both teams", "direction": direction,
+            "side": direction.lower(), "line": line, "point": line,
+            "executed_price": -110, "commence_time": commence,
+            "close_price": None}
+
+
+# A DraftKings book carrying BOTH a prop market and the featured team markets,
+# so a mixed prop+team event resolves from one payload.
+DK_BOOK_ALL = {
+    "key": "draftkings", "title": "DraftKings",
+    "markets": DK_BOOK["markets"] + DK_TEAM_BOOK["markets"],
+}
 
 
 # All commence times are safely in the past so _commence_passed is True.
@@ -332,6 +508,46 @@ class MainTests(unittest.TestCase):
         out = self._run(["backfill_dk_clv.py", "--sport", "mlb"])
         self.assertEqual(self.calls, [])
         self.assertIn("Nothing to do", out)
+
+    def test_prop_and_team_share_one_event_call(self):
+        # A prop + moneyline + total on the SAME event -> ONE fetch whose market
+        # union spans all three families, and each family gets its DK close.
+        self.rows = [
+            _wager("w1", "E1", "batter_hits", "Bat", "OVER", 1.5, _C1),
+            _ml_wager("w2", "E1", "Home Team", _C1),
+            _total_wager("w3", "E1", "OVER", 8.5, _C1),
+        ]
+        self.data = {"E1": _game([DK_BOOK_ALL], "E1")}
+        self._run(["backfill_dk_clv.py", "--sport", "mlb"])
+        by_eid = {c["eid"]: c for c in self.calls}
+        self.assertEqual(set(by_eid), {"E1"})
+        # union of the three wagers' market keys (sorted), not the whole book.
+        self.assertEqual(by_eid["E1"]["markets"], "batter_hits,h2h,totals")
+        filled = self.writer.call_args[0][0]
+        self.assertEqual(filled["w1"]["close_price"], -115)       # prop
+        self.assertEqual((filled["w2"]["close_price"],
+                          filled["w2"]["close_line"]), (-130, None))  # moneyline
+        self.assertEqual((filled["w3"]["close_price"],
+                          filled["w3"]["close_line"]), (-110, 8.5))   # total
+
+    def test_spread_exact_line_filled(self):
+        self.rows = [_spread_wager("w1", "E1", "Away Team", 1.5, _C1)]
+        self.data = {"E1": _game([DK_TEAM_BOOK], "E1")}
+        self._run(["backfill_dk_clv.py", "--sport", "mlb"])
+        by_eid = {c["eid"]: c for c in self.calls}
+        self.assertEqual(by_eid["E1"]["markets"], "spreads")
+        filled = self.writer.call_args[0][0]
+        self.assertEqual((filled["w1"]["close_price"],
+                          filled["w1"]["close_line"]), (-115, 1.5))
+
+    def test_team_line_moved_left_unfilled(self):
+        # Spread bet at -2.5 but DK's featured close is -1.5 -> no exact match ->
+        # left blank (not stamped with a mismatched line).
+        self.rows = [_spread_wager("w1", "E1", "Home Team", -2.5, _C1)]
+        self.data = {"E1": _game([DK_TEAM_BOOK], "E1")}
+        out = self._run(["backfill_dk_clv.py", "--sport", "mlb"])
+        self.assertEqual(self.writer.call_args[0][0], {})
+        self.assertIn("left blank", out)
 
 
 if __name__ == "__main__":

@@ -8,37 +8,44 @@ CLV in My Bets was wrong for a DraftKings-only bettor in two ways:
   1. It compared the user's DK executed price against a best-of-book / de-vigged
      CONSENSUS close from the odds warehouse (which never stores DraftKings) —
      optimistically biased.
-  2. The warehouse prop lookup ignores the LINE, and the fill hardcoded
-     close_line = the bet's line, so a DK line move produced a bogus cross-line
-     CLV number.
+  2. The warehouse lookup matched the LINE fuzzily (falling back to any point
+     when the exact one was absent) and the fill hardcoded close_line = the
+     bet's line, so a DK line move produced a bogus cross-line CLV number.
+
+Both flaws were first fixed for PLAYER PROPS and now also for TEAM markets
+(moneyline / spread / total): the warehouse CLV path (attach_clv/persist_clv)
+has been retired entirely, and every bet's CLV comes from here instead.
 
 This utility fetches DraftKings' historical closing snapshot for each of your
-started prop bets straight from The Odds API historical event-odds endpoint
+started bets straight from The Odds API historical event-odds endpoint
 (bookmakers=draftkings, date=commence_time -> nearest snapshot at-or-before the
-close), reads DK's price at the EXACT line you bet, and writes a true DK-vs-DK,
-same-line CLV.
+close), reads DK's price at the EXACT line/side you bet, and writes a true
+DK-vs-DK, same-line CLV. Moneyline has no line, so a DK price for your team is
+always a same-line comparison; spread/total require DK's featured close to carry
+your exact point.
 
-When DK's standard close does NOT carry the exact line you bet, the row is left
-UNFILLED (blank CLV), not stamped with a mismatched line: the settled table
-shows only clv_pct (never close_line), so recording a different line would be
-invisible AND would permanently strand the row (close_price set -> never
-retried). Leaving it unfilled keeps it eligible for a future alternate-line pass
-and costs nothing to retry (permanent snapshot cache). This covers genuine DK
-line moves and alternate-line / safe-mode ("N+") bets, whose exact line lives in
-the '_alternate' market this tool does not yet fetch (see Out of scope).
+When DK's standard (featured) close does NOT carry the exact line you bet, the
+row is left UNFILLED (blank CLV), not stamped with a mismatched line: the
+settled table shows only clv_pct (never close_line), so recording a different
+line would be invisible AND would permanently strand the row (close_price set ->
+never retried). Leaving it unfilled keeps it eligible for a future alternate-line
+pass and costs nothing to retry (permanent snapshot cache). This covers genuine
+DK line moves and alternate-line / safe-mode ("N+") bets, whose exact line lives
+in the '_alternate' ladders this tool does not fetch (see Out of scope).
 
-Only player-prop wagers are handled here; team markets keep their warehouse CLV
-path. Historical responses are cached permanently by odds_client, so re-running
-only ever pays for genuinely new games. attach_clv no longer fills props from
-the warehouse, so a prop's CLV appears only after this backfill runs.
+Historical responses are cached permanently by odds_client, so re-running only
+ever pays for genuinely new games. A bet's CLV appears only after this backfill
+runs.
 
-  IMPORTANT after first deploy: props settled before this change still carry the
+  IMPORTANT after first deploy: bets settled before this change still carry the
   old (biased/cross-line) warehouse CLV. Run once with --refresh to clear and
   recompute them from DraftKings.
 
-Cost: 10 x prop-markets x 1 region PER GAME (one call covers all your bets on
-that game). Scoped to your actual bets this is small; --dry-run prints the exact
-NEW (uncached) cost first, and --max-credits caps the spend.
+Cost: 10 x markets x 1 region PER GAME (one call covers all your bets on that
+game). Markets = your prop markets on the game PLUS the featured team markets
+(h2h / spreads / totals) you have a bet on. Scoped to your actual bets this is
+small; --dry-run prints the exact NEW (uncached) cost first, and --max-credits
+caps the spend.
 
 Examples
 --------
@@ -48,8 +55,8 @@ Examples
     # Real run, tightly budgeted:
     python backfill_dk_clv.py --sport mlb --max-credits 200
 
-    # Recompute after a correction, or clear stale pre-deploy prop CLV (clears
-    # existing prop CLV first; re-fetch is free thanks to the permanent cache):
+    # Recompute after a correction, or clear stale pre-deploy CLV (clears
+    # existing CLV first; re-fetch is free thanks to the permanent cache):
     python backfill_dk_clv.py --sport mlb --refresh
 """
 import argparse
@@ -66,6 +73,7 @@ from odds_client import (
     is_historical_event_cached,
     get_upcoming_events,
     dk_prop_lines,
+    dk_game_lines,
     american_to_implied_prob,
     get_remaining_credits,
 )
@@ -82,6 +90,10 @@ SPORT_MAP = {
 }
 
 REGIONS = "us"  # DraftKings lives in the US region
+
+# Team-market bet_type -> the featured Odds-API market key that carries its close.
+TEAM_MARKET_KEY = {"moneyline": "h2h", "spread": "spreads", "total": "totals"}
+CLV_BET_TYPES = ("player_prop",) + tuple(TEAM_MARKET_KEY)
 
 
 def load_config():
@@ -119,67 +131,79 @@ def _implied(price):
         return None
 
 
-def _is_prop_candidate(row, sport_full, now):
-    """A started prop wager of this sport that still needs a DK close."""
-    return (row.get("bet_type") == "player_prop"
+def _market_key(row):
+    """The Odds-API market key this wager needs at the close, or None when the
+    row can't be fetched (a prop missing its prop_key). Props map to their
+    prop_key market; team markets map through TEAM_MARKET_KEY."""
+    bt = row.get("bet_type")
+    if bt == "player_prop":
+        return row.get("prop_key")
+    return TEAM_MARKET_KEY.get(bt)
+
+
+def _is_clv_candidate(row, sport_full, now):
+    """A started wager of this sport (prop OR team market) that still needs a DK
+    close."""
+    return (row.get("bet_type") in CLV_BET_TYPES
             # Re-check in Python: the Blob/local read ignores a SQL ``where``
             # filter and returns every row, so without this an already-filled
-            # prop would be reconsidered (and re-fetched) on that backend.
+            # wager would be reconsidered (and re-fetched) on that backend.
             and row.get("close_price") is None
             and _same_sport(row.get("sport_key"), sport_full)
             and wagers._commence_passed(row, now))
 
 
 def refresh_reset(sport_full):
-    """Clear existing prop CLV for this sport so rows left blank by an earlier
-    line-move (or filled by the old warehouse path pre-deploy) recompute; the
-    re-fetch is free via the permanent snapshot cache. Best-effort."""
+    """Clear existing CLV for this sport (props + team markets) so rows left blank
+    by an earlier line-move (or filled by the old warehouse path pre-deploy)
+    recompute; the re-fetch is free via the permanent snapshot cache.
+    Best-effort."""
     ids = [r.get("wager_id") for r in wagers.read_wagers()
-           if r.get("bet_type") == "player_prop"
+           if r.get("bet_type") in CLV_BET_TYPES
            and _same_sport(r.get("sport_key"), sport_full)
            and r.get("wager_id")]
     if not ids:
         return
     try:
         cleared = wagers.reset_clv(wager_ids=ids)
-        print(f"  [refresh] cleared CLV on {cleared} prop wager(s).")
+        print(f"  [refresh] cleared CLV on {cleared} wager(s).")
     except Exception as exc:
         print(f"  [warn] --refresh reset failed: {exc}")
 
 
 def group_by_event(candidates, all_rows, sport_full):
-    """event_id -> {commence, markets:set(prop_key), rows:[candidate rows]}.
+    """event_id -> {commence, markets:set(market_key), rows:[candidate rows]}.
 
-    ``markets`` is the FULL set of prop markets across EVERY prop wager on the
-    event (filled or not), not just the unfilled candidates. Requesting the same
-    market set every run keeps the permanent-cache key stable, so once an event
-    is fetched, re-runs are free — a set that shrank as sibling props filled
-    would hash to a new key and re-bill the API on every run.
+    ``markets`` is the FULL set of Odds-API market keys across EVERY wager on the
+    event — prop markets PLUS featured team markets (h2h / spreads / totals),
+    filled or not — not just the unfilled candidates. Requesting the same market
+    set every run keeps the permanent-cache key stable, so once an event is
+    fetched, re-runs are free — a set that shrank as sibling bets filled would
+    hash to a new key and re-bill the API on every run.
 
-    Wagers missing event_id / commence_time / prop_key can't be fetched and are
-    dropped from ``rows`` (counted as skipped)."""
+    Wagers missing event_id / commence_time (or a prop missing prop_key) can't be
+    fetched and are dropped from ``rows`` (counted as skipped)."""
     full_markets = {}
     for r in all_rows:
-        if r.get("bet_type") != "player_prop":
-            continue
         if not _same_sport(r.get("sport_key"), sport_full):
             continue
-        eid, prop = r.get("event_id"), r.get("prop_key")
-        if eid and prop:
-            full_markets.setdefault(eid, set()).add(prop)
+        mkey = _market_key(r)
+        eid = r.get("event_id")
+        if eid and mkey:
+            full_markets.setdefault(eid, set()).add(mkey)
 
     groups = {}
     skipped = 0
     for r in candidates:
         eid = r.get("event_id")
         commence = r.get("commence_time")
-        prop = r.get("prop_key")
-        if not eid or not commence or not prop:
+        mkey = _market_key(r)
+        if not eid or not commence or not mkey:
             skipped += 1
             continue
         g = groups.setdefault(eid, {"commence": commence,
                                     "markets": set(), "rows": []})
-        g["markets"] |= full_markets.get(eid, {prop})
+        g["markets"] |= full_markets.get(eid, {mkey})
         g["rows"].append(r)
     return groups, skipped
 
@@ -219,6 +243,61 @@ def dk_close_for_wager(dk_offers, row):
     return close_price, close_line, clv
 
 
+def dk_close_for_team_wager(dk_lines, row):
+    """Resolve DraftKings' closing price/line for one TEAM-market wager.
+
+    ``dk_lines`` = dk_game_lines(data) for this event. The bet's executed_price
+    is already DraftKings (the app analyzes a DK-only odds view — see app.py's
+    team-market block), so comparing it to this DK close gives a true DK-vs-DK,
+    same-line CLV. Returns ``(close_price, close_line, clv_pct)`` only for such a
+    match:
+      * moneyline — DK posted your team's h2h price (no line; close_line=None);
+      * spread    — DK's featured close carried your team at your EXACT point;
+      * total     — DK's featured close carried your side at your EXACT point.
+    Returns None otherwise — DK didn't post it, or the featured line moved off
+    your point (a genuine move, or an alternate-line bet whose exact line lives in
+    a ladder this tool does not fetch). Unfilled rows keep clv blank and retry
+    free next run (permanent cache); nothing misleading is written.
+    """
+    executed = wagers._executed_implied(row.get("executed_price"))
+
+    def _resolve(close_price, close_line):
+        close_imp = _implied(close_price)
+        clv = (round((close_imp - executed) * 100.0, 2)
+               if close_imp is not None and executed is not None else None)
+        return close_price, close_line, clv
+
+    bt = row.get("bet_type")
+    if bt == "moneyline":
+        norm = normalize_name(row.get("team"))
+        match = next((o for o in dk_lines.get("moneyline", [])
+                      if normalize_name(o.get("team")) == norm
+                      and o.get("price") is not None), None)
+        # Moneyline has no line, so a matched DK price is always same-line.
+        return _resolve(match["price"], None) if match else None
+
+    if bt == "spread":
+        norm = normalize_name(row.get("team"))
+        bet_line = row.get("line")
+        match = next((o for o in dk_lines.get("spreads", [])
+                      if normalize_name(o.get("team")) == norm
+                      and o.get("price") is not None
+                      and _lines_equal(o.get("point"), bet_line)), None)
+        return _resolve(match["price"], match["point"]) if match else None
+
+    if bt == "total":
+        want = (row.get("direction") or row.get("side") or "OVER").upper()
+        want_side = "Over" if want == "OVER" else "Under"
+        bet_line = row.get("line")
+        match = next((o for o in dk_lines.get("totals", [])
+                      if o.get("side") == want_side
+                      and o.get("price") is not None
+                      and _lines_equal(o.get("point"), bet_line)), None)
+        return _resolve(match["price"], match["point"]) if match else None
+
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Backfill DraftKings closing-line CLV into the wagers ledger "
@@ -231,8 +310,8 @@ def main():
     p.add_argument("--dry-run", action="store_true",
                    help="Show the plan and estimated cost without calling the API.")
     p.add_argument("--refresh", action="store_true",
-                   help="Clear existing prop CLV for this sport first, then "
-                        "recompute (re-fetch is free via the permanent cache).")
+                   help="Clear existing CLV for this sport first (props + team "
+                        "markets), then recompute (re-fetch is free via the cache).")
     args = p.parse_args()
 
     # Target the SQL backend when the SQL_* secrets are configured (mirrors the
@@ -257,7 +336,7 @@ def main():
     api_key = cfg["odds_api_key"]
     now = datetime.now(timezone.utc)
 
-    print(f"\n=== Backfill DraftKings CLV: {sport_full} player props ===")
+    print(f"\n=== Backfill DraftKings CLV: {sport_full} (props + team markets) ===")
     print(f"  Region(s): {REGIONS}   Budget cap: {args.max_credits} credits")
 
     if args.refresh:
@@ -270,14 +349,14 @@ def main():
         print("  The durable store may be temporarily unreachable; try again.")
         raise SystemExit(2)
 
-    candidates = [r for r in all_rows if _is_prop_candidate(r, sport_full, now)]
+    candidates = [r for r in all_rows if _is_clv_candidate(r, sport_full, now)]
     if not candidates:
-        print("  No started prop wagers need a DK close. Nothing to do.")
+        print("  No started wagers need a DK close. Nothing to do.")
         return
     groups, skipped = group_by_event(candidates, all_rows, sport_full)
     if skipped:
-        print(f"  [note] {skipped} wager(s) missing event_id/commence/prop_key "
-              f"— cannot fetch; skipped.")
+        print(f"  [note] {skipped} wager(s) missing event_id/commence "
+              f"(or a prop's prop_key) — cannot fetch; skipped.")
     if not groups:
         print("  No fetchable events. Done.")
         return
@@ -295,9 +374,9 @@ def main():
             bookmakers=["draftkings"])
 
     new_cost = sum(per_event_cost[eid] for eid in order if not _cached(eid))
-    print(f"  {len(groups)} event(s), {n_wagers} prop wager(s) needing CLV.")
+    print(f"  {len(groups)} event(s), {n_wagers} wager(s) needing CLV.")
     print(f"  Full cost if nothing were cached: ~{total_cost} credits "
-          f"(10 x prop-markets/game).")
+          f"(10 x markets/game).")
     print(f"  Estimated NEW spend (uncached events only): ~{new_cost} credits.")
 
     if args.dry_run:
@@ -360,11 +439,21 @@ def main():
             # Bill only a genuine paid fetch; cache hits and 404s are free.
             if not cached:
                 spent += per_event_cost[eid]
-            need = {row.get("prop_key") for row in g["rows"]}
+            # Parse each family of markets from the one payload: props per
+            # prop_key, and the featured team lines once (only if a team bet
+            # rides this event).
+            need = {row.get("prop_key") for row in g["rows"]
+                    if row.get("bet_type") == "player_prop"}
             dk_by_prop = {prop: dk_prop_lines(data, prop) for prop in need}
+            has_team = any(row.get("bet_type") in TEAM_MARKET_KEY
+                           for row in g["rows"])
+            dk_lines = dk_game_lines(data) if has_team else {}
             for row in g["rows"]:
-                res = dk_close_for_wager(dk_by_prop.get(row.get("prop_key"), []),
-                                         row)
+                if row.get("bet_type") == "player_prop":
+                    res = dk_close_for_wager(
+                        dk_by_prop.get(row.get("prop_key"), []), row)
+                else:
+                    res = dk_close_for_team_wager(dk_lines, row)
                 if res is None:
                     n_unmatched += 1
                     continue

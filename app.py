@@ -1527,7 +1527,6 @@ def render_my_bets():
         if refresh or stale:
             with st.spinner("Grading settled bets..."):
                 graded = wagers.resolve_pending_wagers()
-                wagers.persist_clv()
             st.session_state["_wagers_graded_at"] = time.time()
             if graded:
                 st.success(f"Graded {graded} newly settled bet(s).")
@@ -1555,12 +1554,13 @@ def render_my_bets():
         )
         return
 
-    # CLV is read straight from the durable ledger — persist_clv() fills it (for
-    # games past first pitch, the only ones with a real closing line) during the
-    # once-per-session prefetch and on Refresh. We deliberately do NOT call
-    # attach_clv() here: it hit the odds warehouse (a manifest + snapshot GET per
-    # un-priced row) on every rerun, which was the dominant source of My Bets
-    # sluggishness. CLV updates at startup and whenever you click Refresh.
+    # CLV is read straight from the durable ledger; the app never fills it. The
+    # old render-time warehouse fill (attach_clv/persist_clv) was retired — it
+    # compared DK executed prices against a best-of-book / de-vigged CONSENSUS
+    # close the warehouse can't tie to DraftKings, and it hit the warehouse (a
+    # manifest + snapshot GET per un-priced row) on every rerun. CLV now comes
+    # exclusively from the DK closing-line backfill CLI (backfill_dk_clv.py),
+    # which reads DK's price at the EXACT line you bet.
 
     sport_labels = {info["key"]: name for name, info in SPORTS.items()}
 
@@ -1841,25 +1841,23 @@ for _persist_key in list(st.session_state.keys()):
         st.session_state[_persist_key] = st.session_state[_persist_key]
 
 # Prefetch the My Bets ledger once per session, BEFORE the page router, so the
-# 🧾 My Bets page opens ready (it then just reads the already-graded, CLV-filled
-# durable ledger). Runs above the st.stop() router + setup gate so it fires on
-# whichever page loads first, and needs no odds API key (grading uses free box
-# scores). Results persist to the blob, so this is a one-time cost per session.
-# A separate sentinel from the grade timestamp so the post-save regrade reset
-# doesn't re-trigger this block; stamping _wagers_graded_at=now lets My Bets skip
-# its own pass until the grade goes stale (_GRADE_STALE_SECONDS).
+# 🧾 My Bets page opens ready (it then just reads the already-graded durable
+# ledger; CLV is filled offline by backfill_dk_clv.py, never at render time).
+# Runs above the st.stop() router + setup gate so it fires on whichever page
+# loads first, and needs no odds API key (grading uses free box scores). Results
+# persist to the blob, so this is a one-time cost per session. A separate
+# sentinel from the grade timestamp so the post-save regrade reset doesn't
+# re-trigger this block; stamping _wagers_graded_at=now lets My Bets skip its own
+# pass until the grade goes stale (_GRADE_STALE_SECONDS).
 if not st.session_state.get("_wagers_prefetched"):
     st.session_state["_wagers_prefetched"] = True
     try:
         import wagers as _wagers
         with st.status("Updating your bet ledger…", expanded=False) as _status:
             _graded = _wagers.resolve_pending_wagers()
-            _clv = _wagers.persist_clv()
             st.session_state["_wagers_graded_at"] = time.time()
-            _bits = ([f"{_graded} bet(s) graded"] if _graded else []) + \
-                    ([f"CLV on {_clv} bet(s)"] if _clv else [])
             _status.update(
-                label=("Updated: " + ", ".join(_bits) + "." if _bits
+                label=(f"Updated: {_graded} bet(s) graded." if _graded
                        else "Bet ledger up to date."),
                 state="complete")
     except Exception:
@@ -2650,6 +2648,16 @@ if analyze_clicked and selected_game_labels:
         if eid in odds_results:
             raw_game_odds = odds_results[eid]
             market_comparisons = build_market_comparisons(raw_game_odds)
+            # Team-market analysis runs on a DraftKings-ONLY view of the odds, so
+            # every executable price the analyzers surface (moneyline best_price,
+            # spread/total consensus price) is DK's price — the team-market
+            # equivalent of the props' P1.1b "stake at DK" rule (props instead
+            # parse all books and carry dk_over/under_price separately). This is
+            # what makes a submitted team bet's executed_price DraftKings, hence
+            # its CLV a true DK-vs-DK comparison against the DK close backfilled
+            # by backfill_dk_clv.py. Do NOT widen this to all books without giving
+            # the team path its own dk_price field, or team CLV silently reverts
+            # to a mixed DK-close-vs-best-of-book comparison.
             draftkings_game_odds = dict(raw_game_odds)
             draftkings_game_odds["bookmakers"] = [
                 book for book in raw_game_odds.get("bookmakers", [])

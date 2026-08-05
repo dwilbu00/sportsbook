@@ -892,6 +892,53 @@ def dk_prop_lines(game_data, prop_key, book_key="draftkings"):
     return out
 
 
+def dk_game_lines(game_data, book_key="draftkings"):
+    """Every TEAM-market line DraftKings posts in an event-odds payload, split by
+    market — the team-market analogue of dk_prop_lines.
+
+    Returns ``{"moneyline": [...], "spreads": [...], "totals": [...]}`` where
+      moneyline -> [{"team", "price"}]                (no line)
+      spreads   -> [{"team", "point", "price"}]        (signed team spread)
+      totals    -> [{"side": "Over"/"Under", "point", "price"}]
+    one entry per outcome DK offers. Only the DraftKings bookmaker is read
+    (matched on key or title) and only the FEATURED markets (h2h/spreads/totals),
+    not the '_alternate' ladders. The DK closing-line CLV backfill
+    (backfill_dk_clv.py) needs DK's price at the *exact* line/side a team bet was
+    placed on, which the warehouse's best-of-book / de-vigged consensus can't
+    provide. Pure and hermetic; never raises."""
+    out = {"moneyline": [], "spreads": [], "totals": []}
+    try:
+        for bookmaker in game_data.get("bookmakers", []) or []:
+            key = str(bookmaker.get("key") or "").lower()
+            title = str(bookmaker.get("title") or "").lower()
+            if book_key not in key and book_key not in title:
+                continue
+            for market in bookmaker.get("markets", []) or []:
+                mkey = market.get("key")
+                for outcome in market.get("outcomes", []) or []:
+                    name = outcome.get("name")
+                    price = outcome.get("price")
+                    if name is None or price is None:
+                        continue
+                    if mkey == "h2h":
+                        out["moneyline"].append({"team": name, "price": price})
+                    elif mkey == "spreads":
+                        point = outcome.get("point")
+                        if point is None:
+                            continue
+                        out["spreads"].append(
+                            {"team": name, "point": point, "price": price})
+                    elif mkey == "totals":
+                        point = outcome.get("point")
+                        if point is None or name not in ("Over", "Under"):
+                            continue
+                        out["totals"].append(
+                            {"side": name, "point": point, "price": price})
+    except Exception:
+        return out
+    return out
+
+
 # ── De-vig consensus quality (P1.1c) ──
 # Sharp books whose de-vigged prices are up-weighted when averaging the prop
 # consensus. Keys are lowercased substrings matched against the book title.

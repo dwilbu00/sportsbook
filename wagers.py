@@ -4,8 +4,9 @@ The forward prediction log tracks how the *model* would have done at a flat unit
 this ledger tracks how the *user* actually did on the bets they placed money on.
 The "Submit Picks" button turns the selected-bets checklist into ledger rows
 (flat unit stake, executed at the model's best price at submit), which are then
-auto-graded and rolled up into stake-weighted realized ROI. Closing lines from
-the odds warehouse add CLV once they accumulate.
+auto-graded and rolled up into stake-weighted realized ROI. Closing-line value
+(CLV) is filled offline by the DraftKings backfill CLI (backfill_dk_clv.py),
+which reads DK's price at the exact line each bet was placed on.
 
 Storage is a single NDJSON sibling blob (``wagers.jsonl``) written through the
 generalized read-modify-write store in ``recalibration`` — no new secret. Rows
@@ -556,7 +557,16 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Closing-line value (from the warehouse)
+# Closing-line value (DraftKings, via backfill_dk_clv.py)
+#
+# CLV is filled EXCLUSIVELY by the on-demand DraftKings closing-line backfill
+# (backfill_dk_clv.py) — DK-vs-DK at the exact bet line, for both player props
+# AND team markets (moneyline/spread/total). The old render-time warehouse fill
+# (attach_clv/persist_clv) was retired: the warehouse stores best-of-book /
+# de-vigged CONSENSUS (never DraftKings) and matched lines fuzzily, so a
+# DK-only bettor's CLV was optimistically biased and could compare mismatched
+# lines. This module now only holds the shared writer/reset helpers; the render
+# path just READS whatever CLV the backfill has written.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _executed_implied(price):
@@ -567,95 +577,10 @@ def _executed_implied(price):
         return None
 
 
-def attach_clv(rows):
-    """Fill close_line/close_price/clv_pct from warehoused closing lines.
-
-    Positive CLV = the executed price implied a lower probability (better odds)
-    than the closing line. Mutates and returns ``rows``. Best-effort.
-
-    Player props are DELIBERATELY skipped here: the user bets only at DraftKings,
-    but the warehouse stores best-of-book / de-vigged consensus (not DK) and its
-    prop lookup ignores the line, so a warehouse close is neither DK-vs-DK nor
-    same-line. Prop CLV is filled exclusively by the DK closing-line backfill
-    (backfill_dk_clv.py), which fetches DraftKings' historical close at the exact
-    bet line. Team markets (moneyline/spread/total) keep the warehouse path."""
-    try:
-        import warehouse
-    except Exception:
-        return rows
-    for row in rows:
-        if row.get("close_price") is not None:
-            continue
-        try:
-            bet_type = row.get("bet_type")
-            if bet_type == "player_prop":
-                continue  # DK-only prop CLV — filled by backfill_dk_clv.py
-            commence = row.get("commence_time")
-            # The warehouse partitions snapshots by the UTC commence date
-            # (commence[:10]); the row's game_date is now US-local, so a late
-            # game would miss its snapshot folder. Query by the UTC date, only
-            # falling back to game_date when commence is absent.
-            wh_date = (commence or "")[:10] or (row.get("game_date") or "")[:10]
-            common = dict(sport=row.get("sport_key"), game_date=wh_date,
-                          event_id=row.get("event_id"),
-                          commence_time=commence)
-            if bet_type == "total":
-                close = warehouse.closing_line_for(
-                    bet_type="total", selection=row.get("side"),
-                    point=row.get("point"), **common)
-            else:  # moneyline / spread — selection is the team
-                close = warehouse.closing_line_for(
-                    bet_type=bet_type, selection=row.get("team"),
-                    point=row.get("point"),
-                    team_code=row.get("team_code"), **common)
-            if not close or close.get("implied_prob") is None:
-                continue
-            row["close_price"] = close.get("price")
-            row["close_line"] = row.get("point")
-            executed = _executed_implied(row.get("executed_price"))
-            if executed is not None:
-                row["clv_pct"] = round(
-                    (close["implied_prob"] - executed) * 100.0, 2)
-        except Exception:
-            continue
-    return rows
-
-
 def _commence_passed(row, now):
     """True once first pitch/kickoff has passed (the closing line is now final)."""
     commence = game_results._parse_utc(row.get("commence_time"))
     return commence is not None and now >= commence
-
-
-def persist_clv(rows=None, now=None):
-    """Compute closing-line value for started games and write it durably.
-
-    CLV is only meaningful once the game has started — before then the warehouse
-    has no post-commence "closing" snapshot and the latest line is still moving —
-    so this only fills rows whose commence_time has passed and that don't already
-    have a close_price. The filled close_price/close_line/clv_pct are written
-    back through the ETag-safe ledger store so later renders (and restarts) read
-    them cheaply instead of re-hitting the warehouse every time. Returns the
-    count newly persisted. Best-effort; never raises."""
-    now = now or datetime.now(timezone.utc)
-    # CLV is only ever filled on rows whose close_price IS NULL, so pull just
-    # those from the durable store (SQL path) instead of the whole ledger; the
-    # commence-passed narrowing below still happens in Python.
-    rows = read_wagers(where={"close_price": None}) if rows is None else rows
-    if not rows:
-        return 0
-    candidates = [r for r in rows
-                  if r.get("close_price") is None and _commence_passed(r, now)]
-    if not candidates:
-        return 0
-    attach_clv(candidates)  # fills close_price/close_line/clv_pct in memory
-    filled = {
-        r["wager_id"]: {k: r.get(k)
-                        for k in ("close_price", "close_line", "clv_pct")}
-        for r in candidates
-        if r.get("wager_id") and r.get("close_price") is not None
-    }
-    return apply_clv_updates(filled)
 
 
 def apply_clv_updates(filled):
@@ -664,9 +589,9 @@ def apply_clv_updates(filled):
     ``filled`` maps wager_id -> {close_price, close_line, clv_pct}. Only rows
     whose close_price IS NULL are updated, so re-runs are idempotent (the SQL
     read is restricted to them; the Blob path ignores ``where`` and the mutator
-    self-filters). Shared by persist_clv (team-market warehouse fill on render)
-    and the DK closing-line prop backfill. Returns the count persisted.
-    Best-effort; never raises."""
+    self-filters). This is the sole CLV writer — the DK closing-line backfill
+    (backfill_dk_clv.py, props + team markets) calls it. Returns the count
+    persisted. Best-effort; never raises."""
     if not filled:
         return 0
 
@@ -687,17 +612,16 @@ def apply_clv_updates(filled):
 
 
 def reset_clv(wager_ids=None):
-    """Clear close_price/close_line/clv_pct so persist_clv recomputes them.
+    """Clear close_price/close_line/clv_pct so the DK backfill recomputes them.
 
-    Use after a closing-line correction (e.g. the _order bugfix that had CLV
-    computed against the opening snapshot): persist_clv only fills rows whose
-    close_price IS NULL, so already-filled (stale) values must be cleared first.
-    Limited to ``wager_ids`` when given, else (``wager_ids is None``) every row
-    that has a CLV value. An explicitly EMPTY selection clears nothing — never
-    everything — so a caller that computed "the rows to reset" and got none
-    (e.g. a ledger with only player props) can't accidentally wipe the ledger.
-    Returns the count cleared. Raises on a storage failure so callers can surface
-    it."""
+    Use after a closing-line correction, or to drop stale warehouse-era CLV so
+    backfill_dk_clv.py can refill it DK-vs-DK: apply_clv_updates only fills rows
+    whose close_price IS NULL, so already-filled (stale) values must be cleared
+    first. Limited to ``wager_ids`` when given, else (``wager_ids is None``) every
+    row that has a CLV value. An explicitly EMPTY selection clears nothing — never
+    everything — so a caller that computed "the rows to reset" and got none can't
+    accidentally wipe the ledger. Returns the count cleared. Raises on a storage
+    failure so callers can surface it."""
     ids = None
     if wager_ids is not None:
         ids = {wid for wid in wager_ids if wid}

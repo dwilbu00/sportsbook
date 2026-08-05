@@ -618,153 +618,6 @@ class DeleteAndEditTests(unittest.TestCase):
             self.assertEqual(wagers.read_wagers()[0]["status"], "pending")
 
 
-class AttachClvTests(unittest.TestCase):
-    def test_clv_queries_warehouse_by_utc_commence_date(self):
-        # The row's game_date is US-local (7/20) but the warehouse partitions by
-        # the UTC commence date (7/21). attach_clv must query by the UTC date or
-        # it misses the snapshot folder and CLV never populates. (Team markets
-        # still use the warehouse; props are backfilled from DraftKings instead.)
-        import warehouse
-        row = {
-            "bet_type": "total", "sport_key": "baseball_mlb",
-            "event_id": "E1", "side": "over",
-            "point": 8.5, "line": 8.5,
-            "game_date": "2026-07-20",
-            "commence_time": "2026-07-21T02:30:00Z",
-            "executed_price": -110,
-        }
-        seen = {}
-
-        def fake_closing(**kwargs):
-            seen.update(kwargs)
-            return {"price": -120, "implied_prob": 0.545, "captured_at": "x"}
-
-        with patch.object(warehouse, "closing_line_for", side_effect=fake_closing):
-            wagers.attach_clv([row])
-        self.assertEqual(seen.get("game_date"), "2026-07-21")  # UTC, not 7/20
-        self.assertEqual(row["close_price"], -120)
-        self.assertIsNotNone(row["clv_pct"])
-
-    def test_skips_player_props(self):
-        # Props are DK-only now: attach_clv must NOT fill them from the consensus
-        # warehouse (they are filled by backfill_dk_clv.py instead). Even when the
-        # warehouse would return a line, a prop row stays blank.
-        import warehouse
-        prop = {"bet_type": "player_prop", "sport_key": "baseball_mlb",
-                "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
-                "direction": "OVER", "line": 1.5, "point": 1.5,
-                "player_mlb_id": "608070",
-                "commence_time": "2026-07-21T02:30:00Z", "executed_price": -110}
-        with patch.object(warehouse, "closing_line_for",
-                          return_value={"price": -120, "implied_prob": 0.545}) as m:
-            wagers.attach_clv([prop])
-            m.assert_not_called()  # prop never touches the warehouse
-        self.assertIsNone(prop.get("close_price"))
-        self.assertIsNone(prop.get("clv_pct"))
-
-    def test_forwards_canonical_ids_to_warehouse(self):
-        # attach_clv threads the row's precomputed ids so the odds-line lookup can
-        # prefer id over name for team markets (ml/spread -> team_code). Props are
-        # skipped entirely.
-        import warehouse
-        seen = {}
-
-        def fake_closing(**kwargs):
-            seen[kwargs.get("bet_type")] = kwargs
-            return {"price": -120, "implied_prob": 0.545, "captured_at": "x"}
-
-        prop = {"bet_type": "player_prop", "sport_key": "baseball_mlb",
-                "event_id": "E1", "player": "Bat", "prop_key": "batter_hits",
-                "direction": "OVER", "line": 1.5, "player_mlb_id": "608070",
-                "commence_time": "2026-07-21T02:30:00Z", "executed_price": -110}
-        ml = {"bet_type": "moneyline", "sport_key": "baseball_mlb",
-              "event_id": "E2", "team": "Cleveland Guardians", "point": None,
-              "team_code": "CLE", "commence_time": "2026-07-21T02:30:00Z",
-              "executed_price": -110}
-        with patch.object(warehouse, "closing_line_for", side_effect=fake_closing):
-            wagers.attach_clv([prop, ml])
-        self.assertNotIn("player_prop", seen)  # prop skipped
-        self.assertEqual(seen["moneyline"].get("team_code"), "CLE")
-
-
-class PersistClvTests(unittest.TestCase):
-    def _total(self, commence, seq=0):
-        # A team market — persist_clv fills these from the warehouse. (Props are
-        # DK-only now and are backfilled by backfill_dk_clv.py, not persist_clv.)
-        meta = {"sport_key": "baseball_mlb", "event_id": "E1",
-                "commence_time": commence, "game_date": commence[:10],
-                "home_team": "H", "away_team": "A", "stake": 10.0,
-                "placed_at": "2026-07-20T12:00:00+00:00", "seq": seq}
-        return wagers.build_wager_row("total", "OVER", {
-            "line": 8.5, "over_price": -110, "under_price": -105,
-            "over_hit_rate": 55.0, "over_edge_pct": 6.0,
-            "matchup": "A @ H", "event_id": "E1"}, meta)
-
-    def _prop(self, commence, seq=0):
-        meta = {"sport_key": "baseball_mlb", "event_id": "E1",
-                "commence_time": commence, "game_date": commence[:10],
-                "home_team": "H", "away_team": "A", "stake": 10.0,
-                "placed_at": "2026-07-20T12:00:00+00:00", "seq": seq}
-        return wagers.build_wager_row("player_prop", None, {
-            "player": "Bat", "prop": "batter_hits", "prop_label": "Hits",
-            "line": 1.5, "direction": "OVER", "over_price": -110,
-            "over_rate": 60.0, "edge_pct": 7.0, "matchup": "A @ H",
-            "team": "H", "event_id": "E1"}, meta)
-
-    def test_persists_clv_for_started_game_and_is_idempotent(self):
-        import warehouse
-        row = self._total("2026-07-21T02:30:00Z")
-        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)  # after commence
-        with _LocalLedger():
-            wagers.submit_wagers([row])
-            with patch.object(warehouse, "closing_line_for",
-                              return_value={"price": -120, "implied_prob": 0.545,
-                                            "captured_at": "x"}):
-                self.assertEqual(wagers.persist_clv(now=now), 1)
-                saved = wagers.read_wagers()[0]
-                self.assertEqual(saved["close_price"], -120)
-                self.assertIsNotNone(saved["clv_pct"])
-                # Already persisted -> nothing more to write.
-                self.assertEqual(wagers.persist_clv(now=now), 0)
-
-    def test_skips_pregame_rows(self):
-        import warehouse
-        row = self._total("2026-07-21T02:30:00Z")
-        now = datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc)  # before commence
-        with _LocalLedger():
-            wagers.submit_wagers([row])
-            with patch.object(warehouse, "closing_line_for",
-                              return_value={"price": -120, "implied_prob": 0.5}) as m:
-                self.assertEqual(wagers.persist_clv(now=now), 0)
-                m.assert_not_called()  # pre-commence -> not even queried
-            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
-
-    def test_returns_zero_when_warehouse_has_no_line(self):
-        import warehouse
-        row = self._total("2026-07-21T02:30:00Z")
-        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
-        with _LocalLedger():
-            wagers.submit_wagers([row])
-            with patch.object(warehouse, "closing_line_for", return_value=None):
-                self.assertEqual(wagers.persist_clv(now=now), 0)
-            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
-
-    def test_does_not_persist_player_props(self):
-        # Props are DK-only: persist_clv (the render path) must leave a started
-        # prop blank even when the warehouse has a line, so the only prop CLV that
-        # ever shows is the DK-vs-DK, same-line value from backfill_dk_clv.py.
-        import warehouse
-        row = self._prop("2026-07-21T02:30:00Z")
-        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)  # after commence
-        with _LocalLedger():
-            wagers.submit_wagers([row])
-            with patch.object(warehouse, "closing_line_for",
-                              return_value={"price": -120, "implied_prob": 0.545,
-                                            "captured_at": "x"}):
-                self.assertEqual(wagers.persist_clv(now=now), 0)
-            self.assertIsNone(wagers.read_wagers()[0]["close_price"])
-
-
 class ResetClvTests(unittest.TestCase):
     def test_reset_clears_clv_fields_and_is_idempotent(self):
         with _LocalLedger():
@@ -864,29 +717,30 @@ class FilteredWagerDmlSqlTests(unittest.TestCase):
             self.assertEqual(rows[a["wager_id"]]["status"], "pending")
             self.assertEqual(rows[b["wager_id"]]["status"], "lost")  # untouched
 
-    def test_persist_clv_is_null_filter_fills_and_is_idempotent(self):
-        import warehouse
+    def test_apply_clv_updates_is_null_filter_fills_and_is_idempotent(self):
+        # apply_clv_updates is the sole CLV writer (fed by backfill_dk_clv.py).
+        # It must fill only close_price IS NULL rows via the SQL ``where`` filter,
+        # so a re-run with the same input writes nothing.
         meta = {"sport_key": "baseball_mlb", "event_id": "E1",
                 "commence_time": "2026-07-21T02:30:00Z", "game_date": "2026-07-21",
                 "home_team": "H", "away_team": "A", "stake": 10.0,
                 "placed_at": "2026-07-20T12:00:00+00:00", "seq": 0}
-        # A team market — persist_clv fills these from the warehouse (props are
-        # DK-only and backfilled by backfill_dk_clv.py, not persist_clv).
         row = wagers.build_wager_row("total", "OVER", {
             "line": 8.5, "over_price": -110, "under_price": -105,
             "over_hit_rate": 55.0, "over_edge_pct": 6.0,
             "matchup": "A @ H", "event_id": "E1"}, meta)
-        now = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
         with _SqlLedger():
             wagers.submit_wagers([row])
-            with patch.object(warehouse, "closing_line_for",
-                              return_value={"price": -120, "implied_prob": 0.545,
-                                            "captured_at": "x"}):
-                # First pass fills the close_price IS NULL row via the SQL filter.
-                self.assertEqual(wagers.persist_clv(now=now), 1)
-                self.assertEqual(wagers.read_wagers()[0]["close_price"], -120)
-                # Second pass: the IS NULL filter now returns no rows -> no work.
-                self.assertEqual(wagers.persist_clv(now=now), 0)
+            wid = row["wager_id"]
+            filled = {wid: {"close_price": -120, "close_line": 8.5,
+                            "clv_pct": 3.2}}
+            # First pass fills the close_price IS NULL row via the SQL filter.
+            self.assertEqual(wagers.apply_clv_updates(filled), 1)
+            saved = wagers.read_wagers()[0]
+            self.assertEqual(saved["close_price"], -120)
+            self.assertEqual(saved["clv_pct"], 3.2)
+            # Second pass: the IS NULL filter now returns no rows -> no work.
+            self.assertEqual(wagers.apply_clv_updates(filled), 0)
 
 
 class SummaryTests(unittest.TestCase):
