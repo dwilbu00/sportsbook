@@ -133,6 +133,35 @@ def _gamecontext_fn(form):
     return fn
 
 
+# ── platoon feature (roadmap §2.6, batter vs opposing-starter hand) ───────────
+# A per-batter multiplier from the batter's as-of vs-hand xwOBAcon RELATIVE to
+# his own all-hands baseline — a RESIDUAL over overall quality, so it doesn't
+# double-count the level the projection already carries. The opposing STARTER's
+# HAND is the one platoon input matchup_mult leaves on the table (matchup_mult
+# reads only the starter's aggregate xBA-allowed, never his hand). The raw ratio
+# is already bounded to +/-PLATOON_RUN_CAP offline (book_line_calibration.
+# _attach_platoon, leakage-safe as-of); here it is only strength-scaled and
+# re-clamped, exactly mirroring rest/gamecontext's shape. Whitelisted to
+# batter_hits; a hard no-op everywhere else and whenever the factor is absent
+# (thin vs-hand sample / unknown opposing hand / non-MLB) -> strength-0 byte
+# parity.
+PLATOON_FEAT_CAP = 0.08   # hard bound on the platoon multiplier: [1-CAP, 1+CAP]
+
+
+def _platoon_fn(ctx, strength):
+    """Strength-scale + re-clamp the pre-clamped platoon ratio threaded in as
+    ``ctx["platoon_factor"]`` (a scalar vs-hand / all-hands xwOBAcon ratio, or
+    None). Returns 1.0 (no-op) when strength<=0 or the factor is absent, so both
+    strength-0 and missing context reproduce production bit-for-bit."""
+    if not strength or strength <= 0:
+        return 1.0
+    factor = ctx.get("platoon_factor")
+    if not factor:
+        return 1.0
+    mult = 1.0 + strength * (factor - 1.0)
+    return max(1.0 - PLATOON_FEAT_CAP, min(1.0 + PLATOON_FEAT_CAP, mult))
+
+
 # ── registry ────────────────────────────────────────────────────────────────
 # Each entry is plain data. ``props`` restricts where the feature applies (None =
 # all props); a feature is a hard no-op elsewhere. ``strengths`` is the sweep /
@@ -161,6 +190,22 @@ FEATURE_REGISTRY = [
         "strengths": (0.0, 0.5, 1.0),
         "runtime_knob": "gamecontext_strength",
         "fn": _gamecontext_fn("full"),
+    },
+    {
+        # batter platoon vs the OPPOSING STARTER's hand — the last untested
+        # curated §2.6 tenant. matchup_mult reads only the starter's aggregate
+        # xBA-allowed (never his hand), so the platoon edge is ADDITIVE here.
+        # Sized as the batter's as-of vs-hand xwOBAcon RESIDUAL over his own
+        # all-hands baseline (book_line_calibration._attach_platoon). Kept
+        # registered but INERT (no sweep-grid axis, no runtime knob ever set) so
+        # a bare --feature-diag can re-check it for free as the warehouse grows,
+        # exactly like `gamecontext`. Whitelisted to batter_hits; hard no-op
+        # elsewhere / when the factor is absent -> strength-0 byte parity.
+        "name": "platoon",
+        "props": frozenset({"batter_hits"}),
+        "strengths": (0.0, 0.5, 1.0),
+        "runtime_knob": "platoon_strength",
+        "fn": _platoon_fn,
     },
 ]
 
@@ -195,7 +240,8 @@ def strengths_from_params(params):
 
 
 def projection_multiplier(prop_key, feature_strengths, prior_game_dates,
-                          graded_date, gamecontext_factors=None):
+                          graded_date, gamecontext_factors=None,
+                          platoon_factor=None):
     """Combined projection multiplier over all registered features that apply to
     ``prop_key``, at the strengths in ``feature_strengths`` ({name: strength}).
 
@@ -203,11 +249,17 @@ def projection_multiplier(prop_key, feature_strengths, prior_game_dates,
     dict for this game (from mlb_starters.build_game_context), or None; threaded
     to the gamecontext feature fns. Absent -> those fns no-op to 1.0.
 
+    ``platoon_factor`` — the batter's pre-clamped as-of vs-(opposing-starter-
+    hand) xwOBAcon / all-hands ratio for this game (book_line_calibration.
+    _attach_platoon), or None; threaded to the platoon feature fn. Absent -> it
+    no-ops to 1.0.
+
     Returns 1.0 when nothing applies — so an all-off / empty map is a no-op."""
     if not feature_strengths:
         return 1.0
     ctx = {"prior_game_dates": prior_game_dates, "graded_date": graded_date,
-           "gamecontext_factors": gamecontext_factors}
+           "gamecontext_factors": gamecontext_factors,
+           "platoon_factor": platoon_factor}
     mult = 1.0
     for name, strength in feature_strengths.items():
         f = _BY_NAME.get(name)

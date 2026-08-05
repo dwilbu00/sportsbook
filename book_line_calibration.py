@@ -453,6 +453,7 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
           f"(one per player-prop-game); dropped {skipped_no_player:,} "
           f"(player not found) and {skipped_no_game:,} (no matching game/stat).")
     _attach_gamecontext(enriched, espn_sport)
+    _attach_platoon(enriched, espn_sport)
     return enriched
 
 
@@ -504,6 +505,144 @@ def _attach_gamecontext(enriched, espn_sport):
             continue
         side = "home" if obs.get("test_game", {}).get("is_home") else "away"
         obs["gc_factor"] = gc["gc_factor"][side]
+    return enriched
+
+
+# ── platoon attach (roadmap §2.6, batter vs opposing-starter hand) ────────────
+# The raw Statcast cache (savant_history) stores EVERY pitch with
+# pitcher/p_throws/batting_team/batter, so the opposing starter's HAND is
+# recoverable entirely offline — no schedule fetch, no cross-source team mapping
+# (cheaper than gamecontext's per-date network call). Pre-clamp bound + sample
+# thresholds live here (the attach side); prop_features.PLATOON_FEAT_CAP is the
+# downstream strength-scaled re-clamp (mirrors GC_RUN_CAP / GC_FEAT_CAP split).
+PLATOON_RUN_CAP = 0.15        # pre-clamp on the raw vs-hand / all-hands ratio
+PLATOON_MIN_BBE_BASE = 40     # all-hands baseline leg (== the xBA-blend gate)
+PLATOON_MIN_BBE_VS = 25       # vs-hand leg — lower for LHP coverage (~28% of BBE)
+
+_PLATOON_CACHE = {}           # frozenset(years) -> built tuple | False (failed)
+
+
+def _build_platoon_indices(raw, bp):
+    """Build the four leakage-safe platoon lookups from raw Statcast PITCH rows.
+
+    Returns (base_idx, vs_idx, starter_hand, batter_team) or None when empty:
+      * base_idx  — AsOfIndex keyed by batter -> as-of ALL-hands xwOBAcon
+      * vs_idx    — AsOfIndex keyed by (batter, p_throws) -> as-of vs-hand xwOBAcon
+      * starter_hand[(game_date, batting_team)] — p_throws of the max-pitch-count
+        opposing pitcher that date (a robust starter proxy: starters throw ~4x a
+        reliever's pitches)
+      * batter_team[(batter, game_date)] — the batter's own batting_team that date
+        (self-derived so keys match Savant's namespace, no ESPN abbr mapping)."""
+    if not raw:
+        return None
+    base_idx = bp.AsOfIndex()
+    vs_idx = bp.AsOfIndex()
+    hands = bp._pitcher_hands(raw)
+    pitch_counts = defaultdict(lambda: defaultdict(int))  # (gd,team) -> {pid: n}
+    batter_team = {}
+    for r in raw:
+        b = r.get("batter")
+        gd = r.get("game_date")
+        bt = r.get("batting_team")
+        # xwOBAcon legs: batted balls only (xwoba populated on BBE), leakage-safe
+        # via AsOfIndex's strict date<as_of bisect.
+        x = r.get("xwoba")
+        if b and gd and x is not None:
+            base_idx.add(b, gd, x)
+            pth = r.get("p_throws")
+            if pth:
+                vs_idx.add((b, pth), gd, x)
+        # team + opposing-starter HAND: pre-game facts, over ALL pitches.
+        if b and gd and bt:
+            batter_team[(b, gd)] = bt          # consistent within a game
+        pit = r.get("pitcher")
+        if gd and bt and pit:
+            pitch_counts[(gd, bt)][pit] += 1
+    starter_hand = {}
+    for key, counts in pitch_counts.items():
+        top_pid = max(counts, key=counts.get)  # most pitches vs this team = starter
+        h = hands.get(top_pid)
+        if h:
+            starter_hand[key] = h
+    return base_idx, vs_idx, starter_hand, batter_team
+
+
+def _attach_platoon(enriched, espn_sport):
+    """Attach each batter_hits obs's leakage-safe platoon factor (roadmap §2.6).
+
+    For each batter_hits obs, resolves the opposing starter's hand (max-pitch
+    pitcher vs the batter's team that date), then writes ``obs["platoon_factor"]``
+    = the batter's as-of vs-hand xwOBAcon / all-hands baseline (pre-clamped to
+    +/-PLATOON_RUN_CAP). Both quality legs use only batted balls STRICTLY before
+    the obs's game_date (AsOfIndex bisect_left), so no outcome from the graded
+    game enters the factor — only the opposing hand + the batter's team, both
+    pre-game facts, are read from the graded date.
+
+    Fail-open, never raises: any missing piece (thin vs-hand sample, unknown
+    opposing hand, unresolved player id, non-MLB) leaves the obs WITHOUT a
+    platoon_factor, so the platoon feature no-ops to 1.0 and the obs stays in the
+    sample at baseline (not dropped). Runs once per join (diagnose_features reuses
+    the enriched list across strengths); the built indices are memoized in
+    _PLATOON_CACHE by season-set, and the whole attach short-circuits off the
+    batter_hits path so unrelated joins pay nothing."""
+    if espn_sport != "baseball":
+        return enriched
+    if not any(o.get("prop_key") == "batter_hits" for o in enriched):
+        return enriched                     # perf: only batter_hits consumes it
+    try:
+        import savant_history as sh
+        import backtest_props as bp
+        import mlb_starters
+    except Exception:
+        return enriched
+
+    years = sorted({str(o.get("game_date"))[:4] for o in enriched
+                    if o.get("game_date")})
+    if not years:
+        return enriched
+    cache_key = frozenset(years)
+    built = _PLATOON_CACHE.get(cache_key)
+    if built is None:
+        try:
+            raw = []
+            for y in years:
+                raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+            built = _build_platoon_indices(raw, bp)
+        except Exception:
+            built = False                   # remember the failure; fail-open
+        _PLATOON_CACHE[cache_key] = built
+    if not built:
+        return enriched
+    base_idx, vs_idx, starter_hand, batter_team = built
+
+    for obs in enriched:
+        if obs.get("prop_key") != "batter_hits":
+            continue
+        try:
+            gd = obs.get("game_date")
+            player = obs.get("player")
+            if not gd or not player:
+                continue
+            season = int(str(gd)[:4])
+            pid_info = mlb_starters.find_player_id(player, season)
+            if not pid_info or not pid_info[0] or pid_info[1]:   # batter only
+                continue
+            pid = str(pid_info[0])
+            team = batter_team.get((pid, gd))
+            if not team:
+                continue
+            opp_hand = starter_hand.get((gd, team))
+            if not opp_hand:
+                continue
+            vs = vs_idx.asof_mean((pid, opp_hand), gd, min_bbe=PLATOON_MIN_BBE_VS)
+            base = base_idx.asof_mean(pid, gd, min_bbe=PLATOON_MIN_BBE_BASE)
+            if vs is None or base is None or base <= 0:
+                continue
+            ratio = vs / base
+            obs["platoon_factor"] = max(
+                1.0 - PLATOON_RUN_CAP, min(1.0 + PLATOON_RUN_CAP, ratio))
+        except Exception:
+            continue                        # fail-open per obs
     return enriched
 
 
@@ -653,7 +792,8 @@ def project_and_empirical(obs, params, sport_key,
         feat_mult = prop_features.projection_multiplier(
             obs.get("prop_key"), feat_strengths,
             [g.get("game_date") for g in prior_games], obs.get("game_date"),
-            gamecontext_factors=obs.get("gc_factor"))
+            gamecontext_factors=obs.get("gc_factor"),
+            platoon_factor=obs.get("platoon_factor"))
         if feat_mult and feat_mult != 1.0:
             projected *= feat_mult
             line_eff = line / feat_mult
