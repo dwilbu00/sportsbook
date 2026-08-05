@@ -91,6 +91,25 @@ LEAGUE_AVG = {
 }
 PYTHAGOREAN_EXPONENT = 1.83
 
+# ── §3.1 GameContext constants ──────────────────────────────────────────────
+# One shared, cached, leakage-safe run/hits environment per game (see
+# build_game_context). These are conservative, hand-set constants (the small caps
+# + the confirmation gate's 2-fold check are the backstops), noted fit-elsewhere
+# like LEAGUE_AVG. NONE of the object's run_pmf/total/team_hits fields feed the
+# confirmation gate — only gc_factor (a per-batter MEAN multiplier) does, and it
+# depends solely on the leakage-safe xwOBA offense/bullpen factors below.
+GC_EPS = 0.55            # runs->hits (and run-index->gc) elasticity (hits < runs vol)
+GC_STARTER_SHARE = 0.62  # opposing-staff PA share owned by the STARTER, which is
+                         #   pinned to neutral 1.0 here (matchup_mult owns the
+                         #   per-batter starter log5 — we must not double-count it)
+GC_RUN_CAP = 0.10        # hard bound on the raw gc_factor: [1-CAP, 1+CAP]
+LEAGUE_RUNS_PER_GAME = 4.30   # object mu_runs base only (does NOT feed gc_factor)
+LEAGUE_HITS_PER_GAME = 8.30   # object team_hits_mean base only (does NOT feed gc_factor)
+
+_GC_CACHE = {}                # (home_abbr, away_abbr, date) -> (built_at, context)
+_GC_LIVE_TTL = 20 * 60        # incomplete context: re-build this often
+_GC_FINAL_TTL = 24 * 3600     # complete context: trust a day (inputs are 24h-cached)
+
 
 def _ensure_cache_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -390,6 +409,39 @@ def pythagorean_win_probability(runs_scored, runs_allowed,
     return scored_power / (scored_power + runs_allowed ** exponent)
 
 
+def _run_pmf(mu, dispersion=0.0, max_runs=30):
+    """Discrete score PMF over 0..``max_runs`` for a team's expected runs ``mu``.
+
+    ``dispersion == 0`` -> independent Poisson; ``dispersion > 0`` -> negative
+    binomial with variance = mean + dispersion*mean**2 (the overdispersed
+    baseball score tails). The terminal bucket absorbs any probability past
+    ``max_runs``. Extracted VERBATIM from the inner ``probabilities`` of
+    poisson_margin_probability / negative_binomial_margin_probability (identical
+    arithmetic and evaluation order, so their spread output is byte-identical) so
+    the per-team run joint those models build — and then discarded after
+    collapsing to a spread scalar — is now retained and reusable (roadmap §3.1).
+    """
+    mu = float(mu)
+    max_runs = int(max_runs)
+    if dispersion and dispersion > 0:
+        size = 1.0 / dispersion
+        success_probability = size / (size + mu)
+        failure_probability = 1.0 - success_probability
+        values = [success_probability ** size]
+        for score in range(1, max_runs + 1):
+            values.append(
+                values[-1]
+                * (score - 1.0 + size) / score
+                * failure_probability
+            )
+    else:
+        values = [math.exp(-mu)]
+        for score in range(1, max_runs + 1):
+            values.append(values[-1] * mu / score)
+    values[-1] += max(0.0, 1.0 - sum(values))
+    return values
+
+
 def poisson_margin_probability(home_runs, away_runs, home_spread,
                                max_runs=30):
     """Return P(home score + spread > away score) from expected runs.
@@ -408,11 +460,7 @@ def poisson_margin_probability(home_runs, away_runs, home_spread,
         return None
 
     def probabilities(expected):
-        values = [math.exp(-expected)]
-        for score in range(1, max_runs + 1):
-            values.append(values[-1] * expected / score)
-        values[-1] += max(0.0, 1.0 - sum(values))
-        return values
+        return _run_pmf(expected, dispersion=0.0, max_runs=max_runs)
 
     home_prob = probabilities(home_runs)
     away_prob = probabilities(away_runs)
@@ -449,18 +497,7 @@ def negative_binomial_margin_probability(home_runs, away_runs, home_spread,
             home_runs, away_runs, home_spread, max_runs)
 
     def probabilities(expected):
-        size = 1.0 / dispersion
-        success_probability = size / (size + expected)
-        failure_probability = 1.0 - success_probability
-        values = [success_probability ** size]
-        for score in range(1, max_runs + 1):
-            values.append(
-                values[-1]
-                * (score - 1.0 + size) / score
-                * failure_probability
-            )
-        values[-1] += max(0.0, 1.0 - sum(values))
-        return values
+        return _run_pmf(expected, dispersion=dispersion, max_runs=max_runs)
 
     home_prob = probabilities(home_runs)
     away_prob = probabilities(away_runs)
@@ -470,6 +507,217 @@ def negative_binomial_margin_probability(home_runs, away_runs, home_spread,
         for away_score, ap in enumerate(away_prob)
         if home_score + home_spread > away_score
     )
+
+
+# ── §3.1 GameContext ─────────────────────────────────────────────────────────
+def _gc_own_off(expected_inputs, abbr):
+    """Hand-averaged own-offense factor (>1 = better than league), or None.
+
+    Averages the team's league-relative xwOBA vs LHP and vs RHP so no
+    probable-starter hand is needed (the offline gate has none). Mirrors the
+    per-hand factor in build_matchup_features._expected_offense."""
+    if not expected_inputs or not abbr:
+        return None
+    league = expected_inputs.get("league_xwoba")
+    ovh = expected_inputs.get("offense_vs_hand") or {}
+    vals = []
+    for hand in ("L", "R"):
+        x = (ovh.get(hand) or {}).get(abbr)
+        if x and league:
+            vals.append(max(0.5, min(2.0, x / league)))
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _gc_opp_bull_supp(expected_inputs, opp_abbr):
+    """Opposing-bullpen run suppression (>1 = better opposing pen -> fewer hits),
+    or None. Mirrors the bullpen term in build_matchup_features._expected_staff."""
+    if not expected_inputs or not opp_abbr:
+        return None
+    league = expected_inputs.get("league_bullpen_xwoba")
+    bx = (expected_inputs.get("bullpen_xwoba") or {}).get(opp_abbr)
+    if not league or not bx:
+        return None
+    return max(0.5, min(2.0, league / bx))
+
+
+def _gc_factor_from_terms(own_off, opp_bull_supp, form="full"):
+    """Combine the leakage-safe terms into the bounded per-batter gc_factor.
+
+    The opposing STARTER is pinned to neutral 1.0 — it is owned by matchup_mult
+    (the SHIPPED opp0.5 batter_hits log5), so re-pricing it here would double
+    count. ``form`` selects the ablation the free --feature-diag read compares
+    (all measured MARGINAL over the SHIPPED opp_defense, which is already in the
+    gate's baseline params, so no special handling is needed):
+      full -> own_off / eff_supp   (own offense AND opposing bullpen)
+      own  -> own_off              (own offense only; orthogonal to opp_defense)
+      opp  -> 1 / eff_supp         (opposing-bullpen residual only)
+    Returns 1.0 (no-op) whenever a required term is missing (fail-open)."""
+    if form == "own":
+        if own_off is None:
+            return 1.0
+        run_index = own_off
+    elif form == "opp":
+        if opp_bull_supp is None:
+            return 1.0
+        eff_supp = GC_STARTER_SHARE + (1.0 - GC_STARTER_SHARE) * opp_bull_supp
+        run_index = 1.0 / eff_supp
+    else:  # full
+        if own_off is None or opp_bull_supp is None:
+            return 1.0
+        eff_supp = GC_STARTER_SHARE + (1.0 - GC_STARTER_SHARE) * opp_bull_supp
+        run_index = own_off / eff_supp
+    if not run_index or run_index <= 0:
+        return 1.0
+    val = run_index ** GC_EPS
+    return max(1.0 - GC_RUN_CAP, min(1.0 + GC_RUN_CAP, val))
+
+
+def _convolve_pmf(a, b):
+    """Discrete convolution of two score PMFs -> the sum's PMF."""
+    out = [0.0] * (len(a) + len(b) - 1)
+    for i, ai in enumerate(a):
+        if not ai:
+            continue
+        for j, bj in enumerate(b):
+            out[i + j] += ai * bj
+    return out
+
+
+def _pmf_moments(pmf):
+    """(mean, std) of a PMF indexed by outcome value 0, 1, 2, ..."""
+    mean = sum(k * p for k, p in enumerate(pmf))
+    var = sum((k * k) * p for k, p in enumerate(pmf)) - mean * mean
+    return mean, (math.sqrt(var) if var > 0 else 0.0)
+
+
+def build_game_context(home_team, away_team, date, season, team_index=None):
+    """Shared, cached, leakage-safe per-game run/hits environment (roadmap §3.1).
+
+    Returns a dict::
+
+        {complete, mu_runs:{home,away}, run_pmf:{home:[..30],away:[..30]},
+         total_pmf:[..60], total_mean, total_std, team_hits_mean:{home,away},
+         gc_factor:{home:{full,own,opp}, away:{full,own,opp}}}
+
+    ``gc_factor`` is the per-batter MEAN multiplier the confirmation gate can see
+    (per side, per ablation form). Everything else (run/total PMFs, team-hit
+    means — the run joint the spread model used to discard, now retained) is the
+    reusable foundation for the deferred totals-unification + parlay consumer and
+    does NOT feed the gate.
+
+    LEAKAGE-SAFE: run inputs come ONLY from get_expected_runs_team_factors
+    (as-of, cutoff = date-1d) — never the season-to-date get_team_offense_splits
+    / get_team_bullpen_quality / get_pitcher_quality. Needs only two team abbrs +
+    a date (no probable-starter, no lineup fetch), so it is computable over
+    historical backtest dates. Incomplete inputs / unmatched team -> complete
+    False and gc_factor 1.0 (a fail-open no-op preserving strength-0 byte parity).
+
+    Memoized per (home_abbr, away_abbr, date) with the completeness-OR-TTL guard
+    game_results._SCORE_CACHE uses: an incomplete build is retried soon, a
+    complete one is trusted for a day (the inputs are themselves 24h-cached)."""
+    if team_index is None:
+        try:
+            team_index = get_team_index(season)
+        except (OSError, ValueError, requests.RequestException):
+            team_index = None
+    home_info = _match_team_id(home_team, team_index) if team_index else None
+    away_info = _match_team_id(away_team, team_index) if team_index else None
+    home_abbr = home_info.get("abbr") if home_info else None
+    away_abbr = away_info.get("abbr") if away_info else None
+
+    key = (home_abbr, away_abbr, str(date))
+    now = time.time()
+    cached = _GC_CACHE.get(key)
+    if cached is not None:
+        built_at, prev = cached
+        ttl = _GC_FINAL_TTL if prev.get("complete") else _GC_LIVE_TTL
+        if now - built_at < ttl:
+            return prev
+
+    expected_inputs = None
+    if home_abbr and away_abbr:  # no point fetching if we'll fail open anyway
+        try:
+            expected_inputs = get_expected_runs_team_factors(season, str(date))
+        except (OSError, ValueError, requests.RequestException):
+            expected_inputs = None
+
+    neutral = {"full": 1.0, "own": 1.0, "opp": 1.0}
+    ctx = {
+        "complete": False,
+        "mu_runs": {"home": None, "away": None},
+        "run_pmf": {"home": None, "away": None},
+        "total_pmf": None, "total_mean": None, "total_std": None,
+        "team_hits_mean": {"home": None, "away": None},
+        "gc_factor": {"home": dict(neutral), "away": dict(neutral)},
+    }
+
+    if expected_inputs and home_abbr and away_abbr:
+        # Per side: this team's own offense vs the OPPONENT's bullpen.
+        terms = {
+            "home": (_gc_own_off(expected_inputs, home_abbr),
+                     _gc_opp_bull_supp(expected_inputs, away_abbr)),
+            "away": (_gc_own_off(expected_inputs, away_abbr),
+                     _gc_opp_bull_supp(expected_inputs, home_abbr)),
+        }
+        ctx["gc_factor"] = {
+            side: {form: _gc_factor_from_terms(own, opp, form)
+                   for form in ("full", "own", "opp")}
+            for side, (own, opp) in terms.items()
+        }
+        # Object foundation (NOT gate-facing): expected team runs with the starter
+        # pinned neutral (no probable starter offline), each side's run PMF, the
+        # convolved game-total distribution, and a runs->hits mean map.
+        mu = {}
+        for side, (own, opp) in terms.items():
+            off = own if own is not None else 1.0
+            supp = (GC_STARTER_SHARE
+                    + (1.0 - GC_STARTER_SHARE) * (opp if opp is not None else 1.0))
+            er = expected_runs_from_factors(LEAGUE_RUNS_PER_GAME, off, supp)
+            mu[side] = er if er is not None else LEAGUE_RUNS_PER_GAME
+        ctx["mu_runs"] = mu
+        ctx["run_pmf"] = {s: _run_pmf(mu[s], 0.0, 30) for s in ("home", "away")}
+        total = _convolve_pmf(ctx["run_pmf"]["home"], ctx["run_pmf"]["away"])
+        ctx["total_pmf"] = total
+        ctx["total_mean"], ctx["total_std"] = _pmf_moments(total)
+        ctx["team_hits_mean"] = {
+            s: LEAGUE_HITS_PER_GAME * (mu[s] / LEAGUE_RUNS_PER_GAME) ** GC_EPS
+            for s in ("home", "away")}
+        ctx["complete"] = all(
+            terms[s][0] is not None and terms[s][1] is not None
+            for s in ("home", "away"))
+
+    _GC_CACHE[key] = (now, ctx)
+    return ctx
+
+
+def gamecontext_factor(own_team, opp_team, date, season, form="full",
+                       team_index=None):
+    """Own-side per-batter gc_factor for ``own_team`` facing ``opp_team`` — the
+    Phase-3 runtime/sweep entry point. gc_factor depends only on own offense +
+    opposing bullpen (not home/away), so this needs no game orientation. Same
+    leakage-safe terms and bounds as build_game_context; 1.0 fail-open on a
+    miss (unmatched team / missing as-of inputs)."""
+    if team_index is None:
+        try:
+            team_index = get_team_index(season)
+        except (OSError, ValueError, requests.RequestException):
+            team_index = None
+    if not team_index:
+        return 1.0
+    own_info = _match_team_id(own_team, team_index)
+    opp_info = _match_team_id(opp_team, team_index)
+    own_abbr = own_info.get("abbr") if own_info else None
+    opp_abbr = opp_info.get("abbr") if opp_info else None
+    if not own_abbr or not opp_abbr:
+        return 1.0
+    try:
+        ei = get_expected_runs_team_factors(season, str(date))
+    except (OSError, ValueError, requests.RequestException):
+        ei = None
+    return _gc_factor_from_terms(_gc_own_off(ei, own_abbr),
+                                 _gc_opp_bull_supp(ei, opp_abbr), form)
 
 
 def get_team_index(season):
