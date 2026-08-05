@@ -1,5 +1,12 @@
 requests
-streamlit>=1.56
+# PINNED (do not loosen without testing). streamlit>=1.57 defaults to the
+# Starlette/Uvicorn backend and pulls an unbounded starlette; starlette >=0.48
+# added a required `thread_minimum_size` kwarg to GZipResponder.__init__ that
+# streamlit's _MediaAwareGZipResponder subclass doesn't pass, so every request
+# 500s on Streamlit Cloud (uv resolved the newer combo on rebuild). 1.56.0 is
+# the tornado-backed line that matches local + the full test suite; it never
+# imports starlette (extra, not requested here), so it can't hit that path.
+streamlit==1.56.0
 # Azure SQL durable-state backend (used only when SQL_* secrets are set; the app
 # falls back to the local/Blob store otherwise). pymssql is the TDS driver
 # (pip wheel, no system ODBC driver / packages.txt needed on Streamlit Cloud).
