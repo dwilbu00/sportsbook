@@ -147,25 +147,20 @@ FEATURE_REGISTRY = [
         "fn": _rest_fn,
     },
     {
-        "name": "gamecontext",              # own offense AND opposing bullpen
+        # own offense AND opposing bullpen (opposing STARTER pinned neutral —
+        # owned by matchup_mult). The full form; kept registered but INERT (no
+        # sweep-grid axis, no runtime knob set) so a bare --feature-diag can
+        # re-check it for free as the warehouse grows, exactly like `rest`.
+        # §3.1 first-verdict (2026-08-05, 3,547 obs): +0.0002 @strength 1.0 on
+        # the incumbent E — correctly signed but far below the 0.002 gate, so it
+        # ships nowhere. The two diagnostic ablations (own-only ~+0.0000, opp-only
+        # ~+0.0001) resolved the judge disagreement — full is marginally best,
+        # opp overlaps the shipped opp_defense — and were dropped once settled.
+        "name": "gamecontext",
         "props": frozenset({"batter_hits"}),
         "strengths": (0.0, 0.5, 1.0),
         "runtime_knob": "gamecontext_strength",
         "fn": _gamecontext_fn("full"),
-    },
-    {
-        "name": "gamecontext_own",          # ablation: own offense only
-        "props": frozenset({"batter_hits"}),
-        "strengths": (0.0, 0.5, 1.0),
-        "runtime_knob": "gamecontext_own_strength",
-        "fn": _gamecontext_fn("own"),
-    },
-    {
-        "name": "gamecontext_opp",          # ablation: opposing bullpen only
-        "props": frozenset({"batter_hits"}),
-        "strengths": (0.0, 0.5, 1.0),
-        "runtime_knob": "gamecontext_opp_strength",
-        "fn": _gamecontext_fn("opp"),
     },
 ]
 

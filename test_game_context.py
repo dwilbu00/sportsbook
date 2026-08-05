@@ -257,32 +257,39 @@ class GamecontextRegistryTest(unittest.TestCase):
     FACTORS = {"full": 1.06, "own": 1.04, "opp": 0.97}
 
     def test_applies_only_to_batter_hits(self):
-        for name in ("gamecontext", "gamecontext_own", "gamecontext_opp"):
-            self.assertTrue(pf.feature_applies(name, "batter_hits"))
-            for pk in ("pitcher_outs", "pitcher_strikeouts",
-                       "pitcher_earned_runs", "player_points"):
-                self.assertFalse(pf.feature_applies(name, pk))
+        # Only the full `gamecontext` form is registered (the two diagnostic
+        # ablations were dropped once the §3.1 verdict settled).
+        self.assertTrue(pf.feature_applies("gamecontext", "batter_hits"))
+        for pk in ("pitcher_outs", "pitcher_strikeouts",
+                   "pitcher_earned_runs", "player_points"):
+            self.assertFalse(pf.feature_applies("gamecontext", pk))
+        for dropped in ("gamecontext_own", "gamecontext_opp"):
+            self.assertFalse(pf.feature_applies(dropped, "batter_hits"))
 
-    def test_strengths_from_params_reads_gc_knobs(self):
+    def test_strengths_from_params_reads_gc_knob(self):
         self.assertEqual(
             pf.strengths_from_params({"gamecontext_strength": 1.0}),
             {"gamecontext": 1.0})
         self.assertEqual(
-            pf.strengths_from_params({"gamecontext_own_strength": 0.5}),
-            {"gamecontext_own": 0.5})
-        self.assertEqual(
-            pf.strengths_from_params({"gamecontext_opp_strength": 0.0}), {})
+            pf.strengths_from_params({"gamecontext_strength": 0.0}), {})
 
-    def test_each_form_reads_its_own_key_and_scales(self):
-        for name, key in (("gamecontext", "full"),
-                          ("gamecontext_own", "own"),
-                          ("gamecontext_opp", "opp")):
-            gc = self.FACTORS[key]
-            for s in (0.5, 1.0):
-                m = pf.projection_multiplier(
-                    "batter_hits", {name: s}, [], "2025-06-01",
-                    gamecontext_factors=self.FACTORS)
-                self.assertAlmostEqual(m, 1.0 + s * (gc - 1.0), places=12)
+    def test_full_form_reads_full_key_and_scales(self):
+        gc = self.FACTORS["full"]
+        for s in (0.5, 1.0):
+            m = pf.projection_multiplier(
+                "batter_hits", {"gamecontext": s}, [], "2025-06-01",
+                gamecontext_factors=self.FACTORS)
+            self.assertAlmostEqual(m, 1.0 + s * (gc - 1.0), places=12)
+
+    def test_factory_forms_read_their_own_key(self):
+        # The _gamecontext_fn factory itself still supports all three forms (kept
+        # for the object's Phase-3 use), even though only `full` is registered.
+        for key in ("full", "own", "opp"):
+            fn = pf._gamecontext_fn(key)
+            got = fn({"gamecontext_factors": self.FACTORS}, 1.0)
+            self.assertAlmostEqual(got, self.FACTORS[key], places=12)
+            self.assertEqual(fn({"gamecontext_factors": None}, 1.0), 1.0)
+            self.assertEqual(fn({"gamecontext_factors": self.FACTORS}, 0.0), 1.0)
 
     def test_strength_zero_and_absent_factors_are_noop(self):
         # strength 0 -> production; missing form / None factors -> 1.0.
