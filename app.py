@@ -1011,6 +1011,16 @@ def render_model_guide():
                         if cfg.get("fit_brier") is not None else "Not exported"
                     ),
                     "Probability method": cfg.get("method", "—"),
+                    # Provenance of the Brier/accuracy numbers above: props re-fit
+                    # on genuine book lines vs. still carrying the offline synthetic
+                    # season-average sweep. The fallback labels pre-fit_basis
+                    # entries correctly (real_line_fit present => real book lines).
+                    "Fit basis": (
+                        "Real book lines"
+                        if cfg.get("fit_basis") == "real_line"
+                        or cfg.get("real_line_fit")
+                        else "Synthetic sweep"
+                    ),
                     "Full fit observations": cfg.get("n_obs", "—"),
                     "Calibration date": fit_date,
                 })

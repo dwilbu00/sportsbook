@@ -1231,7 +1231,10 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
     ``roi_tiebreak`` (default True) breaks a Brier near-tie (methods within
     MIN_CALIB_BRIER_GAIN of each other on the single holdout, all confirmed
     out-of-sample) by realized ROI through the live edge+EV gate — see
-    _roi_tiebreak. Pass False for a pure-Brier view (e.g. diagnose_negbin).
+    _roi_tiebreak. An ROI override is honored only if the winner ALSO beats the
+    Brier leader by the ROI margin in BOTH expanding folds (a cross-fold guard
+    mirroring the Brier gate's _confirms). Pass False for a pure-Brier view
+    (e.g. diagnose_negbin).
 
     Returns None if fewer than 20 usable (actual != line) observations, else:
       {method, fit_brier, baseline_brier, cv_brier, confirmed,
@@ -1254,10 +1257,14 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
         usable[:split], usable[split:], negbin_eligible)
     baseline = single["A"]
 
-    # Two-fold out-of-sample confirmation for non-empirical methods.
+    # Two-fold out-of-sample confirmation for non-empirical methods. Keep the FULL
+    # per-fold tuple (scores, _, probs, out); fold_scores stays value-identical for
+    # _confirms/cv_brier, and the retained probs/out feed the ROI cross-fold guard
+    # below (same number of _score_abc_real calls as before — zero added compute).
     folds = _real_line_folds(usable)
-    fold_scores = ([_score_abc_real(tr, te, negbin_eligible)[0]
-                    for tr, te in folds] if folds else [])
+    fold_full = ([_score_abc_real(tr, te, negbin_eligible)
+                  for tr, te in folds] if folds else [])
+    fold_scores = [ff[0] for ff in fold_full]
 
     def _confirms(method):
         if not fold_scores:
@@ -1306,8 +1313,28 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
                 rec["tie_set"] = tie_set
                 roi_record = rec
                 if rec["applied"]:
-                    best_method = rec["winner"]
-                    best_brier = single.get(best_method, best_brier)
+                    # Cross-fold ROI guard — the ROI analogue of _confirms: a
+                    # single-split ROI override is honored only if the SAME winner
+                    # also beats the Brier leader by the ROI margin in BOTH expanding
+                    # folds (defeats the winner's-curse the Brier gate already guards
+                    # against; consensus n_bets can be as low as 15, so a lone-split
+                    # ROI edge is exactly the noise to reconfirm). Else keep the
+                    # Brier pick. best_method here is still the pre-ROI Brier leader.
+                    winner = rec["winner"]
+                    fold_recs = [
+                        _roi_tiebreak(te, fp, fo, tie_set, best_method,
+                                      ROI_TIEBREAK_THRESHOLD, ROI_TIEBREAK_MIN_BETS,
+                                      ROI_TIEBREAK_MIN_ROI_GAIN)
+                        for (_tr, te), (_fs, _f2, fp, fo) in zip(folds, fold_full)]
+                    rec["fold_confirmed"] = bool(fold_full) and all(
+                        fr and fr.get("applied") and fr.get("winner") == winner
+                        for fr in fold_recs)
+                    rec["fold_recs"] = fold_recs
+                    if rec["fold_confirmed"]:
+                        best_method = winner
+                        best_brier = single.get(best_method, best_brier)
+                    else:
+                        rec["applied"] = False
 
     # Deployed residual distribution: fit on ALL usable obs.
     resid = [r["actual"] - r["projected"] for r in usable]
@@ -1335,7 +1362,10 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
         # compare its winner against the POOLED method on the same split.
         "single_split": single,
         # ROI-tiebreak audit trail (None when it didn't run): {ran, winner,
-        # applied, rois, n_bets, tie_set}. Diagnostic only — not persisted to JSON.
+        # applied, rois, n_bets, tie_set[, fold_confirmed, fold_recs]}. When a
+        # single-split override is proposed, fold_confirmed records whether it
+        # survived the 2-fold ROI guard (applied is forced False if not).
+        # Diagnostic only — not persisted to JSON.
         "roi_tiebreak": roi_record,
     }
     # When E wins, its deployed params are fit on ALL usable obs (mirrors the

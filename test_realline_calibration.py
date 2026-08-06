@@ -232,6 +232,24 @@ class RefitSportRealLinesTests(unittest.TestCase):
         self.assertEqual(bh["variant_label"], "none/defadj0.0/ven0.0")
         self.assertEqual(bh["warmup"], existing["batter_hits"]["warmup"])
         self.assertTrue(bh["real_line_fit"]["fit_at_real_lines"])
+        # provenance flips synthetic -> real on a genuine real-line flip.
+        self.assertEqual(bh["fit_basis"], "real_line")
+
+    def test_confirmed_unchanged_prop_keeps_synthetic_fit_basis(self):
+        # A prop re-evaluated on real lines but NOT flipped (method confirmed
+        # unchanged) must NOT be rewritten -> its synthetic provenance survives and
+        # it gains no real_line_fit. Guards against falsely labeling stale
+        # synthetic pitcher numbers as real-line fits.
+        existing = self._existing()
+        existing["batter_hits"]["fit_basis"] = "synthetic_sweep"
+        keep_a = {"method": "A", "fit_brier": 0.2141, "baseline_brier": 0.2141,
+                  "cv_brier": None, "confirmed": False, "residual_mu": 0.0,
+                  "residual_sigma": 1.0, "residual_ecdf": [-1.0, 0.0, 1.0],
+                  "n_obs": 900}
+        _, save_mock = self._run({"batter_hits": keep_a}, existing=existing)
+        save_mock.assert_not_called()
+        self.assertEqual(existing["batter_hits"]["fit_basis"], "synthetic_sweep")
+        self.assertNotIn("real_line_fit", existing["batter_hits"])
 
     def test_nothing_written_when_no_prop_has_data(self):
         _, save_mock = self._run({"batter_hits": None,
@@ -755,7 +773,16 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
     patched to script the Brier scene deterministically (call 0 = single
     holdout, calls 1..2 = the two confirmation folds)."""
 
-    def _patch(self, single_scores, single_probs, single_out, fold_scores):
+    def _patch(self, single_scores, single_probs, single_out, fold_scores,
+               fold_confirm=True):
+        """Script `_score_abc_real`: call 0 = single holdout (the given scene),
+        calls 1..2 = the two confirmation folds. Each fold now returns REAL
+        per-fold probs/out sized to its own `len(test)` so the ROI cross-fold
+        guard can re-run `_roi_tiebreak` on it (the same C-backs-the-winner scene
+        the single holdout uses -> C confirms). With ``fold_confirm=False`` the
+        SECOND fold's C is made inert (P(over)~market -> no value bets -> C
+        untradeable there), so the winner fails one fold and the guard suppresses
+        the override."""
         calls = {"n": 0}
 
         def _se(train, test, negbin_eligible=False):
@@ -763,7 +790,14 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
             calls["n"] += 1
             if i == 0:
                 return (single_scores, (0.0, 1.0, []), single_probs, single_out)
-            return (fold_scores, (0.0, 1.0, []), {}, [])
+            m = len(test)
+            fo = [1, 0] * (m // 2) + ([1] if m % 2 else [])
+            if not fold_confirm and i == 2:
+                c = [0.51] * m           # edge ~0.01 < threshold -> no C bets
+            else:
+                c = [0.6 if o else 0.4 for o in fo]   # C backs the winning side
+            fp = {"A": [0.6] * m, "B": [0.5] * m, "C": c}
+            return (fold_scores, (0.0, 1.0, []), fp, fo)
 
         return patch.object(blc, "_score_abc_real", side_effect=_se)
 
@@ -811,6 +845,57 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
             sel = blc.select_method_at_real_lines(_priced_rows(120))
         self.assertEqual(sel["method"], "C")
         self.assertIsNone(sel["roi_tiebreak"])   # tie_set == [C]; never ran
+
+    def test_roi_override_requires_both_folds(self):
+        # C wins the single-split ROI AND clears the ROI margin in BOTH folds ->
+        # the cross-fold guard confirms it and the override is honored.
+        single, probs, out, folds = self._scene()
+        with self._patch(single, probs, out, folds, fold_confirm=True):
+            sel = blc.select_method_at_real_lines(_priced_rows(120))
+        self.assertEqual(sel["method"], "C")
+        rt = sel["roi_tiebreak"]
+        self.assertTrue(rt["applied"])
+        self.assertIs(rt["fold_confirmed"], True)
+        self.assertEqual(len(rt["fold_recs"]), 2)
+        self.assertTrue(all(fr["applied"] and fr["winner"] == "C"
+                            for fr in rt["fold_recs"]))
+
+    def test_roi_override_suppressed_when_fold_fails(self):
+        # C wins the single-split ROI but is untradeable in the SECOND fold ->
+        # the cross-fold guard keeps the Brier pick (A) and marks the override
+        # unconfirmed. Mirrors the 2-fold winner's-curse guard the Brier gate
+        # already enforces via _confirms.
+        single, probs, out, folds = self._scene()
+        with self._patch(single, probs, out, folds, fold_confirm=False):
+            sel = blc.select_method_at_real_lines(_priced_rows(120))
+        self.assertEqual(sel["method"], "A")
+        rt = sel["roi_tiebreak"]
+        self.assertFalse(rt["applied"])          # forced False by the guard
+        self.assertIs(rt["fold_confirmed"], False)
+        self.assertEqual(rt["winner"], "C")      # single-split winner recorded
+        # first fold confirmed C, second fold did not (C untradeable there).
+        self.assertEqual(rt["fold_recs"][0]["winner"], "C")
+        self.assertNotEqual(rt["fold_recs"][1]["winner"], "C")
+
+    def test_guard_reaches_per_bucket_path(self):
+        # The guard lives inside select_method_at_real_lines behind
+        # `if roi_tiebreak:`. The per-bucket path (_select_line_methods) must
+        # forward roi_tiebreak=True so the guard is live there too, not just on
+        # the pooled path. Spy the selector and assert the forwarded flag.
+        obs = [{"prop_key": "batter_hits", "player": f"P{i}", "line": 0.5,
+                "actual": 1.0, "game_date": _day(i),
+                "over_price": -110, "under_price": -110} for i in range(120)]
+        spy = MagicMock(return_value=None)
+        with patch.object(blc, "project_and_empirical", return_value=(1.0, 0.6)), \
+                patch.object(blc, "project_distributional", return_value=0.6), \
+                patch.object(blc, "select_method_at_real_lines", spy):
+            refit_calibration._select_line_methods(
+                "batter_hits", obs, params={}, sport_key="baseball_mlb",
+                team_defense={}, league_avg_def={}, pooled_method="A",
+                xba_index=None, quality_index=None)
+        self.assertTrue(spy.called)
+        _args, kwargs = spy.call_args
+        self.assertIs(kwargs.get("roi_tiebreak"), True)
 
 
 if __name__ == "__main__":

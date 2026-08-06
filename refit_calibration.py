@@ -648,6 +648,12 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
         # P2.1: whether the winning knob combo cleared the variant confirmation
         # gate (beat the baseline variant in both folds). False = baseline (floor).
         "variant_confirmed": winner.get("variant_confirmed", False),
+        # Provenance of the shipped numbers (display-only; no reader consumes it).
+        # Every prop starts life fit at the SYNTHETIC season-average line here; the
+        # real-line pass (below) promotes this to "real_line" only when it flips a
+        # prop on genuine book-line obs. Keeps the app from showing stale synthetic
+        # pitcher Briers as if they were measured on real lines.
+        "fit_basis": "synthetic_sweep",
     }
     cfg.update(fit)
     return cfg
@@ -985,6 +991,9 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                 "store_label": store_label or "default",
                 "xstats_strength": prop_xstats,
             }
+            # Provenance flips synthetic -> real: these method/residual numbers were
+            # just measured on genuine book-line obs, not the synthetic sweep.
+            new_cfg["fit_basis"] = "real_line"
             # Persist the xBA blend weight so props._knob activates it in
             # production at exactly the weight its residuals were re-fit under.
             if prop_xstats > 0:

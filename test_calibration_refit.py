@@ -259,6 +259,13 @@ class BuildPropCfgKnobTests(unittest.TestCase):
         cfg = self._cfg("hl10/defadj0.0/ven0.0", False, shrinkage_k_default=7)
         self.assertEqual(cfg["shrinkage_k"], 7)
 
+    def test_fit_basis_defaults_to_synthetic_sweep(self):
+        # Every prop is fit at the SYNTHETIC season-average line here; the
+        # real-line pass promotes provenance to "real_line" only on a genuine
+        # book-line flip. The offline builder must always start synthetic.
+        cfg = self._cfg("hl10/opp0.5/defadj1.0/shrink5/ven0.25", True)
+        self.assertEqual(cfg["fit_basis"], "synthetic_sweep")
+
 
 if __name__ == "__main__":
     unittest.main()
