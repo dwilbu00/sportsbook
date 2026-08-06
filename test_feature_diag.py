@@ -14,6 +14,10 @@ Four layers, all pure stdlib (no live ESPN / Statcast / SQL / secrets):
   * diagnose_features — end-to-end, hermetic: per-prop×strength Brier table, the
     incumbent gain + gate verdict, the pick-flip line, the consensus-ROI column,
     and the invariant that a DIAGNOSTIC writes nothing.
+  * per-line-bucket lens (Track 2) — the pure partition helpers, and the
+    diagnose_features per-bucket pass that surfaces an in-bucket gain the POOLED
+    gate saturates away (the killer test), skips a below-floor bucket, and writes
+    nothing.
 
 Run: PYTHONIOENCODING=utf-8 python test_feature_diag.py
 """
@@ -328,6 +332,118 @@ class DiagnoseFeaturesEndToEndTests(unittest.TestCase):
         # only an excluded prop is calibrated -> no registered feature applies.
         out, save_mock = self._run({"pitcher_earned_runs": {"method": "A"}})
         self.assertIn("No calibrated props", out)
+        save_mock.assert_not_called()
+
+
+# ── per-line-bucket lens (Track 2): partition helpers + diagnose_features pass ──
+class PartitionHelperTests(unittest.TestCase):
+    def test_line_bucket_key(self):
+        # LINE_BUCKETS = [0.5, None]: line <= 0.5 -> 'le_0.5', else 'top'.
+        self.assertEqual(rc._line_bucket_key(0.0), "le_0.5")
+        self.assertEqual(rc._line_bucket_key(0.5), "le_0.5")
+        self.assertEqual(rc._line_bucket_key(1.5), "top")
+        self.assertEqual(rc._line_bucket_key(2.5), "top")
+        self.assertIsNone(rc._line_bucket_key(None))
+        self.assertIsNone(rc._line_bucket_key("x"))
+
+    def test_partition_orders_and_groups(self):
+        rows = [{"line": 1.5}, {"line": 0.5}, {"line": 0.5},
+                {"line": 2.5}, {"line": None}]
+        parts = rc._partition_rows_by_bucket(rows)
+        self.assertEqual(list(parts.keys()), ["le_0.5", "top"])   # canonical order
+        self.assertEqual(len(parts["le_0.5"]), 2)
+        self.assertEqual(len(parts["top"]), 2)                    # 1.5+2.5; None gone
+
+    def test_keys_match_props_resolver(self):
+        # The diagnostic helper must derive the SAME bucket key as the runtime
+        # resolver (we deliberately don't DRY-refactor the frozen write path, so
+        # this invariant is pinned by a test instead).
+        from props import _resolve_line_bucket
+        cfg = {"line_methods": [{"max_line": 0.5, "method": "C"},
+                                {"max_line": None, "method": "D"}]}
+        self.assertEqual(_resolve_line_bucket(cfg, 0.5)[0], rc._line_bucket_key(0.5))
+        self.assertEqual(_resolve_line_bucket(cfg, 1.5)[0], rc._line_bucket_key(1.5))
+
+
+def _killer_build(enriched, params, *a, **k):
+    """700 obs at line 0.5 (~87.5%) + 100 at line 1.5 — the batter_hits shape that
+    saturates the pooled gate. Tagged with the injected strength."""
+    s = (params.get("features") or {}).get("rest", 0.0)
+    rows = [{"line": 0.5, "_s": s} for _ in range(700)]
+    rows += [{"line": 1.5, "_s": s} for _ in range(100)]
+    return rows
+
+
+def _killer_select(rows, **k):
+    """single_split keyed on the LINES PRESENT: le_0.5 inert, top helped a lot,
+    pooled (mixed) a sub-gate blend. Proves the per-bucket lens surfaces the
+    top-bucket signal the pooled number can't move."""
+    s = rows[0]["_s"] if rows else 0.0
+    lines = {r["line"] for r in rows}
+    on = s > 0.0
+    if lines == {0.5}:                       # le_0.5 bucket: feature inert
+        ss = {"A": 0.2000}
+    elif lines == {1.5}:                     # top bucket: feature helps a lot
+        ss = {"A": 0.2900 if on else 0.3000}
+    else:                                    # pooled (mixed): sub-gate +0.0010
+        ss = {"A": 0.2110 if on else 0.2120}
+    return {"method": "A", "single_split": ss, "n_obs": len(rows)}
+
+
+def _thin_build(enriched, params, *a, **k):
+    s = (params.get("features") or {}).get("rest", 0.0)
+    rows = [{"line": 0.5, "_s": s} for _ in range(150)]
+    rows += [{"line": 1.5, "_s": s} for _ in range(10)]        # top < MIN_BUCKET_OBS
+    return rows
+
+
+def _thin_select(rows, **k):
+    return {"method": "A", "single_split": {"A": 0.200}, "n_obs": len(rows)}
+
+
+class PerBucketFeatureDiagTests(unittest.TestCase):
+    def _run(self, existing, build, select, feature="rest"):
+        buf = io.StringIO()
+        with patch.object(rc, "load_calibration", return_value=existing), \
+             patch.object(rc, "save_calibration") as save_mock, \
+             patch.object(rc, "_roi_by_method", side_effect=_fake_roi), \
+             patch.object(blc, "harvest_real_line_book_lines",
+                          return_value=([{}], 1, 0)), \
+             patch.object(blc, "join_book_lines_to_actuals",
+                          return_value=[{"prop_key": "batter_hits"}]), \
+             patch.object(blc, "build_real_line_obs", side_effect=build), \
+             patch.object(blc, "select_method_at_real_lines", side_effect=select), \
+             redirect_stdout(buf):
+            rc.diagnose_features("mlb", feature=feature)
+        return buf.getvalue(), save_mock
+
+    def test_per_bucket_surfaces_what_pooled_hides(self):
+        out, save_mock = self._run(
+            {"batter_hits": {"method": "A", "half_life": None}},
+            _killer_build, _killer_select)
+        # The pooled gate HIDES it: mixed obs blend to +0.0010 < 0.002.
+        self.assertIn("gain +0.0010; >= 0.002 gate: no", out)
+        # The per-bucket lens re-scores WITHIN each bucket ...
+        self.assertIn("per-line-bucket gain", out)
+        # ... the saturated bucket is inert (both buckets clear MIN_BUCKET_OBS=100)
+        self.assertIn("bucket le_0.5 (incumbent=A, usable n=700)", out)
+        self.assertIn("+0.0000  no", out)
+        # ... but the top bucket clears the SAME 0.002 gate the pooled number can't.
+        self.assertIn("bucket top (incumbent=A, usable n=100)", out)
+        self.assertIn("+0.0100  YES", out)
+        # A diagnostic writes nothing.
+        self.assertIn("nothing written", out)
+        save_mock.assert_not_called()
+
+    def test_thin_top_bucket_skipped(self):
+        out, save_mock = self._run(
+            {"batter_hits": {"method": "A", "half_life": None}},
+            _thin_build, _thin_select)
+        # top bucket below the floor -> one-line skip, no sub-table.
+        self.assertIn("bucket top: n=10 < 100 floor - skipped (thin).", out)
+        self.assertNotIn("bucket top (incumbent=", out)
+        # the deep bucket still prints.
+        self.assertIn("bucket le_0.5 (incumbent=", out)
         save_mock.assert_not_called()
 
 

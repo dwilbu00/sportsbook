@@ -120,6 +120,43 @@ def _lc_bucket_ready(enriched, target_props):
     return False
 
 
+def _line_bucket_key(line):
+    """Book line -> LINE_BUCKETS key: 'le_<cap:g>' for the first finite cap >= line,
+    else 'top' (open-ended). Pure; matches props._resolve_line_bucket's canonical
+    keys exactly. Returns None when line is unusable (None / non-numeric).
+    Diagnostic-only helper (used by the per-line-bucket --feature-diag lens); the
+    WRITE-path selectors keep their own inline cap-walks. The invariant that all
+    three agree is pinned by test_feature_diag.test_keys_match_props_resolver."""
+    try:
+        ln = float(line)
+    except (TypeError, ValueError):
+        return None
+    for cap in LINE_BUCKETS:            # ascending caps; None = open-ended top
+        if cap is None:
+            return "top"
+        if ln <= cap:
+            return f"le_{cap:g}"        # 0.5 -> 'le_0.5'
+    return "top"
+
+
+def _partition_rows_by_bucket(rows):
+    """Group real-line obs rows (dicts carrying 'line') by LINE_BUCKETS key, in
+    canonical bucket order (finite caps ascending, then 'top'). Rows with an
+    unusable line are dropped; a key is present only when it has >= 1 row. Pure — does
+    not mutate rows. Diagnostic-only (per-bucket --feature-diag lens)."""
+    grouped = {}
+    for r in rows:
+        key = _line_bucket_key(r.get("line"))
+        if key is not None:
+            grouped.setdefault(key, []).append(r)
+    ordered = {}
+    for cap in LINE_BUCKETS:
+        key = "top" if cap is None else f"le_{cap:g}"
+        if key in grouped:
+            ordered[key] = grouped[key]
+    return ordered
+
+
 def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                          league_avg_def, pooled_method, xba_index, quality_index,
                          roi_tiebreak=True):
@@ -1858,12 +1895,13 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
                 continue
             strengths = list(f["strengths"])
             off = strengths[0]
-            sels, rois = {}, {}
+            sels, rois, rows_by_s = {}, {}, {}
             for s in strengths:
                 params = dict(base_params, features={f["name"]: s})
                 rows = blc.build_real_line_obs(
                     enriched, params, sport_key, prop_key, team_defense,
                     league_avg_def, xstats_strength=0.0, xba_index=None)
+                rows_by_s[s] = rows        # stash for the per-line-bucket pass below
                 sels[s] = blc.select_method_at_real_lines(
                     rows, negbin_eligible=elig, roi_tiebreak=False)
                 rois[s] = _roi_by_method(enriched, params, sport_key, prop_key,
@@ -1917,6 +1955,62 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
                           f"{sim['roi'] * 100:>8.1f}%")
                 else:
                     print(f"    {s:>8.2f}{mth:>8}{'—':>8}{'—':>9}")
+
+            # ── Per-line-bucket pass (DIAGNOSTIC-ONLY; every pooled table above is
+            #    unchanged). Calibration METHODS get a per-line-bucket selector but
+            #    FEATURES are gated only on the POOLED holdout. ~87.5% of batter_hits
+            #    obs sit at line <= 0.5 where P(>=1 hit) is saturated (~binary), so a
+            #    feature that only helps at >= 1.5 can't move the pooled number. Here
+            #    we re-score the incumbent method WITHIN each line bucket to surface
+            #    signal the pooled gate hides. Bucket membership by raw book line is
+            #    strength-invariant (a feature moves projection/p_dist, never the
+            #    line), so we just partition each strength's already-built rows and
+            #    score each bucket with the SAME select_method_at_real_lines the ship
+            #    path uses. Print-only: cannot change any shipped decision.
+            parts = {s: _partition_rows_by_bucket(rows_by_s[s]) for s in strengths}
+            if parts.get(off):
+                print("    per-line-bucket gain (diagnostic; pooled gate above may "
+                      "saturate at line<=0.5):")
+            for bkey, off_bucket in parts.get(off, {}).items():
+                if len(off_bucket) < MIN_BUCKET_OBS:
+                    print(f"      bucket {bkey}: n={len(off_bucket)} < "
+                          f"{MIN_BUCKET_OBS} floor - skipped (thin).")
+                    continue
+                sel_b = {s: blc.select_method_at_real_lines(
+                             parts[s].get(bkey, []), negbin_eligible=elig,
+                             roi_tiebreak=False)
+                         for s in strengths}
+                if sel_b[off] is None:
+                    print(f"      bucket {bkey}: n={len(off_bucket)} but "
+                          f"usable<20 - can't score.")
+                    continue
+                # Faithful per-bucket incumbent: if the shipped cfg has a line_methods
+                # entry for this bucket use THAT bucket's method, else the pooled
+                # incumbent (batter_hits line_methods is null today -> pooled method).
+                b_inc = _rc_method_for_line(
+                    off_bucket[0]["line"], cfg.get("line_methods"), incumbent)
+                inc_off_b = (sel_b[off].get("single_split", {}) or {}).get(b_inc)
+                n_use = sel_b[off].get("n_obs")
+                print(f"      bucket {bkey} (incumbent={b_inc}, usable n={n_use}):")
+                print(f"        {'strength':>8}{'off':>9}{'on':>9}{'gain':>9}  gate")
+                for s in strengths:
+                    if s == off:
+                        continue
+                    inc_s_b = ((sel_b[s].get("single_split", {}) or {}).get(b_inc)
+                               if sel_b[s] else None)
+                    if inc_off_b is None or inc_s_b is None:
+                        print(f"        {s:>8.2f}{'-':>9}{'-':>9}{'-':>9}  "
+                              f"n/a (incumbent {b_inc} unscored in bucket)")
+                        continue
+                    gain_b = inc_off_b - inc_s_b
+                    passes_b = gain_b >= MIN_CALIB_BRIER_GAIN
+                    print(f"        {s:>8.2f}{inc_off_b:>9.4f}{inc_s_b:>9.4f}"
+                          f"{gain_b:>+9.4f}  {'YES' if passes_b else 'no'}")
+                    if (sel_b[s] and sel_b[off]
+                            and sel_b[s].get("method") != sel_b[off].get("method")):
+                        print(f"          gate pick: off={sel_b[off].get('method')} "
+                              f"-> strength{s:.2f}={sel_b[s].get('method')} "
+                              f"(selection would change)")
 
     print(f"\n  (Diagnostic only — nothing written. Strengths are injected into "
           f"the offline projection via prop_features; strength 0 == production. A "
