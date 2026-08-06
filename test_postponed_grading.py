@@ -256,5 +256,47 @@ class EspnAdjacentGuardTests(unittest.TestCase):
         self.assertEqual(actual, 2.0)  # 30min away -> genuine slippage -> graded
 
 
+class EspnRoleGateTests(unittest.TestCase):
+    """resolve_one_prop's ESPN fallback must never grade a pitcher prop off a
+    BATTER's gamelog (or vice-versa): pitcher_strikeouts and batter_strikeouts
+    both map to the ESPN "K"/"SO" labels, so an id-map / namesake slip that pools
+    the wrong role's log would grade the bet off the wrong stat. Mirrors
+    backtest._role_matches_gamelog on the main sweep and the book-line join."""
+
+    def _resolve(self, prop_key, gamelog, by_date, game_date, commence):
+        with patch.object(recalibration, "_resolve_mlb_actual",
+                          return_value=None), \
+             patch.object(recalibration, "_load_player_gamelog",
+                          return_value=(gamelog, by_date)):
+            return recalibration.resolve_one_prop(
+                "baseball_mlb", "P", prop_key, 5.5, game_date, commence)
+
+    def test_pitcher_prop_on_batter_log_stays_pending(self):
+        # Batter log: "SO" present, no "IP". Without the gate, "SO" would grade a
+        # pitcher_strikeouts bet off the batter's strikeouts.
+        gl = [{"SO": 3.0, "H": 1.0, "game_date": "2025-07-01T23:30:00Z",
+               "completed": True}]
+        by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
+        self.assertIsNone(self._resolve("pitcher_strikeouts", gl, by_date,
+                                        "2025-07-01", "2025-07-01T23:30:00Z"))
+
+    def test_batter_prop_on_pitcher_log_stays_pending(self):
+        # Pitcher log: "K" + "IP". Without the gate, "K" would grade a
+        # batter_strikeouts bet off the pitcher's strikeouts.
+        gl = [{"K": 7.0, "IP": 6.0, "game_date": "2025-07-01T23:30:00Z",
+               "completed": True}]
+        by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
+        self.assertIsNone(self._resolve("batter_strikeouts", gl, by_date,
+                                        "2025-07-01", "2025-07-01T23:30:00Z"))
+
+    def test_pitcher_prop_on_pitcher_log_grades(self):
+        # Role matches -> the gate is transparent; the bet grades normally on "K".
+        gl = [{"K": 7.0, "IP": 6.0, "game_date": "2025-07-01T23:30:00Z",
+               "completed": True}]
+        by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
+        self.assertEqual(self._resolve("pitcher_strikeouts", gl, by_date,
+                                       "2025-07-01", "2025-07-01T23:30:00Z"), 7.0)
+
+
 if __name__ == "__main__":
     unittest.main()

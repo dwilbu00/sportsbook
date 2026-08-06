@@ -36,7 +36,7 @@ from backtest import (
     SPORT_MAP, VARIANT_PRESETS, _empirical_cdf, _brier, _logloss, _hit_rate,
     _resolve_params, opp_defense_mult, venue_mult,
     _team_defense_lookup, _resolve_opp_pts_allowed,
-    _per_player_stats, _shrunk,
+    _per_player_stats, _shrunk, _role_matches_gamelog,
 )
 from espn_client import PROP_STAT_MAP, ip_to_outs
 from pricing_common import et_local_date  # UTC at rest, ET on read
@@ -397,6 +397,17 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         dup_dates = {d for d, c in date_counts.items() if c > 1}
 
         for row in rows:
+            # Never grade a pitcher prop off a batter's gamelog (or vice-versa):
+            # the "K"/"SO" strikeout labels collide across MLB roles, so
+            # _stat_label_for would bind the wrong role's log (mirrors
+            # backtest._role_matches_gamelog on the main sweep and the
+            # recalibration ESPN-grading guard). A role mismatch drops just this
+            # row; non-MLB props (role None) always pass. Hardening — 0 known
+            # instances given id-based resolution, but cheap insurance against a
+            # namesake / id-map slip pooling a cross-role game into the fit.
+            if not _role_matches_gamelog(row["prop_key"], gamelog):
+                skipped_no_game += 1
+                continue
             stat_label = _stat_label_for(row["prop_key"], gamelog)
             if not stat_label:
                 continue

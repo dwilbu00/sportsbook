@@ -173,8 +173,8 @@ class RefitSportRealLinesTests(unittest.TestCase):
             },
         }
 
-    def _run(self, sel_map, harvest=None, join=None):
-        existing = self._existing()
+    def _run(self, sel_map, harvest=None, join=None, existing=None):
+        existing = existing if existing is not None else self._existing()
         save_mock = MagicMock()
         # build returns a per-prop marker list so the patched selector can key
         # off the prop; the actual projection math is not exercised here.
@@ -256,6 +256,104 @@ class RefitSportRealLinesTests(unittest.TestCase):
              patch.object(refit_calibration, "save_calibration", save_mock):
             refit_calibration.refit_sport_real_lines("mlb")
         save_mock.assert_not_called()
+
+    # ── Incumbent protection (anti-churn on thin real-line samples) ──
+
+    def test_thin_flip_is_suppressed(self):
+        # pitcher_strikeouts ships A; the selector proposes A->B but on only 300
+        # real-line obs (< MIN_REAL_LINE_OVERRIDE_OBS): too thin to trust the
+        # 2-fold gate, so the incumbent is kept and NOTHING is written.
+        thin_b = {"method": "B", "fit_brier": 0.2612, "baseline_brier": 0.2774,
+                  "cv_brier": 0.2650, "confirmed": True, "residual_mu": 0.0,
+                  "residual_sigma": 1.0, "residual_ecdf": [0.0], "n_obs": 300,
+                  "single_split": {"A": 0.2774, "B": 0.2612}}
+        _, save_mock = self._run({"batter_hits": None,
+                                  "pitcher_strikeouts": thin_b})
+        save_mock.assert_not_called()
+
+    def test_deep_flip_writes_while_thin_flip_suppressed(self):
+        # batter_hits flips A->C on a DEEP sample (>=500) -> written; the thin
+        # pitcher_strikeouts A->B flip is suppressed in the SAME run.
+        deep_c = {"method": "C", "fit_brier": 0.2424, "baseline_brier": 0.2472,
+                  "cv_brier": 0.2411, "confirmed": True, "residual_mu": 0.05,
+                  "residual_sigma": 0.8, "residual_ecdf": [-2.0, 0.0, 2.0],
+                  "n_obs": 938, "single_split": {"A": 0.2472, "C": 0.2424}}
+        thin_b = {"method": "B", "fit_brier": 0.26, "baseline_brier": 0.277,
+                  "cv_brier": 0.265, "confirmed": True, "residual_mu": 0.0,
+                  "residual_sigma": 1.0, "residual_ecdf": [0.0], "n_obs": 300,
+                  "single_split": {"A": 0.277, "B": 0.26}}
+        _, save_mock = self._run({"batter_hits": deep_c,
+                                  "pitcher_strikeouts": thin_b})
+        self.assertEqual(save_mock.call_count, 1)
+        changed = save_mock.call_args[0][1]
+        self.assertEqual(set(changed.keys()), {"batter_hits"})
+        self.assertEqual(changed["batter_hits"]["method"], "C")
+
+    def test_worse_than_incumbent_flip_suppressed(self):
+        # A deep sample where the selector lands on the safe baseline A, but the
+        # incumbent B still scores BETTER than A on the single split (B beat A
+        # pooled and only lost a confirmation fold). Flipping B->A would drop the
+        # stronger method for no gain -> keep B, write nothing.
+        existing = self._existing()
+        existing["pitcher_strikeouts"]["method"] = "B"
+        pick_a = {"method": "A", "fit_brier": 0.278, "baseline_brier": 0.278,
+                  "cv_brier": None, "confirmed": False, "residual_mu": 0.0,
+                  "residual_sigma": 1.0, "residual_ecdf": [0.0], "n_obs": 800,
+                  "single_split": {"A": 0.278, "B": 0.265}}
+        _, save_mock = self._run({"batter_hits": None,
+                                  "pitcher_strikeouts": pick_a},
+                                 existing=existing)
+        save_mock.assert_not_called()
+
+
+class IncumbentProtectedUnitTests(unittest.TestCase):
+    """Pure-function tests of refit_calibration._incumbent_protected — the
+    anti-churn guard that suppresses a thin / not-better real-line method flip."""
+
+    P = staticmethod(refit_calibration._incumbent_protected)
+
+    def test_no_flip_returns_none(self):
+        self.assertIsNone(self.P(
+            {"method": "E", "n_obs": 3000, "single_split": {}}, "E"))
+
+    def test_no_incumbent_returns_none(self):
+        self.assertIsNone(self.P({"method": "C", "n_obs": 3000}, None))
+        self.assertIsNone(self.P({"method": "C", "n_obs": 3000}, ""))
+
+    def test_falsy_sel_returns_none(self):
+        self.assertIsNone(self.P(None, "A"))
+
+    def test_thin_flip_protected(self):
+        note = self.P(
+            {"method": "B", "n_obs": 300,
+             "single_split": {"A": 0.277, "B": 0.261}}, "A")
+        self.assertIsNotNone(note)
+        self.assertIn("too thin", note)
+
+    def test_deep_flip_pick_better_allowed(self):
+        self.assertIsNone(self.P(
+            {"method": "C", "n_obs": 900,
+             "single_split": {"A": 0.247, "C": 0.242}}, "A"))
+
+    def test_deep_flip_pick_worse_protected(self):
+        note = self.P(
+            {"method": "A", "n_obs": 900,
+             "single_split": {"A": 0.278, "B": 0.265}}, "B")
+        self.assertIsNotNone(note)
+        self.assertIn("not better", note)
+
+    def test_deep_flip_incumbent_unscored_allowed(self):
+        # incumbent method absent from single_split -> can't compare the pick to
+        # it -> allow the (deep, gate-confirmed) flip rather than block blindly.
+        self.assertIsNone(self.P(
+            {"method": "C", "n_obs": 900,
+             "single_split": {"A": 0.247, "C": 0.242}}, "D"))
+
+    def test_custom_min_override_obs(self):
+        sel = {"method": "B", "n_obs": 300,
+               "single_split": {"A": 0.28, "B": 0.26}}
+        self.assertIsNotNone(self.P(sel, "A"))                       # default 500
+        self.assertIsNone(self.P(sel, "A", min_override_obs=100))    # lowered
 
 
 class VariantGateTests(unittest.TestCase):
@@ -483,6 +581,34 @@ class JoinToActualsTests(unittest.TestCase):
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
                            + [("2026-07-24", 2), ("2026-07-24", 0)])
         self.assertEqual(self._join([self._book_row()], gl), [])
+
+    def _pitcher_gamelog(self, dates_k):
+        # Pitcher rows carry IP (the pitcher discriminator) plus K/SO.
+        return [{"game_date": f"{d}T23:00:00Z", "IP": 6.0, "K": k, "SO": k}
+                for d, k in dates_k]
+
+    def test_join_drops_pitcher_prop_on_batter_gamelog(self):
+        # A pitcher_strikeouts book line pooled (via a namesake / id-map slip)
+        # onto a BATTER's gamelog: the shared "SO" label would bind and grade the
+        # bet off the batter's whiffs. The role gate drops the row instead.
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
+                           + [("2026-07-24", 2)])
+        for g in gl:
+            g["SO"] = 1                       # would let _stat_label_for match
+        row = self._book_row(line=5.5)
+        row["prop_key"] = "pitcher_strikeouts"
+        self.assertEqual(self._join([row], gl), [])
+
+    def test_join_grades_pitcher_prop_on_pitcher_gamelog(self):
+        # Role matches -> the gate is transparent; the pitcher prop grades on "K".
+        gl = self._pitcher_gamelog(
+            [(f"2026-07-{d:02d}", 7) for d in range(12, 24)] + [("2026-07-24", 9)])
+        row = self._book_row(line=5.5)
+        row["prop_key"] = "pitcher_strikeouts"
+        out = self._join([row], gl)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["actual"], 9.0)
+        self.assertEqual(out[0]["stat_label"], "K")
 
 
 class JoinIdBridgeTests(_Backend, unittest.TestCase):

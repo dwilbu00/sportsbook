@@ -1507,6 +1507,19 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
             return None
+        # Never grade a pitcher prop off a batter's gamelog (or vice-versa): the
+        # "K"/"SO" strikeout labels collide across MLB roles, so _stat_label
+        # would bind the wrong role's log (mirrors backtest._role_matches_gamelog
+        # and the book-line calibration guard). Non-MLB props (role None) always
+        # pass. Lazy import — backtest imports recalibration, so a top-level
+        # import would be circular. Fail-open: if the guard can't load, grade as
+        # before (defensive hardening, not a load-bearing dependency).
+        try:
+            from backtest import _role_matches_gamelog
+            if not _role_matches_gamelog(prop_key, gamelog):
+                return None
+        except Exception:
+            pass
         stat_label = _stat_label(prop_key, gamelog)
         if not stat_label:
             return None

@@ -38,6 +38,20 @@ from espn_client import list_season_athletes
 # gets shipped and advertises an optimistic fit_brier. See P1.4.
 MIN_CALIB_BRIER_GAIN = 0.002
 
+# ── Incumbent protection at real book lines (anti-churn on thin samples) ──
+# The 2-fold real-line confirmation gate is unreliable below a few hundred obs:
+# a thin prop's fold verdict flips run-to-run as the chronological split boundary
+# shifts (observed live: pitcher_strikeouts read B->A one day and B-crushes-A the
+# next, both at n~300). Re-selecting on that noise churns the shipped method for
+# no real gain. So a real-line result may OVERRIDE the shipped method only when
+# the sample is deep enough to trust the gate (see _incumbent_protected). Deep
+# props (batter_hits, n~3.7k) are unaffected; thin props (pitcher_*, n~200-330
+# today) hold their incumbent until they earn the override. Conservative floor —
+# comfortably above every thin pitcher prop and far below batter_hits; revisit as
+# the warehouse accrues. This is a gate PARAMETER, so a --real-lines write that
+# changes it needs the same explicit approval as any other calibration write.
+MIN_REAL_LINE_OVERRIDE_OBS = 500
+
 # ── ROI tiebreaker within the Brier noise band (§2.6-adjacent) ──
 # When >=2 calibration methods land within MIN_CALIB_BRIER_GAIN of each other on
 # the single holdout (i.e. Brier can't tell them apart — including a confirmed
@@ -194,6 +208,37 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
         line_methods.append(entry)
         prev_cap = cap
     return line_methods if adopted_any else None
+
+
+def _incumbent_protected(sel, old_method, min_override_obs=MIN_REAL_LINE_OVERRIDE_OBS):
+    """Return a reason string when a proposed real-line method FLIP away from the
+    shipped ``old_method`` should be SUPPRESSED (keep the incumbent), else None.
+
+    Two anti-churn guards (see MIN_REAL_LINE_OVERRIDE_OBS):
+      • thin sample — ``sel['n_obs'] < min_override_obs``: the 2-fold gate is too
+        noisy at this depth to trust an override.
+      • not-better-than-incumbent — the newly-selected method scores WORSE than
+        the incumbent on the current single chronological split. The selector can
+        land on the safe baseline A over a synthetic-sweep B that beats A pooled
+        but loses a confirmation fold; flipping B->A there would drop a method
+        that is actually stronger on the split for no gain.
+
+    Never fires (returns None) when no flip is proposed, when there is no
+    incumbent to protect (``old_method`` falsy — a brand-new prop is fit by the
+    synthetic sweep first), or when ``sel`` is falsy. Pure/side-effect-free so it
+    is unit-testable in isolation; the caller reverts ``sel['method']`` on a hit."""
+    if not sel or not old_method or sel.get("method") == old_method:
+        return None
+    n_obs = sel.get("n_obs") or 0
+    if n_obs < min_override_obs:
+        return (f"real-line n={n_obs} < {min_override_obs} — too thin to override "
+                f"incumbent {old_method}")
+    ss = sel.get("single_split") or {}
+    inc_b, pick_b = ss.get(old_method), ss.get(sel.get("method"))
+    if inc_b is not None and pick_b is not None and pick_b > inc_b + 1e-9:
+        return (f"selected {sel.get('method')} (single-split brier {pick_b:.4f}) "
+                f"not better than incumbent {old_method} ({inc_b:.4f})")
+    return None
 
 
 def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
@@ -820,6 +865,18 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             continue
 
         old_method = cfg.get("method")
+
+        # ── Incumbent protection: suppress a thin / not-better real-line flip ──
+        # (see _incumbent_protected / MIN_REAL_LINE_OVERRIDE_OBS). Revert sel to
+        # the incumbent BEFORE the per-line-bucket pass so buckets inherit and
+        # compare against the method we will actually keep, and so pooled_flip
+        # below evaluates to False. Only the shipped pooled method is protected;
+        # a projection-basis re-fit (xBA blend) and per-bucket overrides are
+        # unaffected. Deep props (batter_hits) never trip this.
+        protect_note = _incumbent_protected(sel, old_method)
+        if protect_note:
+            sel["method"] = old_method
+
         # Data-gated line-conditional selection (batter_hits): may adopt a
         # different method per line bucket. Computed against the POOLED method so
         # a bucket only flips when it genuinely beats pooling on that bucket.
@@ -841,9 +898,14 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             note = f"real-line eval confirms method {old_method}"
             if "line_methods" not in cfg:
                 kept.append(prop_key)
-                print(f"  [keep]   {prop_key}: method {old_method} confirmed at "
-                      f"real lines (brier {sel['fit_brier']} vs baseline-A "
-                      f"{sel['baseline_brier']}, n={sel['n_obs']})")
+                if protect_note:
+                    print(f"  [keep]   {prop_key}: incumbent {old_method} "
+                          f"PROTECTED — {protect_note} (selector proposed a flip; "
+                          f"suppressed)")
+                else:
+                    print(f"  [keep]   {prop_key}: method {old_method} confirmed "
+                          f"at real lines (brier {sel['fit_brier']} vs baseline-A "
+                          f"{sel['baseline_brier']}, n={sel['n_obs']})")
                 continue
             # A previously-written line_methods no longer qualifies → drop it.
             new_cfg = dict(cfg)
