@@ -798,18 +798,66 @@ def project_and_empirical(obs, params, sport_key,
     # the projection AND divide the line, so methods A-E all move (unlike the
     # `center` operator, which only touched the mean).
     feat_strengths = prop_features.strengths_from_params(params)
-    line_eff = line
+    feat_mult = 1.0
     if feat_strengths:
-        feat_mult = prop_features.projection_multiplier(
+        fm = prop_features.projection_multiplier(
             obs.get("prop_key"), feat_strengths,
             [g.get("game_date") for g in prior_games], obs.get("game_date"),
             gamecontext_factors=obs.get("gc_factor"),
             platoon_factor=obs.get("platoon_factor"))
-        if feat_mult and feat_mult != 1.0:
-            projected *= feat_mult
-            line_eff = line / feat_mult
+        if fm:
+            feat_mult = fm
 
-    # Empirical over-probability AT THE (feature-shifted) BOOK LINE
+    # ── Park-factor road-context delta (P1.2), mirroring production combined_mult ──
+    # Reconstruct production's park_mult offline so the re-fit residual basis (and
+    # the shifted comparison line) match the LIVE projection, which already scales
+    # batter_hits / pitcher_earned_runs by park via combined_mult -> avg_stat /
+    # effective_line (props.py:1213-1258). Uses props._park_factor_mult -- the SAME
+    # function the runtime calls -- with the identical past-park reconstruction:
+    # each past game's park is the player's own team's park when he was home, else
+    # the opponent's park; the upcoming park is always the home team's. Strictly
+    # leakage-safe (static park table, no future data). park_factor_strength is not
+    # a swept knob and no MLB prop overrides it, so this resolves to the sport
+    # default (1.0 for MLB) -- matching production's _knob fallback. Fails open to
+    # 1.0 for park-neutral props, prediction-log rows (home_team None), unknown
+    # parks, or any error -- never breaks the refit.
+    park_mult = 1.0
+    try:
+        import props
+        park_strength = params.get("park_factor_strength")
+        if park_strength is None:
+            park_strength = props._player_prop_park_strength(sport_key)
+        if park_strength and park_strength > 0:
+            home_team = obs.get("home_team")
+            player_team_name = (
+                home_team if upcoming_is_home is True
+                else obs.get("away_team") if upcoming_is_home is False
+                else None)
+            past_parks = []
+            for ph, opp in zip(prior_home_aways, prior_opponents):
+                if ph is True:
+                    past_parks.append(player_team_name)
+                elif ph is False:
+                    past_parks.append(opp)
+                else:
+                    past_parks.append(None)
+            park_mult, _pm = props._park_factor_mult(
+                obs.get("prop_key"), past_parks, weights, home_team,
+                park_strength)
+    except Exception:
+        park_mult = 1.0   # fail open -- never let park reconstruction break the refit
+
+    # Fold the feature + park multipliers into the projection AND the comparison
+    # line (mirrors props.py combined_mult: scale the projection, divide the line).
+    # Both == 1.0 -> projection AND line stay byte-identical to production (the
+    # diagnostic self-check), so methods A-E are unchanged wherever no factor fires.
+    combined_mult = feat_mult * park_mult
+    line_eff = line
+    if combined_mult and combined_mult != 1.0:
+        projected *= combined_mult
+        line_eff = line / combined_mult
+
+    # Empirical over-probability AT THE (feature + park-shifted) BOOK LINE
     empirical_over = _weighted_rate(
         prior_values, weights, lambda v: v > line_eff)
 

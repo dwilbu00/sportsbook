@@ -629,6 +629,74 @@ class JoinToActualsTests(unittest.TestCase):
         self.assertEqual(out[0]["stat_label"], "K")
 
 
+class OfflineParkProjectionTests(unittest.TestCase):
+    """`project_and_empirical` reconstructs production's park-factor road-context
+    delta (props.py combined_mult) so the re-fit residual basis matches the LIVE
+    projection. These pin the three behaviours the "measure, then decide" dry-run
+    established: (1) a park-eligible prop folds park into BOTH the projection and
+    the comparison line; (2) a park-neutral prop is byte-identical to the no-park
+    path (the pitcher_outs control); (3) a prediction-log row (home_team None)
+    fails open to no shift. Park never changes a shipped method today, but it must
+    keep behaving this way as the warehouse grows."""
+
+    def _obs(self, prop="batter_hits", stat="H", home="Reds", away="Guardians",
+             upcoming_home=True, line=1.0, values=None):
+        # 12 prior games, all played at home (past_parks -> player's own park),
+        # so a non-1.0 upcoming park produces a genuine road-context delta. MLB
+        # rows carry MIN 0.0 (no minutes filter). Values straddle line/1.10 so
+        # the line-shift is observable in the empirical over-rate.
+        values = values if values is not None else [1, 2, 0, 1, 2, 1, 0, 1, 2, 1, 1, 0]
+        prior = [{stat: float(v), "is_home": True, "opponent": away,
+                  "game_date": f"2026-06-{i + 1:02d}", "MIN": 0.0}
+                 for i, v in enumerate(values)]
+        return {
+            "prop_key": prop, "stat_label": stat, "line": line,
+            "home_team": home, "away_team": away,
+            "test_game": {"is_home": upcoming_home},
+            "prior_games": prior,
+            "game_date": "2026-07-01", "player": "A. Batter",
+        }
+
+    def test_park_folds_into_projection_and_line(self):
+        obs = self._obs()
+        params = {"half_life": 5.0}
+        with patch("props._park_factor_mult", return_value=(1.10, {"kind": "hits"})):
+            proj_on, emp_on = blc.project_and_empirical(obs, params, "baseball_mlb")
+        with patch("props._park_factor_mult", return_value=(1.0, None)):
+            proj_off, emp_off = blc.project_and_empirical(obs, params, "baseball_mlb")
+        # Projection scales by the park multiplier (mean-scale).
+        self.assertAlmostEqual(proj_on, proj_off * 1.10, places=9)
+        # The comparison line shifts by the inverse (line/1.10 < line), so at least
+        # one prior value (the 1.0s) now clears it -> a strictly higher over-rate.
+        self.assertGreater(emp_on, emp_off)
+
+    def test_park_neutral_prop_is_byte_identical(self):
+        # batter_strikeouts is not in park_factors.PROP_PARK_KIND -> park_mult 1.0
+        # even with a home team set. Must match an explicitly-neutralized run
+        # exactly (the pitcher_outs 0.3056/0.3056 control from the dry-run).
+        obs = self._obs(prop="batter_strikeouts", stat="SO",
+                        values=[0, 1, 2, 1, 0, 1, 1, 2, 0, 1, 1, 0], line=1.5)
+        params = {"half_life": 5.0}
+        proj_real, emp_real = blc.project_and_empirical(obs, params, "baseball_mlb")
+        with patch("props._park_factor_mult", return_value=(1.0, None)):
+            proj_neut, emp_neut = blc.project_and_empirical(obs, params, "baseball_mlb")
+        self.assertEqual((proj_real, emp_real), (proj_neut, emp_neut))
+
+    def test_park_fails_open_on_prediction_log_row(self):
+        # Prediction-log rows carry no game frame (home_team None, is_home None).
+        # The upcoming park is unknown -> _park_factor_mult fails closed to 1.0,
+        # so the projection is unshifted (identical to a neutralized run).
+        obs = self._obs()
+        obs["home_team"] = None
+        obs["away_team"] = None
+        obs["test_game"] = {"is_home": None}
+        params = {"half_life": 5.0}
+        proj_real, emp_real = blc.project_and_empirical(obs, params, "baseball_mlb")
+        with patch("props._park_factor_mult", return_value=(1.0, None)):
+            proj_neut, emp_neut = blc.project_and_empirical(obs, params, "baseball_mlb")
+        self.assertEqual((proj_real, emp_real), (proj_neut, emp_neut))
+
+
 class JoinIdBridgeTests(_Backend, unittest.TestCase):
     """join_book_lines_to_actuals pivots athlete-id resolution onto the book
     line's player_mlb_id via the SFBB bridge (MLBAM→ESPN), bypassing the
