@@ -365,8 +365,8 @@ GO
 -- cache (cache/backtest/*.json) so completed games survive Cloud restarts.
 -- Per-sport dense fact tables: columns = ONLY the stats the app reads, so a read
 -- reconstructs the exact get_athlete_gamelog dict shape. Mirrors gamelog_store.py
--- (test_gamelog_store.py::SchemaParityTests enforces it). MLB + NBA only; NFL and
--- other sports pass through to direct ESPN with no persistence. season_bucket 0 =
+-- (test_gamelog_store.py::SchemaParityTests enforces it). MLB + NBA + NFL; other
+-- sports (e.g. NHL) pass through to direct ESPN with no persistence. season_bucket 0 =
 -- current/None season; a specific past year is its own immutable bucket.
 -- game_date is the FULL ISO timestamp (its time component disambiguates
 -- doubleheaders). Refresh is DELETE+INSERT per (athlete, season_bucket).
@@ -437,6 +437,31 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.nba_gamelog'))
 CREATE INDEX ix_nba_gamelog_athlete
     ON dbo.nba_gamelog (athlete_id, season_bucket);
+GO
+
+--------------------------------------------------------------------- nfl_gamelog
+-- ONE position-dependent row per game; the app reads only two labels (pass/rush
+-- yds both -> [YDS]; anytime TD -> [TD]). [YDS] is passing yds for a QB, rushing
+-- for a RB, receiving for a WR (see gamelog_store._NFL_STATS).
+IF OBJECT_ID('dbo.nfl_gamelog', 'U') IS NULL
+CREATE TABLE dbo.nfl_gamelog (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,
+    season_bucket INT NOT NULL,
+    game_key      NVARCHAR(220),
+    game_date     NVARCHAR(40),
+    opponent      NVARCHAR(160),
+    is_home       BIT,
+    team_id       NVARCHAR(32),
+    completed     BIT,
+    [YDS] FLOAT, [TD] FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_gamelog_athlete'
+                 AND object_id = OBJECT_ID('dbo.nfl_gamelog'))
+CREATE INDEX ix_nfl_gamelog_athlete
+    ON dbo.nfl_gamelog (athlete_id, season_bucket);
 GO
 
 --------------------------------------------------------------- gamelog_fetch_meta

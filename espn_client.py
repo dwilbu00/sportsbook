@@ -1003,10 +1003,10 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
 
     # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact
     # extraction/return below is reused (identical result-dict shape). Gated on a
-    # sport that has a fact table; other sports (NFL) keep the direct path
+    # sport that has a fact table; other sports (e.g. NHL) keep the direct path
     # unchanged. gamelog_store.get_gamelog handles the MLB pitcher fallback.
     use_sql = (db_store is not None and db_store.enabled()
-               and sport in ("baseball", "basketball"))
+               and sport in ("baseball", "basketball", "football"))
     if use_sql:
         import gamelog_store
         athlete = gamelog_store.get_athlete_id(sport, league, player_name,

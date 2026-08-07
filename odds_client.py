@@ -836,6 +836,22 @@ PROP_LABELS = {
 }
 
 
+def _prop_side(market_key, side):
+    """Normalize an outcome's side to Over/Under. The anytime-TD market is a
+    two-way Yes/No market where Yes == Over 0.5 TDs (the player scores) and No ==
+    Under; map it so the two-sided de-vig/line machinery treats it like any other
+    Over/Under prop (its line is pinned to 0.5 alongside). All other markets pass
+    through unchanged. If a book posts only the Yes side, the downstream
+    two-sided requirement still drops it -- no fictitious one-sided market, so
+    this is a strict improvement over silently discarding every anytime-TD."""
+    if market_key == "player_anytime_td":
+        if side == "Yes":
+            return "Over"
+        if side == "No":
+            return "Under"
+    return side
+
+
 def _dk_offer(side_offers, book_key="draftkings"):
     """First offer whose book title matches DraftKings (case-insensitive), or
     None. Used to carve the executable DK price out of the multi-book set for
@@ -871,7 +887,7 @@ def dk_prop_lines(game_data, prop_key, book_key="draftkings"):
                 by_pl = {}
                 for outcome in market.get("outcomes", []) or []:
                     player = outcome.get("description")
-                    side = outcome.get("name")
+                    side = _prop_side(prop_key, outcome.get("name"))
                     if not player or side not in ("Over", "Under"):
                         continue
                     line = (0.5 if prop_key == "player_anytime_td"
@@ -1026,7 +1042,7 @@ def parse_player_props(game_data):
                 player = outcome.get("description")
                 if not player:
                     continue
-                side = outcome.get("name")
+                side = _prop_side(market_key, outcome.get("name"))
                 if side not in ("Over", "Under"):
                     continue
                 line = (0.5 if market_key == "player_anytime_td"

@@ -23,7 +23,7 @@ Design
   stored once. Each TTL-expired fetch DELETEs + re-INSERTs that athlete's rows
   (portable across SQLite + mssql; no MERGE/upsert), guarded so a transient
   partial response can't clobber a good log.
-* **MLB + NBA only.** NFL (and any other sport) has no fact table -> the store
+* **MLB + NBA + NFL.** Other sports (e.g. NHL) have no fact table -> the store
   passes through to the direct ESPN calls without persisting, so nothing
   regresses when SQL is on. Batter vs pitcher is one endpoint now (real
   per-game pitcher gamelogs); the synthesized-splits fallback is dormant.
@@ -89,6 +89,12 @@ _META = MetaData()
 _BATTER_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH")
 _PITCHER_STATS = ("IP", "K", "ER")
 _NBA_STATS = ("MIN", "PTS", "REB", "AST")
+# NFL gamelogs are ONE position-dependent row per game; across all three NFL props
+# the app reads only two labels -- pass/rush yds both resolve to "YDS" (passing
+# for a QB, rushing for a RB, receiving for a WR) and anytime-TD to "TD" -- so,
+# like _NBA_STATS, this keeps only what's read (verified against the live ESPN
+# NFL gamelog contract), not the full ~18-label row.
+_NFL_STATS = ("YDS", "TD")
 # Metadata keys re-emitted on every reconstructed row.
 _META_KEYS = ("opponent", "is_home", "team_id", "game_date", "completed")
 
@@ -113,12 +119,14 @@ def _fact_table(name, stat_cols):
 mlb_batter_gamelog = _fact_table("mlb_batter_gamelog", _BATTER_STATS)
 mlb_pitcher_gamelog = _fact_table("mlb_pitcher_gamelog", _PITCHER_STATS)
 nba_gamelog = _fact_table("nba_gamelog", _NBA_STATS)
+nfl_gamelog = _fact_table("nfl_gamelog", _NFL_STATS)
 
 # (player_type -> (Table, stat columns)). player_type is stored on the meta row.
 _TABLE_FOR = {
     "batter": (mlb_batter_gamelog, _BATTER_STATS),
     "pitcher": (mlb_pitcher_gamelog, _PITCHER_STATS),
     "nba": (nba_gamelog, _NBA_STATS),
+    "nfl": (nfl_gamelog, _NFL_STATS),
 }
 
 # TTL gate + which fact table an athlete lives in.
@@ -189,7 +197,7 @@ def _now():
 # ESPN fetch (raw) + classification
 # ──────────────────────────────────────────────────────────────────────────────
 def _sport_has_table(sport):
-    return sport in ("baseball", "basketball")
+    return sport in ("baseball", "basketball", "football")
 
 
 def _fetch_espn(sport, league, athlete_id, season_year, player_name=None):
@@ -221,6 +229,8 @@ def _classify(sport, rows, via_pitcher):
     contain H). The splits fallback is always pitcher."""
     if sport == "basketball":
         return "nba"
+    if sport == "football":
+        return "nfl"
     if sport == "baseball":
         if via_pitcher or any("IP" in r for r in rows):
             return "pitcher"

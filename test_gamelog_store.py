@@ -38,6 +38,16 @@ def _nba_row(game_date, pts=25.0, reb=8.0, ast=6.0, minutes=34.0):
             "game_date": game_date, "completed": True}
 
 
+def _nfl_row(game_date, yds=88.0, td=1.0, opp="Bears", home=True, team="3",
+             completed=True):
+    """A realistic ESPN NFL gamelog row: ONE position-dependent row per game with
+    ~18 labels; the store keeps only the two the app reads (YDS, TD)."""
+    return {"CMP": 22.0, "ATT": 33.0, "YDS": yds, "CMP%": 66.7, "AVG": 4.0,
+            "TD": td, "INT": 0.0, "LNG": 40.0, "SACK": 1.0, "RTG": 105.0,
+            "QBR": 70.0, "CAR": 3.0, "opponent": opp, "is_home": home,
+            "team_id": team, "game_date": game_date, "completed": completed}
+
+
 class _Backend:
     def setUp(self):
         db_store.configure_engine("sqlite://")
@@ -97,6 +107,23 @@ class RoundTripTests(_Backend, unittest.TestCase):
                          {"MIN", "PTS", "REB", "AST", "opponent", "is_home",
                           "team_id", "game_date", "completed"})
         self.assertEqual(served[0]["PTS"], 25.0)
+
+    def test_nfl_roundtrip_reduced_shape(self):
+        rows = [_nfl_row("2025-09-14T18:00:00.000+00:00", yds=305.0, td=2.0),
+                _nfl_row("2025-09-07T18:00:00.000+00:00", yds=210.0, td=1.0)]
+        with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
+            first = gamelog_store.get_gamelog("football", "nfl", "n1")
+            self.assertEqual(len(first), 2)          # fetch path returns raw rows
+        with patch.object(espn_client, "get_athlete_gamelog") as mock:
+            served = gamelog_store.get_gamelog("football", "nfl", "n1")
+            mock.assert_not_called()                  # 2nd served from SQL
+        self.assertEqual(len(served), 2)
+        # Only the two consumer-read labels survive; the ~16 others are dropped.
+        self.assertEqual(set(served[0]),
+                         {"YDS", "TD", "opponent", "is_home", "team_id",
+                          "game_date", "completed"})
+        self.assertEqual(served[0]["YDS"], 305.0)
+        self.assertEqual(served[0]["TD"], 2.0)
 
 
 class TtlGateTests(_Backend, unittest.TestCase):
@@ -174,9 +201,9 @@ class ClobberGuardTests(_Backend, unittest.TestCase):
 
 class ClassificationTests(_Backend, unittest.TestCase):
 
-    def _player_type(self, aid):
+    def _player_type(self, aid, sport="baseball", league="mlb"):
         with db_store.get_engine().connect() as conn:
-            meta = gamelog_store._read_meta(conn, "baseball", "mlb", aid, 0)
+            meta = gamelog_store._read_meta(conn, sport, league, aid, 0)
         return meta["player_type"] if meta else None
 
     def test_pitcher_classified_by_ip(self):
@@ -199,15 +226,22 @@ class ClassificationTests(_Backend, unittest.TestCase):
             gamelog_store.get_gamelog("baseball", "mlb", "p2")
         self.assertEqual(self._player_type("p2"), "pitcher")
 
-    def test_unknown_sport_passthrough_no_persist(self):
-        rows = [{"YDS": 88.0, "TD": 1.0, "opponent": "Bears", "is_home": True,
-                 "team_id": "3", "game_date": "2026-09-14T18:00:00Z"}]
+    def test_nfl_classified_as_nfl(self):
+        with patch.object(espn_client, "get_athlete_gamelog",
+                          return_value=[_nfl_row("2025-09-14T18:00:00Z")]):
+            gamelog_store.get_gamelog("football", "nfl", "n2")
+        self.assertEqual(self._player_type("n2", "football", "nfl"), "nfl")
+
+    def test_tableless_sport_passthrough_no_persist(self):
+        # A sport with no fact table (e.g. NHL) still passes through to direct
+        # ESPN with no persistence -- nothing regresses when SQL is on.
+        rows = [{"G": 1.0, "A": 2.0, "opponent": "Bruins", "is_home": True,
+                 "team_id": "3", "game_date": "2026-01-14T18:00:00Z"}]
         with patch.object(espn_client, "get_athlete_gamelog", return_value=rows):
-            out = gamelog_store.get_gamelog("football", "nfl", "n1")
+            out = gamelog_store.get_gamelog("hockey", "nhl", "h1")
         self.assertEqual(out, rows)            # passthrough returns raw
-        # Nothing persisted for an unclassifiable sport.
         with db_store.get_engine().connect() as conn:
-            meta = gamelog_store._read_meta(conn, "football", "nfl", "n1", 0)
+            meta = gamelog_store._read_meta(conn, "hockey", "nhl", "h1", 0)
         self.assertIsNone(meta)
 
 
@@ -351,6 +385,11 @@ class SchemaParityTests(_Backend, unittest.TestCase):
         self.assertEqual(
             {c.name for c in gamelog_store.nba_gamelog.columns},
             set(gamelog_store._FACT_META_COLS) | set(gamelog_store._NBA_STATS))
+
+    def test_nfl_columns(self):
+        self.assertEqual(
+            {c.name for c in gamelog_store.nfl_gamelog.columns},
+            set(gamelog_store._FACT_META_COLS) | set(gamelog_store._NFL_STATS))
 
     def test_meta_columns(self):
         self.assertEqual(
