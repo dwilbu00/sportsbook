@@ -399,16 +399,32 @@ def _iter_wager_candidates(ar):
             yield key, "player_prop", None, c
 
 
-# Fractional-Kelly bet-sizing defaults (session-only, all editable in the submit
-# form). Kelly is very sensitive to probability miscalibration, so the shipped
-# default is HALF-Kelly with a per-bet cap and a slate-total exposure cap; those
-# caps — not the fraction alone — are the real safety margin.
+# Fractional-Kelly bet-sizing defaults. The three limiters are editable in the
+# submit form and PERSIST across sessions (via bankroll.save/load_kelly_settings);
+# the bankroll Kelly scales against is the durable ledger balance
+# (bankroll.current_balance()), not a knob. Kelly is very sensitive to probability
+# miscalibration, so the shipped default is HALF-Kelly with a per-bet cap and a
+# slate-total exposure cap; those caps — not the fraction alone — are the real
+# safety margin.
 _KELLY_DEFAULTS = {
-    "kelly_bankroll": 1000.0,     # $ — the DraftKings bankroll Kelly scales against
     "kelly_fraction": 0.5,        # 0-1 multiplier on the full-Kelly fraction
     "kelly_cap_pct": 5.0,         # per-bet hard cap, % of bankroll
     "kelly_slate_cap_pct": 25.0,  # slate-total exposure cap, % of bankroll
 }
+
+
+def _save_kelly_settings():
+    """Persist the three Kelly limiters durably (best-effort) so they survive a
+    new session, not just a page switch. Runs as an on_change callback after the
+    edited value has committed to session_state."""
+    try:
+        import bankroll as bankroll_mod
+        bankroll_mod.save_kelly_settings(
+            _kelly_float("kelly_fraction"),
+            _kelly_float("kelly_cap_pct"),
+            _kelly_float("kelly_slate_cap_pct"))
+    except Exception:
+        pass
 
 
 def _kelly_float(key):
@@ -435,7 +451,8 @@ def _selected_kelly_rows(ar, valid_keys=None):
     to the currently-rendered checklist (drops phantom ticks); see
     ``_submit_selected_picks``."""
     import wagers
-    bankroll = _kelly_float("kelly_bankroll")
+    import bankroll as bankroll_mod
+    bankroll = bankroll_mod.current_balance()  # durable ledger balance, not a widget
     fraction = _kelly_float("kelly_fraction")
     cap_pct = _kelly_float("kelly_cap_pct")
     slate_pct = _kelly_float("kelly_slate_cap_pct")
@@ -624,7 +641,8 @@ def _render_selected_bet_checklist(entries, ar):
         # rows the Submit callback will persist (same sizing + slate-total cap),
         # so the size is visible before betting.
         _rows, stake_by_key = _selected_kelly_rows(ar, valid_keys)
-        bankroll = _kelly_float("kelly_bankroll")
+        import bankroll as bankroll_mod
+        bankroll = bankroll_mod.current_balance()  # durable ledger balance
 
         def _fmt_stake(s):
             return f"${s:,.2f}" if isinstance(s, (int, float)) else "—"
@@ -651,8 +669,8 @@ def _render_selected_bet_checklist(entries, ar):
             )
         else:
             st.caption(
-                "Enter your bankroll below to size these bets (stakes stay $0.00 "
-                "until a bankroll is set)."
+                "Set your bankroll on the 🧾 My Bets page to size these bets "
+                "(stakes stay $0.00 until the bankroll ledger is above $0)."
             )
         # Submit the checked bets to the actual-bets ledger at the previewed
         # fractional-Kelly stakes, executed at the DK price at submit (tracks REAL
@@ -663,13 +681,8 @@ def _render_selected_bet_checklist(entries, ar):
         # re-instantiate), so clearing the checkbox keys stays safe.
         bank_col, submit_col = st.columns([1, 1])
         with bank_col:
-            st.number_input(
-                "Bankroll ($)", min_value=0.0,
-                value=_KELLY_DEFAULTS["kelly_bankroll"], step=0.01,
-                format="%.2f", key="kelly_bankroll",
-                help="Your DraftKings bankroll. Fractional-Kelly stakes scale "
-                     "against this. Session-only — re-enter it each session.",
-            )
+            st.metric("Bankroll", f"${bankroll:,.2f}")
+            st.caption("Durable ledger balance — manage it on 🧾 My Bets.")
         with submit_col:
             st.button(
                 "✅ Submit Picks", key="submit_picks_btn", width="stretch",
@@ -680,24 +693,25 @@ def _render_selected_bet_checklist(entries, ar):
             st.number_input(
                 "Kelly fraction", min_value=0.0, max_value=1.0,
                 value=_KELLY_DEFAULTS["kelly_fraction"], step=0.05,
-                format="%.2f", key="kelly_fraction",
+                format="%.2f", key="kelly_fraction", on_change=_save_kelly_settings,
                 help="Multiplier on the full-Kelly bet fraction. 0.5 = half-Kelly "
                      "(recommended); lower is more conservative.",
             )
             st.number_input(
                 "Per-bet cap (% of bankroll)", min_value=0.0, max_value=100.0,
                 value=_KELLY_DEFAULTS["kelly_cap_pct"], step=0.5,
-                format="%.1f", key="kelly_cap_pct",
+                format="%.1f", key="kelly_cap_pct", on_change=_save_kelly_settings,
                 help="Hard ceiling on any single bet, as a percent of bankroll.",
             )
             st.number_input(
                 "Slate-total cap (% of bankroll)", min_value=0.0, max_value=100.0,
                 value=_KELLY_DEFAULTS["kelly_slate_cap_pct"], step=1.0,
                 format="%.1f", key="kelly_slate_cap_pct",
+                on_change=_save_kelly_settings,
                 help="Ceiling on total exposure across all submitted bets; the "
                      "batch is scaled down proportionally if it would exceed this.",
             )
-            st.caption("Sizing settings are session-only.")
+            st.caption("Sizing settings are saved across sessions.")
         st.button("Clear selected bets", key="clear_selected_bets",
                   width="stretch", on_click=_clear_bet_selections,
                   args=(valid_keys,))
@@ -1607,6 +1621,89 @@ def render_model_guide():
 _GRADE_STALE_SECONDS = 300
 
 
+def _apply_bankroll_adjustment():
+    """Record a manual bankroll adjustment from the typed target (button
+    callback, fires before widgets re-instantiate). Writes a single transaction
+    for the SIGNED difference target - current, so the ledger balance becomes
+    exactly what the user entered. Best-effort; leaves a flash for the rerun."""
+    import bankroll
+    try:
+        target = float(st.session_state.get("bankroll_adjust_target"))
+    except (TypeError, ValueError):
+        return
+    delta = bankroll.record_adjustment(target)
+    new_balance = bankroll.current_balance()
+    # Re-sync the input to the new balance so it reads correctly next render.
+    st.session_state["bankroll_adjust_target"] = new_balance
+    if abs(delta) < 0.005:
+        st.session_state["_bankroll_flash"] = (
+            "info", f"Bankroll already at ${new_balance:,.2f} — no change.")
+    else:
+        verb = "Deposit" if delta > 0 else "Withdrawal"
+        st.session_state["_bankroll_flash"] = (
+            "success",
+            f"{verb} of ${abs(delta):,.2f} recorded — bankroll now "
+            f"${new_balance:,.2f}.")
+
+
+def _render_bankroll_section():
+    """💰 Bankroll ledger — realized bet P/L plus manual adjustments. The balance
+    is the SUM of every transaction (never stored), so it can't drift when a bet
+    is re-graded; fractional-Kelly stakes on the Value Finder size against it."""
+    import bankroll
+    bsummary = bankroll.summary()
+    with st.container(border=True):
+        st.subheader("💰 Bankroll")
+        bflash = st.session_state.pop("_bankroll_flash", None)
+        if bflash:
+            getattr(st, bflash[0], st.info)(bflash[1])
+        bcols = st.columns(3)
+        bcols[0].metric("Current bankroll", f"${bsummary['balance']:,.2f}")
+        bcols[1].metric("Realized bet P/L", f"${bsummary['bets_total']:+,.2f}")
+        bcols[2].metric("Manual adjustments",
+                        f"${bsummary['adjustments_total']:+,.2f}")
+        st.caption(
+            "Balance = realized P/L from settled bets + your manual adjustments. "
+            "Fractional-Kelly stakes on the 🎯 Value Finder size against it."
+        )
+        with st.expander("Adjust bankroll (deposit / withdrawal / correction)"):
+            st.caption(
+                "Enter your **real** current bankroll. The app writes a single "
+                "adjustment for the difference so the ledger balance becomes "
+                "exactly what you enter — e.g. ledger $700, you withdraw $200 and "
+                "enter $500 → it records −$200; add it back and enter $700 → +$200."
+            )
+            st.number_input(
+                "Current bankroll ($)", min_value=0.0,
+                value=float(bsummary["balance"]), step=0.01, format="%.2f",
+                key="bankroll_adjust_target",
+            )
+            st.button(
+                "Update bankroll", key="bankroll_adjust_btn",
+                on_click=_apply_bankroll_adjustment,
+                help="Record the difference between this value and the current "
+                     "ledger balance as an adjustment transaction.")
+        txns = bsummary["txns"]
+        if txns:
+            with st.expander(f"Bankroll history ({len(txns)} transaction(s))"):
+                # Running balance is cumulative oldest→newest; display newest first.
+                running = 0.0
+                with_balance = []
+                for t in reversed(txns):            # oldest first
+                    running = round(running + bankroll.txn_amount(t), 2)
+                    with_balance.append((t, running))
+                with_balance.reverse()               # newest first for the table
+                st.dataframe([
+                    {
+                        "When": (t.get("created_at") or "")[:19].replace("T", " "),
+                        "Type": (t.get("txn_type") or "").title(),
+                        "Amount": f"${bankroll.txn_amount(t):+,.2f}",
+                        "Balance": f"${bal:,.2f}",
+                        "Note": t.get("note") or "",
+                    } for t, bal in with_balance
+                ], hide_index=True, width="stretch")
+
+
 def render_my_bets():
     """Actual-bets ledger — realized ROI on the picks the user really placed."""
     import wagers
@@ -1617,9 +1714,10 @@ def render_my_bets():
     if flash:
         st.success(flash)
     st.caption(
-        "Realized return on the bets you actually submitted (flat unit stake, "
-        "executed at the model's best price at submit). Bets auto-grade from "
-        "free box scores; closing-line value fills in as the odds warehouse "
+        "Realized return on the bets you actually submitted (fractional-Kelly "
+        "stake off your bankroll, executed at the DK price at submit). Bets "
+        "auto-grade from free box scores and their P/L maintains the bankroll "
+        "ledger below; closing-line value fills in as the odds warehouse "
         "accumulates."
     )
 
@@ -1657,6 +1755,21 @@ def render_my_bets():
             "up** (it resets on the 1st of the month)."
         )
         return
+
+    # Keep the bankroll ledger in step with the CURRENT settled-wager P/L on every
+    # open/rerun (covers grade, re-grade, edit, and delete via one idempotent
+    # sweep; passes the rows already read to avoid a second fetch).
+    try:
+        import bankroll
+        bankroll.reconcile_bet_txns(rows)
+    except Exception:
+        pass
+
+    # 💰 Bankroll — the money header of the money page, rendered BEFORE the
+    # "no bets yet" guard so a new user can set their starting bankroll before
+    # placing a single bet (fractional-Kelly on the Value Finder sizes against it).
+    _render_bankroll_section()
+
     if not rows:
         st.info(
             "No submitted picks yet. On the 🎯 Value Finder page, check "
@@ -1946,11 +2059,24 @@ config = load_config()
 # which is a plain key Streamlit never garbage-collects.
 for _persist_key in list(st.session_state.keys()):
     if (_persist_key in ("sport", "markets", "props", "result_filter",
-                         "kelly_bankroll", "kelly_fraction", "kelly_cap_pct",
+                         "kelly_fraction", "kelly_cap_pct",
                          "kelly_slate_cap_pct", "auto_pick_count",
                          "auto_pick_metric")
             or str(_persist_key).startswith("bet_selection:")):
         st.session_state[_persist_key] = st.session_state[_persist_key]
+
+# Load the durable Kelly limiters once per session (they persist across sessions
+# in the app_settings KV store, not just across page switches). setdefault runs
+# BEFORE the submit-form widgets are created, so each number_input adopts the
+# persisted value instead of the shipped default. Best-effort.
+if not st.session_state.get("_kelly_settings_loaded"):
+    st.session_state["_kelly_settings_loaded"] = True
+    try:
+        import bankroll as _bankroll
+        for _k, _v in _bankroll.load_kelly_settings().items():
+            st.session_state.setdefault(_k, _v)
+    except Exception:
+        pass
 
 # Prefetch the My Bets ledger once per session, BEFORE the page router, so the
 # 🧾 My Bets page opens ready (it then just reads the already-graded durable
@@ -1968,6 +2094,12 @@ if not st.session_state.get("_wagers_prefetched"):
         with st.status("Updating your bet ledger…", expanded=False) as _status:
             _graded = _wagers.resolve_pending_wagers()
             st.session_state["_wagers_graded_at"] = time.time()
+            # Sync realized bet P/L into the bankroll ledger (idempotent).
+            try:
+                import bankroll as _bankroll
+                _bankroll.reconcile_bet_txns()
+            except Exception:
+                pass
             _status.update(
                 label=(f"Updated: {_graded} bet(s) graded." if _graded
                        else "Bet ledger up to date."),

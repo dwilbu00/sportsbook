@@ -642,3 +642,41 @@ CREATE TABLE dbo.id_map_meta (
     CONSTRAINT uq_id_map_meta UNIQUE (map_name)
 );
 GO
+
+--------------------------------------------------------------- bankroll_ledger
+-- One signed transaction per row; the current bankroll is the SUM of all amounts
+-- (the balance is never stored -> a re-graded wager can't leave a stale running
+-- total behind). Two kinds: 'bet' (one per settled wager, amount = its realized
+-- profit, txn_id = 'bet:<wager_id>') and 'adjustment' (a manual deposit/withdrawal/
+-- correction, amount = the signed delta the user's typed target implies).
+IF OBJECT_ID('dbo.bankroll_ledger', 'U') IS NULL
+CREATE TABLE dbo.bankroll_ledger (
+    id          INT IDENTITY(1,1) PRIMARY KEY,
+    txn_id      NVARCHAR(80) NOT NULL,           -- 'bet:<wager_id>' | 'adj:<iso>#<n>'
+    txn_type    NVARCHAR(16),                    -- bet | adjustment
+    amount      FLOAT,                           -- signed dollars
+    wager_id    NVARCHAR(64),                    -- set for 'bet' txns
+    note        NVARCHAR(256),
+    created_at  NVARCHAR(40),
+    CONSTRAINT uq_bankroll_txn UNIQUE (txn_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_bankroll_txn_type'
+                 AND object_id = OBJECT_ID('dbo.bankroll_ledger'))
+CREATE INDEX ix_bankroll_txn_type ON dbo.bankroll_ledger (txn_type);
+GO
+
+------------------------------------------------------------------ app_settings
+-- Durable per-user app settings: a generic key/value store. Currently the Kelly
+-- sizing knobs (fraction / per-bet cap % / slate-total cap %) so they persist
+-- across sessions, not just page switches.
+IF OBJECT_ID('dbo.app_settings', 'U') IS NULL
+CREATE TABLE dbo.app_settings (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    setting_key   NVARCHAR(64) NOT NULL,
+    setting_value NVARCHAR(256),
+    updated_at    NVARCHAR(40),
+    CONSTRAINT uq_app_setting_key UNIQUE (setting_key)
+);
+GO

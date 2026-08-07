@@ -222,6 +222,37 @@ wagers = Table(
     Index("ix_wager_status", "status"),
 )
 
+# Bankroll ledger — one signed transaction per row; the current bankroll is the
+# SUM of all amounts. Two kinds: 'bet' (one per settled wager, amount = its
+# realized profit, txn_id = 'bet:<wager_id>') and 'adjustment' (a manual
+# deposit/withdrawal/correction, amount = the signed delta the user's typed
+# target implies). The balance is never stored — it is derived — so a re-graded
+# wager can't leave a stale running total behind.
+bankroll_ledger = Table(
+    "bankroll_ledger", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("txn_id", String(80), nullable=False),
+    Column("txn_type", String(16)),                      # bet | adjustment
+    Column("amount", Float),                             # signed dollars
+    Column("wager_id", String(64)),                     # set for 'bet' txns
+    Column("note", String(256)),
+    Column("created_at", String(40)),
+    UniqueConstraint("txn_id", name="uq_bankroll_txn"),
+    Index("ix_bankroll_txn_type", "txn_type"),
+)
+
+# Durable per-user app settings — a generic key/value store. Currently the Kelly
+# sizing knobs (fraction / per-bet cap % / slate-total cap %) so they persist
+# across sessions, not just page switches.
+app_settings = Table(
+    "app_settings", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("setting_key", String(64), nullable=False),
+    Column("setting_value", String(256)),
+    Column("updated_at", String(40)),
+    UniqueConstraint("setting_key", name="uq_app_setting_key"),
+)
+
 # Team-market forward tracking — the MODEL's pick per (game, market). Sibling of
 # prediction_log; one row per (sport, event, bet_type) natural identity.
 market_prediction_log = Table(
@@ -382,6 +413,15 @@ _WAGER_SPEC = [
     ("home_code", _s), ("away_code", _s),
 ]
 
+_BANKROLL_SPEC = [
+    ("txn_id", _s), ("txn_type", _s), ("amount", _f), ("wager_id", _s),
+    ("note", _s), ("created_at", _s),
+]
+
+_APP_SETTINGS_SPEC = [
+    ("setting_key", _s), ("setting_value", _s), ("updated_at", _s),
+]
+
 # Team-market forward-tracking columns (event_key is derived, like prediction).
 _MARKET_PREDICTION_SPEC = [
     ("ts", _s), ("sport_key", _s), ("event_id", _s), ("commence_time", _s),
@@ -460,6 +500,12 @@ _NDJSON_TABLES = {
                               "identity": _market_prediction_identity},
     "wagers": {"table": wagers, "spec": _WAGER_SPEC, "derive": lambda row: {},
                "identity": lambda row: {"wager_id": row.get("wager_id")}},
+    "bankroll_ledger": {"table": bankroll_ledger, "spec": _BANKROLL_SPEC,
+                        "derive": lambda row: {},
+                        "identity": lambda row: {"txn_id": row.get("txn_id")}},
+    "app_settings": {"table": app_settings, "spec": _APP_SETTINGS_SPEC,
+                     "derive": lambda row: {},
+                     "identity": lambda row: {"setting_key": row.get("setting_key")}},
 }
 
 
