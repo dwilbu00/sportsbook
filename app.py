@@ -1673,10 +1673,14 @@ def _render_bankroll_section():
                 "exactly what you enter — e.g. ledger $700, you withdraw $200 and "
                 "enter $500 → it records −$200; add it back and enter $700 → +$200."
             )
+            # Prefill the user's real bankroll with the current ledger balance,
+            # but never below the input's floor: before a starting bankroll is
+            # set, settled losses can leave the derived balance negative, and a
+            # value under min_value crashes the widget.
             st.number_input(
                 "Current bankroll ($)", min_value=0.0,
-                value=float(bsummary["balance"]), step=0.01, format="%.2f",
-                key="bankroll_adjust_target",
+                value=max(0.0, float(bsummary["balance"])), step=0.01,
+                format="%.2f", key="bankroll_adjust_target",
             )
             st.button(
                 "Update bankroll", key="bankroll_adjust_btn",
