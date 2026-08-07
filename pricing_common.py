@@ -99,6 +99,71 @@ def profit(american_price, stake, won):
     return (american_to_decimal(american_price) - 1.0) * stake
 
 
+def kelly_fraction(prob, american_price, fraction=0.5, cap=0.05):
+    """Fractional-Kelly stake as a fraction of bankroll, in [0, cap].
+
+    The Kelly optimum for a Bernoulli bet at net decimal odds ``b`` is
+    ``f* = (p*b - (1-p)) / b``, which is exactly ``_expected_roi(p, price) / b``
+    (the expected profit per dollar staked, divided by the net odds). Scaled by
+    ``fraction`` (0.5 = half-Kelly) and clamped to ``cap`` (a hard fraction of
+    bankroll). Returns 0.0 — never a negative or a raise — for a missing price,
+    a non-positive-EV bet (the edge is already gone to the vig, mirroring the
+    ``_prop_is_value`` EV gate), or any degenerate input, so a caller can size a
+    whole slate without guarding each leg."""
+    try:
+        if prob is None or american_price is None:
+            return 0.0
+        er = _expected_roi(prob, american_price)
+        if er is None or er <= 0.0:
+            return 0.0
+        b = american_to_decimal(american_price) - 1.0
+        if b <= 0.0:
+            return 0.0
+        f = fraction * (er / b)
+        if f <= 0.0:
+            return 0.0
+        return min(f, cap)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def kelly_stake(prob, american_price, bankroll, fraction=0.5, cap=0.05):
+    """Dollar stake = ``bankroll * kelly_fraction(...)``, rounded to cents.
+
+    Fail-open to 0.0 on any bad input or a non-positive bankroll, and never
+    negative, so it always satisfies the ledger ``stake >= 0`` constraint."""
+    try:
+        bankroll = float(bankroll)
+    except (TypeError, ValueError):
+        return 0.0
+    if bankroll <= 0.0:
+        return 0.0
+    f = kelly_fraction(prob, american_price, fraction, cap)
+    return round(bankroll * f, 2)
+
+
+def scale_to_slate_cap(stakes, bankroll, cap_fraction):
+    """Proportionally scale a list of dollar stakes so their sum does not exceed
+    ``cap_fraction * bankroll`` (a slate-total exposure cap).
+
+    Returns a NEW list rounded to cents. A no-op (each stake merely rounded) when
+    the sum is already within the cap, or when any input is degenerate — so the
+    caller can apply it unconditionally. Never raises."""
+    try:
+        stakes = [float(s or 0.0) for s in stakes]
+    except (TypeError, ValueError):
+        return list(stakes)
+    try:
+        cap = float(bankroll) * float(cap_fraction)
+    except (TypeError, ValueError):
+        return [round(s, 2) for s in stakes]
+    total = sum(stakes)
+    if cap <= 0.0 or total <= 0.0 or total <= cap:
+        return [round(s, 2) for s in stakes]
+    factor = cap / total
+    return [round(s * factor, 2) for s in stakes]
+
+
 def _prop_is_value(edge, threshold, expected_roi):
     """Decide whether a player prop qualifies as a value bet.
 

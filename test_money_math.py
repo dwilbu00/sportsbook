@@ -13,7 +13,9 @@ import unittest
 
 import analysis
 import odds_client
+import wagers
 from odds_client import american_to_decimal, american_to_implied_prob
+from pricing_common import kelly_fraction, kelly_stake, scale_to_slate_cap
 from recalibration import apply_platt
 
 
@@ -200,6 +202,127 @@ class ApplyPlattTests(unittest.TestCase):
             v = apply_platt(p, 1.0, 0.0)
             self.assertTrue(math.isfinite(v))
             self.assertTrue(0.0 < v < 1.0)
+
+
+class KellySizingTests(unittest.TestCase):
+    """Vig-aware fractional-Kelly bet sizing (P-Kelly). Each assertion pins a
+    hand-computed stake/fraction rather than re-deriving through the code, since a
+    regression here mis-sizes real-money bets."""
+
+    def test_kelly_fraction_basic_half_and_full(self):
+        # p=0.55 at +100 (decimal 2.0, b=1.0): expected ROI 0.10, so full-Kelly
+        # f* = 0.10; half-Kelly = 0.05. cap=1.0 leaves them uncapped.
+        self.assertAlmostEqual(kelly_fraction(0.55, 100, 0.5, 1.0), 0.05, places=9)
+        self.assertAlmostEqual(kelly_fraction(0.55, 100, 1.0, 1.0), 0.10, places=9)
+
+    def test_kelly_fraction_reuses_american_to_decimal(self):
+        # Pin b = decimal - 1 for both American signs (proves reuse of the odds
+        # helper, not a hand-rolled conversion). p chosen so every leg is +EV.
+        p = 0.65
+        for a in (-150, 150, -110, 200):
+            b = american_to_decimal(a) - 1.0
+            er = p * (b + 1.0) - 1.0
+            expected = 0.5 * er / b  # cap 1.0, all +EV so no clamp
+            self.assertAlmostEqual(
+                kelly_fraction(p, a, 0.5, 1.0), expected, places=9,
+                msg=f"mismatch at {a}")
+
+    def test_kelly_fraction_non_positive_ev_is_zero(self):
+        # 0.40 at +100 is -EV -> no stake (mirrors the _prop_is_value EV gate).
+        self.assertEqual(kelly_fraction(0.40, 100, 0.5, 0.05), 0.0)
+        # Break-even (0.50 at +100, ROI exactly 0) also sizes to 0.
+        self.assertEqual(kelly_fraction(0.50, 100, 0.5, 0.05), 0.0)
+
+    def test_kelly_fraction_none_safe(self):
+        self.assertEqual(kelly_fraction(0.60, None, 0.5, 0.05), 0.0)
+        self.assertEqual(kelly_fraction(None, 100, 0.5, 0.05), 0.0)
+        # Probability boundaries must not raise.
+        for p in (0.0, 1.0):
+            self.assertIsInstance(kelly_fraction(p, 100, 0.5, 0.05), float)
+
+    def test_kelly_fraction_cap_clamp(self):
+        # 0.90 at +100: full f* = 0.80, half = 0.40, both clamped to the 5% cap.
+        self.assertAlmostEqual(kelly_fraction(0.90, 100, 0.5, 0.05), 0.05, places=9)
+        self.assertAlmostEqual(kelly_fraction(0.90, 100, 1.0, 0.05), 0.05, places=9)
+
+    def test_kelly_fraction_scales_linearly(self):
+        # 0.60 at +100: full f* = 0.20 (cap 1.0). Fraction scales it linearly.
+        self.assertAlmostEqual(kelly_fraction(0.60, 100, 0.25, 1.0), 0.05, places=9)
+        self.assertAlmostEqual(kelly_fraction(0.60, 100, 0.50, 1.0), 0.10, places=9)
+        self.assertAlmostEqual(kelly_fraction(0.60, 100, 1.00, 1.0), 0.20, places=9)
+        self.assertEqual(kelly_fraction(0.60, 100, 0.0, 1.0), 0.0)
+
+    def test_kelly_stake_dollars_and_rounding(self):
+        # 0.52 at +100: full f* = 0.04, half = 0.02 (under the 5% cap).
+        self.assertAlmostEqual(
+            kelly_stake(0.52, 100, 1000.0, 0.5, 0.05), 20.00, places=2)
+        # Rounds to cents: 333.33 * 0.02 = 6.6666 -> 6.67.
+        self.assertAlmostEqual(
+            kelly_stake(0.52, 100, 333.33, 0.5, 0.05), 6.67, places=2)
+
+    def test_kelly_stake_non_positive_bankroll_or_ev(self):
+        self.assertEqual(kelly_stake(0.60, 100, 0.0, 0.5, 0.05), 0.0)
+        self.assertEqual(kelly_stake(0.60, 100, -500.0, 0.5, 0.05), 0.0)
+        self.assertEqual(kelly_stake(0.40, 100, 1000.0, 0.5, 0.05), 0.0)
+        self.assertEqual(kelly_stake(0.60, None, 1000.0, 0.5, 0.05), 0.0)
+
+    def test_scale_to_slate_cap_scales_down_proportionally(self):
+        # Sum 60 > cap 25 (25% of 100) -> scale by 25/60.
+        out = scale_to_slate_cap([10, 20, 30], 100.0, 0.25)
+        self.assertAlmostEqual(sum(out), 25.00, places=2)
+        self.assertAlmostEqual(out[0], 4.17, places=2)
+        self.assertAlmostEqual(out[1], 8.33, places=2)
+        self.assertAlmostEqual(out[2], 12.50, places=2)
+
+    def test_scale_to_slate_cap_noop_within_cap(self):
+        # Sum 10 <= cap 25 -> unchanged (just rounded).
+        self.assertEqual(scale_to_slate_cap([5, 5], 100.0, 0.25), [5.0, 5.0])
+
+    def test_scale_to_slate_cap_degenerate_inputs(self):
+        # Zero bankroll -> cap 0 -> no scaling, stakes merely rounded.
+        self.assertEqual(scale_to_slate_cap([10, 20], 0.0, 0.25), [10.0, 20.0])
+        # None entries coerce to 0.0 and never raise.
+        out = scale_to_slate_cap([10, None, 20], 100.0, 0.25)
+        self.assertAlmostEqual(sum(out), 25.00, places=2)
+        self.assertEqual(out[1], 0.0)
+
+    def test_build_wager_row_kelly_sizes_stake(self):
+        # End-to-end through the per-bet hook: model_prob 55% (-> 0.55) at the DK
+        # price +100, bankroll 1000, half-Kelly, 5% cap -> f* 0.05 -> $50.00.
+        cand = {
+            "event_id": "E1", "direction": "OVER", "line": 0.5,
+            "dk_over_price": 100, "over_price": 120,  # DK preferred over best-book
+            "over_rate": 55.0, "player": "Test Batter",
+            "prop": "batter_hits", "prop_label": "Hits", "edge_pct": 6.0,
+            "matchup": "AWY @ HOM", "team": "HOM",
+        }
+        meta = {
+            "sport_key": "americanfootball_nfl",  # skips MLB id-enrichment
+            "event_id": "E1", "stake": 0.0, "placed_at": "2026-08-07T00:00:00+00:00",
+            "seq": 0, "kelly": True, "bankroll": 1000.0,
+            "kelly_fraction": 0.5, "kelly_cap": 0.05,
+        }
+        row = wagers.build_wager_row("player_prop", "OVER", cand, meta)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["executed_price"], 100)  # DK, not the +120 best-book
+        self.assertAlmostEqual(row["model_prob"], 0.55, places=9)
+        self.assertAlmostEqual(row["stake"], 50.00, places=2)
+
+    def test_build_wager_row_flat_when_kelly_off(self):
+        # No meta['kelly'] -> the flat _blank_row stake is preserved (fail-open).
+        cand = {
+            "event_id": "E1", "direction": "OVER", "line": 0.5,
+            "dk_over_price": 100, "over_rate": 55.0, "player": "Test Batter",
+            "prop": "batter_hits", "prop_label": "Hits", "edge_pct": 6.0,
+            "matchup": "AWY @ HOM", "team": "HOM",
+        }
+        meta = {
+            "sport_key": "americanfootball_nfl", "event_id": "E1", "stake": 10.0,
+            "placed_at": "2026-08-07T00:00:00+00:00", "seq": 0,
+        }
+        row = wagers.build_wager_row("player_prop", "OVER", cand, meta)
+        self.assertIsNotNone(row)
+        self.assertAlmostEqual(row["stake"], 10.0, places=2)
 
 
 if __name__ == "__main__":

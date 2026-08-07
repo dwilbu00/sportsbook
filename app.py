@@ -399,23 +399,50 @@ def _iter_wager_candidates(ar):
             yield key, "player_prop", None, c
 
 
-def _submit_selected_picks(ar, valid_keys=None):
-    """Record the checked value bets to the actual-bets ledger (flat unit stake,
-    model price). Runs as a (form-)button callback (before widgets re-instantiate),
-    so clearing the checkbox keys afterward is safe.
+# Fractional-Kelly bet-sizing defaults (session-only, all editable in the submit
+# form). Kelly is very sensitive to probability miscalibration, so the shipped
+# default is HALF-Kelly with a per-bet cap and a slate-total exposure cap; those
+# caps — not the fraction alone — are the real safety margin.
+_KELLY_DEFAULTS = {
+    "kelly_bankroll": 1000.0,     # $ — the DraftKings bankroll Kelly scales against
+    "kelly_fraction": 0.5,        # 0-1 multiplier on the full-Kelly fraction
+    "kelly_cap_pct": 5.0,         # per-bet hard cap, % of bankroll
+    "kelly_slate_cap_pct": 25.0,  # slate-total exposure cap, % of bankroll
+}
 
-    ``valid_keys`` is the set of selection keys in the CURRENTLY rendered
-    checklist; when given, only those are submitted. A checkbox key can linger
-    True in session_state after its bet leaves the list (search filter,
-    games_sampled drop, or a re-run producing a different slate), and those
-    phantom ticks would otherwise be written to the ledger even though the user
-    can no longer see or untick them."""
+
+def _kelly_float(key):
+    """Read a Kelly sizing knob from session_state, coerced to float.
+
+    Falls back to the shipped default when the key is absent (first render, before
+    the form widget below is created) or unparseable. Preserves an explicit 0.0
+    (which ``x or default`` would wrongly discard)."""
+    v = st.session_state.get(key, _KELLY_DEFAULTS[key])
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(_KELLY_DEFAULTS[key])
+
+
+def _selected_kelly_rows(ar, valid_keys=None):
+    """Build fractional-Kelly-sized ledger rows for the currently-checked value
+    bets, plus a {selection_key: stake} map.
+
+    Shared by the submit callback AND the pre-submit preview so the stake shown is
+    exactly the stake recorded — both size each leg via ``wagers.build_wager_row``
+    in Kelly mode (off the shrunk model prob at the DK price), then apply the
+    slate-total exposure cap across the batch. ``valid_keys`` restricts submission
+    to the currently-rendered checklist (drops phantom ticks); see
+    ``_submit_selected_picks``."""
     import wagers
-    stake = float(st.session_state.get("wager_unit_stake", 10.0) or 0.0)
+    bankroll = _kelly_float("kelly_bankroll")
+    fraction = _kelly_float("kelly_fraction")
+    cap_pct = _kelly_float("kelly_cap_pct")
+    slate_pct = _kelly_float("kelly_slate_cap_pct")
     events = ar.get("events", {})
     sport_key = ar.get("sport_key")
     placed_at = datetime.now(timezone.utc).isoformat()
-    rows = []
+    built = []  # (selection_key, row)
     seq = 0
     for sel_key, bet_type, side, candidate in _iter_wager_candidates(ar):
         if not st.session_state.get(sel_key, False):
@@ -426,17 +453,46 @@ def _submit_selected_picks(ar, valid_keys=None):
         meta.update({
             "sport_key": sport_key,
             "event_id": candidate.get("event_id"),
-            "stake": stake,
+            "stake": 0.0,  # flat fallback; Kelly overwrites when the leg is sizable
             "placed_at": placed_at,
             "seq": seq,
+            "kelly": True,
+            "bankroll": bankroll,
+            "kelly_fraction": fraction,
+            "kelly_cap": cap_pct / 100.0,
         })
         try:
             row = wagers.build_wager_row(bet_type, side, candidate, meta)
         except Exception:
             row = None
         if row:
-            rows.append(row)
+            built.append((sel_key, row))
             seq += 1
+    # Slate-total exposure cap: scale the whole batch down proportionally so the
+    # sum of stakes never exceeds slate_pct% of bankroll.
+    scaled = pricing_common.scale_to_slate_cap(
+        [r.get("stake") for _k, r in built], bankroll, slate_pct / 100.0)
+    for (_sel_key, row), stake in zip(built, scaled):
+        row["stake"] = stake
+    rows = [row for _k, row in built]
+    stake_by_key = {sel_key: row.get("stake") for sel_key, row in built}
+    return rows, stake_by_key
+
+
+def _submit_selected_picks(ar, valid_keys=None):
+    """Record the checked value bets to the actual-bets ledger at fractional-Kelly
+    stakes (sized off the shrunk model prob at the DK price; see
+    ``_selected_kelly_rows``). Runs as a (form-)button callback (before widgets
+    re-instantiate), so clearing the checkbox keys afterward is safe.
+
+    ``valid_keys`` is the set of selection keys in the CURRENTLY rendered
+    checklist; when given, only those are submitted. A checkbox key can linger
+    True in session_state after its bet leaves the list (search filter,
+    games_sampled drop, or a re-run producing a different slate), and those
+    phantom ticks would otherwise be written to the ledger even though the user
+    can no longer see or untick them."""
+    import wagers
+    rows, _stake_by_key = _selected_kelly_rows(ar, valid_keys)
     if not rows:
         st.session_state["_submit_picks_msg"] = (
             "warning", "No selected bets to submit.")
@@ -561,42 +617,87 @@ def _render_selected_bet_checklist(entries, ar):
                 "a simple checklist here."
             )
             return
-        st.caption(f"{len(selected)} selected bet(s) · bet details only")
+        # Only the bets in the CURRENT checklist are submittable — the phantom-
+        # tick guard in _submit_selected_picks drops any stale/filtered-out ticks.
+        valid_keys = {entry["selection_key"] for entry in entries}
+        # Preview the fractional-Kelly stakes for the checked bets: exactly the
+        # rows the Submit callback will persist (same sizing + slate-total cap),
+        # so the size is visible before betting.
+        _rows, stake_by_key = _selected_kelly_rows(ar, valid_keys)
+        bankroll = _kelly_float("kelly_bankroll")
+
+        def _fmt_stake(s):
+            return f"${s:,.2f}" if isinstance(s, (int, float)) else "—"
+
+        st.caption(f"{len(selected)} selected bet(s)")
         st.dataframe(
             [{
                 "Bet type": entry["type"],
                 "Bet to place": entry["bet"],
                 "Matchup": entry["matchup"],
                 "Team": entry["team"],
+                "Stake $": _fmt_stake(stake_by_key.get(entry["selection_key"])),
             } for entry in selected],
             hide_index=True,
             width="stretch",
         )
-        # Submit the checked bets to the actual-bets ledger at a flat unit stake,
-        # executed at the model's best price at submit (tracks REAL ROI). Both
-        # buttons use on_click callbacks (fire before widgets re-instantiate), so
-        # popping the checkbox keys is safe.
-        # Only the bets in the CURRENT checklist are submittable — the phantom-
-        # tick guard in _submit_selected_picks drops any stale/filtered-out ticks.
-        valid_keys = {entry["selection_key"] for entry in entries}
-        # Stake + Submit live in a form so editing the stake doesn't rerun the
-        # whole results page on every keystroke: the value is committed (and the
-        # picks written) only when Submit is pressed. The form-submit on_click
-        # still fires before widgets re-instantiate, so clearing the checkbox keys
-        # in the callback stays safe.
-        with st.form("submit_picks_form", clear_on_submit=False):
-            stake_col, submit_col = st.columns([1, 1])
-            with stake_col:
-                st.number_input(
-                    "Unit stake ($)", min_value=0.0, value=10.0, step=0.01,
-                    format="%.2f", key="wager_unit_stake",
-                    help="Flat dollar stake recorded for each submitted pick.",
-                )
-            with submit_col:
-                st.form_submit_button(
-                    "✅ Submit Picks", width="stretch",
-                    help="Record the checked bets to your actual-bets ledger.",
-                    on_click=_submit_selected_picks, args=(ar, valid_keys))
+        total_stake = sum(
+            v for v in stake_by_key.values() if isinstance(v, (int, float)))
+        if bankroll > 0:
+            st.caption(
+                f"Total staked ${total_stake:,.2f} of ${bankroll:,.2f} bankroll "
+                f"({total_stake / bankroll * 100:.0f}% exposure) · fractional "
+                "Kelly, capped per-bet and per-slate."
+            )
+        else:
+            st.caption(
+                "Enter your bankroll below to size these bets (stakes stay $0.00 "
+                "until a bankroll is set)."
+            )
+        # Submit the checked bets to the actual-bets ledger at the previewed
+        # fractional-Kelly stakes, executed at the DK price at submit (tracks REAL
+        # ROI). The sizing inputs live OUTSIDE a form so an edit commits to
+        # session_state immediately and the preview above updates on the next
+        # rerun — a form would defer the write and desync the preview from what is
+        # recorded. All buttons use on_click callbacks (fire before widgets
+        # re-instantiate), so clearing the checkbox keys stays safe.
+        bank_col, submit_col = st.columns([1, 1])
+        with bank_col:
+            st.number_input(
+                "Bankroll ($)", min_value=0.0,
+                value=_KELLY_DEFAULTS["kelly_bankroll"], step=0.01,
+                format="%.2f", key="kelly_bankroll",
+                help="Your DraftKings bankroll. Fractional-Kelly stakes scale "
+                     "against this. Session-only — re-enter it each session.",
+            )
+        with submit_col:
+            st.button(
+                "✅ Submit Picks", key="submit_picks_btn", width="stretch",
+                help="Record the checked bets to your actual-bets ledger at the "
+                     "previewed Kelly stakes.",
+                on_click=_submit_selected_picks, args=(ar, valid_keys))
+        with st.expander("⚙️ Sizing settings (Kelly)"):
+            st.number_input(
+                "Kelly fraction", min_value=0.0, max_value=1.0,
+                value=_KELLY_DEFAULTS["kelly_fraction"], step=0.05,
+                format="%.2f", key="kelly_fraction",
+                help="Multiplier on the full-Kelly bet fraction. 0.5 = half-Kelly "
+                     "(recommended); lower is more conservative.",
+            )
+            st.number_input(
+                "Per-bet cap (% of bankroll)", min_value=0.0, max_value=100.0,
+                value=_KELLY_DEFAULTS["kelly_cap_pct"], step=0.5,
+                format="%.1f", key="kelly_cap_pct",
+                help="Hard ceiling on any single bet, as a percent of bankroll.",
+            )
+            st.number_input(
+                "Slate-total cap (% of bankroll)", min_value=0.0, max_value=100.0,
+                value=_KELLY_DEFAULTS["kelly_slate_cap_pct"], step=1.0,
+                format="%.1f", key="kelly_slate_cap_pct",
+                help="Ceiling on total exposure across all submitted bets; the "
+                     "batch is scaled down proportionally if it would exceed this.",
+            )
+            st.caption("Sizing settings are session-only.")
         st.button("Clear selected bets", key="clear_selected_bets",
                   width="stretch", on_click=_clear_bet_selections,
                   args=(valid_keys,))
@@ -1845,7 +1946,8 @@ config = load_config()
 # which is a plain key Streamlit never garbage-collects.
 for _persist_key in list(st.session_state.keys()):
     if (_persist_key in ("sport", "markets", "props", "result_filter",
-                         "wager_unit_stake", "auto_pick_count",
+                         "kelly_bankroll", "kelly_fraction", "kelly_cap_pct",
+                         "kelly_slate_cap_pct", "auto_pick_count",
                          "auto_pick_metric")
             or str(_persist_key).startswith("bet_selection:")):
         st.session_state[_persist_key] = st.session_state[_persist_key]

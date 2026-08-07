@@ -226,6 +226,19 @@ def build_wager_row(bet_type, side, candidate, meta):
             })
         else:
             return None
+        # Fractional-Kelly stake (P-Kelly): size from the already-shrunk model
+        # probability (row['model_prob'] is a 0-1 fraction via _pct) at the DK
+        # executed price (row['executed_price']). Sizing here keeps the stake
+        # perfectly consistent with what grading/ROI read off the same row.
+        # Fail-open: leave the flat _blank_row stake (meta['stake']) when Kelly
+        # is off or the leg is not sizable (no DK price / non-positive EV).
+        if (meta.get("kelly")
+                and row.get("model_prob") is not None
+                and row.get("executed_price") is not None):
+            row["stake"] = pricing_common.kelly_stake(
+                row["model_prob"], row["executed_price"],
+                meta.get("bankroll"), meta.get("kelly_fraction", 0.5),
+                meta.get("kelly_cap", 0.05))
         return _enrich_ids(row)
     except Exception:
         return None
