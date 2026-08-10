@@ -857,3 +857,73 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.player_alias'))
 CREATE INDEX ix_player_alias_mlb ON dbo.player_alias (mlb_player_id);
 GO
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MLB → StatsAPI medallion (P2). Game-centric per-game batter/pitcher stat FACTS,
+-- derived straight from the boxscore so athlete_id is the MLBAM id and game_pk
+-- comes from the games dim. game_pk is ALWAYS present → the natural key is a plain
+-- UNIQUE(athlete_id, game_pk) (no NULL / filtered-index dance). team_id is NOT
+-- NULL but NOT in the key (attribute FD on (athlete, game)); season_bucket is
+-- derived (FD on the game) → a plain indexed attribute, NOT in the key. The
+-- denormalized game_date/opponent/is_home are NOT stored — the reader/gold view
+-- rejoins fact→mlb_game→mlb_team. These live ALONGSIDE the ESPN-sourced
+-- mlb_batter_gamelog/mlb_pitcher_gamelog (gamelog_store.py, untouched); nothing
+-- app-facing consumes them until the P4 cutover. Constraint/index names mirror
+-- mlb_warehouse.py (test_mlb_warehouse.py::SchemaParityTests enforces columns).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+--------------------------------------------------------------------- mlb_batter_game
+IF OBJECT_ID('dbo.mlb_batter_game', 'U') IS NULL
+CREATE TABLE dbo.mlb_batter_game (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,               -- MLBAM (natural key part)
+    game_pk       INT          NOT NULL,               -- games dim (natural key part)
+    team_id       NVARCHAR(32) NOT NULL,               -- MLBAM (attribute, NOT in key)
+    season_bucket INT,                                  -- derived; indexed, NOT in key
+    AB            FLOAT,
+    H             FLOAT,
+    SO            FLOAT,
+    BB            FLOAT,
+    HBP           FLOAT,
+    SF            FLOAT,
+    SH            FLOAT,
+    fetched_at    FLOAT,
+    CONSTRAINT uq_mlb_batter_game UNIQUE (athlete_id, game_pk),
+    CONSTRAINT fk_mlb_batter_game_game
+        FOREIGN KEY (game_pk) REFERENCES dbo.mlb_game (game_pk),
+    CONSTRAINT fk_mlb_batter_game_team
+        FOREIGN KEY (team_id) REFERENCES dbo.mlb_team (team_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_batter_game_athlete'
+                 AND object_id = OBJECT_ID('dbo.mlb_batter_game'))
+CREATE INDEX ix_mlb_batter_game_athlete
+    ON dbo.mlb_batter_game (athlete_id, season_bucket);
+GO
+
+-------------------------------------------------------------------- mlb_pitcher_game
+IF OBJECT_ID('dbo.mlb_pitcher_game', 'U') IS NULL
+CREATE TABLE dbo.mlb_pitcher_game (
+    id            INT IDENTITY(1,1) PRIMARY KEY,
+    athlete_id    NVARCHAR(32) NOT NULL,               -- MLBAM (natural key part)
+    game_pk       INT          NOT NULL,               -- games dim (natural key part)
+    team_id       NVARCHAR(32) NOT NULL,               -- MLBAM (attribute, NOT in key)
+    season_bucket INT,                                  -- derived; indexed, NOT in key
+    IP            FLOAT,                                 -- base-3 float (6.1 == 6IP+1out)
+    K             FLOAT,
+    ER            FLOAT,
+    fetched_at    FLOAT,
+    CONSTRAINT uq_mlb_pitcher_game UNIQUE (athlete_id, game_pk),
+    CONSTRAINT fk_mlb_pitcher_game_game
+        FOREIGN KEY (game_pk) REFERENCES dbo.mlb_game (game_pk),
+    CONSTRAINT fk_mlb_pitcher_game_team
+        FOREIGN KEY (team_id) REFERENCES dbo.mlb_team (team_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_pitcher_game_athlete'
+                 AND object_id = OBJECT_ID('dbo.mlb_pitcher_game'))
+CREATE INDEX ix_mlb_pitcher_game_athlete
+    ON dbo.mlb_pitcher_game (athlete_id, season_bucket);
+GO

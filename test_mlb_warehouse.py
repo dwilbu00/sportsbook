@@ -11,7 +11,7 @@ import json
 import unittest
 from unittest import mock
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
 import db_store
 import mlb_warehouse
@@ -177,6 +177,14 @@ class SchemaParityTests(unittest.TestCase):
     def test_alias_cols(self):
         self.assertEqual({c.name for c in mlb_warehouse.player_alias.columns},
                          set(mlb_warehouse._ALIAS_COLS))
+
+    def test_batter_game_cols(self):
+        self.assertEqual({c.name for c in mlb_warehouse.mlb_batter_game.columns},
+                         set(mlb_warehouse._BATTER_GAME_COLS))
+
+    def test_pitcher_game_cols(self):
+        self.assertEqual({c.name for c in mlb_warehouse.mlb_pitcher_game.columns},
+                         set(mlb_warehouse._PITCHER_GAME_COLS))
 
 
 # ─────────────────────────────────────────────────────────── pure parse / derive
@@ -463,6 +471,151 @@ class ParityAlignTests(unittest.TestCase):
             {("y", "2024-07-03"): 2.0}, set(),
             start="2024-07-01", end="2024-07-04")
         self.assertEqual(out, {("y", "2024-07-03"): 2.0})
+
+
+# ───────────────────────────────────── P2 StatsAPI-native game facts (writer)
+class GameFactTests(_Backend, unittest.TestCase):
+    """The game-centric writer: ingest_date persists boxscore-derived batter/
+    pitcher stat lines into mlb_batter_game / mlb_pitcher_game (dual-run)."""
+
+    def _ingest(self, schedule=SCHEDULE, boxscore=BOXSCORE):
+        with mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS), \
+             mock.patch.object(mlb_warehouse, "fetch_schedule",
+                               return_value=schedule), \
+             mock.patch.object(mlb_warehouse, "fetch_boxscore",
+                               return_value=boxscore):
+            return mlb_warehouse.ingest_date("2024-07-04")
+
+    def test_ingest_writes_game_facts(self):
+        summary = self._ingest()
+        self.assertEqual(summary["batter_rows"], 2)   # Judge + Devers (Cole: 0 PA)
+        self.assertEqual(summary["pitcher_rows"], 1)   # Cole
+        b = {r._mapping["athlete_id"]: r._mapping
+             for r in _rows(mlb_warehouse.mlb_batter_game)}
+        self.assertEqual(set(b), {"592450", "646240"})
+        self.assertEqual(b["592450"]["H"], 2.0)
+        self.assertEqual(b["592450"]["game_pk"], 745804)   # native from the boxscore
+        self.assertEqual(b["592450"]["team_id"], "147")
+        self.assertEqual(b["592450"]["season_bucket"], 2024)
+        self.assertEqual(b["646240"]["team_id"], "111")
+        p = _rows(mlb_warehouse.mlb_pitcher_game)
+        self.assertEqual(len(p), 1)
+        cole = p[0]._mapping
+        self.assertEqual(cole["athlete_id"], "543037")
+        self.assertEqual(cole["IP"], 6.1)                  # base-3 float
+        self.assertEqual(cole["K"], 8.0)
+        self.assertEqual(cole["team_id"], "147")
+        # live game 745805 contributed no facts (not genuine-final)
+        self.assertTrue(all(r._mapping["game_pk"] == 745804
+                            for r in _rows(mlb_warehouse.mlb_batter_game)))
+
+    def test_game_facts_idempotent(self):
+        self._ingest()
+        self._ingest()
+        self.assertEqual(_count(mlb_warehouse.mlb_batter_game), 2)
+        self.assertEqual(_count(mlb_warehouse.mlb_pitcher_game), 1)
+
+    def test_game_facts_correction_updates_in_place(self):
+        self._ingest()
+        changed = copy.deepcopy(BOXSCORE)
+        (changed["teams"]["home"]["players"]["ID592450"]
+         ["stats"]["batting"]["hits"]) = 3
+        self._ingest(boxscore=changed)
+        b = {r._mapping["athlete_id"]: r._mapping
+             for r in _rows(mlb_warehouse.mlb_batter_game)}
+        self.assertEqual(b["592450"]["H"], 3.0)                     # updated
+        self.assertEqual(_count(mlb_warehouse.mlb_batter_game), 2)  # not duped
+
+
+# ─────────────────────────────── P2 leakage-safe reader (the ordering fix)
+class GameLogReaderTests(_Backend, unittest.TestCase):
+    """get_batter/pitcher_game_log: most-recent-first by JOINED game_date DESC,
+    game_pk DESC tiebreak; as_of_date is a strict leakage cutoff."""
+
+    def _seed_game(self, game_pk, official_date, game_date,
+                   home="147", away="111", season=2024):
+        with db_store.get_engine().begin() as conn:
+            for tid in (home, away):
+                if not conn.execute(
+                        select(mlb_warehouse.mlb_team).where(
+                            mlb_warehouse.mlb_team.c.team_id == tid)).first():
+                    conn.execute(insert(mlb_warehouse.mlb_team),
+                                 {"team_id": tid, "name": tid})
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": game_pk, "game_date": game_date,
+                "official_date": official_date, "season": season,
+                "home_team_id": home, "away_team_id": away})
+
+    def _seed_batter(self, athlete_id, game_pk, H, team_id="147", season=2024):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": athlete_id, "game_pk": game_pk,
+                "team_id": team_id, "season_bucket": season, "H": H})
+
+    def test_orders_by_game_date_not_game_pk(self):
+        # Postponement: pk=100 was scheduled early but PLAYED in Sept; pk=200
+        # played in April. Recency must follow game_date (play date), not pk.
+        self._seed_game(100, "2024-09-01", "2024-09-01T18:00:00Z")
+        self._seed_game(200, "2024-04-01", "2024-04-01T18:00:00Z")
+        self._seed_batter("1", 100, 2.0)
+        self._seed_batter("1", 200, 0.0)
+        log = mlb_warehouse.get_batter_game_log("1")
+        self.assertEqual([r["game_pk"] for r in log], [100, 200])  # Sept first
+
+    def test_doubleheader_game_pk_tiebreak(self):
+        # Identical play timestamp (traditional DH) → deterministic game_pk DESC.
+        self._seed_game(300, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._seed_game(301, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._seed_batter("1", 300, 1.0)
+        self._seed_batter("1", 301, 3.0)
+        log = mlb_warehouse.get_batter_game_log("1")
+        self.assertEqual([r["game_pk"] for r in log], [301, 300])
+
+    def test_as_of_cutoff_is_strict(self):
+        self._seed_game(1, "2024-07-01", "2024-07-01T18:00:00Z")
+        self._seed_game(2, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._seed_game(3, "2024-07-08", "2024-07-08T18:00:00Z")
+        for pk in (1, 2, 3):
+            self._seed_batter("1", pk, 1.0)
+        log = mlb_warehouse.get_batter_game_log("1", as_of_date="2024-07-05")
+        self.assertEqual([r["game_pk"] for r in log], [2, 1])   # 07-08 excluded
+        # a game ON the cutoff date is excluded (strictly-before)
+        log2 = mlb_warehouse.get_batter_game_log("1", as_of_date="2024-07-04")
+        self.assertEqual([r["game_pk"] for r in log2], [1])
+
+    def test_opponent_and_is_home_derivation(self):
+        self._seed_game(10, "2024-07-04", "2024-07-04T18:00:00Z",
+                        home="147", away="111")
+        self._seed_batter("home_guy", 10, 1.0, team_id="147")
+        self._seed_batter("away_guy", 10, 1.0, team_id="111")
+        home = mlb_warehouse.get_batter_game_log("home_guy")[0]
+        self.assertTrue(home["is_home"])
+        self.assertEqual(home["opponent_team_id"], "111")
+        away = mlb_warehouse.get_batter_game_log("away_guy")[0]
+        self.assertFalse(away["is_home"])
+        self.assertEqual(away["opponent_team_id"], "147")
+
+    def test_limit_and_season_filter(self):
+        self._seed_game(1, "2023-07-01", "2023-07-01T18:00:00Z", season=2023)
+        self._seed_game(2, "2024-07-04", "2024-07-04T18:00:00Z", season=2024)
+        self._seed_batter("1", 1, 1.0, season=2023)
+        self._seed_batter("1", 2, 2.0, season=2024)
+        self.assertEqual(len(mlb_warehouse.get_batter_game_log("1", limit=1)), 1)
+        self.assertEqual(
+            [r["game_pk"] for r in
+             mlb_warehouse.get_batter_game_log("1", season=2024)], [2])
+
+    def test_pitcher_reader(self):
+        self._seed_game(5, "2024-07-04", "2024-07-04T18:00:00Z")
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
+                "athlete_id": "p1", "game_pk": 5, "team_id": "147",
+                "season_bucket": 2024, "IP": 6.1, "K": 8.0, "ER": 2.0})
+        log = mlb_warehouse.get_pitcher_game_log("p1")
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["K"], 8.0)
+        self.assertEqual(log[0]["IP"], 6.1)
+        self.assertEqual(log[0]["is_home"], True)
 
 
 if __name__ == "__main__":

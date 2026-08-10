@@ -1,11 +1,12 @@
-"""mlb_warehouse.py — MLB StatsAPI medallion: silver dims + bronze landing (P1).
+"""mlb_warehouse.py — MLB StatsAPI medallion: silver dims + bronze + game facts.
 
 Read-only DUAL-RUN. Populates durable, StatsAPI-native dims (team / game / player),
-a per-season standings fact, a provider→MLBAM alias scaffold, and a transient
-bronze raw-JSON landing table — in parallel with the live ESPN path. NOTHING in
-the app consumes these tables yet (that begins at the P4 cutover); P1 exists so a
-parity harness (mlb_warehouse_parity.py) can diff the StatsAPI-derived shapes
-against the ESPN path before anything is switched over.
+a per-season standings fact, a provider→MLBAM alias scaffold, a transient bronze
+raw-JSON landing table (all P1), and — P2 — the game-centric per-game batter /
+pitcher stat FACTS (mlb_batter_game / mlb_pitcher_game), all in parallel with the
+live ESPN path. NOTHING in the app consumes these tables yet (that begins at the
+P4 cutover); the parity harness (mlb_warehouse_parity.py) diffs the StatsAPI-
+derived shapes against the ESPN path before anything is switched over.
 
 House conventions (mirrors gamelog_store.py / player_id_map.py):
   * Owns its OWN SQLAlchemy Core MetaData + Tables + create_all() (create_all is
@@ -23,11 +24,16 @@ Design notes carried from the re-architecture doc (11-mlb-statsapi-rearchitectur
   * reconcile() DELETES in-scope rows absent from the desired set, so every
     accumulating-dim upsert here is SCOPED to its single natural key (the
     athlete_id_cache idiom) — a call can never delete a sibling row.
-  * P1 does NOT write the gamelog FACT tables — that re-key is P2. The
-    boxscore-derived batter/pitcher rows (derive_*_rows) are produced here only
-    for the parity harness; P1 persists dims + bronze, not facts.
+  * P2 game facts are game-centric + MLBAM-native: one row per (athlete, game_pk)
+    straight from the boxscore, so game_pk is ALWAYS present → the natural key is a
+    plain UNIQUE(athlete_id, game_pk) (no NULL/filtered-index dance). team_id is
+    NOT NULL but NOT in the key; season_bucket is derived + indexed, NOT in the
+    key; game_date/opponent/is_home are NOT stored (the reader rejoins mlb_game).
+  * The reader (_game_log) orders MOST-RECENT-FIRST by the JOINED game_date DESC
+    (play date), game_pk DESC tiebreak — surrogate id is NOT recency once the
+    writer is a surgical reconcile (the §6 mandatory ordering fix, done natively).
 
-MLB only. NBA/NFL stay on ESPN.
+MLB only. NBA/NFL stay on ESPN. The ESPN gamelog_store.py path is UNTOUCHED.
 """
 
 from __future__ import annotations
@@ -140,6 +146,43 @@ player_alias = Table(
     Index("ix_player_alias_mlb", "mlb_player_id"),
 )
 
+# ── StatsAPI-native per-game stat facts (P2, game-centric, dual-run) ──────────
+# One row per (athlete, game), derived straight from the boxscore, so athlete_id
+# is the MLBAM id and game_pk comes from the games dim — game_pk is ALWAYS
+# present, so the natural key is a plain UNIQUE(athlete_id, game_pk) (no NULL /
+# filtered-index dance). team_id is NOT NULL but NOT in the key: it is an
+# attribute functionally dependent on (athlete, game) (§6). season_bucket is
+# derived (FD on the game) and kept only as a plain indexed attribute for cheap
+# season scans — deliberately NOT in the UNIQUE. Denormalized game_date/opponent/
+# is_home are NOT stored: the reader/gold view rejoins fact→mlb_game→mlb_team.
+# Surrogate id stays PK. These live ALONGSIDE the ESPN-sourced *_gamelog tables
+# in gamelog_store.py (untouched) — nothing app-facing consumes these until P4.
+_BATTER_GAME_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH")
+_PITCHER_GAME_STATS = ("IP", "K", "ER")
+
+
+def _game_fact_table(name, stat_cols):
+    return Table(
+        name, _META,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("athlete_id", String(32), nullable=False),        # MLBAM (natural key part)
+        Column("game_pk", Integer,
+               ForeignKey("mlb_game.game_pk", name=f"fk_{name}_game"),
+               nullable=False),                                  # games dim (natural key part)
+        Column("team_id", String(32),
+               ForeignKey("mlb_team.team_id", name=f"fk_{name}_team"),
+               nullable=False),                                  # MLBAM (attribute, NOT in key)
+        Column("season_bucket", Integer),                        # derived; indexed, NOT in key
+        *[Column(c, Float) for c in stat_cols],
+        Column("fetched_at", Float),
+        UniqueConstraint("athlete_id", "game_pk", name=f"uq_{name}"),
+        Index(f"ix_{name}_athlete", "athlete_id", "season_bucket"),
+    )
+
+
+mlb_batter_game = _game_fact_table("mlb_batter_game", _BATTER_GAME_STATS)
+mlb_pitcher_game = _game_fact_table("mlb_pitcher_game", _PITCHER_GAME_STATS)
+
 # Column-name SPECs — SchemaParityTests asserts these equal the Table columns.
 _BRONZE_COLS = ("id", "kind", "natural_ref", "payload", "fetched_at", "processed_at")
 _TEAM_COLS = ("team_id", "name", "name_norm", "abbreviation", "league_id",
@@ -153,6 +196,10 @@ _STANDINGS_COLS = ("id", "team_id", "season", "as_of_date", "wins", "losses",
                    "win_pct", "fetched_at")
 _ALIAS_COLS = ("id", "provider", "provider_key", "mlb_player_id", "confidence",
                "resolution_method", "valid_from", "valid_to", "fetched_at")
+_BATTER_GAME_COLS = ("id", "athlete_id", "game_pk", "team_id", "season_bucket",
+                     *_BATTER_GAME_STATS, "fetched_at")
+_PITCHER_GAME_COLS = ("id", "athlete_id", "game_pk", "team_id", "season_bucket",
+                      *_PITCHER_GAME_STATS, "fetched_at")
 
 
 def create_all():
@@ -542,6 +589,47 @@ def _upsert_rows(table, rows, key_cols, ignore_cols=("fetched_at",)):
     return (0, 0, 0)
 
 
+def _augment_game_facts(rows, season):
+    """Stamp derive_*_rows with the derived season_bucket + a fetched_at."""
+    now = _now()
+    season = _i(season)
+    for r in rows:
+        r["season_bucket"] = season
+        r["fetched_at"] = now
+    return rows
+
+
+def _valid_game_fact(r):
+    """A fact row is writable only with a real MLBAM athlete_id, a game_pk, and a
+    team_id (the NOT NULL + FK columns) — guards against a malformed boxscore
+    row silently violating a constraint or landing a junk 'None' athlete."""
+    aid = r.get("athlete_id")
+    return (bool(aid) and aid != "None"
+            and r.get("game_pk") is not None and bool(r.get("team_id")))
+
+
+def _write_game_facts(conn, box, game):
+    """Persist the StatsAPI-native per-game batter/pitcher stat lines for one
+    boxscore into mlb_batter_game / mlb_pitcher_game (game-centric, MLBAM +
+    game_pk native). Per-row surgical upsert scoped to (athlete_id, game_pk) — the
+    mlb_player idiom, so a call can never delete a sibling and an empty derive
+    result is a no-op (never a scope wipe). Runs INSIDE the caller's boxscore
+    transaction; the game_pk FK resolves from the earlier schedule txn and the
+    team_id FK from the minimal schedule teams. Returns (n_batter, n_pitcher)."""
+    season = game.get("season")
+    batters = [r for r in _augment_game_facts(derive_batter_rows(box, game), season)
+               if _valid_game_fact(r)]
+    pitchers = [r for r in _augment_game_facts(derive_pitcher_rows(box, game), season)
+                if _valid_game_fact(r)]
+    for table, rows in ((mlb_batter_game, batters), (mlb_pitcher_game, pitchers)):
+        for r in rows:
+            db_store.reconcile(
+                conn, table, [r], ("athlete_id", "game_pk"),
+                scope={"athlete_id": r["athlete_id"], "game_pk": r["game_pk"]},
+                ignore_cols=("fetched_at",))
+    return len(batters), len(pitchers)
+
+
 def ensure_teams(season, force=False):
     """Load/refresh the full 30-team dim for a season (memoized per process)."""
     if not enabled():
@@ -563,11 +651,14 @@ def ensure_teams(season, force=False):
 
 # ───────────────────────────────────────────────────────────────── ingestion API
 def ingest_date(date, with_boxscores=True):
-    """Ingest one YYYY-MM-DD slate → mlb_team/mlb_game (+ mlb_player from each
-    genuine-final boxscore). Read-only dual-run: NO gamelog facts, NO ESPN reads,
-    NOTHING app-facing consumes the result. Idempotent (surgical upsert)."""
+    """Ingest one YYYY-MM-DD slate → mlb_team/mlb_game (+ mlb_player and the
+    StatsAPI-native per-game batter/pitcher stat facts from each genuine-final
+    boxscore). Read-only DUAL-RUN: NO ESPN reads, and NOTHING app-facing consumes
+    the result until the P4 cutover (the ESPN gamelog_store path stays live).
+    Idempotent (surgical upsert)."""
     summary = {"date": date, "games": 0, "final": 0, "boxscores": 0,
-               "players": 0, "skipped": not enabled()}
+               "players": 0, "batter_rows": 0, "pitcher_rows": 0,
+               "skipped": not enabled()}
     if not enabled():
         return summary
     season = int(str(date)[:4])
@@ -612,6 +703,7 @@ def ingest_date(date, with_boxscores=True):
         except Exception:
             continue
         players = parse_boxscore_players(box, g)
+        nb = npi = 0
         with _WRITE_LOCK:
             for attempt in range(3):
                 try:
@@ -622,12 +714,15 @@ def ingest_date(date, with_boxscores=True):
                                 conn, mlb_player, [p], ("player_id",),
                                 scope={"player_id": p["player_id"]},
                                 ignore_cols=("fetched_at",))
+                        nb, npi = _write_game_facts(conn, box, g)
                         _mark_bronze_processed(conn, "boxscore", str(g["game_pk"]))
                     break
                 except OperationalError:
                     if attempt == 2:
                         raise
         summary["boxscores"] += 1
+        summary["batter_rows"] += nb
+        summary["pitcher_rows"] += npi
         seen_players.update(p["player_id"] for p in players)
     summary["players"] = len(seen_players)
     return summary
@@ -711,6 +806,68 @@ def find_game_pk(official_date, home_team_id, away_team_id):
         return rows[0][0] if len(rows) == 1 else None
     except OperationalError:
         return None
+
+
+def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
+              limit=None):
+    """StatsAPI-native per-game log for one athlete, MOST-RECENT-FIRST, joined to
+    the games dim for chronology + opponent/home derivation.
+
+    This is the reconcile-safe ordering the design mandates (§6): the writer is a
+    surgical upsert, so surrogate ``id`` is NOT recency — order by the joined
+    ``mlb_game.game_date`` DESC (the PLAY date; ``game_pk`` is assigned at schedule
+    time, not play time, so a postponed game keeps a low pk under a late date) with
+    ``game_pk`` DESC only as the same-date (doubleheader) tiebreaker. Pass
+    ``as_of_date`` for a LEAKAGE-SAFE slice: only games whose ``official_date`` is
+    STRICTLY BEFORE it (excludes the game being predicted). Dual-run — nothing
+    app-facing consumes this until P4. Fail-open → []."""
+    if not enabled():
+        return []
+    g = mlb_game
+    joined = table.join(g, table.c.game_pk == g.c.game_pk)
+    cols = [table.c.athlete_id, table.c.game_pk, table.c.team_id,
+            table.c.season_bucket, g.c.game_date, g.c.official_date, g.c.season,
+            g.c.home_team_id, g.c.away_team_id] + [table.c[c] for c in stat_cols]
+    stmt = (select(*cols).select_from(joined)
+            .where(table.c.athlete_id == str(athlete_id)))
+    if season is not None:
+        stmt = stmt.where(table.c.season_bucket == int(season))
+    if as_of_date is not None:
+        stmt = stmt.where(g.c.official_date < str(as_of_date))
+    stmt = stmt.order_by(g.c.game_date.desc(), table.c.game_pk.desc())
+    if limit:
+        stmt = stmt.limit(int(limit))
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return []
+    out = []
+    for r in rows:
+        m = r._mapping
+        team_id = m["team_id"]
+        is_home = team_id == m["home_team_id"]
+        rec = {"athlete_id": m["athlete_id"], "game_pk": m["game_pk"],
+               "team_id": team_id, "is_home": is_home,
+               "opponent_team_id": m["away_team_id"] if is_home else m["home_team_id"],
+               "game_date": m["game_date"], "official_date": m["official_date"],
+               "season": m["season"]}
+        for c in stat_cols:
+            rec[c] = m[c]
+        out.append(rec)
+    return out
+
+
+def get_batter_game_log(athlete_id, season=None, as_of_date=None, limit=None):
+    """Most-recent-first StatsAPI-native batter per-game log (P2, dual-run)."""
+    return _game_log(mlb_batter_game, _BATTER_GAME_STATS, athlete_id,
+                     season=season, as_of_date=as_of_date, limit=limit)
+
+
+def get_pitcher_game_log(athlete_id, season=None, as_of_date=None, limit=None):
+    """Most-recent-first StatsAPI-native pitcher per-game log (P2, dual-run)."""
+    return _game_log(mlb_pitcher_game, _PITCHER_GAME_STATS, athlete_id,
+                     season=season, as_of_date=as_of_date, limit=limit)
 
 
 def _fmt(summary):
