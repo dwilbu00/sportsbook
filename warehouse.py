@@ -50,6 +50,16 @@ try:
 except Exception:  # pragma: no cover - SQLAlchemy absent
     _db = None
 
+# Structured DB-failure telemetry (WS1b). Guarded so a partial deploy without the
+# module degrades to a silent no-op rather than breaking the capture hook.
+try:
+    import ops_telemetry as _ops
+except Exception:  # pragma: no cover
+    class _ops:  # noqa: N801 - tiny no-op stand-in
+        @staticmethod
+        def ops_event(*a, **k):
+            pass
+
 
 def _sql():
     return _db is not None and _db.enabled()
@@ -326,7 +336,15 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
                 "regions": regions, "markets": markets,
                 "bookmakers": _books_str(bookmakers),
             }, _enumerate_lines(payload, "the-odds-api-v4-event-odds", kind))
-            _db.capture_odds_snapshot(_snap, _lines)
+            # Narrow DB-failure telemetry: a transient SQL error here silently
+            # drops a durable odds snapshot. Surface it, then keep failing open
+            # (same net behavior as the outer best-effort handler).
+            try:
+                _db.capture_odds_snapshot(_snap, _lines)
+            except Exception as e:
+                _ops.ops_event("database_failure", op="capture_odds_snapshot",
+                               sport=sport, event_id=event_id,
+                               error=type(e).__name__)
             return
         name = snapshot_name(sport, game_date, event_id, kind, captured_at)
         envelope = {
@@ -815,7 +833,9 @@ def load_team_market_store(sport_key, dates=None):
         return empty
     try:
         rows = _db.team_market_lines(sport_key, dates=dates)
-    except Exception:
+    except Exception as e:
+        _ops.ops_event("database_failure", op="team_market_lines",
+                       sport=sport_key, error=type(e).__name__)
         return empty
     if not rows:
         return empty
@@ -901,7 +921,9 @@ def load_prop_lines(sport_key, dates=None):
         return []
     try:
         rows = _db.player_prop_lines(sport_key, dates=dates)
-    except Exception:
+    except Exception as e:
+        _ops.ops_event("database_failure", op="player_prop_lines",
+                       sport=sport_key, error=type(e).__name__)
         return []
     if not rows:
         return []

@@ -98,6 +98,16 @@ try:
 except Exception:  # pragma: no cover - SQLAlchemy absent
     _db = None
 
+# Structured DB-failure telemetry (WS1b). Guarded so a partial deploy without the
+# module degrades to a silent no-op rather than breaking the store.
+try:
+    import ops_telemetry as _ops
+except Exception:  # pragma: no cover
+    class _ops:  # noqa: N801 - tiny no-op stand-in
+        @staticmethod
+        def ops_event(*a, **k):
+            pass
+
 _PRED_TABLE = "prediction_log"
 
 
@@ -1810,8 +1820,9 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
     if to_blob and _sql():
         try:
             _db.save_recal(sport_key, blob)
-        except Exception:
-            pass
+        except Exception as e:
+            _ops.ops_event("database_failure", op="save_recal",
+                           sport=sport_key, error=type(e).__name__)
     _LOAD_CACHE.pop(sport_key, None)
 
 
