@@ -123,15 +123,26 @@ def diff_value_maps(statsapi_map, espn_map, tol=1e-6):
 
 # ─────────────────────────────────────────────────────── StatsAPI side (tested)
 def statsapi_standings_winpct(season):
-    """{team_name_norm: win_pct} from a StatsAPI /standings snapshot."""
+    """{team_full_name_norm: win_pct} from a StatsAPI /standings snapshot.
+
+    The /standings payload's team.name is only the NICKNAME ('Yankees', 'Dbacks'),
+    which does not match ESPN's full displayName ('New York Yankees', 'Arizona
+    Diamondbacks'). Resolve each team_id → full name via /teams so the two sides
+    key on the same string (falls back to the nickname if /teams is unavailable)."""
     raw = mlb_warehouse.fetch_standings(season)
+    try:
+        id_to_name = {t["team_id"]: t["name"] for t
+                      in mlb_warehouse.parse_teams(mlb_warehouse.fetch_teams(season))}
+    except Exception:
+        id_to_name = {}
     out = {}
     for rec in (raw or {}).get("records", []) or []:
         for tr in rec.get("teamRecords", []) or []:
-            name = (tr.get("team") or {}).get("name")
+            team = tr.get("team") or {}
+            full = id_to_name.get(str(team.get("id"))) or team.get("name")
             wp = mlb_warehouse._f(tr.get("winningPercentage"))
-            if name and wp is not None:
-                out[_norm(name)] = wp
+            if full and wp is not None:
+                out[_norm(full)] = wp
     return out
 
 

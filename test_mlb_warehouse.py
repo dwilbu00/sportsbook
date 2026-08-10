@@ -409,11 +409,16 @@ class ParityDiffTests(unittest.TestCase):
         self.assertEqual(m, {("gerrit cole", "2024-07-04"): 8.0})
 
     def test_statsapi_standings_winpct(self):
-        with mock.patch.object(mlb_warehouse, "fetch_standings",
-                               return_value=STANDINGS):
+        # /standings gives nicknames; the lens resolves full names via /teams so
+        # the keys align with ESPN's displayName — both fetchers are mocked.
+        nick = copy.deepcopy(STANDINGS)
+        nick["records"][0]["teamRecords"][0]["team"]["name"] = "Yankees"
+        nick["records"][1]["teamRecords"][0]["team"]["name"] = "Dodgers"
+        with mock.patch.object(mlb_warehouse, "fetch_standings", return_value=nick), \
+             mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS):
             m = parity.statsapi_standings_winpct(2024)
-        self.assertAlmostEqual(m["new york yankees"], 0.647)
-        self.assertAlmostEqual(m["los angeles dodgers"], 0.612)
+        self.assertAlmostEqual(m["new york yankees"], 0.647)   # resolved from id 147
+        self.assertAlmostEqual(m["los angeles dodgers"], 0.612)  # resolved from id 119
 
 
 class ParityAlignTests(unittest.TestCase):
