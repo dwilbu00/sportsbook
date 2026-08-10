@@ -332,7 +332,9 @@ GO
 ----------------------------------------------------------------------- odds_line
 -- One row per extracted line within a snapshot. price/implied reproduce
 -- closing_line_for's extraction (best-across-books for team; consensus for
--- props), computed at capture. snapshot_id references odds_snapshot.id.
+-- props), computed at capture. snapshot_id references odds_snapshot.id, enforced
+-- by fk_odds_line_snapshot ON DELETE CASCADE (WS1c) so a line cannot outlive its
+-- snapshot and deleting a snapshot removes its lines.
 IF OBJECT_ID('dbo.odds_line', 'U') IS NULL
 CREATE TABLE dbo.odds_line (
     id           INT IDENTITY(1,1) PRIMARY KEY,
@@ -344,13 +346,27 @@ CREATE TABLE dbo.odds_line (
     prop_key     NVARCHAR(64),
     direction    NVARCHAR(8),
     price        INT,
-    implied_prob FLOAT
+    implied_prob FLOAT,
+    CONSTRAINT fk_odds_line_snapshot
+        FOREIGN KEY (snapshot_id) REFERENCES dbo.odds_snapshot (id)
+        ON DELETE CASCADE
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_odds_line_snapshot'
                  AND object_id = OBJECT_ID('dbo.odds_line'))
 CREATE INDEX ix_odds_line_snapshot ON dbo.odds_line (snapshot_id);
+GO
+-- WS1c: add the FK to a pre-existing odds_line (created before the constraint).
+-- Idempotent; WITH CHECK validates current rows, so clear any orphaned lines
+-- (snapshot_id with no parent) first if this ever errors on legacy data.
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys
+               WHERE name = 'fk_odds_line_snapshot'
+                 AND parent_object_id = OBJECT_ID('dbo.odds_line'))
+    ALTER TABLE dbo.odds_line WITH CHECK
+        ADD CONSTRAINT fk_odds_line_snapshot
+        FOREIGN KEY (snapshot_id) REFERENCES dbo.odds_snapshot (id)
+        ON DELETE CASCADE;
 GO
 -- SFBB cross-map enrichment (Phase 3): id-based joins. All nullable/best-effort.
 IF COL_LENGTH('dbo.odds_line', 'player_mlb_id') IS NULL

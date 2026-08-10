@@ -746,6 +746,61 @@ class WarehouseSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertEqual(hit["price"], 120)
 
 
+class OddsLineForeignKeyTests(_SqliteBackend, unittest.TestCase):
+    """WS1c: odds_line.snapshot_id -> odds_snapshot.id FK, ON DELETE CASCADE.
+
+    Azure SQL enforces declared FKs natively; the SQLite test engine only does so
+    with PRAGMA foreign_keys=ON, which get_engine() sets — verified here so these
+    integrity guarantees are actually exercised, not silently inert."""
+
+    def _meta(self, hour, kind="team"):
+        return {"sport": "baseball_mlb", "game_date": "2026-07-22",
+                "event_id": "e1", "kind": kind, "snapshot_hour": hour,
+                "captured_at": f"2026-07-22T{hour[-3:-1]}:00:00Z",
+                "commence_time": "2026-07-22T23:00:00Z",
+                "home": "Rockies", "away": "Astros", "regions": "us",
+                "markets": "h2h", "bookmakers": None}
+
+    def test_sqlite_fk_enforcement_is_on(self):
+        eng = db_store.get_engine()
+        with eng.connect() as conn:
+            self.assertEqual(
+                conn.exec_driver_sql("PRAGMA foreign_keys").scalar(), 1)
+
+    def test_delete_snapshot_cascades_to_lines(self):
+        from sqlalchemy import delete, func, select
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), [
+            {"bet_type": "moneyline", "selection": "Rockies", "price": 120,
+             "implied_prob": 0.45},
+            {"bet_type": "total", "selection": "Over", "point": 9.5,
+             "price": -105, "implied_prob": 0.51}])
+        sid = db_store.odds_snapshots_for_event(
+            "baseball_mlb", "2026-07-22", "e1")[0]["id"]
+        eng = db_store.get_engine()
+        with eng.connect() as conn:
+            self.assertEqual(conn.execute(
+                select(func.count()).select_from(db_store.odds_line)
+                .where(db_store.odds_line.c.snapshot_id == sid)).scalar(), 2)
+        # Deleting the parent snapshot cascades to its lines.
+        with eng.begin() as conn:
+            conn.execute(delete(db_store.odds_snapshot)
+                         .where(db_store.odds_snapshot.c.id == sid))
+        with eng.connect() as conn:
+            self.assertEqual(conn.execute(
+                select(func.count()).select_from(db_store.odds_line)
+                .where(db_store.odds_line.c.snapshot_id == sid)).scalar(), 0)
+
+    def test_orphan_line_insert_is_rejected(self):
+        from sqlalchemy import insert
+        from sqlalchemy.exc import IntegrityError
+        eng = db_store.get_engine()
+        with self.assertRaises(IntegrityError):
+            with eng.begin() as conn:
+                conn.execute(insert(db_store.odds_line), {
+                    "snapshot_id": 999999, "bet_type": "moneyline",
+                    "selection": "Rockies", "price": 120})
+
+
 class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
     """Phase B: bulk team-market reader (db_store.team_market_lines) + the
     warehouse store assembler (warehouse.load_team_market_store)."""

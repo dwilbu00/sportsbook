@@ -38,9 +38,9 @@ import time
 import unicodedata
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, Float, Index, Integer, MetaData,
-    PrimaryKeyConstraint, String, Table, UniqueConstraint, and_, create_engine,
-    delete, func, insert, select, update,
+    Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
+    MetaData, PrimaryKeyConstraint, String, Table, UniqueConstraint, and_,
+    create_engine, delete, event, func, insert, select, update,
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -371,7 +371,14 @@ odds_snapshot = Table(
 odds_line = Table(
     "odds_line", _META,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("snapshot_id", Integer, nullable=False),
+    # Enforced parent reference (WS1c): a line cannot outlive its snapshot, and
+    # deleting a snapshot cascades to its lines. Named so the prod DDL / ALTER
+    # matches (see sql/schema.sql). SQLite enforces this only with the
+    # PRAGMA foreign_keys=ON set on each connection in get_engine().
+    Column("snapshot_id", Integer,
+           ForeignKey("odds_snapshot.id", ondelete="CASCADE",
+                      name="fk_odds_line_snapshot"),
+           nullable=False),
     Column("bet_type", String(16), nullable=False),   # moneyline|spread|total|player_prop
     Column("selection", String(160)),                 # team | Over | Under | player
     Column("point", Float),
@@ -627,6 +634,15 @@ def get_engine():
             _ENGINE = create_engine(
                 "sqlite://", connect_args={"check_same_thread": False},
                 poolclass=StaticPool)
+            # SQLite ignores FK constraints unless enabled per-connection, so the
+            # odds_line -> odds_snapshot FK (WS1c) would be inert in tests. Turn
+            # it on so the test harness enforces the same integrity Azure SQL does
+            # natively. (Azure SQL/MSSQL enforces declared FKs by default.)
+            @event.listens_for(_ENGINE, "connect")
+            def _sqlite_fk_pragma(dbapi_conn, _rec):  # pragma: no cover - trivial
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
         else:
             # login_timeout/timeout give the driver time to ride out an Azure SQL
             # serverless resume from auto-pause (the first connect after idle can
