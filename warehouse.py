@@ -54,6 +54,38 @@ except Exception:  # pragma: no cover - SQLAlchemy absent
 def _sql():
     return _db is not None and _db.enabled()
 
+
+# ── SQL-off hardening (WS1 Layer B) ──
+# Reads that silently return [] when SQL is off would make a mis-deployed prod
+# look like an empty warehouse instead of failing loud. _ensure_durable raises
+# only when a SQL deployment is signalled but SQL is actually off; it stays inert
+# in dev/tests (no SQL_* secrets) and in healthy prod (SQL on).
+_REQUIRE_SQL_ENV = "SPORTSBOOK_REQUIRE_SQL"
+_SQL_SECRET_KEYS = ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD")
+
+
+def _require_sql():
+    if _db is not None:
+        return _db.require_sql()
+    val = os.environ.get(_REQUIRE_SQL_ENV)
+    if val is not None:
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return any(os.environ.get(k) for k in _SQL_SECRET_KEYS)
+
+
+def _ensure_durable(op):
+    """Raise if a durable ``op`` would hit ephemeral local disk in a prod context.
+    No-op unless SQL is off AND a SQL deployment is signalled."""
+    if _sql() or not _require_sql():
+        return
+    raise RuntimeError(
+        f"Refusing to {op}: the SQL backend is not enabled but a SQL deployment "
+        f"is configured (SPORTSBOOK_REQUIRE_SQL or SQL_* secrets present). The "
+        f"local warehouse/ directory is ephemeral and would silently read empty. "
+        f"Fix the SQL_* secrets / the db_store import, or set "
+        f"SPORTSBOOK_REQUIRE_SQL=0 for intentional local use.")
+
+
 # sport nickname -> The Odds API sport_key (CLI convenience).
 _SPORT_KEYS = {
     "nba": "basketball_nba",
@@ -778,6 +810,7 @@ def load_team_market_store(sport_key, dates=None):
     when SQL is off or on any error."""
     empty = {"sport_key": sport_key, "games": {},
              "bookmaker": "warehouse (best-of-book, closing)"}
+    _ensure_durable("read the team-market warehouse")
     if not _sql():
         return empty
     try:
@@ -863,6 +896,7 @@ def load_prop_lines(sport_key, dates=None):
     (event, player, prop_key). ``game_date`` is the US-Eastern calendar date
     (UTC at rest, ET on read; see pricing_common.et_local_date). SQL-only and
     best-effort: returns [] when SQL is off or on any error."""
+    _ensure_durable("read the player-prop warehouse")
     if not _sql():
         return []
     try:

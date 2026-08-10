@@ -2734,6 +2734,18 @@ def main():
         db_store.promote_secrets_from_toml()
     except Exception:
         pass
+    else:
+        # SQL-off hardening (WS1 Layer C): a refit against a signalled-but-off SQL
+        # deployment would silently train/write nothing (degenerate warehouse
+        # reads + local-disk writes wiped on restart). Abort loudly. --store-label
+        # is an explicit local backfill read, so it is exempt from the read abort;
+        # Layer A still guards any writes it makes (mark_predictions_refit).
+        if (not args.store_label and db_store.require_sql()
+                and not db_store.enabled()):
+            p.error("SQL backend not reachable but a SQL deployment is configured "
+                    "(SPORTSBOOK_REQUIRE_SQL or SQL_* secrets present); aborting so "
+                    "the refit does not silently train/write nothing. Fix SQL_* "
+                    "secrets or pass --store-label for an intentional local run.")
 
     if args.dist_diag:
         diagnose_distributional(args.sport, store_label=args.store_label,

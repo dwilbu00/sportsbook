@@ -105,6 +105,41 @@ def _sql():
     return _db is not None and _db.enabled()
 
 
+# F1 guard: a durable write must fail LOUDLY when SQL is off but a SQL deployment
+# is configured, instead of silently degrading to ephemeral local disk. Env-only
+# so it is inert in every hermetic test and no-SQL dev run. The _db-is-None branch
+# (SQLAlchemy absent but SQL_* configured = a prod misconfig we must still catch)
+# reimplements require_sql() from the environment, since _db.require_sql() is
+# unreachable then.
+_REQUIRE_SQL_ENV = "SPORTSBOOK_REQUIRE_SQL"
+_SQL_SECRET_KEYS = ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD")
+
+
+def _require_sql():
+    if _db is not None:
+        return _db.require_sql()
+    flag = os.environ.get(_REQUIRE_SQL_ENV, "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return any(os.environ.get(k, "").strip() for k in _SQL_SECRET_KEYS)
+
+
+def _ensure_durable(op):
+    """Raise if a durable ``op`` would hit ephemeral local disk in a prod context.
+    No-op unless SQL is off AND a SQL deployment is signalled — so it never fires
+    in tests, no-SQL dev, or healthy prod."""
+    if _sql() or not _require_sql():
+        return
+    raise RuntimeError(
+        f"Refusing to {op}: the SQL backend is not enabled but a SQL deployment "
+        f"is configured (SPORTSBOOK_REQUIRE_SQL or SQL_* secrets present). Writing "
+        f"to ephemeral local disk would silently lose data. Fix the SQL_* secrets "
+        f"/ the db_store import, or set SPORTSBOOK_REQUIRE_SQL=0 for intentional "
+        f"local use.")
+
+
 def _table_for(filename):
     """Map an NDJSON store filename to its SQL table (e.g. 'wagers.jsonl'
     → 'wagers')."""
@@ -219,6 +254,7 @@ def mutate_prediction_log(mutator, max_retries=5, where=None):
     ``where`` (SQL path only) restricts the rows read into the mutator to a subset
     (see db_store.mutate) — for update-only passes like grading unresolved rows.
     The local path ignores it (reads all); the mutator must self-filter."""
+    _ensure_durable("write the prediction log")
     if _sql():
         # Serialize with the module lock, mirroring the local path: SQL's
         # read->mutate->replace is a read-modify-write, so concurrent threads in
@@ -347,6 +383,7 @@ def mutate_ndjson_log(filename, mutator, max_retries=5, where=None):
     (see db_store.mutate) — for update-only reconciliation passes. The local
     path ignores it and reads all rows, so the mutator must be correct on the full
     set (it self-filters)."""
+    _ensure_durable(f"write {filename}")
     if _sql():
         with _lock:  # in-process serialization of read->mutate->replace
             result = _db.mutate(_table_for(filename), mutator, where=where)
@@ -1754,6 +1791,12 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
     }
     if meta:
         blob["meta"] = meta
+    # A runtime refit (to_blob=True) is a durable write: refuse to let it land on
+    # ephemeral local disk when a SQL deployment is signalled but SQL is off. The
+    # offline seed path (to_blob=False) is *meant* to write the committed git file,
+    # so it stays unguarded.
+    if to_blob:
+        _ensure_durable("save recalibration params")
     # Local write (atomic swap). A runtime SQL refit skips this so it cannot
     # clobber the committed seed (which the merge/gate read back as the prior).
     if not (to_blob and _sql()):

@@ -23,13 +23,35 @@ sys.path.insert(0, SCRIPT_DIR)
 # Promote the Azure SQL connection secrets into the environment so the storage
 # layer (db_store, imported lazily by recalibration) can build its engine. When
 # these are unset the app keeps using the local store unchanged.
+# SPORTSBOOK_REQUIRE_SQL is promoted too so the SQL-off boot guard (below) and
+# db_store.require_sql() can key on the operator's explicit prod opt-in.
 try:
-    for _sql_key in ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD"):
+    for _sql_key in ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD",
+                     "SPORTSBOOK_REQUIRE_SQL"):
         _sql_val = st.secrets.get(_sql_key)
         if _sql_val:
             os.environ.setdefault(_sql_key, str(_sql_val))
 except Exception:
     pass
+
+# SQL-off hardening (WS1 Layer C): if a SQL deployment is signalled but the SQL
+# backend is not reachable, halt at boot instead of silently writing bets and
+# predictions to the ephemeral local disk (wiped on Streamlit Cloud restart).
+# Keyed on require_sql() → a local dev app with no SQL_* secrets is unaffected.
+# Only the predicate is wrapped; st.stop() runs outside so its halt propagates.
+try:
+    import db_store as _db_boot
+    _sql_misconfigured = _db_boot.require_sql() and not _db_boot.enabled()
+except Exception:
+    _sql_misconfigured = False
+if _sql_misconfigured:
+    st.error(
+        "Durable SQL backend is not reachable, but a SQL deployment is "
+        "configured (SPORTSBOOK_REQUIRE_SQL or SQL_* secrets present). "
+        "The app is halted to avoid silently writing bets and predictions "
+        "to ephemeral local disk that is wiped on restart. Fix the SQL_* "
+        "secrets, or set SPORTSBOOK_REQUIRE_SQL=0 for an intentional local run.")
+    st.stop()
 
 from odds_client import (
     get_upcoming_events,

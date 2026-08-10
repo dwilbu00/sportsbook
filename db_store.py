@@ -49,6 +49,7 @@ from sqlalchemy.pool import StaticPool
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _SECRET_KEYS = ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD")
+_REQUIRE_SQL_ENV = "SPORTSBOOK_REQUIRE_SQL"  # explicit prod opt-in / dev escape hatch
 _SQL_PORT = 1433
 
 _ENGINE = None
@@ -552,6 +553,30 @@ def _configured():
 def enabled():
     """True when the SQL backend should be used (test override, or all secrets)."""
     return _OVERRIDE_URL is not None or _configured()
+
+
+def require_sql():
+    """True when a SQL deployment is SIGNALLED, so a durable write/refit-read must
+    fail loudly rather than silently degrade to ephemeral local disk.
+
+    Environment-only (like _secret), so it is False in every hermetic test and
+    every no-SQL dev run, and True exactly when the operator has signalled a SQL
+    deployment. Precedence:
+      SPORTSBOOK_REQUIRE_SQL=1/true/yes/on  → True   (explicit prod opt-in)
+      SPORTSBOOK_REQUIRE_SQL=0/false/no/off → False  (explicit dev escape hatch)
+      else                                   → any SQL_* secret present ⇒ SQL intent
+
+    "Any SQL_* present" has no false positives: when True, either enabled() is
+    also True (all four present → healthy prod, guard inert) or the config is
+    genuinely broken (partial secrets / SQLAlchemy missing / Azure unreachable →
+    the loud failure is correct). A dev/test with no SQL deployment sets zero
+    SQL_* → False → local fallback fully preserved."""
+    flag = os.environ.get(_REQUIRE_SQL_ENV, "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return any(_secret(key) for key in _SECRET_KEYS)
 
 
 def configure_engine(url):
