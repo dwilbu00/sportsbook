@@ -286,6 +286,28 @@ class AthleteIdCacheTests(_Backend, unittest.TestCase):
             mock.assert_not_called()
         self.assertEqual(got["id"], "2")      # authoritative overwrite
 
+    def test_reseed_is_surgical_keeps_surrogate_id(self):
+        # WS15: re-seeding the same natural key is an UPDATE-in-place, not a
+        # delete + insert — the surrogate id is preserved and no duplicate row
+        # is left behind.
+        from sqlalchemy import select
+
+        def _row():
+            with db_store.get_engine().connect() as conn:
+                return [dict(r._mapping) for r in conn.execute(
+                    select(gamelog_store.athlete_id_cache).where(
+                        gamelog_store.athlete_id_cache.c.player_name_lower
+                        == "dupe"))]
+
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Dupe", "1")
+        before = _row()
+        self.assertEqual(len(before), 1)
+        gamelog_store.seed_athlete_id("baseball", "mlb", "Dupe", "2")
+        after = _row()
+        self.assertEqual(len(after), 1)                 # no orphan/dup row
+        self.assertEqual(after[0]["id"], before[0]["id"])   # surrogate id stable
+        self.assertEqual(after[0]["athlete_id"], "2")       # data updated
+
     def test_seed_noop_on_falsy_id(self):
         gamelog_store.seed_athlete_id("baseball", "mlb", "Ghost", None)
         with patch.object(espn_client, "search_athlete",

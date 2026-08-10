@@ -493,6 +493,30 @@ def _mlb_espn_id(name):
     return None
 
 
+def _put_athlete_cache(sport, league, name_lower, team_key, row):
+    """WS15: surgical upsert of the single athlete_id_cache row keyed by
+    (sport, league, player_name_lower, team_key) via db_store.reconcile — an
+    UPDATE-in-place (stable surrogate id) or INSERT instead of delete-by-key +
+    insert. ``fetched_at`` is the cache-hit TTL gate, so it is refreshed on every
+    call (NOT an ignore_col). Serialized per key with the same OperationalError
+    retry the delete+insert path used."""
+    engine = db_store.get_engine()
+    scope = {"sport": sport, "league": league,
+             "player_name_lower": name_lower, "team_key": team_key}
+    with _key_lock(("athlete", sport, league, name_lower, team_key)):
+        for attempt in range(3):
+            try:
+                with engine.begin() as conn:
+                    db_store.reconcile(
+                        conn, athlete_id_cache, [row],
+                        ("sport", "league", "player_name_lower", "team_key"),
+                        scope=scope)
+                return
+            except OperationalError:
+                if attempt == 2:
+                    raise
+
+
 def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOURS):
     """Durable name->id lookup. Returns {'id','name','team_id'} or None, matching
     espn_client.search_athlete. Works for all sports (sport-agnostic cache).
@@ -537,27 +561,14 @@ def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOU
     athlete = search_athlete(sport, league, name, team_ids=team_ids)
     aid = athlete["id"] if athlete else None
 
-    with _key_lock(("athlete", sport, league, name_lower, team_key)):
-        for attempt in range(3):
-            try:
-                with engine.begin() as conn:
-                    conn.execute(delete(athlete_id_cache).where(
-                        (athlete_id_cache.c.sport == sport)
-                        & (athlete_id_cache.c.league == league)
-                        & (athlete_id_cache.c.player_name_lower == name_lower)
-                        & (athlete_id_cache.c.team_key == team_key)))
-                    conn.execute(insert(athlete_id_cache), {
-                        "sport": sport, "league": league,
-                        "player_name_lower": name_lower, "team_key": team_key,
-                        "athlete_id": _s(aid),
-                        "name": _s(athlete.get("name")) if athlete else None,
-                        "team_id": _s(athlete.get("team_id")) if athlete else None,
-                        "fetched_at": _now(),
-                    })
-                break
-            except OperationalError:
-                if attempt == 2:
-                    raise
+    _put_athlete_cache(sport, league, name_lower, team_key, {
+        "sport": sport, "league": league,
+        "player_name_lower": name_lower, "team_key": team_key,
+        "athlete_id": _s(aid),
+        "name": _s(athlete.get("name")) if athlete else None,
+        "team_id": _s(athlete.get("team_id")) if athlete else None,
+        "fetched_at": _now(),
+    })
     return athlete
 
 
@@ -575,23 +586,9 @@ def seed_athlete_id(sport, league, name, athlete_id, team_ids=None):
         return
     name_lower = (name or "").lower()
     team_key = "|".join(sorted(str(t) for t in team_ids if t)) if team_ids else ""
-    engine = db_store.get_engine()
-    with _key_lock(("athlete", sport, league, name_lower, team_key)):
-        for attempt in range(3):
-            try:
-                with engine.begin() as conn:
-                    conn.execute(delete(athlete_id_cache).where(
-                        (athlete_id_cache.c.sport == sport)
-                        & (athlete_id_cache.c.league == league)
-                        & (athlete_id_cache.c.player_name_lower == name_lower)
-                        & (athlete_id_cache.c.team_key == team_key)))
-                    conn.execute(insert(athlete_id_cache), {
-                        "sport": sport, "league": league,
-                        "player_name_lower": name_lower, "team_key": team_key,
-                        "athlete_id": _s(athlete_id), "name": _s(name),
-                        "team_id": None, "fetched_at": _now(),
-                    })
-                return
-            except OperationalError:
-                if attempt == 2:
-                    raise
+    _put_athlete_cache(sport, league, name_lower, team_key, {
+        "sport": sport, "league": league,
+        "player_name_lower": name_lower, "team_key": team_key,
+        "athlete_id": _s(athlete_id), "name": _s(name),
+        "team_id": None, "fetched_at": _now(),
+    })
