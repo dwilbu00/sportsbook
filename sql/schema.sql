@@ -696,3 +696,164 @@ CREATE TABLE dbo.app_settings (
     CONSTRAINT uq_app_setting_key UNIQUE (setting_key)
 );
 GO
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MLB → StatsAPI medallion (P1). BRONZE transient raw-JSON landing + SILVER
+-- durable dims (team/game/player) + a standings fact + a provider→MLBAM alias
+-- scaffold. Populated read-only alongside the live ESPN path (dual-run); nothing
+-- consumes it until the P4 cutover. Mirrors mlb_warehouse.py's SQLAlchemy Core
+-- metadata (test_mlb_warehouse.py::SchemaParityTests enforces column parity).
+-- Natural keys from StatsAPI are the PKs for the dims (team_id/game_pk/player_id);
+-- the games dim is the spine (home/away FK → team dim). MLB only.
+-- Order matters: mlb_team is created BEFORE mlb_game / mlb_team_standings so the
+-- FKs resolve. game_date is the FULL ISO timestamp (its time disambiguates split
+-- doubleheaders); official_date is the YYYY-MM-DD play date used for joins.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+------------------------------------------------------------------------ mlb_bronze
+-- Transient raw-response landing (one live payload per natural ref). A boxscore
+-- row is purged once its game is genuine-final AND the silver it feeds is written;
+-- schedule/standings rows are overwritten on next fetch (UNIQUE(kind,natural_ref)).
+-- Never read by the app — only by the silver-builder. payload = raw JSON text.
+IF OBJECT_ID('dbo.mlb_bronze', 'U') IS NULL
+CREATE TABLE dbo.mlb_bronze (
+    id           INT IDENTITY(1,1) PRIMARY KEY,
+    kind         NVARCHAR(16)  NOT NULL,          -- schedule|boxscore|standings|teams
+    natural_ref  NVARCHAR(64)  NOT NULL,          -- gamePk | YYYY-MM-DD | season
+    payload      NVARCHAR(MAX) NOT NULL,          -- raw JSON
+    fetched_at   FLOAT,                            -- epoch seconds
+    processed_at FLOAT,                            -- set when dims/facts written; NULL=pending
+    CONSTRAINT uq_mlb_bronze UNIQUE (kind, natural_ref)
+);
+GO
+
+-------------------------------------------------------------------------- mlb_team
+-- Team dim keyed on the MLBAM team_id (natural PK). league_id/division_id from
+-- /teams; name_norm = normalize_name(name) for tolerant joins.
+IF OBJECT_ID('dbo.mlb_team', 'U') IS NULL
+CREATE TABLE dbo.mlb_team (
+    team_id      NVARCHAR(32)  NOT NULL PRIMARY KEY,   -- MLBAM
+    name         NVARCHAR(160),
+    name_norm    NVARCHAR(160),
+    abbreviation NVARCHAR(16),
+    league_id    NVARCHAR(16),
+    division_id  NVARCHAR(16),
+    fetched_at   FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_team_name'
+                 AND object_id = OBJECT_ID('dbo.mlb_team'))
+CREATE INDEX ix_mlb_team_name ON dbo.mlb_team (name_norm);
+GO
+
+-------------------------------------------------------------------------- mlb_game
+-- Games dim = the spine. game_pk (MLBAM, globally unique across all MLB history)
+-- is the natural PK; home/away FK → mlb_team. Facts reference this dim to derive
+-- opponent/is_home/game_date rather than denormalizing them.
+IF OBJECT_ID('dbo.mlb_game', 'U') IS NULL
+CREATE TABLE dbo.mlb_game (
+    game_pk        INT           NOT NULL PRIMARY KEY,  -- MLBAM (supplied, not IDENTITY)
+    game_date      NVARCHAR(40),                        -- FULL ISO timestamp (UTC)
+    official_date  NVARCHAR(10),                        -- YYYY-MM-DD play date
+    season         INT,
+    game_number    INT,                                 -- doubleheader game #
+    double_header  NVARCHAR(4),                         -- N|Y (traditional)|S (split)
+    home_team_id   NVARCHAR(32),
+    away_team_id   NVARCHAR(32),
+    venue_id       NVARCHAR(16),
+    status         NVARCHAR(32),                         -- abstractGameState
+    detailed_state NVARCHAR(64),                         -- detailedState
+    home_score     FLOAT,
+    away_score     FLOAT,
+    fetched_at     FLOAT,
+    CONSTRAINT fk_mlb_game_home
+        FOREIGN KEY (home_team_id) REFERENCES dbo.mlb_team (team_id),
+    CONSTRAINT fk_mlb_game_away
+        FOREIGN KEY (away_team_id) REFERENCES dbo.mlb_team (team_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_game_official_date'
+                 AND object_id = OBJECT_ID('dbo.mlb_game'))
+CREATE INDEX ix_mlb_game_official_date ON dbo.mlb_game (official_date);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_game_teams'
+                 AND object_id = OBJECT_ID('dbo.mlb_game'))
+CREATE INDEX ix_mlb_game_teams
+    ON dbo.mlb_game (official_date, home_team_id, away_team_id);  -- retro-match
+GO
+
+------------------------------------------------------------------------ mlb_player
+-- Player dim keyed on the MLBAM player_id (natural PK). bats/throws are nullable
+-- in P1 (boxscore rosters give name/position/is_pitcher; handedness backfills from
+-- /people later). name_norm for tolerant joins.
+IF OBJECT_ID('dbo.mlb_player', 'U') IS NULL
+CREATE TABLE dbo.mlb_player (
+    player_id        NVARCHAR(32) NOT NULL PRIMARY KEY,  -- MLBAM
+    full_name        NVARCHAR(160),
+    name_norm        NVARCHAR(160),
+    primary_position NVARCHAR(16),
+    is_pitcher       BIT,
+    bats             NVARCHAR(8),
+    throws           NVARCHAR(8),
+    fetched_at       FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_player_name'
+                 AND object_id = OBJECT_ID('dbo.mlb_player'))
+CREATE INDEX ix_mlb_player_name ON dbo.mlb_player (name_norm);
+GO
+
+----------------------------------------------------------------- mlb_team_standings
+-- Team win%/record snapshot fact (team × season × as-of). Feeds team markets +
+-- opponent-strength; replaces the ESPN /standings merge for MLB.
+IF OBJECT_ID('dbo.mlb_team_standings', 'U') IS NULL
+CREATE TABLE dbo.mlb_team_standings (
+    id          INT IDENTITY(1,1) PRIMARY KEY,
+    team_id     NVARCHAR(32) NOT NULL,
+    season      INT          NOT NULL,
+    as_of_date  NVARCHAR(16) NOT NULL,               -- YYYY-MM-DD snapshot cutoff
+    wins        INT,
+    losses      INT,
+    win_pct     FLOAT,
+    fetched_at  FLOAT,
+    CONSTRAINT uq_mlb_team_standings UNIQUE (team_id, season, as_of_date),
+    CONSTRAINT fk_mlb_standings_team
+        FOREIGN KEY (team_id) REFERENCES dbo.mlb_team (team_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_team_standings_asof'
+                 AND object_id = OBJECT_ID('dbo.mlb_team_standings'))
+CREATE INDEX ix_mlb_team_standings_asof
+    ON dbo.mlb_team_standings (season, as_of_date);
+GO
+
+----------------------------------------------------------------------- player_alias
+-- Provider NAME/id → MLBAM resolution store (the "associations" stored once).
+-- Seeded from player_id_map (SFBB) + grown at runtime by the P3 entity resolver.
+-- confidence/resolution_method/validity per the identity-resolution spec.
+-- mlb_player_id is a value (validated at write time), NOT an enforced FK, so an
+-- alias can be recorded before its player dim row lands.
+IF OBJECT_ID('dbo.player_alias', 'U') IS NULL
+CREATE TABLE dbo.player_alias (
+    id                INT IDENTITY(1,1) PRIMARY KEY,
+    provider          NVARCHAR(32)  NOT NULL,         -- e.g. 'oddsapi'|'sfbb'
+    provider_key      NVARCHAR(200) NOT NULL,         -- provider name or id
+    mlb_player_id     NVARCHAR(32)  NOT NULL,         -- MLBAM
+    confidence        FLOAT,
+    resolution_method NVARCHAR(32),                   -- alias|roster_exact|fuzzy_single|seed
+    valid_from        NVARCHAR(40),
+    valid_to          NVARCHAR(40),
+    fetched_at        FLOAT,
+    CONSTRAINT uq_player_alias UNIQUE (provider, provider_key)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_player_alias_mlb'
+                 AND object_id = OBJECT_ID('dbo.player_alias'))
+CREATE INDEX ix_player_alias_mlb ON dbo.player_alias (mlb_player_id);
+GO
