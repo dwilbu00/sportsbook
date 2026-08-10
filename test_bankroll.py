@@ -37,8 +37,8 @@ class _SqlBankroll:
 
 
 class _LocalBankroll:
-    """Force bankroll/recalibration onto a tempdir NDJSON store (Blob/local
-    fallback: ``where`` ignored, full-file read-modify-write)."""
+    """Force bankroll/recalibration onto a tempdir NDJSON store (local fallback:
+    ``where`` ignored, full-file read-modify-write)."""
 
     def __init__(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -47,13 +47,11 @@ class _LocalBankroll:
         recalibration._NDJSON_CACHE.clear()
         recalibration._LOAD_CACHE.clear()
         self._p1 = patch.object(recalibration, "PRED_DIR", self._tmp.name)
-        self._p2 = patch.object(recalibration, "_prediction_log_blob_url",
-                                return_value="")
-        self._p1.start(); self._p2.start()
+        self._p1.start()
         return self
 
     def __exit__(self, *exc):
-        self._p1.stop(); self._p2.stop()
+        self._p1.stop()
         recalibration._NDJSON_CACHE.clear()
         recalibration._LOAD_CACHE.clear()
         self._tmp.cleanup()

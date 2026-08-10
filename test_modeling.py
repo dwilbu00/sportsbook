@@ -1198,13 +1198,11 @@ class RecalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["realized_roi"], (1 + 10 / 11) / 2)
 
     def test_maintenance_resolves_before_testing_refit_gate(self):
-        # blob-url -> "" keeps compact_prediction_log off live Azure (secrets.toml
-        # is present locally); a None last-fit forces the refit branch the way the
-        # old os.path.exists=False mock did before the gate became blob-aware.
+        # A None last-fit forces the refit branch; compact_prediction_log is mocked
+        # out so nothing touches the durable store (secrets.toml is present locally).
         with patch.object(
                 recalibration, "resolve_pending_outcomes", return_value=25), patch.object(
                 recalibration, "resolve_pending_market_outcomes", return_value=0), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=""), patch.object(
                 recalibration, "_load_recal_cached", return_value=(None, {})), patch.object(
                 recalibration, "compact_prediction_log", return_value=0), patch.object(
                 recalibration, "refit_sport", return_value={"prop": (1, 0, 90)}) as refit:
@@ -1267,8 +1265,7 @@ class RecalibrationTests(unittest.TestCase):
                 recalibration, "PRED_DIR", temp_dir), patch.object(
                 recalibration, "CALIB_DIR", temp_dir), patch.object(
                 recalibration, "LOG_PATH",
-                os.path.join(temp_dir, "prediction_log.jsonl")), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=""):
+                os.path.join(temp_dir, "prediction_log.jsonl")):
             written = recalibration.log_prediction_rows([{"test": 1}])
             rows = recalibration.read_prediction_log()
         self.assertEqual(written, 1)

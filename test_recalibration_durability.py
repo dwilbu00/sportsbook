@@ -1,10 +1,12 @@
-"""Tests for accuracy-roadmap 0.1b (Blob-durable Platt recalibration) and 0.2
-(hard-ID / doubleheader-safe outcome resolution).
+"""Tests for the SQL-durable Platt recalibration overlay (accuracy-roadmap 0.1b)
+and doubleheader-safe outcome resolution (0.2).
 
-All external I/O is mocked: the Azure blob (requests.get/put) and the MLB
-statsapi client (_get) are patched, and _prediction_log_blob_url is either
-patched to a fake URL or to "" so nothing touches live services — important
-because .streamlit/secrets.toml is present locally.
+The durable store is Azure SQL in prod; here it runs against an in-memory SQLite
+engine (db_store.configure_engine("sqlite://")). The local git-committed
+recalibration file is the seed/prior the SQL overlay merges onto, so CALIB_DIR is
+redirected to a temp dir per test (empty = no prior). The MLB statsapi client
+(_get) is patched so nothing touches live services — important because
+.streamlit/secrets.toml is present locally.
 """
 
 import json
@@ -12,139 +14,126 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
+import db_store
 import mlb_starters
 import recalibration
-
-_FAKE_URL = ("https://acct.blob.core.windows.net/cont/predictions/"
-             "prediction_log.jsonl?sig=abc&sr=c")
-
-
-class _FakeBlobStore:
-    """Minimal in-memory Azure blob honoring If-None-Match:* and If-Match."""
-
-    def __init__(self, body=None, etag=None):
-        self.body = body
-        self.etag = etag
-
-    def get(self, url, headers=None, timeout=None):
-        inm = (headers or {}).get("If-None-Match")
-        if self.body is None:
-            return Mock(status_code=404)
-        if inm and inm == self.etag:
-            return Mock(status_code=304)
-        return Mock(status_code=200, text=self.body, headers={"ETag": self.etag})
-
-    def put(self, url, data=None, headers=None, timeout=None):
-        inm = (headers or {}).get("If-None-Match")
-        ifm = (headers or {}).get("If-Match")
-        if inm == "*" and self.body is not None:
-            return Mock(status_code=412)
-        if ifm is not None and ifm != self.etag:
-            return Mock(status_code=412)
-        self.body = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
-        self.etag = f'"{abs(hash(self.body)) & 0xffff}"'
-        return Mock(status_code=201)
-
 
 _VALID_FIT = {"batter_hits": {"a": 0.5, "b": 0.1, "n_fit": 120, "validated": True}}
 
 
-class BlobRecalibrationTests(unittest.TestCase):
+class SqlRecalibrationTests(unittest.TestCase):
+    """The SQL overlay round-trips validated fits and merges onto the local seed.
+
+    Runs against an in-memory SQLite engine; CALIB_DIR is a temp dir so the local
+    seed (the prior) is controlled per test — empty means no prior to blend."""
+
     def setUp(self):
         recalibration._LOAD_CACHE.pop("baseball_mlb", None)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        self.addCleanup(db_store.configure_engine, None)
         self.addCleanup(recalibration._LOAD_CACHE.pop, "baseball_mlb", None)
 
-    def test_save_then_load_blob_round_trip(self):
-        store = _FakeBlobStore()
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                "requests.get", side_effect=store.get), patch(
-                "requests.put", side_effect=store.put):
+    def _write_seed(self, props, ts="2026-07-20T00:00:00+00:00"):
+        path = os.path.join(self._tmp.name, "recalibration_baseball_mlb.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"fit_timestamp": ts, "props": props}, f)
+
+    def test_save_then_load_sql_round_trip(self):
+        # Empty seed dir → no prior to blend → the SQL fit applies verbatim.
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name):
             recalibration.save_recalibration("baseball_mlb", _VALID_FIT)
             props = recalibration.load_recalibration("baseball_mlb")
         self.assertIn("batter_hits", props)
         self.assertEqual(props["batter_hits"]["a"], 0.5)
-        self.assertIsNotNone(store.body)  # persisted to the blob, not just local
+        # A runtime SQL refit persists to SQL only, never the committed seed file.
+        self.assertFalse(os.path.exists(
+            os.path.join(self._tmp.name, "recalibration_baseball_mlb.json")))
 
     def test_unvalidated_fit_is_not_applied(self):
-        store = _FakeBlobStore()
         fit = {"pitcher_strikeouts": {"a": 1.0, "b": 0.0, "validated": False}}
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                "requests.get", side_effect=store.get), patch(
-                "requests.put", side_effect=store.put):
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name):
             recalibration.save_recalibration("baseball_mlb", fit)
             props = recalibration.load_recalibration("baseball_mlb")
         self.assertEqual(props, {})
 
-    def test_load_falls_back_to_local_baseline_on_404(self):
-        # Empty blob (404) must not hide the git-committed seed.
-        store = _FakeBlobStore()  # body None -> GET 404
-        path = os.path.join(self._tmp.name, "recalibration_baseball_mlb.json")
-        with open(path, "w") as f:
-            json.dump({"fit_timestamp": "2026-07-20T00:00:00+00:00",
-                       "props": _VALID_FIT}, f)
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                "requests.get", side_effect=store.get):
+    def test_sql_empty_falls_back_to_local_seed(self):
+        # An empty SQL overlay must not hide the git-committed seed.
+        self._write_seed(_VALID_FIT)
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name):
             props = recalibration.load_recalibration("baseball_mlb")
         self.assertIn("batter_hits", props)
 
-    def test_load_degrades_to_cache_on_network_error(self):
-        store = _FakeBlobStore(body=json.dumps({"props": _VALID_FIT}), etag='"e1"')
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL):
-            with patch("requests.get", side_effect=store.get):
-                first = recalibration.load_recalibration("baseball_mlb")
+    def test_load_degrades_to_cache_on_db_error(self):
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name):
+            recalibration.save_recalibration("baseball_mlb", _VALID_FIT)
+            first = recalibration.load_recalibration("baseball_mlb")
             self.assertIn("batter_hits", first)
-            # Expire the TTL, then make the network fail.
+            # Expire the TTL, then make the DB read fail: serve the last cache.
             recalibration._LOAD_CACHE["baseball_mlb"]["fetched_at"] = 0
-            import requests
-            with patch("requests.get", side_effect=requests.RequestException("down")):
+            with patch.object(recalibration._db, "load_recal",
+                              side_effect=Exception("db down")):
                 degraded = recalibration.load_recalibration("baseball_mlb")
         self.assertEqual(degraded, first)
 
     def test_malformed_props_degrades_to_empty_without_raising(self):
-        # Valid JSON but a bad `props` shape must NOT raise on the free-loop
-        # load path (props.py:348 is unwrapped) — it must degrade to {}.
-        for body in ('{"props": {"batter_hits": null}}',
-                     '{"props": [1, 2, 3]}',
-                     '{"props": {"batter_hits": "oops"}}'):
-            store = _FakeBlobStore(body=body, etag='"e"')
+        # A bad `props` shape from the store must degrade to {} on the (unwrapped)
+        # free-loop load path (props.py:348), never raise.
+        for cfg in ({"props": {"batter_hits": None}},
+                    {"props": [1, 2, 3]},
+                    {"props": {"batter_hits": "oops"}}):
             recalibration._LOAD_CACHE.pop("baseball_mlb", None)
-            with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                    recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                    "requests.get", side_effect=store.get):
+            with patch.object(recalibration, "CALIB_DIR", self._tmp.name), \
+                 patch.object(recalibration._db, "load_recal", return_value=cfg):
                 self.assertEqual(
                     recalibration.load_recalibration("baseball_mlb"), {})
 
-    def test_save_overwrites_an_unreadable_blob(self):
-        # A present-but-corrupt blob must be overwritable (If-Match), not loop
-        # forever on If-None-Match:* -> 412 (durability silently lost).
-        store = _FakeBlobStore(body="corrupt not json", etag='"e0"')
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                "requests.get", side_effect=store.get), patch(
-                "requests.put", side_effect=store.put):
-            recalibration.save_recalibration("baseball_mlb", _VALID_FIT)
-            props = recalibration.load_recalibration("baseball_mlb")
-        self.assertIn("batter_hits", props)
-
     def test_seed_save_stays_local_only(self):
-        # to_blob=False must never PUT to the production blob.
-        put_calls = []
-        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), patch.object(
-                recalibration, "_prediction_log_blob_url", return_value=_FAKE_URL), patch(
-                "requests.put", side_effect=lambda *a, **k: put_calls.append(a)):
+        # to_blob=False (offline seeding) writes the local seed and never touches
+        # the SQL overlay, keeping the committed file a pristine prior.
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name), \
+             patch.object(recalibration._db, "save_recal") as save_recal:
             recalibration.save_recalibration("baseball_mlb", _VALID_FIT,
                                              to_blob=False)
-        self.assertEqual(put_calls, [])
+        save_recal.assert_not_called()
         self.assertTrue(os.path.exists(
             os.path.join(self._tmp.name, "recalibration_baseball_mlb.json")))
+
+    def test_sql_fit_blends_toward_seed_and_keeps_seed_only_props(self):
+        # Seed holds two props; the SQL overlay has a fit for only one. The fit
+        # blends toward its seed prior; the seed-only prop survives untouched
+        # (the per-key overlay, not the old all-or-nothing fallback).
+        seed = {
+            "batter_hits": {"a": 0.4, "b": 0.2, "n_fit": 100, "validated": True},
+            "pitcher_outs": {"a": 0.6, "b": -0.1, "n_fit": 80, "validated": True},
+        }
+        self._write_seed(seed)
+        sql_fit = {"batter_hits":
+                   {"a": 0.8, "b": 0.0, "n_fit": 300, "validated": True}}
+        with patch.object(recalibration, "CALIB_DIR", self._tmp.name):
+            recalibration.save_recalibration("baseball_mlb", sql_fit)  # SQL only
+            props = recalibration.load_recalibration("baseball_mlb")
+        # Seed-only prop passes through unchanged...
+        self.assertEqual(props["pitcher_outs"]["a"], 0.6)
+        # ...and the fit prop is a shrinkage blend strictly between seed and loop.
+        self.assertIn("blend_weight", props["batter_hits"])
+        self.assertGreater(props["batter_hits"]["a"], 0.4)
+        self.assertLess(props["batter_hits"]["a"], 0.8)
+
+
+class StorageBackendStringTests(unittest.TestCase):
+    """With no SQL configured, the human-readable backend strings name local."""
+
+    def test_local_storage_strings_when_no_sql(self):
+        import warehouse
+        with patch.object(recalibration, "_sql", return_value=False):
+            self.assertEqual(recalibration.prediction_log_storage(), "Local cache")
+        with patch.object(warehouse, "_sql", return_value=False):
+            self.assertEqual(warehouse.storage_backend(), "Local warehouse/")
 
 
 class RefitGateTests(unittest.TestCase):
@@ -368,79 +357,55 @@ class StatsapiResolverTests(unittest.TestCase):
         self.assertIs(val, mlb_starters.GAME_NOT_FINAL)
 
 
-class _Resp:
-    """Minimal requests.Response stand-in for the NDJSON read-cache test."""
-    def __init__(self, status, text="", etag=None):
-        self.status_code = status
-        self.text = text
-        self.headers = {"ETag": etag} if etag else {}
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            import requests
-            raise requests.HTTPError(str(self.status_code))
-
-
 class NdjsonReadCacheTests(unittest.TestCase):
-    """The blob read-cache (use_cache=True) must serve repeat reads without a
-    new GET, and every write through mutate_ndjson_log must invalidate it."""
+    """The SQL read-cache (use_cache=True) must serve repeat reads without a new
+    DB read, and every write through mutate_ndjson_log must invalidate it."""
 
     def setUp(self):
         recalibration._NDJSON_CACHE.clear()
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        self.addCleanup(db_store.configure_engine, None)
         self.addCleanup(recalibration._NDJSON_CACHE.clear)
 
+    def _seed(self, **row):
+        def add(rows):
+            rows.append(row)
+            return 1
+        recalibration.mutate_ndjson_log("wagers.jsonl", add)
+
     def test_cached_read_then_write_invalidates(self):
-        state = {"body": '{"wager_id": "w1", "status": "pending"}\n',
-                 "etag": '"v1"', "gets": 0}
-
-        def fake_get(url, timeout=None, **kw):
-            state["gets"] += 1
-            return _Resp(200, state["body"], state["etag"])
-
-        def fake_put(url, data=None, headers=None, timeout=None, **kw):
-            state["body"] = data.decode("utf-8") if isinstance(data, bytes) else data
-            state["etag"] = '"v2"'
-            return _Resp(201)
-
-        with patch.object(recalibration, "_prediction_log_blob_url",
-                          return_value=_FAKE_URL), \
-             patch("requests.get", side_effect=fake_get), \
-             patch("requests.put", side_effect=fake_put):
+        self._seed(wager_id="w1", status="pending")
+        # Spy on the DB read (mutate uses _select_rows, so it never bumps this).
+        with patch.object(recalibration._db, "read_rows",
+                          side_effect=db_store.read_rows) as spy:
             rows1, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
             self.assertEqual(len(rows1), 1)
-            self.assertEqual(state["gets"], 1)
+            self.assertEqual(spy.call_count, 1)
 
-            # Second read within TTL is served from cache — no new GET.
+            # Second read within TTL is served from cache — no new DB read.
             rows2, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
-            self.assertEqual(state["gets"], 1)
+            self.assertEqual(spy.call_count, 1)
             self.assertEqual(len(rows2), 1)
 
-            # A write pops the cache; the next cached read re-fetches fresh rows.
+            # A write pops the cache; the next cached read re-queries.
             def add(rows):
                 rows.append({"wager_id": "w2", "status": "pending"})
                 return 1
             recalibration.mutate_ndjson_log("wagers.jsonl", add)
-            gets_before = state["gets"]
+            calls_before = spy.call_count
             rows3, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
-            self.assertGreater(state["gets"], gets_before)  # cache was invalidated
+            self.assertGreater(spy.call_count, calls_before)  # cache invalidated
             self.assertEqual(len(rows3), 2)
 
     def test_mutated_rows_do_not_poison_cache(self):
-        # A read returns a deep copy, so a caller mutating rows in place cannot
-        # corrupt the cached snapshot served to the next reader.
-        state = {"body": '{"wager_id": "w1", "close_price": null}\n', "gets": 0}
-
-        def fake_get(url, timeout=None, **kw):
-            state["gets"] += 1
-            return _Resp(200, state["body"], '"v1"')
-
-        with patch.object(recalibration, "_prediction_log_blob_url",
-                          return_value=_FAKE_URL), \
-             patch("requests.get", side_effect=fake_get):
-            rows1, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
-            rows1[0]["close_price"] = -120  # caller mutates its copy
-            rows2, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
-            self.assertIsNone(rows2[0]["close_price"])  # cache untouched
+        # A cached read returns a deep copy, so a caller mutating rows in place
+        # cannot corrupt the snapshot served to the next reader.
+        self._seed(wager_id="w1", status="pending", close_price=None)
+        rows1, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+        rows1[0]["close_price"] = -120  # caller mutates its copy
+        rows2, _ = recalibration._read_ndjson_blob("wagers.jsonl", use_cache=True)
+        self.assertIsNone(rows2[0]["close_price"])  # cache untouched
 
 
 class StaleDnpVoidTests(unittest.TestCase):

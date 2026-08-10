@@ -190,13 +190,11 @@ class _LocalLedger:
 
     def __enter__(self):
         self._p1 = patch.object(recalibration, "PRED_DIR", self._tmp.name)
-        self._p2 = patch.object(recalibration, "_prediction_log_blob_url",
-                                return_value="")
-        self._p1.start(); self._p2.start()
+        self._p1.start()
         return self
 
     def __exit__(self, *exc):
-        self._p1.stop(); self._p2.stop()
+        self._p1.stop()
         self._tmp.cleanup()
 
 

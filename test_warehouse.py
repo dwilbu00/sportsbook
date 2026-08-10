@@ -1,21 +1,16 @@
 """Tests for roadmap 0.4 — the durable odds/line warehouse.
 
-Fully hermetic: no live Odds API / Azure I/O. The blob path is exercised with an
-in-memory fake container (honoring If-None-Match:* write-once and If-Match RMW);
-the local-fallback path uses a tempdir. capture -> flush -> read is verified end
-to end, along with write-once immutability, seeding, and closing-line lookup.
+Fully hermetic: no live Odds API / Azure I/O. These exercise the local-fallback
+path (SCRIPT_DIR redirected to a tempdir, _sql() forced off); capture -> flush ->
+read is verified end to end, along with write-once immutability, seeding, and
+closing-line lookup.
 """
-import json
 import os
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
-from urllib.parse import urlsplit
+from unittest.mock import patch
 
 import warehouse
-
-_FAKE_URL = ("https://acct.blob.core.windows.net/cont/predictions/"
-             "prediction_log.jsonl?sig=abc&sr=c")
 
 
 def _payload(event_id="E1", home="Boston Red Sox", away="New York Yankees",
@@ -37,40 +32,6 @@ def _payload(event_id="E1", home="Boston Red Sox", away="New York Yankees",
     }
 
 
-class _FakeContainer:
-    """In-memory Azure container honoring If-None-Match:* and If-Match."""
-
-    def __init__(self):
-        self.blobs = {}   # path -> (body, etag)
-        self.puts = []
-
-    @staticmethod
-    def _path(url):
-        return urlsplit(url).path
-
-    def get(self, url, headers=None, timeout=None):
-        path = self._path(url)
-        if path not in self.blobs:
-            return Mock(status_code=404)
-        body, etag = self.blobs[path]
-        return Mock(status_code=200, text=body, headers={"ETag": etag})
-
-    def put(self, url, data=None, headers=None, timeout=None):
-        path = self._path(url)
-        headers = headers or {}
-        exists = path in self.blobs
-        if headers.get("If-None-Match") == "*" and exists:
-            return Mock(status_code=412)
-        ifm = headers.get("If-Match")
-        if ifm is not None and (not exists or self.blobs[path][1] != ifm):
-            return Mock(status_code=412)
-        body = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
-        etag = f'"{abs(hash(body)) & 0xffff}"'
-        self.blobs[path] = (body, etag)
-        self.puts.append(path)
-        return Mock(status_code=201)
-
-
 class LocalFallbackTests(unittest.TestCase):
     def setUp(self):
         warehouse._accumulator.clear()
@@ -78,7 +39,7 @@ class LocalFallbackTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.addCleanup(warehouse._accumulator.clear)
         p1 = patch.object(warehouse, "SCRIPT_DIR", self._tmp.name)
-        p2 = patch.object(warehouse, "_blob_base", return_value="")
+        p2 = patch.object(warehouse, "_sql", return_value=False)
         p1.start(); p2.start()
         self.addCleanup(p1.stop); self.addCleanup(p2.stop)
 
@@ -125,55 +86,6 @@ class LocalFallbackTests(unittest.TestCase):
         self.assertAlmostEqual(close["implied_prob"], 120 / 220, places=4)
 
 
-class BlobStoreTests(unittest.TestCase):
-    def setUp(self):
-        warehouse._accumulator.clear()
-        self.addCleanup(warehouse._accumulator.clear)
-        self.container = _FakeContainer()
-        p1 = patch.object(warehouse, "_blob_base", return_value=_FAKE_URL)
-        p2 = patch("requests.get", side_effect=self.container.get)
-        p3 = patch("requests.put", side_effect=self.container.put)
-        p1.start(); p2.start(); p3.start()
-        self.addCleanup(p1.stop); self.addCleanup(p2.stop); self.addCleanup(p3.stop)
-
-    def test_snapshot_lands_under_container_root(self):
-        warehouse.capture_event_odds(
-            "baseball_mlb", "E1", "us", "h2h", None, _payload(),
-            captured_at="2026-07-16T14:00:00Z")
-        warehouse.flush()
-        # Blob paths are container-root-relative (…/cont/warehouse/…), not nested
-        # under predictions/.
-        snap_paths = [p for p in self.container.puts if "/warehouse/" in p
-                      and not p.endswith("_manifest.json")]
-        self.assertTrue(snap_paths)
-        self.assertIn("/cont/warehouse/baseball_mlb/2026-07-16/", snap_paths[0])
-        snaps = warehouse.list_snapshots("baseball_mlb", "2026-07-16")
-        self.assertEqual(len(snaps), 1)
-
-    def test_reput_same_name_is_412_swallowed(self):
-        for _ in range(2):
-            warehouse.capture_event_odds(
-                "baseball_mlb", "E1", "us", "h2h", None, _payload(),
-                captured_at="2026-07-16T14:00:00Z")
-        # Two eager PUTs to the same immutable name: the second returns 412 and
-        # must be swallowed (no raise); the manifest still holds exactly one.
-        warehouse.flush()
-        snaps = warehouse.list_snapshots("baseball_mlb", "2026-07-16")
-        self.assertEqual(len(snaps), 1)
-
-    def test_manifest_merges_two_events(self):
-        warehouse.capture_event_odds(
-            "baseball_mlb", "E1", "us", "h2h", None, _payload("E1"),
-            captured_at="2026-07-16T14:00:00Z")
-        warehouse.capture_event_odds(
-            "baseball_mlb", "E2", "us", "h2h", None,
-            _payload("E2", home="Chicago Cubs", away="St. Louis Cardinals"),
-            captured_at="2026-07-16T14:00:00Z")
-        warehouse.flush()
-        snaps = warehouse.list_snapshots("baseball_mlb", "2026-07-16")
-        self.assertEqual({s["event_id"] for s in snaps}, {"E1", "E2"})
-
-
 class SeedAndJoinTests(unittest.TestCase):
     def setUp(self):
         warehouse._accumulator.clear()
@@ -183,7 +95,7 @@ class SeedAndJoinTests(unittest.TestCase):
         self._store_dir = os.path.join(self._tmp.name, "historical_odds")
         os.makedirs(self._store_dir, exist_ok=True)
         p1 = patch.object(warehouse, "SCRIPT_DIR", self._tmp.name)
-        p2 = patch.object(warehouse, "_blob_base", return_value="")
+        p2 = patch.object(warehouse, "_sql", return_value=False)
         p1.start(); p2.start()
         self.addCleanup(p1.stop); self.addCleanup(p2.stop)
 

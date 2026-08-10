@@ -2,33 +2,30 @@
 
 Every odds snapshot the app fetches is otherwise ephemeral — Streamlit Cloud's
 filesystem is wiped on restart, so there is no durable record of the lines the
-model acted on. This module archives each fetched snapshot to Azure Blob (free —
-it reuses payloads already fetched), giving us the closing-line history needed
+model acted on. This module archives each fetched snapshot to Azure SQL (or a
+local ``warehouse/`` directory in dev), giving us the closing-line history needed
 for honest backtests, empirical correlations, and CLV on the bets actually
 placed.
 
 Design (locked)
 ---------------
-* **Immutable, write-once snapshots.** Each capture PUTs one blob with
-  ``If-None-Match:*`` and is never rewritten:
+* **SQL when configured.** ``capture_event_odds`` parses each payload into
+  normalized ``odds_snapshot`` + ``odds_line`` rows (Phase B). This is the
+  durable store in production.
+* **Local fallback (dev/tests).** With no SQL backend, everything writes under a
+  gitignored ``warehouse/`` directory as immutable, write-once snapshots:
   ``warehouse/{sport}/{game_date}/{event_id}/{kind}/{YYYYMMDDTHHZ}.json``.
   The hour-bucketed, colon-free name is idempotent given the 1-hour fetch cache
-  and safe on the local-fallback filesystem (Windows).
-* **Manifest index (no list permission).** The container SAS has no ``list``
-  right, so reads can't enumerate blobs. Each capture also appends to a
-  per-``(sport, date)`` manifest blob (``.../_manifest.json``, a single
-  deterministic GET) via a read-modify-write ETag loop. The prefix-structured
-  names still enable native list-prefix later if ``l`` is granted.
-* **Hot-path safe.** ``capture_event_odds`` does the immutable PUT eagerly
-  (short timeout, swallowed; unique names → no contention) and appends to a
-  thread-safe accumulator; ``flush`` (called once by the app after both fetch
-  waves) updates the manifests.
-* **Local fallback.** With no blob URL, everything writes under a gitignored
-  ``warehouse/`` directory so tests and offline runs work unchanged.
+  and safe on Windows.
+* **Manifest index (local path).** A directory scan is the only local
+  enumeration, so each capture also appends to a per-``(sport, date)`` manifest
+  (``.../_manifest.json``): ``capture_event_odds`` queues entries on a
+  thread-safe accumulator and ``flush`` (called once by the app after both fetch
+  waves) writes the manifests.
 
-Self-contained on purpose: it re-implements the ~40 lines of SAS plumbing rather
-than importing recalibration, so the ``odds_client → warehouse`` capture hook
-never risks an import cycle. Every public entry point fails closed.
+Self-contained on purpose: no import of recalibration, so the
+``odds_client → warehouse`` capture hook never risks an import cycle. Every
+public entry point fails closed.
 """
 import json
 import os
@@ -36,7 +33,6 @@ import threading
 from datetime import date as _date, datetime, timedelta, timezone
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BLOB_URL_ENV = "PREDICTION_LOG_BLOB_URL"
 
 _TEAM_MARKETS = {"h2h", "spreads", "totals"}
 
@@ -46,9 +42,9 @@ _acc_lock = threading.Lock()
 
 # ── SQL backend (Azure SQL, Phase B) ──
 # When db_store is importable AND configured, the warehouse stores normalized
-# snapshots + extracted lines in SQL (no Blob, no _manifest.json). A missing
-# SQLAlchemy install or unset secret leaves _sql() False → the Blob/local path is
-# used unchanged. Guarded import (self-contained module, no import cycle).
+# snapshots + extracted lines in SQL (no _manifest.json). A missing SQLAlchemy
+# install or unset secret leaves _sql() False → the local warehouse/ path is used
+# unchanged. Guarded import (self-contained module, no import cycle).
 try:
     import db_store as _db
 except Exception:  # pragma: no cover - SQLAlchemy absent
@@ -93,97 +89,13 @@ def _hour_bucket(iso_ts):
     return dt.strftime("%Y%m%dT%HZ")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SAS plumbing (self-contained; container-scoped, no new secret)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _blob_base():
-    """The prediction-log SAS URL (container-scoped), or ''."""
-    url = os.environ.get(BLOB_URL_ENV, "").strip()
-    if url:
-        return url
-    secrets_path = os.path.join(SCRIPT_DIR, ".streamlit", "secrets.toml")
-    try:
-        import tomllib
-        with open(secrets_path, "rb") as f:
-            value = tomllib.load(f).get(BLOB_URL_ENV)
-        return str(value).strip() if value else ""
-    except (ImportError, OSError, TypeError, ValueError):
-        return ""
-
-
 def storage_backend():
     """Human-readable active warehouse backend."""
-    if _sql():
-        return "Azure SQL"
-    return "Azure Blob" if _blob_base() else "Local warehouse/"
-
-
-def _blob_url_for(name):
-    """Container-root-relative blob URL for ``name`` (e.g. 'warehouse/...').
-
-    The SAS is container-scoped (``sr=c``), so any path under the container is
-    reachable with the same token. We derive the container root from the base
-    URL rather than assuming the log lives at the container root."""
-    base = _blob_base()
-    if not base:
-        return ""
-    from urllib.parse import urlsplit
-    parts = urlsplit(base)
-    segments = parts.path.split("/")
-    container = segments[1] if len(segments) > 1 else ""
-    root = f"{parts.scheme}://{parts.netloc}/{container}"
-    url = f"{root}/{name}"
-    return f"{url}?{parts.query}" if parts.query else url
-
-
-def _get_blob(name):
-    """(status, obj, etag): 'ok' | 'missing' | 'error'."""
-    url = _blob_url_for(name)
-    if not url:
-        return "missing", None, None
-    import requests
-    try:
-        resp = requests.get(url, timeout=10)
-    except Exception:
-        return "error", None, None
-    if resp.status_code == 404:
-        return "missing", None, None
-    if resp.status_code != 200:
-        return "error", None, None
-    try:
-        return "ok", json.loads(resp.text), resp.headers.get("ETag")
-    except Exception:
-        return "error", None, resp.headers.get("ETag")
-
-
-def _put_blob(name, obj, if_none_match=False, version=None, timeout=10):
-    """PUT a JSON blob. Returns True on success, False on conflict/failure.
-
-    ``if_none_match`` → create-only (write-once). ``version`` → If-Match."""
-    url = _blob_url_for(name)
-    if not url:
-        return False
-    import requests
-    headers = {
-        "Content-Type": "application/json",
-        "x-ms-blob-type": "BlockBlob",
-        "x-ms-version": "2023-11-03",
-    }
-    if if_none_match:
-        headers["If-None-Match"] = "*"
-    elif version:
-        headers["If-Match"] = version
-    try:
-        resp = requests.put(url, data=json.dumps(obj).encode("utf-8"),
-                            headers=headers, timeout=timeout)
-    except Exception:
-        return False
-    return resp.status_code in (200, 201)
+    return "Azure SQL" if _sql() else "Local warehouse/"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Unified read/write (blob when configured, else local warehouse/)
+# Unified read/write (local warehouse/; the SQL path is handled by the callers)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _local_path(name):
@@ -192,8 +104,6 @@ def _local_path(name):
 
 def _read_json(name):
     """(status, obj, etag). Local files have no ETag (etag=None)."""
-    if _blob_base():
-        return _get_blob(name)
     path = _local_path(name)
     if not os.path.exists(path):
         return "missing", None, None
@@ -205,9 +115,6 @@ def _read_json(name):
 
 
 def _write_json(name, obj, if_none_match=False, version=None, timeout=10):
-    if _blob_base():
-        return _put_blob(name, obj, if_none_match=if_none_match,
-                         version=version, timeout=timeout)
     path = _local_path(name)
     if if_none_match and os.path.exists(path):
         return False  # write-once already present
@@ -365,7 +272,7 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
     """Archive one fetched event-odds payload. Best-effort; never raises.
 
     SQL backend: parse the payload into normalized snapshot + line rows
-    (write-once). Blob/local backend: eagerly PUT the immutable snapshot and
+    (write-once). Local backend: eagerly write the immutable snapshot and
     queue a manifest entry for the next flush(). A no-op when the payload lacks an
     event id or a commence date. ``captured_at`` overrides the timestamp (used by
     the historical backfill so past snapshots land under their true time)."""
@@ -483,9 +390,7 @@ def list_snapshots(sport, game_date):
     status, manifest, _ = _read_json(manifest_name(sport, game_date))
     if status == "ok" and isinstance(manifest, dict):
         return list(manifest.get("snapshots", []))
-    if not _blob_base():
-        return _scan_local_snapshots(sport, game_date)
-    return []
+    return _scan_local_snapshots(sport, game_date)
 
 
 def _scan_local_snapshots(sport, game_date):
@@ -631,7 +536,7 @@ def closing_line_for(sport, game_date, event_id, bet_type, selection=None,
     ``{'price','implied_prob','captured_at'}`` or None. Best-effort.
 
     ``player_mlb_id``/``team_code`` (SQL path only) let the odds-line lookup
-    prefer the canonical id over the name; the Blob/JSON fallback has no id
+    prefer the canonical id over the name; the local JSON fallback has no id
     columns and stays name-based."""
     try:
         target = _parse_utc(commence_time)
@@ -1120,7 +1025,8 @@ def _main_cli():
 
     # Target the SQL backend when the SQL_* secrets are configured (mirrors the
     # app's boot promotion; outside Streamlit they aren't in the env yet). Falls
-    # back to Blob/local when SQL isn't configured or db_store is unavailable.
+    # back to the local warehouse/ when SQL isn't configured or db_store is
+    # unavailable.
     try:
         import db_store
         db_store.promote_secrets_from_toml()

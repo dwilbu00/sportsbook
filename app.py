@@ -20,16 +20,9 @@ import weather_factors
 # Add script dir to path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-try:
-    prediction_blob_url = st.secrets.get("PREDICTION_LOG_BLOB_URL")
-    if prediction_blob_url:
-        os.environ.setdefault(
-            "PREDICTION_LOG_BLOB_URL", str(prediction_blob_url))
-except Exception:
-    pass
 # Promote the Azure SQL connection secrets into the environment so the storage
 # layer (db_store, imported lazily by recalibration) can build its engine. When
-# these are unset the app keeps using the Blob/local store unchanged.
+# these are unset the app keeps using the local store unchanged.
 try:
     for _sql_key in ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD"):
         _sql_val = st.secrets.get(_sql_key)
@@ -1151,8 +1144,9 @@ def render_model_guide():
         if storage_backend == "Local cache":
             st.warning(
                 "Forward data is using local container storage, which can reset "
-                "when Streamlit Cloud restarts or redeploys. Configure "
-                "PREDICTION_LOG_BLOB_URL for a shared durable Azure Blob."
+                "when Streamlit Cloud restarts or redeploys. Configure the Azure "
+                "SQL secrets (SQL_SERVER/DATABASE/USER/PASSWORD) for shared "
+                "durable storage."
             )
         else:
             st.caption(f"Prediction log storage: {storage_backend} (shared and durable).")
@@ -1728,8 +1722,8 @@ def render_my_bets():
     if wagers.storage_backend() == "Local cache":
         st.warning(
             "Your bet ledger is stored locally and resets when a hosted app "
-            "(e.g. Streamlit Cloud) restarts or redeploys. Set "
-            "PREDICTION_LOG_BLOB_URL for a durable Azure Blob."
+            "(e.g. Streamlit Cloud) restarts or redeploys. Set the Azure SQL "
+            "secrets (SQL_SERVER/DATABASE/USER/PASSWORD) for durable storage."
         )
 
     refresh = st.button("🔄 Refresh results",
@@ -2171,7 +2165,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     # Durability notice (P1.8): the forward-tracking prediction log is only
-    # durable when an Azure Blob is configured. Without it the log lives in
+    # durable when Azure SQL is configured. Without it the log lives in
     # ephemeral container storage that a hosted deploy wipes on restart —
     # silently resetting resolved outcomes and recalibration. Surface it during
     # normal use, not only on the Model Guide page.
@@ -2181,7 +2175,8 @@ with st.sidebar:
             st.warning(
                 "Forward-tracking data is stored locally and resets when a "
                 "hosted app (e.g. Streamlit Cloud) restarts or redeploys. Set "
-                "PREDICTION_LOG_BLOB_URL for a durable Azure Blob."
+                "the Azure SQL secrets (SQL_SERVER/DATABASE/USER/PASSWORD) for "
+                "durable storage."
             )
     except Exception:
         pass

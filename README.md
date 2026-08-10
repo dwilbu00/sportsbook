@@ -377,17 +377,19 @@ The app has several built-in defenses against impressive-looking but fragile pre
 
    ```toml
    ODDS_API_KEY = "your_api_key_here"
-   PREDICTION_LOG_BLOB_URL = "https://ACCOUNT.blob.core.windows.net/CONTAINER/prediction_log.jsonl?SAS_TOKEN"
+   SQL_SERVER   = "ACCOUNT.database.windows.net"
+   SQL_DATABASE = "your_database"
+   SQL_USER     = "your_app_user"
+   SQL_PASSWORD = "your_app_password"
    ```
 
 4. Get an API key from [the-odds-api.com](https://the-odds-api.com/#get-access).
-5. For durable forward tracking, create a private Azure Block Blob SAS URL with
-   **read, create, and write** permissions. Add the same URL to Streamlit Cloud
-   secrets.
+5. For durable forward tracking, provision an Azure SQL database and create the
+   tables from `sql/schema.sql`, then add the four `SQL_*` secrets above (connect
+   as a least-privilege CRUD app user, not the server admin).
 
-Without `PREDICTION_LOG_BLOB_URL`, the app falls back to `cache/predictions/`.
-That local container storage is not durable across Streamlit Cloud restarts or
-redeployments.
+Without the `SQL_*` secrets, the app falls back to `cache/predictions/`. That
+local storage is not durable across Streamlit Cloud restarts or redeployments.
 
 ### Local
 
@@ -396,11 +398,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-For local secrets, create `.streamlit/secrets.toml`:
+For local secrets, create `.streamlit/secrets.toml` (see
+`.streamlit/secrets.toml.example`):
 
 ```toml
 ODDS_API_KEY = "your_api_key_here"
-PREDICTION_LOG_BLOB_URL = "https://ACCOUNT.blob.core.windows.net/CONTAINER/prediction_log.jsonl?SAS_TOKEN"
+# Optional — set the four SQL_* keys for a durable backend; otherwise the app
+# uses the ephemeral local cache/ directory.
 ```
 
 ### Forward tracking in Streamlit
@@ -415,7 +419,7 @@ and gated refitting run automatically during normal app analysis
 metrics (hit rate, Brier, realized ROI) are computed from these resolved outcomes;
 realized ROI uses the price offered when the pick was logged.
 
-Durability across Streamlit container restarts requires the Azure Blob
+Durability across Streamlit container restarts requires the Azure SQL
 configuration described above; otherwise the log lives in ephemeral container
 storage that a hosted deploy wipes on restart.
 

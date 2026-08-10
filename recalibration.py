@@ -45,7 +45,6 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 PRED_DIR = os.path.join(CACHE_DIR, "predictions")
 LOG_PATH = os.path.join(PRED_DIR, "prediction_log.jsonl")
 CALIB_DIR = os.path.join(SCRIPT_DIR, "calibration")
-REMOTE_LOG_URL_ENV = "PREDICTION_LOG_BLOB_URL"
 
 MIN_FIT_SAMPLES = 50          # below this, skip Platt fit for a prop
 MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
@@ -73,13 +72,13 @@ MIN_NEW_FOR_OFFLINE_REFIT = 200
 # is negligible.
 STALE_DNP_HOURS = 24
 AUTO_MAINTENANCE_INTERVAL_SECONDS = 3600
-RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal blob
+RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal store
 
 _lock = threading.Lock()
 _last_auto_maintenance = {}  # sport_key -> attempt timestamp
 
-# Short-TTL in-memory cache for read-only NDJSON blob reads (e.g. the wagers
-# ledger read on every My Bets rerun). Only the Azure-blob path is cached; local
+# Short-TTL in-memory cache for read-only NDJSON reads (e.g. the wagers
+# ledger read on every My Bets rerun). Only the SQL path is cached; local
 # disk reads are already cheap. Every writer goes through mutate_ndjson_log,
 # which reads FRESH (use_cache=False) and pops this cache after a successful
 # write, so cached reads never mask a just-persisted change within a session.
@@ -90,10 +89,10 @@ _NDJSON_CACHE_TTL = 30        # seconds
 # ── SQL backend (Azure SQL) dispatch ──
 # When db_store is importable AND its SQL_* secret is configured, the durable
 # stores here (prediction log, wagers ledger, recalibration params) route to SQL
-# instead of the Azure-Blob SAS path. A missing SQLAlchemy install or unset
-# secret leaves _sql() False → the Blob/local path is used unchanged. The row-list
-# mutators are reused verbatim; db_store runs them inside a transaction and
-# replaces the store's rows (its CHECK/UNIQUE constraints reject bad data).
+# instead of local disk. A missing SQLAlchemy install or unset secret leaves
+# _sql() False → the local-disk path is used unchanged. The row-list mutators are
+# reused verbatim; db_store runs them inside a transaction and replaces the
+# store's rows (its CHECK/UNIQUE constraints reject bad data).
 try:
     import db_store as _db
 except Exception:  # pragma: no cover - SQLAlchemy absent
@@ -125,26 +124,9 @@ def _ensure_dirs():
     os.makedirs(CALIB_DIR, exist_ok=True)
 
 
-def _prediction_log_blob_url():
-    """Return an optional Azure Blob SAS URL for durable shared log storage."""
-    url = os.environ.get(REMOTE_LOG_URL_ENV, "").strip()
-    if url:
-        return url
-    secrets_path = os.path.join(SCRIPT_DIR, ".streamlit", "secrets.toml")
-    try:
-        import tomllib
-        with open(secrets_path, "rb") as f:
-            value = tomllib.load(f).get(REMOTE_LOG_URL_ENV)
-        return str(value).strip() if value else ""
-    except (ImportError, OSError, TypeError, ValueError):
-        return ""
-
-
 def prediction_log_storage():
     """Human-readable active prediction-log backend."""
-    if _sql():
-        return "Azure SQL"
-    return "Azure Blob" if _prediction_log_blob_url() else "Local cache"
+    return "Azure SQL" if _sql() else "Local cache"
 
 
 def _parse_log_text(text):
@@ -206,21 +188,13 @@ def _local_log_lock():
 
 
 def _read_log_snapshot(where=None):
-    """Return (rows, version) from SQL, local disk, or the configured Azure blob.
+    """Return (rows, version) from SQL or local disk.
 
-    ``where`` (SQL path only) is an equality/IN {col: value} filter; the Blob/local
+    ``where`` (SQL path only) is an equality/IN {col: value} filter; the local
     path ignores it (single-file NDJSON has no partial read) and the caller
     self-filters in Python."""
     if _sql():
         return _db.read_rows(_PRED_TABLE, where=where), None
-    blob_url = _prediction_log_blob_url()
-    if blob_url:
-        import requests
-        response = requests.get(blob_url, timeout=30)
-        if response.status_code == 404:
-            return [], None
-        response.raise_for_status()
-        return _parse_log_text(response.text), response.headers.get("ETag")
     if not os.path.exists(LOG_PATH):
         return [], None
     with open(LOG_PATH, "r", encoding="utf-8") as f:
@@ -228,23 +202,10 @@ def _read_log_snapshot(where=None):
 
 
 def _write_log_snapshot(rows, version=None):
-    """Conditionally write a complete log snapshot."""
+    """Write a complete log snapshot atomically (local disk).
+
+    ``version`` is accepted for signature stability but ignored on the local path."""
     content = _serialize_log(rows)
-    blob_url = _prediction_log_blob_url()
-    if blob_url:
-        import requests
-        headers = {
-            "Content-Type": "application/x-ndjson",
-            "x-ms-blob-type": "BlockBlob",
-            "x-ms-version": "2023-11-03",
-        }
-        headers["If-Match" if version else "If-None-Match"] = version or "*"
-        response = requests.put(
-            blob_url, data=content.encode("utf-8"), headers=headers, timeout=30)
-        if response.status_code in (409, 412):
-            raise _LogConflict()
-        response.raise_for_status()
-        return
     _ensure_dirs()
     tmp = LOG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -257,40 +218,28 @@ def mutate_prediction_log(mutator, max_retries=5, where=None):
 
     ``where`` (SQL path only) restricts the rows read into the mutator to a subset
     (see db_store.mutate) — for update-only passes like grading unresolved rows.
-    The Blob/local path ignores it (reads all); the mutator must self-filter."""
+    The local path ignores it (reads all); the mutator must self-filter."""
     if _sql():
         # Serialize with the module lock, mirroring the local path: SQL's
         # read->mutate->replace is a read-modify-write, so concurrent threads in
         # the (single-replica) Streamlit process must not interleave and lose an
         # update. db_store.mutate's transaction is the atomicity guarantee; this
-        # lock is the in-process concurrency guard the blob ETag path provided.
+        # lock is the in-process concurrency guard.
         with _lock:
             return _db.mutate(_PRED_TABLE, mutator, where=where)
-    if not _prediction_log_blob_url():
-        with _lock:
-            with _local_log_lock():
-                rows, version = _read_log_snapshot()
-                result = mutator(rows)
-                if result:
-                    _write_log_snapshot(rows, version)
-                return result
-    for _ in range(max_retries):
-        rows, version = _read_log_snapshot()
-        result = mutator(rows)
-        if not result:
+    with _lock:
+        with _local_log_lock():
+            rows, version = _read_log_snapshot()
+            result = mutator(rows)
+            if result:
+                _write_log_snapshot(rows, version)
             return result
-        try:
-            _write_log_snapshot(rows, version)
-            return result
-        except _LogConflict:
-            continue
-    raise RuntimeError("Prediction log changed repeatedly; update was not saved")
 
 
 def count_pending_refit(sport_key=None):
     """Count RESOLVED prediction-log rows not yet consumed by an offline refit
     (refit_performed falsy). This is the app's "enough new labeled data to refit"
-    signal — cheap SQL COUNT on the SQL path, in-memory count on the Blob/local
+    signal — cheap SQL COUNT on the SQL path, in-memory count on the local
     path. Best-effort: returns 0 on any error (a banner must never break a page)."""
     where = {"resolved": True, "refit_performed": False}
     if sport_key:
@@ -312,7 +261,7 @@ def mark_predictions_refit(sport_key):
     completed offline calibration refit. Returns the number flagged; best-effort.
 
     Surgical on the SQL path (WHERE resolved=1 AND refit_performed=0); the mutator
-    self-filters on resolved so the where-ignoring Blob path is also correct."""
+    self-filters on resolved so the where-ignoring local path is also correct."""
     where = {"sport_key": sport_key, "resolved": True, "refit_performed": False}
 
     def apply(rows):
@@ -321,7 +270,7 @@ def mark_predictions_refit(sport_key):
             if not r.get("resolved") or r.get("refit_performed"):
                 continue
             if not _sql() and sport_key and r.get("sport_key") != sport_key:
-                continue    # Blob path ignores `where` -> self-filter by sport
+                continue    # local path ignores `where` -> self-filter by sport
             r["refit_performed"] = True
             changed += 1
         return changed
@@ -333,29 +282,29 @@ def mark_predictions_refit(sport_key):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Generalized NDJSON blob store (sibling files: wagers.jsonl, etc.)
+# Generalized NDJSON store (sibling files: wagers.jsonl, etc.)
 # ──────────────────────────────────────────────────────────────────────────────
-# The prediction log's read-modify-write + ETag loop is reusable for any small
-# NDJSON store. These helpers parameterize it by filename via _blob_url_for
-# (container-scoped SAS — no new secret), mirroring the prediction-log path
-# exactly. The dedicated prediction-log functions above are left untouched.
+# The prediction log's read-modify-write is reusable for any small NDJSON store.
+# These helpers parameterize it by filename (SQL table on the SQL path, sibling
+# file on the local path), mirroring the prediction-log path exactly. The
+# dedicated prediction-log functions above are left untouched.
 
 def _ndjson_local_path(filename):
     return os.path.join(PRED_DIR, filename)
 
 
 def _read_ndjson_blob(filename, use_cache=False, where=None):
-    """Return (rows, version) for an NDJSON store, from Azure or local disk.
+    """Return (rows, version) for an NDJSON store, from SQL or local disk.
 
     ``use_cache`` (read-only callers only) serves the read from a short-TTL
     in-memory cache to avoid a full read+parse on every rerun. Writers
     (mutate_ndjson_log) MUST leave it False so the read-modify-write always sees
-    the authoritative store + its ETag.
+    the authoritative store.
 
     ``where`` (SQL path only) is an equality/IN {col: value} filter that pulls only
     matching rows — for reconciliation callers that need just the ungraded subset.
     A filtered read never uses or populates the full-read cache (its result is a
-    subset), and the Blob/local path ignores it (a single NDJSON file has no
+    subset), and the local path ignores it (a single NDJSON file has no
     partial read; those callers self-filter in Python)."""
     cacheable = use_cache and where is None
     if _sql():
@@ -367,24 +316,6 @@ def _read_ndjson_blob(filename, use_cache=False, where=None):
         if cacheable:
             _NDJSON_CACHE[filename] = (copy.deepcopy(rows), None, time.time())
         return rows, None
-    blob_url = _blob_url_for(filename)
-    if blob_url:
-        if cacheable:
-            entry = _NDJSON_CACHE.get(filename)
-            if entry and (time.time() - entry[2]) < _NDJSON_CACHE_TTL:
-                return copy.deepcopy(entry[0]), entry[1]
-        import requests
-        response = requests.get(blob_url, timeout=30)
-        if response.status_code == 404:
-            if cacheable:
-                _NDJSON_CACHE[filename] = ([], None, time.time())
-            return [], None
-        response.raise_for_status()
-        rows = _parse_log_text(response.text)
-        version = response.headers.get("ETag")
-        if cacheable:
-            _NDJSON_CACHE[filename] = (copy.deepcopy(rows), version, time.time())
-        return rows, version
     path = _ndjson_local_path(filename)
     if not os.path.exists(path):
         return [], None
@@ -393,23 +324,10 @@ def _read_ndjson_blob(filename, use_cache=False, where=None):
 
 
 def _write_ndjson_blob(filename, rows, version=None):
-    """Conditionally write a complete NDJSON snapshot (create or If-Match)."""
+    """Write a complete NDJSON snapshot atomically (local disk).
+
+    ``version`` is accepted for signature stability but ignored on the local path."""
     content = _serialize_log(rows)
-    blob_url = _blob_url_for(filename)
-    if blob_url:
-        import requests
-        headers = {
-            "Content-Type": "application/x-ndjson",
-            "x-ms-blob-type": "BlockBlob",
-            "x-ms-version": "2023-11-03",
-        }
-        headers["If-Match" if version else "If-None-Match"] = version or "*"
-        response = requests.put(
-            blob_url, data=content.encode("utf-8"), headers=headers, timeout=30)
-        if response.status_code in (409, 412):
-            raise _LogConflict()
-        response.raise_for_status()
-        return
     path = _ndjson_local_path(filename)
     _ensure_dirs()
     tmp = path + ".tmp"
@@ -423,11 +341,10 @@ def mutate_ndjson_log(filename, mutator, max_retries=5, where=None):
 
     Generalizes mutate_prediction_log to any sibling NDJSON file. The mutator
     receives the row list and mutates it in place; a falsy return skips the
-    write. Blob-backed writers retry on ETag conflict; local writers hold an
-    inter-process file lock.
+    write. Local writers hold an inter-process file lock.
 
     ``where`` (SQL path only) restricts the rows read into the mutator to a subset
-    (see db_store.mutate) — for update-only reconciliation passes. The Blob/local
+    (see db_store.mutate) — for update-only reconciliation passes. The local
     path ignores it and reads all rows, so the mutator must be correct on the full
     set (it self-filters)."""
     if _sql():
@@ -436,98 +353,14 @@ def mutate_ndjson_log(filename, mutator, max_retries=5, where=None):
         if result:
             _NDJSON_CACHE.pop(filename, None)
         return result
-    if not _blob_url_for(filename):
-        with _lock:
-            with _local_file_lock(_ndjson_local_path(filename)):
-                rows, version = _read_ndjson_blob(filename)
-                result = mutator(rows)
-                if result:
-                    _write_ndjson_blob(filename, rows, version)
-                    _NDJSON_CACHE.pop(filename, None)
-                return result
-    for _ in range(max_retries):
-        rows, version = _read_ndjson_blob(filename)
-        result = mutator(rows)
-        if not result:
+    with _lock:
+        with _local_file_lock(_ndjson_local_path(filename)):
+            rows, version = _read_ndjson_blob(filename)
+            result = mutator(rows)
+            if result:
+                _write_ndjson_blob(filename, rows, version)
+                _NDJSON_CACHE.pop(filename, None)
             return result
-        try:
-            _write_ndjson_blob(filename, rows, version)
-            _NDJSON_CACHE.pop(filename, None)
-            return result
-        except _LogConflict:
-            continue
-    raise RuntimeError(f"{filename} changed repeatedly; update was not saved")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Generic JSON-blob helpers (durable calibration state)
-# ──────────────────────────────────────────────────────────────────────────────
-# The prediction-log SAS is container-scoped (sr=c), so sibling blobs are
-# reachable with the SAME token by swapping the last path segment. This lets the
-# learned Platt store persist to Azure exactly like the log, without a new secret.
-
-def _blob_url_for(filename):
-    """Sibling blob URL for `filename`, reusing the prediction-log SAS token.
-    Returns "" when no blob backend is configured."""
-    base = _prediction_log_blob_url()
-    if not base:
-        return ""
-    path, sep, query = base.partition("?")
-    parent = path.rsplit("/", 1)[0]
-    url = f"{parent}/{filename}"
-    return f"{url}{sep}{query}" if sep else url
-
-
-def _read_json_blob(filename, etag=None):
-    """Read a JSON blob.
-
-    Returns (status, obj, etag) where status is "ok" | "notmodified" | "missing".
-    Sends a conditional GET when `etag` is provided. Raises on network / HTTP
-    errors other than 404 (missing) and 304 (not modified) so callers can retry
-    or degrade explicitly.
-    """
-    url = _blob_url_for(filename)
-    if not url:
-        return "missing", {}, None
-    import requests
-    headers = {"If-None-Match": etag} if etag else {}
-    response = requests.get(url, headers=headers, timeout=10)
-    if response.status_code == 304:
-        return "notmodified", {}, etag
-    if response.status_code == 404:
-        return "missing", {}, None
-    response.raise_for_status()
-    etag = response.headers.get("ETag")
-    try:
-        obj = json.loads(response.text)
-    except json.JSONDecodeError:
-        # Present but corrupt: return the ETag so a save can overwrite it
-        # (If-Match) instead of looping forever on If-None-Match:*.
-        return "unreadable", {}, etag
-    if not isinstance(obj, dict):
-        return "unreadable", {}, etag
-    return "ok", obj, etag
-
-
-def _write_json_blob(filename, obj, version=None):
-    """Conditionally PUT a JSON blob. Raises _LogConflict on 409/412 so a
-    read-modify-write caller can retry with a fresh ETag."""
-    url = _blob_url_for(filename)
-    if not url:
-        return
-    import requests
-    content = json.dumps(obj, indent=2)
-    headers = {
-        "Content-Type": "application/json",
-        "x-ms-blob-type": "BlockBlob",
-        "x-ms-version": "2023-11-03",
-    }
-    headers["If-Match" if version else "If-None-Match"] = version or "*"
-    response = requests.put(
-        url, data=content.encode("utf-8"), headers=headers, timeout=10)
-    if response.status_code in (409, 412):
-        raise _LogConflict()
-    response.raise_for_status()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -625,7 +458,7 @@ def log_prediction_rows(new_rows):
 
     Re-viewing the same slate would otherwise append a fresh row for every
     (sport, event, prop, player, line) on each analysis, growing the log
-    without bound and rewriting the whole blob every append. Instead we keep a
+    without bound and rewriting the whole log every append. Instead we keep a
     single row per forecast identity: the newest forecast supersedes stale
     unresolved duplicates, while any graded outcome on an older duplicate is
     folded forward so scoring survives. A forecast whose outcome is already
@@ -709,7 +542,7 @@ def prediction_identity(row):
 
     Must stay in lockstep with db_store._prediction_identity — both compute the
     key via db_store.player_key so the mutator's dedup and the surgical-diff
-    layer agree. On the Blob/local path (SQLAlchemy absent, ``_db`` is None) we
+    layer agree. On the local path (SQLAlchemy absent, ``_db`` is None) we
     fall back to the raw player name: those stores were never re-keyed and the
     id columns don't exist there (the id-based identity is a SQL-only invariant).
     Legacy fallback for pre-event-ID rows preserved via event_ref."""
@@ -888,7 +721,7 @@ def market_prediction_row_key(row):
 
 
 def mutate_market_prediction_log(mutator, max_retries=5, where=None):
-    """Atomically mutate the team-market prediction log (SQL/blob/local)."""
+    """Atomically mutate the team-market prediction log (SQL or local)."""
     return mutate_ndjson_log(MARKET_PREDICTION_LOG_FILE, mutator,
                              max_retries=max_retries, where=where)
 
@@ -1583,7 +1416,7 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
         return 0
     # Pull only this sport's UNRESOLVED rows out of the DB (settled rows are the
     # bulk and are discarded anyway); the game_date<today refinement stays in
-    # Python below. The Blob/local path ignores the filter and self-filters.
+    # Python below. The local path ignores the filter and self-filters.
     unresolved = {"sport_key": sport_key, "resolved": False}
     rows = _read_log(where=unresolved)
     if not rows:
@@ -1911,8 +1744,8 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
     git-committed file (the seed/prior that ships to Cloud). A runtime SQL refit
     (`to_blob=True` and `_sql()`) persists to Azure SQL *only* and deliberately
     leaves the local seed untouched, so it stays a pristine prior for the per-key
-    merge/champion-gate in `_load_recal_cached`/`refit_sport`. Legacy blob and
-    pure-local dev (no SQL) still write the local file."""
+    merge/champion-gate in `_load_recal_cached`/`refit_sport`. Pure-local dev
+    (no SQL) still writes the local file."""
     _ensure_dirs()
     blob = {
         "sport_key": sport_key,
@@ -1928,25 +1761,12 @@ def save_recalibration(sport_key, per_prop_params, meta=None, to_blob=True):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(blob, f, indent=2)
         os.replace(tmp, recalibration_path(sport_key))
-    # Durable Blob write — best-effort last-writer-wins with If-Match retry.
-    # A transient blob failure leaves the local file intact; the next refit
-    # retries. Swallowing keeps the free loop (maybe_auto_refit) crash-proof.
+    # SQL is the durable overlay when configured. Best-effort: a transient SQL
+    # failure leaves the local seed intact and the next refit retries; swallowing
+    # keeps the free loop (maybe_auto_refit) crash-proof.
     if to_blob and _sql():
-        # SQL is the durable overlay when configured (replaces the blob write).
         try:
             _db.save_recal(sport_key, blob)
-        except Exception:
-            pass
-    elif to_blob and _prediction_log_blob_url():
-        filename = os.path.basename(recalibration_path(sport_key))
-        try:
-            for _ in range(5):
-                _, _, version = _read_json_blob(filename)
-                try:
-                    _write_json_blob(filename, blob, version)
-                    break
-                except _LogConflict:
-                    continue
         except Exception:
             pass
     _LOAD_CACHE.pop(sport_key, None)
@@ -1981,7 +1801,7 @@ def _parse_recal_blob(blob):
 
 def _read_local_recal(sport_key):
     """(fit_ts_epoch_or_None, validated_props) from the local git-committed
-    file, or (None, {}). This is the bootstrap the Blob overlays."""
+    file, or (None, {}). This is the bootstrap the SQL overlay merges onto."""
     path = recalibration_path(sport_key)
     if not os.path.exists(path):
         return None, {}
@@ -2026,15 +1846,15 @@ def _load_recal_cached(sport_key):
     """
     Return (fit_ts_epoch_or_None, validated_props).
 
-    Reads the Azure blob when configured — with a short TTL and an ETag
-    conditional GET — and falls back to the local git-committed file so a
-    fresh/empty blob never hides the shipped seed. Never raises; degrades to the
-    last good cache, then the local file, then {}. Shared by load_recalibration
-    (applied on every analyze) and the maintain_sport refit gate, so a
-    maintenance tick plus the following analyze issue a single blob GET.
+    Reads the SQL overlay when configured — with a short TTL — and merges it onto
+    the local git-committed seed so a fresh/empty overlay never hides the shipped
+    seed. Never raises; degrades to the last good cache, then the local file, then
+    {}. Shared by load_recalibration (applied on every analyze) and the
+    maintain_sport refit gate, so a maintenance tick plus the following analyze
+    issue a single SQL read.
     """
     if _sql():
-        # SQL overlay of the git-committed baseline, mirroring the blob path:
+        # SQL overlay of the git-committed baseline:
         # a sport with no (validated) SQL fit falls back to the shipped seed.
         now = time.time()
         cached = _LOAD_CACHE.get(sport_key)
@@ -2067,55 +1887,25 @@ def _load_recal_cached(sport_key):
         _LOAD_CACHE[sport_key] = {
             "fetched_at": now, "etag": None, "fit_ts": fit_ts, "props": props}
         return fit_ts, props
-    if not _prediction_log_blob_url():
-        # Local-only: mtime-keyed cache (unchanged semantics).
-        path = recalibration_path(sport_key)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            _LOAD_CACHE.pop(sport_key, None)
-            return None, {}
-        cached = _LOAD_CACHE.get(sport_key)
-        if cached and cached.get("fetched_at") == mtime:
-            return cached["fit_ts"], cached["props"]
-        fit_ts, props = _read_local_recal(sport_key)
-        _LOAD_CACHE[sport_key] = {
-            "fetched_at": mtime, "etag": None, "fit_ts": fit_ts, "props": props}
-        return fit_ts, props
-
-    filename = os.path.basename(recalibration_path(sport_key))
-    now = time.time()
-    cached = _LOAD_CACHE.get(sport_key)
-    if cached and (now - cached["fetched_at"]) < RECAL_LOAD_TTL_SECONDS:
-        return cached["fit_ts"], cached["props"]
-    etag = cached["etag"] if cached else None
+    # Local-only: mtime-keyed cache (unchanged semantics).
+    path = recalibration_path(sport_key)
     try:
-        status, blob, new_etag = _read_json_blob(filename, etag=etag)
-    except Exception:
-        # Blob outage: prefer the last good cache, else the local baseline.
-        if cached:
-            cached["fetched_at"] = now
-            return cached["fit_ts"], cached["props"]
-        return _read_local_recal(sport_key)
-    if status == "notmodified" and cached:
-        cached["fetched_at"] = now
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _LOAD_CACHE.pop(sport_key, None)
+        return None, {}
+    cached = _LOAD_CACHE.get(sport_key)
+    if cached and cached.get("fetched_at") == mtime:
         return cached["fit_ts"], cached["props"]
-    if status == "ok":
-        fit_ts, props = _parse_recal_blob(blob)
-        _LOAD_CACHE[sport_key] = {
-            "fetched_at": now, "etag": new_etag,
-            "fit_ts": fit_ts, "props": props}
-        return fit_ts, props
-    # "missing" (404) — overlay the local git-committed baseline.
     fit_ts, props = _read_local_recal(sport_key)
     _LOAD_CACHE[sport_key] = {
-        "fetched_at": now, "etag": None, "fit_ts": fit_ts, "props": props}
+        "fetched_at": mtime, "etag": None, "fit_ts": fit_ts, "props": props}
     return fit_ts, props
 
 
 def load_recalibration(sport_key):
     """Return {prop_key: {"a": ..., "b": ..., "n_fit": ...}} of validated fits,
-    or {}. Blob-backed (overlaying the local baseline) when configured."""
+    or {}. SQL-overlaid (merged onto the local baseline) when configured."""
     _, props = _load_recal_cached(sport_key)
     return props
 
@@ -2253,7 +2043,7 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
             sport_key, max_to_resolve=max_resolve)
     except Exception:
         newly_resolved_markets = 0
-    # Gate on the last fit's timestamp from the durable store (blob-backed when
+    # Gate on the last fit's timestamp from the durable store (SQL-backed when
     # configured, else the local file's mtime). Using os.path.getmtime alone
     # would refit on every Cloud restart, since the ephemeral FS has no file.
     last_fit_ts, _ = _load_recal_cached(sport_key)
@@ -2468,8 +2258,8 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
 
     if per_prop_params:
         # Offline bootstrap: write the local file only (committed to git and
-        # shipped as the Cloud baseline). The production blob is populated by the
-        # online refit loop, not by local seed runs.
+        # shipped as the Cloud baseline). The production SQL store is populated by
+        # the online refit loop, not by local seed runs.
         save_recalibration(sport_key, per_prop_params,
                            meta={"source": "book_line_cache_seed"},
                            to_blob=False)
@@ -2499,7 +2289,7 @@ def _main_cli():
                    help="Print current recalibration params for the sport.")
     args = p.parse_args()
 
-    # Target the durable SQL/Blob backend when the SQL_*/Blob secrets are
+    # Target the durable SQL backend when the SQL_* secrets are
     # configured (mirrors the app's boot promotion + refit_calibration.main;
     # outside Streamlit these aren't in the env yet). Without this, --seed/--refit
     # read the odds_line warehouse + prediction log via _sql()/db_store.enabled(),
