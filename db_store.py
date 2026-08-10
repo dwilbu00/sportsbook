@@ -989,7 +989,15 @@ def load_recal(sport_key):
 
 
 def save_recal(sport_key, cfg):
-    """Persist a recalibration cfg dict (replace this sport's rows atomically)."""
+    """Persist a recalibration cfg dict for a sport (atomically).
+
+    WS15: reconcile each of the three tables to its desired end-state via
+    :func:`reconcile` (a surgical natural-key upsert on the composite PKs)
+    instead of delete-all-by-sport_key + insert-all. A prop/fold whose cfg is
+    unchanged across refits isn't rewritten, and the sport's rows are never
+    momentarily emptied — the end-state is identical to the old rebuild
+    (dropped props/shrunk fold sets are still DELETEd). All three writes share
+    one transaction, so a CHECK/UNIQUE violation rolls the whole save back."""
     props = (cfg or {}).get("props") or {}
     param_rows = []
     fold_rows = []
@@ -1010,20 +1018,20 @@ def save_recal(sport_key, cfg):
             fold_rows.append(fold_row)
 
     meta = (cfg or {}).get("meta") or {}
+    meta_row = {
+        "sport_key": sport_key,
+        "fit_timestamp": (cfg or {}).get("fit_timestamp"),
+        "source": meta.get("source"),
+    }
+    scope = {"sport_key": sport_key}
     engine = get_engine()
     with engine.begin() as conn:
-        for table in (recalibration_params, recalibration_folds,
-                      recalibration_meta):
-            conn.execute(delete(table).where(table.c.sport_key == sport_key))
-        if param_rows:
-            conn.execute(insert(recalibration_params), param_rows)
-        if fold_rows:
-            conn.execute(insert(recalibration_folds), fold_rows)
-        conn.execute(insert(recalibration_meta), {
-            "sport_key": sport_key,
-            "fit_timestamp": (cfg or {}).get("fit_timestamp"),
-            "source": meta.get("source"),
-        })
+        reconcile(conn, recalibration_params, param_rows,
+                  ("sport_key", "prop_key"), scope=scope)
+        reconcile(conn, recalibration_folds, fold_rows,
+                  ("sport_key", "prop_key", "fold_index"), scope=scope)
+        reconcile(conn, recalibration_meta, [meta_row],
+                  ("sport_key",), scope=scope)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

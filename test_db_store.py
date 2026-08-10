@@ -221,6 +221,43 @@ class DbStoreOpsTests(_SqliteBackend, unittest.TestCase):
         self.assertNotIn("batter_hits", got["props"])
         self.assertIn("pitcher_strikeouts", got["props"])
 
+    def test_recal_resave_unchanged_is_surgical_noop(self):
+        # WS15: re-saving an identical cfg must not churn any row — reconcile
+        # reports zero inserts/updates/deletes across all three tables, and the
+        # sport's rows are never momentarily emptied.
+        cfg = {
+            "fit_timestamp": "2026-07-22T00:00:00+00:00",
+            "props": {"batter_hits": {
+                "a": 0.5, "b": 0.2, "n_fit": 938, "validated": True,
+                "source": "seed",
+                "validation_folds": [
+                    {"holdout_start": "2026-07-17", "n_validation": 210,
+                     "raw_brier": 0.25, "calibrated_brier": 0.24}]}},
+            "meta": {"source": "seed"},
+        }
+        db_store.save_recal("baseball_mlb", cfg)
+        seen = {}
+        real = db_store.reconcile
+
+        def spy(conn, table, desired, identity, scope=None):
+            n = real(conn, table, desired, identity, scope=scope)
+            seen[table.name] = n
+            return n
+
+        with patch.object(db_store, "reconcile", side_effect=spy):
+            db_store.save_recal("baseball_mlb", cfg)
+        self.assertEqual(seen["recalibration_params"], (0, 0, 0))
+        self.assertEqual(seen["recalibration_folds"], (0, 0, 0))
+        self.assertEqual(seen["recalibration_meta"], (0, 0, 0))
+        # A changed param IS written (one update, nothing else churned).
+        cfg["props"]["batter_hits"]["a"] = 0.7
+        with patch.object(db_store, "reconcile", side_effect=spy):
+            db_store.save_recal("baseball_mlb", cfg)
+        self.assertEqual(seen["recalibration_params"], (0, 1, 0))
+        self.assertEqual(seen["recalibration_folds"], (0, 0, 0))
+        self.assertEqual(db_store.load_recal("baseball_mlb")["props"]
+                         ["batter_hits"]["a"], 0.7)
+
     def test_load_recal_missing_returns_none(self):
         self.assertIsNone(db_store.load_recal("no_such_sport"))
 
