@@ -147,6 +147,48 @@ class FetchParseTests(_Backend, unittest.TestCase):
         self.assertEqual(meta["row_count"], 8)
         self.assertIsNotNone(meta["last_fetched_at"])
 
+    def test_reload_unchanged_feed_is_surgical_noop(self):
+        # WS15: re-fetching an unchanged SFBB feed churns no player/team rows
+        # (the per-row fetched_at is an ignore_col), keeps surrogate ids stable,
+        # yet still bumps meta.last_fetched_at so the TTL gate stays fresh.
+        from sqlalchemy import select
+        t = player_id_map.player_id_map
+        with patch.object(player_id_map, "_now", return_value=1000.0):
+            self._load()
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            trout = conn.execute(
+                select(t.c.id, t.c.fetched_at).where(t.c.mlb_id == "545361")
+            ).first()
+
+        seen = {}
+        real = db_store.reconcile
+
+        def spy(conn, table, desired, identity, scope=None, ignore_cols=()):
+            n = real(conn, table, desired, identity, scope=scope,
+                     ignore_cols=ignore_cols)
+            seen.setdefault(table.name, []).append(n)
+            return n
+
+        with patch.object(player_id_map, "_now", return_value=2000.0), \
+             patch.object(db_store, "reconcile", side_effect=spy):
+            self._load()
+
+        self.assertEqual(seen["player_id_map"], [(0, 0, 0)])   # no player churn
+        self.assertEqual(seen["team_id_map"], [(0, 0, 0)])     # no team churn
+        with engine.connect() as conn:
+            trout2 = conn.execute(
+                select(t.c.id, t.c.fetched_at).where(t.c.mlb_id == "545361")
+            ).first()
+        self.assertEqual(trout2[0], trout[0])                  # surrogate id stable
+        self.assertEqual(trout2[1], 1000.0)                    # ignored col kept
+        # Both meta rows (player + team) refresh last_fetched_at every load.
+        self.assertEqual(seen["id_map_meta"], [(0, 1, 0), (0, 1, 0)])
+        with engine.connect() as conn:
+            self.assertEqual(
+                player_id_map._read_meta(conn, "player")["last_fetched_at"],
+                2000.0)
+
 
 class PlayerLookupTests(_Backend, unittest.TestCase):
 

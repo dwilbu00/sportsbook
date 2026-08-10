@@ -829,7 +829,7 @@ def mutate(table_name, mutator, where=None, max_retries=3):
     raise last_exc
 
 
-def reconcile(conn, table, desired, identity_cols, scope=None):
+def reconcile(conn, table, desired, identity_cols, scope=None, ignore_cols=()):
     """App-side-diff reconcile of a *dimension/fact* table to a desired end-state
     — the natural-key analog of :func:`mutate` for the tables that aren't NDJSON
     stores (gamelogs, statcast as-of rates, the SFBB id maps + meta, the
@@ -858,6 +858,14 @@ def reconcile(conn, table, desired, identity_cols, scope=None):
     scope : an equality ``{col: value}`` map bounding the rows this call owns — the
         partition the old delete-all targeted (``None`` = the whole table). Only
         in-scope rows are read, diffed, and deleted; rows outside it are untouched.
+    ignore_cols : column names excluded from the "did this row change?" test but
+        still WRITTEN on every INSERT and on any UPDATE a real change triggers.
+        The audit-timestamp pattern: a per-row ``fetched_at``/``updated_at`` that
+        ticks on every refresh would otherwise force an UPDATE of every row, so
+        list it here — an unchanged row stays a no-op (its timestamp then records
+        when its *data* last changed), while a genuinely changed row still gets a
+        fresh timestamp. A column whose freshness you DO want persisted every call
+        (e.g. a single meta row's ``last_fetched_at``) must NOT be listed.
 
     Returns ``(n_insert, n_update, n_delete)``.
 
@@ -908,12 +916,13 @@ def reconcile(conn, table, desired, identity_cols, scope=None):
 
     # Compute the whole diff before issuing any DML: a precondition raise above
     # then left only SELECTs on the transaction, so the caller can fall back.
+    _ignore = set(ignore_cols)
     inserts, updates = [], []
     for key, params in after_by_key.items():
         prior = before_by_key.get(key)
         if prior is None:
             inserts.append(params)
-        elif any(prior[k] != v for k, v in params.items()):
+        elif any(prior[k] != v for k, v in params.items() if k not in _ignore):
             updates.append((key, params))
     deletes = [key for key in before_by_key if key not in after_by_key]
 

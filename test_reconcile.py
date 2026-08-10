@@ -163,6 +163,40 @@ class SurrogateKeyReconcileTests(_Backend, unittest.TestCase):
             n = db_store.reconcile(conn, self.t, desired, ("k",), scope={"s": "A"})
         self.assertEqual(n, (1, 1, 1))
 
+    def test_ignore_cols_makes_touch_only_change_a_noop(self):
+        # An audit column that ticks every call (here 'note') must not by itself
+        # trigger an update, and the stored value is NOT rewritten on the no-op.
+        self._seed(self.t, {"s": "A", "k": "x", "v": 1, "note": "t0"})
+        with db_store.get_engine().begin() as conn:
+            n = db_store.reconcile(
+                conn, self.t, [{"s": "A", "k": "x", "v": 1, "note": "t1"}],
+                ("k",), scope={"s": "A"}, ignore_cols=("note",))
+        self.assertEqual(n, (0, 0, 0))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual(_rows(conn, self.t, {"s": "A"})[0]["note"], "t0")
+
+    def test_ignore_col_still_written_on_real_update(self):
+        # When a NON-ignored column changes, the row updates and the ignored
+        # column is refreshed too (records when the data last changed).
+        self._seed(self.t, {"s": "A", "k": "x", "v": 1, "note": "t0"})
+        with db_store.get_engine().begin() as conn:
+            n = db_store.reconcile(
+                conn, self.t, [{"s": "A", "k": "x", "v": 2, "note": "t1"}],
+                ("k",), scope={"s": "A"}, ignore_cols=("note",))
+        self.assertEqual(n, (0, 1, 0))
+        with db_store.get_engine().connect() as conn:
+            got = _rows(conn, self.t, {"s": "A"})[0]
+        self.assertEqual((got["v"], got["note"]), (2, "t1"))
+
+    def test_ignore_col_written_on_insert(self):
+        with db_store.get_engine().begin() as conn:
+            n = db_store.reconcile(
+                conn, self.t, [{"s": "A", "k": "x", "v": 1, "note": "t0"}],
+                ("k",), scope={"s": "A"}, ignore_cols=("note",))
+        self.assertEqual(n, (1, 0, 0))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual(_rows(conn, self.t, {"s": "A"})[0]["note"], "t0")
+
 
 class CompositeKeyReconcileTests(_Backend, unittest.TestCase):
 

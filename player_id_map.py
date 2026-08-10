@@ -39,7 +39,7 @@ import time
 import requests
 from sqlalchemy import (
     Boolean, Column, Float, Index, Integer, MetaData, String, Table,
-    UniqueConstraint, delete, insert, select,
+    UniqueConstraint, select,
 )
 from sqlalchemy.exc import OperationalError
 
@@ -295,20 +295,33 @@ def _parse_team_rows(csv_rows, fetched_at):
 # Replace-write (DELETE-all + bulk INSERT == portable rebuild) + meta upsert
 # ──────────────────────────────────────────────────────────────────────────────
 def _write_meta(conn, map_name, row_count):
-    conn.execute(delete(id_map_meta).where(id_map_meta.c.map_name == map_name))
-    conn.execute(insert(id_map_meta), {
-        "map_name": map_name, "last_fetched_at": _now(), "row_count": row_count})
+    # One meta row per map. last_fetched_at is the TTL gate (_meta_fresh reads it),
+    # so it must refresh every call → NOT an ignore_col; reconcile UPDATEs the
+    # single row in place (INSERTs it the first time).
+    db_store.reconcile(
+        conn, id_map_meta,
+        [{"map_name": map_name, "last_fetched_at": _now(),
+          "row_count": row_count}],
+        ("map_name",), scope={"map_name": map_name})
 
 
-def _replace_write(table, params, map_name):
+def _replace_write(table, params, map_name, identity):
+    """WS15: reconcile the whole map to ``params`` (a surgical natural-key upsert
+    on ``identity`` — sfbb_id for players, sfbb_code for teams) instead of
+    delete-all + insert-all. The SFBB feed is a full snapshot that changes only a
+    handful of rows day-to-day, so the common case is now near-zero writes: the
+    per-row ``fetched_at`` ticks on every refresh, so it is excluded from the
+    change test (ignore_cols) — an unchanged player stays a no-op while a
+    genuinely changed one is UPDATEd in place. The map is never momentarily
+    emptied, and rows SFBB dropped are still DELETEd. ``params`` is pre-deduped on
+    the anchor so no duplicate-identity ValueError can fire."""
     engine = db_store.get_engine()
     with _WRITE_LOCK:
         for attempt in range(3):
             try:
                 with engine.begin() as conn:
-                    conn.execute(delete(table))
-                    if params:
-                        conn.execute(insert(table), params)
+                    db_store.reconcile(conn, table, params, identity,
+                                       ignore_cols=("fetched_at",))
                     _write_meta(conn, map_name, len(params))
                 return len(params)
             except OperationalError:
@@ -321,7 +334,7 @@ def refresh_players():
     """Fetch + replace the player map from SFBB. Returns rows written. Raises on a
     fetch/DB error (the CLI surfaces it; the lazy in-app path swallows it)."""
     params = _parse_player_rows(_fetch_csv(PLAYER_URL), _now())
-    n = _replace_write(player_id_map, params, "player")
+    n = _replace_write(player_id_map, params, "player", ("sfbb_id",))
     _invalidate_index("player")
     return n
 
@@ -329,7 +342,7 @@ def refresh_players():
 def refresh_teams():
     """Fetch + replace the team map from SFBB. Returns rows written."""
     params = _parse_team_rows(_fetch_csv(TEAM_URL), _now())
-    n = _replace_write(team_id_map, params, "team")
+    n = _replace_write(team_id_map, params, "team", ("sfbb_code",))
     _invalidate_index("team")
     return n
 
