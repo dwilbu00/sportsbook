@@ -9,6 +9,8 @@ backtest batter-xBA index. All hermetic — no live network.
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy import select
+
 import db_store
 import statcast_asof
 import savant_history as sh
@@ -52,6 +54,28 @@ class StoreRoundTripTests(_SqlBackend, unittest.TestCase):
             "222": {"xba": 0.25, "n_ab": 100, "xwoba": None, "n_bbe": 0}}, "bat")
         self.assertEqual(statcast_asof.get_batter_xba("111", 2026), (None, 0))
         self.assertEqual(statcast_asof.get_batter_xba("222", 2026)[0], 0.25)
+
+    def test_reput_is_surgical_keeps_surrogate_id(self):
+        # WS15: re-putting a partition UPDATEs the overlapping player in place
+        # (stable surrogate id), INSERTs the new one, DELETEs the dropped one —
+        # no delete-all churn, partition never momentarily emptied.
+        t = statcast_asof.statcast_player_asof
+        statcast_asof.put_rates(2026, "d1", {
+            "111": {"xba": 0.30, "n_ab": 100},
+            "222": {"xba": 0.25, "n_ab": 80}}, "bat")
+        with db_store.get_engine().connect() as conn:
+            id111 = conn.execute(
+                select(t.c.id).where(t.c.player_id == "111")).scalar()
+        statcast_asof.put_rates(2026, "d2", {
+            "111": {"xba": 0.33, "n_ab": 110},    # updated
+            "333": {"xba": 0.20, "n_ab": 60}}, "bat")   # 222 dropped, 333 new
+        with db_store.get_engine().connect() as conn:
+            id111_after = conn.execute(
+                select(t.c.id).where(t.c.player_id == "111")).scalar()
+        self.assertEqual(id111_after, id111)      # surrogate id stable
+        self.assertEqual(statcast_asof.get_batter_xba("111", 2026), (0.33, 110))
+        self.assertEqual(statcast_asof.get_batter_xba("222", 2026), (None, 0))
+        self.assertEqual(statcast_asof.get_batter_xba("333", 2026), (0.20, 60))
 
     def test_role_separation(self):
         # A pitcher row and a batter row can share the same MLBAM id (role key).

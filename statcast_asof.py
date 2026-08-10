@@ -25,7 +25,7 @@ import threading
 
 from sqlalchemy import (
     Column, Float, Index, Integer, MetaData, String, Table, UniqueConstraint,
-    delete, insert, select,
+    select,
 )
 from sqlalchemy.exc import OperationalError
 
@@ -123,9 +123,18 @@ def get_pitcher_csw(player_id, season, split="all"):
 
 # ── offline write ──────────────────────────────────────────────────────────
 def put_rates(season, as_of_date, rates, role, split="all"):
-    """Replace all rows for (season, split, role) with ``rates``
+    """Reconcile all rows for (season, split, role) to ``rates``
     ({player_id: {xba,xwoba,n_ab,n_bbe,whiff_pct,csw_pct,hard_hit_pct,
-    barrel_pct,n_pitches,n_bip}}; missing keys → NULL). Returns rows written."""
+    barrel_pct,n_pitches,n_bip}}; missing keys → NULL). Returns rows in the
+    desired end-state.
+
+    WS15: a surgical natural-key upsert (``db_store.reconcile``) replaces the old
+    delete-all + insert-all — players in both the store and ``rates`` are UPDATEd
+    in place (stable surrogate id), new players INSERTed, absent players DELETEd,
+    and the (season, split, role) partition is never momentarily emptied. The
+    (player_id, season_bucket, split, role) key is globally unique
+    (uq_statcast_player_asof), so a sibling role/season partition is never
+    touched (as the role-separation + replace-per-season tests assert)."""
     season = int(season)
     engine = db_store.get_engine()
     _fields = ("xba", "xwoba", "n_ab", "n_bbe", "whiff_pct", "csw_pct",
@@ -137,16 +146,15 @@ def put_rates(season, as_of_date, rates, role, split="all"):
         "role": role,
         "as_of_date": as_of_date,
     }, **{f: r.get(f) for f in _fields}) for pid, r in rates.items()]
+    scope = {"season_bucket": season, "split": split, "role": role}
     with _WRITE_LOCK:
         for attempt in range(3):
             try:
                 with engine.begin() as conn:
-                    conn.execute(delete(statcast_player_asof).where(
-                        (statcast_player_asof.c.season_bucket == season)
-                        & (statcast_player_asof.c.split == split)
-                        & (statcast_player_asof.c.role == role)))
-                    if params:
-                        conn.execute(insert(statcast_player_asof), params)
+                    db_store.reconcile(
+                        conn, statcast_player_asof, params,
+                        ("player_id", "season_bucket", "split", "role"),
+                        scope=scope)
                 return len(params)
             except OperationalError:
                 if attempt == 2:
