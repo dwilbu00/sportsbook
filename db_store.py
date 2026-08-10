@@ -829,6 +829,103 @@ def mutate(table_name, mutator, where=None, max_retries=3):
     raise last_exc
 
 
+def reconcile(conn, table, desired, identity_cols, scope=None):
+    """App-side-diff reconcile of a *dimension/fact* table to a desired end-state
+    — the natural-key analog of :func:`mutate` for the tables that aren't NDJSON
+    stores (gamelogs, statcast as-of rates, the SFBB id maps + meta, the
+    recalibration params/folds/meta, the id caches).
+
+    Replaces a delete-all + insert-all rebuild with a diff on the caller-declared
+    natural key: only rows that actually differ are written, as surgical INSERT /
+    UPDATE / DELETE. Unchanged rows aren't churned, their surrogate ids stay
+    stable, and the owned scope is never momentarily emptied — the WS15
+    integrity/best-practice win, with no change to what data ends up stored.
+
+    Parameters
+    ----------
+    conn : an OPEN transaction (from ``engine.begin()``). The diff runs inside it,
+        so a CHECK/UNIQUE violation rolls the whole reconcile back — matching the
+        atomic delete-all path it replaces. Every read happens before any DML, so
+        a precondition ``ValueError`` (below) leaves the transaction clean.
+    table : the SQLAlchemy ``Table``.
+    desired : the end-state rows as column->value param dicts — exactly what the
+        old ``insert(table), params`` received (every non-surrogate column
+        present; a surrogate ``id`` key, if any, is ignored so INSERTs let the DB
+        assign it and UPDATEs never touch it).
+    identity_cols : the natural-key column names identifying a row *within the
+        scope* (e.g. ``("player_id",)`` under a (season, split, role) scope, or
+        ``("sport_key", "prop_key")``).
+    scope : an equality ``{col: value}`` map bounding the rows this call owns — the
+        partition the old delete-all targeted (``None`` = the whole table). Only
+        in-scope rows are read, diffed, and deleted; rows outside it are untouched.
+
+    Returns ``(n_insert, n_update, n_delete)``.
+
+    Raises ``ValueError`` if two desired rows — or two existing in-scope rows —
+    share a natural identity (the diff can't tell them apart; a delete-all+insert
+    would have surfaced this via the UNIQUE constraint, or silently kept dupes on
+    an unconstrained table). Callers on an unconstrained table (the gamelog fact
+    tables, whose ``game_key`` isn't unique) must guard against this and fall back
+    to a scoped rebuild."""
+    def _params(row):
+        return {k: v for k, v in row.items() if k != "id"}
+
+    scope_clause = _where_clause(table, scope)
+
+    def _id_where(key):
+        # AND the scope predicate in so an UPDATE/DELETE can only touch the
+        # partition this call owns. identity_cols need not be globally unique
+        # (e.g. ("player_id",) under a (season, split, role) scope), so keying on
+        # them alone could otherwise hit an identical natural key in a sibling
+        # partition — the leak this closes to honour the docstring's promise that
+        # "rows outside [the scope] are untouched".
+        parts = [table.c[col] == val for col, val in zip(identity_cols, key)]
+        if scope_clause is not None:
+            parts.append(scope_clause)
+        return and_(*parts)
+
+    # Read the current in-scope rows (SELECT only — no DML yet).
+    stmt = select(table)
+    if scope_clause is not None:
+        stmt = stmt.where(scope_clause)
+    before_by_key = {}
+    for r in conn.execute(stmt):
+        m = r._mapping
+        key = tuple(m[c] for c in identity_cols)
+        if key in before_by_key:
+            raise ValueError(
+                f"{table.name}: duplicate identity {key} in existing rows")
+        before_by_key[key] = m
+
+    after_by_key = {}
+    for row in desired:
+        params = _params(row)
+        key = tuple(params.get(c) for c in identity_cols)
+        if key in after_by_key:
+            raise ValueError(
+                f"{table.name}: duplicate identity {key} in desired rows")
+        after_by_key[key] = params
+
+    # Compute the whole diff before issuing any DML: a precondition raise above
+    # then left only SELECTs on the transaction, so the caller can fall back.
+    inserts, updates = [], []
+    for key, params in after_by_key.items():
+        prior = before_by_key.get(key)
+        if prior is None:
+            inserts.append(params)
+        elif any(prior[k] != v for k, v in params.items()):
+            updates.append((key, params))
+    deletes = [key for key in before_by_key if key not in after_by_key]
+
+    for key, params in updates:
+        conn.execute(update(table).where(_id_where(key)).values(**params))
+    if inserts:
+        conn.execute(insert(table), inserts)
+    for key in deletes:
+        conn.execute(delete(table).where(_id_where(key)))
+    return (len(inserts), len(updates), len(deletes))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Recalibration params (per (sport, prop) + validation-fold child rows)
 # ──────────────────────────────────────────────────────────────────────────────
