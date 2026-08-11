@@ -811,6 +811,109 @@ def find_game_pk(official_date, home_team_id, away_team_id):
         return None
 
 
+# ───────────────────────────────────────── P3 resolver support (read + alias write)
+def team_id_for_name(name):
+    """MLBAM team_id for a team display name (odds feed / any source), via the
+    mlb_team dim's name_norm. Returns the single match, else None (unknown or
+    ambiguous). Fail-open."""
+    if not name or not enabled():
+        return None
+    try:
+        nn = db_store.normalize_name(name)
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(mlb_team.c.team_id).where(mlb_team.c.name_norm == nn)
+            ).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
+    except (OperationalError, ValueError, TypeError):
+        return None
+
+
+def _parse_ts(v):
+    """Parse an ISO-8601 (optionally Z-suffixed) timestamp → aware datetime, or None."""
+    if not v:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20):
+    """Resolve a game_pk for a matchup by the NEAREST game_date to the odds commence
+    time — robust to a series (picks the right day) and a SPLIT doubleheader (picks
+    the right game by first-pitch time), which a bare official_date match cannot.
+    Returns the single closest game_pk within tol_hours, or None if there is no
+    match, it is out of tolerance, or it is AMBIGUOUS (a traditional DH whose two
+    games share a timestamp → the 2nd-closest is within 60s). Fail-closed."""
+    if not (home_team_id and away_team_id) or not enabled():
+        return None
+    ts = _parse_ts(commence)
+    if ts is None:
+        return None
+    day = ts.date()
+    cand_dates = {(day + datetime.timedelta(days=d)).isoformat() for d in (-1, 0, 1)}
+    try:
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(mlb_game.c.game_pk, mlb_game.c.game_date).where(
+                    (mlb_game.c.home_team_id == str(home_team_id))
+                    & (mlb_game.c.away_team_id == str(away_team_id))
+                    & (mlb_game.c.official_date.in_(cand_dates)))
+            ).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return None
+    scored = []
+    for pk, gd in rows:
+        gts = _parse_ts(gd)
+        if gts is not None:
+            scored.append((abs((gts - ts).total_seconds()), pk))
+    if not scored:
+        return None
+    scored.sort()
+    best_delta, best_pk = scored[0]
+    if best_delta > tol_hours * 3600:
+        return None
+    if len(scored) > 1 and (scored[1][0] - best_delta) <= 60:   # ~tied → DH ambiguity
+        return None
+    return best_pk
+
+
+def record_player_alias(provider, provider_key, mlb_player_id,
+                        confidence=1.0, method="sfbb_unique"):
+    """Upsert one provider→MLBAM association into player_alias — the P3 audit trail
+    of successful resolutions (spec §8). Keyed on (provider, provider_key);
+    valid_from records first-seen and is preserved on an unchanged re-resolution
+    (it is an ignore_col, so a no-op diff never resets it). Fail-open → False on any
+    problem; NEVER raises into the caller's prediction path."""
+    if not enabled() or not (provider and provider_key and mlb_player_id):
+        return False
+    row = {"provider": provider, "provider_key": str(provider_key),
+           "mlb_player_id": str(mlb_player_id), "confidence": _f(confidence),
+           "resolution_method": method, "valid_from": _today(), "valid_to": None,
+           "fetched_at": _now()}
+    scope = {"provider": provider, "provider_key": str(provider_key)}
+    try:
+        engine = db_store.get_engine()
+        with _WRITE_LOCK:
+            for attempt in range(3):
+                try:
+                    with engine.begin() as conn:
+                        db_store.reconcile(
+                            conn, player_alias, [row],
+                            ("provider", "provider_key"), scope=scope,
+                            ignore_cols=("valid_from", "fetched_at"))
+                    return True
+                except OperationalError:
+                    if attempt == 2:
+                        raise
+    except Exception:
+        return False
+    return False
+
+
 def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
               limit=None):
     """StatsAPI-native per-game log for one athlete, MOST-RECENT-FIRST, joined to

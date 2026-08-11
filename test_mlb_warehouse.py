@@ -623,5 +623,82 @@ class GameLogReaderTests(_Backend, unittest.TestCase):
         self.assertEqual(log[0]["is_home"], True)
 
 
+# ──────────────────────────────────────────── P3 resolver support (warehouse)
+class P3SupportTests(_Backend, unittest.TestCase):
+    """team_id_for_name, find_game_pk_by_commence (series/DH-robust), and the
+    player_alias writer."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+
+    def _game(self, game_pk, official_date, game_date, home="147", away="111"):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": game_pk, "official_date": official_date,
+                "game_date": game_date, "home_team_id": home,
+                "away_team_id": away, "season": int(official_date[:4])})
+
+    def test_team_id_for_name(self):
+        self.assertEqual(mlb_warehouse.team_id_for_name("New York Yankees"), "147")
+        self.assertEqual(mlb_warehouse.team_id_for_name("new york yankees"), "147")
+        self.assertIsNone(mlb_warehouse.team_id_for_name("Nonexistent Team"))
+        self.assertIsNone(mlb_warehouse.team_id_for_name(None))
+
+    def test_commence_series_picks_right_day(self):
+        self._game(1, "2026-08-08", "2026-08-08T23:05:00Z")
+        self._game(2, "2026-08-09", "2026-08-09T23:05:00Z")
+        self.assertEqual(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-09T23:05:00Z"), 2)
+        self.assertEqual(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-08T23:10:00Z"), 1)
+
+    def test_commence_split_dh_picks_by_time(self):
+        self._game(10, "2026-08-08", "2026-08-08T17:05:00Z")   # game 1 afternoon
+        self._game(11, "2026-08-08", "2026-08-08T23:05:00Z")   # game 2 night
+        self.assertEqual(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-08T23:00:00Z"), 11)
+        self.assertEqual(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-08T17:10:00Z"), 10)
+
+    def test_commence_traditional_dh_identical_ts_is_ambiguous(self):
+        self._game(20, "2026-08-08", "2026-08-08T17:05:00Z")
+        self._game(21, "2026-08-08", "2026-08-08T17:05:00Z")   # identical → ambiguous
+        self.assertIsNone(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-08T17:05:00Z"))
+
+    def test_commence_out_of_tolerance_and_unknown(self):
+        self._game(30, "2026-08-08", "2026-08-08T23:05:00Z")
+        self.assertIsNone(mlb_warehouse.find_game_pk_by_commence(
+            "147", "111", "2026-08-15T23:05:00Z"))          # far date → out of window
+        self.assertIsNone(mlb_warehouse.find_game_pk_by_commence(
+            "999", "888", "2026-08-08T23:05:00Z"))          # unknown matchup
+
+    def test_record_player_alias_upsert(self):
+        self.assertTrue(
+            mlb_warehouse.record_player_alias("oddsapi", "aaron judge", "592450"))
+        rows = _rows(mlb_warehouse.player_alias)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]._mapping["mlb_player_id"], "592450")
+        self.assertEqual(rows[0]._mapping["resolution_method"], "sfbb_unique")
+        # re-record same → no dup
+        mlb_warehouse.record_player_alias("oddsapi", "aaron judge", "592450")
+        self.assertEqual(_count(mlb_warehouse.player_alias), 1)
+        # a changed id updates in place (still one row)
+        mlb_warehouse.record_player_alias("oddsapi", "aaron judge", "999999")
+        rows = _rows(mlb_warehouse.player_alias)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]._mapping["mlb_player_id"], "999999")
+
+    def test_record_player_alias_guards(self):
+        self.assertFalse(mlb_warehouse.record_player_alias("oddsapi", "", "592450"))
+        self.assertFalse(mlb_warehouse.record_player_alias("oddsapi", "x", None))
+        self.assertEqual(_count(mlb_warehouse.player_alias), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
