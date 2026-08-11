@@ -224,5 +224,106 @@ class PropsTeamBridgeTests(unittest.TestCase):
         self.assertEqual(captured.get("sched"), sched)  # tolerant name match hit
 
 
+def _team_on():
+    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_TEAM_ENV: "1"})
+
+
+def _team_off():
+    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_TEAM_ENV: ""})
+
+
+class TeamMarketFlipTests(unittest.TestCase):
+    """mlb_warehouse_team_stats: env-gated, MLB-only, fail-open; rekeys the queried
+    team's recent_games to the ODDS name so the analyzers' exact match holds."""
+
+    # Canonical-named games (queried team home in g1, away in g2).
+    GAMES = [
+        {"date": "2026-08-09T18:00:00Z", "home_team": "Oakland Athletics",
+         "away_team": "Boston Red Sox", "home_score": 5, "away_score": 3,
+         "total_score": 8},
+        {"date": "2026-08-08T18:00:00Z", "home_team": "Tampa Bay Rays",
+         "away_team": "Oakland Athletics", "home_score": 2, "away_score": 4,
+         "total_score": 6},
+    ]
+    SEASON = {"record": "70-50", "wins": 70, "losses": 50, "win_pct": 0.583,
+              "runs_scored": 600, "runs_allowed": 520}
+
+    _MISSING = object()
+
+    def _call(self, sport="baseball", team="Athletics", canonical="Oakland Athletics",
+              season=_MISSING, games=_MISSING, sql=True):
+        season = self.SEASON if season is self._MISSING else season
+        games = self.GAMES if games is self._MISSING else games
+        with mock.patch.object(espn_client, "db_store",
+                               mock.Mock(enabled=mock.Mock(return_value=sql))), \
+             mock.patch("mlb_warehouse.team_name_canonical", return_value=canonical), \
+             mock.patch("mlb_warehouse.get_team_standings", return_value=season), \
+             mock.patch("mlb_warehouse.get_team_games",
+                        return_value=[dict(g) for g in games]), \
+             mock.patch("mlb_warehouse._current_season", return_value=2026):
+            return espn_client.mlb_warehouse_team_stats(sport, team, recent_n=10)
+
+    def test_flag_off_returns_none(self):
+        with _team_off():
+            self.assertIsNone(self._call())
+
+    def test_flag_on_rekeys_to_odds_name_and_matches(self):
+        # Odds "Athletics" vs canonical "Oakland Athletics" — the divergent case.
+        with _team_on():
+            s = self._call()
+        self.assertIsNotNone(s)
+        self.assertEqual(s["season"], self.SEASON)
+        # queried team's own name rekeyed to the odds spelling; opponent left canonical
+        self.assertEqual(s["recent_games"][0]["home_team"], "Athletics")
+        self.assertEqual(s["recent_games"][0]["away_team"], "Boston Red Sox")
+        self.assertEqual(s["recent_games"][1]["away_team"], "Athletics")
+        # compute_recent_form matched both games (proves the rekey is load-bearing:
+        # without it, the canonical/odds gap would zero the form)
+        self.assertEqual(s["recent"]["games"], 2)
+        self.assertEqual(s["recent"]["wins"], 2)          # 5>3 and 4>2
+        self.assertAlmostEqual(s["recent"]["avg_scored"], 4.5)  # (5+4)/2
+
+    def test_non_baseball_returns_none(self):
+        with _team_on():
+            self.assertIsNone(self._call(sport="basketball"))
+
+    def test_sql_off_returns_none(self):
+        with _team_on():
+            self.assertIsNone(self._call(sql=False))
+
+    def test_unresolved_name_returns_none(self):
+        with _team_on():
+            self.assertIsNone(self._call(canonical=None))
+
+    def test_no_standings_returns_none(self):
+        with _team_on():
+            self.assertIsNone(self._call(season=None))
+
+    def test_no_games_returns_none(self):
+        with _team_on():
+            self.assertIsNone(self._call(games=[]))
+
+    def test_never_raises(self):
+        with _team_on(), mock.patch.object(
+                espn_client, "db_store",
+                mock.Mock(enabled=mock.Mock(side_effect=RuntimeError("boom")))):
+            self.assertIsNone(
+                espn_client.mlb_warehouse_team_stats("baseball", "X", 10))
+
+    def test_team_defense_gated_and_fail_open(self):
+        with _team_off():
+            self.assertIsNone(espn_client.mlb_warehouse_team_defense("baseball"))
+        with _team_on(), \
+             mock.patch.object(espn_client, "db_store",
+                               mock.Mock(enabled=mock.Mock(return_value=True))), \
+             mock.patch("mlb_warehouse.get_team_defense",
+                        return_value={"New York Yankees": 4.0}):
+            self.assertEqual(
+                espn_client.mlb_warehouse_team_defense("baseball"),
+                {"New York Yankees": 4.0})
+        with _team_on():                                  # non-baseball → None
+            self.assertIsNone(espn_client.mlb_warehouse_team_defense("basketball"))
+
+
 if __name__ == "__main__":
     unittest.main()

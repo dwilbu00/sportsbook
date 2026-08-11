@@ -1005,6 +1005,73 @@ def _mlb_warehouse_history(sport, player_name, prop_key, n):
         return None
 
 
+# P4 team-market cutover flag (independent of the player-history flag). When ON
+# (+ SQL enabled), MLB team-market inputs — season block, recent form, recent_games,
+# team defense — are served from the StatsAPI warehouse with ESPN as the fail-open
+# fallback; OFF (default) keeps the pure ESPN build.
+_MLB_WAREHOUSE_TEAM_ENV = "ODI_MLB_WAREHOUSE_TEAM"
+
+
+def _mlb_warehouse_team_enabled():
+    return os.environ.get(_MLB_WAREHOUSE_TEAM_ENV, "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def mlb_warehouse_team_stats(sport, team_name, recent_n=10):
+    """Warehouse-first team-market stats (the P4 team-market flip): the
+    {season, recent, recent_games} dict the team analyzers consume, sourced from the
+    StatsAPI warehouse, or None to fall open to the ESPN build. MLB only; env-gated
+    (ODI_MLB_WAREHOUSE_TEAM); current-season scoped (matches the ESPN schedule).
+
+    ``recent_games`` carry the queried team's ODDS-FEED name (``team_name``), not the
+    canonical mlb_team.name, because compute_recent_form + the analyzers
+    (_predict_margin / analyze_moneyline / analyze_totals) identify the team by EXACT
+    string match against the odds name — a canonical/odds spelling gap (e.g.
+    Athletics) would otherwise silently zero the form. Never raises."""
+    if sport != "baseball" or not _mlb_warehouse_team_enabled():
+        return None
+    try:
+        if db_store is None or not db_store.enabled():
+            return None
+        import mlb_warehouse
+        canonical = mlb_warehouse.team_name_canonical(team_name)
+        if not canonical:
+            return None
+        season = mlb_warehouse.get_team_standings(team_name)
+        games = mlb_warehouse.get_team_games(
+            team_name, season=mlb_warehouse._current_season(), limit=recent_n)
+        if not season or not games:
+            return None
+        # Rekey the queried team's own name to the odds spelling (opponent names are
+        # left canonical — the analyzers never match on them). get_team_games returns
+        # fresh dicts, so mutation is safe.
+        for g in games:
+            if g.get("home_team") == canonical:
+                g["home_team"] = team_name
+            elif g.get("away_team") == canonical:
+                g["away_team"] = team_name
+        recent = compute_recent_form(games, team_name, n=recent_n)
+        return {"season": season, "recent": recent, "recent_games": games}
+    except Exception:
+        return None
+
+
+def mlb_warehouse_team_defense(sport):
+    """Warehouse team-defense lookup (P4 team-market flip): {team display name: avg
+    runs allowed} from /standings, or None to fall open to build_team_defense_lookup.
+    MLB only; env-gated; fail-open. Consumers match team names tolerantly
+    (_resolve_team_defense), so the canonical mlb_team.name keys are fine."""
+    if sport != "baseball" or not _mlb_warehouse_team_enabled():
+        return None
+    try:
+        if db_store is None or not db_store.enabled():
+            return None
+        import mlb_warehouse
+        return mlb_warehouse.get_team_defense() or None
+    except Exception:
+        return None
+
+
 def get_player_stat_history(sport, league, player_name, prop_key, n=20,
                             team_ids=None, allow_warehouse=True):
     """

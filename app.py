@@ -796,6 +796,8 @@ from espn_client import (
     annotate_opponent_strength,
     build_team_defense_lookup,
     get_player_stat_history,
+    mlb_warehouse_team_stats,
+    mlb_warehouse_team_defense,
 )
 from analysis import (
     analyze_moneyline_value,
@@ -2813,8 +2815,11 @@ if analyze_clicked and selected_game_labels:
                 event_weather[eid] = None
 
         # Build a per-team avg-points-allowed lookup so the player-prop analyzer
-        # can apply an opponent-defense weighting to historical games.
-        team_defense = build_team_defense_lookup(schedule_results, espn_teams)
+        # can apply an opponent-defense weighting to historical games. P4 flip:
+        # prefer the StatsAPI /standings-derived defense when enabled (MLB-only,
+        # fail-open to the ESPN schedule scan).
+        team_defense = (mlb_warehouse_team_defense(sport["espn_sport"])
+                        or build_team_defense_lookup(schedule_results, espn_teams))
 
         progress.progress(50, text="Getting player props...")
 
@@ -2933,36 +2938,44 @@ if analyze_clicked and selected_game_labels:
             away_espn = find_team(espn_teams, away)
 
             if home_espn and away_espn:
-                home_games = schedule_results.get(home_espn["id"], [])
-                away_games = schedule_results.get(away_espn["id"], [])
+                # P4 team-market flip: prefer the StatsAPI warehouse for both teams
+                # (MLB-only, env-gated). Require BOTH so the two sides are never
+                # mixed warehouse/ESPN; any miss → the ESPN build for both.
+                wh_home = mlb_warehouse_team_stats(sport["espn_sport"], home, recent_n)
+                wh_away = mlb_warehouse_team_stats(sport["espn_sport"], away, recent_n)
+                if wh_home and wh_away:
+                    home_stats, away_stats = wh_home, wh_away
+                else:
+                    home_games = schedule_results.get(home_espn["id"], [])
+                    away_games = schedule_results.get(away_espn["id"], [])
 
-                home_recent = home_games[:recent_n]
-                away_recent = away_games[:recent_n]
-                # Annotate each recent game with opponent_win_pct for
-                # opponent-strength weighting in the analyzers.
-                annotate_opponent_strength(home_recent, home_espn["display_name"], espn_teams)
-                annotate_opponent_strength(away_recent, away_espn["display_name"], espn_teams)
+                    home_recent = home_games[:recent_n]
+                    away_recent = away_games[:recent_n]
+                    # Annotate each recent game with opponent_win_pct for
+                    # opponent-strength weighting in the analyzers.
+                    annotate_opponent_strength(home_recent, home_espn["display_name"], espn_teams)
+                    annotate_opponent_strength(away_recent, away_espn["display_name"], espn_teams)
 
-                home_stats = {
-                    "season": {
-                        "record": home_espn["record"],
-                        "wins": home_espn["wins"],
-                        "losses": home_espn["losses"],
-                        "win_pct": home_espn["win_pct"],
-                    },
-                    "recent": compute_recent_form(home_games, home_espn["display_name"], n=recent_n),
-                    "recent_games": home_recent,
-                }
-                away_stats = {
-                    "season": {
-                        "record": away_espn["record"],
-                        "wins": away_espn["wins"],
-                        "losses": away_espn["losses"],
-                        "win_pct": away_espn["win_pct"],
-                    },
-                    "recent": compute_recent_form(away_games, away_espn["display_name"], n=recent_n),
-                    "recent_games": away_recent,
-                }
+                    home_stats = {
+                        "season": {
+                            "record": home_espn["record"],
+                            "wins": home_espn["wins"],
+                            "losses": home_espn["losses"],
+                            "win_pct": home_espn["win_pct"],
+                        },
+                        "recent": compute_recent_form(home_games, home_espn["display_name"], n=recent_n),
+                        "recent_games": home_recent,
+                    }
+                    away_stats = {
+                        "season": {
+                            "record": away_espn["record"],
+                            "wins": away_espn["wins"],
+                            "losses": away_espn["losses"],
+                            "win_pct": away_espn["win_pct"],
+                        },
+                        "recent": compute_recent_form(away_games, away_espn["display_name"], n=recent_n),
+                        "recent_games": away_recent,
+                    }
 
                 def _tag_event(cands, market_key):
                     for c in cands:

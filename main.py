@@ -40,6 +40,7 @@ from espn_client import (
     find_team,
     annotate_opponent_strength,
     get_player_stat_history,
+    mlb_warehouse_team_stats,
 )
 from analysis import (
     analyze_moneyline_value,
@@ -329,8 +330,15 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             print(f"    {home_espn['display_name']} ({home_espn['record']}) vs "
                   f"{away_espn['display_name']} ({away_espn['record']})")
 
-            home_stats = build_team_stats(home_espn, espn_sport, espn_league, recent_n, espn_teams)
-            away_stats = build_team_stats(away_espn, espn_sport, espn_league, recent_n, espn_teams)
+            # P4 team-market flip: prefer the StatsAPI warehouse (MLB-only,
+            # env-gated); fall open to the ESPN build. Require both sides.
+            wh_home = mlb_warehouse_team_stats(espn_sport, home, recent_n)
+            wh_away = mlb_warehouse_team_stats(espn_sport, away, recent_n)
+            if wh_home and wh_away:
+                home_stats, away_stats = wh_home, wh_away
+            else:
+                home_stats = build_team_stats(home_espn, espn_sport, espn_league, recent_n, espn_teams)
+                away_stats = build_team_stats(away_espn, espn_sport, espn_league, recent_n, espn_teams)
 
             # Cache per-team avg_allowed for opponent-defense weighting on props.
             team_defense[home_espn["display_name"]] = home_stats["recent"]["avg_allowed"]
