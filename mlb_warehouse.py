@@ -46,7 +46,8 @@ import time
 
 from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Index, Integer, MetaData, String,
-    Table, Text, UniqueConstraint, delete, insert, select, update,
+    Table, Text, UniqueConstraint, and_, delete, insert, not_, or_, select,
+    update,
 )
 from sqlalchemy.exc import OperationalError
 
@@ -126,6 +127,8 @@ mlb_team_standings = Table(
     Column("wins", Integer),
     Column("losses", Integer),
     Column("win_pct", Float),
+    Column("runs_scored", Integer),      # season cumulative (StatsAPI runsScored)
+    Column("runs_allowed", Integer),     # season cumulative (StatsAPI runsAllowed)
     Column("fetched_at", Float),
     UniqueConstraint("team_id", "season", "as_of_date",
                      name="uq_mlb_team_standings"),
@@ -195,7 +198,7 @@ _GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_type",
 _PLAYER_COLS = ("player_id", "full_name", "name_norm", "primary_position",
                 "is_pitcher", "bats", "throws", "fetched_at")
 _STANDINGS_COLS = ("id", "team_id", "season", "as_of_date", "wins", "losses",
-                   "win_pct", "fetched_at")
+                   "win_pct", "runs_scored", "runs_allowed", "fetched_at")
 _ALIAS_COLS = ("id", "provider", "provider_key", "mlb_player_id", "confidence",
                "resolution_method", "valid_from", "valid_to", "fetched_at")
 _BATTER_GAME_COLS = ("id", "athlete_id", "game_pk", "team_id", "season_bucket",
@@ -422,6 +425,8 @@ def parse_standings(raw, season, as_of_date):
                 "wins": _i(tr.get("wins")),
                 "losses": _i(tr.get("losses")),
                 "win_pct": _f(tr.get("winningPercentage")),
+                "runs_scored": _i(tr.get("runsScored")),
+                "runs_allowed": _i(tr.get("runsAllowed")),
                 "fetched_at": _now(),
             })
     return out
@@ -461,10 +466,14 @@ def parse_boxscore_players(box, game=None):
 
 
 def derive_batter_rows(box, game):
-    """Raw boxscore → per-batter stat rows (P1: for the parity harness, not
-    persisted). Shape mirrors the mlb_batter_gamelog fact: athlete_id (MLBAM),
-    game_pk, team_id, AB/H/SO/BB/HBP/SF/SH. Only players who came to the plate."""
-    rows = []
+    """Raw boxscore → per-batter stat rows (athlete_id (MLBAM), game_pk, team_id,
+    AB/H/SO/BB/HBP/SF/SH). Only players who came to the plate (or carry a batting
+    order). DEDUPED per athlete_id: a player can legitimately appear under BOTH
+    teams in one boxscore — the 2024-06-26 Danny Jansen game (suspended, traded,
+    resumed → listed for both clubs) — so keep the line where he actually batted
+    (max plate appearances), which also picks the correct team_id. Otherwise the
+    (athlete_id, game_pk) natural key would collide."""
+    by_ath = {}                                    # athlete_id -> (participation, row)
     teams = (box or {}).get("teams", {}) or {}
     gid = (game or {}).get("game_pk")
     for side in ("home", "away"):
@@ -484,8 +493,9 @@ def derive_batter_rows(box, game):
             if pa <= 0 and (ab + bb + hbp + sf + sh) <= 0 and not has_order:
                 continue
             person = p.get("person") or {}
-            rows.append({
-                "athlete_id": str(person.get("id")),
+            aid = str(person.get("id"))
+            row = {
+                "athlete_id": aid,
                 "game_pk": gid,
                 "team_id": team_id,
                 "AB": _f(bat.get("atBats")),
@@ -495,15 +505,20 @@ def derive_batter_rows(box, game):
                 "HBP": _f(bat.get("hitByPitch")),
                 "SF": _f(bat.get("sacFlies")),
                 "SH": _f(bat.get("sacBunts")),
-            })
-    return rows
+            }
+            participation = pa if pa > 0 else (ab + bb + hbp + sf + sh)
+            prev = by_ath.get(aid)
+            if prev is None or participation > prev[0]:
+                by_ath[aid] = (participation, row)
+    return [row for _participation, row in by_ath.values()]
 
 
 def derive_pitcher_rows(box, game):
-    """Raw boxscore → per-pitcher stat rows (P1: parity harness only). Shape
-    mirrors mlb_pitcher_gamelog: athlete_id, game_pk, team_id, IP/K/ER. IP is the
-    base-3 float ("6.1" == 6IP + 1 out), matching get_pitcher_gamelog."""
-    rows = []
+    """Raw boxscore → per-pitcher stat rows: athlete_id, game_pk, team_id, IP/K/ER.
+    IP is the base-3 float ("6.1" == 6IP + 1 out). DEDUPED per athlete_id (keep the
+    max-IP line) for the same both-teams-in-one-game anomaly derive_batter_rows
+    guards against, so the (athlete_id, game_pk) natural key can't collide."""
+    by_ath = {}                                    # athlete_id -> (outs, row)
     teams = (box or {}).get("teams", {}) or {}
     gid = (game or {}).get("game_pk")
     for side in ("home", "away"):
@@ -517,15 +532,20 @@ def derive_pitcher_rows(box, game):
             if ip_raw in (None, ""):
                 continue
             person = p.get("person") or {}
-            rows.append({
-                "athlete_id": str(person.get("id")),
+            aid = str(person.get("id"))
+            row = {
+                "athlete_id": aid,
                 "game_pk": gid,
                 "team_id": team_id,
                 "IP": _f(ip_raw),
                 "K": _f(pit.get("strikeOuts")),
                 "ER": _f(pit.get("earnedRuns")),
-            })
-    return rows
+            }
+            outs = _ip_to_outs(_f(ip_raw)) or 0
+            prev = by_ath.get(aid)
+            if prev is None or outs > prev[0]:
+                by_ath[aid] = (outs, row)
+    return [row for _outs, row in by_ath.values()]
 
 
 # ─────────────────────────────────────────────────────────── bronze + silver writes
@@ -1179,6 +1199,172 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
         "team_name": names.get(own_team_id),
         "found": True,
     }
+
+
+# ── P4 team-market model inputs: recent form / standings / team defense ───────
+# StatsAPI-native team readers for the team markets. recent_games come from
+# mlb_game (per-game scores — no better source); win%/record + team defense come
+# from the /standings snapshot (mlb_team_standings), which carries the cumulative
+# runsScored/runsAllowed DIRECTLY — cleaner + more authoritative than ESPN's
+# scan-and-average, and it unlocks run differential / Pythagorean strength for a
+# future team-market signal. Dual-run: nothing app-facing consumes these until the
+# team-market flip. Fail-open; leakage-safe via as_of_date.
+def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
+    """Most-recent-first FINAL regular/postseason games for a team (home or away),
+    from mlb_game joined to mlb_team for the home/away display names. Each dict
+    mirrors espn_client.get_team_schedule ({date, home_team, away_team, home_score,
+    away_score, total_score}) so compute_recent_form / compute_team_defense /
+    annotate_opponent_strength work UNCHANGED on it. Ordered game_date DESC,
+    game_pk DESC; leakage-safe via as_of_date (strict official_date <)."""
+    if not enabled() or not team_id:
+        return []
+    g = mlb_game
+    home = mlb_team.alias("home_t")
+    away = mlb_team.alias("away_t")
+    joined = (g.join(home, g.c.home_team_id == home.c.team_id, isouter=True)
+              .join(away, g.c.away_team_id == away.c.team_id, isouter=True))
+    # Genuine-final only: mlb_game (unlike the fact tables) holds EVERY scheduled
+    # game, and a SUSPENDED game reports abstractGameState 'Final' with a PARTIAL
+    # score, so gate on detailed_state too — same denylist as
+    # mlb_starters._is_genuine_final (NULL trusts the abstract state).
+    det = g.c.detailed_state
+    genuine_final = or_(det.is_(None), and_(
+        *[not_(det.ilike(f"%{b}%")) for b in mlb_starters._NON_FINAL_DETAILED]))
+    stmt = (select(g.c.game_date, g.c.game_pk, g.c.home_score, g.c.away_score,
+                   home.c.name.label("home_name"), away.c.name.label("away_name"))
+            .select_from(joined)
+            .where((g.c.home_team_id == str(team_id))
+                   | (g.c.away_team_id == str(team_id)))
+            .where(g.c.status == "Final")
+            .where(genuine_final)
+            .where(g.c.home_score.isnot(None))
+            .where(g.c.away_score.isnot(None))
+            .where(g.c.game_type.notin_(_NON_REGULAR_GAME_TYPES)))
+    if season is not None:
+        stmt = stmt.where(g.c.season == int(season))
+    if as_of_date is not None:
+        stmt = stmt.where(g.c.official_date < str(as_of_date))
+    stmt = stmt.order_by(g.c.game_date.desc(), g.c.game_pk.desc())
+    if limit:
+        stmt = stmt.limit(int(limit))
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return []
+    out = []
+    for r in rows:
+        m = r._mapping
+        try:
+            hs, as_ = int(m["home_score"]), int(m["away_score"])
+        except (TypeError, ValueError):
+            continue
+        out.append({"date": m["game_date"], "home_team": m["home_name"],
+                    "away_team": m["away_name"], "home_score": hs,
+                    "away_score": as_, "total_score": hs + as_})
+    return out
+
+
+def get_team_games(team_name, as_of_date=None, season=None, limit=None):
+    """espn_client.get_team_schedule analog from the warehouse (final reg/post
+    games, most-recent-first, leakage-safe). Fail-open → [].
+
+    ⚠ home_team/away_team in each dict are the CANONICAL mlb_team.name. The
+    consumers compute_recent_form / compute_team_defense match the team by EXACT
+    string, so the flip must pass THAT canonical name (see team_name_canonical) —
+    NOT the raw odds/ESPN spelling — or the exact-match silently yields all-zero
+    form. team_name here is resolved tolerantly (team_id_for_name), so the input
+    spelling may differ; the OUTPUT names are canonical."""
+    return _team_final_games(team_id_for_name(team_name),
+                             as_of_date=as_of_date, season=season, limit=limit)
+
+
+def team_name_canonical(team_name):
+    """The canonical mlb_team.name for a (tolerantly-resolved) team name, or None.
+    The team-market flip resolves the odds/ESPN name ONCE via this and passes the
+    result to BOTH get_team_games and compute_recent_form / compute_team_defense so
+    their exact-string team match holds despite StatsAPI/ESPN/odds spelling gaps
+    (e.g. 'St Louis Cardinals' vs 'St. Louis Cardinals', Athletics)."""
+    tid = team_id_for_name(team_name)
+    return _team_name_map().get(tid) if tid else None
+
+
+def _latest_standings_asof(conn, season, as_of_date=None):
+    """The most-recent standings snapshot date for a season (<= as_of_date if
+    given), or None. All 30 teams share an as_of_date per ingest, so this pins one
+    coherent snapshot to read."""
+    s = mlb_team_standings
+    stmt = select(s.c.as_of_date).where(s.c.season == season)
+    if as_of_date is not None:
+        stmt = stmt.where(s.c.as_of_date <= str(as_of_date))
+    r = conn.execute(stmt.order_by(s.c.as_of_date.desc()).limit(1)).first()
+    return r[0] if r is not None else None
+
+
+def get_team_standings(team_name, season=None, as_of_date=None):
+    """The season block {record, wins, losses, win_pct, runs_scored, runs_allowed}
+    from the LATEST mlb_team_standings snapshot for the team (as_of_date <= the
+    cutoff, else the overall latest) — mirrors the ESPN get_all_teams season fields
+    (runs_* are additive, for a future run-differential/Pythagorean signal). None if
+    unknown. Fail-open."""
+    if not enabled():
+        return None
+    tid = team_id_for_name(team_name)
+    if not tid:
+        return None
+    season = int(season) if season else _current_season()
+    s = mlb_team_standings
+    stmt = (select(s.c.wins, s.c.losses, s.c.win_pct,
+                   s.c.runs_scored, s.c.runs_allowed)
+            .where(s.c.team_id == str(tid)).where(s.c.season == season))
+    if as_of_date is not None:
+        stmt = stmt.where(s.c.as_of_date <= str(as_of_date))
+    stmt = stmt.order_by(s.c.as_of_date.desc()).limit(1)
+    try:
+        with db_store.get_engine().connect() as conn:
+            r = conn.execute(stmt).first()
+    except (OperationalError, ValueError, TypeError):
+        return None
+    if r is None:
+        return None
+    w = int(r[0]) if r[0] is not None else 0
+    losses = int(r[1]) if r[1] is not None else 0
+    wp = (float(r[2]) if r[2] is not None
+          else (w / (w + losses) if (w + losses) else 0.0))
+    return {"record": f"{w}-{losses}", "wins": w, "losses": losses, "win_pct": wp,
+            "runs_scored": (int(r[3]) if r[3] is not None else None),
+            "runs_allowed": (int(r[4]) if r[4] is not None else None)}
+
+
+def get_team_defense(season=None, as_of_date=None):
+    """{team display name: avg runs ALLOWED per game} — the StatsAPI-native team-
+    defense input, from the latest /standings snapshot's cumulative runs_allowed /
+    games (wins+losses). Cleaner + more authoritative than reconstructing it by
+    scanning per-game scores (ESPN's method). Optional as_of_date picks the latest
+    snapshot <= that date (leakage-safe). Fail-open → {}."""
+    if not enabled():
+        return {}
+    season = int(season) if season else _current_season()
+    s = mlb_team_standings
+    try:
+        with db_store.get_engine().connect() as conn:
+            asof = _latest_standings_asof(conn, season, as_of_date)
+            if asof is None:
+                return {}
+            rows = conn.execute(
+                select(s.c.team_id, s.c.wins, s.c.losses, s.c.runs_allowed)
+                .where(s.c.season == season)
+                .where(s.c.as_of_date == asof)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    names = _team_name_map()
+    out = {}
+    for tid, w, losses, ra in rows:
+        games = (int(w) if w else 0) + (int(losses) if losses else 0)
+        nm = names.get(tid)
+        if nm and ra is not None and games > 0:
+            out[nm] = float(ra) / games
+    return out
 
 
 # ── P4 unified resolution: refresh an ACTIVE game, freeze a HISTORICAL one ─────

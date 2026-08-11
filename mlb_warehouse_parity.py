@@ -373,6 +373,49 @@ def player_input_parity(start, end, role="batter", sample=25, espn_n=40):
     return rep
 
 
+# ─────────────────────── team-market lens: standings-derived team defense vs ESPN
+def _warehouse_team_defense_map(season):
+    """{team_name_norm: avg runs allowed} from the STORED standings snapshot
+    (mlb_warehouse.get_team_defense = cumulative runsAllowed / games)."""
+    return {_norm(k): v for k, v
+            in (mlb_warehouse.get_team_defense(season) or {}).items()
+            if k and v is not None}
+
+
+def _espn_team_defense_map():
+    """{team_name_norm: avg runs allowed} from the live ESPN teams + schedules via
+    build_team_defense_lookup (avg over the schedule games). Best-effort; network."""
+    try:
+        import espn_client
+        teams = espn_client.get_all_teams(_ESPN_SPORT, _ESPN_LEAGUE)
+        sched = {}
+        for info in (teams or {}).values():
+            tid = info.get("id")
+            if tid:
+                sched[tid] = espn_client.get_team_schedule(
+                    _ESPN_SPORT, _ESPN_LEAGUE, tid)
+        lookup = espn_client.build_team_defense_lookup(sched, teams)
+    except Exception:
+        return {}
+    return {_norm(k): v for k, v in (lookup or {}).items() if v is not None}
+
+
+def team_defense_parity(season=None):
+    """Diff StatsAPI standings-derived avg-runs-allowed per team (cumulative
+    runsAllowed / games) vs the ESPN build_team_defense_lookup (avg over the
+    schedule). The two derivations differ slightly (cumulative vs per-game scan +
+    coverage/timing), so the tolerance is loose — this catches gross divergence /
+    missing teams, not exact agreement. Returns a report dict."""
+    season = int(season) if season else mlb_warehouse._current_season()
+    a = _warehouse_team_defense_map(season)
+    b = _espn_team_defense_map()
+    rep = diff_value_maps(a, b, tol=0.25)          # ~quarter run / game
+    rep["season"] = season
+    rep["statsapi_teams"] = len(a)
+    rep["espn_teams"] = len(b)
+    return rep
+
+
 def _fmt_report(title, rep):
     lines = [f"── {title} ─────────────────────────────────────────"]
     for k in ("season", "role", "window", "stat", "players_sampled",
@@ -408,6 +451,10 @@ def _main_cli():
                     help="Model-input parity: STORED warehouse facts (the flip's "
                          "read path) vs the ESPN gamelog over an inclusive window; "
                          "only_espn also measures backfill coverage.")
+    ap.add_argument("--team-defense", nargs="?", const=0, type=int, metavar="SEASON",
+                    help="Team-defense parity: StatsAPI standings runs_allowed/game "
+                         "vs the ESPN build_team_defense_lookup (default: current "
+                         "year).")
     ap.add_argument("--role", choices=("batter", "pitcher"), default="batter",
                     help="Gamelog/player-input role to diff (default: batter → hits).")
     ap.add_argument("--sample", type=int, default=25,
@@ -430,9 +477,13 @@ def _main_cli():
         rep = player_input_parity(args.player_input[0], args.player_input[1],
                                   role=args.role, sample=args.sample)
         print(_fmt_report(f"model-input parity ({args.role})", rep))
+    if args.team_defense is not None:
+        did = True
+        season = args.team_defense if args.team_defense and args.team_defense > 0 else None
+        print(_fmt_report("team-defense parity", team_defense_parity(season)))
     if not did:
         ap.error("nothing to do — pass --standings and/or --gamelog and/or "
-                 "--player-input START END")
+                 "--player-input START END and/or --team-defense")
 
 
 if __name__ == "__main__":

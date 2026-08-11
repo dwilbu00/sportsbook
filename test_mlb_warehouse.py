@@ -279,6 +279,43 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual(cole["ER"], 2.0)
         self.assertEqual(cole["team_id"], "147")
 
+    def test_batter_same_player_both_teams_deduped(self):
+        # The 2024-06-26 Danny Jansen game: suspended, traded, resumed → listed for
+        # BOTH clubs. Keep the line where he actually batted (max PA) + its team.
+        box = {"teams": {
+            "home": {"team": {"id": 111}, "players": {"ID643376": {
+                "person": {"id": 643376, "fullName": "Danny Jansen"},
+                "position": {"abbreviation": "C"}, "battingOrder": "701",
+                "stats": {"batting": {"atBats": 4, "hits": 1, "strikeOuts": 1,
+                                      "plateAppearances": 4}}}}},
+            "away": {"team": {"id": 141}, "players": {"ID643376": {
+                "person": {"id": 643376, "fullName": "Danny Jansen"},
+                "position": {"abbreviation": "C"}, "battingOrder": "700",
+                "stats": {"batting": {"atBats": 0, "hits": 0, "strikeOuts": 0,
+                                      "plateAppearances": 0}}}}}}}
+        game = {"game_pk": 746942, "home_team_id": "111", "away_team_id": "141"}
+        rows = mlb_warehouse.derive_batter_rows(box, game)
+        self.assertEqual(len(rows), 1)                 # deduped
+        self.assertEqual(rows[0]["athlete_id"], "643376")
+        self.assertEqual(rows[0]["team_id"], "111")    # Boston — where he batted
+        self.assertEqual((rows[0]["AB"], rows[0]["H"]), (4.0, 1.0))
+
+    def test_pitcher_same_player_both_teams_deduped(self):
+        box = {"teams": {
+            "home": {"team": {"id": 111}, "players": {"ID1": {
+                "person": {"id": 1, "fullName": "Two Team"},
+                "stats": {"pitching": {"inningsPitched": "5.0", "strikeOuts": 6,
+                                       "earnedRuns": 2}}}}},
+            "away": {"team": {"id": 141}, "players": {"ID1": {
+                "person": {"id": 1, "fullName": "Two Team"},
+                "stats": {"pitching": {"inningsPitched": "0.1", "strikeOuts": 0,
+                                       "earnedRuns": 0}}}}}}}
+        game = {"game_pk": 700, "home_team_id": "111", "away_team_id": "141"}
+        rows = mlb_warehouse.derive_pitcher_rows(box, game)
+        self.assertEqual(len(rows), 1)                 # deduped (max IP)
+        self.assertEqual(rows[0]["team_id"], "111")
+        self.assertEqual(rows[0]["IP"], 5.0)
+
 
 # ─────────────────────────────────────────────────────────────────── ingestion
 class IngestTests(_Backend, unittest.TestCase):
@@ -1126,6 +1163,141 @@ class PlayerInputParityTests(_Backend, unittest.TestCase):
             rep = parity.player_input_parity("2024-07-04", "2024-07-10")
         self.assertEqual(rep["matches"], 1)
         self.assertEqual(rep["only_espn"], 1)                   # 07-10 not in warehouse
+
+
+class TeamMarketReaderTests(_Backend, unittest.TestCase):
+    """StatsAPI-native team-market model inputs: recent_games from mlb_game;
+    win%/record + team defense from the standings snapshot (cumulative runs)."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox"),
+                        ("119", "Los Angeles Dodgers")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+
+    def _game(self, pk, official_date, game_date, home, away, hs, as_,
+              status="Final", game_type="R", season=2024):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": pk, "official_date": official_date,
+                "game_date": game_date, "season": season, "game_type": game_type,
+                "home_team_id": home, "away_team_id": away,
+                "home_score": hs, "away_score": as_, "status": status})
+
+    def _stand(self, tid, w, losses, wp, rs, ra, as_of="2024-07-04", season=2024):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_team_standings), {
+                "team_id": tid, "season": season, "as_of_date": as_of,
+                "wins": w, "losses": losses, "win_pct": wp,
+                "runs_scored": rs, "runs_allowed": ra})
+
+    def test_parse_standings_captures_runs(self):
+        raw = {"records": [{"teamRecords": [
+            {"team": {"id": 147}, "wins": 55, "losses": 30,
+             "winningPercentage": ".647", "runsScored": 420, "runsAllowed": 330}]}]}
+        row = mlb_warehouse.parse_standings(raw, 2024, "2024-07-04")[0]
+        self.assertEqual(row["runs_scored"], 420)
+        self.assertEqual(row["runs_allowed"], 330)
+
+    def test_get_team_games_shape_order_and_exclusions(self):
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z", "147", "111", 5, 3)
+        self._game(2, "2024-07-05", "2024-07-06T00:10:00Z", "119", "147", 4, 2)
+        self._game(3, "2024-07-03", "2024-07-03T18:00:00Z", "147", "111", 1, 2,
+                   status="Live")                       # not final → excluded
+        self._game(4, "2024-03-01", "2024-03-01T18:00:00Z", "147", "111", 9, 0,
+                   game_type="S")                       # spring → excluded
+        games = mlb_warehouse.get_team_games("New York Yankees")
+        self.assertEqual([g["date"][:10] for g in games],
+                         ["2024-07-06", "2024-07-01"])  # most-recent-first, final reg
+        g0 = games[0]
+        self.assertEqual((g0["home_team"], g0["away_team"]),
+                         ("Los Angeles Dodgers", "New York Yankees"))
+        self.assertEqual((g0["home_score"], g0["away_score"], g0["total_score"]),
+                         (4, 2, 6))
+
+    def test_get_team_games_leakage_cutoff(self):
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z", "147", "111", 5, 3)
+        self._game(2, "2024-07-05", "2024-07-05T18:00:00Z", "147", "111", 4, 2)
+        past = mlb_warehouse.get_team_games("New York Yankees",
+                                            as_of_date="2024-07-05")
+        self.assertEqual([g["date"][:10] for g in past], ["2024-07-01"])
+
+    def test_get_team_games_excludes_suspended(self):
+        # A suspended game reports abstractGameState 'Final' with a PARTIAL score;
+        # detailed_state gates it out (mlb_game holds every scheduled game).
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z", "147", "111", 5, 3)
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 2, "official_date": "2024-07-02",
+                "game_date": "2024-07-02T18:00:00Z", "season": 2024,
+                "game_type": "R", "home_team_id": "147", "away_team_id": "111",
+                "home_score": 3, "away_score": 1, "status": "Final",
+                "detailed_state": "Suspended: Rain"})
+        games = mlb_warehouse.get_team_games("New York Yankees")
+        self.assertEqual([g["date"][:10] for g in games], ["2024-07-01"])
+
+    def test_team_name_canonical_tolerant(self):
+        # tolerant input spelling → canonical mlb_team.name (for the flip's
+        # exact-match consumers).
+        self.assertEqual(
+            mlb_warehouse.team_name_canonical("new york yankees"),
+            "New York Yankees")
+        self.assertIsNone(mlb_warehouse.team_name_canonical("Nowhere FC"))
+
+    def test_get_team_standings(self):
+        self._stand("147", 55, 30, 0.647, 420, 330)
+        self.assertEqual(
+            mlb_warehouse.get_team_standings("New York Yankees", season=2024),
+            {"record": "55-30", "wins": 55, "losses": 30, "win_pct": 0.647,
+             "runs_scored": 420, "runs_allowed": 330})
+
+    def test_get_team_standings_latest_snapshot_and_asof(self):
+        self._stand("147", 40, 30, 0.571, 300, 280, as_of="2024-06-01")
+        self._stand("147", 55, 30, 0.647, 420, 330, as_of="2024-07-04")
+        self.assertEqual(mlb_warehouse.get_team_standings(
+            "New York Yankees", season=2024)["wins"], 55)           # latest
+        self.assertEqual(mlb_warehouse.get_team_standings(
+            "New York Yankees", season=2024, as_of_date="2024-06-15")["wins"], 40)
+
+    def test_get_team_defense_from_standings_runs(self):
+        self._stand("147", 50, 50, 0.5, 500, 400)   # 100 g, 400 allowed → 4.0
+        self._stand("111", 40, 40, 0.5, 360, 480)   #  80 g, 480 allowed → 6.0
+        d = mlb_warehouse.get_team_defense(season=2024)
+        self.assertAlmostEqual(d["New York Yankees"], 4.0)
+        self.assertAlmostEqual(d["Boston Red Sox"], 6.0)
+
+    def test_get_team_defense_uses_latest_snapshot(self):
+        self._stand("147", 10, 10, 0.5, 100, 100, as_of="2024-06-01")  # 5.0
+        self._stand("147", 50, 50, 0.5, 500, 400, as_of="2024-07-04")  # 4.0
+        self.assertAlmostEqual(
+            mlb_warehouse.get_team_defense(season=2024)["New York Yankees"], 4.0)
+
+
+class TeamDefenseParityTests(_Backend, unittest.TestCase):
+    """team_defense_parity diffs the standings-derived warehouse map vs ESPN
+    (monkeypatched); reuses the pure diff core."""
+
+    def test_diff_warehouse_vs_espn(self):
+        for tid, nm in (("147", "New York Yankees"),):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_team_standings), {
+                "team_id": "147", "season": 2024, "as_of_date": "2024-07-04",
+                "wins": 50, "losses": 50, "win_pct": 0.5,
+                "runs_scored": 500, "runs_allowed": 400})     # → 4.0/game
+        nm = db_store.normalize_name("New York Yankees")
+        with mock.patch.object(parity, "_espn_team_defense_map",
+                               return_value={nm: 4.1}):        # within 0.25 tol
+            rep = parity.team_defense_parity(2024)
+        self.assertEqual(rep["compared"], 1)
+        self.assertEqual(rep["matches"], 1)
+        self.assertEqual(rep["mismatches"], 0)
 
 
 if __name__ == "__main__":

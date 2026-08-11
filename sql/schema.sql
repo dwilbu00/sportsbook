@@ -850,6 +850,15 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_mlb_team_standings_asof
     ON dbo.mlb_team_standings (season, as_of_date);
 GO
+-- Additive: cumulative season runs (StatsAPI runsScored/runsAllowed) — the
+-- StatsAPI-native team-defense input + a run-differential/Pythagorean signal.
+-- Existing snapshots stay NULL until the next standings ingest re-populates them.
+IF COL_LENGTH('dbo.mlb_team_standings', 'runs_scored') IS NULL
+    ALTER TABLE dbo.mlb_team_standings ADD runs_scored INT;
+GO
+IF COL_LENGTH('dbo.mlb_team_standings', 'runs_allowed') IS NULL
+    ALTER TABLE dbo.mlb_team_standings ADD runs_allowed INT;
+GO
 
 ----------------------------------------------------------------------- player_alias
 -- Provider NAME/id → MLBAM resolution store (the "associations" stored once).
