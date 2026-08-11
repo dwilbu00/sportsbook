@@ -915,6 +915,9 @@ CREATE TABLE dbo.mlb_batter_game (
     HBP           FLOAT,
     SF            FLOAT,
     SH            FLOAT,
+    HR            FLOAT,
+    TB            FLOAT,
+    RBI           FLOAT,
     fetched_at    FLOAT,
     CONSTRAINT uq_mlb_batter_game UNIQUE (athlete_id, game_pk),
     CONSTRAINT fk_mlb_batter_game_game
@@ -928,6 +931,18 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.mlb_batter_game'))
 CREATE INDEX ix_mlb_batter_game_athlete
     ON dbo.mlb_batter_game (athlete_id, season_bucket);
+GO
+-- Additive: HR/TB/RBI (StatsAPI homeRuns/totalBases/rbi), captured for the
+-- batter_home_runs / batter_total_bases / batter_rbis props. Existing rows stay
+-- NULL until re-backfilled; not yet fact-servable (_ACTUAL_STAT_SPEC) — see mlb_warehouse.py.
+IF COL_LENGTH('dbo.mlb_batter_game', 'HR') IS NULL
+    ALTER TABLE dbo.mlb_batter_game ADD HR FLOAT;
+GO
+IF COL_LENGTH('dbo.mlb_batter_game', 'TB') IS NULL
+    ALTER TABLE dbo.mlb_batter_game ADD TB FLOAT;
+GO
+IF COL_LENGTH('dbo.mlb_batter_game', 'RBI') IS NULL
+    ALTER TABLE dbo.mlb_batter_game ADD RBI FLOAT;
 GO
 
 -------------------------------------------------------------------- mlb_pitcher_game

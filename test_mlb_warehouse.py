@@ -78,6 +78,7 @@ BOXSCORE = {"teams": {
                 "stats": {"batting": {
                     "atBats": 4, "hits": 2, "strikeOuts": 1, "baseOnBalls": 1,
                     "hitByPitch": 0, "sacFlies": 0, "sacBunts": 0,
+                    "homeRuns": 1, "totalBases": 5, "rbi": 2,
                     "plateAppearances": 5}},
             },
             "ID543037": {
@@ -101,6 +102,7 @@ BOXSCORE = {"teams": {
                 "stats": {"batting": {
                     "atBats": 3, "hits": 1, "strikeOuts": 2, "baseOnBalls": 0,
                     "hitByPitch": 1, "sacFlies": 0, "sacBunts": 0,
+                    "homeRuns": 0, "totalBases": 1, "rbi": 0,
                     "plateAppearances": 4}},
             },
             "ID1": {   # bench player, never batted → excluded from batter rows
@@ -263,10 +265,14 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual(judge["H"], 2.0)
         self.assertEqual(judge["AB"], 4.0)
         self.assertEqual(judge["BB"], 1.0)
+        self.assertEqual(judge["HR"], 1.0)          # HR/TB/RBI captured
+        self.assertEqual(judge["TB"], 5.0)          # HR + single
+        self.assertEqual(judge["RBI"], 2.0)
         self.assertEqual(judge["game_pk"], 745804)
         self.assertEqual(judge["team_id"], "147")
         devers = by_id["646240"]
         self.assertEqual(devers["HBP"], 1.0)
+        self.assertEqual((devers["HR"], devers["TB"], devers["RBI"]), (0.0, 1.0, 0.0))
         self.assertEqual(devers["team_id"], "111")
 
     def test_derive_pitcher_rows(self):
@@ -537,6 +543,9 @@ class GameFactTests(_Backend, unittest.TestCase):
              for r in _rows(mlb_warehouse.mlb_batter_game)}
         self.assertEqual(set(b), {"592450", "646240"})
         self.assertEqual(b["592450"]["H"], 2.0)
+        self.assertEqual(b["592450"]["HR"], 1.0)           # HR/TB/RBI persisted end-to-end
+        self.assertEqual(b["592450"]["TB"], 5.0)
+        self.assertEqual(b["592450"]["RBI"], 2.0)
         self.assertEqual(b["592450"]["game_pk"], 745804)   # native from the boxscore
         self.assertEqual(b["592450"]["team_id"], "147")
         self.assertEqual(b["592450"]["season_bucket"], 2024)
@@ -884,7 +893,8 @@ class RefreshGameFactsTests(_Backend, unittest.TestCase):
             conn.execute(insert(mlb_warehouse.mlb_batter_game), {
                 "athlete_id": "592450", "game_pk": 745804, "team_id": "147",
                 "season_bucket": 2024, "AB": 4.0, "H": 2.0, "SO": 1.0, "BB": 1.0,
-                "HBP": 0.0, "SF": 0.0, "SH": 0.0, "fetched_at": fetched_at})
+                "HBP": 0.0, "SF": 0.0, "SH": 0.0, "HR": 1.0, "TB": 5.0, "RBI": 2.0,
+                "fetched_at": fetched_at})
 
     def _judge(self):
         return next(r._mapping for r in _rows(mlb_warehouse.mlb_batter_game)

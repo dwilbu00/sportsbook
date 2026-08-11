@@ -161,7 +161,11 @@ player_alias = Table(
 # is_home are NOT stored: the reader/gold view rejoins fact→mlb_game→mlb_team.
 # Surrogate id stays PK. These live ALONGSIDE the ESPN-sourced *_gamelog tables
 # in gamelog_store.py (untouched) — nothing app-facing consumes these until P4.
-_BATTER_GAME_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH")
+# HR/TB/RBI appended (2026-08-11) so batter_home_runs / batter_total_bases /
+# batter_rbis become fact-servable LATER — captured now, but deliberately NOT yet in
+# _ACTUAL_STAT_SPEC (that + a re-backfill is the "incorporate into the app" step;
+# adding them early would read NULL-as-0.0 on un-backfilled rows).
+_BATTER_GAME_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH", "HR", "TB", "RBI")
 _PITCHER_GAME_STATS = ("IP", "K", "ER")
 
 
@@ -505,6 +509,9 @@ def derive_batter_rows(box, game):
                 "HBP": _f(bat.get("hitByPitch")),
                 "SF": _f(bat.get("sacFlies")),
                 "SH": _f(bat.get("sacBunts")),
+                "HR": _f(bat.get("homeRuns")),      # StatsAPI gives these directly
+                "TB": _f(bat.get("totalBases")),    # (HR = 4 TB); no derivation needed
+                "RBI": _f(bat.get("rbi")),
             }
             participation = pa if pa > 0 else (ab + bb + hbp + sf + sh)
             prev = by_ath.get(aid)
