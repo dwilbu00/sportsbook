@@ -8,6 +8,8 @@ pricing_common / odds_client / calibration_loader / recalibration / prop_filter.
 analysis re-exports these names for backward compatibility.
 """
 
+import os
+
 from calibration_loader import (
     apply_calibration_with_warmup,
     count_current_season_games,
@@ -44,6 +46,26 @@ from stats import (
     hits_at_least,
     negbin_at_least,
 )
+
+
+# P4 fail-closed identity enforcement (default OFF). When on, an MLB player the
+# entity resolver can't UNIQUELY pin (unknown / namesake-ambiguous) gets NO
+# prediction — betting a mis-identified player is worse than skipping. OFF = the P3
+# shadow posture (the prediction still logs with a NULL id). Env-gated so the blast
+# radius (`prediction_log WHERE sport_key='baseball_mlb' AND player_mlb_id IS NULL`)
+# is understood + resolvable SFBB gaps fixed before flipping.
+_MLB_ENFORCE_IDENTITY_ENV = "ODI_MLB_ENFORCE_IDENTITY"
+
+# Circuit breaker: enforcement drops UNPINNED players, but a SYSTEMIC failure (a SQL
+# blip, or the SFBB id-map being rebuilt) makes the resolver return resolved=False
+# for EVERYONE — which would silently suppress the whole slate. Above this unpinned
+# fraction, treat it as systemic and fail OPEN for the run. Normal rate is ~2-3%.
+_ENFORCE_FAILOPEN_FRACTION = 0.5
+
+
+def _identity_enforced():
+    return os.environ.get(_MLB_ENFORCE_IDENTITY_ENV, "").strip().lower() in (
+        "1", "true", "on", "yes")
 
 
 # MLB league baselines used as log5-style denominators for the props matchup
@@ -965,10 +987,12 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
 
     # P3: resolve each odds-feed player NAME → (MLBAM id, game_pk) ONCE per event,
     # fail-closed, at the odds boundary (home/away/commence all in scope here).
-    # The resolved ids are stamped onto the prediction rows below; an unresolved
-    # MLB player keeps NULL ids (the shadow signal) — nothing is dropped yet
-    # (enforcement is P4). MLB only; cached across this event's prop loops.
+    # The resolved ids are stamped onto the prediction rows below. P3 posture is
+    # SHADOW: an unresolved MLB player keeps NULL ids (the signal). P4 ENFORCEMENT
+    # (env-gated, below) flips that to fail-CLOSED: no prediction for a player we
+    # can't uniquely pin. MLB only; cached across this event's prop loops.
     _is_mlb_props = str(sport_key or "").startswith("baseball_mlb")
+    _enforce_identity = _is_mlb_props and _identity_enforced()
     _ident_cache = {}
 
     def _resolve_ident(pname):
@@ -983,6 +1007,30 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             except Exception:               # never break analysis on a resolver hiccup
                 _ident_cache[pname] = None
         return _ident_cache[pname]
+
+    def _ident_pinned(pname):
+        """True if the resolver UNIQUELY pinned this MLB player (resolved +
+        mlb_player_id). A systemic hiccup (_resolve_ident → None, e.g. an import
+        break) counts as pinned = kept (a crash must not drop a player)."""
+        ident = _resolve_ident(pname)
+        if ident is None:
+            return True
+        return bool(ident.get("resolved") and ident.get("mlb_player_id"))
+
+    # P4 enforcement + circuit breaker (see _ENFORCE_FAILOPEN_FRACTION): pre-scan the
+    # slate; if an implausible fraction of MLB players is unpinned, that's a systemic
+    # failure (not per-player ambiguity) → fail OPEN for this run so the whole card
+    # isn't silently suppressed (the NULL-id shadow rows reappear as the signal).
+    _enforce_active = _enforce_identity
+    if _enforce_identity:
+        _names = {p for _pl in prop_data.get("props", {}).values() for p in _pl}
+        _unpinned = sum(1 for p in _names if not _ident_pinned(p))
+        if _names and _unpinned / len(_names) >= _ENFORCE_FAILOPEN_FRACTION:
+            _enforce_active = False
+            print(f"[identity-enforce] slate-level FAIL-OPEN: {_unpinned}/"
+                  f"{len(_names)} MLB players unresolved "
+                  f"(>= {int(_ENFORCE_FAILOPEN_FRACTION * 100)}%) — likely systemic; "
+                  f"enforcement skipped this run")
 
     for prop_key, players in prop_data.get("props", {}).items():
         # Resolve per-prop knobs: calibration overrides the in-code defaults
@@ -1000,6 +1048,12 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
+            # P4 fail-closed identity enforcement (env-gated): drop an MLB player the
+            # resolver can't uniquely pin — no candidate, no prediction row. Default
+            # OFF → the P3 shadow posture (a NULL-id prediction still emits).
+            # _enforce_active folds in the systemic-failure circuit breaker above.
+            if _enforce_active and not _ident_pinned(player_name):
+                continue
             line = odds_info["line"]
             over_implied = odds_info["over_implied"]
             under_implied = odds_info["under_implied"]

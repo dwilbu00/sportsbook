@@ -325,5 +325,63 @@ class TeamMarketFlipTests(unittest.TestCase):
             self.assertIsNone(espn_client.mlb_warehouse_team_defense("basketball"))
 
 
+class EnforceIdentityTests(unittest.TestCase):
+    """P4 fail-closed identity enforcement (env ODI_MLB_ENFORCE_IDENTITY): an MLB
+    player the resolver can't uniquely pin gets NO candidate/prediction when on;
+    default OFF keeps the P3 shadow posture; a slate-level circuit breaker fails OPEN
+    on a systemic (all-unresolved) failure. entity_resolver + refit/log mocked."""
+
+    def _prop_data(self, players):
+        return {"commence_time": "2026-08-10T23:10:00Z",
+                "home_team": "New York Yankees", "away_team": "Boston Red Sox",
+                "game_id": "evt-enf",
+                "props": {"batter_hits": {p: {
+                    "line": 0.5, "over_implied": 0.5, "under_implied": 0.5,
+                    "over_price": -110, "under_price": -110,
+                    "over_book": "DK", "under_book": "DK"} for p in players}}}
+
+    def _run(self, resolved_map, enforce, sport_key="baseball_mlb", hiccup=False):
+        def _resolve(name, *a, **k):
+            if hiccup:                       # _resolve_ident catches → None (fail-open)
+                raise RuntimeError("resolver down")
+            return ({"resolved": True, "mlb_player_id": "1", "game_pk": 700}
+                    if resolved_map.get(name) else
+                    {"resolved": False, "mlb_player_id": None, "game_pk": None})
+        env = {props._MLB_ENFORCE_IDENTITY_ENV: "1" if enforce else ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch("entity_resolver.resolve", side_effect=_resolve), \
+             mock.patch.object(props, "maybe_auto_refit"), \
+             mock.patch.object(props, "load_recalibration", return_value={}), \
+             mock.patch.object(props, "log_prediction_rows"):
+            cands = props.analyze_player_props_value(
+                self._prop_data(list(resolved_map)), {}, threshold_pct=1.0,
+                sport_key=sport_key)
+        return {c["player"] for c in cands}
+
+    def test_unresolved_dropped_when_enforced(self):
+        # 1 of 3 unpinned (33% < 50%) → enforce drops only the unresolved one
+        self.assertEqual(
+            self._run({"A": True, "B": True, "C": False}, enforce=True), {"A", "B"})
+
+    def test_kept_when_not_enforced(self):                    # P3 shadow (default)
+        self.assertEqual(
+            self._run({"A": True, "C": False}, enforce=False), {"A", "C"})
+
+    def test_circuit_breaker_all_unresolved_fails_open(self):
+        # systemic: 100% unpinned → fail OPEN, keep the whole slate
+        self.assertEqual(
+            self._run({"A": False, "B": False, "C": False}, enforce=True),
+            {"A", "B", "C"})
+
+    def test_non_mlb_never_enforced(self):
+        self.assertEqual(
+            self._run({"A": False}, enforce=True, sport_key=None), {"A"})
+
+    def test_resolver_hiccup_fails_open(self):
+        self.assertEqual(
+            self._run({"A": False, "B": False}, enforce=True, hiccup=True),
+            {"A", "B"})
+
+
 if __name__ == "__main__":
     unittest.main()
