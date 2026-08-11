@@ -85,6 +85,7 @@ mlb_game = Table(
     Column("game_date", String(40)),                     # FULL ISO timestamp (UTC)
     Column("official_date", String(10)),                 # YYYY-MM-DD play date
     Column("season", Integer),
+    Column("game_type", String(4)),                      # R|S|A|E|D|F|L|W|P (StatsAPI gameType)
     Column("game_number", Integer),                      # doubleheader game #
     Column("double_header", String(4)),                  # N|Y|S
     Column("home_team_id", String(32), ForeignKey("mlb_team.team_id",
@@ -187,9 +188,10 @@ mlb_pitcher_game = _game_fact_table("mlb_pitcher_game", _PITCHER_GAME_STATS)
 _BRONZE_COLS = ("id", "kind", "natural_ref", "payload", "fetched_at", "processed_at")
 _TEAM_COLS = ("team_id", "name", "name_norm", "abbreviation", "league_id",
               "division_id", "fetched_at")
-_GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_number",
-              "double_header", "home_team_id", "away_team_id", "venue_id",
-              "status", "detailed_state", "home_score", "away_score", "fetched_at")
+_GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_type",
+              "game_number", "double_header", "home_team_id", "away_team_id",
+              "venue_id", "status", "detailed_state", "home_score", "away_score",
+              "fetched_at")
 _PLAYER_COLS = ("player_id", "full_name", "name_norm", "primary_position",
                 "is_pitcher", "bats", "throws", "fetched_at")
 _STANDINGS_COLS = ("id", "team_id", "season", "as_of_date", "wins", "losses",
@@ -387,6 +389,7 @@ def parse_schedule(raw, season):
                 "game_date": g.get("gameDate"),
                 "official_date": g.get("officialDate"),
                 "season": _i(g.get("season")) or season,
+                "game_type": _s(g.get("gameType")),      # R=regular, A=all-star, S=spring, P/D/F/L/W=postseason
                 "game_number": _i(g.get("gameNumber")),
                 "double_header": g.get("doubleHeader"),
                 "home_team_id": str(hid) if hid is not None else None,

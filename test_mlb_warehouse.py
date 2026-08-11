@@ -39,6 +39,7 @@ SCHEDULE = {"dates": [{
             "gameDate": "2024-07-04T17:10:00Z",
             "officialDate": "2024-07-04",
             "season": "2024",
+            "gameType": "R",
             "gameNumber": 1,
             "doubleHeader": "N",
             "venue": {"id": 15},
@@ -207,7 +208,11 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(g["away_team_id"], "111")
         self.assertEqual(g["official_date"], "2024-07-04")
         self.assertEqual(g["season"], 2024)
+        self.assertEqual(g["game_type"], "R")            # captured from gameType
         self.assertEqual(g["status"], "Final")
+        # live game has no gameType in the fixture → None (faithful, not defaulted)
+        self.assertIsNone(
+            next(x for x in games if x["game_pk"] == 745805)["game_type"])
         self.assertEqual(g["home_score"], 5.0)
         self.assertEqual(g["away_score"], 3.0)
         self.assertEqual(g["venue_id"], "15")

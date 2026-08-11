@@ -757,6 +757,7 @@ CREATE TABLE dbo.mlb_game (
     game_date      NVARCHAR(40),                        -- FULL ISO timestamp (UTC)
     official_date  NVARCHAR(10),                        -- YYYY-MM-DD play date
     season         INT,
+    game_type      NVARCHAR(4),                         -- R|S|A|E|D|F|L|W|P (StatsAPI gameType)
     game_number    INT,                                 -- doubleheader game #
     double_header  NVARCHAR(4),                         -- N|Y (traditional)|S (split)
     home_team_id   NVARCHAR(32),
@@ -783,6 +784,12 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.mlb_game'))
 CREATE INDEX ix_mlb_game_teams
     ON dbo.mlb_game (official_date, home_team_id, away_team_id);  -- retro-match
+GO
+-- Guarded ALTER for the existing prod mlb_game (added after the P1 create): the
+-- StatsAPI schedule gameType (R=regular, A=all-star, S=spring, P/D/F/L/W=postseason).
+-- Captured faithfully at silver; the P4 gold view uses it to exclude exhibitions.
+IF COL_LENGTH('dbo.mlb_game', 'game_type') IS NULL
+    ALTER TABLE dbo.mlb_game ADD game_type NVARCHAR(4);
 GO
 
 ------------------------------------------------------------------------ mlb_player
