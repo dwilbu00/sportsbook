@@ -53,6 +53,17 @@ def _apply_starter_logit(p, edge, weight):
     return max(0.02, min(0.98, 1.0 / (1.0 + math.exp(-lg))))
 
 
+# ── Pythagorean team strength (WIRING ONLY, inert by default) ─────────────────
+# Expected win% from run differential via the canonical, None-safe 1.83-exponent
+# helper mlb_starters.pythagorean_win_probability (RS^e/(RS^e+RA^e)) — a better
+# season strength estimate than raw W-L%. Runs come from the warehouse /standings
+# season block (runs_scored/runs_allowed); the ESPN block has none, so this is a
+# warehouse-enabled signal (None when runs absent → skipped). DEFAULT_PYTHAG_WEIGHT
+# =0.0 keeps it INERT (computed + exposed in the candidate, but zero effect on the
+# model) until it is backtested and weighted.
+DEFAULT_PYTHAG_WEIGHT = 0.0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Pure-Python statistics helpers now live in stats.py (imported + re-exported
 #  here for backward compatibility with the modules that import them from
@@ -248,6 +259,12 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
         # the UI, but no longer the source of the model probability.
         season_wp = stats["season"]["win_pct"]
         flat_recent_wp = stats["recent"]["win_pct"]
+        # Pythagorean strength from the warehouse season block's runs (None on the
+        # ESPN path, which carries no runs). Exposed always; blended only when
+        # weighted (inert by default — see DEFAULT_PYTHAG_WEIGHT).
+        pythag_wp = mlb_starters.pythagorean_win_probability(
+            stats["season"].get("runs_scored"),
+            stats["season"].get("runs_allowed"))
         upcoming_is_home = (team_name == home_team)
 
         recent_games = stats.get("recent_games", [])
@@ -284,6 +301,13 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                     model_prob, sign * matchup_features["starter_edge"],
                     _starter_adjustment(sport_key, "moneyline"))
 
+        # Pythagorean blend (WIRING ONLY — inert while DEFAULT_PYTHAG_WEIGHT==0.0).
+        # When weighted, pull the model win prob toward the run-differential
+        # estimate; skipped when runs are absent (ESPN path).
+        if DEFAULT_PYTHAG_WEIGHT > 0 and pythag_wp is not None:
+            model_prob = ((1.0 - DEFAULT_PYTHAG_WEIGHT) * model_prob
+                          + DEFAULT_PYTHAG_WEIGHT * pythag_wp)
+
         # Calibrated overconfidence correction (no-op until an ML shrink is fit
         # from backfilled h2h history), then optional model⇄market blend toward
         # the de-vigged closing line (blend_w=1.0 → pure model).
@@ -319,6 +343,8 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "book_implied_prob": round(avg_implied * 100, 2),
             "season_win_pct": round(season_wp * 100, 2),
             "recent_win_pct": round(recent_wp * 100, 2),
+            "pythag_win_pct": (round(pythag_wp * 100, 2)
+                               if pythag_wp is not None else None),
             # model_prob = pure shared-margin win prob (graded by the backtest);
             # hist_prob mirrors it for backward-compatible UI display.
             "model_prob": round(model_prob * 100, 2),

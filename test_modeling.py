@@ -684,6 +684,47 @@ class ExpectedRunsTests(unittest.TestCase):
         self.assertEqual(expected_runs_ml, baseline_ml)
         self.assertEqual(expected_runs_other, baseline_other)
 
+    # ── Pythagorean strength (WIRING ONLY, inert by default) ──────────────────
+    def _stats_with_runs(self):
+        home, away = self._team_stats()
+        home["season"] = dict(home["season"])   # unshare the nested season dict
+        away["season"] = dict(away["season"])
+        home["season"].update(runs_scored=600, runs_allowed=450)   # strong
+        away["season"].update(runs_scored=450, runs_allowed=600)   # weak
+        return home, away
+
+    def _ml_by_team(self, home_stats, away_stats):
+        with patch.object(analysis, "_blend_weight", return_value=1.0):
+            cands = analysis.analyze_moneyline_value(
+                self._game_odds(), home_stats, away_stats, sport_key="baseball_mlb")
+        return {c["team"]: c for c in cands}
+
+    def test_pythag_exposed_and_inert_by_default(self):
+        with_runs = self._ml_by_team(*self._stats_with_runs())
+        no_runs = self._ml_by_team(*self._team_stats())
+        # exposed from the warehouse season block; None on the ESPN (run-less) block
+        self.assertIsNotNone(with_runs["Home"]["pythag_win_pct"])
+        self.assertGreater(with_runs["Home"]["pythag_win_pct"], 50.0)  # strong team
+        self.assertIsNone(no_runs["Home"]["pythag_win_pct"])
+        # INERT: default weight 0 → runs do not move the model probability
+        self.assertEqual(with_runs["Home"]["model_prob"],
+                         no_runs["Home"]["model_prob"])
+
+    def test_pythag_blends_when_weighted(self):
+        with patch.object(analysis, "DEFAULT_PYTHAG_WEIGHT", 1.0):
+            home = self._ml_by_team(*self._stats_with_runs())["Home"]
+        # full weight → the model prob IS the pythagorean win%
+        self.assertEqual(home["model_prob"], home["pythag_win_pct"])
+
+    def test_pythag_skipped_without_runs_even_when_weighted(self):
+        weighted = None
+        with patch.object(analysis, "DEFAULT_PYTHAG_WEIGHT", 1.0):
+            weighted = self._ml_by_team(*self._team_stats())
+        baseline = self._ml_by_team(*self._team_stats())
+        # no runs on the block → weight has no effect (pythag skipped)
+        self.assertEqual(weighted["Home"]["model_prob"],
+                         baseline["Home"]["model_prob"])
+
     @patch("backtest_starters._season_venue_index")
     @patch("backtest_props.season_schedule")
     def test_game_enrichment_attaches_actual_venue(
