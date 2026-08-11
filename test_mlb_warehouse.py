@@ -1350,5 +1350,113 @@ class TeamDefenseParityTests(_Backend, unittest.TestCase):
         self.assertEqual(rep["mismatches"], 0)
 
 
+class BackfillLegacyGamePkTests(unittest.TestCase):
+    """P5: player-anchor game_pk backfill onto legacy prediction_log/wagers rows —
+    DH-safe, non-destructive (fill-NULL-only), idempotent, dry-run vs apply. Needs
+    BOTH db_store + warehouse tables on the shared sqlite engine."""
+
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        mlb_warehouse.create_all()
+        mlb_warehouse._TEAMS_ENSURED.clear()
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+        mlb_warehouse._TEAMS_ENSURED.clear()
+
+    def _game(self, pk, official_date, game_date, home="147", away="111"):
+        with db_store.get_engine().begin() as conn:
+            for tid in (home, away):
+                if not conn.execute(select(mlb_warehouse.mlb_team).where(
+                        mlb_warehouse.mlb_team.c.team_id == tid)).first():
+                    conn.execute(insert(mlb_warehouse.mlb_team),
+                                 {"team_id": tid, "name": tid})
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": pk, "official_date": official_date, "game_date": game_date,
+                "season": 2026, "home_team_id": home, "away_team_id": away})
+
+    def _batter(self, aid, pk):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": aid, "game_pk": pk, "team_id": "147",
+                "season_bucket": 2026, "H": 1.0, "AB": 4.0})
+
+    def _pred(self, tag, mlb_id, game_date, commence, game_pk=None):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(db_store.prediction_log), {
+                "sport_key": "baseball_mlb", "event_key": f"evt-{tag}",
+                "prop_key": "batter_hits", "player": tag, "game_date": game_date,
+                "commence_time": commence, "line": 0.5,
+                "player_key": (f"mlb:{mlb_id}" if mlb_id else f"name:{tag}"),
+                "player_mlb_id": mlb_id, "game_pk": game_pk})
+
+    def _gpks(self):
+        with db_store.get_engine().connect() as conn:
+            return {r._mapping["player"]: r._mapping["game_pk"]
+                    for r in conn.execute(select(db_store.prediction_log))}
+
+    def _seed(self):
+        self._game(700, "2026-08-01", "2026-08-01T18:00:00Z")
+        self._batter("111111", 700)
+        self._pred("single", "111111", "2026-08-01", "2026-08-01T18:00:00Z")
+        # doubleheader: player in BOTH games → disambiguate by commence (nearest 801)
+        self._game(800, "2026-08-02", "2026-08-02T17:00:00Z")
+        self._game(801, "2026-08-02", "2026-08-02T21:00:00Z")
+        self._batter("222222", 800)
+        self._batter("222222", 801)
+        self._pred("dh", "222222", "2026-08-02", "2026-08-02T20:55:00Z")
+        self._pred("dnp", "333333", "2026-08-01", "2026-08-01T18:00:00Z")   # no fact
+        self._pred("noid", None, "2026-08-01", "2026-08-01T18:00:00Z")      # no id
+        self._game(900, "2026-08-03", "2026-08-03T18:00:00Z")
+        self._batter("444444", 900)
+        self._pred("stamped", "444444", "2026-08-03", "2026-08-03T18:00:00Z",
+                   game_pk=999)                                             # already set
+
+    def test_dry_run_reports_but_does_not_write(self):
+        self._seed()
+        s = mlb_warehouse.backfill_legacy_game_pk(dry_run=True)
+        self.assertEqual(s["prediction_log"]["candidates"], 3)   # single, dh, dnp
+        self.assertEqual(s["prediction_log"]["matched"], 2)      # single + dh
+        self.assertIsNone(self._gpks()["single"])                # nothing written
+
+    def test_apply_fills_dh_safe_and_nondestructive(self):
+        self._seed()
+        mlb_warehouse.backfill_legacy_game_pk(dry_run=False)
+        g = self._gpks()
+        self.assertEqual(g["single"], 700)
+        self.assertEqual(g["dh"], 801)          # nearest commence of the two DH games
+        self.assertIsNone(g["dnp"])             # no fact → left NULL
+        self.assertIsNone(g["noid"])            # no player id → left NULL
+        self.assertEqual(g["stamped"], 999)     # existing game_pk NOT overwritten
+
+    def test_idempotent(self):
+        self._seed()
+        mlb_warehouse.backfill_legacy_game_pk(dry_run=False)
+        again = mlb_warehouse.backfill_legacy_game_pk(dry_run=False)
+        self.assertEqual(again["prediction_log"]["matched"], 0)  # nothing left to fill
+
+    def test_identical_timestamp_dh_left_null(self):
+        # traditional DH: both games share a gameDate → ambiguous → leave NULL
+        self._game(810, "2026-08-04", "2026-08-04T18:00:00Z")
+        self._game(811, "2026-08-04", "2026-08-04T18:00:00Z")   # identical timestamp
+        self._batter("555555", 810)
+        self._batter("555555", 811)
+        self._pred("dhtie", "555555", "2026-08-04", "2026-08-04T18:00:00Z")
+        mlb_warehouse.backfill_legacy_game_pk(dry_run=False)
+        self.assertIsNone(self._gpks()["dhtie"])
+
+    def test_naive_commence_dh_does_not_crash(self):
+        # a tz-naive commence on a DH can't disambiguate → NULL, and must NOT abort
+        self._game(820, "2026-08-05", "2026-08-05T17:00:00Z")
+        self._game(821, "2026-08-05", "2026-08-05T21:00:00Z")
+        self._batter("666666", 820)
+        self._batter("666666", 821)
+        self._pred("dhnaive", "666666", "2026-08-05", "2026-08-05T20:55:00")  # no Z
+        s = mlb_warehouse.backfill_legacy_game_pk(dry_run=False)   # must not raise
+        self.assertIsNone(self._gpks()["dhnaive"])
+        self.assertEqual(s["prediction_log"]["candidates"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

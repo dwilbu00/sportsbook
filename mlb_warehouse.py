@@ -46,8 +46,8 @@ import time
 
 from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Index, Integer, MetaData, String,
-    Table, Text, UniqueConstraint, and_, delete, insert, not_, or_, select,
-    update,
+    Table, Text, UniqueConstraint, and_, bindparam, delete, insert, not_, or_,
+    select, update,
 )
 from sqlalchemy.exc import OperationalError
 
@@ -1514,6 +1514,108 @@ def resolve_actual(mlb_player_id, game_pk, prop_key):
         return None
 
 
+# ── P5: translate-in-place backfill of game_pk onto legacy durable rows ────────
+def _legacy_gamepk_index(conn, season=None):
+    """{(athlete_id, official_date): {game_pk: game_date}} from the batter+pitcher
+    facts joined to the games dim — the PLAYER-ANCHOR lookup for the P5 backfill: a
+    player's fact row pins the exact game they appeared in (doubleheader-safe).
+    official_date embeds the year, so keys never collide across seasons."""
+    idx = {}
+    for tbl in (mlb_batter_game, mlb_pitcher_game):
+        stmt = (select(tbl.c.athlete_id, tbl.c.game_pk,
+                       mlb_game.c.official_date, mlb_game.c.game_date)
+                .select_from(tbl.join(mlb_game, tbl.c.game_pk == mlb_game.c.game_pk)))
+        if season is not None:
+            stmt = stmt.where(mlb_game.c.season == int(season))
+        for aid, gpk, offd, gdate in conn.execute(stmt):
+            if aid and offd:
+                idx.setdefault((str(aid), str(offd)), {})[gpk] = gdate
+    return idx
+
+
+# Two DH games whose start times are within this of EACH OTHER (relative to the
+# row's commence) are treated as indistinguishable → leave game_pk NULL rather than
+# guess (mirrors find_game_pk_by_commence's ambiguous-DH → None). A traditional
+# single-admission DH can carry an identical gameDate; split DHs are hours apart.
+_DH_TIE_TOL_SEC = 300
+
+
+def _pick_legacy_game_pk(cands, commence):
+    """From {game_pk: game_date} candidates for one (player, official_date): exactly
+    one → it; a doubleheader (>1) → the game whose start is nearest the row's
+    commence_time, UNLESS the two closest are within _DH_TIE_TOL_SEC (ambiguous) or
+    commence is missing/unparseable/tz-naive → None (leave NULL, additive). Never
+    raises (a bad timestamp can't abort the backfill)."""
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return next(iter(cands))
+    ct = _parse_ts(commence)
+    if ct is None or ct.tzinfo is None:          # can't disambiguate a DH → NULL
+        return None
+    scored = []
+    for gpk, gdate in cands.items():
+        gt = _parse_ts(gdate)
+        if gt is None or gt.tzinfo is None:
+            continue
+        try:
+            scored.append((abs((gt - ct).total_seconds()), gpk))
+        except (TypeError, ValueError):          # mixed awareness / bad ts → skip
+            continue
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0])
+    if len(scored) >= 2 and (scored[1][0] - scored[0][0]) < _DH_TIE_TOL_SEC:
+        return None                              # (near-)tie → ambiguous → NULL
+    return scored[0][1]
+
+
+def backfill_legacy_game_pk(dry_run=True, season=None):
+    """P5: retro-match game_pk onto legacy MLB prediction_log + wagers rows that
+    predate P3 stamping. PLAYER-ANCHOR: a row's player_mlb_id + official_date
+    (game_date[:10]) pins the exact game_pk via the fact tables — the fact row IS the
+    game the player appeared in, so doubleheaders are handled (a DH-both player is
+    disambiguated by commence_time). Unresolvable (DNP → no fact, no player id, or an
+    ambiguous DH) → left NULL (additive; the row still grades by name+date).
+
+    NON-DESTRUCTIVE: only fills a row whose game_pk IS NULL, MLB only; idempotent
+    (re-runs are no-ops). dry_run=True writes nothing and just reports coverage."""
+    summary = {"dry_run": dry_run, "skipped": not enabled()}
+    if not enabled():
+        return summary
+    eng = db_store.get_engine()
+    with eng.connect() as conn:
+        idx = _legacy_gamepk_index(conn, season=season)
+    for name, table in (("prediction_log", db_store.prediction_log),
+                        ("wagers", db_store.wagers)):
+        with eng.connect() as conn:
+            rows = conn.execute(
+                select(table.c.id, table.c.player_mlb_id,
+                       table.c.game_date, table.c.commence_time)
+                .where((table.c.sport_key == "baseball_mlb")
+                       & (table.c.game_pk.is_(None))
+                       & (table.c.player_mlb_id.isnot(None)))).fetchall()
+        matched = []
+        for rid, mlb_id, gdate, commence in rows:
+            offd = str(gdate)[:10] if gdate else None
+            if not offd:
+                continue
+            gpk = _pick_legacy_game_pk(idx.get((str(mlb_id), offd), {}), commence)
+            if gpk is not None:
+                matched.append({"rid": rid, "gpk": int(gpk)})
+        if matched and not dry_run:
+            with _WRITE_LOCK:
+                with eng.begin() as conn:
+                    conn.execute(
+                        update(table)
+                        .where((table.c.id == bindparam("rid"))
+                               & (table.c.game_pk.is_(None)))   # idempotent + safe
+                        .values(game_pk=bindparam("gpk")),
+                        matched)
+        summary[name] = {"candidates": len(rows), "matched": len(matched)}
+    return summary
+
+
 def _fmt(summary):
     return json.dumps(summary, default=str)
 
@@ -1537,6 +1639,12 @@ def _main_cli():
                     help="Schedule/game dims only; skip boxscore player dims.")
     ap.add_argument("--purge-boxscores", action="store_true",
                     help="Maintenance: delete processed boxscore bronze payloads.")
+    ap.add_argument("--backfill-game-pk", action="store_true",
+                    help="P5: retro-match game_pk onto legacy MLB prediction_log + "
+                         "wagers rows (player-anchor). DRY-RUN unless --apply.")
+    ap.add_argument("--apply", action="store_true",
+                    help="With --backfill-game-pk: WRITE the matched game_pks "
+                         "(default is a no-write dry-run preview).")
     args = ap.parse_args()
 
     db_store.promote_secrets_from_toml()
@@ -1560,9 +1668,12 @@ def _main_cli():
     if args.purge_boxscores:
         did = True
         print(f"purged {purge_processed_boxscores()} processed boxscore rows")
+    if args.backfill_game_pk:
+        did = True
+        print(_fmt(backfill_legacy_game_pk(dry_run=not args.apply)))
     if not did:
         ap.error("nothing to do — pass --ingest, --ingest-range, --standings, "
-                 "or --purge-boxscores")
+                 "--purge-boxscores, or --backfill-game-pk")
 
 
 if __name__ == "__main__":
