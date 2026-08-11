@@ -225,5 +225,90 @@ class CompositeKeyReconcileTests(_Backend, unittest.TestCase):
         self.assertNotEqual(got[0]["id"], 12345)   # DB-assigned, not the passed id
 
 
+class UpsertBulkTests(_Backend, unittest.TestCase):
+    """db_store.upsert_bulk — the batched insert-or-update (NEVER delete) primitive
+    the warehouse ingestion uses in place of a per-row reconcile loop."""
+
+    def test_bulk_insert_scoped(self):
+        desired = [{"s": "A", "k": "x", "v": 1, "note": "n"},
+                   {"s": "A", "k": "y", "v": 2, "note": "n"}]
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, desired, ("k",), scope={"s": "A"})
+        self.assertEqual(n, (2, 0))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual(len(_rows(conn, self.t, {"s": "A"})), 2)
+
+    def test_bulk_update_only_changed(self):
+        self._seed(self.t, {"s": "A", "k": "x", "v": 1, "note": "n"},
+                   {"s": "A", "k": "y", "v": 2, "note": "n"})
+        desired = [{"s": "A", "k": "x", "v": 1, "note": "n"},     # unchanged
+                   {"s": "A", "k": "y", "v": 99, "note": "n"}]    # changed
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, desired, ("k",), scope={"s": "A"})
+        self.assertEqual(n, (0, 1))
+        with db_store.get_engine().connect() as conn:
+            got = {r["k"]: r["v"] for r in _rows(conn, self.t, {"s": "A"})}
+        self.assertEqual(got, {"x": 1, "y": 99})
+
+    def test_bulk_never_deletes_sibling_in_scope(self):
+        self._seed(self.t, {"s": "A", "k": "keep", "v": 1},
+                   {"s": "A", "k": "x", "v": 1})
+        with db_store.get_engine().begin() as conn:      # desired omits 'keep'
+            n = db_store.upsert_bulk(conn, self.t, [{"s": "A", "k": "x", "v": 2}],
+                                     ("k",), scope={"s": "A"})
+        self.assertEqual(n, (0, 1))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual({r["k"] for r in _rows(conn, self.t, {"s": "A"})},
+                             {"keep", "x"})              # sibling survived
+
+    def test_bulk_idempotent(self):
+        desired = [{"s": "A", "k": "x", "v": 1, "note": "n"}]
+        with db_store.get_engine().begin() as conn:
+            db_store.upsert_bulk(conn, self.t, desired, ("k",), scope={"s": "A"})
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, desired, ("k",), scope={"s": "A"})
+        self.assertEqual(n, (0, 0))
+
+    def test_bulk_ignore_cols_no_rewrite(self):
+        self._seed(self.t, {"s": "A", "k": "x", "v": 1, "note": "old"})
+        with db_store.get_engine().begin() as conn:      # only the ignored col differs
+            n = db_store.upsert_bulk(conn, self.t,
+                                     [{"s": "A", "k": "x", "v": 1, "note": "new"}],
+                                     ("k",), scope={"s": "A"}, ignore_cols=("note",))
+        self.assertEqual(n, (0, 0))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual(_rows(conn, self.t, {"s": "A"})[0]["note"], "old")
+
+    def test_bulk_dup_identity_in_rows_raises(self):
+        with self.assertRaises(ValueError):
+            with db_store.get_engine().begin() as conn:
+                db_store.upsert_bulk(conn, self.t,
+                                     [{"s": "A", "k": "x", "v": 1},
+                                      {"s": "A", "k": "x", "v": 2}],
+                                     ("k",), scope={"s": "A"})
+
+    def test_bulk_single_col_in_read_no_scope(self):
+        # single-col identity, no scope → WHERE k IN (...); a row with a different
+        # key must NOT be deleted (never-delete).
+        self._seed(self.t, {"s": "Z", "k": "z", "v": 9})
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, [{"s": "A", "k": "a", "v": 1}],
+                                     ("k",))
+        self.assertEqual(n, (1, 0))
+        with db_store.get_engine().connect() as conn:
+            self.assertEqual({r["k"] for r in _rows(conn, self.t)}, {"z", "a"})
+
+    def test_bulk_composite_identity_without_scope_raises(self):
+        with self.assertRaises(ValueError):
+            with db_store.get_engine().begin() as conn:
+                db_store.upsert_bulk(conn, self.t, [{"s": "A", "k": "x", "v": 1}],
+                                     ("s", "k"))
+
+    def test_bulk_empty_rows_noop(self):
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, [], ("k",), scope={"s": "A"})
+        self.assertEqual(n, (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

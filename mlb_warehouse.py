@@ -567,25 +567,20 @@ def purge_processed_boxscores():
 
 
 def _upsert_rows(table, rows, key_cols, ignore_cols=("fetched_at",)):
-    """Single-key surgical upsert of each row (scoped to its own natural key so a
-    call never deletes a sibling row). Returns (n_ins, n_upd, n_del)."""
+    """Batched insert-or-update of an accumulating dim (never deletes a sibling).
+    ONE existing-read + one bulk INSERT + per-changed-row UPDATE via
+    db_store.upsert_bulk — the set-based replacement for the old per-row reconcile
+    loop (which cost a round-trip per row). Returns (n_ins, n_upd, n_del=0)."""
     if not rows or not enabled():
         return (0, 0, 0)
     engine = db_store.get_engine()
     with _WRITE_LOCK:
         for attempt in range(3):
             try:
-                tot = [0, 0, 0]
                 with engine.begin() as conn:
-                    for row in rows:
-                        scope = {k: row[k] for k in key_cols}
-                        i, u, d = db_store.reconcile(
-                            conn, table, [row], key_cols,
-                            scope=scope, ignore_cols=ignore_cols)
-                        tot[0] += i
-                        tot[1] += u
-                        tot[2] += d
-                return tuple(tot)
+                    i, u = db_store.upsert_bulk(
+                        conn, table, rows, key_cols, ignore_cols=ignore_cols)
+                return (i, u, 0)
             except OperationalError:
                 if attempt == 2:
                     raise
@@ -619,17 +614,18 @@ def _write_game_facts(conn, box, game):
     result is a no-op (never a scope wipe). Runs INSIDE the caller's boxscore
     transaction; the game_pk FK resolves from the earlier schedule txn and the
     team_id FK from the minimal schedule teams. Returns (n_batter, n_pitcher)."""
+    gpk = game.get("game_pk")
     season = game.get("season")
     batters = [r for r in _augment_game_facts(derive_batter_rows(box, game), season)
                if _valid_game_fact(r)]
     pitchers = [r for r in _augment_game_facts(derive_pitcher_rows(box, game), season)
                 if _valid_game_fact(r)]
+    # Batched upsert scoped to this game_pk (all a boxscore's rows share it): one
+    # existing-read + one bulk INSERT per table instead of a round-trip per player.
+    # Never deletes — matches the P2 per-row behavior, just set-based.
     for table, rows in ((mlb_batter_game, batters), (mlb_pitcher_game, pitchers)):
-        for r in rows:
-            db_store.reconcile(
-                conn, table, [r], ("athlete_id", "game_pk"),
-                scope={"athlete_id": r["athlete_id"], "game_pk": r["game_pk"]},
-                ignore_cols=("fetched_at",))
+        db_store.upsert_bulk(conn, table, rows, ("athlete_id", "game_pk"),
+                             scope={"game_pk": gpk}, ignore_cols=("fetched_at",))
     return len(batters), len(pitchers)
 
 
@@ -677,16 +673,11 @@ def ingest_date(date, with_boxscores=True):
             try:
                 with engine.begin() as conn:
                     _land_bronze(conn, "schedule", date, raw)
-                    for t in sched_teams:        # minimal → FK safety
-                        db_store.reconcile(
-                            conn, mlb_team, [t], ("team_id",),
-                            scope={"team_id": t["team_id"]},
-                            ignore_cols=("fetched_at",))
-                    for g in games:
-                        db_store.reconcile(
-                            conn, mlb_game, [g], ("game_pk",),
-                            scope={"game_pk": g["game_pk"]},
-                            ignore_cols=("fetched_at",))
+                    # minimal teams BEFORE games (FK); both batched, never delete.
+                    db_store.upsert_bulk(conn, mlb_team, sched_teams, ("team_id",),
+                                         ignore_cols=("fetched_at",))
+                    db_store.upsert_bulk(conn, mlb_game, games, ("game_pk",),
+                                         ignore_cols=("fetched_at",))
                 break
             except OperationalError:
                 if attempt == 2:
@@ -712,11 +703,9 @@ def ingest_date(date, with_boxscores=True):
                 try:
                     with engine.begin() as conn:
                         _land_bronze(conn, "boxscore", str(g["game_pk"]), box)
-                        for p in players:
-                            db_store.reconcile(
-                                conn, mlb_player, [p], ("player_id",),
-                                scope={"player_id": p["player_id"]},
-                                ignore_cols=("fetched_at",))
+                        db_store.upsert_bulk(conn, mlb_player, players,
+                                             ("player_id",),
+                                             ignore_cols=("fetched_at",))
                         nb, npi = _write_game_facts(conn, box, g)
                         _mark_bronze_processed(conn, "boxscore", str(g["game_pk"]))
                     break
@@ -761,13 +750,13 @@ def ingest_standings(season=None, as_of_date=None):
             try:
                 with engine.begin() as conn:
                     _land_bronze(conn, "standings", f"{season}:{as_of}", raw)
-                    for r in rows:
-                        db_store.reconcile(
-                            conn, mlb_team_standings, [r],
-                            ("team_id", "season", "as_of_date"),
-                            scope={"team_id": r["team_id"], "season": r["season"],
-                                   "as_of_date": r["as_of_date"]},
-                            ignore_cols=("fetched_at",))
+                    # Batched: all rows share (season, as_of_date) → scope the read
+                    # to this snapshot; upsert-only (never deletes a sibling snapshot).
+                    db_store.upsert_bulk(
+                        conn, mlb_team_standings, rows,
+                        ("team_id", "season", "as_of_date"),
+                        scope={"season": season, "as_of_date": as_of},
+                        ignore_cols=("fetched_at",))
                 break
             except OperationalError:
                 if attempt == 2:

@@ -943,6 +943,80 @@ def reconcile(conn, table, desired, identity_cols, scope=None, ignore_cols=()):
     return (len(inserts), len(updates), len(deletes))
 
 
+def upsert_bulk(conn, table, rows, identity_cols, scope=None, ignore_cols=()):
+    """Batched INSERT-or-UPDATE (NEVER delete) of ``rows`` keyed on identity_cols —
+    the set-based analog of calling :func:`reconcile` once per row scoped to that
+    row's own key (the warehouse ingestion idiom). Does ONE existing-read + ONE bulk
+    INSERT (executemany) + one UPDATE per genuinely-changed row inside the caller's
+    open transaction, instead of a SELECT+DML round-trip per row — the fix for the
+    slow per-row backfill against remote SQL.
+
+    Because it never deletes, it is safe for ACCUMULATING tables (mlb_player /
+    mlb_team / mlb_game): a call only ever touches the rows it was handed, never a
+    sibling. Two ways to bound the existing-read:
+      * ``scope`` — an equality {col: value} map every desired row shares (a
+        boxscore's facts share game_pk; a standings snapshot shares
+        (season, as_of_date)); reads that partition, diffs by identity_cols.
+      * else SINGLE-column identity → reads ``WHERE identity[0] IN (desired values)``.
+        (Callers batch per game/day, well under the mssql ~2100-param IN limit; pass
+        a ``scope`` instead for very large or composite-key sets.)
+    Composite identity WITHOUT a scope is unsupported (raises). ``ignore_cols``
+    matches reconcile (excluded from the change test, still written on insert/update).
+    Raises ValueError on a duplicate identity in ``rows`` (as reconcile does).
+    Returns ``(n_insert, n_update)``."""
+    if not rows:
+        return (0, 0)
+    ident = tuple(identity_cols)
+
+    after_by_key = {}
+    for row in rows:
+        params = {k: v for k, v in row.items() if k != "id"}
+        key = tuple(params.get(c) for c in ident)
+        if key in after_by_key:
+            raise ValueError(f"{table.name}: duplicate identity {key} in rows")
+        after_by_key[key] = params
+
+    scope_clause = _where_clause(table, scope) if scope is not None else None
+    stmt = select(table)
+    if scope_clause is not None:
+        stmt = stmt.where(scope_clause)
+    elif scope is None and len(ident) == 1:
+        stmt = stmt.where(table.c[ident[0]].in_([k[0] for k in after_by_key]))
+    elif scope is None:
+        raise ValueError(
+            f"{table.name}: upsert_bulk needs a scope for composite identity")
+
+    before_by_key = {}
+    for r in conn.execute(stmt):
+        m = r._mapping
+        key = tuple(m[c] for c in ident)
+        if key in before_by_key:
+            raise ValueError(
+                f"{table.name}: duplicate identity {key} in existing rows")
+        before_by_key[key] = m
+
+    def _id_where(key):
+        parts = [table.c[col] == val for col, val in zip(ident, key)]
+        if scope_clause is not None:
+            parts.append(scope_clause)
+        return and_(*parts)
+
+    _ignore = set(ignore_cols)
+    inserts, updates = [], []
+    for key, params in after_by_key.items():
+        prior = before_by_key.get(key)
+        if prior is None:
+            inserts.append(params)
+        elif any(prior[k] != v for k, v in params.items() if k not in _ignore):
+            updates.append((key, params))
+
+    for key, params in updates:
+        conn.execute(update(table).where(_id_where(key)).values(**params))
+    if inserts:
+        conn.execute(insert(table), inserts)
+    return (len(inserts), len(updates))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Recalibration params (per (sport, prop) + validation-fold child rows)
 # ──────────────────────────────────────────────────────────────────────────────
