@@ -922,11 +922,11 @@ class GetPlayerHistoryTests(_Backend, unittest.TestCase):
                     "name_norm": db_store.normalize_name(nm)})
 
     def _game(self, game_pk, official_date, game_date, home="147", away="111",
-              season=2024):
+              season=2024, game_type="R"):
         with db_store.get_engine().begin() as conn:
             conn.execute(insert(mlb_warehouse.mlb_game), {
                 "game_pk": game_pk, "official_date": official_date,
-                "game_date": game_date, "season": season, "game_type": "R",
+                "game_date": game_date, "season": season, "game_type": game_type,
                 "home_team_id": home, "away_team_id": away})
 
     def _batter(self, athlete_id, game_pk, team_id="147", season=2024, **stats):
@@ -1008,6 +1008,27 @@ class GetPlayerHistoryTests(_Backend, unittest.TestCase):
     def test_disabled_returns_none(self):
         db_store.configure_engine(None)
         self.assertIsNone(mlb_warehouse.get_player_history("1", "batter_hits"))
+
+    def test_excludes_spring_allstar_exhibition(self):
+        # ESPN scope is regular+postseason; spring/all-star/exhibition are dropped
+        # (and an All-Star game must not become rows[0] / the team source).
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z")               # regular
+        self._game(2, "2024-07-16", "2024-07-16T18:00:00Z", game_type="A")  # all-star (newest)
+        self._game(3, "2024-03-01", "2024-03-01T18:00:00Z", game_type="S")  # spring
+        self._batter("592450", 1, H=1.0, AB=4.0)
+        self._batter("592450", 2, H=0.0, AB=1.0)
+        self._batter("592450", 3, H=3.0, AB=5.0)
+        h = mlb_warehouse.get_player_history("592450", "batter_hits")
+        self.assertEqual(h["values"], [1.0])                  # only the regular game
+        self.assertEqual(h["team_name"], "New York Yankees")
+
+    def test_season_filter_scopes_to_year(self):
+        self._game(1, "2023-09-01", "2023-09-01T18:00:00Z", season=2023)
+        self._game(2, "2024-04-01", "2024-04-01T18:00:00Z", season=2024)
+        self._batter("1", 1, H=3.0, AB=4.0, season=2023)
+        self._batter("1", 2, H=1.0, AB=4.0, season=2024)
+        h = mlb_warehouse.get_player_history("1", "batter_hits", season=2024)
+        self.assertEqual(h["values"], [1.0])                  # prior season excluded
 
 
 class PlayerInputParityTests(_Backend, unittest.TestCase):

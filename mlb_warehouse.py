@@ -959,9 +959,13 @@ def record_player_alias(provider, provider_key, mlb_player_id,
 
 
 def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
-              limit=None):
+              limit=None, exclude_game_types=None):
     """StatsAPI-native per-game log for one athlete, MOST-RECENT-FIRST, joined to
     the games dim for chronology + opponent/home derivation.
+
+    ``exclude_game_types`` (e.g. spring/all-star/exhibition) is applied BEFORE the
+    limit so the recent-N window matches the intended scope; None keeps every
+    game_type (the P2 dual-run readers' original behavior).
 
     This is the reconcile-safe ordering the design mandates (§6): the writer is a
     surgical upsert, so surrogate ``id`` is NOT recency — order by the joined
@@ -984,6 +988,8 @@ def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
         stmt = stmt.where(table.c.season_bucket == int(season))
     if as_of_date is not None:
         stmt = stmt.where(g.c.official_date < str(as_of_date))
+    if exclude_game_types:
+        stmt = stmt.where(g.c.game_type.notin_(tuple(exclude_game_types)))
     stmt = stmt.order_by(g.c.game_date.desc(), table.c.game_pk.desc())
     if limit:
         stmt = stmt.limit(int(limit))
@@ -1039,6 +1045,12 @@ _ACTUAL_STAT_SPEC = {
     "pitcher_earned_runs": (mlb_pitcher_game, "ER", None),
     "pitcher_outs": (mlb_pitcher_game, "IP", "ip_to_outs"),
 }
+
+# StatsAPI gameType codes the ESPN player gamelog does NOT return (spring,
+# all-star, exhibition) — excluded from the model-input read so the recent-N
+# window matches the ESPN baseline's regular+postseason scope. Also keeps an
+# All-Star game out of rows[0], whose team_id is a non-team all-star squad id.
+_NON_REGULAR_GAME_TYPES = ("S", "A", "E")
 
 
 def get_actual_stat(mlb_player_id, game_pk, prop_key):
@@ -1121,13 +1133,11 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
     table, col, xform = spec
     is_pitcher = table is mlb_pitcher_game
     stat_cols = _PITCHER_GAME_STATS if is_pitcher else _BATTER_GAME_STATS
-    # NOTE: no game_type filter yet — the ESPN gamelog is regular+postseason-scoped,
-    # so the live FLIP must exclude spring/all-star/exhibition (add a game_types=
-    # filter to _game_log BEFORE the limit, then). Harmless in-season (recent-N is
-    # all regular); the shadow lens filters game_type independently. Not consumed
-    # live yet, so the refinement is deferred to the flip.
+    # Exclude spring/all-star/exhibition (BEFORE the limit) so the recent-N window
+    # matches the ESPN baseline's regular+postseason scope — see the constant.
     rows = _game_log(table, stat_cols, mlb_player_id, season=season,
-                     as_of_date=as_of_date, limit=n)
+                     as_of_date=as_of_date, limit=n,
+                     exclude_game_types=_NON_REGULAR_GAME_TYPES)
     if not rows:
         return None
     names = _team_name_map()

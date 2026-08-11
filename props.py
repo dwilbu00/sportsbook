@@ -946,6 +946,19 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     if espn_teams:
         id_to_name = {str(info.get("id")): name for name, info in espn_teams.items() if info.get("id")}
 
+    # P4 model-input flip bridge: the warehouse history dict carries the player's
+    # team as an MLBAM id + display NAME (team_name), NOT an ESPN id, so the
+    # ESPN-id-keyed id_to_name / team_schedules lookups miss. Map display name →
+    # ESPN schedule so a warehouse-sourced player still gets layoff filtering. Only
+    # consulted when the ESPN-id lookup misses (i.e. MLB warehouse dicts), so
+    # NBA/NFL and the ESPN path are byte-identical.
+    name_to_schedule = {}
+    if espn_teams and team_schedules:
+        for name, info in espn_teams.items():
+            sched = team_schedules.get(str(info.get("id"))) if info.get("id") else None
+            if sched:
+                name_to_schedule[name] = sched
+
     home_team_name = prop_data["home_team"]
     away_team_name = prop_data["away_team"]
     matchup = f"{away_team_name} @ {home_team_name}"
@@ -1036,6 +1049,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                  or [None] * len(values))
             at_bats = history.get("at_bats") or [None] * len(values)
             player_team_id = history.get("team_id")
+            # Present only on warehouse-sourced (MLB flip) dicts — the player's team
+            # DISPLAY NAME, since team_id is then MLBAM (not an ESPN id).
+            player_team_name_wh = history.get("team_name")
 
             # ── Reliability filter ──
             # Drop low-minutes games AND the 1-game-pre + 1-game-post window
@@ -1053,6 +1069,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             team_schedule = None
             if team_schedules and player_team_id:
                 team_schedule = team_schedules.get(str(player_team_id))
+            if team_schedule is None and player_team_name_wh:   # MLBAM id → bridge by name
+                # Tolerant match: the warehouse team_name (StatsAPI mlb_team.name)
+                # can diverge from the ESPN spelling (e.g. "Athletics" vs "Oakland
+                # Athletics"), so reuse the substring/last-word matcher used for
+                # opponent defense rather than an exact .get (which would silently
+                # drop layoff filtering for divergent teams — the ESPN path resolved
+                # this by ESPN id). NOTE: the warehouse game_date is seconds-precise
+                # while the ESPN schedule is minute-precise, a ~1-game layoff-bisect
+                # skew that resolves when team schedules move to the warehouse too.
+                team_schedule = _resolve_team_defense(
+                    player_team_name_wh, name_to_schedule)
             # Half-life historically also set the healthy-game streak floor.
             # Removing MLB decay should change weighting only, not make a
             # previously-untrusted player eligible three games sooner. Preserve
@@ -1095,16 +1122,31 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             plate_appearances = [g.get("_pa") for g in eligible]
             at_bats = [g.get("_ab") for g in eligible]
 
-            # Resolve the player's upcoming home/away by matching their team_id
-            # to the home/away team names of the upcoming game.
+            # Resolve the player's upcoming home/away by matching their team NAME
+            # to the home/away team names of the upcoming game. Prefer the
+            # warehouse-provided name (MLB flip: team_id is MLBAM, not an ESPN id);
+            # else reverse-map the ESPN id (unchanged ESPN path).
             upcoming_is_home = None
-            player_team_name = None
-            if player_team_id and id_to_name:
+            player_team_name = player_team_name_wh
+            if player_team_name is None and player_team_id and id_to_name:
                 player_team_name = id_to_name.get(str(player_team_id))
-                if player_team_name == home_team_name:
-                    upcoming_is_home = True
-                elif player_team_name == away_team_name:
-                    upcoming_is_home = False
+            if player_team_name_wh:
+                # Warehouse StatsAPI name may diverge from the odds spelling →
+                # tolerant match (mirrors the schedule bridge above). Build the
+                # side map from truthy names only, so a blank name can't crash /
+                # spuriously substring-match in _resolve_team_defense.
+                ha_map = {}
+                if home_team_name:
+                    ha_map[home_team_name] = True
+                if away_team_name:
+                    ha_map[away_team_name] = False
+                side = _resolve_team_defense(player_team_name_wh, ha_map)
+                if side is not None:
+                    upcoming_is_home = side
+            elif player_team_name == home_team_name:
+                upcoming_is_home = True
+            elif player_team_name == away_team_name:
+                upcoming_is_home = False
 
             base_weights = _recency_weights(len(values), half_life)
             weights = []

@@ -177,8 +177,10 @@ def _espn_player_game_stats(name, prop_key, n=25):
     """{(name_norm, play_date): value} from the live ESPN gamelog the app reads."""
     try:
         import espn_client
+        # allow_warehouse=False → always the TRUE ESPN side, even if the P4
+        # model-input flip flag is on (else this would diff warehouse vs warehouse).
         hist = espn_client.get_player_stat_history(
-            _ESPN_SPORT, _ESPN_LEAGUE, name, prop_key, n=n)
+            _ESPN_SPORT, _ESPN_LEAGUE, name, prop_key, n=n, allow_warehouse=False)
     except Exception:
         return {}
     if not hist or not hist.get("found"):
@@ -314,7 +316,7 @@ def _warehouse_player_game_stats(start, end, role, prop_key):
             .select_from(joined)
             .where(g.c.official_date >= str(start))
             .where(g.c.official_date <= str(end))
-            .where(g.c.game_type.notin_(("S", "A", "E"))))
+            .where(g.c.game_type.notin_(mlb_warehouse._NON_REGULAR_GAME_TYPES)))
     try:
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(stmt).fetchall()
