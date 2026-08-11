@@ -1074,6 +1074,103 @@ def get_actual_stat(mlb_player_id, game_pk, prop_key):
     return _ip_to_outs(val) if xform == "ip_to_outs" else val
 
 
+def _team_name_map():
+    """{team_id (MLBAM): display name} from the team dim — for resolving a fact
+    row's own/opponent team_id to the NAME the model's venue + opponent-defense
+    lookups key on (the warehouse is MLBAM-keyed; those lookups are name-keyed).
+    Tiny (30 rows). Fail-open → {}."""
+    if not enabled():
+        return {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(mlb_team.c.team_id, mlb_team.c.name)).fetchall()
+        return {r[0]: r[1] for r in rows}
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
+def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
+                       season=None, player_name=None):
+    """Reproduce the ESPN ``get_player_stat_history`` dict for one MLB player+prop
+    straight from the StatsAPI facts — the P4 model-INPUT read (the projection-side
+    analog of ``get_actual_stat``'s grading read).
+
+    Returns the SAME contract dict ``get_player_stat_history`` returns (most-recent-
+    first, index-aligned parallel lists) so a warehouse-first branch can drop in
+    without touching props/backtest: ``player``, ``athlete_id`` (MLBAM),
+    ``stat_label``, ``values``, ``opponents`` (opponent DISPLAY NAME),
+    ``home_aways``, ``minutes`` (0.0 — no MLB analog), ``game_dates``,
+    ``plate_appearances`` (AB+BB+HBP+SF+SH, matching the ESPN reader's own fallback
+    formula), ``at_bats``, ``team_id`` (own team, MLBAM), and ``found``. One
+    ADDITIVE key: ``team_name`` (own team resolved) — the eventual flip maps
+    venue/opponent-defense on NAME because the warehouse is MLBAM-keyed, not
+    ESPN-id-keyed, and props' reverse-map is ESPN-id-keyed (extra keys are harmless;
+    consumers read via .get()).
+
+    Returns None (NOT an empty dict) when the warehouse can't serve — an
+    unsupported prop (HR/TB/RBI have no fact column), SQL off, no id, or no rows —
+    so the caller falls open to the live ESPN path, mirroring ``get_actual_stat``'s
+    None-means-fallback convention. ``pitcher_outs`` values are IP→outs. A fact row
+    exists only for a genuine-final boxscore where the batter came to the plate, so
+    a real 0 is present (0.0) and a DNP is simply ABSENT — never a synthesized
+    0-row. Leakage-safe via ``as_of_date`` (strict official_date <). Fail-open."""
+    spec = _ACTUAL_STAT_SPEC.get(prop_key)
+    if spec is None or not mlb_player_id or not enabled():
+        return None
+    table, col, xform = spec
+    is_pitcher = table is mlb_pitcher_game
+    stat_cols = _PITCHER_GAME_STATS if is_pitcher else _BATTER_GAME_STATS
+    # NOTE: no game_type filter yet — the ESPN gamelog is regular+postseason-scoped,
+    # so the live FLIP must exclude spring/all-star/exhibition (add a game_types=
+    # filter to _game_log BEFORE the limit, then). Harmless in-season (recent-N is
+    # all regular); the shadow lens filters game_type independently. Not consumed
+    # live yet, so the refinement is deferred to the flip.
+    rows = _game_log(table, stat_cols, mlb_player_id, season=season,
+                     as_of_date=as_of_date, limit=n)
+    if not rows:
+        return None
+    names = _team_name_map()
+    values, opponents, home_aways, game_dates = [], [], [], []
+    plate_appearances, at_bats = [], []
+    for r in rows:
+        v = r.get(col)
+        if xform == "ip_to_outs":
+            v = _ip_to_outs(v)
+        values.append(float(v) if v is not None else 0.0)
+        opponents.append(names.get(r["opponent_team_id"]))
+        home_aways.append(bool(r["is_home"]))
+        game_dates.append(r["game_date"])
+        if is_pitcher:
+            plate_appearances.append(None)
+            at_bats.append(None)
+        else:
+            ab = r.get("AB")
+            if ab is None:                       # match ESPN: PA None when AB None
+                plate_appearances.append(None)
+            else:
+                plate_appearances.append(
+                    (ab or 0.0) + (r.get("BB") or 0.0) + (r.get("HBP") or 0.0)
+                    + (r.get("SF") or 0.0) + (r.get("SH") or 0.0))
+            at_bats.append(ab)
+    own_team_id = rows[0]["team_id"]             # newest game's team (~ current)
+    return {
+        "player": player_name,
+        "athlete_id": str(mlb_player_id),
+        "stat_label": col,
+        "values": values,
+        "opponents": opponents,
+        "home_aways": home_aways,
+        "minutes": [0.0] * len(values),
+        "game_dates": game_dates,
+        "plate_appearances": plate_appearances,
+        "at_bats": at_bats,
+        "team_id": own_team_id,
+        "team_name": names.get(own_team_id),
+        "found": True,
+    }
+
+
 # ── P4 unified resolution: refresh an ACTIVE game, freeze a HISTORICAL one ─────
 _HISTORICAL_MIN_AGE_HOURS = 48   # after this (+ one post-window refresh) → frozen
 _BOXSCORE_ACTIVE_TTL = 900       # a recent game's box is re-pulled at most this often

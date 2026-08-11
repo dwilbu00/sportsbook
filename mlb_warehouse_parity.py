@@ -6,13 +6,19 @@ anything is switched over (P4). This module is the ONLY P1 piece that touches
 ESPN — it is a diagnostic, deleted at P6; the warehouse module itself stays
 ESPN-free.
 
-Two lenses:
+Three lenses:
   * standings_parity(season) — StatsAPI /standings win% vs ESPN get_all_teams
     win% per team. This is the riskiest net-new piece (§5: MLB records come only
     from ESPN today, no StatsAPI standings fetcher existed).
-  * gamelog_parity(start, end) — StatsAPI boxscore-derived per-game stat vs the
-    ESPN gamelog the app reads (get_player_stat_history), matched on
-    (player, play-date). Batters compare hits; pitchers compare strikeouts.
+  * gamelog_parity(start, end) — StatsAPI boxscore-derived per-game stat (a FRESH
+    boxscore pull) vs the ESPN gamelog the app reads (get_player_stat_history),
+    matched on (player, play-date). Tests the DERIVATION (P1/P2).
+  * player_input_parity(start, end) — the STORED warehouse facts (mlb_batter_game
+    / mlb_pitcher_game as ingested, read exactly as the P4 model-input flip will
+    read them) vs the same ESPN gamelog. Tests the READ PATH the flip depends on,
+    so only_* also measures BACKFILL COVERAGE — a game ESPN returns but the
+    warehouse hasn't ingested yet surfaces as only_espn. This is the gate for the
+    model-input cutover (as standings/gamelog gated P1/P2).
 
 Nothing here writes to SQL or calibration. It prints a diff report. The pure diff
 helpers are unit-tested; the live ESPN accessors are best-effort and guarded.
@@ -21,6 +27,8 @@ helpers are unit-tested; the live ESPN accessors are best-effort and guarded.
 from __future__ import annotations
 
 import argparse
+
+from sqlalchemy import select
 
 import db_store
 import mlb_starters
@@ -282,6 +290,87 @@ def gamelog_parity(start, end, role="batter", sample=25, espn_n=40):
     return rep
 
 
+# ─────────────────────────── model-input lens: STORED warehouse facts vs ESPN
+def _warehouse_player_game_stats(start, end, role, prop_key):
+    """({(name_norm, official_date): summed value}, {name_norm: display name})
+    for one role read from the STORED facts over [start, end] — what the model-
+    input flip will actually consume (contrast statsapi_player_game_stats, which
+    derives from a FRESH boxscore). Joins fact→mlb_game (official_date window,
+    regular+postseason scope — excludes spring/all-star/exhibition to match the
+    ESPN gamelog)→mlb_player (name). pitcher_outs is IP→outs. A split doubleheader
+    (two game_pks, one official_date) is summed per (player, day) to mirror the
+    ESPN-side collapse. Fail-open → ({}, {})."""
+    if not mlb_warehouse.enabled():
+        return {}, {}
+    spec = mlb_warehouse._ACTUAL_STAT_SPEC.get(prop_key)
+    if spec is None:
+        return {}, {}
+    table, col, xform = spec
+    g = mlb_warehouse.mlb_game
+    p = mlb_warehouse.mlb_player
+    joined = (table.join(g, table.c.game_pk == g.c.game_pk)
+              .join(p, table.c.athlete_id == p.c.player_id, isouter=True))
+    stmt = (select(p.c.name_norm, p.c.full_name, g.c.official_date, table.c[col])
+            .select_from(joined)
+            .where(g.c.official_date >= str(start))
+            .where(g.c.official_date <= str(end))
+            .where(g.c.game_type.notin_(("S", "A", "E"))))
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+    except Exception:
+        return {}, {}
+    out = {}
+    name_display = {}
+    for name_norm, full_name, official_date, raw in rows:
+        d = _date10(official_date)
+        if not name_norm or not d or raw is None:
+            continue
+        v = mlb_warehouse._ip_to_outs(raw) if xform == "ip_to_outs" else raw
+        if v is None:
+            continue
+        key = (name_norm, d)
+        out[key] = out.get(key, 0.0) + float(v)
+        if full_name:
+            name_display.setdefault(name_norm, full_name)
+    return out, name_display
+
+
+def player_input_parity(start, end, role="batter", sample=25, espn_n=40):
+    """Diff the STORED warehouse facts (the model-input flip's real source) vs the
+    ESPN gamelog the app reads today, over a window. role ∈ {'batter','pitcher'}.
+
+    Unlike gamelog_parity (fresh-boxscore derivation), the StatsAPI side here is
+    read straight from mlb_batter_game/mlb_pitcher_game AS INGESTED, so besides
+    value fidelity the counts also measure BACKFILL COVERAGE: only_espn = a game
+    ESPN returns that the warehouse hasn't ingested yet (in this report only_statsapi
+    reads as "only_warehouse"). Both sides are keyed on the official (local) play
+    date and summed per (player, day). No writes; returns a report dict."""
+    stat_key, prop_key = _ROLE_PROP[role]
+    warehouse_map, name_display = _warehouse_player_game_stats(
+        start, end, role, prop_key)
+
+    # Sample distinct players deterministically (sorted by name), like gamelog_parity.
+    players = sorted({nm for (nm, _d) in warehouse_map})[:sample]
+    sampled = {(nm, d): v for (nm, d), v in warehouse_map.items() if nm in players}
+
+    espn_raw = {}
+    for nm in players:
+        for k, v in _espn_player_game_stats(
+                name_display.get(nm, nm), prop_key, n=espn_n).items():
+            espn_raw[k] = espn_raw.get(k, 0.0) + v
+    espn_map = _align_espn_to_official(
+        espn_raw, set(sampled), start=str(start), end=str(end))
+
+    rep = diff_value_maps(sampled, espn_map, tol=1e-6)
+    rep["role"] = role
+    rep["window"] = f"{start}..{end}"
+    rep["stat"] = stat_key
+    rep["players_sampled"] = len(players)
+    rep["source"] = "warehouse_facts"
+    return rep
+
+
 def _fmt_report(title, rep):
     lines = [f"── {title} ─────────────────────────────────────────"]
     for k in ("season", "role", "window", "stat", "players_sampled",
@@ -309,13 +398,18 @@ def _main_cli():
         description="P1 dual-run parity harness: diff StatsAPI-derived MLB shapes "
                     "against the live ESPN path (read-only, no writes).")
     ap.add_argument("--standings", nargs="?", const=0, type=int, metavar="SEASON",
-                    help="Standings win% parity for SEASON (default: current year).")
+                    help="Standings win-pct parity for SEASON (default: current year).")
     ap.add_argument("--gamelog", nargs=2, metavar=("START", "END"),
-                    help="Gamelog parity over an inclusive date window.")
+                    help="Gamelog parity (FRESH boxscore derive vs ESPN) over an "
+                         "inclusive date window.")
+    ap.add_argument("--player-input", nargs=2, metavar=("START", "END"),
+                    help="Model-input parity: STORED warehouse facts (the flip's "
+                         "read path) vs the ESPN gamelog over an inclusive window; "
+                         "only_espn also measures backfill coverage.")
     ap.add_argument("--role", choices=("batter", "pitcher"), default="batter",
-                    help="Gamelog role to diff (default: batter → hits).")
+                    help="Gamelog/player-input role to diff (default: batter → hits).")
     ap.add_argument("--sample", type=int, default=25,
-                    help="Max distinct players to diff for --gamelog.")
+                    help="Max distinct players to diff for --gamelog/--player-input.")
     args = ap.parse_args()
 
     db_store.promote_secrets_from_toml()
@@ -329,8 +423,14 @@ def _main_cli():
         rep = gamelog_parity(args.gamelog[0], args.gamelog[1],
                              role=args.role, sample=args.sample)
         print(_fmt_report(f"gamelog parity ({args.role})", rep))
+    if args.player_input:
+        did = True
+        rep = player_input_parity(args.player_input[0], args.player_input[1],
+                                  role=args.role, sample=args.sample)
+        print(_fmt_report(f"model-input parity ({args.role})", rep))
     if not did:
-        ap.error("nothing to do — pass --standings and/or --gamelog START END")
+        ap.error("nothing to do — pass --standings and/or --gamelog and/or "
+                 "--player-input START END")
 
 
 if __name__ == "__main__":

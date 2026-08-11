@@ -907,5 +907,205 @@ class IngestMaintenanceTests(_Backend, unittest.TestCase):
         self.assertEqual(summary["dates"], 0)          # all failed, but no raise
 
 
+class GetPlayerHistoryTests(_Backend, unittest.TestCase):
+    """get_player_history reproduces the ESPN get_player_stat_history contract dict
+    from the StatsAPI facts: most-recent-first, resolved opponent NAMES, derived PA,
+    IP→outs, leakage-safe as_of, and None (fall-open) when it can't serve."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox"),
+                        ("119", "Los Angeles Dodgers")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+
+    def _game(self, game_pk, official_date, game_date, home="147", away="111",
+              season=2024):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": game_pk, "official_date": official_date,
+                "game_date": game_date, "season": season, "game_type": "R",
+                "home_team_id": home, "away_team_id": away})
+
+    def _batter(self, athlete_id, game_pk, team_id="147", season=2024, **stats):
+        row = {"athlete_id": athlete_id, "game_pk": game_pk, "team_id": team_id,
+               "season_bucket": season}
+        row.update(stats)
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), row)
+
+    def _pitcher(self, athlete_id, game_pk, team_id="147", season=2024, **stats):
+        row = {"athlete_id": athlete_id, "game_pk": game_pk, "team_id": team_id,
+               "season_bucket": season}
+        row.update(stats)
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), row)
+
+    def test_batter_history_shape_order_and_names(self):
+        self._game(200, "2024-04-01", "2024-04-01T18:00:00Z", home="147", away="111")
+        self._game(300, "2024-09-01", "2024-09-01T18:00:00Z", home="119", away="147")
+        # Judge (team 147): home vs BOS in April, away @ LAD in Sept.
+        self._batter("592450", 200, H=1.0, AB=4.0, BB=1.0, HBP=0.0, SF=0.0, SH=0.0)
+        self._batter("592450", 300, H=2.0, AB=3.0, BB=0.0, HBP=1.0, SF=0.0, SH=0.0)
+        h = mlb_warehouse.get_player_history("592450", "batter_hits",
+                                             player_name="Aaron Judge")
+        self.assertTrue(h["found"])
+        self.assertEqual(h["player"], "Aaron Judge")
+        self.assertEqual(h["athlete_id"], "592450")
+        self.assertEqual(h["values"], [2.0, 1.0])                # Sept first (recency)
+        self.assertEqual(h["opponents"],
+                         ["Los Angeles Dodgers", "Boston Red Sox"])
+        self.assertEqual(h["home_aways"], [False, True])         # away @ LAD, home vs BOS
+        self.assertEqual(h["at_bats"], [3.0, 4.0])
+        self.assertEqual(h["plate_appearances"], [4.0, 5.0])     # AB+BB+HBP+SF+SH
+        self.assertEqual(h["team_id"], "147")
+        self.assertEqual(h["team_name"], "New York Yankees")
+        self.assertEqual(h["minutes"], [0.0, 0.0])
+        self.assertEqual([d[:10] for d in h["game_dates"]],
+                         ["2024-09-01", "2024-04-01"])
+
+    def test_pitcher_outs_ip_to_outs(self):
+        self._game(400, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._pitcher("543037", 400, IP=6.1, K=8.0, ER=2.0)
+        h = mlb_warehouse.get_player_history("543037", "pitcher_outs")
+        self.assertEqual(h["values"], [19.0])                    # 6.1 IP → 19 outs
+        self.assertIsNone(h["at_bats"][0])                       # pitcher: no PA/AB
+        self.assertIsNone(h["plate_appearances"][0])
+        self.assertEqual(h["stat_label"], "IP")
+
+    def test_pitcher_strikeouts_raw(self):
+        self._game(401, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._pitcher("543037", 401, IP=5.0, K=7.0, ER=1.0)
+        h = mlb_warehouse.get_player_history("543037", "pitcher_strikeouts")
+        self.assertEqual(h["values"], [7.0])
+
+    def test_unsupported_prop_returns_none(self):
+        self._game(500, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._batter("1", 500, H=1.0, AB=4.0)
+        self.assertIsNone(mlb_warehouse.get_player_history("1", "batter_home_runs"))
+
+    def test_no_rows_returns_none(self):
+        self.assertIsNone(mlb_warehouse.get_player_history("nobody", "batter_hits"))
+
+    def test_as_of_is_strict_leakage_cutoff(self):
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z")
+        self._game(2, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._batter("1", 1, H=1.0, AB=4.0)
+        self._batter("1", 2, H=2.0, AB=4.0)
+        h = mlb_warehouse.get_player_history("1", "batter_hits",
+                                             as_of_date="2024-07-04")
+        self.assertEqual(h["values"], [1.0])                     # 07-04 game excluded
+
+    def test_limit_caps_games(self):
+        for pk, d in ((1, "2024-07-01"), (2, "2024-07-02"), (3, "2024-07-03")):
+            self._game(pk, d, d + "T18:00:00Z")
+            self._batter("1", pk, H=1.0, AB=4.0)
+        h = mlb_warehouse.get_player_history("1", "batter_hits", n=2)
+        self.assertEqual(len(h["values"]), 2)
+
+    def test_disabled_returns_none(self):
+        db_store.configure_engine(None)
+        self.assertIsNone(mlb_warehouse.get_player_history("1", "batter_hits"))
+
+
+class PlayerInputParityTests(_Backend, unittest.TestCase):
+    """The model-input shadow lens reads the STORED facts (not a fresh boxscore)
+    and diffs vs ESPN; only_espn also flags backfill gaps. ESPN side monkeypatched."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_player), {
+                "player_id": "592450", "full_name": "Aaron Judge",
+                "name_norm": db_store.normalize_name("Aaron Judge")})
+        self.nm = db_store.normalize_name("Aaron Judge")
+
+    def _game(self, game_pk, official_date, game_type="R"):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": game_pk, "official_date": official_date,
+                "game_date": official_date + "T18:00:00Z", "season": 2024,
+                "game_type": game_type, "home_team_id": "147",
+                "away_team_id": "111"})
+
+    def _batter(self, game_pk, H, athlete_id="592450"):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": athlete_id, "game_pk": game_pk, "team_id": "147",
+                "season_bucket": 2024, "H": H, "AB": 4.0})
+
+    def test_warehouse_map_keys_and_dh_sum(self):
+        self._game(1, "2024-07-04")
+        self._game(2, "2024-07-04")          # split DH, same official date
+        self._game(3, "2024-07-05")
+        self._batter(1, 1.0)
+        self._batter(2, 2.0)
+        self._batter(3, 0.0)
+        m, disp = parity._warehouse_player_game_stats(
+            "2024-07-04", "2024-07-05", "batter", "batter_hits")
+        self.assertEqual(m[(self.nm, "2024-07-04")], 3.0)        # DH summed
+        self.assertEqual(m[(self.nm, "2024-07-05")], 0.0)
+        self.assertEqual(disp[self.nm], "Aaron Judge")
+
+    def test_window_and_game_type_exclusion(self):
+        self._game(1, "2024-07-04")
+        self._game(2, "2024-07-10")                              # out of window
+        self._game(3, "2024-07-04", game_type="S")              # spring → excluded
+        self._batter(1, 1.0)
+        self._batter(2, 5.0)
+        self._batter(3, 9.0)
+        m, _ = parity._warehouse_player_game_stats(
+            "2024-07-04", "2024-07-06", "batter", "batter_hits")
+        self.assertEqual(m, {(self.nm, "2024-07-04"): 1.0})     # in-window regular only
+
+    def test_pitcher_ip_to_outs(self):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_player), {
+                "player_id": "543037", "full_name": "Gerrit Cole",
+                "name_norm": db_store.normalize_name("Gerrit Cole")})
+        self._game(1, "2024-07-04")
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
+                "athlete_id": "543037", "game_pk": 1, "team_id": "147",
+                "season_bucket": 2024, "IP": 6.1, "K": 8.0, "ER": 2.0})
+        cole = db_store.normalize_name("Gerrit Cole")
+        m, _ = parity._warehouse_player_game_stats(
+            "2024-07-04", "2024-07-04", "pitcher", "pitcher_strikeouts")
+        self.assertEqual(m[(cole, "2024-07-04")], 8.0)          # K raw
+        m2, _ = parity._warehouse_player_game_stats(
+            "2024-07-04", "2024-07-04", "pitcher", "pitcher_outs")
+        self.assertEqual(m2[(cole, "2024-07-04")], 19.0)        # 6.1 IP → 19 outs
+
+    def test_player_input_parity_matches_espn(self):
+        self._game(1, "2024-07-04")
+        self._batter(1, 2.0)
+        with mock.patch.object(parity, "_espn_player_game_stats",
+                               return_value={(self.nm, "2024-07-04"): 2.0}):
+            rep = parity.player_input_parity("2024-07-04", "2024-07-04")
+        self.assertEqual(rep["compared"], 1)
+        self.assertEqual(rep["matches"], 1)
+        self.assertEqual(rep["only_espn"], 0)
+        self.assertEqual(rep["source"], "warehouse_facts")
+
+    def test_player_input_parity_flags_backfill_gap(self):
+        # ESPN has 07-10 (prev-day 07-09 also absent, so no ±1-day remap) that the
+        # warehouse hasn't ingested → surfaces as only_espn.
+        self._game(1, "2024-07-04")
+        self._batter(1, 2.0)
+        with mock.patch.object(parity, "_espn_player_game_stats",
+                               return_value={(self.nm, "2024-07-04"): 2.0,
+                                             (self.nm, "2024-07-10"): 1.0}):
+            rep = parity.player_input_parity("2024-07-04", "2024-07-10")
+        self.assertEqual(rep["matches"], 1)
+        self.assertEqual(rep["only_espn"], 1)                   # 07-10 not in warehouse
+
+
 if __name__ == "__main__":
     unittest.main()
