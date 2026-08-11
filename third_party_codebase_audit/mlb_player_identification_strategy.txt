@@ -1,0 +1,566 @@
+MLB Player Identification and Entity Resolution Strategy
+
+Overview
+
+The odds API does not provide a stable player identifier. It returns a
+player name, and player names are not guaranteed to be unique. The
+current workaround combines player name with team information to
+disambiguate players.
+
+Team is useful evidence, but it should not be part of the player’s
+fundamental identity.
+
+The preferred architecture is to treat the odds-feed name as an
+unresolved external identity and pass it through an entity-resolution
+layer that maps it to a canonical MLB player identifier, preferably
+MLB’s MLBAM player ID.
+
+Conceptually:
+
+    Odds feed:
+    "Michael Harris II" + ATL
+               |
+               v
+         Player resolver
+               |
+               v
+    Canonical MLB identity:
+    MLBAM player_id = 671739
+
+Once the player has been resolved, downstream processing should use the
+canonical player ID rather than the odds-feed name or the player’s
+current team.
+
+1. The Fundamental Problem
+
+The odds provider has discarded identity information.
+
+If it supplies only:
+
+    player_name = "Luis Garcia"
+
+there may be more than one legitimate MLB player who could match that
+string.
+
+No name-matching algorithm can universally reconstruct a missing unique
+identifier with 100% certainty.
+
+Therefore, this should be treated as an entity-resolution problem rather
+than a simple lookup problem.
+
+The goal is not:
+
+    name -> player ID
+
+The goal is:
+
+    name + contextual evidence -> player ID
+
+2. Team Should Be Evidence, Not Identity
+
+A composite such as:
+
+    player_name + team
+
+is useful for disambiguation, but it should not become the canonical
+player key.
+
+Teams change.
+
+For example:
+
+    Before trade:
+    Player X + WSH -> MLBAM 123
+
+    After trade:
+    Player X + LAD -> MLBAM 123
+
+The player’s identity has not changed. Only one piece of contextual
+evidence has changed.
+
+Therefore:
+
+    MLBAM player_id
+
+should represent identity, while:
+
+    team
+    game
+    date
+    roster
+    market type
+
+should be treated as evidence used to establish that identity.
+
+3. Recommended Resolution Hierarchy
+
+The player resolver should use increasingly specific evidence.
+
+A practical hierarchy is:
+
+1.  Normalize the incoming player name.
+
+2.  Search the canonical MLB player map.
+
+3.  If the normalized name maps to exactly one plausible active MLB
+    player, accept that player.
+
+4.  If multiple players share the name, identify the MLB game associated
+    with the odds event.
+
+5.  Use the MLB gamePk to determine the relevant player universe for
+    that game.
+
+6.  Resolve the name only against players associated with that game.
+
+7.  Use team as an additional tie-breaker if necessary.
+
+8.  Use market/player role as another weak signal if necessary.
+
+9.  If exactly one candidate remains, accept the MLBAM ID.
+
+10. If the identity remains ambiguous, reject/skip the prop rather than
+    guess.
+
+Conceptually:
+
+    Normalize name
+          |
+          v
+    Candidate generation
+          |
+          v
+    Unique candidate?
+       /       \
+     yes       no
+      |         |
+    accept    gamePk
+                |
+                v
+           game roster
+                |
+                v
+              team
+                |
+                v
+          market/role
+                |
+                v
+         unique candidate?
+           /         \
+         yes         no
+          |           |
+        accept       reject
+
+4. Game Context Is Stronger Than Team Context
+
+The game-centric StatsAPI architecture improves player identification as
+well as stat retrieval.
+
+The odds event normally provides enough information to identify the
+game:
+
+    date
+    home team
+    away team
+
+Those values can be matched to MLB’s schedule to obtain:
+
+    gamePk
+
+Once gamePk is known, the resolver can restrict candidate players to the
+universe associated with that specific game.
+
+For example:
+
+    Odds event
+       |
+       +-- home = Phillies
+       +-- away = Nationals
+       +-- date = Aug 8
+                |
+                v
+          MLB schedule
+                |
+                v
+          gamePk 123456
+                |
+                v
+        Game player universe
+                |
+                v
+       Odds name "Luis Garcia"
+                |
+                v
+          Name resolver
+                |
+                v
+          MLBAM player ID
+
+This is much stronger than globally asking which “Luis Garcia” currently
+belongs to one of two teams.
+
+It ties the player resolution to the exact sporting event that generated
+the betting market.
+
+5. Canonical Player Identity
+
+For MLB, the canonical external player identity should preferably be:
+
+    MLBAM player_id
+
+Other provider identifiers can be attached to the same canonical player.
+
+Conceptually:
+
+                       ESPN ID
+                          |
+    Odds name -> Resolver -> MLBAM ID
+                          |
+                       other IDs
+
+The application’s own internal player key can also be used if desired:
+
+    internal_player_id
+    mlbam_id
+    espn_id
+    canonical_name
+
+The important point is that names and teams should not be the permanent
+identity.
+
+6. Provider Alias Table
+
+A separate provider-alias table would improve the current ID-map
+architecture.
+
+Example:
+
+    player
+    ------
+    player_id_internal
+    mlbam_id
+    espn_id
+    canonical_name
+
+    player_alias
+    ------------
+    provider
+    sport
+    provider_name
+    canonical_player_id
+    first_seen
+    last_seen
+    confidence
+    resolution_method
+
+Example records:
+
+    provider     provider_name        mlbam_id    method
+    ----------------------------------------------------------
+    odds_api     Trea Turner          607208      game_roster
+    odds_api     Ronald Acuna Jr.     660670      game_roster
+    odds_api     Luis Garcia          671277      game_roster
+    ESPN         Luis García Jr.      671277      provider_id
+
+This allows provider-specific naming differences to be learned and
+reused.
+
+7. Do Not Make Provider + Name Globally Unique
+
+A key caveat is that:
+
+    provider + provider_name
+
+should not automatically be assumed to identify exactly one player
+forever.
+
+If two players can legitimately appear under the same provider name, a
+global alias would recreate the original ambiguity.
+
+Aliases may therefore need validity or contextual information such as:
+
+    provider
+    league
+    provider_name
+    canonical_player_id
+    valid_from
+    valid_to
+
+For ambiguous cases, an alias could be scoped more narrowly:
+
+    provider
+    provider_name
+    team_code
+    valid_from
+    valid_to
+    mlbam_id
+
+Again, the team is contextual metadata used to establish identity during
+a particular period. It is not the player’s canonical identity.
+
+8. Persist Successful Resolutions
+
+When a previously unseen odds-feed name is resolved deterministically,
+that resolution can be persisted.
+
+For example:
+
+    resolve_player(
+        provider="odds_api",
+        name="Luis Garcia",
+        event_game_pk=123456
+    )
+
+If the game roster establishes exactly one valid player, the system can
+record the relationship.
+
+Future requests may then avoid repeating the complete resolution process
+when the alias is known to be safe.
+
+The resolution record should ideally retain information about how it was
+established:
+
+    resolution_method = game_roster
+    confidence = deterministic
+    first_seen
+    last_seen
+
+This also makes debugging easier when an unexpected mapping occurs.
+
+9. Name Normalization
+
+Name normalization is still useful before candidate generation.
+
+Examples of equivalent-looking provider names may include:
+
+    Ronald Acuna Jr
+    Ronald Acuña Jr.
+    Ronald Acuna Jr.
+
+Normalization can address differences such as:
+
+-   Accent marks
+-   Periods
+-   Apostrophes
+-   Extra whitespace
+-   Suffix formatting
+-   Case
+-   Common punctuation differences
+
+However, normalization should generate candidates rather than establish
+identity by itself.
+
+10. Fuzzy Matching Should Not Be the Final Authority
+
+Fuzzy matching can be useful for finding possible candidates.
+
+For example:
+
+    "Ronald Acuna Jr"
+            |
+            v
+    candidate:
+    "Ronald Acuña Jr."
+
+But a similarity score such as:
+
+    92% match
+
+should not automatically authorize a player mapping when multiple
+legitimate candidates exist.
+
+A safer model is:
+
+    normalized/fuzzy name
+            |
+            v
+    candidate set
+            |
+            v
+    game roster
+            |
+            v
+    team
+            |
+            v
+    player role
+            |
+            v
+    deterministic unique candidate
+
+Fuzzy matching should therefore be candidate generation, not final
+identity resolution.
+
+11. Use Market Type as Additional Evidence
+
+The sportsbook market itself contains useful contextual information.
+
+Examples:
+
+    pitcher_strikeouts
+
+strongly implies the referenced player should be a pitcher.
+
+Likewise:
+
+    batter_hits
+
+implies a batting participant.
+
+This can help eliminate an otherwise plausible namesake.
+
+Market type should not be the primary identifier, but it is useful as an
+additional validation signal after game and roster context.
+
+12. Fail Closed on Ambiguous Identity
+
+The resolver should have an explicit rule:
+
+    Ambiguous identity produces no prediction.
+
+This is especially important in a betting/modeling application.
+
+Skipping one ambiguous prop costs one potential betting opportunity.
+
+Incorrectly mapping the prop to the wrong player can contaminate:
+
+-   The player’s projection
+-   Edge calculations
+-   Bet recommendations
+-   Outcome tracking
+-   Historical results
+-   Calibration data
+-   Backtests
+-   Model evaluation
+
+A false-positive identity resolution is therefore substantially more
+damaging than a false negative.
+
+The resolver should prefer:
+
+    unresolved
+
+over:
+
+    probably this player
+
+when identity cannot be established with sufficient confidence.
+
+13. gamePk + MLBAM ID as the Player-Game Key
+
+Once the application adopts game-centric MLB ingestion, a particularly
+strong external key for a player observation is:
+
+    gamePk + MLBAM player_id
+
+For example:
+
+    game_pk = 123456
+    player_id = 607208
+
+This precisely identifies:
+
+    one player
+    in one MLB game
+
+This key is well suited for:
+
+-   Player game logs
+-   Boxscore storage
+-   Historical modeling
+-   Backtesting
+-   Outcome grading
+-   Live-game statistics
+-   Play-by-play joins
+
+It also eliminates many problems associated with reconstructing identity
+from names, dates, opponents, and team assignments.
+
+14. Integration With the Game-Centric StatsAPI Architecture
+
+The player-resolution architecture fits naturally into the proposed
+StatsAPI architecture.
+
+A complete flow could be:
+
+    Odds API event
+          |
+          +-- date
+          +-- home team
+          +-- away team
+          +-- player name
+          +-- market
+          |
+          v
+    Match event to MLB schedule
+          |
+          v
+        gamePk
+          |
+          v
+    Retrieve/check game player universe
+          |
+          v
+    Resolve odds player name
+          |
+          +-- normalized name
+          +-- roster/game context
+          +-- team
+          +-- market role
+          |
+          v
+       MLBAM ID
+          |
+          v
+    Canonical player record
+          |
+          v
+    gamePk + MLBAM ID
+          |
+          v
+    Player-game statistics
+          |
+          v
+    Existing modeling pipeline
+
+The same game lookup that solves targeted stat retrieval therefore also
+provides the strongest context for resolving the odds provider’s
+incomplete player identity.
+
+15. Recommended Design Principle
+
+The key distinction is:
+
+    Identity:
+        MLBAM player ID
+
+    Resolution evidence:
+        provider name
+        normalized name
+        gamePk
+        game roster
+        team
+        active status
+        market/player role
+
+Team remains valuable, but it is moved into the correct architectural
+role.
+
+Instead of:
+
+    player + team = identity
+
+the system becomes:
+
+    player name + contextual evidence
+              |
+              v
+        entity resolver
+              |
+              v
+       canonical player ID
+
+This provides a more stable foundation for the sportsbook application
+and works particularly well with the proposed MLB StatsAPI game-centric
+ingestion model.

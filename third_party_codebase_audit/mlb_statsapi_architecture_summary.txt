@@ -1,0 +1,514 @@
+MLB Player Stats Data Architecture Improvement
+
+Overview
+
+The current application architecture uses ESPN as the primary source for
+player game logs. The main limitation is that ESPN’s player gamelog
+endpoint is season-oriented: when the application needs an individual
+player’s game history, it generally retrieves the player’s entire season
+rather than allowing the application to request only one specific game
+or a small set of games.
+
+For MLB, there is a better approach already partially represented in the
+codebase: MLB’s StatsAPI. Rather than treating the player as the unit of
+retrieval, MLB data should be retrieved and cached by game.
+
+The central architectural change is:
+
+Current approach:
+
+    Player -> ESPN -> Entire season gamelog -> Extract needed games/stats
+
+Recommended MLB approach:
+
+    Game/date -> MLB schedule -> gamePk -> Game boxscore -> All player stats for that game
+
+This change can substantially reduce API traffic, make incremental
+updates much more efficient, and create a cleaner local historical
+dataset for modeling and backtesting.
+
+1. Current ESPN Limitation
+
+The existing ESPN integration retrieves player game logs using a
+player-oriented endpoint. The request can be scoped by season, but ESPN
+does not provide a convenient mechanism in this workflow for saying:
+
+    "Give me this player's statistics for game X only."
+
+As a result, when cached data needs to be refreshed, the application may
+retrieve a player’s complete season gamelog even when only one new game
+has occurred.
+
+For a single player this is not particularly expensive, but it scales
+poorly when the application is analyzing a large MLB slate.
+
+For example, if the sportsbook odds feed produces props for 180 players,
+the application could potentially need many separate ESPN player
+requests, each returning season-level data.
+
+Conceptually:
+
+    180 players
+        x
+    one season gamelog request per player
+
+The amount of redundant data increases throughout the season because the
+application repeatedly receives games it has already processed.
+
+2. Use MLB StatsAPI as the MLB Game-Stat Provider
+
+For MLB, the recommended source is MLB StatsAPI.
+
+The codebase already uses StatsAPI for MLB-specific functionality, so
+this would be an extension of an existing dependency rather than the
+introduction of an entirely new data provider.
+
+The important difference is that StatsAPI supports game-oriented
+retrieval.
+
+A typical workflow would be:
+
+    Date
+      |
+      v
+    MLB schedule
+      |
+      v
+    gamePk values
+      |
+      v
+    /game/{gamePk}/boxscore
+      |
+      v
+    All player statistics for each game
+
+The gamePk is MLB’s canonical identifier for a specific game.
+
+Once the application knows the gamePk, it can request that game’s
+boxscore and obtain batting and pitching lines for all participating
+players.
+
+3. Make the Game the Unit of Retrieval
+
+This is the most important architectural change.
+
+Instead of asking:
+
+    "What did Trea Turner do?"
+
+and then downloading Trea Turner’s season history, ask:
+
+    "What happened in Phillies game 123456?"
+
+The resulting boxscore contains statistics for every player in that
+game.
+
+This aligns much better with how a sportsbook modeling application
+consumes MLB data because the application will typically evaluate many
+players from the same relatively small set of games.
+
+For a normal 15-game MLB slate:
+
+    15 games
+        x
+    approximately one boxscore request per game
+
+can potentially provide the relevant statistics for hundreds of players.
+
+That is considerably more efficient than issuing individual
+season-gamelog requests for every player.
+
+4. Cache Boxscores by gamePk
+
+The application should maintain a game-level MLB cache keyed primarily
+by gamePk.
+
+For example:
+
+    game_pk = 123456
+    game_date = 2026-08-08
+
+The raw or normalized boxscore for that game can then be reused whenever
+the model requests statistics for any player who participated.
+
+A request such as:
+
+    get_player_stat_history(Trea Turner, hits)
+
+would no longer necessarily cause an external player API request.
+
+Instead, the application could query locally stored MLB game/player rows
+associated with Trea Turner.
+
+This has several benefits:
+
+-   One external request serves many players.
+-   Historical games do not need to be downloaded repeatedly.
+-   Completed games become permanent local data.
+-   API usage decreases as the local database grows.
+-   Backtesting becomes less dependent on an external provider.
+
+5. Store MLB’s gamePk as the Canonical Game Identifier
+
+The current gamelog storage architecture has used synthetic identifiers
+based on information such as:
+
+    game_date | opponent | home/away
+
+For MLB data, the actual MLB gamePk should be stored whenever possible.
+
+Using gamePk is preferable because it uniquely identifies the actual MLB
+game.
+
+This is especially useful for:
+
+-   Doubleheaders
+-   Postponed/rescheduled games
+-   Corrections
+-   Reconciliation between different MLB endpoints
+-   Joining boxscores to schedules
+-   Joining play-by-play data later
+-   Preventing accidental duplicate games
+
+A useful MLB data key would conceptually be:
+
+    game_pk + player_id
+
+rather than relying on reconstructed game identity from
+date/opponent/home-away information.
+
+6. Use MLB Player IDs Where Possible
+
+Along with gamePk, MLB’s player identifier should be retained.
+
+For example:
+
+    game_pk
+    player_id
+    team_id
+    game_date
+
+Using canonical MLB player IDs reduces reliance on name matching.
+
+Name matching can cause problems with:
+
+-   Players who share similar names
+-   Suffixes such as Jr.
+-   Accents and punctuation
+-   ESPN versus MLB naming differences
+-   Midseason team changes
+
+Names can still be stored for display, but the underlying joins should
+preferably use IDs.
+
+7. Normalize StatsAPI Fields to the Existing Model Interface
+
+The modeling layer should not need to care whether data came from ESPN
+or MLB StatsAPI.
+
+The application already has concepts such as:
+
+    batter_hits
+    batter_strikeouts
+    pitcher_strikeouts
+    pitcher_outs
+    pitcher_earned_runs
+
+The StatsAPI boxscore fields can be mapped into the application’s
+existing normalized gamelog representation.
+
+For example:
+
+    StatsAPI batting hits -> H / batter_hits
+    StatsAPI batting strikeouts -> SO / batter_strikeouts
+    StatsAPI pitching strikeouts -> SO / pitcher_strikeouts
+    StatsAPI innings pitched -> pitcher_outs
+    StatsAPI earned runs -> ER / pitcher_earned_runs
+
+This preserves the existing modeling interface.
+
+Ideally:
+
+    get_player_stat_history(...)
+
+continues to return the same type of normalized data regardless of
+provider.
+
+8. Keep ESPN for Other Sports
+
+ESPN should not necessarily be removed from the application.
+
+The existing ESPN integration provides a useful common interface across
+multiple sports such as:
+
+-   MLB
+-   NBA
+-   NFL
+
+The recommended change is provider-specific routing.
+
+Conceptually:
+
+    get_player_stat_history()
+              |
+       +------+------+
+       |             |
+      MLB         NBA / NFL
+       |             |
+    StatsAPI        ESPN
+       |             |
+       +------+------+
+              |
+       normalized gamelog
+              |
+          model logic
+
+This allows MLB to use the more efficient game-oriented source without
+requiring a rewrite of the rest of the application’s sports-data
+architecture.
+
+9. Build an Incremental MLB Historical Store
+
+The most valuable long-term improvement is to make the MLB database
+incremental.
+
+Suppose the local database already contains all completed MLB games
+through August 7.
+
+On August 8, the application should not retrieve every player’s season
+again.
+
+Instead:
+
+    Existing history through Aug 7
+                 +
+    newly completed Aug 8 games
+                 |
+                 v
+         permanent local history
+
+On August 9, only the new August 9 games need to be added.
+
+Over time, the application effectively builds its own MLB player-game
+warehouse.
+
+Eventually, most historical model queries can be satisfied entirely from
+the local SQL database.
+
+10. Suggested Data Flow
+
+A clean MLB ingestion pipeline would look roughly like this:
+
+    MLB Schedule API
+          |
+          v
+    Identify gamePk
+          |
+          v
+    Check local database
+          |
+       +--+--+
+       |     |
+     exists  missing/stale
+       |     |
+       |     v
+       |   StatsAPI boxscore
+       |     |
+       |     v
+       |   normalize player stats
+       |     |
+       |     v
+       |   upsert into SQL
+       |     |
+       +-----+
+          |
+          v
+    Local player-game history
+          |
+          v
+    get_player_stat_history()
+          |
+          v
+    Probability / edge model
+
+11. Potential SQL Structure
+
+A normalized table could conceptually contain one row per player per
+game per stat group, or a wider player-game row.
+
+For example:
+
+    mlb_player_game_stats
+
+    game_pk
+    game_date
+    player_id
+    player_name
+    team_id
+    opponent_team_id
+    is_home
+
+    batting_at_bats
+    batting_hits
+    batting_doubles
+    batting_triples
+    batting_home_runs
+    batting_runs
+    batting_rbi
+    batting_walks
+    batting_strikeouts
+
+    pitching_innings
+    pitching_outs
+    pitching_hits
+    pitching_runs
+    pitching_earned_runs
+    pitching_walks
+    pitching_strikeouts
+
+The exact schema should be chosen based on how the existing model
+consumes gamelog rows, but game_pk and player_id should ideally be
+first-class identifiers.
+
+12. Why This Is Better for Backtesting
+
+The application is not only evaluating current bets; historical results
+are also important for model validation and backtesting.
+
+A permanent local player-game store provides several advantages.
+
+Historical calculations become:
+
+    SQL -> local player-game table
+
+instead of:
+
+    Model -> external API -> transform -> calculate
+
+This provides:
+
+-   Faster backtests
+-   Reproducible historical datasets
+-   Reduced dependence on API availability
+-   Less network traffic
+-   Easier debugging
+-   Easier model calibration
+-   Easier comparison of model versions against identical historical
+    inputs
+
+It also allows additional features to be added later without
+re-downloading historical data.
+
+13. Future Expansion: Play-by-Play and Live Modeling
+
+The game-centric architecture also creates a path toward live
+statistics.
+
+StatsAPI exposes richer game feeds in addition to final boxscores,
+including game/live-feed and play-by-play information.
+
+That means the same gamePk used for historical boxscores can eventually
+be used for:
+
+-   Current inning
+-   Plate appearances
+-   Hits already recorded
+-   Pitch counts
+-   Batter results
+-   Pitcher results
+-   Live game state
+
+This could be useful if the application eventually incorporates live
+probabilities or evaluates sportsbook cash-out offers.
+
+The important architectural point is that gamePk becomes the common
+identifier connecting:
+
+    schedule
+    boxscore
+    play-by-play
+    players
+    teams
+    historical results
+    live game state
+
+14. Paid APIs Are Probably Unnecessary at This Stage
+
+Commercial providers such as SportsDataIO and Sportradar can provide
+polished game-level and live feeds.
+
+However, given that:
+
+1.  MLB StatsAPI provides the targeted game data needed,
+2.  the codebase already uses MLB StatsAPI,
+3.  the application already has SQL caching and normalization logic, and
+4.  this is a modeling application where maintaining a local historical
+    store is beneficial,
+
+there is currently little reason to introduce the additional cost and
+dependency of a commercial API solely to solve the ESPN season-gamelog
+problem.
+
+A paid provider could be reconsidered later if requirements arise around
+guaranteed uptime, licensing, support, lower-latency live data, or
+standardized multi-sport feeds.
+
+15. Recommended Migration Strategy
+
+The migration does not need to be disruptive.
+
+A staged approach would be:
+
+Phase 1: - Keep the existing ESPN implementation intact. - Add MLB
+game/boxscore retrieval through StatsAPI. - Normalize StatsAPI batting
+data into the existing gamelog format.
+
+Phase 2: - Store gamePk and MLB player IDs in the local database. -
+Upsert newly completed MLB games rather than replacing complete player
+histories.
+
+Phase 3: - Route MLB player-history requests to the local
+StatsAPI-backed store. - Retain ESPN as a fallback if desired.
+
+Phase 4: - Stop routinely requesting full-season ESPN MLB gamelogs once
+confidence in the StatsAPI pipeline is established.
+
+Phase 5: - Optionally extend the same game-centric infrastructure to
+StatsAPI live/play-by-play feeds.
+
+Bottom Line
+
+The primary improvement is not simply replacing one API with another. It
+is changing the MLB data architecture from player-centric retrieval to
+game-centric ingestion.
+
+Instead of repeatedly downloading:
+
+    one player's entire season
+
+the application should download:
+
+    one game's boxscore containing every player's statistics
+
+and permanently store those player-game results locally.
+
+MLB StatsAPI is well suited to this design and is already partially
+integrated into the codebase.
+
+The target architecture is therefore:
+
+    MLB StatsAPI
+         |
+    gamePk / boxscore
+         |
+    normalized player-game rows
+         |
+    permanent SQL cache
+         |
+    existing get_player_stat_history interface
+         |
+    probability and betting model
+
+This should reduce redundant API calls, improve performance, simplify
+historical data management, strengthen backtesting reproducibility, and
+provide a natural foundation for future live-game modeling.

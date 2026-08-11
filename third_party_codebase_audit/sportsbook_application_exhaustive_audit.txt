@@ -1,0 +1,1100 @@
+Sportsbook Application — Repository-Wide Architecture and Improvement Audit
+
+Scope
+
+This audit covers the current public sportsbook codebase, including:
+
+-   Application architecture
+-   Live and historical data ingestion
+-   ESPN, MLB StatsAPI, Statcast/Baseball Savant, and odds integrations
+-   Player/team/game identity
+-   Database and caching architecture
+-   Player-prop and team modeling
+-   Calibration and recalibration
+-   Historical backtesting
+-   Bankroll and Kelly staking
+-   Bet selection and parlay construction
+-   CLV and wager tracking
+-   Testing and CI
+-   Reliability and observability
+-   Security/configuration
+-   Maintainability
+-   Potential modeling enhancements
+
+The live Azure database was not inspected for this phase. Database
+observations are based on the repository’s schema and application code.
+
+An important finding is that the application has already undergone a
+substantial audit-driven cleanup. Existing work has addressed issues
+including negative-EV value gating, SGP payout/correlation handling,
+look-ahead leakage, winner’s-curse calibration selection, stale odds,
+ESPN negative caching, survivorship bias, name collisions, CI coverage,
+and decomposition of the original analysis.py module.
+
+As a result, this review focuses primarily on the next generation of
+architectural and modeling improvements rather than re-identifying
+already-corrected problems.
+
+Executive Assessment
+
+This is no longer a simple sportsbook statistics script. It has evolved
+into a small quantitative betting platform.
+
+The application includes:
+
+-   Live odds ingestion
+-   Historical odds warehousing
+-   Player gamelogs
+-   Statcast-derived features
+-   Team models
+-   Player-prop models
+-   Chronological backtesting
+-   Calibration selection
+-   Online Platt recalibration
+-   Bet selection
+-   Correlation-aware parlays
+-   Real wager tracking
+-   Closing-line-value tracking
+-   Bankroll management
+-   A meaningful automated test suite
+
+The strongest characteristic of the application is methodological
+discipline. The system deliberately uses chronological holdouts, forward
+validation, Brier scoring, calibration gates, leakage-safe as-of
+features, positive-EV requirements, and conservative rejection of model
+enhancements that fail validation.
+
+The largest remaining opportunities are primarily architectural rather
+than mathematical.
+
+General assessment:
+
+    Modeling methodology:       Strong
+    Testing discipline:         Strong
+    Defensive betting math:     Strong
+    Data architecture:          Moderate, with significant opportunity
+    Reproducibility/provenance: Needs improvement
+    Entity identity:            Improved but not fully solved
+    Maintainability:            Becoming a concern
+    Operational observability:  Underdeveloped
+
+Priority 1 — Build the MLB Data Layer Around gamePk + MLBAM Player ID
+
+This is the highest-priority architectural recommendation.
+
+The durable MLB gamelog architecture still reflects its ESPN origins.
+Batter and pitcher gamelog storage is centered around ESPN athlete IDs,
+season-oriented retrieval, and synthetic game keys.
+
+The existing pattern is conceptually:
+
+    ESPN athlete
+         |
+         v
+    Entire season gamelog
+         |
+         v
+    Delete athlete/season cache
+         |
+         v
+    Insert entire season again
+
+This was reasonable when ESPN was the primary source.
+
+It is no longer ideal.
+
+The recommended MLB architecture is:
+
+    MLB schedule
+         |
+         v
+       gamePk
+         |
+         v
+    Game boxscore
+         |
+         v
+    MLBAM player IDs
+         |
+         v
+    UPSERT player-game facts
+
+The canonical MLB player-game observation should become:
+
+    (game_pk, player_mlb_id)
+
+rather than:
+
+    (espn_athlete_id, synthetic_game_key)
+
+Benefits include:
+
+-   Truly incremental game ingestion
+-   One API request serving all players in a game
+-   Correct doubleheader handling
+-   Stable identity across trades
+-   Easier historical reconstruction
+-   Unified grading and modeling identities
+-   Natural joins to boxscores, lineups, Statcast, play-by-play, and
+    live feeds
+-   Reduced dependency on ESPN for MLB
+
+The application is already moving toward MLBAM identity elsewhere. This
+migration would unify the remaining legacy gamelog architecture with the
+newer identity model.
+
+Priority 2 — Resolve Player Identity at the Event Level
+
+The existing player ID mapping is reasonably defensive. It normalizes
+names, handles suffixes, prefers active mappings, refuses ambiguous
+matches, and uses team as a tie-breaker rather than defining player
+identity by team.
+
+The remaining problem is that identical provider names can still appear
+in separate events.
+
+The lookup identity before entity resolution should be based on
+something like:
+
+    odds_event_id
+    + prop_key
+    + normalized_provider_player_name
+
+Then resolve the player through game context:
+
+    Odds event
+         |
+         v
+    home + away + date
+         |
+         v
+    MLB schedule
+         |
+         v
+       gamePk
+         |
+         v
+    Game player universe
+         |
+         v
+    Name candidates
+         |
+         v
+    MLBAM player ID
+
+Team remains useful evidence, but game participation is stronger
+evidence.
+
+The resolver should explicitly fail closed:
+
+    no unique identity
+           |
+           v
+    NO MODEL OUTPUT
+
+A skipped market costs one opportunity.
+
+A wrongly identified player can contaminate:
+
+-   Projection calculations
+-   Edge calculations
+-   Wager recommendations
+-   Outcome tracking
+-   Historical model data
+-   Calibration observations
+-   Backtests
+
+Therefore false-positive identity resolution is much more damaging than
+a false negative.
+
+Priority 3 — Add Immutable Model Provenance to Every Prediction
+
+This is one of the most important remaining architectural gaps.
+
+Prediction records currently retain useful analytical information, but
+they do not appear to provide a complete immutable description of
+exactly which model state generated each prediction.
+
+Every durable prediction should eventually include fields such as:
+
+    model_version
+    code_commit_sha
+    calibration_version
+    calibration_fit_timestamp
+    feature_set_version
+    data_asof
+    odds_snapshot_id
+    prediction_created_at
+
+Potential additional fields:
+
+    provider_version
+    model_config_hash
+
+Example:
+
+    prediction_id:       184322
+    model_version:       mlb-props-v7
+    git_sha:             a84cb31
+    calibration_version: 2026-08-04T02:14Z
+    feature_version:     12
+    data_asof:           2026-08-08T17:40Z
+    odds_snapshot_id:    44218
+    raw_prob:            0.671
+    final_prob:          0.637
+
+This allows a historical wager to answer:
+
+    "Exactly why did the application believe this bet had a 63.7% probability?"
+
+This becomes increasingly important because the model is adaptive.
+
+Priority 4 — Move Automatic Model Fitting Out of the Live Request Path
+
+The live prop-analysis pathway can currently trigger
+recalibration/refitting behavior when enough new resolved observations
+accumulate.
+
+Statistically, automatic recalibration is reasonable.
+
+Operationally, training and prediction should be separated.
+
+Preferred architecture:
+
+    LIVE APPLICATION
+          |
+          v
+    Read approved model/calibration version
+
+
+    OFFLINE MAINTENANCE
+          |
+          +-- Resolve predictions
+          +-- Fit candidate calibration
+          +-- Run validation gates
+          +-- Approve/reject candidate
+          |
+          v
+    Publish new calibration version
+
+This provides deterministic live behavior and a clear deployment
+history.
+
+For example:
+
+    calibration v31
+          |
+       approved
+          |
+       deployed
+          |
+    predictions 18001-19442
+
+rather than calibration state changing because a user opened or
+refreshed the application.
+
+Priority 5 — Treat Azure SQL as the Application’s Sports-Data Warehouse
+
+The application is already halfway to a warehouse architecture.
+
+The database contains concepts such as:
+
+-   Odds snapshots
+-   Odds lines
+-   Prediction logs
+-   Team prediction logs
+-   Wagers
+-   Player gamelogs
+-   Player mapping
+-   Team mapping
+-   Statcast-derived data
+
+This should become an explicit architectural principle.
+
+Recommended flow:
+
+                    RAW SOURCES
+                         |
+            +------------+------------+
+            |            |            |
+         Odds API    MLB StatsAPI   Statcast
+            |            |            |
+            +------------+------------+
+                         |
+                         v
+                Canonical warehouse
+                         |
+               +---------+---------+
+               |                   |
+           historical           live/as-of
+               |                   |
+               +---------+---------+
+                         |
+                         v
+                    model layer
+                         |
+                         v
+                   predictions
+                         |
+                  +------+------+
+                  |             |
+               wagers      calibration
+
+External APIs should increasingly function as ingestion sources.
+
+The modeling layer should ideally query the local canonical database
+rather than directly querying ESPN, MLB, or Savant whenever possible.
+
+This provides:
+
+-   Reproducibility
+-   Faster modeling
+-   Lower API dependence
+-   Easier debugging
+-   Consistent historical data
+-   Better backtesting
+
+Priority 6 — Add Uniform Source-Data Provenance
+
+Underlying statistics should retain source metadata.
+
+Useful fields include:
+
+    source_provider
+    source_record_id
+    source_fetched_at
+    source_updated_at
+    ingested_at
+
+Examples:
+
+For MLB:
+
+    source_provider = MLB_STATSAPI
+    game_pk = ...
+
+For odds:
+
+    source_provider = THE_ODDS_API
+    snapshot_id = ...
+
+For Statcast:
+
+    source_provider = BASEBALL_SAVANT
+    as_of_date = ...
+
+Parts of this already exist, but source provenance should become a
+uniform warehouse principle.
+
+Priority 7 — Strengthen SQL Relational Integrity
+
+The existing schema is stronger than expected. It contains meaningful
+indexes, unique constraints, check constraints, and schema-parity
+testing.
+
+However, some logical relationships should eventually become explicit
+database relationships.
+
+For example:
+
+    odds_line.snapshot_id
+        ->
+    odds_snapshot.id
+
+should ideally have an actual foreign-key relationship.
+
+A normalized future warehouse could establish relationships among:
+
+    game
+    player
+    player_game
+    team
+    odds_event
+    odds_snapshot
+    prediction
+    wager
+
+This becomes increasingly important as Azure SQL becomes the canonical
+store rather than merely a cache.
+
+Priority 8 — Move Important Timestamps to Native SQL Temporal Types
+
+A number of timestamps are stored as text values or floating-point epoch
+values.
+
+This works but leaves useful SQL Server capabilities unused.
+
+Long term, important timestamps should migrate toward:
+
+    DATETIME2
+
+or:
+
+    DATETIMEOFFSET
+
+Candidates include:
+
+    commence_time
+    captured_at
+    resolved_at
+    fit_timestamp
+    last_fetched_at
+
+Benefits:
+
+-   Reliable ordering
+-   Efficient date filtering
+-   Better range predicates
+-   Better indexing
+-   Less application-side parsing
+-   Easier retention policies
+-   Easier operational diagnostics
+
+This is not urgent but becomes increasingly valuable as the warehouse
+grows.
+
+Priority 9 — Split the Remaining God Modules
+
+The previous decomposition of analysis.py was a good architectural
+improvement.
+
+Several very large modules remain, including approximately:
+
+    backtest.py            ~3,600 lines
+    refit_calibration.py   ~2,600 lines
+    recalibration.py       ~2,400 lines
+    props.py               ~1,600 lines
+    odds_client.py         ~1,100 lines
+    db_store.py            ~1,100 lines
+    warehouse.py           ~1,100 lines
+
+Potential decomposition:
+
+    backtesting/
+        datasets.py
+        runner.py
+        scoring.py
+        prop_backtest.py
+        team_backtest.py
+        validation.py
+
+    calibration/
+        fit.py
+        selection.py
+        validation.py
+        deployment.py
+
+    storage/
+        predictions.py
+        wagers.py
+        odds.py
+        gamelogs.py
+        identities.py
+
+The goal is not merely shorter files.
+
+The goal is to reduce the chance that a change to one statistical
+pathway unintentionally affects another.
+
+Priority 10 — Create a Canonical Typed Prediction Model
+
+A significant amount of inter-module communication currently uses
+dictionaries and loosely structured values.
+
+That flexibility was useful during rapid development.
+
+The application is now mature enough to benefit from typed domain
+objects.
+
+Conceptually:
+
+    @dataclass(frozen=True)
+    class Prediction:
+        sport
+        event_id
+        market
+        side
+        probability
+        fair_probability
+        price
+        expected_roi
+        edge
+        ...
+
+Potential specializations:
+
+    PlayerPropPrediction
+    TeamPrediction
+
+Benefits:
+
+-   Type checking
+-   IDE assistance
+-   Fewer misspelled dictionary keys
+-   Explicit units
+-   Easier serialization
+-   Safer schema evolution
+-   More reliable tests
+
+This is particularly valuable in an application containing large amounts
+of probability arithmetic.
+
+Priority 11 — Standardize Probability and Percentage Units
+
+The application contains both fractional probability values and
+percentage-form display values.
+
+For example:
+
+    internal probability = 0.637
+
+versus:
+
+    displayed probability = 63.7
+
+This is manageable but creates cognitive overhead across many modules.
+
+Recommended hard rule:
+
+    All internal probabilities and returns use fractions.
+
+Examples:
+
+    probability = 0.637
+    edge = 0.071
+    expected_roi = 0.124
+
+Multiplication by 100 should occur only in the presentation layer.
+
+This reduces an important class of future mathematical bugs.
+
+Priority 12 — Replace Heuristic Correlation With Empirical Correlation Over Time
+
+The parlay implementation is sophisticated.
+
+It already includes:
+
+-   Gaussian-copula simulation
+-   Cholesky simulation
+-   Positive-definiteness checking
+-   Correlation-matrix shrinkage
+-   Degradation reporting
+-   Protection against naïvely using correlated sportsbook SGP payouts
+    as evidence of value
+
+The remaining weakness is that pairwise correlation assumptions are
+primarily rule-based.
+
+The next generation should estimate correlations from historical
+outcomes.
+
+Examples:
+
+    P(batter hit OVER, team ML)
+
+    P(pitcher K OVER, opponent hits UNDER)
+
+    P(team total OVER, batter hit OVER)
+
+    P(QB yards OVER, receiver yards OVER)
+
+A strong design would use:
+
+    empirical correlation
+             |
+             v
+    shrink toward heuristic prior
+             |
+             v
+    copula correlation
+
+The current heuristic rules then become priors rather than permanent
+constants.
+
+Priority 13 — Introduce Portfolio-Level Kelly Allocation
+
+Current bankroll management is sensible.
+
+The application uses fractional Kelly, per-bet caps, and total-slate
+exposure limits.
+
+The next enhancement would account for correlation between
+simultaneously held bets.
+
+Current conceptual approach:
+
+    Bet A -> Kelly
+    Bet B -> Kelly
+    Bet C -> Kelly
+            |
+            v
+       slate cap
+
+Advanced approach:
+
+    expected return vector
+             +
+       covariance matrix
+             +
+      bankroll constraint
+             |
+             v
+      portfolio allocation
+
+A full Markowitz-style optimizer is not required.
+
+A simpler first implementation could reduce individual Kelly allocations
+based on shared exposure to:
+
+-   Same game
+-   Same team
+-   Same player
+-   Correlated market groups
+
+This would connect the existing correlation knowledge with bankroll risk
+management.
+
+Priority 14 — Model Uncertainty Around the Estimated Edge
+
+The application currently generates point estimates such as:
+
+    model probability  = 62%
+    market probability = 55%
+    estimated edge     = +7%
+
+But a seven-point edge based on a small effective sample should not
+carry the same confidence as a seven-point edge supported by extensive
+history.
+
+The system could eventually estimate:
+
+    estimated probability: 62%
+    uncertainty interval:   56%-67%
+    market probability:     55%
+
+Or calculate a simpler confidence metric using:
+
+-   Effective sample size
+-   Calibration sample size
+-   Feature completeness
+-   Probability-method validation
+-   Model dispersion
+
+Eventually, value gating could use:
+
+    P(true edge > 0)
+
+rather than only:
+
+    point-estimate edge > threshold
+
+Priority 15 — Track Effective Sample Size
+
+Because historical observations are weighted by factors such as recency,
+venue, and other model components, raw game count overstates the actual
+amount of independent information.
+
+For weights w:
+
+    N_eff = (sum(w))^2 / sum(w^2)
+
+The UI or model diagnostics could then report:
+
+    Games observed: 20
+    Effective N:     8.7
+
+Effective sample size could feed directly into:
+
+-   Confidence metrics
+-   Edge uncertainty
+-   Minimum-data gates
+-   Model diagnostics
+
+Priority 16 — Continue Expanding the Feature-Gating Framework
+
+The prop feature registry is a strong architectural choice because
+runtime modeling, synthetic backtests, and real-line calibration can
+consume the same feature definitions.
+
+New features should continue to be introduced through this controlled
+framework.
+
+Potential MLB batter candidates:
+
+-   Expected plate appearances
+-   Batter/pitcher handedness interaction
+-   Opposing bullpen handedness composition
+-   Park/weather interaction
+-   Umpire zone effects, if reliable data is available
+-   Pitch-type matchup characteristics
+
+Potential MLB pitcher candidates:
+
+-   Projected pitch count
+-   Days rest
+-   Opponent chase/contact profile
+-   Opposing lineup strikeout rate versus handedness
+-   Bullpen availability and expected pitcher leash
+
+Potential NBA candidates:
+
+-   Projected minutes
+-   Teammate availability
+-   Usage redistribution
+-   Pace
+-   Implied team total
+-   Back-to-back/rest status
+-   Starting status
+
+The current philosophy should remain unchanged:
+
+    A feature is not deployed because it makes intuitive sports sense.
+
+    It is deployed only after it passes chronological forward validation.
+
+Priority 17 — Treat Market Information as a First-Class Feature
+
+The application already blends model probability with de-vigged market
+information in several pathways.
+
+The next step would be to explicitly model market structure.
+
+Potential features:
+
+    model-only probability
+    market probability
+    market movement
+    cross-book dispersion
+    time-to-start
+
+Cross-book disagreement itself contains information.
+
+Example A:
+
+    DraftKings  +120
+    FanDuel     +102
+    BetMGM      +105
+    Caesars     +108
+
+is qualitatively different from:
+
+Example B:
+
+    DraftKings  +120
+    FanDuel     +118
+    BetMGM      +121
+    Caesars     +117
+
+even though the executable DraftKings price is +120 in both cases.
+
+The normalized odds warehouse makes this type of research possible.
+
+Priority 18 — Elevate CLV to a Primary Model Diagnostic
+
+The application already stores closing-line and closing-price
+information and has CLV backfill functionality.
+
+CLV should become one of the primary model diagnostics alongside ROI and
+Brier score.
+
+For every model/version, consider tracking:
+
+    ROI
+    Brier score
+    Log loss
+    Win percentage
+    Average predicted edge
+    Average CLV
+    CLV hit rate
+    Number of bets
+
+Short-run ROI is noisy.
+
+Persistent positive CLV can indicate that the model is identifying
+market mispricing even during a period of unfavorable outcome variance.
+
+Priority 19 — Add a Formal Model/Experiment Registry
+
+The application is effectively already doing manual MLOps.
+
+A structured model registry would formalize this.
+
+Example:
+
+    model_run
+    ---------
+    model_run_id
+    sport
+    market
+    created_at
+    git_sha
+    training_start
+    training_end
+    validation_start
+    validation_end
+    feature_set
+    hyperparameters
+    brier
+    log_loss
+    roi
+    clv
+    status
+
+Possible statuses:
+
+    candidate
+    validated
+    deployed
+    retired
+    rejected
+
+The project already tests candidate model improvements and deliberately
+rejects them when they fail independent holdouts.
+
+That history should eventually become structured data rather than only
+documentation or files.
+
+Priority 20 — Improve Operational Observability
+
+The application deliberately contains fail-open and fail-closed behavior
+so that external service failures do not necessarily break the user
+interface.
+
+That is appropriate.
+
+However, suppressed errors should still generate structured telemetry.
+
+Potential operational events:
+
+    api_call
+    api_failure
+    cache_hit
+    cache_stale
+    identity_failure
+    prediction_skipped
+    feature_missing
+    model_fallback
+    database_failure
+    calibration_refit
+    grading_failure
+
+An internal diagnostics view could report:
+
+    MLB games analyzed       14
+    StatsAPI calls           16
+    Odds API calls            8
+    Cache hit rate           91%
+    Unresolved players        2
+    Model fallbacks           3
+    Missing starter data      1
+    Database errors           0
+
+This would make subtle data-quality and integration failures much easier
+to detect.
+
+Priority 21 — Fully Pin Production Dependencies
+
+The application already pins some important dependencies.
+
+The next step should be fully reproducible dependency installation.
+
+Rather than leaving major dependencies unconstrained, production should
+ideally use exact tested versions.
+
+Possible approach:
+
+    requirements.in
+    requirements.txt
+
+with requirements.txt generated and locked.
+
+CI should test exactly what production runs.
+
+Priority 22 — Add Static Analysis to CI
+
+The automated test suite is already substantial.
+
+The next CI layer should include tools such as:
+
+    ruff
+    mypy or pyright
+
+Initially these can run in permissive mode.
+
+Ruff can identify:
+
+-   Dead imports
+-   Shadowed variables
+-   Suspicious constructs
+-   Style-related reliability issues
+
+Typing becomes especially valuable if prediction dictionaries are
+gradually replaced by dataclasses/domain models.
+
+Priority 23 — Complete API-Key Security Cleanup
+
+Previous repository history reportedly contained a live Odds API key.
+
+The current architecture appropriately uses ignored configuration,
+templates, secrets, and environment variables.
+
+If the historical key has not already been rotated, it should be
+rotated.
+
+Even if the repository is obscure, a credential committed to Git history
+should be considered exposed.
+
+Areas That Should NOT Be Rewritten Simply for Sophistication
+
+Do Not Replace the Modeling System Wholesale With Machine Learning
+
+The current modeling system has important advantages:
+
+-   Interpretability
+-   Backtestability
+-   Small-data tolerance
+-   Easier leakage analysis
+-   Controlled feature adoption
+-   Understandable failures
+
+Machine-learning models such as gradient boosting can be tested as
+challengers.
+
+They should not automatically replace the current models simply because
+they are more sophisticated.
+
+The same validation philosophy should apply:
+
+    candidate model
+          |
+          v
+    chronological holdout
+          |
+          v
+    independent validation
+          |
+       +--+--+
+       |     |
+     passes fails
+       |     |
+    consider reject
+
+Keep Market Blending
+
+The application’s goal is not to prove that sportsbooks are wrong in
+isolation.
+
+The useful question is whether the model contains incremental
+information beyond the market.
+
+Market blending is therefore conceptually appropriate.
+
+Preserve Conservative Feature Deployment
+
+One of the project’s strongest characteristics is the willingness to
+reject apparently sensible enhancements when they fail forward
+validation.
+
+That discipline should remain central to future development.
+
+Recommended Implementation Order
+
+If prioritizing future development, the suggested sequence is:
+
+1.  Finish MLB entity resolution using event/game context.
+
+2.  Implement StatsAPI game-centric ingestion.
+
+3.  Make gamePk + MLBAM ID canonical for MLB player-game observations.
+
+4.  Add complete model and data provenance fields to predictions and
+    wagers.
+
+5.  Separate calibration training from live prediction execution.
+
+6.  Add structured diagnostics and operational observability.
+
+7.  Split backtest.py, refit_calibration.py, and recalibration.py into
+    focused modules.
+
+8.  Introduce typed prediction/domain objects.
+
+9.  Add empirical correlation estimation.
+
+10. Add uncertainty, effective sample size, and portfolio-aware staking.
+
+11. Build a formal model/experiment registry.
+
+12. Continue testing predictive features through the existing
+    chronological validation gate.
+
+Recommended Future Azure Database Audit
+
+Read-only access to the live Azure database would materially improve a
+second phase of the audit.
+
+It is not necessary to understand the application, but it would allow
+direct examination of:
+
+-   Actual table sizes
+-   Duplicate incidence
+-   Orphaned rows
+-   Index usefulness
+-   Query execution plans
+-   Table growth rates
+-   Unresolved player frequency
+-   Player ID map coverage
+-   Cache effectiveness
+-   Calibration observation distributions
+-   Wager history
+-   Closing-line-value history
+-   Odds warehouse coverage
+-   Missing/null field rates
+-   Existing synthetic identity collisions
+-   SQL workload caused by season-level DELETE/INSERT gamelog refreshes
+-   Whether proposed indexes are actually justified by production
+    workload
+
+Only read-only access would be required.
+
+A dedicated SQL login restricted to the sportsbook database would be
+preferable to using normal application credentials.
+
+Final Conclusion
+
+The application should not be rewritten.
+
+Its core statistical philosophy is disciplined and relatively mature.
+
+The largest remaining gains are likely to come from making the data,
+identity, provenance, and operational architecture as rigorous as the
+statistical architecture already is.
+
+The most important near-term architectural destination is:
+
+    MLB StatsAPI
+          |
+    schedule / gamePk
+          |
+    canonical game
+          |
+    MLBAM player identity
+          |
+    player-game warehouse
+          |
+    historical/as-of feature layer
+          |
+    versioned model
+          |
+    versioned calibration
+          |
+    immutable prediction
+          |
+    wager / outcome / CLV
+          |
+    evaluation and future model training
+
+This architecture would provide a strong foundation for continued model
+development while improving reproducibility, maintainability, API
+efficiency, historical reliability, identity safety, and long-term
+analytical capability.
