@@ -71,6 +71,12 @@ GO
 IF COL_LENGTH('dbo.prediction_log', 'player_key') IS NULL
     ALTER TABLE dbo.prediction_log ADD player_key NVARCHAR(200);
 GO
+-- P3: the StatsAPI game_pk the prop belongs to (nullable/best-effort, stamped by
+-- entity_resolver). NOT in the UNIQUE key — prop_key + line already distinguish a
+-- player's many props in one game. P4 enforces MLB-scoped non-NULL; P5 backfills.
+IF COL_LENGTH('dbo.prediction_log', 'game_pk') IS NULL
+    ALTER TABLE dbo.prediction_log ADD game_pk INT;
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_prediction_sport_resolved'
                  AND object_id = OBJECT_ID('dbo.prediction_log'))
@@ -183,6 +189,9 @@ IF COL_LENGTH('dbo.wagers', 'home_code') IS NULL
 GO
 IF COL_LENGTH('dbo.wagers', 'away_code') IS NULL
     ALTER TABLE dbo.wagers ADD away_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.wagers', 'game_pk') IS NULL      -- P3: StatsAPI game (best-effort)
+    ALTER TABLE dbo.wagers ADD game_pk INT;
 GO
 
 ------------------------------------------------------- market_prediction_log
@@ -374,6 +383,9 @@ IF COL_LENGTH('dbo.odds_line', 'player_mlb_id') IS NULL
 GO
 IF COL_LENGTH('dbo.odds_line', 'team_code') IS NULL
     ALTER TABLE dbo.odds_line ADD team_code NVARCHAR(16);
+GO
+IF COL_LENGTH('dbo.odds_line', 'game_pk') IS NULL   -- P3: StatsAPI game (best-effort)
+    ALTER TABLE dbo.odds_line ADD game_pk INT;
 GO
 
 -- ═══════════════════════════════════════════════════════════════════════════

@@ -166,6 +166,12 @@ prediction_log = Table(
     Column("player_mlb_id", String(32)),
     Column("team_code", String(16)),
     Column("player_key", String(200), nullable=False),
+    # P3: the StatsAPI game_pk the prop belongs to (nullable/best-effort, stamped
+    # by entity_resolver). Deliberately NOT in the UNIQUE key — identity stays
+    # player_key-based; prop_key + line already distinguish a player's many props
+    # in one game. NULL for NBA/NFL and for unresolved MLB rows (the P3 shadow
+    # signal); P4 enforces MLB-scoped non-NULL, P5 backfills legacy rows.
+    Column("game_pk", Integer),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player_key", "line",
                      name="uq_prediction_identity_v2"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
@@ -215,6 +221,7 @@ wagers = Table(
     Column("opponent_code", String(16)),
     Column("home_code", String(16)),
     Column("away_code", String(16)),
+    Column("game_pk", Integer),                           # P3: StatsAPI game (best-effort)
     UniqueConstraint("wager_id", name="uq_wager_id"),
     CheckConstraint(
         "status IN ('pending','won','lost','push','void')",
@@ -390,6 +397,7 @@ odds_line = Table(
     # SFBB cross-map enrichment (Phase 3, nullable/best-effort): id-based joins.
     Column("player_mlb_id", String(32)),
     Column("team_code", String(16)),
+    Column("game_pk", Integer),                        # P3: StatsAPI game (best-effort)
     Index("ix_odds_line_snapshot", "snapshot_id"),
 )
 
@@ -402,7 +410,7 @@ _PREDICTION_SPEC = [
     ("book", _s), ("resolved_at", _s),
     ("line", _f), ("raw_prob", _f), ("final_prob", _f), ("projected", _f),
     ("actual", _f),
-    ("price", _i), ("outcome", _i), ("batting_order", _i),
+    ("price", _i), ("outcome", _i), ("batting_order", _i), ("game_pk", _i),
     ("team", _s), ("player_mlb_id", _s), ("team_code", _s), ("player_key", _s),
     ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
@@ -418,7 +426,7 @@ _WAGER_SPEC = [
     ("model_edge", _f), ("close_line", _f), ("clv_pct", _f), ("profit", _f),
     ("executed_price", _i), ("model_price", _i), ("close_price", _i),
     ("player_mlb_id", _s), ("team_code", _s), ("opponent_code", _s),
-    ("home_code", _s), ("away_code", _s),
+    ("home_code", _s), ("away_code", _s), ("game_pk", _i),
 ]
 
 _BANKROLL_SPEC = [
@@ -1049,7 +1057,7 @@ def save_recal(sport_key, cfg):
 
 _ODDS_LINE_COLS = ("bet_type", "selection", "point", "player", "prop_key",
                    "direction", "price", "implied_prob",
-                   "player_mlb_id", "team_code")
+                   "player_mlb_id", "team_code", "game_pk")
 
 
 def capture_odds_snapshot(meta, lines):
@@ -1092,6 +1100,7 @@ def capture_odds_snapshot(meta, lines):
                     "implied_prob": _f(ln.get("implied_prob")),
                     "player_mlb_id": _s(ln.get("player_mlb_id")),
                     "team_code": _s(ln.get("team_code")),
+                    "game_pk": _i(ln.get("game_pk")),
                 } for ln in lines])
         return True
     except IntegrityError:

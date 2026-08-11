@@ -417,13 +417,21 @@ def mutate_ndjson_log(filename, mutator, max_retries=5, where=None):
 def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
                    projected=None, direction=None, price=None, book=None,
                    final_prob=None, event_id=None, commence_time=None,
-                   is_value=None, team=None, batting_order=None, write=True):
+                   is_value=None, team=None, batting_order=None,
+                   mlb_player_id=None, game_pk=None, ids_resolved=False,
+                   write=True):
     """Build and optionally append one prediction row. Best-effort, never raises.
 
     ``team`` and ``batting_order`` are the rule inputs the pick-rules ROI lens
     (pickrules_roi.py) re-derives the recommended slate from — they are not used
     by calibration. Both are optional; older rows logged without them leave the
     lens's team-based rules (Rule-of-3, opposing-team L3) reported as skipped.
+
+    ``mlb_player_id``/``game_pk``/``ids_resolved`` (P3): when the caller resolved
+    the player at the odds boundary via entity_resolver (``ids_resolved=True``),
+    the resolved MLBAM id (may be None on a fail-closed miss) + game_pk are stamped
+    verbatim and the weaker single-team SFBB fallback in _enrich_prediction_ids is
+    SUPPRESSED — a miss must stay NULL (the P3 shadow signal), not be re-guessed.
     """
     if not sport_key or not prop_key or not player or game_date is None:
         return
@@ -468,26 +476,35 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "actual": None,
         "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
     }
-    _enrich_prediction_ids(row)
+    row["game_pk"] = game_pk
+    if ids_resolved:
+        row["player_mlb_id"] = mlb_player_id     # resolver-authoritative (may be None)
+    _enrich_prediction_ids(row, trust_ids=ids_resolved)
     if write:
         log_prediction_rows([row])
     return row
 
 
-def _enrich_prediction_ids(row):
+def _enrich_prediction_ids(row, trust_ids=False):
     """Best-effort: stamp the SFBB MLBAM id + canonical team code onto a prediction
     row, then compute its hybrid player_key. MLB-only (an id-space that exists only
     for baseball; other sports keep player_mlb_id/team_code NULL and player_key
     falls back to name:<norm>). Fail-open — a missing map / SQL-off / unknown or
     ambiguous name leaves the id columns NULL. Never raises (log_prediction is
-    best-effort); mutates ``row`` in place and returns it."""
+    best-effort); mutates ``row`` in place and returns it.
+
+    ``trust_ids`` (P3): when True the caller already resolved player_mlb_id at the
+    odds boundary (two-team-hinted, fail-closed) — keep it VERBATIM and skip the
+    weaker single-team fallback here (which could bind where the stronger resolver
+    refused). team_code is still stamped; player_key is computed after either way."""
     row.setdefault("player_mlb_id", None)
     row.setdefault("team_code", None)
     try:
         if (row.get("sport_key") or "").startswith("baseball"):
             import player_id_map
-            row["player_mlb_id"] = player_id_map.mlb_id_for_name(
-                row.get("player"), teams=row.get("team"))
+            if not trust_ids:
+                row["player_mlb_id"] = player_id_map.mlb_id_for_name(
+                    row.get("player"), teams=row.get("team"))
             if row.get("team"):
                 row["team_code"] = player_id_map.team_code_for_name(row.get("team"))
     except Exception:                       # pragma: no cover - never break logging

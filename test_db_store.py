@@ -625,7 +625,7 @@ class SchemaParityTests(unittest.TestCase):
             {c.name for c in db_store.odds_line.columns},
             {"id", "snapshot_id", "bet_type", "selection", "point", "player",
              "prop_key", "direction", "price", "implied_prob",
-             "player_mlb_id", "team_code"})
+             "player_mlb_id", "team_code", "game_pk"})
 
     def test_player_key_prefers_mlb_id(self):
         self.assertEqual(

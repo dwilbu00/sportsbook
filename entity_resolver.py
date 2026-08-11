@@ -15,12 +15,14 @@ props with `... WHERE sport_key='baseball_mlb' AND player_mlb_id IS NULL`. P4
 flips enforcement (unresolved MLB → no prediction) once that blast radius is
 understood.
 
-Design (reuses the battle-tested pieces, no parallel ladder):
-  * MLBAM resolution = mlb_starters.find_player_id(name, season, teams=[home, away])
-    — SFBB id-map FIRST (disambiguates namesakes, folds accents, strips suffixes),
-    then the statsapi season-roster unique-exact match; the two-team hint breaks a
-    genuine namesake tie. It already returns None (fail-closed) on ambiguity — and
-    P3 finally feeds it BOTH teams (the live enrichers pass only one today).
+Design (SFBB-first, structurally fail-closed, no hot-path network):
+  * MLBAM resolution = player_id_map.mlb_id_for_name — bare name first (globally
+    unique → accept + bare-alias), else narrowed by the game's BOTH teams. The
+    two-team want-set is structurally fail-closed: a name shared by two players IN
+    THIS GAME stays None. Deliberately NOT find_player_id — its season-wide
+    unique-exact fallback could bind an in-game namesake merely absent from an
+    incomplete season index, and it fetches statsapi rosters (unwanted on the hot
+    prediction path). An SFBB-missing player → None = the P3 shadow signal.
   * game_pk = mlb_warehouse.find_game_pk_by_commence(home_id, away_id, commence)
     — nearest game_date to the odds commence time (series- and split-DH-robust).
   * player_alias is written ONLY for names that resolve GLOBALLY unambiguously
@@ -37,8 +39,10 @@ from __future__ import annotations
 import db_store
 import mlb_warehouse
 
-# Sport keys this resolver handles. NBA/NFL stay on the ESPN path untouched.
-_MLB_SPORT_KEYS = {"baseball_mlb"}
+# The MLB sport-key prefix this resolver handles (the Odds API + app key is
+# "baseball_mlb"). Other baseball keys (e.g. "baseball_kbo") and NBA/NFL stay on
+# the ESPN path untouched.
+_MLB_SPORT_PREFIX = "baseball_mlb"
 
 
 def _season_of(when):
@@ -66,7 +70,7 @@ def resolve(name, sport_key, home_team, away_team, game_date=None,
     unresolved (or absent — e.g. a doubleheader-ambiguous commence). MLB only;
     other sports and a blank name return unresolved. NEVER raises."""
     try:
-        if sport_key not in _MLB_SPORT_KEYS or not name:
+        if not str(sport_key or "").startswith(_MLB_SPORT_PREFIX) or not name:
             return _unresolved("non_mlb_or_no_name")
         season = season or _season_of(game_date or commence)
 
@@ -76,29 +80,32 @@ def resolve(name, sport_key, home_team, away_team, game_date=None,
         game_pk = (mlb_warehouse.find_game_pk_by_commence(home_id, away_id, commence)
                    if commence else None)
 
-        # MLBAM id: fail-closed SFBB + roster ladder with the two-team hint.
-        import mlb_starters
-        res = mlb_starters.find_player_id(name, season, teams=[home_team, away_team])
-        if not res:
+        # MLBAM id via the SFBB map, FAIL-CLOSED on namesake ambiguity. Try the
+        # bare name first (globally unique → safe to bare-alias); else narrow by the
+        # game's BOTH teams — structurally fail-closed: a name shared by two players
+        # IN THIS GAME stays None rather than risk a mis-bind. Deliberately SFBB-only
+        # (no statsapi roster fetch on the hot prediction path, and NO season-wide
+        # unique fallback, which could bind an in-game namesake that is merely absent
+        # from an incomplete season index). An SFBB-missing player → None = the P3
+        # shadow signal (review it, update the map), never a guess.
+        import player_id_map
+        mid_bare = player_id_map.mlb_id_for_name(name, teams=None)
+        mlb_id = mid_bare or player_id_map.mlb_id_for_name(
+            name, teams=[home_team, away_team])
+        if not mlb_id:
             return _unresolved("ambiguous_or_unknown", game_pk=game_pk)
-        mlb_id, is_pitcher = res
 
         # Record an audit alias ONLY when the name is globally unambiguous (safe to
-        # key by bare name). A name that only resolves via the team hint is a shared
-        # name → bare-aliasing it would later serve the wrong namesake, so skip it.
-        method = "roster_or_hinted"
-        try:
-            import player_id_map
-            if player_id_map.mlb_id_for_name(name, teams=None):
-                method = "sfbb_unique"
-                mlb_warehouse.record_player_alias(
-                    "oddsapi", db_store.normalize_name(name), mlb_id,
-                    confidence=1.0, method=method)
-        except Exception:
-            pass
+        # key by bare name). A name that only resolved via the team hint is shared →
+        # bare-aliasing it would later serve the wrong namesake, so skip the write.
+        method = "sfbb_unique" if mid_bare else "sfbb_hinted"
+        if mid_bare:
+            mlb_warehouse.record_player_alias(
+                "oddsapi", db_store.normalize_name(name), mlb_id,
+                confidence=1.0, method=method)
 
         return {"resolved": True, "mlb_player_id": str(mlb_id), "game_pk": game_pk,
-                "is_pitcher": is_pitcher, "confidence": 1.0, "method": method,
+                "is_pitcher": None, "confidence": 1.0, "method": method,
                 "reason": None}
     except Exception:
         return _unresolved("resolver_error")

@@ -125,8 +125,16 @@ def _enrich_ids(row):
         row["team_code"] = tc(row.get("team")) if row.get("team") else None
         row["opponent_code"] = tc(row.get("opponent")) if row.get("opponent") else None
         if row.get("player"):
-            row["player_mlb_id"] = player_id_map.mlb_id_for_name(
-                row.get("player"), teams=row.get("team"))
+            # P3: resolve player → (MLBAM id, game_pk) fail-closed with the game's
+            # BOTH teams as the namesake-tie hint (stronger than the old single-team
+            # SFBB call). An unresolved player keeps NULL ids (shadow signal).
+            import entity_resolver
+            ident = entity_resolver.resolve(
+                row.get("player"), row.get("sport_key"),
+                row.get("home_team"), row.get("away_team"),
+                game_date=row.get("game_date"), commence=row.get("commence_time"))
+            row["player_mlb_id"] = ident.get("mlb_player_id")
+            row["game_pk"] = ident.get("game_pk")
     except Exception:                       # pragma: no cover - never break submit
         pass
     return row

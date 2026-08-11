@@ -296,11 +296,23 @@ def _enrich_ids(sport, meta, lines):
         import player_id_map
         meta["home_code"] = player_id_map.team_code_for_name(meta.get("home"))
         meta["away_code"] = player_id_map.team_code_for_name(meta.get("away"))
-        prop_teams = (meta.get("home"), meta.get("away"))
+        # P3: resolve prop players → (MLBAM id, game_pk) fail-closed, once per
+        # player per snapshot (OVER/UNDER share the name), with the game's BOTH
+        # teams as the hint. Replaces the bare single-call mlb_id_for_name so the
+        # odds warehouse carries game_pk too. Team lines still get team_code.
+        import entity_resolver
+        _ident = {}
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
-                ln["player_mlb_id"] = player_id_map.mlb_id_for_name(
-                    ln.get("player"), teams=prop_teams)
+                nm = ln.get("player")
+                if nm not in _ident:
+                    _ident[nm] = entity_resolver.resolve(
+                        nm, sport, meta.get("home"), meta.get("away"),
+                        game_date=meta.get("game_date"),
+                        commence=meta.get("commence_time"),
+                        prop_key=ln.get("prop_key"))
+                ln["player_mlb_id"] = _ident[nm].get("mlb_player_id")
+                ln["game_pk"] = _ident[nm].get("game_pk")
             else:
                 ln["team_code"] = player_id_map.team_code_for_name(
                     ln.get("selection"))

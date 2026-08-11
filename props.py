@@ -950,6 +950,27 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     away_team_name = prop_data["away_team"]
     matchup = f"{away_team_name} @ {home_team_name}"
 
+    # P3: resolve each odds-feed player NAME → (MLBAM id, game_pk) ONCE per event,
+    # fail-closed, at the odds boundary (home/away/commence all in scope here).
+    # The resolved ids are stamped onto the prediction rows below; an unresolved
+    # MLB player keeps NULL ids (the shadow signal) — nothing is dropped yet
+    # (enforcement is P4). MLB only; cached across this event's prop loops.
+    _is_mlb_props = str(sport_key or "").startswith("baseball_mlb")
+    _ident_cache = {}
+
+    def _resolve_ident(pname):
+        if not _is_mlb_props:
+            return None
+        if pname not in _ident_cache:
+            try:
+                import entity_resolver
+                _ident_cache[pname] = entity_resolver.resolve(
+                    pname, sport_key, home_team_name, away_team_name,
+                    game_date=log_game_date, commence=commence_iso)
+            except Exception:               # never break analysis on a resolver hiccup
+                _ident_cache[pname] = None
+        return _ident_cache[pname]
+
     for prop_key, players in prop_data.get("props", {}).items():
         # Resolve per-prop knobs: calibration overrides the in-code defaults
         # where present, else fall back to the per-sport defaults.
@@ -1644,6 +1665,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # We log the *raw* (pre-Platt) probability — that's what Platt
             # was fit against and what subsequent refits should map.
             if log_game_date and sport_key and not lineup_out:
+                _ident = _resolve_ident(player_name)
                 prediction_row = log_prediction(
                     sport_key=sport_key,
                     event_id=prop_data.get("game_id"),
@@ -1661,6 +1683,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     is_value=is_value,
                     team=player_team_name,
                     batting_order=history.get("batting_order"),
+                    mlb_player_id=(_ident.get("mlb_player_id") if _ident else None),
+                    game_pk=(_ident.get("game_pk") if _ident else None),
+                    ids_resolved=bool(_ident),
                     write=False,
                 )
                 if prediction_row:
