@@ -1041,16 +1041,20 @@ def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
     return out
 
 
-def get_batter_game_log(athlete_id, season=None, as_of_date=None, limit=None):
+def get_batter_game_log(athlete_id, season=None, as_of_date=None, limit=None,
+                        exclude_game_types=None):
     """Most-recent-first StatsAPI-native batter per-game log (P2, dual-run)."""
     return _game_log(mlb_batter_game, _BATTER_GAME_STATS, athlete_id,
-                     season=season, as_of_date=as_of_date, limit=limit)
+                     season=season, as_of_date=as_of_date, limit=limit,
+                     exclude_game_types=exclude_game_types)
 
 
-def get_pitcher_game_log(athlete_id, season=None, as_of_date=None, limit=None):
+def get_pitcher_game_log(athlete_id, season=None, as_of_date=None, limit=None,
+                         exclude_game_types=None):
     """Most-recent-first StatsAPI-native pitcher per-game log (P2, dual-run)."""
     return _game_log(mlb_pitcher_game, _PITCHER_GAME_STATS, athlete_id,
-                     season=season, as_of_date=as_of_date, limit=limit)
+                     season=season, as_of_date=as_of_date, limit=limit,
+                     exclude_game_types=exclude_game_types)
 
 
 def _ip_to_outs(ip):
@@ -1206,6 +1210,46 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
         "team_name": names.get(own_team_id),
         "found": True,
     }
+
+
+def get_calib_gamelog(mlb_player_id, role, season=None):
+    """Per-game log in the ESPN cached_gamelog SHAPE (a list of per-game dicts,
+    most-recent-first) — the reshape the backtest/calibration real-line readers
+    consume (they walk + index-slice a raw per-game log), sourced from the warehouse
+    facts. role ∈ {'pitcher','batter'}.
+
+    Each dict keeps the role's stat-label keys (batter AB/H/SO/BB/HBP/SF/SH/HR/TB/RBI;
+    pitcher IP/K/ER — same names the readers key on) + is_home + game_date (ISO
+    string) + team_id (MLBAM), and ADDS ``opponent`` (DISPLAY NAME via _team_name_map
+    — load-bearing for the opp_defense weighting + park reconstruction) and
+    ``completed=True`` (a warehouse row exists only for a genuine-final). Current-
+    season by default AND spring/all-star/exhibition excluded (_NON_REGULAR_GAME_
+    TYPES), matching the ESPN reader's scope — an all-star game also carries a non-
+    team squad id absent from mlb_team, so excluding it avoids a None opponent /
+    garbage is_home in the fit. Fail-open → [] so the caller falls back to ESPN.
+
+    ⚠ Before FLIPPING the consumer (env flag), run a per-game-dict parity check — the
+    opponent NAME must match the PARK_FACTORS + team_defense keys (canonical StatsAPI
+    vs ESPN spelling), or those features silently no-op. Value parity is covered by
+    mlb_warehouse_parity.gamelog_parity."""
+    if not enabled() or not mlb_player_id:
+        return []
+    season = season if season is not None else _current_season()
+    rows = (get_pitcher_game_log(mlb_player_id, season=season,
+                                 exclude_game_types=_NON_REGULAR_GAME_TYPES)
+            if role == "pitcher"
+            else get_batter_game_log(mlb_player_id, season=season,
+                                     exclude_game_types=_NON_REGULAR_GAME_TYPES))
+    if not rows:
+        return []
+    names = _team_name_map()
+    out = []
+    for r in rows:
+        g = dict(r)
+        g["opponent"] = names.get(r.get("opponent_team_id"))
+        g["completed"] = True
+        out.append(g)
+    return out
 
 
 # ── P4 team-market model inputs: recent form / standings / team defense ───────

@@ -1077,6 +1077,46 @@ class GetPlayerHistoryTests(_Backend, unittest.TestCase):
         h = mlb_warehouse.get_player_history("1", "batter_hits", season=2024)
         self.assertEqual(h["values"], [1.0])                  # prior season excluded
 
+    # ── get_calib_gamelog: ESPN cached_gamelog SHAPE (per-game dicts) ──────────
+    def test_calib_gamelog_batter_shape(self):
+        self._game(200, "2024-04-01", "2024-04-01T18:00:00Z", home="147", away="111")
+        self._game(300, "2024-09-01", "2024-09-01T18:00:00Z", home="119", away="147")
+        self._batter("592450", 200, H=1.0, AB=4.0)            # home vs BOS
+        self._batter("592450", 300, H=2.0, AB=3.0)            # away @ LAD
+        log = mlb_warehouse.get_calib_gamelog("592450", "batter", season=2024)
+        self.assertEqual([g["H"] for g in log], [2.0, 1.0])          # newest-first
+        self.assertEqual(log[0]["opponent"], "Los Angeles Dodgers")  # opponent NAME
+        self.assertIs(log[0]["is_home"], False)                      # away @ LAD
+        self.assertTrue(all(g["completed"] is True for g in log))
+        self.assertEqual(log[0]["game_date"][:10], "2024-09-01")
+        self.assertEqual(log[0]["AB"], 3.0)
+
+    def test_calib_gamelog_pitcher_role(self):
+        self._game(400, "2024-07-04", "2024-07-04T18:00:00Z")
+        self._pitcher("543037", 400, IP=6.1, K=8.0, ER=2.0)
+        log = mlb_warehouse.get_calib_gamelog("543037", "pitcher", season=2024)
+        self.assertEqual(len(log), 1)
+        self.assertEqual((log[0]["IP"], log[0]["K"], log[0]["ER"]), (6.1, 8.0, 2.0))
+        self.assertNotIn("H", log[0])                    # pitcher log → no batter labels
+        self.assertEqual(log[0]["completed"], True)
+
+    def test_calib_gamelog_empty_and_disabled(self):
+        self.assertEqual(mlb_warehouse.get_calib_gamelog("nobody", "batter"), [])
+        db_store.configure_engine(None)
+        self.assertEqual(mlb_warehouse.get_calib_gamelog("592450", "batter"), [])
+
+    def test_calib_gamelog_excludes_non_regular(self):
+        # Spring/all-star/exhibition must NOT leak into the calibration log (matches
+        # the ESPN gamelog scope; all-star also carries a non-team squad id).
+        self._game(1, "2024-07-01", "2024-07-01T18:00:00Z")               # regular
+        self._game(2, "2024-07-16", "2024-07-16T18:00:00Z", game_type="A")  # all-star
+        self._game(3, "2024-03-01", "2024-03-01T18:00:00Z", game_type="S")  # spring
+        self._batter("592450", 1, H=1.0, AB=4.0)
+        self._batter("592450", 2, H=0.0, AB=1.0)
+        self._batter("592450", 3, H=3.0, AB=5.0)
+        log = mlb_warehouse.get_calib_gamelog("592450", "batter", season=2024)
+        self.assertEqual([g["game_date"][:10] for g in log], ["2024-07-01"])
+
 
 class PlayerInputParityTests(_Backend, unittest.TestCase):
     """The model-input shadow lens reads the STORED facts (not a fresh boxscore)

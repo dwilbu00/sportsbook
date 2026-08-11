@@ -10,6 +10,7 @@ Fully hermetic: no live ESPN / Odds API / Azure I/O. The selector is exercised
 on hand-crafted rows; the orchestration's store/join/save calls are mocked.
 """
 from datetime import date, timedelta
+import os
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -964,6 +965,51 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
         self.assertTrue(spy.called)
         _args, kwargs = spy.call_args
         self.assertIs(kwargs.get("roi_tiebreak"), True)
+
+
+class CalibWarehouseCutoverTests(unittest.TestCase):
+    """P4 calibration cutover: join_book_lines_to_actuals grades off the warehouse
+    per-game facts when ODI_MLB_WAREHOUSE_CALIB is on (MLB + mlb_id), else the ESPN
+    cached_gamelog path (flag OFF = byte-identical). The sweep engine is untouched."""
+
+    def test_calib_role_majority(self):
+        self.assertEqual(blc._calib_role(
+            [{"prop_key": "batter_hits"}, {"prop_key": "batter_strikeouts"}]),
+            "batter")
+        self.assertEqual(blc._calib_role(
+            [{"prop_key": "pitcher_strikeouts"}, {"prop_key": "pitcher_outs"}]),
+            "pitcher")
+        self.assertEqual(blc._calib_role(                        # tie → batter
+            [{"prop_key": "pitcher_outs"}, {"prop_key": "batter_hits"}]),
+            "batter")
+
+    def _book_line(self):
+        return {"player": "Aaron Judge", "player_mlb_id": "592450",
+                "prop_key": "batter_hits", "line": 0.5,
+                "game_date": "2024-07-04T18:00:00Z"}
+
+    def _run(self, flag):
+        # warehouse log dated OFF the book line → row is skipped after the fetch,
+        # so we assert only the SOURCE routing (no downstream projection).
+        wh_log = [{"game_date": "2024-06-01T18:00:00Z", "H": 1.0, "AB": 4.0,
+                   "opponent": "Boston Red Sox", "is_home": True, "completed": True}]
+        with patch.dict(os.environ, {blc._MLB_WAREHOUSE_CALIB_ENV: flag}), \
+             patch.object(blc, "cached_athlete_id", return_value="e1"), \
+             patch("player_id_map.espn_id_for_mlb_id", return_value=None), \
+             patch("mlb_warehouse.get_calib_gamelog", return_value=wh_log) as wh, \
+             patch.object(blc, "cached_gamelog", return_value=[]) as esp:
+            blc.join_book_lines_to_actuals([self._book_line()], "baseball", "mlb")
+        return wh, esp
+
+    def test_flag_on_uses_warehouse(self):
+        wh, esp = self._run("1")
+        wh.assert_called_once_with("592450", "batter")
+        esp.assert_not_called()
+
+    def test_flag_off_uses_espn(self):
+        wh, esp = self._run("")
+        wh.assert_not_called()
+        esp.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -335,6 +335,28 @@ def _stat_label_for(prop_key, gamelog):
 # (their bucket TTL stays immutably long).
 CALIB_GAMELOG_TTL_HOURS = 6
 
+# P4 calibration cutover (default OFF): grade real-line fits off the StatsAPI
+# warehouse per-game facts instead of the ESPN cached_gamelog. Ships GATED OFF while
+# the warehouse backfill runs; fail-open to ESPN. Scope is the real-line join only —
+# the synthetic-sweep backtest engine stays on ESPN (its park/reliability/defense
+# apparatus is ESPN-team-id-keyed). ⚠ run a per-game-dict opponent-NAME parity check
+# before flipping (opp_defense + park key on the opponent name).
+_MLB_WAREHOUSE_CALIB_ENV = "ODI_MLB_WAREHOUSE_CALIB"
+
+
+def _warehouse_calib_enabled():
+    return os.environ.get(_MLB_WAREHOUSE_CALIB_ENV, "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def _calib_role(rows):
+    """batter vs pitcher for the warehouse log fetch — the majority role across a
+    player's book lines (ties → batter). _role_matches_gamelog drops any cross-role
+    rows downstream, mirroring the ESPN one-log-per-player behavior."""
+    pitcher = sum(1 for r in rows
+                  if str(r.get("prop_key") or "").startswith("pitcher_"))
+    return "pitcher" if pitcher > (len(rows) - pitcher) else "batter"
+
 
 def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
@@ -370,9 +392,21 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         if not aid:
             skipped_no_player += len(rows)
             continue
-        gamelog = cached_gamelog(espn_sport, espn_league, aid,
-                                 ttl_hours=CALIB_GAMELOG_TTL_HOURS,
-                                 player_name=player)
+        # P4 cutover (env-gated, MLB-only, fail-open): grade off the warehouse per-
+        # game facts when enabled + the book line carries a MLBAM id; else the ESPN
+        # cached_gamelog path, unchanged. Flag OFF → byte-identical.
+        gamelog = None
+        if _warehouse_calib_enabled() and espn_sport == "baseball" and mlb_id:
+            try:
+                import mlb_warehouse
+                gamelog = mlb_warehouse.get_calib_gamelog(
+                    mlb_id, _calib_role(rows)) or None
+            except Exception:
+                gamelog = None
+        if not gamelog:
+            gamelog = cached_gamelog(espn_sport, espn_league, aid,
+                                     ttl_hours=CALIB_GAMELOG_TTL_HOURS,
+                                     player_name=player)
         if not gamelog:
             skipped_no_player += len(rows)
             continue
