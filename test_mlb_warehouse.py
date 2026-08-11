@@ -7,6 +7,7 @@ diff core. No network — the fetchers are monkeypatched to return fixtures.
 """
 
 import copy
+import datetime
 import json
 import unittest
 from unittest import mock
@@ -749,6 +750,123 @@ class GetActualStatTests(_Backend, unittest.TestCase):
     def test_none_ids_return_none(self):
         self.assertIsNone(mlb_warehouse.get_actual_stat(None, 700, "batter_hits"))
         self.assertIsNone(mlb_warehouse.get_actual_stat("b1", None, "batter_hits"))
+
+
+# ───────────────────── P4 unified resolution (refresh active / freeze historical)
+class ResolveActualTests(_Backend, unittest.TestCase):
+    """resolve_actual: refresh a recent/active game, read a settled game frozen."""
+
+    def _game(self, hours_ago):
+        gd = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(hours=hours_ago)).isoformat()
+        return {"game_date": gd, "status": "Final", "detailed_state": "Final"}
+
+    def test_historical_reads_frozen_no_refresh(self):
+        with mock.patch.object(mlb_warehouse, "get_game",
+                               return_value=self._game(100)), \
+             mock.patch.object(mlb_warehouse, "_fact_captured_after",
+                               return_value=True), \
+             mock.patch.object(mlb_warehouse, "refresh_game_facts") as refresh, \
+             mock.patch.object(mlb_warehouse, "get_actual_stat", return_value=2.0):
+            v = mlb_warehouse.resolve_actual("b1", 700, "batter_hits")
+        self.assertEqual(v, 2.0)
+        refresh.assert_not_called()             # frozen — no network
+
+    def test_active_recent_refreshes_short_ttl(self):
+        with mock.patch.object(mlb_warehouse, "get_game",
+                               return_value=self._game(2)), \
+             mock.patch.object(mlb_warehouse, "refresh_game_facts") as refresh, \
+             mock.patch.object(mlb_warehouse, "get_actual_stat", return_value=1.0):
+            v = mlb_warehouse.resolve_actual("b1", 700, "batter_hits")
+        self.assertEqual(v, 1.0)
+        refresh.assert_called_once()
+        self.assertTrue(refresh.call_args.kwargs["active"])   # short-TTL refresh
+
+    def test_crossed_window_not_post_refreshed_forces_fresh(self):
+        with mock.patch.object(mlb_warehouse, "get_game",
+                               return_value=self._game(100)), \
+             mock.patch.object(mlb_warehouse, "_fact_captured_after",
+                               return_value=False), \
+             mock.patch.object(mlb_warehouse, "refresh_game_facts") as refresh, \
+             mock.patch.object(mlb_warehouse, "get_actual_stat", return_value=3.0):
+            v = mlb_warehouse.resolve_actual("b1", 700, "batter_hits")
+        self.assertEqual(v, 3.0)
+        refresh.assert_called_once()
+        self.assertFalse(refresh.call_args.kwargs["active"])  # one forced-fresh refresh
+
+    def test_game_not_in_warehouse_returns_none(self):
+        with mock.patch.object(mlb_warehouse, "get_game", return_value=None):
+            self.assertIsNone(mlb_warehouse.resolve_actual("b1", 700, "batter_hits"))
+
+    def test_unsupported_prop_returns_none(self):
+        self.assertIsNone(
+            mlb_warehouse.resolve_actual("b1", 700, "batter_home_runs"))
+
+
+class RefreshGameFactsTests(_Backend, unittest.TestCase):
+    def test_refresh_writes_facts_from_boxscore(self):
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "111"):
+                conn.execute(insert(mlb_warehouse.mlb_team),
+                             {"team_id": tid, "name": tid})
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 745804, "official_date": "2024-07-04",
+                "game_date": "2024-07-04T17:10:00Z", "home_team_id": "147",
+                "away_team_id": "111", "season": 2024,
+                "status": "Final", "detailed_state": "Final"})
+        with mock.patch.object(mlb_warehouse, "fetch_boxscore",
+                               return_value=BOXSCORE):
+            ok = mlb_warehouse.refresh_game_facts(745804, active=True)
+        self.assertTrue(ok)
+        self.assertEqual(_count(mlb_warehouse.mlb_batter_game), 2)   # Judge + Devers
+        self.assertEqual(_count(mlb_warehouse.mlb_pitcher_game), 1)  # Cole
+
+    def test_refresh_non_final_is_noop(self):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 999, "official_date": "2024-07-04",
+                "game_date": "2024-07-04T17:10:00Z", "status": "Live",
+                "detailed_state": "In Progress"})
+        with mock.patch.object(mlb_warehouse, "fetch_boxscore") as fb:
+            ok = mlb_warehouse.refresh_game_facts(999, active=True)
+        self.assertFalse(ok)
+        fb.assert_not_called()                  # never fetch a non-final box
+
+    def _seed_judge(self, fetched_at):
+        # game + teams + a pre-existing Judge fact matching the BOXSCORE exactly
+        # (so an unchanged re-pull is a genuine no-op) with a KNOWN old fetched_at.
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "111"):
+                conn.execute(insert(mlb_warehouse.mlb_team),
+                             {"team_id": tid, "name": tid})
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 745804, "official_date": "2024-07-04",
+                "game_date": "2024-07-04T17:10:00Z", "home_team_id": "147",
+                "away_team_id": "111", "season": 2024,
+                "status": "Final", "detailed_state": "Final"})
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": "592450", "game_pk": 745804, "team_id": "147",
+                "season_bucket": 2024, "AB": 4.0, "H": 2.0, "SO": 1.0, "BB": 1.0,
+                "HBP": 0.0, "SF": 0.0, "SH": 0.0, "fetched_at": fetched_at})
+
+    def _judge(self):
+        return next(r._mapping for r in _rows(mlb_warehouse.mlb_batter_game)
+                    if r._mapping["athlete_id"] == "592450")
+
+    def test_post_window_refresh_advances_fetched_at(self):
+        # active=False must bump fetched_at even on an UNCHANGED box → this is what
+        # flips the game to HISTORICAL/frozen in resolve_actual.
+        self._seed_judge(1000.0)
+        with mock.patch.object(mlb_warehouse, "fetch_boxscore", return_value=BOXSCORE):
+            mlb_warehouse.refresh_game_facts(745804, active=False)
+        self.assertGreater(self._judge()["fetched_at"], 1000.0)
+
+    def test_active_refresh_keeps_fetched_at_when_unchanged(self):
+        # active=True on an unchanged box is a no-op — no fetched_at churn.
+        self._seed_judge(1000.0)
+        with mock.patch.object(mlb_warehouse, "fetch_boxscore", return_value=BOXSCORE):
+            mlb_warehouse.refresh_game_facts(745804, active=True)
+        self.assertEqual(self._judge()["fetched_at"], 1000.0)
 
 
 if __name__ == "__main__":

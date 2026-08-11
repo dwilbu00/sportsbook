@@ -300,13 +300,15 @@ def fetch_schedule(date):
     return data
 
 
-def fetch_boxscore(game_pk):
-    """Raw /game/{gamePk}/boxscore payload. Only fetched for genuine-final games
-    (immutable) → long cache."""
+def fetch_boxscore(game_pk, max_age=_SCHED_FINAL_TTL):
+    """Raw /game/{gamePk}/boxscore payload. A genuine-final box is immutable → the
+    default long cache; grading a recent ("active") game passes a SHORT max_age (or
+    0) to pick up official-scorer corrections before they settle."""
     cache = f"warehouse_boxscore_{game_pk}"
-    cached = mlb_starters._read_cache(cache, max_age=_SCHED_FINAL_TTL)
-    if cached is not None:
-        return cached
+    if max_age:
+        cached = mlb_starters._read_cache(cache, max_age=max_age)
+        if cached is not None:
+            return cached
     data = mlb_starters._get(f"game/{game_pk}/boxscore")
     mlb_starters._write_cache(cache, data)
     return data
@@ -606,7 +608,7 @@ def _valid_game_fact(r):
             and r.get("game_pk") is not None and bool(r.get("team_id")))
 
 
-def _write_game_facts(conn, box, game):
+def _write_game_facts(conn, box, game, touch_fetched_at=False):
     """Persist the StatsAPI-native per-game batter/pitcher stat lines for one
     boxscore into mlb_batter_game / mlb_pitcher_game (game-centric, MLBAM +
     game_pk native). Per-row surgical upsert scoped to (athlete_id, game_pk) — the
@@ -623,9 +625,17 @@ def _write_game_facts(conn, box, game):
     # Batched upsert scoped to this game_pk (all a boxscore's rows share it): one
     # existing-read + one bulk INSERT per table instead of a round-trip per player.
     # Never deletes — matches the P2 per-row behavior, just set-based.
+    #
+    # ``touch_fetched_at`` — normally fetched_at is an ignore_col (an idempotent
+    # re-ingest of an unchanged final box is a no-op, no churn). The P4 post-window
+    # "freeze" refresh passes True so fetched_at IS advanced even when the box is
+    # unchanged — that advance is what flips the game to HISTORICAL (frozen, 0
+    # network) in resolve_actual; without it the freeze would never fire and every
+    # >48h grade would re-fetch forever.
+    ignore = () if touch_fetched_at else ("fetched_at",)
     for table, rows in ((mlb_batter_game, batters), (mlb_pitcher_game, pitchers)):
         db_store.upsert_bulk(conn, table, rows, ("athlete_id", "game_pk"),
-                             scope={"game_pk": gpk}, ignore_cols=("fetched_at",))
+                             scope={"game_pk": gpk}, ignore_cols=ignore)
     return len(batters), len(pitchers)
 
 
@@ -1017,6 +1027,102 @@ def get_actual_stat(mlb_player_id, game_pk, prop_key):
         return None
     val = float(r[0])
     return _ip_to_outs(val) if xform == "ip_to_outs" else val
+
+
+# ── P4 unified resolution: refresh an ACTIVE game, freeze a HISTORICAL one ─────
+_HISTORICAL_MIN_AGE_HOURS = 48   # after this (+ one post-window refresh) → frozen
+_BOXSCORE_ACTIVE_TTL = 900       # a recent game's box is re-pulled at most this often
+
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _fact_captured_after(game_pk, game_dt, hours):
+    """True if this game's facts were captured >= game_dt + hours ago — i.e. the
+    one post-correction-window refresh has happened, so the fact is now frozen/
+    historical. False when no fact exists yet or it was captured in-window."""
+    try:
+        cutoff = (game_dt + datetime.timedelta(hours=hours)).timestamp()
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            for tbl in (mlb_batter_game, mlb_pitcher_game):
+                r = conn.execute(
+                    select(tbl.c.fetched_at)
+                    .where(tbl.c.game_pk == int(game_pk)).limit(1)).first()
+                if r is not None and r[0] is not None:
+                    return float(r[0]) >= cutoff
+        return False
+    except (OperationalError, ValueError, TypeError):
+        return False
+
+
+def refresh_game_facts(game_pk, active=True):
+    """Re-pull ONE genuine-final game's boxscore and re-upsert its batter/pitcher
+    facts so the warehouse reflects the settled line. ``active`` uses a short cache
+    (a recent game, corrections may still land); ``active=False`` forces a fresh
+    pull — the single post-window refresh that freezes a game as historical.
+    Returns True if facts were (re)written. Fail-open; a no-op if the game isn't in
+    mlb_game or isn't genuine-final."""
+    if not enabled():
+        return False
+    try:
+        game = get_game(game_pk)
+        if not game or not mlb_starters._is_genuine_final(
+                {"status": game.get("status"),
+                 "detailedState": game.get("detailed_state")}):
+            return False
+        box = fetch_boxscore(game_pk, max_age=_BOXSCORE_ACTIVE_TTL if active else 0)
+        engine = db_store.get_engine()
+        with _WRITE_LOCK:
+            for attempt in range(3):
+                try:
+                    with engine.begin() as conn:
+                        # The post-window (active=False) refresh advances fetched_at
+                        # so the game freezes → subsequent grades are 0-network.
+                        _write_game_facts(conn, box, game,
+                                          touch_fetched_at=not active)
+                    return True
+                except OperationalError:
+                    if attempt == 2:
+                        raise
+    except Exception:
+        return False
+    return False
+
+
+def resolve_actual(mlb_player_id, game_pk, prop_key):
+    """Unified grading read (P4): resolve a prop's actual FROM THE WAREHOUSE, first
+    refreshing a still-correctable game from a fresh boxscore so the database is the
+    single source of truth.
+
+    * HISTORICAL (>= _HISTORICAL_MIN_AGE_HOURS final AND its fact already captured
+      after that window) → read the frozen fact, ZERO network.
+    * ACTIVE (recent) or a just-crossed game whose fact predates the window → one
+      refresh (fresh boxscore → merged facts), then read.
+
+    Returns the value (a real 0 → 0.0), or None (unsupported prop / game not in the
+    warehouse / not final / player DNP) so the caller can fall back to the live
+    per-player path. Fail-open (never raises)."""
+    if (_ACTUAL_STAT_SPEC.get(prop_key) is None or not mlb_player_id
+            or game_pk is None or not enabled()):
+        return None
+    try:
+        game = get_game(game_pk)
+        if not game:                         # schedule not ingested → live fallback
+            return None
+        gd = _parse_ts(game.get("game_date"))
+        active = True
+        if gd is not None:
+            age_h = (_utcnow() - gd).total_seconds() / 3600.0
+            if (age_h >= _HISTORICAL_MIN_AGE_HOURS
+                    and _fact_captured_after(game_pk, gd, _HISTORICAL_MIN_AGE_HOURS)):
+                return get_actual_stat(mlb_player_id, game_pk, prop_key)  # frozen
+            active = age_h < _HISTORICAL_MIN_AGE_HOURS
+        refresh_game_facts(game_pk, active=active)
+        return get_actual_stat(mlb_player_id, game_pk, prop_key)
+    except Exception:
+        return None
 
 
 def _fmt(summary):
