@@ -120,5 +120,50 @@ class ResolveTests(_Backend, unittest.TestCase):
         self.assertIsNone(r["game_pk"])
 
 
+class GapFillTests(_Backend, unittest.TestCase):
+    """On a game_pk miss, resolve ingests that date's schedule once, then retries."""
+
+    def test_gap_fill_on_miss_then_retry(self):
+        er._GAP_FILLED.clear()
+        seq = iter([None, 700])            # miss, then hit after the gap-fill ingest
+        with mock.patch.object(mlb_warehouse, "team_id_for_name", return_value="147"), \
+             mock.patch.object(mlb_warehouse, "find_game_pk_by_commence",
+                               side_effect=lambda *a: next(seq)), \
+             mock.patch.object(mlb_warehouse, "ingest_date") as ing, \
+             mock.patch("player_id_map.mlb_id_for_name", return_value="592450"):
+            r = er.resolve("Aaron Judge", "baseball_mlb", "New York Yankees",
+                           "Boston Red Sox", commence="2026-08-09T23:00:00Z")
+        self.assertEqual(r["game_pk"], 700)
+        ing.assert_called()                # gap-fill ingested the schedule (no boxscores)
+        self.assertFalse(ing.call_args.kwargs.get("with_boxscores", True))
+
+    def test_gap_fill_deduped_per_process(self):
+        er._GAP_FILLED.clear()
+        with mock.patch.object(mlb_warehouse, "team_id_for_name", return_value="147"), \
+             mock.patch.object(mlb_warehouse, "find_game_pk_by_commence",
+                               return_value=None), \
+             mock.patch.object(mlb_warehouse, "ingest_date") as ing, \
+             mock.patch("player_id_map.mlb_id_for_name", return_value="592450"):
+            er.resolve("X", "baseball_mlb", "New York Yankees", "Boston Red Sox",
+                       commence="2026-08-09T23:00:00Z")
+            n1 = ing.call_count
+            er.resolve("Y", "baseball_mlb", "New York Yankees", "Boston Red Sox",
+                       commence="2026-08-09T23:00:00Z")
+            n2 = ing.call_count
+        self.assertEqual(n1, n2)           # same date already gap-filled → no re-ingest
+
+    def test_no_gap_fill_when_game_pk_hits(self):
+        er._GAP_FILLED.clear()
+        with mock.patch.object(mlb_warehouse, "team_id_for_name", return_value="147"), \
+             mock.patch.object(mlb_warehouse, "find_game_pk_by_commence",
+                               return_value=700), \
+             mock.patch.object(mlb_warehouse, "ingest_date") as ing, \
+             mock.patch("player_id_map.mlb_id_for_name", return_value="592450"):
+            r = er.resolve("Aaron Judge", "baseball_mlb", "New York Yankees",
+                           "Boston Red Sox", commence="2026-08-09T23:00:00Z")
+        self.assertEqual(r["game_pk"], 700)
+        ing.assert_not_called()            # already resolvable → no ingest on the hot path
+
+
 if __name__ == "__main__":
     unittest.main()

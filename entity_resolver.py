@@ -36,6 +36,8 @@ Every path is defensive — the resolver NEVER raises into the live prediction p
 
 from __future__ import annotations
 
+import datetime
+
 import db_store
 import mlb_warehouse
 
@@ -43,6 +45,34 @@ import mlb_warehouse
 # "baseball_mlb"). Other baseball keys (e.g. "baseball_kbo") and NBA/NFL stay on
 # the ESPN path untouched.
 _MLB_SPORT_PREFIX = "baseball_mlb"
+
+
+_GAP_FILLED = set()   # official dates whose schedule we've gap-ingested this process
+
+
+def _gap_fill_schedule(commence):
+    """On a game_pk miss, ingest the SCHEDULE (no boxscores) for the date(s) around
+    ``commence`` — the UTC date and the day before, covering the UTC/local official-
+    date slippage find_game_pk_by_commence tolerates — so a same-day-added game
+    becomes resolvable. Each date is ingested at most ONCE per process (a genuine
+    odds/StatsAPI mismatch won't re-fetch forever). Cheap + fail-open; returns True
+    if any date was (re)ingested."""
+    try:
+        base = datetime.date.fromisoformat(str(commence)[:10])
+    except (TypeError, ValueError):
+        return False
+    did = False
+    for delta in (0, -1):
+        d = (base + datetime.timedelta(days=delta)).isoformat()
+        if d in _GAP_FILLED:
+            continue
+        _GAP_FILLED.add(d)
+        try:
+            mlb_warehouse.ingest_date(d, with_boxscores=False)
+            did = True
+        except Exception:
+            pass
+    return did
 
 
 def _season_of(when):
@@ -78,7 +108,19 @@ def resolve(name, sport_key, home_team, away_team, game_date=None,
         home_id = mlb_warehouse.team_id_for_name(home_team)
         away_id = mlb_warehouse.team_id_for_name(away_team)
         game_pk = (mlb_warehouse.find_game_pk_by_commence(home_id, away_id, commence)
-                   if commence else None)
+                   if commence and home_id and away_id else None)
+        # Only-on-miss gap-fill: the odds feed drives the slate, so a same-day-added
+        # game may not be in mlb_game yet → no game_pk to stamp. Ingest that date's
+        # SCHEDULE once (cheap, no boxscores), then retry. Deduped per process +
+        # fail-open, so it never re-fetches a genuine odds/StatsAPI mismatch nor
+        # taxes the hot path in the common (already-ingested) case.
+        if game_pk is None and commence:
+            if _gap_fill_schedule(commence):
+                home_id = home_id or mlb_warehouse.team_id_for_name(home_team)
+                away_id = away_id or mlb_warehouse.team_id_for_name(away_team)
+                if home_id and away_id:
+                    game_pk = mlb_warehouse.find_game_pk_by_commence(
+                        home_id, away_id, commence)
 
         # MLBAM id via the SFBB map, FAIL-CLOSED on namesake ambiguity. Try the
         # bare name first (globally unique → safe to bare-alias); else narrow by the

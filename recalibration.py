@@ -2143,6 +2143,17 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
     keeps the default (80) to stay responsive + ESPN-polite; an offline drain
     (forward_tracker --resolve --max-resolve N) can pass a high value to clear a
     backlog in one run."""
+    # P4: keep the StatsAPI warehouse current BEFORE resolving — pull recent finals'
+    # facts + flip their statuses to Final (so grading takes the warehouse path) and
+    # pre-load upcoming schedule (so new predictions get a game_pk). MLB-only,
+    # fail-open: a warehouse hiccup must never block resolution/refit. Rate-bounded
+    # by the hourly maybe_auto_refit gate + idempotent/cached ingestion.
+    if sport_key == "baseball_mlb":
+        try:
+            import mlb_warehouse
+            mlb_warehouse.ingest_maintenance()
+        except Exception:               # pragma: no cover - never block maintenance
+            pass
     newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
     # Team-market forecasts resolve alongside props but are kept OUT of the
     # newly_resolved count (that gates the prop Platt refit; team markets have no

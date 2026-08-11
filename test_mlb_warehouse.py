@@ -869,5 +869,43 @@ class RefreshGameFactsTests(_Backend, unittest.TestCase):
         self.assertEqual(self._judge()["fetched_at"], 1000.0)
 
 
+# ──────────────────────────────── P4 auto-ingest maintenance (window + stragglers)
+class IngestMaintenanceTests(_Backend, unittest.TestCase):
+    def test_covers_window_and_stragglers(self):
+        today = datetime.date.fromisoformat(mlb_warehouse._today())
+        straggler = (today - datetime.timedelta(days=5)).isoformat()   # past, not Final
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 50, "official_date": straggler,
+                "game_date": straggler + "T18:00:00Z", "status": "Live"})
+        called = []
+        with mock.patch.object(mlb_warehouse, "ingest_date",
+                               side_effect=lambda d, **k: called.append(d) or
+                               {"games": 0, "batter_rows": 0, "pitcher_rows": 0}):
+            mlb_warehouse.ingest_maintenance(days_back=2, days_forward=2)
+        for d in range(-2, 3):                         # rolling window present
+            self.assertIn((today + datetime.timedelta(days=d)).isoformat(), called)
+        self.assertIn(straggler, called)               # straggler swept in
+
+    def test_final_straggler_not_swept(self):
+        today = datetime.date.fromisoformat(mlb_warehouse._today())
+        old_final = (today - datetime.timedelta(days=6)).isoformat()
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 51, "official_date": old_final,
+                "game_date": old_final + "T18:00:00Z", "status": "Final"})
+        called = []
+        with mock.patch.object(mlb_warehouse, "ingest_date",
+                               side_effect=lambda d, **k: called.append(d) or {}):
+            mlb_warehouse.ingest_maintenance(days_back=1, days_forward=0)
+        self.assertNotIn(old_final, called)            # already Final → not re-swept
+
+    def test_fail_open(self):
+        with mock.patch.object(mlb_warehouse, "ingest_date",
+                               side_effect=RuntimeError("boom")):
+            summary = mlb_warehouse.ingest_maintenance(days_back=1, days_forward=0)
+        self.assertEqual(summary["dates"], 0)          # all failed, but no raise
+
+
 if __name__ == "__main__":
     unittest.main()

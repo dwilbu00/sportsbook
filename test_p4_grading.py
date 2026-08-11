@@ -4,6 +4,7 @@ reads a settled game frozen); the live per-player path is the fail-open fallback
 and the per-pass cap bounds ONLY that fallback. mlb_warehouse / the live path are
 monkeypatched (no DB or network touched)."""
 
+import time
 import unittest
 from unittest.mock import patch
 
@@ -89,6 +90,36 @@ class ResolvePendingCapTests(unittest.TestCase):
                                                        max_to_resolve=2)
         self.assertEqual(live.call_count, 2)   # live fallback capped at 2
         self.assertEqual(n, 2)
+
+
+class MaintainSportIngestTests(unittest.TestCase):
+    """maintain_sport runs the warehouse maintenance ingest for MLB (fail-open),
+    and never for NBA/NFL."""
+
+    def _run(self, sport_key):
+        with patch("mlb_warehouse.ingest_maintenance") as ing, \
+             patch("recalibration.resolve_pending_outcomes", return_value=0), \
+             patch("recalibration.resolve_pending_market_outcomes", return_value=0), \
+             patch("recalibration._load_recal_cached", return_value=(time.time(), {})), \
+             patch("recalibration.compact_prediction_log"):
+            recalibration.maintain_sport(sport_key)
+        return ing
+
+    def test_mlb_runs_maintenance_ingest(self):
+        self.assertTrue(self._run("baseball_mlb").called)
+
+    def test_nba_skips_maintenance_ingest(self):
+        self.assertFalse(self._run("basketball_nba").called)
+
+    def test_ingest_failure_does_not_block_resolution(self):
+        with patch("mlb_warehouse.ingest_maintenance",
+                   side_effect=RuntimeError("boom")), \
+             patch("recalibration.resolve_pending_outcomes", return_value=0) as res, \
+             patch("recalibration.resolve_pending_market_outcomes", return_value=0), \
+             patch("recalibration._load_recal_cached", return_value=(time.time(), {})), \
+             patch("recalibration.compact_prediction_log"):
+            recalibration.maintain_sport("baseball_mlb")   # must not raise
+        res.assert_called_once()                           # resolution still ran
 
 
 if __name__ == "__main__":

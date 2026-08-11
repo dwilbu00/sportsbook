@@ -743,6 +743,51 @@ def ingest_range(start, end, with_boxscores=True):
     return results
 
 
+def ingest_maintenance(days_back=2, days_forward=2, straggler_days=14):
+    """Keep the warehouse current for grading + game_pk stamping. Ingests a rolling
+    [today-days_back .. today+days_forward] window (schedule + boxscores → recent
+    finals' facts + upcoming schedule so new predictions can be stamped), PLUS any
+    past game still not marked Final within straggler_days (catches a
+    suspended/resumed game or an ingestion gap of any recent age). MLB-only,
+    idempotent (batched no-op upserts + cached fetches), fail-open per date. Meant
+    to be called from the app's already-hourly maintenance. Returns a summary."""
+    summary = {"dates": 0, "games": 0, "batter_rows": 0, "pitcher_rows": 0,
+               "skipped": not enabled()}
+    if not enabled():
+        return summary
+    today = _today()
+    try:
+        t = datetime.date.fromisoformat(today)
+    except (TypeError, ValueError):
+        return summary
+    dates = {(t + datetime.timedelta(days=d)).isoformat()
+             for d in range(-days_back, days_forward + 1)}
+    # Stragglers: past games the warehouse still doesn't have as Final (bounded so
+    # a genuinely-terminal postponed/cancelled game isn't re-fetched forever).
+    try:
+        lo = (t - datetime.timedelta(days=straggler_days)).isoformat()
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(mlb_game.c.official_date).where(
+                    (mlb_game.c.official_date >= lo)
+                    & (mlb_game.c.official_date < today)
+                    & (mlb_game.c.status != "Final")).distinct()).fetchall()
+        dates.update(r[0] for r in rows if r[0])
+    except (OperationalError, ValueError, TypeError):
+        pass
+    for date in sorted(dates):
+        try:
+            res = ingest_date(date)
+            summary["dates"] += 1
+            summary["games"] += res.get("games", 0)
+            summary["batter_rows"] += res.get("batter_rows", 0)
+            summary["pitcher_rows"] += res.get("pitcher_rows", 0)
+        except Exception:
+            continue
+    return summary
+
+
 def ingest_standings(season=None, as_of_date=None):
     """Snapshot /standings for a season into mlb_team_standings (as-of today)."""
     season = int(season) if season else _current_season()
