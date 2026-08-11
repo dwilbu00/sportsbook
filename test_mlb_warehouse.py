@@ -700,5 +700,56 @@ class P3SupportTests(_Backend, unittest.TestCase):
         self.assertEqual(_count(mlb_warehouse.player_alias), 0)
 
 
+# ─────────────────────────────── P4 grading fast path (actual-stat reader)
+class GetActualStatTests(_Backend, unittest.TestCase):
+    """get_actual_stat reads a graded prop's actual straight from the game facts."""
+
+    def setUp(self):
+        super().setUp()
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "111"):
+                conn.execute(insert(mlb_warehouse.mlb_team),
+                             {"team_id": tid, "name": tid})
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 700, "official_date": "2026-08-09",
+                "game_date": "2026-08-09T23:05:00Z", "home_team_id": "147",
+                "away_team_id": "111", "season": 2026})
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": "b1", "game_pk": 700, "team_id": "147",
+                "season_bucket": 2026, "H": 2.0, "SO": 1.0})
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": "b0", "game_pk": 700, "team_id": "147",
+                "season_bucket": 2026, "H": 0.0, "SO": 0.0})   # a real 0
+            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
+                "athlete_id": "p1", "game_pk": 700, "team_id": "147",
+                "season_bucket": 2026, "K": 8.0, "ER": 2.0, "IP": 6.1})
+
+    def test_batter_and_pitcher_stats(self):
+        gs = mlb_warehouse.get_actual_stat
+        self.assertEqual(gs("b1", 700, "batter_hits"), 2.0)
+        self.assertEqual(gs("b1", 700, "batter_strikeouts"), 1.0)
+        self.assertEqual(gs("p1", 700, "pitcher_strikeouts"), 8.0)
+        self.assertEqual(gs("p1", 700, "pitcher_earned_runs"), 2.0)
+
+    def test_pitcher_outs_converts_ip_base3(self):
+        self.assertEqual(mlb_warehouse.get_actual_stat("p1", 700, "pitcher_outs"), 19)
+
+    def test_resolved_zero_is_not_a_miss(self):
+        self.assertEqual(mlb_warehouse.get_actual_stat("b0", 700, "batter_hits"), 0.0)
+
+    def test_unsupported_prop_returns_none(self):
+        # HR/TB/RBI have no fact column → None → caller falls back to live.
+        self.assertIsNone(mlb_warehouse.get_actual_stat("b1", 700, "batter_home_runs"))
+        self.assertIsNone(mlb_warehouse.get_actual_stat("b1", 700, "batter_total_bases"))
+
+    def test_missing_row_returns_none(self):
+        self.assertIsNone(mlb_warehouse.get_actual_stat("nobody", 700, "batter_hits"))
+        self.assertIsNone(mlb_warehouse.get_actual_stat("b1", 999, "batter_hits"))
+
+    def test_none_ids_return_none(self):
+        self.assertIsNone(mlb_warehouse.get_actual_stat(None, 700, "batter_hits"))
+        self.assertIsNone(mlb_warehouse.get_actual_stat("b1", None, "batter_hits"))
+
+
 if __name__ == "__main__":
     unittest.main()

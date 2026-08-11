@@ -965,6 +965,60 @@ def get_pitcher_game_log(athlete_id, season=None, as_of_date=None, limit=None):
                      season=season, as_of_date=as_of_date, limit=limit)
 
 
+def _ip_to_outs(ip):
+    """IP base-3 notation → out count (6.1 IP = 6*3+1 = 19 outs). Mirrors
+    espn_client.ip_to_outs; kept local so the StatsAPI module stays ESPN-free."""
+    if ip is None:
+        return None
+    whole = int(ip)
+    return whole * 3 + round((ip - whole) * 10)
+
+
+# Graded MLB props whose actual is a stored fact column → (table, column, xform).
+# HR / total_bases / RBI are NOT stored (no column) → absent here → caller falls
+# back to the live per-player fetch.
+_ACTUAL_STAT_SPEC = {
+    "batter_hits": (mlb_batter_game, "H", None),
+    "batter_strikeouts": (mlb_batter_game, "SO", None),
+    "pitcher_strikeouts": (mlb_pitcher_game, "K", None),
+    "pitcher_earned_runs": (mlb_pitcher_game, "ER", None),
+    "pitcher_outs": (mlb_pitcher_game, "IP", "ip_to_outs"),
+}
+
+
+def get_actual_stat(mlb_player_id, game_pk, prop_key):
+    """The actual stat value for a graded MLB prop, read straight from the
+    game-centric facts (ZERO network) — the P4 grading fast path.
+
+    Returns the value (a resolved 0 comes back as 0.0, NOT None), or None when: the
+    prop isn't fact-servable (HR/TB/RBI etc.), the (player, game) has no fact row
+    (game not ingested yet, or a DNP), or SQL is off. A fact row exists only for a
+    genuine-final boxscore, so a non-None result implies the game is final. The
+    caller treats None as "fall back to the live hard-ID/ESPN path." Fail-open."""
+    spec = _ACTUAL_STAT_SPEC.get(prop_key)
+    if spec is None or not mlb_player_id or game_pk is None or not enabled():
+        return None
+    table, col, xform = spec
+    try:
+        gpk = int(game_pk)
+    except (TypeError, ValueError):
+        return None
+    try:
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            r = conn.execute(
+                select(table.c[col]).where(
+                    (table.c.athlete_id == str(mlb_player_id))
+                    & (table.c.game_pk == gpk))
+            ).first()
+    except (OperationalError, ValueError, TypeError):
+        return None
+    if r is None or r[0] is None:
+        return None
+    val = float(r[0])
+    return _ip_to_outs(val) if xform == "ip_to_outs" else val
+
+
 def _fmt(summary):
     return json.dumps(summary, default=str)
 

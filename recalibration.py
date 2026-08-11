@@ -1375,16 +1375,58 @@ def _load_player_gamelog(espn_sport, espn_league, player):
     return gamelog, by_date
 
 
-def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence):
+# The warehouse fast path grades off a fact FROZEN at ingest time, whereas the
+# live path reads the stat FRESH at grade time (max_age=0). An official-scorer
+# correction that lands between ingest and grading would make the frozen fact
+# diverge. So only trust the warehouse once a game is old enough that corrections
+# have settled; a fresher game grades live (fresh). The whole historical backlog
+# is far older than this, so it still clears via the fast uncapped warehouse path.
+WAREHOUSE_GRADE_MIN_AGE_HOURS = 48
+
+
+def _warehouse_grade_ready(commence):
+    """True when the game is old enough (>= WAREHOUSE_GRADE_MIN_AGE_HOURS) that a
+    frozen warehouse fact is safe to grade from. A recent game, or an
+    absent/unparseable commence, returns False → grade off the fresh live read."""
+    try:
+        import mlb_starters
+        dt = mlb_starters._parse_utc(commence)
+        if dt is None:
+            return False
+        age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+        return age_hours >= WAREHOUSE_GRADE_MIN_AGE_HOURS
+    except Exception:
+        return False
+
+
+def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
+                     game_pk=None, mlb_player_id=None):
     """Resolve one player's actual stat for a single forecast game.
 
-    MLB rows resolve via the statsapi hard-ID (gamePk) path first (disambiguating
+    P4 fast path: when the caller has the P3-stamped ``(game_pk, mlb_player_id)``
+    AND the game is old enough that scoring corrections have settled
+    (_warehouse_grade_ready), the actual is read straight from the StatsAPI
+    game-centric warehouse facts — ZERO network. A fact exists only for a
+    genuine-final game, so a hit is authoritative; a miss (game not ingested yet,
+    pre-P3 row, a prop the facts don't store, or a too-recent game) falls through
+    to the live fresh-read path below.
+
+    MLB rows otherwise resolve via the statsapi hard-ID (gamePk) path (disambiguating
     doubleheaders and grading pitcher props ESPN cannot), falling back to cached
     ESPN gamelogs with a ±1-day tolerance for UTC/local date slippage. Returns
     the actual stat as a float, or None when it can't be resolved. `line` is part
     of the forecast context callers pass but is not used to derive the value.
     Never raises. Shared by the prediction-log resolver and the wagers resolver.
     """
+    if (sport_key == "baseball_mlb" and game_pk and mlb_player_id
+            and _warehouse_grade_ready(commence)):
+        try:
+            import mlb_warehouse
+            v = mlb_warehouse.get_actual_stat(mlb_player_id, game_pk, prop_key)
+            if v is not None:
+                return v
+        except Exception:                   # pragma: no cover - never break grading
+            pass
     pair = SPORT_ESPN_MAP.get(sport_key)
     if not pair:
         return None
@@ -1503,35 +1545,53 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
 
     resolved_count = 0     # genuine resolutions (a real outcome) — the return value
     void_count = 0         # stale scratch/DNP rows retired (no outcome)
+    network_attempts = 0   # live fetches only — the P4 cap counts these, NOT the
+                           # warehouse fast path (a free DB read of already-ingested
+                           # game facts), so a fully-ingested slate resolves unbounded
     resolved_updates = {}
-    # Cap total statsapi/ESPN work per pass on genuine + void attempts alike (a
-    # DNP backlog must not spin resolve_one_prop/is_confirmed_dnp unbounded).
+    # The cap bounds statsapi/ESPN work per pass (a DNP backlog must not spin
+    # resolve_one_prop/is_confirmed_dnp unbounded); warehouse hits are exempt.
     for player, p_rows in by_player.items():
-        if resolved_count + void_count >= max_to_resolve:
-            break
         for r in p_rows:
-            if resolved_count + void_count >= max_to_resolve:
-                break
             commence = r.get("commence_time")
-            # Shared resolver: statsapi hard-ID first, then cached ESPN gamelog.
-            actual = resolve_one_prop(
-                sport_key, player, r["prop_key"], r.get("line"),
-                r["game_date"], commence)
+            gpk = r.get("game_pk")
+            pid = r.get("player_mlb_id")
+            # Fast path: P3-stamped ids + a settled game-centric fact → 0 network,
+            # UNCAPPED. Gated on age so a too-recent game (scoring corrections may
+            # still land) grades off the fresh live read below instead.
+            actual = None
+            if (sport_key == "baseball_mlb" and gpk and pid
+                    and _warehouse_grade_ready(commence)):
+                try:
+                    import mlb_warehouse
+                    actual = mlb_warehouse.get_actual_stat(pid, gpk, r["prop_key"])
+                except Exception:
+                    actual = None
             if actual is None:
-                # A confirmed scratch/DNP whose game is well past is permanently
-                # unresolvable → void it (resolved, no outcome) so it leaves
-                # pending and stops re-attempting. A still-live game (resolver
-                # returns the sentinel, not None) or a data outage is NOT voided.
-                if _is_stale_dnp(sport_key, r["prop_key"], player,
-                                 r["game_date"], commence):
-                    resolved_updates[prediction_row_key(r)] = {
-                        "actual": None,
-                        "outcome": None,
-                        "resolved": True,
-                        "resolved_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    void_count += 1
-                continue
+                # Slow path: live fetch (statsapi hard-ID first, then cached ESPN),
+                # bounded by the network cap. Skip (leave pending) once spent — but
+                # keep scanning, so warehouse-resolvable rows still get done.
+                if network_attempts >= max_to_resolve:
+                    continue
+                network_attempts += 1
+                actual = resolve_one_prop(
+                    sport_key, player, r["prop_key"], r.get("line"),
+                    r["game_date"], commence, game_pk=gpk, mlb_player_id=pid)
+                if actual is None:
+                    # A confirmed scratch/DNP whose game is well past is permanently
+                    # unresolvable → void it (resolved, no outcome) so it leaves
+                    # pending and stops re-attempting. A still-live game (resolver
+                    # returns the sentinel, not None) or a data outage is NOT voided.
+                    if _is_stale_dnp(sport_key, r["prop_key"], player,
+                                     r["game_date"], commence):
+                        resolved_updates[prediction_row_key(r)] = {
+                            "actual": None,
+                            "outcome": None,
+                            "resolved": True,
+                            "resolved_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        void_count += 1
+                    continue
             line = float(r["line"])
             if actual == line:
                 outcome = None  # push

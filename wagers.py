@@ -415,9 +415,12 @@ def _grade_wager(row):
     game_date = (row.get("game_date") or "")[:10]
 
     if bet_type == "player_prop":
+        # P4: pass the P3-stamped (game_pk, mlb_player_id) so grading can read the
+        # actual straight from the warehouse facts (0 network) when available.
         actual = recalibration.resolve_one_prop(
             row.get("sport_key"), row.get("player"), row.get("prop_key"),
-            row.get("line"), game_date, commence)
+            row.get("line"), game_date, commence,
+            game_pk=row.get("game_pk"), mlb_player_id=row.get("player_mlb_id"))
         if actual is None:
             return None
         try:
