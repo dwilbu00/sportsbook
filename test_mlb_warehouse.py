@@ -1350,6 +1350,96 @@ class TeamDefenseParityTests(_Backend, unittest.TestCase):
         self.assertEqual(rep["mismatches"], 0)
 
 
+class NonFranchiseTeamTests(_Backend, unittest.TestCase):
+    """Prevention (ingest skips non-real matchups) + cleanup purge (cascade-delete
+    all-star squads / bracket placeholders + their games/facts; real teams safe)."""
+
+    def _team(self, tid, name, league=None, division=None):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_team), {
+                "team_id": tid, "name": name,
+                "name_norm": db_store.normalize_name(name),
+                "league_id": league, "division_id": division})
+
+    def _game(self, pk, home, away, gt="R", status="Final"):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": pk, "official_date": "2024-07-16",
+                "game_date": "2024-07-16T18:00:00Z", "season": 2024,
+                "game_type": gt, "home_team_id": home, "away_team_id": away,
+                "status": status})
+
+    def _batter(self, aid, pk, team):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": aid, "game_pk": pk, "team_id": team,
+                "season_bucket": 2024, "H": 1.0, "AB": 4.0})
+
+    def _pitcher(self, aid, pk, team):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
+                "athlete_id": aid, "game_pk": pk, "team_id": team,
+                "season_bucket": 2024, "IP": 6.0, "K": 6.0, "ER": 2.0})
+
+    def test_purge_cascade_leaves_real_untouched(self):
+        self._team("147", "New York Yankees", "103", "201")   # real
+        self._team("111", "Boston Red Sox", "103", "201")     # real
+        self._team("159", "American League All-Stars")        # placeholder
+        self._team("160", "National League All-Stars")        # placeholder
+        self._team("4618", "AL Wild Card #1")                 # placeholder
+        self._team("4619", "NL Wild Card #1")                 # placeholder
+        self._game(700, "147", "111")                         # real game
+        self._game(800, "159", "160", gt="A")                 # all-star game
+        self._game(900, "4618", "4619", gt=None, status="Preview")  # bracket
+        self._batter("real1", 700, "147")                     # real fact
+        self._batter("star1", 800, "159")                     # all-star fact
+        self._pitcher("realp1", 700, "111")                   # real pitcher fact
+        self._pitcher("starp1", 800, "160")                   # all-star pitcher fact
+
+        dry = mlb_warehouse.purge_non_franchise_teams(dry_run=True)
+        self.assertEqual(
+            (dry["teams"], dry["games"], dry["batter_facts"], dry["pitcher_facts"]),
+            (4, 2, 1, 1))
+        self.assertEqual(_count(mlb_warehouse.mlb_team), 6)   # nothing deleted (dry)
+
+        mlb_warehouse.purge_non_franchise_teams(dry_run=False)
+        self.assertEqual({r._mapping["team_id"]
+                          for r in _rows(mlb_warehouse.mlb_team)}, {"147", "111"})
+        self.assertEqual({r._mapping["game_pk"]
+                          for r in _rows(mlb_warehouse.mlb_game)}, {700})
+        self.assertEqual({r._mapping["athlete_id"]
+                          for r in _rows(mlb_warehouse.mlb_batter_game)}, {"real1"})
+        self.assertEqual({r._mapping["athlete_id"]
+                          for r in _rows(mlb_warehouse.mlb_pitcher_game)}, {"realp1"})
+        # idempotent
+        again = mlb_warehouse.purge_non_franchise_teams(dry_run=False)
+        self.assertEqual(again["teams"], 0)
+
+    def test_ingest_skips_non_franchise_games(self):
+        sched = {"dates": [{"date": "2024-07-16", "games": [
+            {"gamePk": 745804, "gameDate": "2024-07-16T18:00:00Z",
+             "officialDate": "2024-07-16", "season": "2024", "gameType": "R",
+             "status": {"abstractGameState": "Final", "detailedState": "Final"},
+             "teams": {"home": {"score": 5, "team": {"id": 147, "name": "New York Yankees"}},
+                       "away": {"score": 3, "team": {"id": 111, "name": "Boston Red Sox"}}}},
+            {"gamePk": 999001, "gameDate": "2024-07-16T18:00:00Z",
+             "officialDate": "2024-07-16", "season": "2024", "gameType": "A",
+             "status": {"abstractGameState": "Final", "detailedState": "Final"},
+             "teams": {"home": {"score": 3, "team": {"id": 159, "name": "American League All-Stars"}},
+                       "away": {"score": 2, "team": {"id": 160, "name": "National League All-Stars"}}}},
+        ]}]}
+        with mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS), \
+             mock.patch.object(mlb_warehouse, "fetch_schedule", return_value=sched), \
+             mock.patch.object(mlb_warehouse, "fetch_boxscore", return_value=BOXSCORE):
+            summary = mlb_warehouse.ingest_date("2024-07-16")
+        self.assertEqual(summary["games"], 1)                 # all-star game filtered
+        self.assertEqual({r._mapping["game_pk"]
+                          for r in _rows(mlb_warehouse.mlb_game)}, {745804})
+        team_ids = {r._mapping["team_id"] for r in _rows(mlb_warehouse.mlb_team)}
+        self.assertNotIn("159", team_ids)                     # squad not added
+        self.assertNotIn("160", team_ids)
+
+
 class CalibNameParityTests(_Backend, unittest.TestCase):
     """calib_name_parity flags warehouse team names that won't resolve in the
     calib consumers' name-keyed lookups (PARK_FACTORS + ESPN team_defense)."""

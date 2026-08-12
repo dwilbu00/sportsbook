@@ -46,8 +46,8 @@ import time
 
 from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Index, Integer, MetaData, String,
-    Table, Text, UniqueConstraint, and_, bindparam, delete, insert, not_, or_,
-    select, update,
+    Table, Text, UniqueConstraint, and_, bindparam, delete, func, insert, not_,
+    or_, select, update,
 )
 from sqlalchemy.exc import OperationalError
 
@@ -666,6 +666,21 @@ def _write_game_facts(conn, box, game, touch_fetched_at=False):
     return len(batters), len(pitchers)
 
 
+def _real_franchise_ids():
+    """team_ids of the REAL MLB franchises — the /teams-enriched rows (league_id
+    populated). Non-franchise schedule entries (all-star squads, postseason bracket-
+    seed placeholders) only ever get the minimal parse_schedule row (league_id NULL),
+    so this set excludes them. Empty on error → callers fail OPEN (no filtering)."""
+    if not enabled():
+        return set()
+    try:
+        with db_store.get_engine().connect() as conn:
+            return {r[0] for r in conn.execute(
+                select(mlb_team.c.team_id).where(mlb_team.c.league_id.isnot(None)))}
+    except (OperationalError, ValueError, TypeError):
+        return set()
+
+
 def ensure_teams(season, force=False):
     """Load/refresh the full 30-team dim for a season (memoized per process)."""
     if not enabled():
@@ -702,6 +717,15 @@ def ingest_date(date, with_boxscores=True):
 
     raw = fetch_schedule(date)
     games, sched_teams = parse_schedule(raw, season)
+    # Prevention: ingest ONLY real-franchise matchups. Drops all-star games (squad
+    # "teams") + postseason bracket-seed placeholders (TBD "teams") + their minimal
+    # rows, so non-real entries never enter mlb_team/mlb_game/facts. Fail-open — if
+    # the franchise roster is unavailable (empty set), ingest everything as before.
+    real_ids = _real_franchise_ids()
+    if real_ids:
+        games = [g for g in games if g.get("home_team_id") in real_ids
+                 and g.get("away_team_id") in real_ids]
+        sched_teams = [t for t in sched_teams if t.get("team_id") in real_ids]
     summary["games"] = len(games)
 
     engine = db_store.get_engine()
@@ -1616,6 +1640,51 @@ def backfill_legacy_game_pk(dry_run=True, season=None):
     return summary
 
 
+def purge_non_franchise_teams(dry_run=True):
+    """Remove non-real 'teams' that leaked into mlb_team via the schedule — all-star
+    squads + postseason bracket-seed placeholders (league_id AND division_id NULL;
+    never in the /teams franchise roster) — and everything FK-bound to them, in FK
+    order: facts → games → team rows. All REPRODUCIBLE (re-derivable from StatsAPI);
+    the 30 real franchises (league_id populated) are untouched. dry_run=True reports
+    the counts and writes nothing. Idempotent."""
+    summary = {"dry_run": dry_run, "skipped": not enabled()}
+    if not enabled():
+        return summary
+    eng = db_store.get_engine()
+    with eng.connect() as conn:
+        placeholder_ids = {r[0] for r in conn.execute(
+            select(mlb_team.c.team_id).where(
+                mlb_team.c.league_id.is_(None)
+                & mlb_team.c.division_id.is_(None)))}
+        game_pks = set()
+        if placeholder_ids:
+            game_pks = {r[0] for r in conn.execute(
+                select(mlb_game.c.game_pk).where(
+                    mlb_game.c.home_team_id.in_(placeholder_ids)
+                    | mlb_game.c.away_team_id.in_(placeholder_ids)))}
+        bf = pf = 0
+        if game_pks:
+            bf = conn.execute(select(func.count()).select_from(mlb_batter_game)
+                              .where(mlb_batter_game.c.game_pk.in_(game_pks))).scalar()
+            pf = conn.execute(select(func.count()).select_from(mlb_pitcher_game)
+                              .where(mlb_pitcher_game.c.game_pk.in_(game_pks))).scalar()
+    summary.update(teams=len(placeholder_ids), games=len(game_pks),
+                   batter_facts=int(bf or 0), pitcher_facts=int(pf or 0))
+    if placeholder_ids and not dry_run:
+        with _WRITE_LOCK:
+            with eng.begin() as conn:
+                if game_pks:                      # facts → games (FK order)
+                    conn.execute(delete(mlb_batter_game)
+                                 .where(mlb_batter_game.c.game_pk.in_(game_pks)))
+                    conn.execute(delete(mlb_pitcher_game)
+                                 .where(mlb_pitcher_game.c.game_pk.in_(game_pks)))
+                    conn.execute(delete(mlb_game)
+                                 .where(mlb_game.c.game_pk.in_(game_pks)))
+                conn.execute(delete(mlb_team)     # → team rows last
+                             .where(mlb_team.c.team_id.in_(placeholder_ids)))
+    return summary
+
+
 def _fmt(summary):
     return json.dumps(summary, default=str)
 
@@ -1642,9 +1711,13 @@ def _main_cli():
     ap.add_argument("--backfill-game-pk", action="store_true",
                     help="P5: retro-match game_pk onto legacy MLB prediction_log + "
                          "wagers rows (player-anchor). DRY-RUN unless --apply.")
+    ap.add_argument("--purge-non-franchise", action="store_true",
+                    help="Cleanup: remove non-real teams (all-star squads + "
+                         "postseason bracket placeholders) + their games/facts from "
+                         "the dim. DRY-RUN unless --apply.")
     ap.add_argument("--apply", action="store_true",
-                    help="With --backfill-game-pk: WRITE the matched game_pks "
-                         "(default is a no-write dry-run preview).")
+                    help="With --backfill-game-pk / --purge-non-franchise: WRITE the "
+                         "changes (default is a no-write dry-run preview).")
     args = ap.parse_args()
 
     db_store.promote_secrets_from_toml()
@@ -1671,9 +1744,12 @@ def _main_cli():
     if args.backfill_game_pk:
         did = True
         print(_fmt(backfill_legacy_game_pk(dry_run=not args.apply)))
+    if args.purge_non_franchise:
+        did = True
+        print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))
     if not did:
         ap.error("nothing to do — pass --ingest, --ingest-range, --standings, "
-                 "--purge-boxscores, or --backfill-game-pk")
+                 "--purge-boxscores, --backfill-game-pk, or --purge-non-franchise")
 
 
 if __name__ == "__main__":
