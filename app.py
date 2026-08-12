@@ -812,6 +812,7 @@ from espn_client import (
     get_player_stat_history,
     mlb_warehouse_team_stats,
     mlb_warehouse_team_defense,
+    mlb_warehouse_gate_status,
 )
 from analysis import (
     analyze_moneyline_value,
@@ -1188,6 +1189,26 @@ def render_model_guide():
             )
         else:
             st.caption(f"Prediction log storage: {storage_backend} (shared and durable).")
+
+        # MLB→StatsAPI warehouse gates. Predictions don't record which source
+        # served them, so this is the only at-a-glance way to confirm a flag flip
+        # actually took effect on the running app (default OFF = ESPN path).
+        try:
+            _wh = mlb_warehouse_gate_status()
+            _on = [name for name, key in (
+                ("player-history", "history"),
+                ("team-markets", "team"),
+                ("calibration", "calib"),
+                ("identity-enforce", "enforce_identity"),
+            ) if _wh.get(key)]
+            if _wh.get("sql") and _on:
+                st.caption("MLB warehouse (StatsAPI) active: " + ", ".join(_on) + ".")
+            elif _wh.get("sql"):
+                st.caption("MLB warehouse gates all OFF — MLB data served from ESPN.")
+            else:
+                st.caption("MLB warehouse gates require SQL (not enabled) — serving from ESPN.")
+        except Exception:
+            pass
 
         # Manual full-drain of the prediction backlog. The automatic loop stays
         # small (80/cycle, hourly) so the app stays responsive; this grades

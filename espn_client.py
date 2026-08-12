@@ -1017,6 +1017,23 @@ def _mlb_warehouse_team_enabled():
         "1", "true", "on", "yes")
 
 
+def mlb_warehouse_gate_status():
+    """The MLB→StatsAPI warehouse gate states (read from os.environ, which the app
+    boot-promotes from st.secrets) + whether SQL is on — for an at-a-glance operator
+    indicator so a flag flip's effect is VERIFIABLE (predictions don't record which
+    source served them). Keys mirror the gate helpers in espn_client / props /
+    book_line_calibration."""
+    def _on(k):
+        return os.environ.get(k, "").strip().lower() in ("1", "true", "on", "yes")
+    return {
+        "history": _on(_MLB_WAREHOUSE_HIST_ENV),        # ODI_MLB_WAREHOUSE_HIST
+        "team": _on(_MLB_WAREHOUSE_TEAM_ENV),           # ODI_MLB_WAREHOUSE_TEAM
+        "calib": _on("ODI_MLB_WAREHOUSE_CALIB"),        # book_line_calibration
+        "enforce_identity": _on("ODI_MLB_ENFORCE_IDENTITY"),   # props
+        "sql": bool(db_store is not None and db_store.enabled()),
+    }
+
+
 def mlb_warehouse_team_stats(sport, team_name, recent_n=10):
     """Warehouse-first team-market stats (the P4 team-market flip): the
     {season, recent, recent_games} dict the team analyzers consume, sourced from the

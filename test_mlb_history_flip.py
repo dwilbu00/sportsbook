@@ -383,5 +383,35 @@ class EnforceIdentityTests(unittest.TestCase):
             {"A", "B"})
 
 
+class GateStatusTests(unittest.TestCase):
+    """mlb_warehouse_gate_status reflects the live env flags + SQL state — the
+    operator's only signal that a flip took effect (predictions record no source)."""
+
+    def _status(self, env, sql=True):
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(espn_client.db_store, "enabled", return_value=sql):
+            return espn_client.mlb_warehouse_gate_status()
+
+    def test_all_off_by_default(self):
+        s = self._status({})
+        self.assertEqual(
+            s, {"history": False, "team": False, "calib": False,
+                "enforce_identity": False, "sql": True})
+
+    def test_each_flag_reads_its_env_key(self):
+        self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_HIST": "1"})["history"])
+        self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_TEAM": "true"})["team"])
+        self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_CALIB": "on"})["calib"])
+        self.assertTrue(
+            self._status({"ODI_MLB_ENFORCE_IDENTITY": "yes"})["enforce_identity"])
+
+    def test_falsey_values_stay_off(self):
+        self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "0"})["history"])
+        self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "no"})["history"])
+
+    def test_sql_disabled_reported(self):
+        self.assertFalse(self._status({}, sql=False)["sql"])
+
+
 if __name__ == "__main__":
     unittest.main()
