@@ -416,6 +416,33 @@ def team_defense_parity(season=None):
     return rep
 
 
+# ─────────── calib cutover pre-flip gate: warehouse team NAMES resolve downstream
+def calib_name_parity():
+    """The _CALIB cutover's one load-bearing risk: get_calib_gamelog emits the
+    opponent as the CANONICAL mlb_team.name, and the real-line fit's opp_defense +
+    park features key on NAME. Check each warehouse team name resolves in BOTH
+    consumers — PARK_FACTORS (park reconstruction) and the ESPN team_defense key space
+    (tolerant _resolve_team_defense) — else that feature silently no-ops for the team.
+    Read-only. park misses for the Athletics/Rays unsettled venues are EXPECTED
+    (neutral park), not defects — noted separately."""
+    import park_factors
+    import pricing_common
+    names = sorted({v for v in (mlb_warehouse._team_name_map() or {}).values() if v})
+    try:
+        import espn_client
+        espn = {n: 1.0 for n in
+                (espn_client.get_all_teams(_ESPN_SPORT, _ESPN_LEAGUE) or {})}
+    except Exception:
+        espn = {}
+    park_miss = [n for n in names
+                 if park_factors._park_key(n) not in park_factors._NORMALIZED]
+    def_miss = ([n for n in names
+                 if pricing_common._resolve_team_defense(n, espn) is None]
+                if espn else [])
+    return {"warehouse_teams": len(names), "espn_teams": len(espn),
+            "park_unresolved": park_miss, "team_defense_unresolved": def_miss}
+
+
 def _fmt_report(title, rep):
     lines = [f"── {title} ─────────────────────────────────────────"]
     for k in ("season", "role", "window", "stat", "players_sampled",
@@ -455,6 +482,9 @@ def _main_cli():
                     help="Team-defense parity: StatsAPI standings runs_allowed/game "
                          "vs the ESPN build_team_defense_lookup (default: current "
                          "year).")
+    ap.add_argument("--calib-names", action="store_true",
+                    help="Calib cutover pre-flip gate: do warehouse team NAMES resolve "
+                         "in PARK_FACTORS + the ESPN team_defense key space?")
     ap.add_argument("--role", choices=("batter", "pitcher"), default="batter",
                     help="Gamelog/player-input role to diff (default: batter → hits).")
     ap.add_argument("--sample", type=int, default=25,
@@ -481,9 +511,19 @@ def _main_cli():
         did = True
         season = args.team_defense if args.team_defense and args.team_defense > 0 else None
         print(_fmt_report("team-defense parity", team_defense_parity(season)))
+    if args.calib_names:
+        did = True
+        rep = calib_name_parity()
+        print("── calib name parity ─────────────────────────────────────────")
+        print(f"  warehouse_teams : {rep['warehouse_teams']}")
+        print(f"  espn_teams      : {rep['espn_teams']}")
+        print(f"  team_defense_unresolved (opp_defense would no-op): "
+              f"{rep['team_defense_unresolved'] or 'none ✓'}")
+        print(f"  park_unresolved (neutral; Athletics/Rays expected): "
+              f"{rep['park_unresolved'] or 'none'}")
     if not did:
         ap.error("nothing to do — pass --standings and/or --gamelog and/or "
-                 "--player-input START END and/or --team-defense")
+                 "--player-input START END and/or --team-defense and/or --calib-names")
 
 
 if __name__ == "__main__":

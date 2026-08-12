@@ -1350,6 +1350,26 @@ class TeamDefenseParityTests(_Backend, unittest.TestCase):
         self.assertEqual(rep["mismatches"], 0)
 
 
+class CalibNameParityTests(_Backend, unittest.TestCase):
+    """calib_name_parity flags warehouse team names that won't resolve in the
+    calib consumers' name-keyed lookups (PARK_FACTORS + ESPN team_defense)."""
+
+    def test_resolves_real_flags_bogus(self):
+        for nm in ("New York Yankees", "Nowhere FC"):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": nm[:3], "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+        with mock.patch("espn_client.get_all_teams",
+                        return_value={"New York Yankees": {}, "Boston Red Sox": {}}):
+            rep = parity.calib_name_parity()
+        self.assertEqual(rep["warehouse_teams"], 2)
+        self.assertIn("Nowhere FC", rep["team_defense_unresolved"])
+        self.assertNotIn("New York Yankees", rep["team_defense_unresolved"])
+        self.assertIn("Nowhere FC", rep["park_unresolved"])
+        self.assertNotIn("New York Yankees", rep["park_unresolved"])
+
+
 class BackfillLegacyGamePkTests(unittest.TestCase):
     """P5: player-anchor game_pk backfill onto legacy prediction_log/wagers rows —
     DH-safe, non-destructive (fill-NULL-only), idempotent, dry-run vs apply. Needs
