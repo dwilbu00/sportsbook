@@ -39,8 +39,10 @@ MLB only. NBA/NFL stay on ESPN. The ESPN gamelog_store.py path is UNTOUCHED.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import json
+import os
 import threading
 import time
 
@@ -264,6 +266,20 @@ def _current_season():
 _SCHED_LIVE_TTL = 900            # seconds — live/unfinished slate
 _SCHED_FINAL_TTL = 24 * 3600     # seconds — a fully-final slate is immutable
 _STANDINGS_TTL = 3600            # seconds — standings move daily
+
+# A slate's boxscore fetches are the backfill bottleneck (one StatsAPI round-trip
+# each). They are network-bound + independent, so ingest_date fetches them
+# CONCURRENTLY (DB writes stay serial under _WRITE_LOCK). StatsAPI is free but be a
+# polite client — bounded pool, env-tunable via ODI_MLB_BOXSCORE_WORKERS.
+_BOXSCORE_FETCH_WORKERS = 8
+
+
+def _boxscore_fetch_workers():
+    try:
+        n = int(os.environ.get("ODI_MLB_BOXSCORE_WORKERS") or _BOXSCORE_FETCH_WORKERS)
+    except (TypeError, ValueError):
+        return _BOXSCORE_FETCH_WORKERS
+    return max(1, min(32, n))
 
 
 def _schedule_all_final(raw):
@@ -749,16 +765,31 @@ def ingest_date(date, with_boxscores=True):
     if not with_boxscores:
         return summary
 
-    seen_players = set()
-    for g in games:
-        if not mlb_starters._is_genuine_final(
-                {"status": g["status"], "detailedState": g["detailed_state"]}):
-            continue
-        summary["final"] += 1
+    # Genuine-final games each need one boxscore fetch (the backfill bottleneck).
+    # Fetch them CONCURRENTLY (network-bound, free StatsAPI); WRITE serially below
+    # under _WRITE_LOCK. The surgical upsert is order-independent and ex.map preserves
+    # input order, so this is purely a latency win — byte-identical to the old
+    # sequential path. A fetch failure → (g, None) → skipped, matching the prior
+    # try/except-continue.
+    final_games = [
+        g for g in games
+        if mlb_starters._is_genuine_final(
+            {"status": g["status"], "detailedState": g["detailed_state"]})]
+    summary["final"] = len(final_games)
+
+    def _fetch(g):
         try:
-            box = fetch_boxscore(g["game_pk"])
+            return g, fetch_boxscore(g["game_pk"])
         except Exception:
-            continue
+            return g, None
+
+    seen_players = set()
+
+    def _write(g, box):
+        # SERIAL write (main thread, under _WRITE_LOCK) of one fetched boxscore. A
+        # failed fetch (box is None) is skipped → re-ingested on the next run.
+        if box is None:
+            return
         players = parse_boxscore_players(box, g)
         nb = npi = 0
         with _WRITE_LOCK:
@@ -779,6 +810,20 @@ def ingest_date(date, with_boxscores=True):
         summary["batter_rows"] += nb
         summary["pitcher_rows"] += npi
         seen_players.update(p["player_id"] for p in players)
+
+    # Fetch concurrently but CONSUME in submission order, writing each game as its
+    # fetch completes (ex.map yields in order) — so an interrupted backfill still
+    # durably commits the prefix it finished, while all fetches overlap (bounded by
+    # the pool). Byte-identical results to the old sequential path on a clean run.
+    workers = min(_boxscore_fetch_workers(), len(final_games))
+    if workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for g, box in ex.map(_fetch, final_games):
+                _write(g, box)
+    else:
+        for g in final_games:
+            _write(*_fetch(g))
+
     summary["players"] = len(seen_players)
     return summary
 

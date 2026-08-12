@@ -381,6 +381,45 @@ class IngestTests(_Backend, unittest.TestCase):
         # one live bronze payload per (kind, natural_ref) — no growth
         self.assertEqual(_count(mlb_warehouse.mlb_bronze), 2)
 
+    def _two_final_schedule(self):
+        # A doubleheader: two genuine-final 147v111 games (distinct game_pks) so the
+        # boxscore fetch takes the CONCURRENT path (workers = min(8, 2) > 1).
+        g1 = copy.deepcopy(SCHEDULE["dates"][0]["games"][0])   # 745804, Final
+        g2 = copy.deepcopy(g1)
+        g2["gamePk"] = 745806
+        g2["gameNumber"] = 2
+        g2["doubleHeader"] = "S"
+        g2["gameDate"] = "2024-07-04T23:10:00Z"
+        return {"dates": [{"date": "2024-07-04", "games": [g1, g2]}]}
+
+    def test_concurrent_fetch_writes_all_final_games(self):
+        with mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS), \
+             mock.patch.object(mlb_warehouse, "fetch_schedule",
+                               return_value=self._two_final_schedule()), \
+             mock.patch.object(mlb_warehouse, "fetch_boxscore", return_value=BOXSCORE):
+            summary = mlb_warehouse.ingest_date("2024-07-04")
+        self.assertEqual(summary["final"], 2)
+        self.assertEqual(summary["boxscores"], 2)     # both fetched (concurrent) + written
+        gpks = {r._mapping["game_pk"] for r in _rows(mlb_warehouse.mlb_batter_game)}
+        self.assertEqual(gpks, {745804, 745806})
+
+    def test_concurrent_fetch_isolates_per_game_failure(self):
+        # One game's fetch raises → it is skipped; the other still ingests (matches
+        # the prior per-game try/except-continue, now under the concurrent path).
+        def _box(game_pk):
+            if game_pk == 745806:
+                raise RuntimeError("boxscore fetch failed")
+            return BOXSCORE
+        with mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS), \
+             mock.patch.object(mlb_warehouse, "fetch_schedule",
+                               return_value=self._two_final_schedule()), \
+             mock.patch.object(mlb_warehouse, "fetch_boxscore", side_effect=_box):
+            summary = mlb_warehouse.ingest_date("2024-07-04")
+        self.assertEqual(summary["final"], 2)
+        self.assertEqual(summary["boxscores"], 1)     # 745806 failed, 745804 survived
+        gpks = {r._mapping["game_pk"] for r in _rows(mlb_warehouse.mlb_batter_game)}
+        self.assertEqual(gpks, {745804})
+
     def test_reingest_updates_changed_score(self):
         self._ingest()
         changed = copy.deepcopy(SCHEDULE)
