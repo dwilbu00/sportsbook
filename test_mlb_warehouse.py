@@ -763,10 +763,12 @@ class GetActualStatTests(_Backend, unittest.TestCase):
                 "away_team_id": "111", "season": 2026})
             conn.execute(insert(mlb_warehouse.mlb_batter_game), {
                 "athlete_id": "b1", "game_pk": 700, "team_id": "147",
-                "season_bucket": 2026, "H": 2.0, "SO": 1.0})
+                "season_bucket": 2026, "H": 2.0, "SO": 1.0,
+                "TB": 5.0, "RBI": 3.0})            # TB=5 (≠H=2) proves TB→TB, not H
             conn.execute(insert(mlb_warehouse.mlb_batter_game), {
                 "athlete_id": "b0", "game_pk": 700, "team_id": "147",
-                "season_bucket": 2026, "H": 0.0, "SO": 0.0})   # a real 0
+                "season_bucket": 2026, "H": 0.0, "SO": 0.0,
+                "TB": 0.0, "RBI": 0.0})   # a real 0
             conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
                 "athlete_id": "p1", "game_pk": 700, "team_id": "147",
                 "season_bucket": 2026, "K": 8.0, "ER": 2.0, "IP": 6.1})
@@ -775,6 +777,8 @@ class GetActualStatTests(_Backend, unittest.TestCase):
         gs = mlb_warehouse.get_actual_stat
         self.assertEqual(gs("b1", 700, "batter_hits"), 2.0)
         self.assertEqual(gs("b1", 700, "batter_strikeouts"), 1.0)
+        self.assertEqual(gs("b1", 700, "batter_total_bases"), 5.0)
+        self.assertEqual(gs("b1", 700, "batter_rbis"), 3.0)
         self.assertEqual(gs("p1", 700, "pitcher_strikeouts"), 8.0)
         self.assertEqual(gs("p1", 700, "pitcher_earned_runs"), 2.0)
 
@@ -782,12 +786,29 @@ class GetActualStatTests(_Backend, unittest.TestCase):
         self.assertEqual(mlb_warehouse.get_actual_stat("p1", 700, "pitcher_outs"), 19)
 
     def test_resolved_zero_is_not_a_miss(self):
-        self.assertEqual(mlb_warehouse.get_actual_stat("b0", 700, "batter_hits"), 0.0)
+        gs = mlb_warehouse.get_actual_stat
+        self.assertEqual(gs("b0", 700, "batter_hits"), 0.0)
+        self.assertEqual(gs("b0", 700, "batter_total_bases"), 0.0)   # real 0, not a miss
+        self.assertEqual(gs("b0", 700, "batter_rbis"), 0.0)
 
     def test_unsupported_prop_returns_none(self):
-        # HR/TB/RBI have no fact column → None → caller falls back to live.
+        # HR has no fact column (no odds market wired) → None → caller falls back to live.
         self.assertIsNone(mlb_warehouse.get_actual_stat("b1", 700, "batter_home_runs"))
-        self.assertIsNone(mlb_warehouse.get_actual_stat("b1", 700, "batter_total_bases"))
+
+    def test_null_stat_column_is_a_miss(self):
+        # A captured row whose TB/RBI column was never populated (pre-backfill) reads
+        # as None (a miss → caller falls back), NOT a fabricated 0. b_null has H but
+        # NULL TB/RBI.
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
+                "athlete_id": "b_null", "game_pk": 700, "team_id": "147",
+                "season_bucket": 2026, "H": 1.0, "SO": 0.0})   # TB/RBI left NULL
+        self.assertEqual(
+            mlb_warehouse.get_actual_stat("b_null", 700, "batter_hits"), 1.0)
+        self.assertIsNone(
+            mlb_warehouse.get_actual_stat("b_null", 700, "batter_total_bases"))
+        self.assertIsNone(
+            mlb_warehouse.get_actual_stat("b_null", 700, "batter_rbis"))
 
     def test_missing_row_returns_none(self):
         self.assertIsNone(mlb_warehouse.get_actual_stat("nobody", 700, "batter_hits"))
@@ -1027,6 +1048,39 @@ class GetPlayerHistoryTests(_Backend, unittest.TestCase):
         self._pitcher("543037", 401, IP=5.0, K=7.0, ER=1.0)
         h = mlb_warehouse.get_player_history("543037", "pitcher_strikeouts")
         self.assertEqual(h["values"], [7.0])
+
+    def test_batter_total_bases_and_rbis_history(self):
+        self._game(210, "2024-04-01", "2024-04-01T18:00:00Z", home="147", away="111")
+        self._game(310, "2024-09-01", "2024-09-01T18:00:00Z", home="119", away="147")
+        self._batter("592450", 210, H=1.0, AB=4.0, TB=1.0, RBI=0.0)
+        self._batter("592450", 310, H=2.0, AB=3.0, TB=5.0, RBI=3.0)   # 1 single + 1 HR
+        tb = mlb_warehouse.get_player_history("592450", "batter_total_bases")
+        self.assertTrue(tb["found"])
+        self.assertEqual(tb["stat_label"], "TB")
+        self.assertEqual(tb["values"], [5.0, 1.0])                    # Sept first
+        rbi = mlb_warehouse.get_player_history("592450", "batter_rbis")
+        self.assertEqual(rbi["stat_label"], "RBI")
+        self.assertEqual(rbi["values"], [3.0, 0.0])
+
+    def test_null_stat_game_excluded_not_zeroed(self):
+        # Pre-backfill rows have TB/RBI NULL. get_player_history must EXCLUDE such a
+        # game (not fabricate 0.0), keep arrays aligned to the KEPT games, and return
+        # None when EVERY game lacks the stat — so an un-backfilled player falls open
+        # instead of projecting off all-zeros.
+        self._game(220, "2024-04-01", "2024-04-01T18:00:00Z")
+        self._game(320, "2024-09-01", "2024-09-01T18:00:00Z", home="119", away="147")
+        self._batter("700", 220, H=1.0, AB=4.0)                       # TB/RBI NULL
+        self._batter("700", 320, H=2.0, AB=3.0, TB=4.0, RBI=2.0)      # only this has TB
+        tb = mlb_warehouse.get_player_history("700", "batter_total_bases")
+        self.assertEqual(tb["values"], [4.0])              # NULL game dropped, not 0.0
+        self.assertEqual([d[:10] for d in tb["game_dates"]], ["2024-09-01"])
+        self.assertEqual(tb["opponents"], ["Los Angeles Dodgers"])  # arrays stay aligned
+        self.assertEqual(tb["team_id"], "147")             # newest KEPT game's team
+        # a player whose games ALL lack the stat → None (fall open), not all-zeros
+        self._game(330, "2024-08-01", "2024-08-01T18:00:00Z")
+        self._batter("800", 330, H=1.0, AB=4.0)                       # TB/RBI NULL
+        self.assertIsNone(
+            mlb_warehouse.get_player_history("800", "batter_total_bases"))
 
     def test_unsupported_prop_returns_none(self):
         self._game(500, "2024-07-04", "2024-07-04T18:00:00Z")

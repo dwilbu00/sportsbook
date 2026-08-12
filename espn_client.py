@@ -962,6 +962,13 @@ PROP_STAT_MAP = {
     "pitcher_outs": ["IP"],  # innings pitched * 3 = outs
     "batter_strikeouts": ["K", "SO"],
     "pitcher_earned_runs": ["ER"],
+    # TB/RBI resolve against the warehouse calib-gamelog dicts (get_calib_gamelog
+    # emits 'TB'/'RBI' columns). The live ESPN gamelog path serves neither in prod
+    # (the SQL cache gamelog_store._BATTER_STATS drops RBI, and ESPN has no TB label
+    # at all — get_player_stat_history reads a single label, can't derive TB) → these
+    # props are warehouse-served; ESPN is a no_history fall-open for them.
+    "batter_total_bases": ["TB"],
+    "batter_rbis": ["RBI"],
 }
 
 
@@ -1135,6 +1142,18 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         wh = _mlb_warehouse_history(sport, player_name, prop_key, n)
         if wh is not None:
             return wh
+
+    # batter_total_bases / batter_rbis are WAREHOUSE-ONLY (fact-served above via
+    # _mlb_warehouse_history when ODI_MLB_WAREHOUSE_HIST is on). The live ESPN gamelog
+    # must NOT serve them: TB is not an ESPN label, and while the SQL-cache reduced
+    # shape (gamelog_store._BATTER_STATS) drops RBI, the gamelog_store SLOW path
+    # (cache miss/stale) returns the RAW ESPN row which still carries 'RBI' — matching
+    # it here would leak an UNCALIBRATED live over-rate the design keeps inert until the
+    # warehouse is populated + flipped on (findings verify: nondeterministic across
+    # cache TTL / thread race). PROP_STAT_MAP keeps the TB/RBI labels for the backtest/
+    # calibration reshape, which reads get_calib_gamelog directly, not this function.
+    if sport == "baseball" and prop_key in ("batter_total_bases", "batter_rbis"):
+        return result
 
     # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact
     # extraction/return below is reused (identical result-dict shape). Gated on a

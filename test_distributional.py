@@ -438,6 +438,55 @@ class UnderHalfSuppressionTests(unittest.TestCase):
         self.assertFalse(cand["under_suppressed"])
 
 
+class NonHitBatterMarketAnalyzeTests(unittest.TestCase):
+    """The new batter_total_bases (line 1.5) and batter_rbis (line 0.5) props
+    project via the line-agnostic empirical over-rate (method A / sport_key=None),
+    NOT the batter_hits binomial model — so a candidate is produced with the right
+    line and distributional stays None."""
+
+    def _prop_data(self, prop, line, over_implied):
+        return {
+            "commence_time": "2026-07-20T18:00:00Z", "home_team": "H",
+            "away_team": "A", "game_id": "e1",
+            "props": {prop: {"Slugger Sam": {
+                "line": line, "over_implied": over_implied,
+                "under_implied": 1.0 - over_implied, "over_price": -110,
+                "under_price": -110, "over_book": "DK", "under_book": "DK",
+                "dk_over_price": -110, "dk_under_price": -110,
+                "dk_over_book": "DK", "dk_under_book": "DK"}}}}
+
+    def _hist(self, prop, values):
+        dates = [f"2026-07-{d:02d}" for d in range(1, 1 + len(values))]
+        return {"Slugger Sam": {prop: {
+            "found": True, "values": list(values),
+            "game_dates": list(reversed(dates))}}}
+
+    def _run(self, prop_data, hist):
+        return props.analyze_player_props_value(
+            prop_data, hist, threshold_pct=1.0, sport_key=None)[0]
+
+    def test_total_bases_over_is_value(self):
+        # TB multi-valued per game; ~67% clear the 1.5 line, book implies only 45%.
+        cand = self._run(
+            self._prop_data("batter_total_bases", 1.5, 0.45),
+            self._hist("batter_total_bases", [2.0] * 10 + [1.0] * 5))
+        self.assertEqual(cand["prop"], "batter_total_bases")
+        self.assertEqual(cand["line"], 1.5)
+        self.assertEqual(cand["direction"], "OVER")
+        self.assertTrue(cand["is_value"])
+        self.assertIsNone(cand["distributional"])   # binomial model is batter_hits-only
+
+    def test_rbis_over_is_value(self):
+        cand = self._run(
+            self._prop_data("batter_rbis", 0.5, 0.45),
+            self._hist("batter_rbis", [1.0] * 10 + [0.0] * 5))
+        self.assertEqual(cand["prop"], "batter_rbis")
+        self.assertEqual(cand["line"], 0.5)
+        self.assertEqual(cand["direction"], "OVER")
+        self.assertTrue(cand["is_value"])
+        self.assertIsNone(cand["distributional"])
+
+
 class LineConditionalRuntimeTests(unittest.TestCase):
     """props._method_cfg_for_line resolves the per-line bucket method + sub-cfg."""
 

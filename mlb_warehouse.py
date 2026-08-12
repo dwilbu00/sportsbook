@@ -161,10 +161,12 @@ player_alias = Table(
 # is_home are NOT stored: the reader/gold view rejoins fact→mlb_game→mlb_team.
 # Surrogate id stays PK. These live ALONGSIDE the ESPN-sourced *_gamelog tables
 # in gamelog_store.py (untouched) — nothing app-facing consumes these until P4.
-# HR/TB/RBI appended (2026-08-11) so batter_home_runs / batter_total_bases /
-# batter_rbis become fact-servable LATER — captured now, but deliberately NOT yet in
-# _ACTUAL_STAT_SPEC (that + a re-backfill is the "incorporate into the app" step;
-# adding them early would read NULL-as-0.0 on un-backfilled rows).
+# HR/TB/RBI appended (2026-08-11). TB/RBI are now fact-servable (in _ACTUAL_STAT_SPEC
+# → get_actual_stat/get_player_history/resolve_actual) for the batter_total_bases /
+# batter_rbis props; get_player_history SKIPS a game whose stat column is NULL so
+# pre-backfill (un-populated) rows can't corrupt the model input — a full re-backfill
+# just widens coverage, it isn't a correctness prerequisite. batter_home_runs (HR) is
+# captured but not yet an odds market, so it stays out of _ACTUAL_STAT_SPEC.
 _BATTER_GAME_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH", "HR", "TB", "RBI")
 _PITCHER_GAME_STATS = ("IP", "K", "ER")
 
@@ -1090,12 +1092,17 @@ def _ip_to_outs(ip):
     return whole * 3 + round((ip - whole) * 10)
 
 
-# Graded MLB props whose actual is a stored fact column → (table, column, xform).
-# HR / total_bases / RBI are NOT stored (no column) → absent here → caller falls
-# back to the live per-player fetch.
+# Graded/served MLB props whose actual is a stored fact column → (table, column,
+# xform). batter_home_runs (HR) is captured as a column but NOT listed here yet (no
+# odds market wired), so it's absent → caller falls back to the live per-player
+# fetch. ⚠ TB/RBI columns are only populated on rows ingested since the a68f4e6
+# capture landed — legacy rows have them NULL; get_player_history SKIPS a NULL-stat
+# game (never fabricates a 0) so a pre-backfill row can't corrupt the model input.
 _ACTUAL_STAT_SPEC = {
     "batter_hits": (mlb_batter_game, "H", None),
     "batter_strikeouts": (mlb_batter_game, "SO", None),
+    "batter_total_bases": (mlb_batter_game, "TB", None),
+    "batter_rbis": (mlb_batter_game, "RBI", None),
     "pitcher_strikeouts": (mlb_pitcher_game, "K", None),
     "pitcher_earned_runs": (mlb_pitcher_game, "ER", None),
     "pitcher_outs": (mlb_pitcher_game, "IP", "ip_to_outs"),
@@ -1198,11 +1205,21 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
     names = _team_name_map()
     values, opponents, home_aways, game_dates = [], [], [], []
     plate_appearances, at_bats = [], []
+    own_team_id = None
     for r in rows:
         v = r.get(col)
         if xform == "ip_to_outs":
             v = _ip_to_outs(v)
-        values.append(float(v) if v is not None else 0.0)
+        if v is None:
+            # The stat wasn't captured for this game (e.g. TB/RBI on a row written
+            # before those columns were populated / pre-backfill). EXCLUDE it — a
+            # genuine 0 is stored as 0 (StatsAPI always reports the stat for a batter
+            # who came to the plate), so None means "no data", not "zero". Fabricating
+            # a 0.0 here would silently corrupt the projection with all-zero history.
+            continue
+        if own_team_id is None:
+            own_team_id = r["team_id"]           # newest KEPT game's team (~ current)
+        values.append(float(v))
         opponents.append(names.get(r["opponent_team_id"]))
         home_aways.append(bool(r["is_home"]))
         game_dates.append(r["game_date"])
@@ -1218,7 +1235,8 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
                     (ab or 0.0) + (r.get("BB") or 0.0) + (r.get("HBP") or 0.0)
                     + (r.get("SF") or 0.0) + (r.get("SH") or 0.0))
             at_bats.append(ab)
-    own_team_id = rows[0]["team_id"]             # newest game's team (~ current)
+    if not values:              # every candidate game lacked the stat (pre-backfill)
+        return None
     return {
         "player": player_name,
         "athlete_id": str(mlb_player_id),

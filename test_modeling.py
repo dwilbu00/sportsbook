@@ -1389,6 +1389,38 @@ class BestPriceHybridTests(unittest.TestCase):
         self.assertIsNone(info["dk_over_book"])
 
 
+class NewBatterMarketParsingTests(unittest.TestCase):
+    """batter_total_bases (line 1.5) and batter_rbis (line 0.5) parse through the
+    generic parse_player_props once they're in PROP_LABELS — this guards those
+    label entries (a missing label silently drops the market at parse)."""
+
+    def _game(self, market_key, point):
+        outcomes = [
+            {"description": "Slugger Sam", "name": "Over",
+             "price": -110, "point": point},
+            {"description": "Slugger Sam", "name": "Under",
+             "price": -110, "point": point},
+        ]
+        return {
+            "id": "g1", "home_team": "H", "away_team": "A",
+            "commence_time": "2026-07-20T23:10:00Z", "sport_key": "baseball_mlb",
+            "bookmakers": [{"title": "DraftKings",
+                            "markets": [{"key": market_key, "outcomes": outcomes}]}],
+        }
+
+    def test_total_bases_parses(self):
+        out = parse_player_props(self._game("batter_total_bases", 1.5))["props"]
+        self.assertIn("batter_total_bases", out)
+        info = out["batter_total_bases"]["Slugger Sam"]
+        self.assertEqual(info["line"], 1.5)
+        self.assertEqual(info["dk_over_price"], -110)
+
+    def test_rbis_parses(self):
+        out = parse_player_props(self._game("batter_rbis", 0.5))["props"]
+        self.assertIn("batter_rbis", out)
+        self.assertEqual(out["batter_rbis"]["Slugger Sam"]["line"], 0.5)
+
+
 class SharpWeightedConsensusTests(unittest.TestCase):
     """P1.1c: the prop de-vig consensus up-weights sharp books (Pinnacle/Circa)
     and drops stale quotes, reducing to the plain arithmetic mean when neither

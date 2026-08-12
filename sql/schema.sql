@@ -932,9 +932,11 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_mlb_batter_game_athlete
     ON dbo.mlb_batter_game (athlete_id, season_bucket);
 GO
--- Additive: HR/TB/RBI (StatsAPI homeRuns/totalBases/rbi), captured for the
--- batter_home_runs / batter_total_bases / batter_rbis props. Existing rows stay
--- NULL until re-backfilled; not yet fact-servable (_ACTUAL_STAT_SPEC) — see mlb_warehouse.py.
+-- Additive: HR/TB/RBI (StatsAPI homeRuns/totalBases/rbi). TB/RBI are fact-servable
+-- (in _ACTUAL_STAT_SPEC) for the batter_total_bases / batter_rbis props; HR awaits an
+-- odds market. Rows ingested before this landed have them NULL — get_player_history
+-- SKIPS a NULL-stat game (never reads NULL-as-0), so a re-backfill widens coverage but
+-- isn't a correctness prerequisite — see mlb_warehouse.py.
 IF COL_LENGTH('dbo.mlb_batter_game', 'HR') IS NULL
     ALTER TABLE dbo.mlb_batter_game ADD HR FLOAT;
 GO

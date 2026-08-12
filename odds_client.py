@@ -793,7 +793,7 @@ def consensus_odds(team_odds_list):
 PLAYER_PROPS_BY_SPORT = {
     "basketball_nba": ["player_points", "player_assists", "player_rebounds"],
     "americanfootball_nfl": ["player_anytime_td", "player_rush_yds", "player_pass_yds"],
-    "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts", "pitcher_earned_runs"],
+    "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts", "pitcher_earned_runs", "batter_total_bases", "batter_rbis"],
 }
 
 # Mapping of standard player prop market keys → their alt-line market key on
@@ -833,6 +833,8 @@ PROP_LABELS = {
     "pitcher_outs": "Pitcher Outs",
     "batter_strikeouts": "Batter Strikeouts",
     "pitcher_earned_runs": "Pitcher Earned Runs",
+    "batter_total_bases": "Total Bases",
+    "batter_rbis": "RBIs",
 }
 
 

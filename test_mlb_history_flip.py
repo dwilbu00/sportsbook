@@ -65,8 +65,15 @@ class WarehouseHistGateTests(unittest.TestCase):
             self.assertIsNone(self._call(sql_enabled=False))
 
     def test_unsupported_prop_returns_none(self):
-        with _flag_on():                       # HR has no fact column
+        with _flag_on():                       # HR has no odds market / not in spec
             self.assertIsNone(self._call(prop="batter_home_runs"))
+
+    def test_new_batter_markets_are_servable(self):
+        # TB/RBI are now in _ACTUAL_STAT_SPEC, so the flip gate lets them through to
+        # the warehouse reader (HR above stays gated out).
+        with _flag_on():
+            self.assertEqual(self._call(prop="batter_total_bases"), WH_DICT)
+            self.assertEqual(self._call(prop="batter_rbis"), WH_DICT)
 
     def test_ambiguous_or_unknown_name_returns_none(self):
         with _flag_on():
@@ -411,6 +418,40 @@ class GateStatusTests(unittest.TestCase):
 
     def test_sql_disabled_reported(self):
         self.assertFalse(self._status({}, sql=False)["sql"])
+
+
+class WarehouseOnlyPropsEspnGuardTests(unittest.TestCase):
+    """batter_total_bases / batter_rbis are WAREHOUSE-ONLY: the live ESPN gamelog
+    path must return no_history for them even though a RAW ESPN gamelog carries an
+    'RBI' label (gamelog_store's slow path returns raw rows). Without the guard an
+    uncalibrated RBI over-rate would leak whenever the flag is off / cache is stale."""
+
+    def _gamelog(self):
+        return [{"H": 1.0, "RBI": 2.0, "opponent": "BOS", "is_home": True,
+                 "game_date": "2026-07-0%d" % d} for d in range(1, 6)]
+
+    def _hist(self, prop):
+        with mock.patch.object(espn_client, "db_store",
+                               mock.Mock(enabled=mock.Mock(return_value=False))), \
+             mock.patch.object(espn_client, "search_athlete",
+                               return_value={"id": "1", "team_id": "147"}), \
+             mock.patch.object(espn_client, "get_athlete_gamelog",
+                               return_value=self._gamelog()):
+            return espn_client.get_player_stat_history(
+                "baseball", "mlb", "Guy", prop, allow_warehouse=False)
+
+    def test_rbis_not_served_by_espn(self):
+        rbi = self._hist("batter_rbis")
+        self.assertFalse(rbi["found"])          # guarded: warehouse-only
+        self.assertEqual(rbi["values"], [])
+
+    def test_total_bases_not_served_by_espn(self):
+        self.assertFalse(self._hist("batter_total_bases")["found"])
+
+    def test_hits_still_served_by_espn(self):   # control: guard is TB/RBI-specific
+        hits = self._hist("batter_hits")
+        self.assertTrue(hits["found"])
+        self.assertEqual(hits["values"][0], 1.0)
 
 
 if __name__ == "__main__":
