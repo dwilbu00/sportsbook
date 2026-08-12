@@ -34,6 +34,20 @@ try:
 except Exception:
     pass
 
+# P4/P5 MLB→StatsAPI warehouse feature gates. On Streamlit Cloud there are no
+# settable OS env vars — only st.secrets — and the gate helpers read os.environ, so
+# promote the gate flags here (boot) exactly like the SQL secrets above. Absent →
+# unset → the gate stays OFF (its default). Set e.g. ODI_MLB_WAREHOUSE_HIST = "1" in
+# the app's Secrets to flip a gate; str() handles a TOML boolean (true → "True").
+try:
+    for _gate_key in ("ODI_MLB_WAREHOUSE_HIST", "ODI_MLB_WAREHOUSE_TEAM",
+                      "ODI_MLB_WAREHOUSE_CALIB", "ODI_MLB_ENFORCE_IDENTITY"):
+        _gate_val = st.secrets.get(_gate_key)
+        if _gate_val is not None:
+            os.environ.setdefault(_gate_key, str(_gate_val))
+except Exception:
+    pass
+
 # SQL-off hardening (WS1 Layer C): if a SQL deployment is signalled but the SQL
 # backend is not reachable, halt at boot instead of silently writing bets and
 # predictions to the ephemeral local disk (wiped on Streamlit Cloud restart).
