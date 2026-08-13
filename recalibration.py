@@ -419,7 +419,7 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
                    final_prob=None, event_id=None, commence_time=None,
                    is_value=None, team=None, batting_order=None,
                    mlb_player_id=None, game_pk=None, ids_resolved=False,
-                   write=True):
+                   source=None, write=True):
     """Build and optionally append one prediction row. Best-effort, never raises.
 
     ``team`` and ``batting_order`` are the rule inputs the pick-rules ROI lens
@@ -477,6 +477,7 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
         "outcome": None,    # 1=over_won, 0=under_won, None=push/unresolved
     }
     row["game_pk"] = game_pk
+    row["source"] = source       # data path that served the model-input history
     if ids_resolved:
         row["player_mlb_id"] = mlb_player_id     # resolver-authoritative (may be None)
     _enrich_prediction_ids(row, trust_ids=ids_resolved)

@@ -1143,6 +1143,11 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         "at_bats": [],
         "team_id": None,
         "found": False,
+        # Which data path served this history — stamped onto prediction_log.source so
+        # a warehouse-gate flip's effect is auditable per prediction. This ESPN path
+        # is "espn"; the warehouse branch below returns get_player_history's dict,
+        # which carries "warehouse".
+        "source": "espn",
     }
 
     # P4 model-input cutover (MLB only, env-gated, fail-open): serve the recent-game

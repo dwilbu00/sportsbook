@@ -1782,6 +1782,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     mlb_player_id=(_ident.get("mlb_player_id") if _ident else None),
                     game_pk=(_ident.get("game_pk") if _ident else None),
                     ids_resolved=bool(_ident),
+                    source=history.get("source"),   # "warehouse" | "espn" (audit the flip)
                     write=False,
                 )
                 if prediction_row:

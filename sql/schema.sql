@@ -77,6 +77,13 @@ GO
 IF COL_LENGTH('dbo.prediction_log', 'game_pk') IS NULL
     ALTER TABLE dbo.prediction_log ADD game_pk INT;
 GO
+-- P6 teardown verification: which data path served the model-input history at
+-- prediction time — "warehouse" (StatsAPI facts) or "espn". Nullable/best-effort;
+-- makes a warehouse-gate flip's effect auditable per prediction (the durable
+-- "prove the gate is carrying the load" signal) before ESPN removal.
+IF COL_LENGTH('dbo.prediction_log', 'source') IS NULL
+    ALTER TABLE dbo.prediction_log ADD source NVARCHAR(16);
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_prediction_sport_resolved'
                  AND object_id = OBJECT_ID('dbo.prediction_log'))

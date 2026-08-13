@@ -172,6 +172,11 @@ prediction_log = Table(
     # in one game. NULL for NBA/NFL and for unresolved MLB rows (the P3 shadow
     # signal); P4 enforces MLB-scoped non-NULL, P5 backfills legacy rows.
     Column("game_pk", Integer),
+    # Which data path served the model-input history at prediction time: "warehouse"
+    # (StatsAPI facts) or "espn". Nullable/best-effort — makes a warehouse-gate flip's
+    # effect auditable per prediction (NULL for pre-column rows / unknown source),
+    # the durable signal for "prove the gate is carrying the load" before ESPN removal.
+    Column("source", String(16)),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player_key", "line",
                      name="uq_prediction_identity_v2"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
@@ -412,6 +417,7 @@ _PREDICTION_SPEC = [
     ("actual", _f),
     ("price", _i), ("outcome", _i), ("batting_order", _i), ("game_pk", _i),
     ("team", _s), ("player_mlb_id", _s), ("team_code", _s), ("player_key", _s),
+    ("source", _s),
     ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
 

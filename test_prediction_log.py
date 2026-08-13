@@ -79,6 +79,22 @@ class LogPredictionFieldTests(unittest.TestCase):
             recalibration.prediction_identity(row),
             ("baseball_mlb", "e1", "batter_hits", "name:slugger", 0.5))
 
+    def test_source_persisted(self):
+        # The data-path provenance ("warehouse" | "espn") is stamped so a
+        # warehouse-gate flip is auditable per prediction.
+        self.assertEqual(self._build(source="warehouse")["source"], "warehouse")
+        self.assertEqual(self._build(source="espn")["source"], "espn")
+
+    def test_source_defaults_to_none(self):
+        self.assertIsNone(self._build()["source"])
+
+    def test_source_unaffected_by_identity(self):
+        # source is provenance metadata — it must never shift the forecast identity.
+        a = self._build(source="warehouse")
+        b = self._build(source="espn")
+        self.assertEqual(recalibration.prediction_identity(a),
+                         recalibration.prediction_identity(b))
+
 
 class UpsertDeduplicationTests(unittest.TestCase):
     def test_relogging_supersedes_stale_unresolved_duplicate(self):

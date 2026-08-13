@@ -1310,6 +1310,7 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
         "team_id": own_team_id,
         "team_name": names.get(own_team_id),
         "found": True,
+        "source": "warehouse",     # stamped onto prediction_log.source (see espn_client.get_player_stat_history)
     }
 
 
