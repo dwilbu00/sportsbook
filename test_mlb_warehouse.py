@@ -1443,6 +1443,81 @@ class TeamDefenseParityTests(_Backend, unittest.TestCase):
         self.assertEqual(rep["mismatches"], 0)
 
 
+class WarehouseFindTeamTests(_Backend, unittest.TestCase):
+    """warehouse_find_team / team_id_for_name_tolerant — the find_team replacement
+    that lets MLB team markets resolve (gate + event_team_ids + season block) without
+    the ESPN teams dict."""
+
+    def setUp(self):
+        super().setUp()
+        # Red Sox + White Sox both end in 'Sox' (ambiguity guard); Athletics covers
+        # the 'Oakland Athletics' vs canonical 'Athletics' spelling gap.
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox"),
+                        ("145", "Chicago White Sox"), ("133", "Athletics")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+
+    def _stand(self, tid, w, losses, wp, season=2024, as_of="2024-07-04"):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_team_standings), {
+                "team_id": tid, "season": season, "as_of_date": as_of,
+                "wins": w, "losses": losses, "win_pct": wp,
+                "runs_scored": 0, "runs_allowed": 0})
+
+    def test_tolerant_exact(self):
+        self.assertEqual(
+            mlb_warehouse.team_id_for_name_tolerant("New York Yankees"), "147")
+
+    def test_tolerant_case_and_punct(self):
+        self.assertEqual(
+            mlb_warehouse.team_id_for_name_tolerant("new york yankees"), "147")
+
+    def test_tolerant_athletics_spelling_gap(self):
+        # 'Oakland Athletics' (odds/ESPN) resolves to the canonical 'Athletics'.
+        self.assertEqual(
+            mlb_warehouse.team_id_for_name_tolerant("Oakland Athletics"), "133")
+
+    def test_tolerant_ambiguous_returns_none(self):
+        # 'Sox' matches BOTH Red Sox and White Sox → refuse (never bind wrong team).
+        self.assertIsNone(mlb_warehouse.team_id_for_name_tolerant("Sox"))
+
+    def test_tolerant_unknown_returns_none(self):
+        self.assertIsNone(mlb_warehouse.team_id_for_name_tolerant("Nowhere FC"))
+
+    def test_find_team_dict_shape_with_standings(self):
+        self._stand("147", 55, 30, 0.647)
+        t = mlb_warehouse.warehouse_find_team("New York Yankees", season=2024)
+        self.assertEqual(t["id"], "147")
+        self.assertEqual(t["display_name"], "New York Yankees")
+        self.assertEqual((t["wins"], t["losses"], t["record"]), (55, 30, "55-30"))
+        self.assertAlmostEqual(t["win_pct"], 0.647)
+
+    def test_find_team_tolerant_name_returns_canonical(self):
+        self._stand("133", 40, 45, 0.471)
+        t = mlb_warehouse.warehouse_find_team("Oakland Athletics", season=2024)
+        self.assertEqual(t["id"], "133")
+        self.assertEqual(t["display_name"], "Athletics")     # canonical, not input
+        self.assertEqual(t["wins"], 40)
+
+    def test_find_team_no_standings_defaults(self):
+        # Resolvable team, no standings snapshot → zeros/empty record, still a dict.
+        t = mlb_warehouse.warehouse_find_team("New York Yankees", season=2024)
+        self.assertEqual(t["id"], "147")
+        self.assertEqual((t["wins"], t["losses"], t["record"], t["win_pct"]),
+                         (0, 0, "", 0.0))
+
+    def test_find_team_unknown_returns_none(self):
+        self.assertIsNone(mlb_warehouse.warehouse_find_team("Nowhere FC"))
+
+    def test_returns_none_when_sql_off(self):
+        db_store.configure_engine(None)                      # tearDown re-clears
+        self.assertIsNone(mlb_warehouse.warehouse_find_team("New York Yankees"))
+        self.assertIsNone(
+            mlb_warehouse.team_id_for_name_tolerant("New York Yankees"))
+
+
 class NonFranchiseTeamTests(_Backend, unittest.TestCase):
     """Prevention (ingest skips non-real matchups) + cleanup purge (cascade-delete
     all-star squads / bracket placeholders + their games/facts; real teams safe)."""

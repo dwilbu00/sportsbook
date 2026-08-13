@@ -1441,6 +1441,73 @@ def team_name_canonical(team_name):
     return _team_name_map().get(tid) if tid else None
 
 
+def team_id_for_name_tolerant(name):
+    """team_id_for_name with a fuzzy fallback ladder — exact name_norm (the fast
+    path), then substring, then last-word/nickname — mirroring espn_client.find_team's
+    tolerance so the warehouse team-dim resolver matches odds/ESPN spellings the exact
+    name_norm misses (e.g. 'Oakland Athletics' vs the canonical 'Athletics'). Returns
+    the team_id ONLY on an UNAMBIGUOUS hit (a single distinct team); an ambiguous
+    partial like 'Sox' (Red Sox + White Sox) or 'Los Angeles' (two LA clubs) → None,
+    so a caller never binds the wrong franchise. Fail-open (None on any error)."""
+    if not name or not enabled():
+        return None
+    tid = team_id_for_name(name)                      # exact name_norm (fast path)
+    if tid:
+        return tid
+    try:
+        nn = db_store.normalize_name(name)
+    except (TypeError, ValueError):
+        return None
+    if not nn:
+        return None
+    nn_last = nn.split()[-1]
+    substr, lastword = set(), set()
+    for cand_id, disp in _team_name_map().items():
+        try:
+            dn = db_store.normalize_name(disp or "")
+        except (TypeError, ValueError):
+            continue
+        if not dn:
+            continue
+        if nn in dn or dn in nn:
+            substr.add(cand_id)
+        if nn_last and dn.split() and nn_last == dn.split()[-1]:
+            lastword.add(cand_id)
+    for hits in (substr, lastword):                  # substring is the tighter tier
+        if len(hits) == 1:
+            return next(iter(hits))
+    return None
+
+
+def warehouse_find_team(team_name, season=None, as_of_date=None):
+    """StatsAPI-warehouse replacement for espn_client.find_team: return the same
+    ``{id, display_name, abbreviation, short_name, record, wins, losses, win_pct}``
+    dict its consumers read — the ``if home_espn and away_espn`` team-market gate,
+    the event_team_ids for player disambiguation, and the season block — sourced from
+    the mlb_team dim + the latest /standings snapshot, so MLB team markets resolve
+    WITHOUT the ESPN teams dict. The tolerance is applied ONCE here; the canonical
+    display name then feeds get_team_standings' exact match. None when the name can't
+    be resolved unambiguously (or SQL is off). Fail-open — callers keep find_team as a
+    transition fallback until the P6 teardown removes ESPN team resolution for MLB."""
+    if not enabled():
+        return None
+    tid = team_id_for_name_tolerant(team_name)
+    if not tid:
+        return None
+    disp = _team_name_map().get(tid) or team_name
+    st = get_team_standings(disp, season=season, as_of_date=as_of_date) or {}
+    return {
+        "id": str(tid),
+        "display_name": disp,
+        "abbreviation": "",          # not stored/used by the team-market consumers
+        "short_name": "",            # (present for shape parity with find_team)
+        "record": st.get("record", ""),
+        "wins": st.get("wins", 0),
+        "losses": st.get("losses", 0),
+        "win_pct": st.get("win_pct", 0.0),
+    }
+
+
 def _latest_standings_asof(conn, season, as_of_date=None):
     """The most-recent standings snapshot date for a season (<= as_of_date if
     given), or None. All 30 teams share an as_of_date per ingest, so this pins one
