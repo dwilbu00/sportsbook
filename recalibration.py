@@ -1420,15 +1420,15 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
     except Exception:
         pass
     if actual is None:
-        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: the statsapi hard-ID
-        # path above is their legitimate non-ESPN source (returns the true boxscore
-        # value). A raw ESPN gamelog carries an UNCALIBRATED 'RBI' (and no 'TB'), so
-        # NEVER grade these off it — stay pending (return None) rather than fall to
-        # the ESPN gamelog. MLB-gated so NBA/NFL/NHL are untouched. Mirrors
-        # espn_client.WAREHOUSE_ONLY_PROPS + the history/calibration guards.
-        import espn_client
-        if (sport_key == "baseball_mlb"
-                and prop_key in espn_client.WAREHOUSE_ONLY_PROPS):
+        # P6 grading cutover — MLB grades from the WAREHOUSE + statsapi ONLY:
+        # grading already tried the warehouse (resolve_actual) then the statsapi
+        # hard-ID path (_resolve_mlb_actual, which resolves by NAME — no game_pk
+        # needed). Both missed, so DO NOT fall to the ESPN gamelog for baseball —
+        # stay pending (return None). _ENFORCE_IDENTITY keeps new unpinnable rows
+        # from ever being logged, so the only rows this leaves pending are legacy
+        # id-less prospects ESPN couldn't reliably grade anyway (aged out
+        # separately). NBA/NFL/NHL keep the ESPN gamelog path below unchanged.
+        if sport_key == "baseball_mlb":
             return None
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
@@ -1481,12 +1481,9 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
         if not _espn_row_final(gamelog[idx]):
             return None
         actual = gamelog[idx].get(stat_label)
-        # ESPN reports pitcher_outs as IP notation (6.1 = 6 innings + 1 out = 19
-        # outs). The statsapi hard-ID path above already returns true outs, so
-        # convert ONLY on this ESPN-fallback branch — else a bet would grade a
-        # raw 6.1 against an outs line (~18.5) and always resolve UNDER.
-        if prop_key == "pitcher_outs" and actual is not None:
-            actual = espn_client.ip_to_outs(actual)   # espn_client imported above
+        # (The MLB-only pitcher_outs IP->outs conversion lived here; MLB no longer
+        # reaches this ESPN branch — see the baseball_mlb return above — so it's gone.
+        # This branch is now NBA/NFL/NHL-only, whose stats need no such conversion.)
     if actual is None:
         return None
     try:

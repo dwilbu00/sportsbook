@@ -1257,10 +1257,13 @@ class RecalibrationTests(unittest.TestCase):
             "baseball_mlb", resolve_first=False, newly_resolved=25)
 
     def test_outcome_resolution_refreshes_recent_gamelogs(self):
+        # NBA/NFL/NHL grading refreshes the ESPN gamelog (ttl_hours=6). MLB is
+        # warehouse+statsapi only in P6 and never reaches this ESPN path, so the
+        # refresh behavior is exercised via basketball.
         rows = [{
             "ts": "2024-04-01T10:00:00Z",
-            "sport_key": "baseball_mlb",
-            "prop_key": "batter_hits",
+            "sport_key": "basketball_nba",
+            "prop_key": "player_points",
             "player": "Player One",
             "game_date": "2024-04-01",
             "line": 0.5,
@@ -1270,22 +1273,20 @@ class RecalibrationTests(unittest.TestCase):
         def mutate(mutator, where=None):
             return mutator(rows)
 
-        # _resolve_mlb_actual -> None forces the ESPN fallback (and keeps this
-        # MLB row off live statsapi, which the hard-ID path would otherwise hit).
         with patch.object(recalibration, "_read_log", return_value=rows), patch.object(
                 recalibration, "_resolve_mlb_actual", return_value=None), patch(
                 "espn_cache.cached_athlete_id", return_value="123"), patch(
                 "espn_cache.cached_gamelog",
-                return_value=[{"game_date": "2024-04-01", "H": 1}],
+                return_value=[{"game_date": "2024-04-01", "PTS": 1}],
         ) as gamelog, patch.object(
-                recalibration, "_stat_label", return_value="H"), patch.object(
+                recalibration, "_stat_label", return_value="PTS"), patch.object(
                 recalibration, "mutate_prediction_log", side_effect=mutate):
-            resolved = recalibration.resolve_pending_outcomes("baseball_mlb")
+            resolved = recalibration.resolve_pending_outcomes("basketball_nba")
 
         self.assertEqual(resolved, 1)
         self.assertTrue(rows[0]["resolved"])
         gamelog.assert_called_once_with(
-            "baseball", "mlb", "123", ttl_hours=6)
+            "basketball", "nba", "123", ttl_hours=6)
 
     def test_forced_odds_refresh_never_uses_expired_cache(self):
         response = requests.Response()

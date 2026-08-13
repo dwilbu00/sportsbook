@@ -85,22 +85,32 @@ class SplitsFallbackTests(unittest.TestCase):
 
 
 class GradingFallbackTests(unittest.TestCase):
-    """Cluster 1: resolve_one_prop ESPN fallback converts IP->outs; the statsapi
-    hard-ID path (already outs) is NOT re-converted."""
+    """Cluster 1 (P6 cutover): MLB grades from the WAREHOUSE + statsapi ONLY. When
+    both miss, resolve_one_prop stays pending (None) and never touches the ESPN
+    gamelog for ANY prop; the statsapi hard-ID value is passed through as-is. (The
+    ESPN grading path remains for NBA/NFL/NHL — exercised in the postponed/role-gate
+    suites retargeted to basketball.)"""
 
-    def test_espn_fallback_converts_ip_to_outs(self):
-        gamelog = [{"IP": 6.1, "game_date": "2025-07-01T18:00:00Z",
-                    "completed": True, "opponent": "X", "is_home": True}]
+    def test_mlb_never_grades_off_espn(self):
+        # After the statsapi miss, MLB must NOT fall to the ESPN gamelog for ANY
+        # prop (incl. the old pitcher_outs IP->outs and the TB/RBI warehouse-only
+        # cases) — it stays pending (None) and never even loads the gamelog.
+        gamelog = [{"H": 2.0, "IP": 6.1, "RBI": 2.0, "TB": 3.0,
+                    "game_date": "2025-07-01T18:00:00Z", "completed": True,
+                    "opponent": "X", "is_home": True}]
         by_date = {"2025-07-01": [0]}
-        with patch.object(recalibration, "_resolve_mlb_actual",
-                          return_value=None), \
-             patch.object(recalibration, "_load_player_gamelog",
-                          return_value=(gamelog, by_date)), \
-             patch.object(recalibration, "_pick_candidate", return_value=0):
-            actual = recalibration.resolve_one_prop(
-                "baseball_mlb", "P", "pitcher_outs", 18.5,
-                "2025-07-01", "2025-07-01T18:00:00Z")
-        self.assertEqual(actual, 19.0)   # ip_to_outs(6.1), not raw 6.1
+        for role, prop in (("P", "pitcher_outs"), ("B", "batter_hits"),
+                           ("B", "batter_rbis"), ("B", "batter_total_bases")):
+            with patch.object(recalibration, "_resolve_mlb_actual",
+                              return_value=None), \
+                 patch.object(recalibration, "_load_player_gamelog",
+                              return_value=(gamelog, by_date)) as ld, \
+                 patch.object(recalibration, "_pick_candidate", return_value=0):
+                actual = recalibration.resolve_one_prop(
+                    "baseball_mlb", role, prop, 0.5,
+                    "2025-07-01", "2025-07-01T18:00:00Z")
+            self.assertIsNone(actual, prop)
+            ld.assert_not_called()       # ESPN gamelog never loaded for MLB
 
     def test_statsapi_outs_not_double_converted(self):
         with patch.object(recalibration, "_resolve_mlb_actual",
@@ -109,41 +119,6 @@ class GradingFallbackTests(unittest.TestCase):
                 "baseball_mlb", "P", "pitcher_outs", 18.5,
                 "2025-07-01", "2025-07-01T18:00:00Z")
         self.assertEqual(actual, 18.0)   # statsapi outs passed through as-is
-
-    def test_batter_hits_fallback_unchanged(self):
-        gamelog = [{"H": 2.0, "game_date": "2025-07-01T18:00:00Z",
-                    "completed": True, "opponent": "X", "is_home": True}]
-        by_date = {"2025-07-01": [0]}
-        with patch.object(recalibration, "_resolve_mlb_actual",
-                          return_value=None), \
-             patch.object(recalibration, "_load_player_gamelog",
-                          return_value=(gamelog, by_date)), \
-             patch.object(recalibration, "_pick_candidate", return_value=0):
-            actual = recalibration.resolve_one_prop(
-                "baseball_mlb", "B", "batter_hits", 0.5,
-                "2025-07-01", "2025-07-01T18:00:00Z")
-        self.assertEqual(actual, 2.0)    # non-IP prop untouched
-
-    def test_tb_rbi_never_grade_off_espn(self):
-        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: after the statsapi
-        # hard-ID miss, the ESPN gamelog fallback must NOT grade them off its
-        # uncalibrated 'RBI' (or a phantom 'TB') — resolve_one_prop returns None
-        # (bet stays pending) and never even loads the ESPN gamelog.
-        gamelog = [{"H": 1.0, "RBI": 2.0, "TB": 3.0,
-                    "game_date": "2025-07-01T18:00:00Z", "completed": True,
-                    "opponent": "X", "is_home": True}]
-        by_date = {"2025-07-01": [0]}
-        for prop in ("batter_rbis", "batter_total_bases"):
-            with patch.object(recalibration, "_resolve_mlb_actual",
-                              return_value=None), \
-                 patch.object(recalibration, "_load_player_gamelog",
-                              return_value=(gamelog, by_date)) as ld, \
-                 patch.object(recalibration, "_pick_candidate", return_value=0):
-                actual = recalibration.resolve_one_prop(
-                    "baseball_mlb", "B", prop, 0.5,
-                    "2025-07-01", "2025-07-01T18:00:00Z")
-            self.assertIsNone(actual, prop)
-            ld.assert_not_called()       # guarded BEFORE the ESPN gamelog load
 
 
 class RealLineCalibrationTests(unittest.TestCase):

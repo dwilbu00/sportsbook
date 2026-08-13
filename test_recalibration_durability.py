@@ -180,31 +180,32 @@ class DoubleheaderPickTests(unittest.TestCase):
         self.assertEqual(
             recalibration._pick_candidate(cands, "2024-07-04T23:00:00Z"), 0)
 
-    def test_resolve_disambiguates_doubleheader_via_espn(self):
+    def test_doubleheader_disambiguated_via_statsapi_not_espn(self):
+        # MLB doubleheaders are disambiguated by the statsapi hard-ID (gamePk) path
+        # (mlb_starters.resolve_player_game_stat via _resolve_mlb_actual), NOT the
+        # ESPN gamelog — MLB grading is warehouse+statsapi only in P6, so ESPN is
+        # never consulted (the statsapi value already pins the correct game).
         row = {
             "ts": "2024-07-04T10:00:00Z", "sport_key": "baseball_mlb",
             "prop_key": "batter_hits", "player": "Player One",
             "game_date": "2024-07-04", "commence_time": "2024-07-04T23:05:00Z",
             "line": 0.5, "resolved": False,
         }
-        gamelog = [
-            {"game_date": "2024-07-04T17:10:00Z", "H": 0},   # game 1
-            {"game_date": "2024-07-04T23:10:00Z", "H": 2},   # game 2 (nightcap)
-        ]
 
         def mutate(mutator, where=None):
             return mutator([row])
 
         with patch.object(recalibration, "_read_log", return_value=[row]), \
-             patch.object(recalibration, "_resolve_mlb_actual", return_value=None), \
-             patch("espn_cache.cached_athlete_id", return_value="1"), \
-             patch("espn_cache.cached_gamelog", return_value=gamelog), \
-             patch.object(recalibration, "_stat_label", return_value="H"), \
+             patch.object(recalibration, "_resolve_mlb_actual",
+                          return_value=2.0) as sa, \
+             patch("espn_cache.cached_gamelog") as esp, \
              patch.object(recalibration, "mutate_prediction_log", side_effect=mutate):
             resolved = recalibration.resolve_pending_outcomes("baseball_mlb")
         self.assertEqual(resolved, 1)
-        self.assertEqual(row["actual"], 2.0)   # nightcap, not the 17:10 opener
+        self.assertEqual(row["actual"], 2.0)   # statsapi nightcap value
         self.assertEqual(row["outcome"], 1)
+        sa.assert_called()                     # statsapi hard-ID path used
+        esp.assert_not_called()                # ESPN never consulted for MLB
 
     def test_statsapi_resolves_when_espn_unavailable(self):
         # The hard-ID path must run independently of ESPN: a player ESPN can't

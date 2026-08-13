@@ -226,7 +226,9 @@ class MlbScoresExcludePostponedTests(unittest.TestCase):
 class EspnAdjacentGuardTests(unittest.TestCase):
     """resolve_one_prop's ±1-day ESPN fallback must not grade a postponed game
     against the prior night's DIFFERENT game (~24h away); genuine UTC/local date
-    slippage (same start time) still resolves."""
+    slippage (same start time) still resolves. This is the NBA/NFL/NHL grading
+    path (MLB is warehouse+statsapi only in P6 and never reaches ESPN), so it's
+    exercised via basketball."""
 
     def _resolve(self, gamelog, by_date, game_date, commence):
         with patch.object(recalibration, "_resolve_mlb_actual",
@@ -234,12 +236,12 @@ class EspnAdjacentGuardTests(unittest.TestCase):
              patch.object(recalibration, "_load_player_gamelog",
                           return_value=(gamelog, by_date)):
             return recalibration.resolve_one_prop(
-                "baseball_mlb", "B", "batter_hits", 0.5, game_date, commence)
+                "basketball_nba", "P1", "player_points", 0.5, game_date, commence)
 
     def test_adjacent_prior_night_not_graded(self):
         # Bet on a game postponed on 2025-07-02 (~23:10Z). ESPN has no row that
         # day, but the player DID play the prior night (2025-07-01 ~23:10Z).
-        gamelog = [{"H": 2.0, "game_date": "2025-07-01T23:10:00Z",
+        gamelog = [{"PTS": 2.0, "game_date": "2025-07-01T23:10:00Z",
                     "completed": True}]
         by_date = {"2025-07-01": [("2025-07-01T23:10:00Z", 0)]}
         actual = self._resolve(gamelog, by_date, "2025-07-02",
@@ -248,7 +250,7 @@ class EspnAdjacentGuardTests(unittest.TestCase):
 
     def test_genuine_slippage_resolves(self):
         # Same physical game, filed a calendar day off (commence == row start).
-        gamelog = [{"H": 2.0, "game_date": "2025-07-01T23:30:00Z",
+        gamelog = [{"PTS": 2.0, "game_date": "2025-07-01T23:30:00Z",
                     "completed": True}]
         by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
         actual = self._resolve(gamelog, by_date, "2025-07-02",
@@ -257,45 +259,32 @@ class EspnAdjacentGuardTests(unittest.TestCase):
 
 
 class EspnRoleGateTests(unittest.TestCase):
-    """resolve_one_prop's ESPN fallback must never grade a pitcher prop off a
-    BATTER's gamelog (or vice-versa): pitcher_strikeouts and batter_strikeouts
-    both map to the ESPN "K"/"SO" labels, so an id-map / namesake slip that pools
-    the wrong role's log would grade the bet off the wrong stat. Mirrors
-    backtest._role_matches_gamelog on the main sweep and the book-line join."""
+    """The cross-role K/SO grading hazard (pitcher_strikeouts vs batter_strikeouts
+    both mapping to the ESPN "K"/"SO" labels) is ELIMINATED for MLB grading in P6:
+    MLB never grades off the ESPN gamelog (warehouse + statsapi only), so a K/SO
+    prop stays pending after a statsapi miss regardless of any pooled gamelog and
+    never even loads it. (The role gate itself still guards the book-line
+    calibration join + the backtest — covered in those suites.)"""
 
     def _resolve(self, prop_key, gamelog, by_date, game_date, commence):
         with patch.object(recalibration, "_resolve_mlb_actual",
                           return_value=None), \
              patch.object(recalibration, "_load_player_gamelog",
-                          return_value=(gamelog, by_date)):
-            return recalibration.resolve_one_prop(
+                          return_value=(gamelog, by_date)) as ld:
+            out = recalibration.resolve_one_prop(
                 "baseball_mlb", "P", prop_key, 5.5, game_date, commence)
+        return out, ld
 
-    def test_pitcher_prop_on_batter_log_stays_pending(self):
-        # Batter log: "SO" present, no "IP". Without the gate, "SO" would grade a
-        # pitcher_strikeouts bet off the batter's strikeouts.
-        gl = [{"SO": 3.0, "H": 1.0, "game_date": "2025-07-01T23:30:00Z",
-               "completed": True}]
+    def test_mlb_ko_props_stay_pending_never_espn(self):
+        # Even a role-MATCHING pitcher log must NOT grade an MLB K/SO prop off ESPN.
+        gl = [{"K": 7.0, "IP": 6.0, "SO": 3.0, "H": 1.0,
+               "game_date": "2025-07-01T23:30:00Z", "completed": True}]
         by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
-        self.assertIsNone(self._resolve("pitcher_strikeouts", gl, by_date,
-                                        "2025-07-01", "2025-07-01T23:30:00Z"))
-
-    def test_batter_prop_on_pitcher_log_stays_pending(self):
-        # Pitcher log: "K" + "IP". Without the gate, "K" would grade a
-        # batter_strikeouts bet off the pitcher's strikeouts.
-        gl = [{"K": 7.0, "IP": 6.0, "game_date": "2025-07-01T23:30:00Z",
-               "completed": True}]
-        by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
-        self.assertIsNone(self._resolve("batter_strikeouts", gl, by_date,
-                                        "2025-07-01", "2025-07-01T23:30:00Z"))
-
-    def test_pitcher_prop_on_pitcher_log_grades(self):
-        # Role matches -> the gate is transparent; the bet grades normally on "K".
-        gl = [{"K": 7.0, "IP": 6.0, "game_date": "2025-07-01T23:30:00Z",
-               "completed": True}]
-        by_date = {"2025-07-01": [("2025-07-01T23:30:00Z", 0)]}
-        self.assertEqual(self._resolve("pitcher_strikeouts", gl, by_date,
-                                       "2025-07-01", "2025-07-01T23:30:00Z"), 7.0)
+        for prop in ("pitcher_strikeouts", "batter_strikeouts"):
+            out, ld = self._resolve(prop, gl, by_date,
+                                    "2025-07-01", "2025-07-01T23:30:00Z")
+            self.assertIsNone(out, prop)
+            ld.assert_not_called()
 
 
 if __name__ == "__main__":
