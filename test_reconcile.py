@@ -309,6 +309,49 @@ class UpsertBulkTests(_Backend, unittest.TestCase):
             n = db_store.upsert_bulk(conn, self.t, [], ("k",), scope={"s": "A"})
         self.assertEqual(n, (0, 0))
 
+    def test_bulk_update_many_rows_batched(self):
+        # The backfill scenario the executemany-UPDATE path exists for: fill a
+        # previously-NULL column on SEVERAL existing rows in ONE call (one
+        # executemany batch, not a round-trip per row). All are UPDATEs; a row in
+        # another scope must be untouched.
+        self._seed(self.t,
+                   {"s": "A", "k": "a", "v": 1, "note": None},
+                   {"s": "A", "k": "b", "v": 2, "note": None},
+                   {"s": "A", "k": "c", "v": 3, "note": None},
+                   {"s": "B", "k": "a", "v": 9, "note": None})   # other scope
+        desired = [{"s": "A", "k": "a", "v": 1, "note": "x"},
+                   {"s": "A", "k": "b", "v": 2, "note": "x"},
+                   {"s": "A", "k": "c", "v": 3, "note": "x"}]
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.t, desired, ("k",), scope={"s": "A"})
+        self.assertEqual(n, (0, 3))
+        with db_store.get_engine().connect() as conn:
+            got = {r["k"]: r["note"] for r in _rows(conn, self.t, {"s": "A"})}
+            other = {r["k"]: r["note"] for r in _rows(conn, self.t, {"s": "B"})}
+        self.assertEqual(got, {"a": "x", "b": "x", "c": "x"})
+        self.assertEqual(other, {"a": None})               # other scope untouched
+
+    def test_bulk_update_composite_identity_with_scope(self):
+        # The mlb_batter_game fact-backfill pattern: composite identity
+        # (athlete_id, game_pk) with a scope (game_pk). Fills a NULL column on
+        # multiple existing composite-key rows via one executemany batch; a row in
+        # another scope is untouched.
+        self._seed(self.p,
+                   {"sport": "mlb", "prop": "h", "a": None},
+                   {"sport": "mlb", "prop": "hr", "a": None},
+                   {"sport": "nba", "prop": "h", "a": None})     # other scope
+        desired = [{"sport": "mlb", "prop": "h", "a": 1.0},
+                   {"sport": "mlb", "prop": "hr", "a": 2.0}]
+        with db_store.get_engine().begin() as conn:
+            n = db_store.upsert_bulk(conn, self.p, desired, ("sport", "prop"),
+                                     scope={"sport": "mlb"})
+        self.assertEqual(n, (0, 2))
+        with db_store.get_engine().connect() as conn:
+            got = {r["prop"]: r["a"] for r in _rows(conn, self.p, {"sport": "mlb"})}
+            other = {r["prop"]: r["a"] for r in _rows(conn, self.p, {"sport": "nba"})}
+        self.assertEqual(got, {"h": 1.0, "hr": 2.0})
+        self.assertEqual(other, {"h": None})               # other scope untouched
+
 
 if __name__ == "__main__":
     unittest.main()

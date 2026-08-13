@@ -40,7 +40,7 @@ import unicodedata
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
     MetaData, PrimaryKeyConstraint, String, Table, UniqueConstraint, and_,
-    create_engine, delete, event, func, insert, select, update,
+    bindparam, create_engine, delete, event, func, insert, select, update,
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -552,7 +552,7 @@ def promote_secrets_from_toml(path=None):
         import tomllib
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
-        for key in _SECRET_KEYS:
+        for key in (*_SECRET_KEYS, "SQL_DRIVER"):   # SQL_DRIVER optional (pyodbc opt-in)
             value = data.get(key)
             if value:
                 os.environ.setdefault(key, str(value).strip())
@@ -614,14 +614,24 @@ def _connection_url():
         return _OVERRIDE_URL
     if not _configured():
         return None
-    return URL.create(
-        "mssql+pymssql",
+    # Driver: pymssql by default — pure-Python TDS, no system ODBC driver needed
+    # (the reason it was chosen; required on Streamlit Cloud). Set SQL_DRIVER=pyodbc
+    # to use mssql+pyodbc, which unlocks fast_executemany (array-bound bulk
+    # INSERT/UPDATE, ~10x+ vs pymssql's per-row round-trips) for the desktop bulk
+    # backfill. That machine needs the "ODBC Driver 18 for SQL Server" +
+    # `pip install pyodbc`; the cloud app leaves SQL_DRIVER unset and stays pymssql.
+    common = dict(
         username=_secret("SQL_USER"),
         password=_secret("SQL_PASSWORD"),
         host=_secret("SQL_SERVER"),
         port=_SQL_PORT,
         database=_secret("SQL_DATABASE"),
     )
+    if (_secret("SQL_DRIVER") or "pymssql").lower() == "pyodbc":
+        return URL.create("mssql+pyodbc",
+                          query={"driver": "ODBC Driver 18 for SQL Server"},
+                          **common)
+    return URL.create("mssql+pymssql", **common)
 
 
 def get_engine():
@@ -652,13 +662,25 @@ def get_engine():
                 cur.execute("PRAGMA foreign_keys=ON")
                 cur.close()
         else:
-            # login_timeout/timeout give the driver time to ride out an Azure SQL
-            # serverless resume from auto-pause (the first connect after idle can
-            # take tens of seconds) rather than failing instantly; pool_pre_ping
-            # recycles connections the resume dropped.
-            _ENGINE = create_engine(
-                url, pool_pre_ping=True, pool_recycle=1500,
-                connect_args={"login_timeout": 60, "timeout": 60})
+            # pool_pre_ping recycles connections dropped during an Azure SQL
+            # serverless resume from auto-pause; the timeout gives the first connect
+            # after idle time to ride out that resume rather than failing instantly.
+            # connect_args differ by driver: pymssql accepts login_timeout, pyodbc
+            # does not (it would raise — pyodbc.connect has no such kwarg).
+            #
+            # fast_executemany (pyodbc only): pymssql runs executemany per-row, so a
+            # bulk backfill of tens of thousands of fact rows is a round-trip PER ROW
+            # against remote Azure SQL. pyodbc's array binding collapses each batch
+            # into one parameterized round-trip (~10x+). Enabled only when the desktop
+            # backfill opts into SQL_DRIVER=pyodbc; unset (cloud/pymssql) it is inert.
+            is_pyodbc = "pyodbc" in str(url)
+            eng_kwargs = dict(pool_pre_ping=True, pool_recycle=1500)
+            if is_pyodbc:
+                eng_kwargs["fast_executemany"] = True
+                eng_kwargs["connect_args"] = {"timeout": 60}
+            else:
+                eng_kwargs["connect_args"] = {"login_timeout": 60, "timeout": 60}
+            _ENGINE = create_engine(url, **eng_kwargs)
         return _ENGINE
 
 
@@ -995,12 +1017,6 @@ def upsert_bulk(conn, table, rows, identity_cols, scope=None, ignore_cols=()):
                 f"{table.name}: duplicate identity {key} in existing rows")
         before_by_key[key] = m
 
-    def _id_where(key):
-        parts = [table.c[col] == val for col, val in zip(ident, key)]
-        if scope_clause is not None:
-            parts.append(scope_clause)
-        return and_(*parts)
-
     _ignore = set(ignore_cols)
     inserts, updates = [], []
     for key, params in after_by_key.items():
@@ -1010,8 +1026,44 @@ def upsert_bulk(conn, table, rows, identity_cols, scope=None, ignore_cols=()):
         elif any(prior[k] != v for k, v in params.items() if k not in _ignore):
             updates.append((key, params))
 
-    for key, params in updates:
-        conn.execute(update(table).where(_id_where(key)).values(**params))
+    # UPDATEs batched into one executemany per distinct SET column-set (array-bound
+    # under fast_executemany) instead of a round-trip per changed row — the fix for
+    # update-heavy backfills (e.g. filling new fact columns on rows that already
+    # exist) against remote SQL. Identity columns are matched via "_k_"-prefixed
+    # binds so they never collide with the SET-column binds (an identity col also
+    # appears in the SET, exactly as the prior .values(**params) did). Grouping by
+    # the exact column-set keeps each executemany's compiled statement uniform;
+    # heterogeneous rows just form separate (usually one) groups. Byte-identical
+    # result to the prior per-row loop.
+    # A NULL in an identity value needs `col IS NULL` matching (SQLAlchemy renders
+    # `col == None` as IS NULL); a bound `col = :p` with p=None renders `col = NULL`,
+    # which matches nothing. Unreachable today (every upsert_bulk identity is a
+    # NOT NULL column) but handle it per-row so behaviour stays byte-identical to the
+    # prior loop; the common NOT-NULL case takes the batched executemany path.
+    null_updates = [(k, p) for k, p in updates if None in k]
+    batch_updates = [(k, p) for k, p in updates if None not in k]
+    for key, params in null_updates:
+        parts = [table.c[col] == val for col, val in zip(ident, key)]
+        if scope_clause is not None:
+            parts.append(scope_clause)
+        conn.execute(update(table).where(and_(*parts)).values(**params))
+    if batch_updates:
+        key_where = [table.c[col] == bindparam("_k_" + col) for col in ident]
+        if scope_clause is not None:
+            key_where.append(scope_clause)
+        where = and_(*key_where)
+        by_cols = {}
+        for key, params in batch_updates:
+            by_cols.setdefault(tuple(sorted(params)), []).append((key, params))
+        for set_cols, group in by_cols.items():
+            stmt = update(table).where(where).values(
+                {c: bindparam(c) for c in set_cols})
+            payload = []
+            for key, params in group:
+                d = dict(params)
+                d.update({"_k_" + col: val for col, val in zip(ident, key)})
+                payload.append(d)
+            conn.execute(stmt, payload)
     if inserts:
         conn.execute(insert(table), inserts)
     return (len(inserts), len(updates))

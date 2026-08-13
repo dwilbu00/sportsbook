@@ -719,12 +719,19 @@ def ensure_teams(season, force=False):
 
 
 # ───────────────────────────────────────────────────────────────── ingestion API
-def ingest_date(date, with_boxscores=True):
+def ingest_date(date, with_boxscores=True, land_bronze=True):
     """Ingest one YYYY-MM-DD slate → mlb_team/mlb_game (+ mlb_player and the
     StatsAPI-native per-game batter/pitcher stat facts from each genuine-final
     boxscore). Read-only DUAL-RUN: NO ESPN reads, and NOTHING app-facing consumes
     the result until the P4 cutover (the ESPN gamelog_store path stays live).
-    Idempotent (surgical upsert)."""
+    Idempotent (surgical upsert).
+
+    ``land_bronze`` — normally the raw schedule/boxscore JSON is upserted into
+    mlb_bronze (the audit/reprocess trail). Bronze is transient (purged once its
+    silver is written), and for a bulk historical backfill re-landing every large
+    boxscore blob is pure write overhead against remote SQL — pass False to skip
+    it and write ONLY the silver dims + facts (10x-less write volume per game).
+    The maintenance/live paths keep the default (True)."""
     summary = {"date": date, "games": 0, "final": 0, "boxscores": 0,
                "players": 0, "batter_rows": 0, "pitcher_rows": 0,
                "skipped": not enabled()}
@@ -751,7 +758,8 @@ def ingest_date(date, with_boxscores=True):
         for attempt in range(3):
             try:
                 with engine.begin() as conn:
-                    _land_bronze(conn, "schedule", date, raw)
+                    if land_bronze:
+                        _land_bronze(conn, "schedule", date, raw)
                     # minimal teams BEFORE games (FK); both batched, never delete.
                     db_store.upsert_bulk(conn, mlb_team, sched_teams, ("team_id",),
                                          ignore_cols=("fetched_at",))
@@ -796,12 +804,15 @@ def ingest_date(date, with_boxscores=True):
             for attempt in range(3):
                 try:
                     with engine.begin() as conn:
-                        _land_bronze(conn, "boxscore", str(g["game_pk"]), box)
+                        if land_bronze:
+                            _land_bronze(conn, "boxscore", str(g["game_pk"]), box)
                         db_store.upsert_bulk(conn, mlb_player, players,
                                              ("player_id",),
                                              ignore_cols=("fetched_at",))
                         nb, npi = _write_game_facts(conn, box, g)
-                        _mark_bronze_processed(conn, "boxscore", str(g["game_pk"]))
+                        if land_bronze:
+                            _mark_bronze_processed(conn, "boxscore",
+                                                   str(g["game_pk"]))
                     break
                 except OperationalError:
                     if attempt == 2:
@@ -828,15 +839,18 @@ def ingest_date(date, with_boxscores=True):
     return summary
 
 
-def ingest_range(start, end, with_boxscores=True):
-    """Ingest an inclusive [start, end] date range; yields a per-date summary."""
+def ingest_range(start, end, with_boxscores=True, land_bronze=True):
+    """Ingest an inclusive [start, end] date range; yields a per-date summary.
+    ``land_bronze=False`` skips the transient raw-JSON audit trail for a fast
+    bulk backfill (see ingest_date)."""
     d0 = datetime.date.fromisoformat(str(start))
     d1 = datetime.date.fromisoformat(str(end))
     results = []
     cur = d0
     step = datetime.timedelta(days=1)
     while cur <= d1:
-        results.append(ingest_date(cur.isoformat(), with_boxscores=with_boxscores))
+        results.append(ingest_date(cur.isoformat(), with_boxscores=with_boxscores,
+                                   land_bronze=land_bronze))
         cur += step
     return results
 
@@ -1769,6 +1783,11 @@ def _main_cli():
                     help="Snapshot standings for SEASON (default: current year).")
     ap.add_argument("--no-boxscores", action="store_true",
                     help="Schedule/game dims only; skip boxscore player dims.")
+    ap.add_argument("--no-bronze", action="store_true",
+                    help="Fast backfill: skip the transient raw-JSON bronze audit "
+                         "trail, writing only silver dims + facts (much less write "
+                         "volume/round-trips per game). Use for bulk historical "
+                         "re-ingest; the live/maintenance path keeps bronze.")
     ap.add_argument("--purge-boxscores", action="store_true",
                     help="Maintenance: delete processed boxscore bronze payloads.")
     ap.add_argument("--backfill-game-pk", action="store_true",
@@ -1789,13 +1808,15 @@ def _main_cli():
 
     did = False
     box = not args.no_boxscores
+    bronze = not args.no_bronze
     if args.ingest:
         did = True
-        print(_fmt(ingest_date(args.ingest, with_boxscores=box)))
+        print(_fmt(ingest_date(args.ingest, with_boxscores=box,
+                               land_bronze=bronze)))
     if args.ingest_range:
         did = True
         for res in ingest_range(args.ingest_range[0], args.ingest_range[1],
-                                with_boxscores=box):
+                                with_boxscores=box, land_bronze=bronze):
             print(_fmt(res))
     if args.standings is not None:
         did = True
