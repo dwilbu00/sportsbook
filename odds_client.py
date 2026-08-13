@@ -1006,6 +1006,13 @@ def _trim_stale_offers(offers, max_stale_seconds=MAX_STALE_SECONDS):
     return kept or offers
 
 
+# Minimum independent (non-DK) books that must also quote DK's line for the two
+# player-prop value gates (edge-vs-consensus and EV-vs-DK-price) to stay
+# independent. Below this the de-vig degrades to DK's own two-way (self-devig) and
+# props requires a larger edge (see props._DK_SELFDEVIG_EDGE_MULT).
+_DK_LINE_MIN_PEERS = 3
+
+
 def parse_player_props(game_data):
     """
     Parse player prop odds from an event odds response.
@@ -1083,15 +1090,35 @@ def parse_player_props(game_data):
     for market_key, by_player in grouped.items():
         result["props"][market_key] = {}
         for player, by_line in by_player.items():
-            # Use the modal line as the consensus standard line. On a tie,
-            # prefer the line nearest the median of the offered lines.
+            # Consensus standard line = the modal line across books (tie → nearest
+            # the median of offered lines). Retained for audit/diffing.
             lines = sorted(by_line)
             median_line = lines[len(lines) // 2]
-            line = max(
+            consensus_line = max(
                 lines,
                 key=lambda value: (len(by_line[value]),
                                    -abs(float(value) - float(median_line))),
             )
+            # DK-only bettor (2026-08-13): ANCHOR the analyzed line on the line DK
+            # actually posts, so a DK-bettable MAIN (two-sided) line is no longer
+            # dropped when the cross-book modal line differs from DK's. (A one-sided
+            # DK line still falls through — it can't be de-vigged for a fair prob;
+            # that's the Level-2 alt-ladder item.) by_line holds only two-sided lines
+            # and DK posts both sides on the main market, so DK's main line is
+            # present here whenever DK offers this player; fall back to the consensus
+            # line when DK doesn't offer the player at all (then dk_* stay None →
+            # not bettable → the fail-closed "never recommend an un-bettable line"
+            # safety is preserved). Tie (DK posts >1 two-sided main line, rare):
+            # nearest the median. Everything below reads `line`, so over_implied,
+            # best/DK prices, and the value gate all recompute at DK's line for free.
+            dk_lines = [ln for ln in lines if _dk_offer(by_line[ln]) is not None]
+            if dk_lines:
+                line = min(dk_lines,
+                           key=lambda v: abs(float(v) - float(median_line)))
+                line_source = "dk"
+            else:
+                line = consensus_line
+                line_source = "consensus"
             offers = by_line[line]
             # De-vig each book first, drop stale quotes, then take a sharp-book-
             # weighted mean of the fair OVER probs (P1.1c). Reduces to the plain
@@ -1121,8 +1148,32 @@ def parse_player_props(game_data):
             # to the best price.
             dk_over = _dk_offer(executable["Over"])
             dk_under = _dk_offer(executable["Under"])
+            # Independent market check at the CHOSEN line = the non-DK books quoting
+            # it. When DK is the anchor but NEITHER enough peers NOR a sharp book
+            # (Pinnacle/Circa) also quotes DK's line, over_implied degrades toward
+            # DK's own two-way de-vig, collapsing the two value gates (edge-vs-fair,
+            # EV-vs-DK-price) into one comparison — tag it so props raises the edge
+            # bar instead of rubber-stamping. A single sharp peer is a stronger check
+            # than several soft books, so it also lifts the collapse. peer_count is
+            # measured on the post-trim survivors (the exact set feeding over_implied)
+            # and excludes the DK offer itself.
+            dk_in = _dk_offer(survivors)
+            peer_count = len(survivors) - (1 if dk_in else 0)
+            has_sharp_peer = any(o is not dk_in
+                                 and _book_weight(o.get("book")) > 1.0
+                                 for o in survivors)
+            if line_source == "dk":
+                implied_method = (
+                    "two_way_devig_peerconsensus_at_dk_line"
+                    if (peer_count >= _DK_LINE_MIN_PEERS or has_sharp_peer)
+                    else "dk_selfdevig_fallback")
+            else:
+                implied_method = "two_way_devig_sharpweighted_consensus"
             result["props"][market_key][player] = {
                 "line": line,
+                "line_source": line_source,          # 'dk' | 'consensus' (audit)
+                "consensus_line": consensus_line,    # the old modal line (diffing)
+                "peer_count": peer_count,            # independent books at the line
                 "over_price": best_over["price"],
                 "under_price": best_under["price"],
                 "over_book": best_over["book"],
@@ -1139,7 +1190,7 @@ def parse_player_props(game_data):
                 "books_sampled": len(offers),
                 "over_prices_sampled": len(executable["Over"]),
                 "under_prices_sampled": len(executable["Under"]),
-                "market_implied_method": "two_way_devig_sharpweighted_consensus",
+                "market_implied_method": implied_method,
             }
 
     return result

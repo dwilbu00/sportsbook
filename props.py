@@ -881,6 +881,15 @@ def _player_prop_half_life(sport_key):
     return override if override is not None else _half_life_for(sport_key)
 
 
+# DK-alone guard: when DK is the ONLY book quoting its line (odds_client sets
+# market_implied_method == 'dk_selfdevig_fallback'), over_implied degrades to DK's
+# own two-way de-vig, so the edge gate (model vs fair) and the EV gate (model vs DK
+# price) collapse into one comparison. Require this multiple of the normal edge
+# threshold before flagging value, so a miscalibrated model can't rubber-stamp a
+# DK-only line with no independent market check.
+_DK_SELFDEVIG_EDGE_MULT = 2.0
+
+
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
@@ -1735,8 +1744,14 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             )
 
             # Value requires clearing the fair-market edge AND being +EV at the
-            # DraftKings price (see _prop_is_value / P1.1).
-            is_value = _prop_is_value(edge, threshold, expected_roi)
+            # DraftKings price (see _prop_is_value / P1.1). DK-alone guard: when DK
+            # is the sole book at its line (no independent market check), the de-vig
+            # degrades to DK-self-devig and the edge/EV gates collapse into one, so
+            # require a larger edge (else a miscalibrated model rubber-stamps it).
+            eff_threshold = threshold
+            if odds_info.get("market_implied_method") == "dk_selfdevig_fallback":
+                eff_threshold = threshold * _DK_SELFDEVIG_EDGE_MULT
+            is_value = _prop_is_value(edge, eff_threshold, expected_roi)
 
             # §2.4b-2 direction split: demote losing UNDER picks on cheap lines
             # (batter_hits under 0.5 wins only ~43% OOS) from recommendations.
@@ -1819,6 +1834,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "dk_under_price": dk_under_price,
                 "dk_price": dk_price,
                 "dk_book": dk_book,
+                # Which line this was analyzed at: 'dk' (DK's own line) vs
+                # 'consensus' (DK didn't offer the player); peer_count = independent
+                # books at that line. Surfaced for the UI + audit of the DK anchor.
+                "line_source": odds_info.get("line_source"),
+                "peer_count": odds_info.get("peer_count"),
                 "expected_roi_pct": (round(expected_roi * 100, 2)
                                       if expected_roi is not None else None),
                 "is_value": is_value,

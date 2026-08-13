@@ -487,6 +487,46 @@ class NonHitBatterMarketAnalyzeTests(unittest.TestCase):
         self.assertIsNone(cand["distributional"])
 
 
+class DkSelfDevigGuardTests(unittest.TestCase):
+    """props raises the edge bar when DK is the ONLY book at its line
+    (odds_client market_implied_method == 'dk_selfdevig_fallback'), so a DK-only
+    line with no independent market check isn't rubber-stamped."""
+
+    def _prop_data(self, method):
+        return {"commence_time": "2026-07-20T18:00:00Z", "home_team": "H",
+                "away_team": "A", "game_id": "e1",
+                "props": {"batter_total_bases": {"Slugger Sam": {
+                    "line": 1.5, "over_implied": 0.90, "under_implied": 0.10,
+                    "over_price": -110, "under_price": -110,
+                    "over_book": "DK", "under_book": "DK",
+                    "dk_over_price": -110, "dk_under_price": -110,
+                    "dk_over_book": "DK", "dk_under_book": "DK",
+                    "market_implied_method": method}}}}
+
+    def _hist(self):
+        dates = [f"2026-07-{d:02d}" for d in range(1, 16)]
+        return {"Slugger Sam": {"batter_total_bases": {
+            "found": True, "values": [2.0] * 15,        # all clear 1.5 -> over-rate ~1.0
+            "game_dates": list(reversed(dates))}}}
+
+    def _run(self, method):
+        # threshold 8% -> edge ~10% clears the normal bar but NOT the doubled 16% one.
+        return props.analyze_player_props_value(
+            self._prop_data(method), self._hist(),
+            threshold_pct=8.0, sport_key=None)[0]
+
+    def test_peerconsensus_leg_clears(self):
+        cand = self._run("two_way_devig_peerconsensus_at_dk_line")
+        self.assertEqual(cand["direction"], "OVER")
+        self.assertTrue(cand["is_value"])              # ~10% edge >= 8% bar
+
+    def test_dk_selfdevig_leg_blocked(self):
+        cand = self._run("dk_selfdevig_fallback")
+        self.assertEqual(cand["direction"], "OVER")
+        self.assertFalse(cand["is_value"])             # ~10% edge < doubled 16% bar
+        self.assertGreater(cand["edge_pct"], 8.0)      # a real edge, just gated
+
+
 class LineConditionalRuntimeTests(unittest.TestCase):
     """props._method_cfg_for_line resolves the per-line bucket method + sub-cfg."""
 

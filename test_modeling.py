@@ -1389,6 +1389,71 @@ class BestPriceHybridTests(unittest.TestCase):
         self.assertIsNone(info["dk_over_book"])
 
 
+class DkLineAnchorTests(unittest.TestCase):
+    """DK-only bettor: parse_player_props anchors the analyzed line on the line DK
+    actually posts (not the cross-book modal), so a DK-bettable leg is never dropped
+    when the consensus line differs; falls back to consensus when DK is absent."""
+
+    def _game(self, books):
+        return {"id": "g1", "home_team": "H", "away_team": "A",
+                "commence_time": "2026-07-20T23:10:00Z",
+                "sport_key": "baseball_mlb", "bookmakers": books}
+
+    def _book(self, title, line, over=-110, under=-110):
+        return {"title": title, "markets": [{"key": "batter_hits", "outcomes": [
+            {"description": "P", "name": "Over", "price": over, "point": line},
+            {"description": "P", "name": "Under", "price": under, "point": line}]}]}
+
+    def _info(self, books):
+        return parse_player_props(self._game(books))["props"]["batter_hits"]["P"]
+
+    def test_anchors_on_dk_line_when_consensus_differs(self):
+        # 3 peers post 0.5 (the modal); DK posts only 1.5. Old behavior analyzed 0.5
+        # -> DK price None -> silently dropped. New: analyze DK's 1.5.
+        info = self._info([
+            self._book("BetMGM", 0.5), self._book("Caesars", 0.5),
+            self._book("FanDuel", 0.5), self._book("DraftKings", 1.5)])
+        self.assertEqual(info["line"], 1.5)
+        self.assertEqual(info["line_source"], "dk")
+        self.assertEqual(info["consensus_line"], 0.5)
+        self.assertIsNotNone(info["dk_over_price"])       # DK now bettable
+        self.assertEqual(info["peer_count"], 0)           # DK alone at 1.5
+        self.assertEqual(info["market_implied_method"], "dk_selfdevig_fallback")
+
+    def test_peerconsensus_when_peers_quote_dk_line(self):
+        info = self._info([
+            self._book("DraftKings", 1.5), self._book("BetMGM", 1.5),
+            self._book("Caesars", 1.5), self._book("FanDuel", 1.5)])
+        self.assertEqual(info["line"], 1.5)
+        self.assertEqual(info["line_source"], "dk")
+        self.assertEqual(info["peer_count"], 3)
+        self.assertEqual(info["market_implied_method"],
+                         "two_way_devig_peerconsensus_at_dk_line")
+
+    def test_falls_back_to_consensus_when_dk_absent(self):
+        info = self._info([
+            self._book("BetMGM", 0.5), self._book("Caesars", 0.5),
+            self._book("FanDuel", 1.5)])
+        self.assertEqual(info["line"], 0.5)               # modal, DK absent
+        self.assertEqual(info["line_source"], "consensus")
+        self.assertIsNone(info["dk_over_price"])          # not bettable
+        self.assertEqual(info["market_implied_method"],
+                         "two_way_devig_sharpweighted_consensus")
+
+    def test_sharp_peer_lifts_selfdevig_fallback(self):
+        # DK + a single SHARP book (Pinnacle) at DK's line: peer_count is only 1, but
+        # a sharp book is a real independent check, so it is NOT the self-devig
+        # fallback — the raised-edge guard must not fire.
+        info = self._info([
+            self._book("BetMGM", 0.5), self._book("Caesars", 0.5),
+            self._book("DraftKings", 1.5), self._book("Pinnacle", 1.5)])
+        self.assertEqual(info["line"], 1.5)
+        self.assertEqual(info["line_source"], "dk")
+        self.assertEqual(info["peer_count"], 1)
+        self.assertEqual(info["market_implied_method"],
+                         "two_way_devig_peerconsensus_at_dk_line")
+
+
 class NewBatterMarketParsingTests(unittest.TestCase):
     """batter_total_bases (line 1.5) and batter_rbis (line 0.5) parse through the
     generic parse_player_props once they're in PROP_LABELS — this guards those
