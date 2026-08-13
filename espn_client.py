@@ -996,16 +996,21 @@ def _mlb_warehouse_hist_enabled():
         "1", "true", "on", "yes")
 
 
-def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None):
+def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None,
+                          confirmed_lineup=None, probable_starters=None):
     """Warehouse-first MLB player history (the P4 model-input flip): return the
     get_player_stat_history contract dict from the StatsAPI facts, or None so the
     caller falls open to the ESPN path. Gated on: the env flag, sport=='baseball',
-    SQL enabled, a fact-servable prop, and a name→MLBAM resolution NARROWED BY the
-    game's two teams (P6: a namesake like "Max Muncy" / "Luis Garcia Jr." resolves
-    off the matchup teams instead of falling to ESPN; a still-ambiguous / unknown
-    name stays None). Scoped to the CURRENT season to match the ESPN/gamelog_store
-    baseline (which is current-season-only), so the recent-N window isn't padded
-    with prior-season games early in the year. Never raises."""
+    SQL enabled, a fact-servable prop, and a GAME-CONTEXT-FIRST name→MLBAM resolution
+    (mlb_starters.resolve_mlbam_id): today's posted lineup / announced probables for
+    the matchup ``teams`` (authoritative + trade-aware), then the statsapi season
+    roster, then a role-verified SFBB fallback — so a namesake like "Max Muncy" /
+    "Luis Garcia Jr." binds to the id that actually appears in this game rather than
+    the drift-prone SFBB cross-map; a still-ambiguous / unknown name stays None.
+    History is fetched BY that MLBAM id (constant across trades). Scoped to the
+    CURRENT season to match the ESPN/gamelog_store baseline (current-season-only), so
+    the recent-N window isn't padded with prior-season games early in the year. Never
+    raises."""
     if sport != "baseball" or not _mlb_warehouse_hist_enabled():
         return None
     try:
@@ -1014,8 +1019,12 @@ def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None):
         import mlb_warehouse
         if mlb_warehouse._ACTUAL_STAT_SPEC.get(prop_key) is None:
             return None                       # HR/TB/RBI etc. → ESPN
-        import player_id_map
-        mlb_id = player_id_map.mlb_id_for_name(player_name, teams=teams)
+        import mlb_starters
+        resolved = mlb_starters.resolve_mlbam_id(
+            player_name, mlb_warehouse._current_season(), prop_key=prop_key,
+            teams=teams, confirmed_lineup=confirmed_lineup,
+            probable_starters=probable_starters)
+        mlb_id = resolved[0] if resolved else None
         if not mlb_id:
             return None                       # unknown / still-ambiguous → ESPN
         return mlb_warehouse.get_player_history(
@@ -1110,7 +1119,8 @@ def mlb_warehouse_team_defense(sport):
 
 
 def get_player_stat_history(sport, league, player_name, prop_key, n=20,
-                            team_ids=None, allow_warehouse=True, teams=None):
+                            team_ids=None, allow_warehouse=True, teams=None,
+                            confirmed_lineup=None, probable_starters=None):
     """
     Look up a player on ESPN and return their recent stat values for a given prop.
 
@@ -1122,6 +1132,11 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         n (int): Number of recent games to return
         team_ids (iterable, optional): ESPN team ids of the matchup, forwarded to
             search_athlete to disambiguate same-name players (see that function).
+        confirmed_lineup, probable_starters (optional): MLB-ONLY today's-game context
+            (mlb_starters.get_confirmed_lineup / get_probable_starters). When present
+            they make the warehouse-history id resolution GAME-CONTEXT-FIRST
+            (trade-aware, namesake-safe); ignored for every non-baseball sport (the
+            warehouse branch early-returns), so those callers stay byte-identical.
 
     Returns:
         dict: {
@@ -1157,7 +1172,9 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     # the ESPN path (the parity harness passes it so it always diffs the TRUE ESPN
     # side even when the flip flag is on).
     if allow_warehouse:
-        wh = _mlb_warehouse_history(sport, player_name, prop_key, n, teams=teams)
+        wh = _mlb_warehouse_history(sport, player_name, prop_key, n, teams=teams,
+                                    confirmed_lineup=confirmed_lineup,
+                                    probable_starters=probable_starters)
         if wh is not None:
             return wh
 

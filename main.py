@@ -22,6 +22,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from odds_client import (
     get_upcoming_events,
@@ -376,8 +377,31 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             # ESPN team ids disambiguate same-name players for the ESPN history path
             # (search_athlete). MLB (P6) serves history from the warehouse by
             # globally-unique NAME, not team ids, so pass no hint for baseball.
+            mlb_lineup = None
+            mlb_probables = None
             if sport_key == "baseball_mlb":
                 event_team_ids = []
+                # P6 game-context-first identity: today's posted lineup + announced
+                # probables give the authoritative, trade-aware, namesake-safe
+                # name→MLBAM id for the two teams playing (mirrors app.py Phase 2).
+                import mlb_starters
+                _gd = raw_prop.get("commence_time", "")[:10]
+                try:
+                    _c = datetime.fromisoformat(
+                        raw_prop["commence_time"].replace("Z", "+00:00"))
+                    _gd = _c.astimezone(
+                        ZoneInfo("America/New_York")).date().isoformat()
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+                try:
+                    mlb_lineup = mlb_starters.get_confirmed_lineup(
+                        prop_data.get("home_team"), prop_data.get("away_team"), _gd)
+                except Exception:
+                    mlb_lineup = None
+                try:
+                    mlb_probables = mlb_starters.get_probable_starters(_gd)
+                except Exception:
+                    mlb_probables = None
             else:
                 event_teams = [find_team(espn_teams, tn)
                                for tn in (prop_data.get("home_team"),
@@ -399,6 +423,9 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
                             # MLB: matchup teams narrow a namesake to its MLBAM id.
                             teams=[prop_data.get("home_team"),
                                    prop_data.get("away_team")],
+                            # MLB game-context-first identity (None for other sports).
+                            confirmed_lineup=mlb_lineup,
+                            probable_starters=mlb_probables,
                         )
                         player_histories[player_name][prop_key] = history
                         if history["found"]:

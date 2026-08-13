@@ -245,6 +245,19 @@ class PlayerStartStatusTests(unittest.TestCase):
                 "batter_hits", "J Ram odds spelling", "Guardians", "Tigers",
                 lineup, {}, season=2025), "in")
 
+    def test_batter_unresolvable_name_not_ruled_out(self):
+        # Both lineups posted and he's absent by name, but his id can't be
+        # resolved (find_player_id -> None, e.g. a StatsAPI index outage that
+        # resolve_mlbam_id swallows to None) -> stay "unknown", never a false
+        # "out" that would demote a valid bet AND drop its calibration label.
+        # Symmetric with test_pitcher_unresolvable_name_not_ruled_out.
+        lineup = self._lineup([f"H{i}" for i in range(1, 10)],
+                              [f"A{i}" for i in range(1, 10)])
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            self.assertEqual(mlb_starters.player_start_status(
+                "batter_hits", "Ghost Batter", "Guardians", "Tigers",
+                lineup, {}, season=2025), "unknown")
+
     # ---- pitcher arm ----
     def test_pitcher_matches_probable_is_in(self):
         probs = self._probables("Shane Bieber", "Tarik Skubal")

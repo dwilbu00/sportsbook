@@ -2897,23 +2897,64 @@ if analyze_clicked and selected_game_labels:
         progress.progress(50, text="Getting player props...")
 
         # ── Phase 2: Parse prop data and fire off ALL player history lookups ──
-        prop_history_futures = {}  # (player_name, prop_key) -> future
+        prop_history_futures = {}  # history key -> future
         parsed_props = {}  # eid -> parsed prop data
+        events_by_id = {e["id"]: e for e in selected_events}
+
+        # P6/F3: pre-warm the StatsAPI season player index on the MAIN thread so the
+        # Phase-2 pool workers (resolve_mlbam_id -> _player_index) hit the populated
+        # module/disk cache instead of each racing a full-roster fetch + cache write
+        # (the no-network-racing-file-cache invariant).
+        if sport["key"] == "baseball_mlb":
+            try:
+                import mlb_starters
+                import mlb_warehouse
+                mlb_starters.warm_player_index(mlb_warehouse._current_season())
+            except Exception:
+                pass
 
         for eid, raw_data in prop_odds_results.items():
             parsed = parse_player_props(raw_data)
             parsed_props[eid] = parsed
             # ESPN team ids for THIS matchup disambiguate same-name players so
             # the correct athlete's history is fetched (see search_athlete
-            # team_ids). Global (player, prop) dedup means the first event to
-            # reference a name wins its hint — a namesake in a different game on
-            # the same slate is a documented residual.
+            # team_ids). NON-MLB sports dedup the future GLOBALLY by (player, prop):
+            # the first event to reference a name wins its hint — a namesake in a
+            # different game on the same slate is a documented residual. MLB keys the
+            # future per-event (below), so that residual does not apply to baseball.
             # ESPN team ids disambiguate same-name players for the ESPN history
             # path (search_athlete). MLB (P6) serves history from the warehouse by
             # globally-unique NAME, not team ids — and a warehouse MLBAM team id
             # would mis-hint ESPN search_athlete — so pass no hint for baseball.
+            mlb_lineup = None
+            mlb_probables = None
             if sport["key"] == "baseball_mlb":
                 event_team_ids = []
+                # P6 game-context-first identity: today's posted lineup + announced
+                # probables give the AUTHORITATIVE, trade-aware, namesake-safe
+                # name→MLBAM id for the two teams playing (mlb_starters.resolve_mlbam_id
+                # inside the warehouse-history path). Fetched here so it is in scope at
+                # history-resolution time (Phase 3's per-event fetch is too late); both
+                # are date-global cached, so Phase 3's re-fetch is a cache hit.
+                import mlb_starters
+                _ev = events_by_id.get(eid)
+                _gd = (_ev or {}).get("commence_time", "")[:10]
+                try:
+                    _c = datetime.fromisoformat(
+                        _ev["commence_time"].replace("Z", "+00:00"))
+                    _gd = _c.astimezone(
+                        ZoneInfo("America/New_York")).date().isoformat()
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+                try:
+                    mlb_lineup = mlb_starters.get_confirmed_lineup(
+                        parsed.get("home_team"), parsed.get("away_team"), _gd)
+                except Exception:
+                    mlb_lineup = None
+                try:
+                    mlb_probables = mlb_starters.get_probable_starters(_gd)
+                except Exception:
+                    mlb_probables = None
             else:
                 event_teams = [find_team(espn_teams, tn)
                                for tn in (parsed.get("home_team"),
@@ -2922,7 +2963,14 @@ if analyze_clicked and selected_game_labels:
                                   if t and t.get("id")]
             for prop_key, players in parsed.get("props", {}).items():
                 for player_name in players:
-                    key = (player_name, prop_key)
+                    # MLB serves history from the warehouse by resolved MLBAM id and a
+                    # player appears in exactly one game/day, so keying the future
+                    # per-event loses no dedup while preventing a same-name batter in
+                    # ANOTHER game on this slate from reusing this game's lineup-
+                    # resolved id (F4). Other sports keep the global (player, prop) key.
+                    key = ((eid, player_name, prop_key)
+                           if sport["key"] == "baseball_mlb"
+                           else (player_name, prop_key))
                     if key not in prop_history_futures:
                         prop_history_futures[key] = pool.submit(
                             get_player_stat_history,
@@ -2934,6 +2982,9 @@ if analyze_clicked and selected_game_labels:
                             # resolves off the warehouse instead of falling to ESPN.
                             teams=[parsed.get("home_team"),
                                    parsed.get("away_team")],
+                            # MLB game-context-first identity (None for other sports).
+                            confirmed_lineup=mlb_lineup,
+                            probable_starters=mlb_probables,
                         )
 
         # Collect all player histories
@@ -3090,8 +3141,12 @@ if analyze_clicked and selected_game_labels:
                 for player_name in players:
                     if player_name not in player_histories:
                         player_histories[player_name] = {}
+                    # Mirror the Phase-2 key: MLB futures are per-event (F4).
+                    _hk = ((eid, player_name, prop_key)
+                           if sport["key"] == "baseball_mlb"
+                           else (player_name, prop_key))
                     history = dict(prop_history_results.get(
-                        (player_name, prop_key),
+                        _hk,
                         {"player": player_name, "found": False, "values": []},
                     ))
                     if confirmed_lineup:

@@ -26,6 +26,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 import unicodedata
 
@@ -136,9 +137,22 @@ def _read_cache(name, max_age=CACHE_MAX_AGE):
 
 
 def _write_cache(name, data):
+    # Atomic write (temp in the same dir + os.replace) so a concurrent reader --
+    # or a second writer racing the same file from a Phase-2 pool worker -- never
+    # sees a half-written/truncated JSON blob. os.replace is atomic on the same
+    # filesystem on both POSIX and Windows.
     _ensure_cache_dir()
-    with open(_cache_path(name), "w") as f:
-        json.dump({"cached_at": time.time(), "data": data}, f)
+    path = _cache_path(name)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"cached_at": time.time(), "data": data}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _get(path, params=None, max_retries=4, backoff_base=1.5, timeout=30):
@@ -920,12 +934,20 @@ def player_start_status(prop_key, player_name, home_team, away_team,
         # (the odds feed may spell him differently than the Stats API).
         if season is not None:
             resolved = find_player_id(player_name, season)
-            if resolved:
-                pid = resolved[0]
-                for p in players.values():
-                    if str(p.get("player_id")) == str(pid):
-                        side = p.get("side")
-                        return "in" if lineup.get(f"{side}_confirmed") else "unknown"
+            if not resolved:
+                # Could not positively identify him -- a spelling we can't bridge, or a
+                # transient StatsAPI/index outage (resolve_mlbam_id swallows infra
+                # errors to None). That is NOT a confident "out": rule out only on a
+                # POSITIVE id that is positively absent, mirroring the pitcher arm
+                # (which requires pid is not None) and this function's documented
+                # "any uncertainty -> unknown" fail-open. A blanket "out" here would
+                # demote a valid bet AND drop its calibration label during an outage.
+                return "unknown"
+            pid = resolved[0]
+            for p in players.values():
+                if str(p.get("player_id")) == str(pid):
+                    side = p.get("side")
+                    return "in" if lineup.get(f"{side}_confirmed") else "unknown"
         return "out"
     except Exception:
         return "unknown"
@@ -1382,35 +1404,67 @@ def get_schedule_index(date):
     return out
 
 
-_PLAYER_INDEX_CACHE = {}  # season -> {norm_name: [(mlbam_id, is_pitcher), ...]}
+_PLAYER_INDEX_CACHE = {}       # season -> {norm_name: [(mlbam_id, is_pitcher), ...]}
+_PLAYER_INDEX_LOADED_AT = {}   # season -> time.monotonic() of the last real load
+_PLAYER_INDEX_TTL = 6 * 3600   # in-memory freshness: a long-lived process re-reads
+                               # the (7-day) disk cache instead of pinning a season
+                               # snapshot for its whole lifetime, so a mid-season
+                               # callup isn't permanently shadowed by a namesake.
 
 
 def _player_index(season):
-    """{normalized_full_name: [(id, is_pitcher), ...]} for a season's players."""
+    """{normalized_full_name: [(id, is_pitcher), ...]} for a season's players.
+
+    The in-memory copy carries a bounded TTL so a long-lived process doesn't hold a
+    stale season snapshot indefinitely (which would let a same-name incumbent shadow
+    a debuting callup absent from it). On expiry it re-reads the disk cache /
+    refetches; if that (re)load fails it keeps serving the stale in-memory copy
+    rather than going dark. Test-primed caches (no load timestamp) are treated as
+    pinned/fresh."""
     cached = _PLAYER_INDEX_CACHE.get(season)
     if cached is not None:
-        return cached
-    disk = _read_cache(f"players_index_{season}", max_age=7 * 24 * 3600)
-    if disk is not None:
-        index = {k: [tuple(v) for v in vs] for k, vs in disk.items()}
-        _PLAYER_INDEX_CACHE[season] = index
-        return index
-    data = _get("sports/1/players", {"season": season})
-    index = {}
-    for p in data.get("people", []) or []:
-        pid = p.get("id")
-        full = p.get("fullName")
-        if not pid or not full:
-            continue
-        pos = p.get("primaryPosition") or {}
-        is_pitcher = (pos.get("abbreviation") == "P"
-                      or pos.get("type") == "Pitcher"
-                      or str(pos.get("code")) == "1")
-        index.setdefault(_norm(full), []).append((pid, is_pitcher))
-    _write_cache(f"players_index_{season}",
-                 {k: [[pid, isp] for pid, isp in vs] for k, vs in index.items()})
+        loaded = _PLAYER_INDEX_LOADED_AT.get(season)
+        if loaded is None or (time.monotonic() - loaded) < _PLAYER_INDEX_TTL:
+            return cached
+    try:
+        disk = _read_cache(f"players_index_{season}", max_age=7 * 24 * 3600)
+        if disk is not None:
+            index = {k: [tuple(v) for v in vs] for k, vs in disk.items()}
+        else:
+            data = _get("sports/1/players", {"season": season})
+            index = {}
+            for p in data.get("people", []) or []:
+                pid = p.get("id")
+                full = p.get("fullName")
+                if not pid or not full:
+                    continue
+                pos = p.get("primaryPosition") or {}
+                is_pitcher = (pos.get("abbreviation") == "P"
+                              or pos.get("type") == "Pitcher"
+                              or str(pos.get("code")) == "1")
+                index.setdefault(_norm(full), []).append((pid, is_pitcher))
+            _write_cache(f"players_index_{season}",
+                         {k: [[pid, isp] for pid, isp in vs]
+                          for k, vs in index.items()})
+    except Exception:
+        if cached is not None:
+            return cached          # (re)load failed -> keep the stale copy, not dark
+        raise                      # cold + failed -> propagate (caller fail-opens)
     _PLAYER_INDEX_CACHE[season] = index
+    _PLAYER_INDEX_LOADED_AT[season] = time.monotonic()
+    _PITCHER_BY_ID_CACHE.pop(season, None)     # derived; refresh alongside a reload
     return index
+
+
+def warm_player_index(season):
+    """Pre-load the season player index (idempotent). Call ONCE on the main thread
+    before fanning MLB work out to a pool so the workers hit the populated
+    module/disk cache instead of racing N concurrent full-roster fetches + cache
+    writes (the no-network-racing-file-cache invariant). Never raises."""
+    try:
+        _player_index(season)
+    except Exception:
+        pass
 
 
 _PITCHER_BY_ID_CACHE = {}  # season -> {str(mlbam_id): is_pitcher}
@@ -1441,38 +1495,209 @@ def _player_id_map():
         return None
 
 
-def _resolve_is_pitcher(mid, season, row):
-    """is_pitcher for an MLBAM id. The statsapi season roster is authoritative (so
-    two-way players like Ohtani keep their statsapi position); the SFBB map's ALLPOS
-    is used only when the id isn't in the roster (e.g. a mid-season callup absent
-    from the cached payload)."""
+def _role_known(mid, season, row):
+    """(is_pitcher, known) for an MLBAM id. The statsapi season roster is
+    authoritative (so two-way players like Ohtani keep their statsapi position); the
+    SFBB row's ALLPOS is used only when the id isn't in the roster (e.g. a mid-season
+    callup absent from the cached payload). ``known`` is False when NEITHER source
+    establishes the role -- a role-verifying caller must not trust the defaulted
+    is_pitcher, because an unverifiable role is exactly the drift risk (a batter prop
+    could otherwise bind an unroster'd pitcher id whose role can't be contradicted)."""
     idx = _is_pitcher_index(season)
     if str(mid) in idx:
-        return idx[str(mid)]
+        return idx[str(mid)], True
     allpos = ((row or {}).get("allpos") or "").upper().replace(",", "/")
-    return "P" in [p.strip() for p in allpos.split("/")]
+    positions = [p.strip() for p in allpos.split("/") if p.strip()]
+    if positions:
+        return ("P" in positions), True
+    return False, False
 
 
-def find_player_id(name, season, teams=None):
-    """(mlbam_id, is_pitcher) for a UNIQUE exact full-name match, else None.
+def _resolve_is_pitcher(mid, season, row):
+    """is_pitcher for an MLBAM id (see _role_known); defaults False when unknown."""
+    return _role_known(mid, season, row)[0]
 
-    Resolves via the SFBB player id-map FIRST — it disambiguates namesakes the
-    statsapi unique-exact match drops (preferring the single active player), folds
-    accents, and strips generational suffixes ("Jazz Chisholm Jr." → the map's
-    "Jazz Chisholm") — then falls back to the statsapi season roster's unique-exact
-    name match. is_pitcher stays statsapi-authoritative. ``teams`` (the game's
-    home/away, when the caller has them) breaks a genuine namesake tie by the
-    player's team; without it a STILL-ambiguous name is skipped rather than risk
-    binding a prop to the wrong player and poisoning the fit."""
-    pim = _player_id_map()
-    if pim is not None:
-        mid = pim.mlb_id_for_name(name, teams=teams)
-        if mid:
-            return (mid, _resolve_is_pitcher(mid, season, pim.get_row(name)))
-    matches = _player_index(season).get(_norm(name))
-    if not matches or len(matches) != 1:
+
+# Generational suffix tokens the odds feed sometimes DROPS ("Bobby Witt") while the
+# StatsAPI fullName KEEPS them ("Bobby Witt Jr."). Stripped only as an on-miss
+# fallback so a name that already resolves is never broadened. Mirrors
+# player_id_map._NAME_SUFFIXES (kept local so the resolver has no import cycle).
+_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
+
+def _norm_suffix_stripped(name):
+    """_norm(name) with any trailing generational-suffix tokens removed, or ""."""
+    toks = _norm(name).split()
+    while toks and toks[-1] in _NAME_SUFFIXES:
+        toks.pop()
+    return " ".join(toks)
+
+
+def _iter_team_names(teams):
+    """Yield the individual team strings from a hint that may be a single str or an
+    iterable (e.g. the odds event's (home, away))."""
+    if not teams:
+        return
+    if isinstance(teams, str):
+        yield teams
+        return
+    try:
+        for t in teams:
+            if t:
+                yield t
+    except TypeError:
+        yield teams
+
+
+def _game_context_id(name, role, teams, confirmed_lineup, probable_starters):
+    """MLBAM id for ``name`` from TODAY'S posted game, role-partitioned, or None.
+
+    ``role`` is "P" (pitcher prop → announced probables, scoped to the matchup
+    ``teams``), "B" (batter prop → posted lineup), or None (unknown → accept a hit
+    only when exactly ONE of lineup/probables matches, so a same-spelling cross-role
+    namesake is left for the roster tier). Exact _norm match then a suffix-stripped
+    fallback (odds "Luis Garcia Jr." vs statsapi "Luis García Jr."). The ids come
+    from the ACTUAL players in today's game, so this is authoritative, trade-aware
+    (today's team) and namesake-safe (role + two-team scope)."""
+    key = _norm(name)
+    skey = _norm_suffix_stripped(name)
+
+    def _from_lineup():
+        players = (confirmed_lineup or {}).get("players") or {}
+        rec = players.get(key)
+        if rec is None and skey:
+            for k, r in players.items():
+                if _norm_suffix_stripped(k) == skey:
+                    rec = r
+                    break
+        return (rec or {}).get("player_id")
+
+    def _from_probables():
+        probs = probable_starters or {}
+        want = [_norm(t) for t in _iter_team_names(teams)]
+        # probs is keyed by _norm(StatsAPI team name) but ``teams`` are the raw ODDS
+        # names, which diverge (odds "Athletics" vs statsapi "Oakland Athletics").
+        # Match tolerantly (like get_confirmed_lineup) so the authoritative pitcher
+        # game-context tier doesn't silently no-op for divergent-name teams; a strict
+        # probs.get would drop them and fall through to the drift-prone SFBB tier.
+        if want:
+            cands = [s for k, s in probs.items()
+                     if s and any(_names_match(k, w) for w in want)]
+        else:
+            cands = list(probs.values())
+        for s in cands:
+            nm = (s or {}).get("name")
+            if nm and (_norm(nm) == key
+                       or (skey and _norm_suffix_stripped(nm) == skey)):
+                return s.get("pitcher_id")
         return None
-    return matches[0]
+
+    if role == "P":
+        return _from_probables()
+    if role == "B":
+        return _from_lineup()
+    bid, pid = _from_lineup(), _from_probables()
+    if bid and pid and str(bid) != str(pid):
+        return None                        # ambiguous same-name cross-role → defer
+    return bid or pid
+
+
+def resolve_mlbam_id(name, season, prop_key=None, teams=None,
+                     confirmed_lineup=None, probable_starters=None):
+    """(mlbam_id, is_pitcher) for a name resolved GAME-CONTEXT-FIRST, else None.
+
+    The single StatsAPI-native identity resolver for MLB — resolution order (each
+    tier yields an MLBAM id; ``is_pitcher`` stays statsapi-authoritative):
+
+      1. TODAY'S POSTED GAME (``_game_context_id``) — role-partitioned by ``prop_key``:
+         a batter prop matches the confirmed lineup's ``player_id``, a pitcher prop the
+         announced probable's ``pitcher_id`` (scoped to the matchup ``teams``).
+         Authoritative, trade-aware, namesake-safe.
+      2. StatsAPI SEASON-ROSTER unique-exact (``_player_index``) — trade-safe for a
+         uniquely-named player before the lineup posts. Because the statsapi name KEEPS
+         the generational suffix, "Luis García Jr." is a DISTINCT roster key from
+         "Luis García", so a suffixed namesake resolves correctly here without context.
+         This tier is teams-BLIND, so it is deferred to tier 3 when the team-hinted
+         SFBB map names a DIFFERENT same-role player (the ~weekly index can miss a
+         recent add while a namesake is its sole entry).
+      3. SFBB (``mlb_id_for_name``, team-hinted) — reordered BELOW statsapi and never
+         trusted blind: when the prop's role is known, an id whose role CONTRADICTS the
+         prop (the Luis Garcia Jr. pitcher-id-for-a-batter-prop drift) — or whose role
+         cannot be VERIFIED at all (id absent from the index + no SFBB position) — is
+         rejected. This is the ONLY tier that can drift, and it is now last-resort.
+
+    ``prop_key=None`` (the find_player_id contract) resolves role-agnostically and lets
+    the caller role-gate the tuple. Returns None rather than risk a wrong bind; never
+    raises."""
+    try:
+        if not name:
+            return None
+        role = None
+        if prop_key is not None:
+            role = "P" if str(prop_key).startswith("pitcher_") else "B"
+
+        # 1. Today's posted game (authoritative, trade-aware, namesake-safe).
+        gc = _game_context_id(name, role, teams, confirmed_lineup, probable_starters)
+        if gc:
+            # A probable starter is definitionally a pitcher; a lineup batter's
+            # is_pitcher stays statsapi-authoritative (two-way players like Ohtani).
+            isp = True if role == "P" else _resolve_is_pitcher(gc, season, None)
+            return (gc, isp)
+
+        # Team-aware SFBB candidate, resolved ONCE: it both cross-checks the
+        # teams-blind statsapi tier below and is the last-resort fallback. Its role
+        # is "known" only when the season index or the SFBB row can establish it.
+        sfbb_id, sfbb_isp, sfbb_known = None, False, False
+        pim = _player_id_map()
+        if pim is not None:
+            sid = pim.mlb_id_for_name(name, teams=teams)
+            if sid:
+                sfbb_id = sid
+                sfbb_isp, sfbb_known = _role_known(sid, season, pim.get_row(name))
+
+        # 2. StatsAPI season-roster unique-exact (trade-safe, pre-lineup). Accept the
+        #    teams-blind index hit UNLESS a team-aware SFBB lookup names a DIFFERENT
+        #    SAME-ROLE player under a matchup hint: the ~weekly index can miss a
+        #    recently-added player while a namesake is its sole entry, so defer that
+        #    conflict to the team-aware SFBB tier. (A cross-role SFBB disagreement is
+        #    the drift the index is meant to beat, so it does NOT trigger a deferral.)
+        matches = _player_index(season).get(_norm(name))
+        if matches and len(matches) == 1:
+            mid, isp = matches[0]
+            if role is None or (role == "P") == bool(isp):
+                conflict = (role is not None and bool(teams) and sfbb_id
+                            and str(sfbb_id) != str(mid)
+                            and sfbb_known and (role == "P") == bool(sfbb_isp))
+                if not conflict:
+                    return (mid, isp)
+
+        # 3. SFBB fallback, role-verified (never trusted blind): reject an id whose
+        #    role CONTRADICTS the prop, AND -- because an unverifiable role is exactly
+        #    the drift risk -- reject a role-known prop whose SFBB id role can't be
+        #    established at all (id absent from the index + no SFBB position).
+        if sfbb_id:
+            if role is not None and (not sfbb_known
+                                     or (role == "P") != bool(sfbb_isp)):
+                return None
+            return (sfbb_id, sfbb_isp)
+        return None
+    except Exception:                       # pragma: no cover - fail-open guard
+        return None
+
+
+def find_player_id(name, season, teams=None, lineup=None, probables=None):
+    """(mlbam_id, is_pitcher) for a resolvable name, else None — GAME-CONTEXT-FIRST.
+
+    Thin, stable, test-patched entry point that delegates to ``resolve_mlbam_id``
+    (role-agnostic here — callers role-gate the returned tuple). ``lineup`` /
+    ``probables`` (today's posted lineup / announced probables) let the resolver bind
+    off the actual game before falling to the statsapi season roster, then to a
+    role-checked SFBB fallback. The two-tuple contract and the never-wrong-bind
+    refusal (None on an ambiguous name) are unchanged; the ONLY change from the prior
+    SFBB-first order is that statsapi identity now wins over the drift-prone SFBB
+    cross-map."""
+    return resolve_mlbam_id(name, season, prop_key=None, teams=teams,
+                            confirmed_lineup=lineup, probable_starters=probables)
 
 
 def _player_gamelog_splits(pid, group, season, max_age=CACHE_MAX_AGE):
