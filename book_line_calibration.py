@@ -380,38 +380,39 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         # Prefer the book line's authoritative MLBAM id → ESPN athlete_id (name-
         # independent; handles accents/namesakes), falling back to the name-based
         # cache lookup for un-enriched / unmapped / non-baseball rows.
-        aid = None
-        if mlb_id and espn_sport == "baseball":
-            try:
-                import player_id_map
-                aid = player_id_map.espn_id_for_mlb_id(mlb_id)
-            except Exception:
-                aid = None
-        if not aid:
-            aid = cached_athlete_id(espn_sport, espn_league, player)
-        if not aid:
-            skipped_no_player += len(rows)
-            continue
-        # P4 cutover (env-gated, MLB-only, fail-open): grade off the warehouse per-
-        # game facts when enabled + the book line carries a MLBAM id; else the ESPN
-        # cached_gamelog path, unchanged. Flag OFF → byte-identical.
+        # P6 MLB calibration cutover — WAREHOUSE-ONLY (no ESPN for baseball):
+        # grade MLB book lines off the StatsAPI facts (get_calib_gamelog); a valid
+        # MLBAM id is sufficient (the facts don't need an ESPN athlete_id), so a row
+        # is NO LONGER dropped for a missing ESPN aid — the old cached_athlete_id
+        # precondition was an ungated ESPN coupling that silently omitted valid-MLBAM
+        # rows from the fit. A warehouse miss / missing MLBAM id drops the row (it
+        # never falls open to ESPN). ODI_MLB_WAREHOUSE_CALIB is now unconditional for
+        # MLB (proven on). NBA/NFL/NHL keep the unchanged ESPN name→aid→gamelog path.
         gamelog = None
         from_warehouse = False
-        if _warehouse_calib_enabled() and espn_sport == "baseball" and mlb_id:
-            try:
-                import mlb_warehouse
-                gamelog = mlb_warehouse.get_calib_gamelog(
-                    mlb_id, _calib_role(rows)) or None
-                from_warehouse = gamelog is not None
-            except Exception:
-                gamelog = None
-        if not gamelog:
+        if espn_sport == "baseball":
+            if mlb_id:
+                try:
+                    import mlb_warehouse
+                    gamelog = mlb_warehouse.get_calib_gamelog(
+                        mlb_id, _calib_role(rows)) or None
+                    from_warehouse = gamelog is not None
+                except Exception:
+                    gamelog = None
+            if not gamelog:
+                skipped_no_player += len(rows)
+                continue
+        else:
+            aid = cached_athlete_id(espn_sport, espn_league, player)
+            if not aid:
+                skipped_no_player += len(rows)
+                continue
             gamelog = cached_gamelog(espn_sport, espn_league, aid,
                                      ttl_hours=CALIB_GAMELOG_TTL_HOURS,
                                      player_name=player)
-        if not gamelog:
-            skipped_no_player += len(rows)
-            continue
+            if not gamelog:
+                skipped_no_player += len(rows)
+                continue
         gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
 
         # Build a date → game-index lookup. A date carrying MORE THAN ONE gamelog

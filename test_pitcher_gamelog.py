@@ -353,14 +353,15 @@ class PitcherRealLineJoinTests(unittest.TestCase):
         return {"sport_key": "baseball_mlb", "game_date": gd,
                 "commence_time": f"{gd}T23:00:00Z", "event_id": "e1",
                 "home_team": "Reds", "away_team": "Guardians",
-                "player": "A. Pitcher", "prop_key": "pitcher_earned_runs",
+                "player": "A. Pitcher", "player_mlb_id": "123",
+                "prop_key": "pitcher_earned_runs",
                 "line": line, "over_price": -110, "under_price": -110}
 
     def _join(self, book_rows, gamelog):
         import book_line_calibration as blc
-        with patch("book_line_calibration.cached_athlete_id",
-                   return_value="123"), \
-             patch("book_line_calibration.cached_gamelog", return_value=gamelog):
+        # MLB calibration is warehouse-only (no ESPN): source the per-game log from
+        # get_calib_gamelog.
+        with patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog):
             return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
 
     def test_dated_pitcher_log_joins(self):

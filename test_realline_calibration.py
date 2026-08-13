@@ -578,13 +578,15 @@ class JoinToActualsTests(unittest.TestCase):
         return {"sport_key": "baseball_mlb", "game_date": gd,
                 "commence_time": f"{gd}T23:00:00Z", "event_id": "e1",
                 "home_team": "Reds", "away_team": "Guardians",
-                "player": "A. Batter", "prop_key": "batter_hits", "line": line,
+                "player": "A. Batter", "player_mlb_id": "123",
+                "prop_key": "batter_hits", "line": line,
                 "over_price": -110, "under_price": -110}
 
     def _join(self, book_rows, gamelog):
-        with patch("book_line_calibration.cached_athlete_id",
-                   return_value="123"), \
-             patch("book_line_calibration.cached_gamelog", return_value=gamelog):
+        # MLB calibration is warehouse-only now (no ESPN): source the per-game log
+        # from get_calib_gamelog. The join LOGIC under test (idx binding /
+        # prior_games / doubleheader guard / role gate) is source-independent.
+        with patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog):
             return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
 
     def test_join_attaches_actual_and_prior_games(self):
@@ -629,37 +631,28 @@ class JoinToActualsTests(unittest.TestCase):
         self.assertEqual(out[0]["actual"], 9.0)
         self.assertEqual(out[0]["stat_label"], "K")
 
-    def test_join_drops_tb_rbi_on_espn_gamelog(self):
-        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY. With no mlb_id the
-        # warehouse is skipped and we fall open to the ESPN gamelog — which must NOT
-        # grade these off its uncalibrated 'RBI' (or a phantom 'TB'). The row is
-        # dropped rather than poison the calibration corpus.
-        gl = [{"game_date": f"2026-07-{d:02d}T23:00:00Z", "H": 1, "RBI": 2, "TB": 3}
-              for d in range(12, 25)]
-        for prop in ("batter_rbis", "batter_total_bases"):
-            row = self._book_row(line=0.5)
-            row["prop_key"] = prop
-            self.assertEqual(self._join([row], gl), [], prop)
-
-    def _join_warehouse(self, book_rows, gamelog):
-        # CALIB on + book line carrying an mlb_id → the gamelog is warehouse-sourced.
-        with patch.dict(os.environ, {blc._MLB_WAREHOUSE_CALIB_ENV: "1"}), \
-             patch("player_id_map.espn_id_for_mlb_id", return_value="123"), \
-             patch("book_line_calibration.cached_athlete_id", return_value="123"), \
-             patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog), \
-             patch("book_line_calibration.cached_gamelog", return_value=[]):
-            return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
+    def test_join_drops_row_without_mlb_id(self):
+        # MLB calibration is warehouse-only: a book line with no MLBAM id can't be
+        # warehouse-resolved and NEVER falls open to ESPN — the row is dropped, and
+        # the warehouse isn't even consulted.
+        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 25)])
+        row = self._book_row()
+        row["player_mlb_id"] = None
+        with patch("mlb_warehouse.get_calib_gamelog", return_value=gl) as wh:
+            out = blc.join_book_lines_to_actuals([row], "baseball", "mlb")
+        self.assertEqual(out, [])
+        wh.assert_not_called()
 
     def test_tb_rbi_grade_off_warehouse(self):
-        # The guard is SOURCE-aware, not a blanket drop: when the warehouse serves
-        # the gamelog (CALIB on + mlb_id), batter_rbis grades normally off its 'RBI'.
+        # TB/RBI are warehouse-only; with the warehouse serving they grade normally
+        # off its 'RBI' column (they can no longer bind an ESPN gamelog — MLB never
+        # touches ESPN in calibration now).
         wh = [{"game_date": f"2026-07-{d:02d}T23:00:00Z", "RBI": 1, "completed": True}
               for d in range(12, 24)] + [
               {"game_date": "2026-07-24T23:00:00Z", "RBI": 3, "completed": True}]
         row = self._book_row(line=0.5)
         row["prop_key"] = "batter_rbis"
-        row["player_mlb_id"] = "592450"
-        out = self._join_warehouse([row], wh)
+        out = self._join([row], wh)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["actual"], 3.0)
         self.assertEqual(out[0]["stat_label"], "RBI")
@@ -734,10 +727,10 @@ class OfflineParkProjectionTests(unittest.TestCase):
 
 
 class JoinIdBridgeTests(_Backend, unittest.TestCase):
-    """join_book_lines_to_actuals pivots athlete-id resolution onto the book
-    line's player_mlb_id via the SFBB bridge (MLBAM→ESPN), bypassing the
-    name-based cache entirely; same-id spellings pool into ONE gamelog fetch.
-    Uses the map-seeding mixin so espn_id_for_mlb_id resolves for real."""
+    """MLB calibration is warehouse-only + id-native: join_book_lines_to_actuals
+    resolves the per-game log from the book line's player_mlb_id via
+    get_calib_gamelog (no ESPN athlete_id / name-cache search); same-id spellings
+    pool into ONE fetch, and a warehouse miss drops the row (never ESPN)."""
 
     def _gamelog(self, dates_hits):
         return [{"game_date": f"{d}T23:00:00Z", "H": h} for d, h in dates_hits]
@@ -750,61 +743,61 @@ class JoinIdBridgeTests(_Backend, unittest.TestCase):
                 "prop_key": "batter_hits", "line": line,
                 "over_price": -110, "under_price": -110}
 
-    def test_id_resolves_aid_and_skips_name_search(self):
-        # The book row's name is a garbage spelling the name cache would miss, but
-        # the correct player_mlb_id resolves the ESPN athlete_id via the bridge.
+    def test_id_resolves_via_warehouse_skips_name(self):
+        # The book row's name is a garbage spelling, but the player_mlb_id resolves
+        # the warehouse gamelog directly — no ESPN name-cache / gamelog touched.
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
                            + [("2026-07-24", 2)])
         seen = {}
 
-        def fake_gamelog(sport, league, aid, **kw):
-            seen["aid"] = aid
+        def fake_calib(mlb_id, role, **kw):
+            seen["mlb_id"] = mlb_id
             return gl
 
         with patch("book_line_calibration.cached_athlete_id") as m_name, \
-             patch("book_line_calibration.cached_gamelog",
-                   side_effect=fake_gamelog):
+             patch("book_line_calibration.cached_gamelog") as m_espn, \
+             patch("mlb_warehouse.get_calib_gamelog", side_effect=fake_calib):
             out = blc.join_book_lines_to_actuals(
                 [self._row("Totally Wrong Spelling")], "baseball", "mlb")
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["actual"], 2.0)
-        m_name.assert_not_called()                 # name cache bypassed
-        self.assertEqual(seen["aid"],
-                         player_id_map.espn_id_for_mlb_id("608070"))
+        self.assertEqual(seen["mlb_id"], "608070")   # resolved by MLBAM id
+        m_name.assert_not_called()                    # no ESPN name search
+        m_espn.assert_not_called()                    # no ESPN gamelog
 
     def test_same_id_two_spellings_pool_one_fetch(self):
-        # Two alt-line rows for the same player under different spellings: grouped
-        # by id → a single ESPN gamelog fetch, both lines still join.
+        # Two alt-line rows for the same player under different spellings: grouped by
+        # MLBAM id → a single warehouse fetch, both lines still join.
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
                            + [("2026-07-24", 2)])
         calls = []
 
-        def fake_gamelog(sport, league, aid, **kw):
-            calls.append(aid)
+        def fake_calib(mlb_id, role, **kw):
+            calls.append(mlb_id)
             return gl
 
         rows = [self._row("Jose Ramirez", line=0.5),
                 self._row("José Ramírez", line=1.5)]
         with patch("book_line_calibration.cached_athlete_id") as m_name, \
-             patch("book_line_calibration.cached_gamelog",
-                   side_effect=fake_gamelog):
+             patch("book_line_calibration.cached_gamelog") as m_espn, \
+             patch("mlb_warehouse.get_calib_gamelog", side_effect=fake_calib):
             out = blc.join_book_lines_to_actuals(rows, "baseball", "mlb")
-        self.assertEqual(len(calls), 1)            # pooled: ONE fetch
+        self.assertEqual(len(calls), 1)               # pooled: ONE fetch
         m_name.assert_not_called()
+        m_espn.assert_not_called()
         self.assertEqual(sorted(r["line"] for r in out), [0.5, 1.5])
 
-    def test_falls_back_to_name_when_id_unresolved(self):
-        # An unmapped id must not strand the row: the join falls back to the
-        # name-based cache (zero regression for un-enriched / unknown players).
-        gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
-                           + [("2026-07-24", 2)])
-        with patch("book_line_calibration.cached_athlete_id",
-                   return_value="999") as m_name, \
-             patch("book_line_calibration.cached_gamelog", return_value=gl):
+    def test_warehouse_miss_drops_row_no_espn_fallback(self):
+        # A warehouse miss (no facts for that MLBAM id) drops the row — MLB NEVER
+        # falls back to the ESPN name cache.
+        with patch("book_line_calibration.cached_athlete_id") as m_name, \
+             patch("book_line_calibration.cached_gamelog") as m_espn, \
+             patch("mlb_warehouse.get_calib_gamelog", return_value=[]):
             out = blc.join_book_lines_to_actuals(
                 [self._row("A. Batter", mlb_id="000404")], "baseball", "mlb")
-        self.assertEqual(len(out), 1)
-        m_name.assert_called_once()                # id miss → name path
+        self.assertEqual(out, [])
+        m_name.assert_not_called()                    # no ESPN name fallback
+        m_espn.assert_not_called()
 
 
 class RoiTiebreakUnitTests(unittest.TestCase):
@@ -1041,10 +1034,12 @@ class CalibWarehouseCutoverTests(unittest.TestCase):
         wh.assert_called_once_with("592450", "batter")
         esp.assert_not_called()
 
-    def test_flag_off_uses_espn(self):
-        wh, esp = self._run("")
-        wh.assert_not_called()
-        esp.assert_called_once()
+    def test_baseball_warehouse_only_ignores_flag(self):
+        # P6 cutover: MLB calibration is warehouse-only regardless of the (now
+        # retired) flag — it never falls open to ESPN.
+        wh, esp = self._run("")           # flag OFF
+        wh.assert_called_once_with("592450", "batter")
+        esp.assert_not_called()
 
 
 if __name__ == "__main__":
