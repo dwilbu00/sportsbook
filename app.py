@@ -2929,6 +2929,11 @@ if analyze_clicked and selected_game_labels:
                             sport["espn_sport"], sport["espn_league"],
                             player_name, prop_key, recent_n,
                             team_ids=event_team_ids,
+                            # MLB: the matchup teams narrow a namesake to its MLBAM
+                            # id in the warehouse (Max Muncy / Luis Garcia Jr.) so it
+                            # resolves off the warehouse instead of falling to ESPN.
+                            teams=[parsed.get("home_team"),
+                                   parsed.get("away_team")],
                         )
 
         # Collect all player histories

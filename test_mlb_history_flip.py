@@ -79,6 +79,23 @@ class WarehouseHistGateTests(unittest.TestCase):
         with _flag_on():
             self.assertIsNone(self._call(mlb_id=None))
 
+    def test_namesake_narrowed_by_teams(self):
+        # P6: the game's two teams narrow a namesake (Max Muncy / Luis Garcia Jr.)
+        # to its MLBAM id via mlb_id_for_name(teams=...), so it resolves off the
+        # warehouse instead of falling to ESPN.
+        with _flag_on(), mock.patch.object(
+                espn_client, "db_store",
+                mock.Mock(enabled=mock.Mock(return_value=True))), \
+             mock.patch("player_id_map.mlb_id_for_name",
+                        return_value="592450") as m_id, \
+             mock.patch("mlb_warehouse.get_player_history", return_value=WH_DICT):
+            out = espn_client._mlb_warehouse_history(
+                "baseball", "Max Muncy", "batter_hits", 20,
+                teams=["Athletics", "New York Yankees"])
+        self.assertEqual(out, WH_DICT)
+        m_id.assert_called_once_with(
+            "Max Muncy", teams=["Athletics", "New York Yankees"])
+
     def test_warehouse_no_rows_returns_none(self):
         with _flag_on():
             self.assertIsNone(self._call(wh=None))

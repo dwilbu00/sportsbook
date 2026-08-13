@@ -395,7 +395,10 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
                         print(f"    Looking up {player_name} ({PROP_LABELS.get(prop_key, prop_key)})...")
                         history = get_player_stat_history(
                             espn_sport, espn_league, player_name, prop_key,
-                            n=recent_n, team_ids=event_team_ids
+                            n=recent_n, team_ids=event_team_ids,
+                            # MLB: matchup teams narrow a namesake to its MLBAM id.
+                            teams=[prop_data.get("home_team"),
+                                   prop_data.get("away_team")],
                         )
                         player_histories[player_name][prop_key] = history
                         if history["found"]:
