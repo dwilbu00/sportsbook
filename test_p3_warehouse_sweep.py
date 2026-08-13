@@ -279,5 +279,96 @@ class MlbPlayerPoolTests(unittest.TestCase):
         self.assertEqual(pool, [("1", "batter", "Two Way")])
 
 
+class WarehouseTeamSchedulesTests(unittest.TestCase):
+    """P3b: _warehouse_team_schedules mirrors get_all_teams + build_schedules for the
+    team-market backtests, pooling seasons, canonical names."""
+
+    NAMES = {"147": "New York Yankees", "111": "Boston Red Sox"}
+
+    def _tfg(self, tid, season=None):
+        return [{"date": f"{season}-07-20T18:00Z", "home_team": "New York Yankees",
+                 "away_team": "Boston Red Sox", "home_score": 5, "away_score": 3,
+                 "total_score": 8}]
+
+    def test_shape_season_pooling_and_win_pct(self):
+        with mock.patch("mlb_warehouse._team_name_map", return_value=self.NAMES), \
+             mock.patch("mlb_warehouse._team_final_games", side_effect=self._tfg):
+            teams, sched = backtest._warehouse_team_schedules([2025, 2026])
+        # NYY home 5-3 in every fixture game → 1.0; BOS away, loses → 0.0.
+        self.assertEqual(teams["New York Yankees"], {"id": "147", "win_pct": 1.0})
+        self.assertEqual(teams["Boston Red Sox"], {"id": "111", "win_pct": 0.0})
+        self.assertEqual(len(sched["147"]), 2)          # pooled across both seasons
+        self.assertEqual(sched["147"][0]["home_team"], "New York Yankees")
+
+    def test_none_season_maps_to_current_not_all_seasons(self):
+        seen = []
+
+        def _tfg(tid, season=None):
+            seen.append(season)
+            return []
+
+        with mock.patch("mlb_warehouse._team_name_map", return_value={"147": "NYY"}), \
+             mock.patch("mlb_warehouse._current_season", return_value=2026), \
+             mock.patch("mlb_warehouse._team_final_games", side_effect=_tfg):
+            backtest._warehouse_team_schedules([None])
+        self.assertEqual(seen, [2026])   # None → current, NOT the unfiltered all-seasons branch
+
+    def test_no_games_win_pct_defaults_neutral(self):
+        with mock.patch("mlb_warehouse._team_name_map", return_value={"147": "NYY"}), \
+             mock.patch("mlb_warehouse._current_season", return_value=2026), \
+             mock.patch("mlb_warehouse._team_final_games", return_value=[]):
+            teams, _ = backtest._warehouse_team_schedules([2026])
+        self.assertEqual(teams["NYY"]["win_pct"], 0.5)
+
+
+class TeamMarketGateTests(unittest.TestCase):
+    """P3b: run_backtest / run_odds_backtest source MLB team schedules from the
+    warehouse when gated, ESPN otherwise; non-baseball is byte-identical."""
+
+    def test_run_backtest_baseball_env_on_uses_warehouse(self):
+        wh = mock.Mock(return_value=({}, {}))   # empty → clean "No games" early return
+        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
+             mock.patch.object(backtest, "_warehouse_team_schedules", wh), \
+             mock.patch.object(backtest, "get_all_teams") as gat:
+            backtest.run_backtest("baseball_mlb", "baseball", "mlb", limit=10,
+                                  window=10, variants={"base": {"half_life": 10}},
+                                  season_year=2026)
+        wh.assert_called_once()
+        gat.assert_not_called()
+
+    def test_run_backtest_nba_ignores_flag(self):
+        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
+             mock.patch.object(backtest, "_warehouse_team_schedules") as wh, \
+             mock.patch.object(backtest, "get_all_teams", return_value={}) as gat, \
+             mock.patch.object(backtest, "build_schedules", return_value={}):
+            backtest.run_backtest("basketball_nba", "basketball", "nba", limit=10,
+                                  window=10, variants={"base": {"half_life": 10}},
+                                  season_year=2025)
+        gat.assert_called_once()
+        wh.assert_not_called()
+
+    def test_run_odds_backtest_baseball_env_on_uses_warehouse(self):
+        store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z",
+                                  "home_team": "A", "away_team": "B"}},
+                 "bookmaker": "dk"}
+        wh = mock.Mock(return_value=({}, {}))
+        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
+             mock.patch.object(backtest, "_load_odds_store",
+                               return_value=(store, "store")), \
+             mock.patch.object(backtest, "_build_odds_lookup", return_value=({}, 0)), \
+             mock.patch.object(backtest, "_warehouse_team_schedules", wh), \
+             mock.patch.object(backtest, "get_all_teams") as gat:
+            try:
+                backtest.run_odds_backtest(
+                    "baseball_mlb", "baseball", "mlb", limit=10, window=10,
+                    variants={"base": {"half_life": 10}}, season_year=2026,
+                    supplement_log=False)
+            except Exception:
+                pass   # downstream empty-slate handling isn't under test; the
+                       # warehouse branch runs before any of it
+        wh.assert_called_once()
+        gat.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

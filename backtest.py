@@ -341,6 +341,41 @@ def build_schedules(espn_sport, espn_league, espn_teams, season_year=None, max_w
     return results
 
 
+def _warehouse_team_schedules(seasons_list):
+    """MLB warehouse analog of get_all_teams + build_schedules for the team-market
+    backtests (run_backtest / run_odds_backtest). Returns (teams, schedules):
+      teams     = {canonical_name: {"id": mlbam_team_id}}   (get_all_teams shape)
+      schedules = {mlbam_team_id: [game dicts]}             (build_schedules shape)
+    Each game dict is a mlb_warehouse._team_final_games row ({date, home_team,
+    away_team, home_score, away_score, total_score}) with CANONICAL StatsAPI names —
+    the same shape get_team_schedule emits — pooled across seasons_list. The
+    opponent-strength annotation + the odds-store join key off these structures; the
+    odds join prefers SFBB team CODES (team_code_for_name), robust to canonical-vs-
+    odds spelling, with the name key a fallback — so both backtests run unchanged."""
+    import mlb_warehouse
+    # A None season means the CURRENT season (mirroring get_team_schedule(None), the
+    # ESPN default). _team_final_games applies NO filter on season=None, so leaving it
+    # None would silently pool EVERY warehouse season and broaden the fit -- map it to
+    # the concrete current year instead.
+    cur = mlb_warehouse._current_season()
+    seasons = list(dict.fromkeys(cur if sy is None else sy for sy in seasons_list))
+    names = mlb_warehouse._team_name_map()             # {mlbam_tid: canonical_name}
+    teams, schedules = {}, {}
+    for tid, nm in names.items():
+        rows = []
+        for sy in seasons:
+            rows.extend(mlb_warehouse._team_final_games(tid, season=sy))
+        schedules[tid] = rows
+        # win_pct (from the fetched games) mirrors the ESPN teams dict so
+        # annotate_opponent_strength's opponent-strength weighting isn't neutralized:
+        # a missing win_pct defaults to 0.5 and opp_strength_mult(0.5, s) == 1.0.
+        wins = sum(1 for g in rows if (
+            (g["home_team"] == nm and g["home_score"] > g["away_score"])
+            or (g["away_team"] == nm and g["away_score"] > g["home_score"])))
+        teams[nm] = {"id": tid, "win_pct": (wins / len(rows)) if rows else 0.5}
+    return teams, schedules
+
+
 def all_completed_games(schedules):
     """Flatten all schedules into a deduped list of (date, home, away, home_score, away_score)."""
     seen = set()
@@ -378,17 +413,28 @@ def prior_games_for(team_name, schedules, espn_teams, before_date, window):
 
 def run_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
                  min_sample=5, season_year=None, sweep=False,
-                 quantile_mode=False, safe_target=0.80):
+                 quantile_mode=False, safe_target=0.80, warehouse_inputs=None):
     # Resolve "auto" half-life in variants
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
 
-    print(f"\n=== Loading {sport_key} team list ===")
-    espn_teams = get_all_teams(espn_sport, espn_league)
-    print(f"Loaded {len(espn_teams)} teams")
+    # P3b/P6: source MLB team schedules from the StatsAPI warehouse instead of ESPN.
+    # Env-gated (ODI_MLB_WAREHOUSE_BACKTEST) unless a caller forces it; MLB-only, so
+    # NBA/NFL stay byte-identical.
+    use_warehouse = (espn_sport == "baseball") and (
+        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
+        else bool(warehouse_inputs))
 
+    print(f"\n=== Loading {sport_key} team list ===")
     season_label = f"season {season_year}" if season_year else "current season"
-    print(f"\n=== Fetching schedules for {season_label} (cached) ===")
-    schedules = build_schedules(espn_sport, espn_league, espn_teams, season_year=season_year)
+    if use_warehouse:
+        print("=== team-market inputs: StatsAPI warehouse (ESPN bypassed) ===")
+        espn_teams, schedules = _warehouse_team_schedules([season_year])
+    else:
+        espn_teams = get_all_teams(espn_sport, espn_league)
+        print(f"Loaded {len(espn_teams)} teams")
+        print(f"\n=== Fetching schedules for {season_label} (cached) ===")
+        schedules = build_schedules(espn_sport, espn_league, espn_teams,
+                                    season_year=season_year)
     print(f"Fetched {sum(1 for v in schedules.values() if v)} non-empty schedules")
 
     all_games = all_completed_games(schedules)
@@ -1061,7 +1107,8 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       min_sample=5, season_year=None, threshold_pct=5.0,
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
-                      supplement_log=True, min_shrink_n=MIN_SHRINK_N):
+                      supplement_log=True, min_shrink_n=MIN_SHRINK_N,
+                      warehouse_inputs=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1100,27 +1147,39 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         print(f"\n[store-label: {store_label}] grading ROI at the "
               f"{store.get('snapshot_time','labeled')} price, not the close.")
 
+    # P3b/P6: source MLB team schedules from the StatsAPI warehouse instead of ESPN
+    # (env-gated ODI_MLB_WAREHOUSE_BACKTEST unless forced; MLB-only). The odds-store
+    # join below prefers SFBB team CODES, so the canonical warehouse names join fine.
+    use_warehouse = (espn_sport == "baseball") and (
+        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
+        else bool(warehouse_inputs))
+    # season_year may be a single year (int/None) or an iterable of years. When
+    # several years are given we pool each season's schedule so the fit can span
+    # multiple seasons (e.g. NFL, whose ~200 games/season are too thin alone).
+    if isinstance(season_year, (list, tuple, set)):
+        seasons_list = list(season_year)
+    else:
+        seasons_list = [season_year]
+
     print(f"\n=== Loading {sport_key} team list ===")
-    espn_teams = get_all_teams(espn_sport, espn_league)
+    if use_warehouse:
+        print("=== team-market inputs: StatsAPI warehouse (ESPN bypassed) ===")
+        espn_teams, schedules = _warehouse_team_schedules(seasons_list)
+    else:
+        espn_teams = get_all_teams(espn_sport, espn_league)
     lookup, unmatched = _build_odds_lookup(store, espn_teams)
     print(f"Stored games: {len(store['games'])} "
           f"(bookmaker: {store.get('bookmaker','?')}); "
           f"name-unmatched: {unmatched}")
 
     print(f"\n=== Fetching schedules (cached) ===")
-    # season_year may be a single year (int/None) or an iterable of years. When
-    # several years are given we fetch each season's schedule and merge them so
-    # the fit can pool multiple seasons (e.g. NFL, whose ~200 games/season are
-    # too thin to fit a stable per-market shrink alone).
-    if isinstance(season_year, (list, tuple, set)):
-        seasons_list = list(season_year)
-    else:
-        seasons_list = [season_year]
-    schedules = {}
-    for sy in seasons_list:
-        sched = build_schedules(espn_sport, espn_league, espn_teams, season_year=sy)
-        for tid, games in sched.items():
-            schedules.setdefault(tid, []).extend(games)
+    if not use_warehouse:
+        schedules = {}
+        for sy in seasons_list:
+            sched = build_schedules(espn_sport, espn_league, espn_teams,
+                                    season_year=sy)
+            for tid, games in sched.items():
+                schedules.setdefault(tid, []).extend(games)
     all_games = all_completed_games(schedules)
     if limit and limit < len(all_games):
         all_games = all_games[-limit:]
@@ -3907,6 +3966,11 @@ def main():
                         "'warehouse' forces the warehouse; 'store' forces the "
                         "local JSON. Under 'auto', a --store-label forces the "
                         "local JSON (the warehouse has no label concept).")
+    p.add_argument("--warehouse-inputs", action="store_true", default=None,
+                   help="MLB only (P3b/P6): source team schedules + player gamelogs "
+                        "from the StatsAPI warehouse instead of ESPN. Defaults to the "
+                        "ODI_MLB_WAREHOUSE_BACKTEST env flag when unset; ignored for "
+                        "NBA/NFL.")
     p.add_argument("--supplement-log", dest="supplement_log",
                    action="store_true", default=True,
                    help="(odds mode, live engine) Fold resolved market_prediction_"
@@ -3982,13 +4046,15 @@ def main():
                           variance_inflate=args.variance_inflate,
                           engine=args.engine, prob_shrink=args.prob_shrink,
                           source=args.source, supplement_log=args.supplement_log,
-                          min_shrink_n=args.min_shrink_n)
+                          min_shrink_n=args.min_shrink_n,
+                          warehouse_inputs=args.warehouse_inputs)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
                      min_sample=args.min_sample, season_year=args.season,
                      sweep=args.sweep, quantile_mode=args.quantile_mode,
-                     safe_target=args.safe_target)
+                     safe_target=args.safe_target,
+                     warehouse_inputs=args.warehouse_inputs)
     else:
         # Player-props mode
         if args.players:
@@ -4022,7 +4088,8 @@ def main():
                                   safe_target=args.safe_target,
                                   quantile_mode=args.quantile_mode,
                                   calibrate=args.calibrate,
-                                  cross_season=args.cross_season)
+                                  cross_season=args.cross_season,
+                                  warehouse_inputs=args.warehouse_inputs)
 
 
 if __name__ == "__main__":
