@@ -2763,13 +2763,18 @@ if analyze_clicked and selected_game_labels:
 
     progress = st.progress(0, text="Starting analysis...")
 
-    # Fetch ESPN teams
-    progress.progress(5, text="Loading ESPN team data...")
-    try:
-        espn_teams = fetch_espn_teams(sport["espn_sport"], sport["espn_league"])
-    except Exception as e:
-        st.error(f"Failed to fetch ESPN data: {e}")
-        st.stop()
+    # Team data. MLB (P6): team resolution is warehouse-only (parity-verified 30/30,
+    # full-slate 9/9), so skip the ESPN get_all_teams fetch entirely — the last
+    # ungated ESPN team call for MLB. NBA/NFL/NHL still fetch from ESPN.
+    progress.progress(5, text="Loading team data...")
+    if sport["key"] == "baseball_mlb":
+        espn_teams = {}
+    else:
+        try:
+            espn_teams = fetch_espn_teams(sport["espn_sport"], sport["espn_league"])
+        except Exception as e:
+            st.error(f"Failed to fetch ESPN data: {e}")
+            st.stop()
 
     selected_events = [game_options[l] for l in selected_game_labels]
     total_games = len(selected_events)

@@ -291,15 +291,19 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
         print("  No games to analyze.")
         return
 
-    # Fetch ESPN team data
-    print(f"\n  Fetching {espn_league.upper()} team data from ESPN...")
-    try:
-        espn_teams = get_all_teams(espn_sport, espn_league)
-    except Exception as e:
-        print(f"  ERROR fetching ESPN data: {e}")
-        sys.exit(1)
-
-    print(f"  Loaded {len(espn_teams)} teams.")
+    # Team data. MLB (P6): team resolution is warehouse-only (no ESPN get_all_teams);
+    # NBA/NFL/NHL still fetch from ESPN.
+    if sport_key == "baseball_mlb":
+        espn_teams = {}
+        print("\n  MLB team resolution: StatsAPI warehouse (no ESPN).")
+    else:
+        print(f"\n  Fetching {espn_league.upper()} team data from ESPN...")
+        try:
+            espn_teams = get_all_teams(espn_sport, espn_league)
+        except Exception as e:
+            print(f"  ERROR fetching ESPN data: {e}")
+            sys.exit(1)
+        print(f"  Loaded {len(espn_teams)} teams.")
 
     # Analyze team-level markets (h2h, spreads, totals)
     all_ml_candidates = []
