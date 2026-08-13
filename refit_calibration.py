@@ -279,25 +279,46 @@ def _incumbent_protected(sel, old_method, min_override_obs=MIN_REAL_LINE_OVERRID
 
 
 def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
-    """Resolve a broad, data-driven MLB calibration pool from cached seasons."""
+    """Resolve a broad, data-driven MLB calibration pool from cached seasons.
+
+    Returns a list of (mlb_id, role, name) tuples — role ∈ {'batter','pitcher'}, from
+    which of frequent_batter_ids / starter_ids the id came — so the P3/P6 warehouse
+    sweep binds each player by his AUTHORITATIVE MLBAM id + role (get_calib_gamelog)
+    with no lossy name round-trip. The name is retained for display + the ESPN sweep
+    path (which resolves name→ESPN id); deduped by id (an id is a player's identity,
+    so a shared fullName keeps both, unlike the old name-dedup)."""
     if not season:
         season = datetime.now(timezone.utc).year
     try:
         import mlb_starters
         from backtest_props import frequent_batter_ids, starter_ids
 
-        player_ids = (frequent_batter_ids([season], max_batters)
-                      + starter_ids([season])[:max_pitchers])
-        names = []
+        batter_ids = frequent_batter_ids([season], max_batters)
+        pitcher_ids = starter_ids([season])[:max_pitchers]
+        role_by_id = {}
+        for pid in batter_ids:
+            role_by_id.setdefault(str(pid), "batter")
+        for pid in pitcher_ids:
+            role_by_id.setdefault(str(pid), "pitcher")   # two-way rarity: first wins
+        player_ids = list(batter_ids) + list(pitcher_ids)
+        name_by_id = {}
         for start in range(0, len(player_ids), 50):
             chunk = player_ids[start:start + 50]
             data = mlb_starters._get(
                 "people", {"personIds": ",".join(map(str, chunk))})
-            names.extend(
-                person.get("fullName") for person in data.get("people", [])
-                if person.get("fullName")
-            )
-        return list(dict.fromkeys(names))
+            for person in data.get("people", []):
+                pid, full = person.get("id"), person.get("fullName")
+                if pid and full:
+                    name_by_id[str(pid)] = full
+        pool, seen = [], set()
+        for pid in player_ids:
+            spid = str(pid)
+            name = name_by_id.get(spid)
+            if not name or spid in seen:
+                continue
+            seen.add(spid)
+            pool.append((spid, role_by_id.get(spid, "batter"), name))
+        return pool
     except Exception as exc:
         print(f"  [warn] broad MLB player pool unavailable: {exc}")
         return []
@@ -662,7 +683,7 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
-                nba_max_players=150, nba_min_games=15):
+                nba_max_players=150, nba_min_games=15, warehouse_inputs=None):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     if sport in ("mlb", "nba") and season is None:
         season = datetime.now(timezone.utc).year
@@ -698,7 +719,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         season_year=season, safe_mode=True,
         cushion_sweep=False, safe_target=0.80,
         quantile_mode=False, calibrate=True,
-        cross_season="strict",
+        cross_season="strict", warehouse_inputs=warehouse_inputs,
     )
     if not curr_results:
         print("Current-season run produced no results; aborting.")
@@ -719,9 +740,19 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             cushion_sweep=False, safe_target=0.80,
             quantile_mode=False, calibrate=True,
             cross_season="all",  # within a single prior season this is fine
+            warehouse_inputs=warehouse_inputs,
         )
         if warmup_results:
             warmup_winners = _best_per_prop(warmup_results, props)
+        else:
+            # A requested warmup that yields nothing would otherwise ship a calibration
+            # with NO warmup block (degrading players with < warmup_games current-season
+            # games) behind a single buried "Aborting." line. Make it loud + auditable —
+            # the likeliest cause under --warehouse-inputs is missing prior-season facts.
+            print(f"  [WARN] WARMUP (prior season {prior_season}) produced NO results "
+                  f"— shipping calibration WITHOUT a warmup block."
+                  + (" The warehouse may lack prior-season facts; backfill that season "
+                     "or drop --warehouse-inputs." if warehouse_inputs else ""))
 
     # Build final cfg
     props_cfg = {}
@@ -758,6 +789,10 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         "games_per_player": games_per_player,
         "warmup_games": warmup_games,
         "n_players": len(players),
+        # False when a warmup was requested but yielded no fit (e.g. the warehouse
+        # lacks prior-season facts) — an at-a-glance signal that the shipped file has
+        # no warmup block, since the omission is otherwise silent.
+        "warmup_present": bool(warmup_winners),
     }
     save_calibration(sport_key, props_cfg, meta=meta)
     print(f"\n✓ Wrote calibration/{sport_key}.json "
@@ -2637,6 +2672,11 @@ def main():
     p.add_argument("--nba-max-players", type=int, default=150,
                    help="Data-driven NBA pool size (top-N by minutes) when "
                         "--players is omitted.")
+    p.add_argument("--warehouse-inputs", action="store_true", default=None,
+                   help="MLB only (P3/P6): source the sweep's player gamelogs + team "
+                        "apparatus from the StatsAPI warehouse instead of ESPN. "
+                        "Defaults to the ODI_MLB_WAREHOUSE_BACKTEST env flag when "
+                        "unset; ignored for NBA/NFL.")
     p.add_argument("--nba-min-games", type=int, default=15,
                    help="Minimum games played for an NBA player to enter the "
                         "data-driven pool.")
@@ -2806,7 +2846,8 @@ def main():
                 mlb_max_batters=args.mlb_max_batters,
                 mlb_max_pitchers=args.mlb_max_pitchers,
                 nba_max_players=args.nba_max_players,
-                nba_min_games=args.nba_min_games)
+                nba_min_games=args.nba_min_games,
+                warehouse_inputs=args.warehouse_inputs)
 
 
 if __name__ == "__main__":

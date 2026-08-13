@@ -2143,10 +2143,71 @@ def _weighted_quantile(values, weights, q):
     return pairs[-1][0]
 
 
-def fetch_player_data(espn_sport, espn_league, players, season_year=None):
-    """Resolve each player → (athlete_id, gamelog). Returns {name: gamelog_list}."""
+def _mlb_warehouse_backtest_enabled():
+    """P3/P6 env gate: source the MLB synthetic-sweep inputs (player gamelogs + team
+    apparatus) from the StatsAPI warehouse instead of ESPN. OFF (default) keeps the
+    unchanged ESPN path. Read here (not app-boot-promoted) because the sweep is an
+    offline, operator-run tool."""
+    return os.environ.get("ODI_MLB_WAREHOUSE_BACKTEST", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def _iter_pool_players(players):
+    """Normalize each player-pool entry to (mlb_id, role, name). The MLB pool is
+    enriched to (mlb_id, role, name) tuples (refit_calibration._mlb_player_pool) so the
+    warehouse path binds each player by his authoritative MLBAM id + role; ESPN / NBA /
+    NFL pools and a --players override are plain name strings (mlb_id/role None)."""
+    for entry in players:
+        if isinstance(entry, (tuple, list)):
+            vals = list(entry) + [None, None, None]
+            yield vals[0], vals[1], vals[2]
+        else:
+            yield None, None, entry
+
+
+def fetch_player_data(espn_sport, espn_league, players, season_year=None,
+                      warehouse_inputs=False):
+    """Resolve each player → (athlete_id, gamelog). Returns {name: gamelog_list}.
+
+    ``warehouse_inputs`` (MLB only, the P3/P6 sweep cutover) sources each player's
+    per-game log from the StatsAPI warehouse (mlb_warehouse.get_calib_gamelog by the
+    pool's authoritative MLBAM id + role) — no name→ESPN-id round trip, no ESPN gamelog
+    fetch. A bare-name --players override under the flag is resolved to its MLBAM id via
+    the game-context-free resolver. OFF (default) = the unchanged ESPN path (also the
+    path NBA/NFL always take)."""
     data = {}
-    for name in players:
+    for mlb_id, role, name in _iter_pool_players(players):
+        if not name:
+            continue
+        if warehouse_inputs and espn_sport == "baseball":
+            import mlb_warehouse
+            rid, rrole = mlb_id, role
+            if not rid:
+                # A bare-name --players override under the flag: resolve the
+                # authoritative MLBAM id + role (get_calib_gamelog needs the role to
+                # pick the batter vs pitcher fact table).
+                import mlb_starters
+                resolved = mlb_starters.resolve_mlbam_id(
+                    name, season_year or mlb_warehouse._current_season())
+                if resolved:
+                    rid = resolved[0]
+                    rrole = "pitcher" if resolved[1] else "batter"
+            gamelog = (mlb_warehouse.get_calib_gamelog(
+                str(rid), rrole, season=season_year) if rid else [])
+            if not gamelog:
+                print(f"  [skip] {name}: no warehouse gamelog")
+                continue
+            gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
+            # The pool dedups by MLBAM id and can carry two DISTINCT players who share
+            # a fullName (e.g. Will Smith the catcher + the pitcher). data is keyed by
+            # name for display + the pitcher_team_name lookup, so disambiguate a
+            # collision with the id rather than letting the second overwrite (and
+            # silently drop) the first. Role is derived from each gamelog downstream,
+            # so a suffixed key is harmless.
+            key = name if name not in data else f"{name} ({rid})"
+            data[key] = gamelog
+            print(f"  [ok]   {key}: {len(gamelog)} games (warehouse)")
+            continue
         aid = cached_athlete_id(espn_sport, espn_league, name)
         if not aid:
             print(f"  [skip] {name}: athlete not found")
@@ -2285,6 +2346,37 @@ def _team_defense_lookup(espn_sport, espn_league, season_year=None):
     return lookup, series, league_avg
 
 
+def _mlb_warehouse_defense_lookup(season_year=None):
+    """Warehouse analog of _team_defense_lookup for the MLB sweep (P3/P6): returns
+    (avg_lookup, series_lookup, league_avg) keyed on the CANONICAL StatsAPI team name,
+    which is EXACTLY the ``opponent`` name get_calib_gamelog stamps on each player row
+    (both via mlb_warehouse._team_name_map) — so _resolve_opp_pts_allowed / _asof match
+    by construction, with no ESPN spelling gap to silently no-op the defense weighting.
+    Built from mlb_game scores (mlb_warehouse._team_final_games); the FULL-season series
+    is returned here and _resolve_opp_pa_asof does the strict-before-date leakage cut."""
+    import mlb_warehouse
+    names = mlb_warehouse._team_name_map()          # {mlbam_team_id: canonical_name}
+    lookup, series = {}, {}
+    for tid, tname in names.items():
+        rows = []
+        for g in mlb_warehouse._team_final_games(tid, season=season_year):
+            if g["home_team"] == tname:
+                allowed = g["away_score"]
+            elif g["away_team"] == tname:
+                allowed = g["home_score"]
+            else:
+                continue
+            if allowed is not None:
+                rows.append((g.get("date"), allowed))
+        if rows:
+            rows.sort(key=lambda r: r[0] or "", reverse=True)
+            vals = [a for _, a in rows]
+            lookup[tname] = sum(vals) / len(vals)
+            series[tname] = rows
+    league_avg = (sum(lookup.values()) / len(lookup)) if lookup else None
+    return lookup, series, league_avg
+
+
 def _resolve_opp_pa_asof(opp_name, test_date, team_series, window=None):
     """
     Return avg pts allowed by `opp_name` using only their games STRICTLY BEFORE
@@ -2331,8 +2423,17 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               variants, sweep=False, season_year=None,
                               safe_mode=False, cushion_sweep=False,
                               safe_target=0.80, quantile_mode=False,
-                              calibrate=False, cross_season="strict"):
+                              calibrate=False, cross_season="strict",
+                              warehouse_inputs=None):
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
+    # P3/P6: source MLB sweep inputs (player gamelogs + team apparatus) from the
+    # StatsAPI warehouse instead of ESPN. Env-gated (ODI_MLB_WAREHOUSE_BACKTEST) unless
+    # a caller forces it explicitly; MLB-only, so NBA/NFL stay byte-identical.
+    use_warehouse = (espn_sport == "baseball") and (
+        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
+        else bool(warehouse_inputs))
+    if use_warehouse:
+        print("=== MLB sweep inputs: StatsAPI warehouse (ESPN bypassed) ===")
     # Sweep mode + cushion-sweep mode always use the fine-grained offsets so
     # the cushion-for-target metric is well-resolved. Coarse offsets only
     # apply for a non-sweep, plain --safe-mode invocation.
@@ -2347,7 +2448,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     season_label = f" (season {season_year})" if season_year else ""
     print(f"\n=== Fetching gamelogs for {len(players)} players{season_label} ===")
     player_data = fetch_player_data(espn_sport, espn_league, players,
-                                    season_year=season_year)
+                                    season_year=season_year,
+                                    warehouse_inputs=use_warehouse)
     if not player_data:
         print("No player data resolved. Aborting.")
         return
@@ -2373,8 +2475,16 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
               f"({len(unique_team_ids)} teams) ===")
         for tid in unique_team_ids:
             try:
-                team_schedules_for_filter[tid] = cached_schedule(
-                    espn_sport, espn_league, tid, season_year=season_year)
+                if use_warehouse:
+                    # Warehouse rows carry MLBAM team_ids; the reliability filter reads
+                    # only the schedule's game dates (_extract_schedule_dates), which
+                    # _team_final_games supplies as 'date'.
+                    import mlb_warehouse
+                    team_schedules_for_filter[tid] = mlb_warehouse._team_final_games(
+                        tid, season=season_year)
+                else:
+                    team_schedules_for_filter[tid] = cached_schedule(
+                        espn_sport, espn_league, tid, season_year=season_year)
             except Exception:
                 team_schedules_for_filter[tid] = []
     print(f"=== Reliability filter: as-of-date mode "
@@ -2389,8 +2499,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     )
     if needs_defense:
         print("\n=== Fetching team schedules for defense lookup ===")
-        team_defense, team_defense_series, league_avg_def = _team_defense_lookup(
-            espn_sport, espn_league, season_year=season_year)
+        if use_warehouse:
+            team_defense, team_defense_series, league_avg_def = (
+                _mlb_warehouse_defense_lookup(season_year=season_year))
+        else:
+            team_defense, team_defense_series, league_avg_def = _team_defense_lookup(
+                espn_sport, espn_league, season_year=season_year)
         print(f"Built defense lookup for {len(team_defense)} teams "
               f"(league avg pts allowed = {league_avg_def:.1f})" if league_avg_def
               else "Defense lookup empty.")
@@ -2414,30 +2528,50 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     needs_park = any(
         (p.get("park_strength", 0.0) or 0.0) > 0 for p in variants.values())
     if needs_park:
-        _park_teams = get_all_teams(espn_sport, espn_league)
-        team_id_to_name = {
-            str(info["id"]): nm for nm, info in _park_teams.items()
-            if info.get("id")
-        }
-        print(f"Built team-name map for park factors ({len(team_id_to_name)} teams).")
-        # Pitchers' real StatsAPI logs carry no ESPN team_id (StatsAPI ids are
-        # MLBAM), so their home starts would drop out of the park baseline and
-        # a home upcoming start would get no park adjustment. Resolve each
-        # pitcher's team from the athlete record — mirroring production
-        # props.py, which reads the pitcher's park from athlete.team_id, not
-        # from per-game rows.
-        for _nm, _gl in player_data.items():
-            if not _gamelog_is_pitcher(_gl):
-                continue
-            try:
-                _ath = search_athlete(espn_sport, espn_league, _nm)
-            except Exception:
-                _ath = None
-            _ptid = _ath.get("team_id") if _ath else None
-            if _ptid and str(_ptid) in team_id_to_name:
-                pitcher_team_name[_nm] = team_id_to_name[str(_ptid)]
-        if pitcher_team_name:
-            print(f"Resolved park teams for {len(pitcher_team_name)} pitchers.")
+        if use_warehouse:
+            # MLBAM team-id → canonical name; warehouse pitcher rows DO carry the
+            # pitcher's MLBAM team_id, so resolve his park from a row (no ESPN
+            # search_athlete). (Dormant in the standard MLB grid — park_strength is
+            # not a sweep axis — but kept ESPN-free for when a park variant is used.)
+            import mlb_warehouse
+            team_id_to_name = {str(k): v
+                               for k, v in mlb_warehouse._team_name_map().items()}
+            print(f"Built team-name map for park factors "
+                  f"({len(team_id_to_name)} teams).")
+            for _nm, _gl in player_data.items():
+                if not _gamelog_is_pitcher(_gl):
+                    continue
+                _ptid = next((str(g.get("team_id")) for g in _gl
+                              if g.get("team_id")), None)
+                if _ptid and _ptid in team_id_to_name:
+                    pitcher_team_name[_nm] = team_id_to_name[_ptid]
+            if pitcher_team_name:
+                print(f"Resolved park teams for {len(pitcher_team_name)} pitchers.")
+        else:
+            _park_teams = get_all_teams(espn_sport, espn_league)
+            team_id_to_name = {
+                str(info["id"]): nm for nm, info in _park_teams.items()
+                if info.get("id")
+            }
+            print(f"Built team-name map for park factors ({len(team_id_to_name)} teams).")
+            # Pitchers' real StatsAPI logs carry no ESPN team_id (StatsAPI ids are
+            # MLBAM), so their home starts would drop out of the park baseline and
+            # a home upcoming start would get no park adjustment. Resolve each
+            # pitcher's team from the athlete record — mirroring production
+            # props.py, which reads the pitcher's park from athlete.team_id, not
+            # from per-game rows.
+            for _nm, _gl in player_data.items():
+                if not _gamelog_is_pitcher(_gl):
+                    continue
+                try:
+                    _ath = search_athlete(espn_sport, espn_league, _nm)
+                except Exception:
+                    _ath = None
+                _ptid = _ath.get("team_id") if _ath else None
+                if _ptid and str(_ptid) in team_id_to_name:
+                    pitcher_team_name[_nm] = team_id_to_name[str(_ptid)]
+            if pitcher_team_name:
+                print(f"Resolved park teams for {len(pitcher_team_name)} pitchers.")
 
     # results[variant][prop] = {errors, n, hits, decisive, safe[offset]={"hits":, "n":}}
     # When calibrate=True, also collect per-observation tuples for residual-
@@ -2523,6 +2657,15 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     skipped += 1
                     continue
                 prior_games = filt["eligible_games"]
+
+                # Drop prior games whose value for THIS prop's stat is None so it can't
+                # poison prior_values / sum() (a legacy warehouse batter row can carry a
+                # NULL TB/RBI predating the a68f4e6 capture; get_calib_gamelog emits it
+                # as a present-but-None key, which g.get(label, 0.0) does NOT default).
+                # No-op for always-populated labels (H/SO/K/ER/IP) and the ESPN path;
+                # keeps prior_values index-aligned with the home/away/opponent arrays.
+                prior_games = [g for g in prior_games
+                               if g.get(stat_label) is not None]
 
                 if len(prior_games) < min_sample:
                     skipped += 1
