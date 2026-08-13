@@ -38,7 +38,7 @@ from backtest import (
     _team_defense_lookup, _resolve_opp_pts_allowed,
     _per_player_stats, _shrunk, _role_matches_gamelog,
 )
-from espn_client import PROP_STAT_MAP, ip_to_outs
+from espn_client import PROP_STAT_MAP, WAREHOUSE_ONLY_PROPS, ip_to_outs
 from pricing_common import et_local_date  # UTC at rest, ET on read
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, ...)
 
@@ -396,11 +396,13 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         # game facts when enabled + the book line carries a MLBAM id; else the ESPN
         # cached_gamelog path, unchanged. Flag OFF → byte-identical.
         gamelog = None
+        from_warehouse = False
         if _warehouse_calib_enabled() and espn_sport == "baseball" and mlb_id:
             try:
                 import mlb_warehouse
                 gamelog = mlb_warehouse.get_calib_gamelog(
                     mlb_id, _calib_role(rows)) or None
+                from_warehouse = gamelog is not None
             except Exception:
                 gamelog = None
         if not gamelog:
@@ -431,6 +433,17 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         dup_dates = {d for d, c in date_counts.items() if c > 1}
 
         for row in rows:
+            # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: an ESPN gamelog's
+            # 'RBI' is uncalibrated and it has no 'TB', so NEVER fit these off an
+            # ESPN-sourced gamelog — only the warehouse get_calib_gamelog may serve
+            # them into the calibration corpus. Mirrors espn_client.WAREHOUSE_ONLY_PROPS
+            # + the history/grading guards; MLB-gated so other sports are unaffected.
+            # (from_warehouse is False when the warehouse missed and we fell open to
+            # the ESPN cached_gamelog above.)
+            if (not from_warehouse and espn_sport == "baseball"
+                    and row["prop_key"] in WAREHOUSE_ONLY_PROPS):
+                skipped_no_game += 1
+                continue
             # Never grade a pitcher prop off a batter's gamelog (or vice-versa):
             # the "K"/"SO" strikeout labels collide across MLB roles, so
             # _stat_label_for would bind the wrong role's log (mirrors

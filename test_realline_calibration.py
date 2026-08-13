@@ -629,6 +629,41 @@ class JoinToActualsTests(unittest.TestCase):
         self.assertEqual(out[0]["actual"], 9.0)
         self.assertEqual(out[0]["stat_label"], "K")
 
+    def test_join_drops_tb_rbi_on_espn_gamelog(self):
+        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY. With no mlb_id the
+        # warehouse is skipped and we fall open to the ESPN gamelog — which must NOT
+        # grade these off its uncalibrated 'RBI' (or a phantom 'TB'). The row is
+        # dropped rather than poison the calibration corpus.
+        gl = [{"game_date": f"2026-07-{d:02d}T23:00:00Z", "H": 1, "RBI": 2, "TB": 3}
+              for d in range(12, 25)]
+        for prop in ("batter_rbis", "batter_total_bases"):
+            row = self._book_row(line=0.5)
+            row["prop_key"] = prop
+            self.assertEqual(self._join([row], gl), [], prop)
+
+    def _join_warehouse(self, book_rows, gamelog):
+        # CALIB on + book line carrying an mlb_id → the gamelog is warehouse-sourced.
+        with patch.dict(os.environ, {blc._MLB_WAREHOUSE_CALIB_ENV: "1"}), \
+             patch("player_id_map.espn_id_for_mlb_id", return_value="123"), \
+             patch("book_line_calibration.cached_athlete_id", return_value="123"), \
+             patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog), \
+             patch("book_line_calibration.cached_gamelog", return_value=[]):
+            return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
+
+    def test_tb_rbi_grade_off_warehouse(self):
+        # The guard is SOURCE-aware, not a blanket drop: when the warehouse serves
+        # the gamelog (CALIB on + mlb_id), batter_rbis grades normally off its 'RBI'.
+        wh = [{"game_date": f"2026-07-{d:02d}T23:00:00Z", "RBI": 1, "completed": True}
+              for d in range(12, 24)] + [
+              {"game_date": "2026-07-24T23:00:00Z", "RBI": 3, "completed": True}]
+        row = self._book_row(line=0.5)
+        row["prop_key"] = "batter_rbis"
+        row["player_mlb_id"] = "592450"
+        out = self._join_warehouse([row], wh)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["actual"], 3.0)
+        self.assertEqual(out[0]["stat_label"], "RBI")
+
 
 class OfflineParkProjectionTests(unittest.TestCase):
     """`project_and_empirical` reconstructs production's park-factor road-context

@@ -1419,6 +1419,16 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
     except Exception:
         pass
     if actual is None:
+        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: the statsapi hard-ID
+        # path above is their legitimate non-ESPN source (returns the true boxscore
+        # value). A raw ESPN gamelog carries an UNCALIBRATED 'RBI' (and no 'TB'), so
+        # NEVER grade these off it — stay pending (return None) rather than fall to
+        # the ESPN gamelog. MLB-gated so NBA/NFL/NHL are untouched. Mirrors
+        # espn_client.WAREHOUSE_ONLY_PROPS + the history/calibration guards.
+        import espn_client
+        if (sport_key == "baseball_mlb"
+                and prop_key in espn_client.WAREHOUSE_ONLY_PROPS):
+            return None
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
             return None
@@ -1475,8 +1485,7 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
         # convert ONLY on this ESPN-fallback branch — else a bet would grade a
         # raw 6.1 against an outs line (~18.5) and always resolve UNDER.
         if prop_key == "pitcher_outs" and actual is not None:
-            import espn_client
-            actual = espn_client.ip_to_outs(actual)
+            actual = espn_client.ip_to_outs(actual)   # espn_client imported above
     if actual is None:
         return None
     try:

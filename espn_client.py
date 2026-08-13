@@ -972,6 +972,18 @@ PROP_STAT_MAP = {
 }
 
 
+# batter_total_bases / batter_rbis are WAREHOUSE-ONLY on EVERY MLB read path: the
+# warehouse (get_player_history / resolve_actual / get_calib_gamelog) is their only
+# legitimate source. ESPN must NEVER serve them — TB has no ESPN label at all, and a
+# raw ESPN batter row's 'RBI' is UNCALIBRATED (the SQL cache's reduced shape drops it,
+# but the slow-path / SQL-off raw row still carries it). Binding it would leak an
+# uncalibrated value into a projection, a graded bet, or the calibration corpus. All
+# three ESPN read paths guard on this set: get_player_stat_history (history, below),
+# recalibration.resolve_one_prop (grading fallback), and
+# book_line_calibration.join_book_lines_to_actuals (calibration ESPN fall-open).
+WAREHOUSE_ONLY_PROPS = frozenset({"batter_total_bases", "batter_rbis"})
+
+
 # P4 model-input cutover flag. When ON (and SQL enabled), MLB player histories are
 # served from the StatsAPI warehouse facts (mlb_warehouse.get_player_history) with
 # ESPN as the fail-open fallback; OFF (default) keeps the pure ESPN path. Env-gated
@@ -1152,7 +1164,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     # warehouse is populated + flipped on (findings verify: nondeterministic across
     # cache TTL / thread race). PROP_STAT_MAP keeps the TB/RBI labels for the backtest/
     # calibration reshape, which reads get_calib_gamelog directly, not this function.
-    if sport == "baseball" and prop_key in ("batter_total_bases", "batter_rbis"):
+    if sport == "baseball" and prop_key in WAREHOUSE_ONLY_PROPS:
         return result
 
     # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact

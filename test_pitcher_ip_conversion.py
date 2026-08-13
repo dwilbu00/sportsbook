@@ -124,6 +124,27 @@ class GradingFallbackTests(unittest.TestCase):
                 "2025-07-01", "2025-07-01T18:00:00Z")
         self.assertEqual(actual, 2.0)    # non-IP prop untouched
 
+    def test_tb_rbi_never_grade_off_espn(self):
+        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: after the statsapi
+        # hard-ID miss, the ESPN gamelog fallback must NOT grade them off its
+        # uncalibrated 'RBI' (or a phantom 'TB') — resolve_one_prop returns None
+        # (bet stays pending) and never even loads the ESPN gamelog.
+        gamelog = [{"H": 1.0, "RBI": 2.0, "TB": 3.0,
+                    "game_date": "2025-07-01T18:00:00Z", "completed": True,
+                    "opponent": "X", "is_home": True}]
+        by_date = {"2025-07-01": [0]}
+        for prop in ("batter_rbis", "batter_total_bases"):
+            with patch.object(recalibration, "_resolve_mlb_actual",
+                              return_value=None), \
+                 patch.object(recalibration, "_load_player_gamelog",
+                              return_value=(gamelog, by_date)) as ld, \
+                 patch.object(recalibration, "_pick_candidate", return_value=0):
+                actual = recalibration.resolve_one_prop(
+                    "baseball_mlb", "B", prop, 0.5,
+                    "2025-07-01", "2025-07-01T18:00:00Z")
+            self.assertIsNone(actual, prop)
+            ld.assert_not_called()       # guarded BEFORE the ESPN gamelog load
+
 
 class RealLineCalibrationTests(unittest.TestCase):
     """Cluster 3: book_line_calibration.project_and_empirical converts IP."""
