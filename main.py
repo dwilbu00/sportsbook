@@ -317,14 +317,14 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
 
             print(f"  [{i}/{len(raw_games)}] {away} @ {home}")
 
-            home_espn = find_team(espn_teams, home)
-            away_espn = find_team(espn_teams, away)
+            home_espn = _resolve_team_dim(sport_key, home, espn_teams)
+            away_espn = _resolve_team_dim(sport_key, away, espn_teams)
 
             if not home_espn:
-                print(f"    WARNING: Could not match '{home}' in ESPN data. Skipping.")
+                print(f"    WARNING: Could not resolve '{home}'. Skipping.")
                 continue
             if not away_espn:
-                print(f"    WARNING: Could not match '{away}' in ESPN data. Skipping.")
+                print(f"    WARNING: Could not resolve '{away}'. Skipping.")
                 continue
 
             print(f"    {home_espn['display_name']} ({home_espn['record']}) vs "
@@ -337,8 +337,10 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             if wh_home and wh_away:
                 home_stats, away_stats = wh_home, wh_away
             else:
-                home_stats = build_team_stats(home_espn, espn_sport, espn_league, recent_n, espn_teams)
-                away_stats = build_team_stats(away_espn, espn_sport, espn_league, recent_n, espn_teams)
+                home_stats = build_team_stats(home_espn, espn_sport, espn_league,
+                                              recent_n, espn_teams, sport_key)
+                away_stats = build_team_stats(away_espn, espn_sport, espn_league,
+                                              recent_n, espn_teams, sport_key)
 
             # Cache per-team avg_allowed for opponent-defense weighting on props.
             team_defense[home_espn["display_name"]] = home_stats["recent"]["avg_allowed"]
@@ -367,13 +369,17 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             prop_data = parse_player_props(raw_prop)
             print(f"  [{i}/{len(raw_props)}] {prop_data['away_team']} @ {prop_data['home_team']}")
 
-            # ESPN team ids for this matchup disambiguate same-name players so
-            # the correct athlete's history is fetched (see search_athlete team_ids).
-            event_teams = [find_team(espn_teams, tn)
-                           for tn in (prop_data.get("home_team"),
-                                      prop_data.get("away_team")) if tn]
-            event_team_ids = [str(t["id"]) for t in event_teams
-                              if t and t.get("id")]
+            # ESPN team ids disambiguate same-name players for the ESPN history path
+            # (search_athlete). MLB (P6) serves history from the warehouse by
+            # globally-unique NAME, not team ids, so pass no hint for baseball.
+            if sport_key == "baseball_mlb":
+                event_team_ids = []
+            else:
+                event_teams = [find_team(espn_teams, tn)
+                               for tn in (prop_data.get("home_team"),
+                                          prop_data.get("away_team")) if tn]
+                event_team_ids = [str(t["id"]) for t in event_teams
+                                  if t and t.get("id")]
 
             # Collect all unique players and their prop keys
             player_histories = {}
@@ -413,13 +419,36 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
     print()
 
 
-def build_team_stats(team_info, espn_sport, espn_league, recent_n, espn_teams=None):
-    """Build a stats dict for a team by fetching their schedule and computing form."""
+def _resolve_team_dim(sport_key, name, espn_teams):
+    """Team dict for a matchup team. MLB (P6 teardown): resolve off the StatsAPI
+    warehouse (warehouse_find_team) so team markets no longer need the ESPN teams
+    dict; ESPN find_team is the transition fallback (no MLB game silently drops)
+    and the sole path for NBA/NFL/NHL."""
+    if sport_key == "baseball_mlb":
+        try:
+            import mlb_warehouse
+            wh = mlb_warehouse.warehouse_find_team(name)
+            if wh:
+                return wh
+        except Exception:
+            pass
+    return find_team(espn_teams, name)
+
+
+def build_team_stats(team_info, espn_sport, espn_league, recent_n, espn_teams=None,
+                     sport_key=None):
+    """Build a stats dict for a team by fetching their schedule and computing form.
+    MLB (P6): the schedule comes from the StatsAPI warehouse (get_team_games), no
+    ESPN. This is only the fallback when mlb_warehouse_team_stats misses."""
     team_id = team_info["id"]
     display_name = team_info["display_name"]
 
     try:
-        games = get_team_schedule(espn_sport, espn_league, team_id)
+        if sport_key == "baseball_mlb":
+            import mlb_warehouse
+            games = mlb_warehouse.get_team_games(display_name) or []
+        else:
+            games = get_team_schedule(espn_sport, espn_league, team_id)
     except Exception as e:
         print(f"    WARNING: Could not fetch schedule for {display_name}: {e}")
         games = []

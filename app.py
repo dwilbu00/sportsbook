@@ -1031,6 +1031,39 @@ def fetch_espn_teams(espn_sport, espn_league):
     return get_all_teams(espn_sport, espn_league)
 
 
+def _resolve_team_dim(sport_key, name, espn_teams):
+    """Team dict {id, display_name, record, wins, losses, win_pct, ...} for a
+    matchup team. MLB (P6 teardown): resolve off the StatsAPI warehouse
+    (warehouse_find_team) so team markets + the schedule/venue bridge no longer need
+    the ESPN teams dict; ESPN find_team is the transition fallback (no MLB game is
+    silently dropped if the warehouse can't resolve a team) and the sole path for
+    NBA/NFL/NHL. warehouse_find_team returns id = the MLBAM team_id, which matches
+    the warehouse player history's team_id — so a warehouse-keyed schedule resolves
+    in props with no change there."""
+    if sport_key == "baseball_mlb":
+        try:
+            import mlb_warehouse
+            wh = mlb_warehouse.warehouse_find_team(name)
+            if wh:
+                return wh
+        except Exception:
+            pass
+    return find_team(espn_teams, name)
+
+
+def _fetch_team_schedule(sport_key, team, espn_sport, espn_league):
+    """Recent team games for the layoff/recent-form bridge. MLB: from the StatsAPI
+    warehouse (get_team_games, by display name — no ESPN); other sports: ESPN
+    get_team_schedule. Returns a list of per-game dicts (each with a 'date')."""
+    if sport_key == "baseball_mlb":
+        try:
+            import mlb_warehouse
+            return mlb_warehouse.get_team_games(team["display_name"]) or []
+        except Exception:
+            return []
+    return get_team_schedule(espn_sport, espn_league, team["id"])
+
+
 def format_time(commence_time):
     try:
         dt = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
@@ -2779,17 +2812,17 @@ if analyze_clicked and selected_game_labels:
                     get_event_odds, api_key, sport["key"], eid, markets=prop_markets_str, bookmakers=None
                 )
 
-            # Team schedules (for both teams)
-            home_espn = find_team(espn_teams, home)
-            away_espn = find_team(espn_teams, away)
-            if home_espn and home_espn["id"] not in team_schedule_futures:
-                team_schedule_futures[home_espn["id"]] = pool.submit(
-                    get_team_schedule, sport["espn_sport"], sport["espn_league"], home_espn["id"]
-                )
-            if away_espn and away_espn["id"] not in team_schedule_futures:
-                team_schedule_futures[away_espn["id"]] = pool.submit(
-                    get_team_schedule, sport["espn_sport"], sport["espn_league"], away_espn["id"]
-                )
+            # Team schedules (for both teams). MLB (P6): resolve off the warehouse
+            # (transition fallback to ESPN) and source the schedule from the
+            # warehouse — no ESPN get_team_schedule fan-out for baseball. Keyed by
+            # the resolved team id (MLBAM for the warehouse path).
+            home_espn = _resolve_team_dim(sport["key"], home, espn_teams)
+            away_espn = _resolve_team_dim(sport["key"], away, espn_teams)
+            for team in (home_espn, away_espn):
+                if team and team["id"] not in team_schedule_futures:
+                    team_schedule_futures[team["id"]] = pool.submit(
+                        _fetch_team_schedule, sport["key"], team,
+                        sport["espn_sport"], sport["espn_league"])
 
             # Pre-game weather forecast (MLB only — park geo is MLB). Feeds the
             # weather/wind projection nudge on batter_hits / pitcher_earned_runs;
@@ -2870,11 +2903,18 @@ if analyze_clicked and selected_game_labels:
             # team_ids). Global (player, prop) dedup means the first event to
             # reference a name wins its hint — a namesake in a different game on
             # the same slate is a documented residual.
-            event_teams = [find_team(espn_teams, tn)
-                           for tn in (parsed.get("home_team"),
-                                      parsed.get("away_team")) if tn]
-            event_team_ids = [str(t["id"]) for t in event_teams
-                              if t and t.get("id")]
+            # ESPN team ids disambiguate same-name players for the ESPN history
+            # path (search_athlete). MLB (P6) serves history from the warehouse by
+            # globally-unique NAME, not team ids — and a warehouse MLBAM team id
+            # would mis-hint ESPN search_athlete — so pass no hint for baseball.
+            if sport["key"] == "baseball_mlb":
+                event_team_ids = []
+            else:
+                event_teams = [find_team(espn_teams, tn)
+                               for tn in (parsed.get("home_team"),
+                                          parsed.get("away_team")) if tn]
+                event_team_ids = [str(t["id"]) for t in event_teams
+                                  if t and t.get("id")]
             for prop_key, players in parsed.get("props", {}).items():
                 for player_name in players:
                     key = (player_name, prop_key)
@@ -2969,8 +3009,8 @@ if analyze_clicked and selected_game_labels:
                 if book.get("key") == "draftkings"
             ]
             game_odds = parse_game_odds(draftkings_game_odds)
-            home_espn = find_team(espn_teams, home)
-            away_espn = find_team(espn_teams, away)
+            home_espn = _resolve_team_dim(sport["key"], home, espn_teams)
+            away_espn = _resolve_team_dim(sport["key"], away, espn_teams)
 
             if home_espn and away_espn:
                 # P4 team-market flip: prefer the StatsAPI warehouse for both teams
