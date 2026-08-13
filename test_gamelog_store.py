@@ -363,6 +363,9 @@ class DispatchTests(_Backend, unittest.TestCase):
         self.assertEqual(meta["player_type"], "batter")
 
     def test_get_player_stat_history_routes_to_sql(self):
+        # P2.5b makes baseball history WAREHOUSE-ONLY on the live path, so this
+        # gamelog_store SQL-caching machinery test reaches the ESPN->SQL path via
+        # allow_warehouse=False (the same seam the parity harness + backtest use).
         rows = [_batter_row("2026-07-20T18:00:00.000+00:00", h=2.0),
                 _batter_row("2026-07-19T18:00:00.000+00:00", h=1.0)]
         athlete = {"id": "555", "name": "Slugger", "team_id": "10"}
@@ -370,10 +373,12 @@ class DispatchTests(_Backend, unittest.TestCase):
              patch.object(espn_client, "get_athlete_gamelog",
                           return_value=rows) as gl:
             hist = espn_client.get_player_stat_history(
-                "baseball", "mlb", "Slugger", "batter_hits", n=20)
+                "baseball", "mlb", "Slugger", "batter_hits", n=20,
+                allow_warehouse=False)
             # Second call serves from SQL (no second ESPN gamelog fetch).
             espn_client.get_player_stat_history(
-                "baseball", "mlb", "Slugger", "batter_hits", n=20)
+                "baseball", "mlb", "Slugger", "batter_hits", n=20,
+                allow_warehouse=False)
             self.assertEqual(gl.call_count, 1)
         self.assertTrue(hist["found"])
         self.assertEqual(hist["values"], [2.0, 1.0])

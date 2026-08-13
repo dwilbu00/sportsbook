@@ -148,26 +148,54 @@ class GetPlayerStatHistoryBranchTests(unittest.TestCase):
         wh.assert_called_once()
 
     def test_allow_warehouse_false_forces_espn(self):
+        # Parity-harness exemption: allow_warehouse=False skips the warehouse branch
+        # AND the P2.5b baseball fail-closed guard, so the TRUE ESPN side is still
+        # reached for diffing (search_athlete consulted).
         with mock.patch.object(espn_client, "_mlb_warehouse_history",
                                return_value=WH_DICT) as wh, \
              mock.patch.object(espn_client, "db_store",
                                mock.Mock(enabled=mock.Mock(return_value=False))), \
-             mock.patch.object(espn_client, "search_athlete", return_value=None):
+             mock.patch.object(espn_client, "search_athlete",
+                               return_value=None) as sa:
             r = espn_client.get_player_stat_history(
                 "baseball", "mlb", "Aaron Judge", "batter_hits", n=10,
                 allow_warehouse=False)
         wh.assert_not_called()                 # warehouse never consulted
+        sa.assert_called_once()                # P2.5b guard exempt -> ESPN reached
         self.assertFalse(r["found"])           # fell to ESPN (no athlete resolved)
 
-    def test_warehouse_miss_falls_open_to_espn(self):
+    def test_baseball_warehouse_miss_fails_closed_not_espn(self):
+        # P2.5b: on the LIVE path (allow_warehouse defaults True) a baseball warehouse
+        # MISS fails CLOSED to an empty history -- it must NOT fall open to ESPN. The
+        # ESPN name lookup + gamelog fetch are asserted un-called: the warehouse is the
+        # sole MLB source, and an empty history drops the prop rather than serving a
+        # wrong ESPN-sourced value.
+        with mock.patch.object(espn_client, "_mlb_warehouse_history",
+                               return_value=None), \
+             mock.patch.object(espn_client, "db_store",
+                               mock.Mock(enabled=mock.Mock(return_value=True))), \
+             mock.patch.object(espn_client, "search_athlete") as sa, \
+             mock.patch.object(espn_client, "get_athlete_gamelog") as gg:
+            r = espn_client.get_player_stat_history(
+                "baseball", "mlb", "X", "batter_hits", n=10)
+        self.assertFalse(r["found"])
+        self.assertEqual(r["values"], [])
+        sa.assert_not_called()                 # ESPN name resolution never consulted
+        gg.assert_not_called()                 # ESPN gamelog never fetched
+
+    def test_non_baseball_warehouse_miss_still_falls_open(self):
+        # Sport-scoping: the P2.5b fail-closed guard is baseball-only. A basketball
+        # miss still falls open to the ESPN path (other sports stay byte-identical).
         with mock.patch.object(espn_client, "_mlb_warehouse_history",
                                return_value=None), \
              mock.patch.object(espn_client, "db_store",
                                mock.Mock(enabled=mock.Mock(return_value=False))), \
-             mock.patch.object(espn_client, "search_athlete", return_value=None):
+             mock.patch.object(espn_client, "search_athlete",
+                               return_value=None) as sa:
             r = espn_client.get_player_stat_history(
-                "baseball", "mlb", "X", "batter_hits", n=10)
+                "basketball", "nba", "X", "player_points", n=10)
         self.assertFalse(r["found"])
+        sa.assert_called_once()                # non-baseball still consults ESPN
 
 
 class PropsTeamBridgeTests(unittest.TestCase):
@@ -593,10 +621,12 @@ class WarehouseHistoryEndToEndTests(unittest.TestCase):
                         expect_id="543037")
         self.assertEqual(out, WH_DICT)           # resolved 543037 off real probables
 
-    def test_absent_name_falls_open_to_espn(self):
+    def test_absent_name_returns_none(self):
         # A name in neither the real lineup nor probables (and no SFBB) resolves to
-        # nothing → None → the caller falls open to ESPN. Proves the WH_DICT hits
-        # above came from a real bind, not an unconditional stub.
+        # nothing → _mlb_warehouse_history returns None (a warehouse MISS). Proves the
+        # WH_DICT hits above came from a real bind, not an unconditional stub. (Under
+        # P2.5b that None now fails CLOSED at the get_player_stat_history level for
+        # baseball rather than falling open to ESPN — see GetPlayerStatHistoryBranchTests.)
         lineup, probs = self._producers()
         self.assertIsNone(
             self._run("Ghost Player", "batter_hits", lineup, probs,

@@ -256,10 +256,14 @@ class NameThreadingTests(_SqliteBackend, unittest.TestCase):
         # helper -> get_pitcher_gamelog -> dated rows -> pitcher_outs values.
         gamelog_store.seed_athlete_id("baseball", "mlb", "Ace McReal", "ace9")
         real = _real_rows()   # IP 6.0 each -> 18 outs
+        # P2.5b makes baseball history WAREHOUSE-ONLY on the live path; this ESPN/
+        # StatsAPI pitcher name-threading chain is now reached via allow_warehouse=False
+        # (the parity/backtest seam), which the machinery still serves.
         with patch.object(espn_client, "get_athlete_gamelog", return_value=[]), \
              patch.object(mlb_starters, "get_pitcher_gamelog", return_value=real):
             hist = espn_client.get_player_stat_history(
-                "baseball", "mlb", "Ace McReal", "pitcher_outs", n=20)
+                "baseball", "mlb", "Ace McReal", "pitcher_outs", n=20,
+                allow_warehouse=False)
         self.assertTrue(hist["found"])
         self.assertEqual(hist["stat_label"], "IP")
         self.assertEqual(hist["values"], [18.0, 18.0, 18.0])   # ip_to_outs(6.0)

@@ -1190,6 +1190,18 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     if sport == "baseball" and prop_key in WAREHOUSE_ONLY_PROPS:
         return result
 
+    # P2.5b (P6 teardown): on the LIVE path MLB history is WAREHOUSE-ONLY. The
+    # warehouse branch above (allow_warehouse=True) already served it whenever the
+    # name resolved to a player with facts; reaching here for baseball means the
+    # warehouse MISSED -- an unresolved/ambiguous name, no current-season facts yet,
+    # or SQL off. The StatsAPI warehouse is now the sole MLB source, so fail CLOSED
+    # (empty, found=False) instead of falling open to ESPN: an empty history drops the
+    # prop as no_history (safe), never a wrong ESPN-sourced value. The parity harness
+    # passes allow_warehouse=False to force the TRUE ESPN side for diffing, so it is
+    # exempt and falls through to the ESPN extraction below (as do all other sports).
+    if sport == "baseball" and allow_warehouse:
+        return result
+
     # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact
     # extraction/return below is reused (identical result-dict shape). Gated on a
     # sport that has a fact table; other sports (e.g. NHL) keep the direct path
