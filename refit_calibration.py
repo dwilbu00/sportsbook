@@ -2045,7 +2045,8 @@ def _roi_by_method(enriched, params, sport_key, prop_key, elig,
     return out
 
 
-def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
+def diagnose_features(sport, feature=None, prop_filter=None, store_label="",
+                      strengths_override=None):
     """Candidate-feature evaluation harness (roadmap §2.6, NO WRITE).
 
     For each calibrated prop and each registered candidate feature that applies
@@ -2124,7 +2125,12 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
         for f in feats:
             if not prop_features.feature_applies(f["name"], prop_key):
                 continue
-            strengths = list(f["strengths"])
+            # A --feature-strengths override sweeps a finer grid (0.0 is always
+            # the off baseline, prepended + de-duped) so a small optimum (e.g. 0.2)
+            # isn't missed by the coarse registry default (0.0, 0.5, 1.0).
+            strengths = (([0.0] + [s for s in sorted(set(strengths_override))
+                                   if s > 0])
+                         if strengths_override else list(f["strengths"]))
             off = strengths[0]
             sels, rois, rows_by_s = {}, {}, {}
             for s in strengths:
@@ -2981,6 +2987,11 @@ def main():
     p.add_argument("--feature-prop", default=None,
                    help="Restrict --feature-diag to these prop_key(s), "
                         "comma-separated (e.g. pitcher_outs,pitcher_strikeouts).")
+    p.add_argument("--feature-strengths", default=None,
+                   help="Override the --feature-diag strength grid with a finer "
+                        "comma list (e.g. '0.1,0.2,0.3,0.4,0.5,0.75,1.0'); 0.0 is "
+                        "always prepended as the off baseline. Finds a small "
+                        "optimum the coarse registry default (0.0,0.5,1.0) misses.")
     p.add_argument("--roi-diag", action="store_true",
                    help="Profitability lens: for each calibrated prop, replay the "
                         "live edge+EV recommendation gate at BEST-OF-BOOK consensus "
@@ -3099,8 +3110,11 @@ def main():
     if args.feature_diag:
         prop_filter = ([p.strip() for p in args.feature_prop.split(",")]
                        if args.feature_prop else None)
+        strengths_override = ([float(s) for s in args.feature_strengths.split(",")]
+                              if args.feature_strengths else None)
         diagnose_features(args.sport, feature=args.feature,
-                          prop_filter=prop_filter, store_label=args.store_label)
+                          prop_filter=prop_filter, store_label=args.store_label,
+                          strengths_override=strengths_override)
         return
 
     if args.roi_diag:

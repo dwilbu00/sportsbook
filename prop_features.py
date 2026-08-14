@@ -163,6 +163,15 @@ def _platoon_fn(ctx, strength):
 
 
 # ── registry ────────────────────────────────────────────────────────────────
+# HIGH-FIDELITY strength grid: 0.0..1.0 in 0.1 steps. This is the DIAGNOSTIC
+# domain (--feature-diag, refit_calibration.diagnose_features) — read ONLY there,
+# NOT by the main props sweep grid (backtest._build_props_sweep_grid hardcodes
+# rest as a global {0.0, 1.0} axis), so a fine grid here can't explode the sweep.
+# Fine steps matter because a curated feature's optimum is often small (e.g. 0.2-
+# 0.3) and a coarse {0.5, 1.0} grid would overshoot the cap and miss it. Winner's
+# curse is still gated by the 2-fold confirmation on the SELECTED strength.
+HIGH_FIDELITY_STRENGTHS = tuple(round(i * 0.1, 1) for i in range(11))  # 0.0..1.0
+
 # Each entry is plain data. ``props`` restricts where the feature applies (None =
 # all props); a feature is a hard no-op elsewhere. ``strengths`` is the sweep /
 # diagnostic domain. ``runtime_knob`` is the per-prop cfg / knob key the gate
@@ -171,7 +180,7 @@ FEATURE_REGISTRY = [
     {
         "name": "rest",
         "props": frozenset({"pitcher_outs", "pitcher_strikeouts", "batter_hits"}),
-        "strengths": (0.0, 0.5, 1.0),
+        "strengths": HIGH_FIDELITY_STRENGTHS,
         "runtime_knob": "rest_strength",
         "fn": _rest_fn,
     },
@@ -187,7 +196,7 @@ FEATURE_REGISTRY = [
         # opp overlaps the shipped opp_defense — and were dropped once settled.
         "name": "gamecontext",
         "props": frozenset({"batter_hits"}),
-        "strengths": (0.0, 0.5, 1.0),
+        "strengths": HIGH_FIDELITY_STRENGTHS,
         "runtime_knob": "gamecontext_strength",
         "fn": _gamecontext_fn("full"),
     },
@@ -203,7 +212,7 @@ FEATURE_REGISTRY = [
         # elsewhere / when the factor is absent -> strength-0 byte parity.
         "name": "platoon",
         "props": frozenset({"batter_hits"}),
-        "strengths": (0.0, 0.5, 1.0),
+        "strengths": HIGH_FIDELITY_STRENGTHS,
         "runtime_knob": "platoon_strength",
         "fn": _platoon_fn,
     },
