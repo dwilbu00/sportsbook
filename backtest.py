@@ -3953,8 +3953,13 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
         ("EV>=5% & edge>=1%", 0.05, 0.01, 0.0),
     ]
     print("\n=== TEAM-MARKET gate x shrink lens (realized flat-1u ROI) ===")
-    print("  shrink pulls the model prob toward 0.5 (1.0 = none, 0.25 = live ML/"
-          "spread). Closing-priced; RELATIVE ranking is the signal.")
+    print("  shrink pulls the model prob toward 0.5 (1.0 = none, 0.25 = live ML).")
+    print("  Closing-priced; RELATIVE ranking is the signal.")
+    print("  ⚠ MONEYLINE is the CLEAN row: it collects the PRE-shrink model_prob, so")
+    print("    the shrink axis maps 1:1 to the live shrink. SPREADS is CONFOUNDED —")
+    print("    model_cover_rate already bakes in the live spread shrink + the")
+    print("    expected_runs_challenger blend, so the shrink axis DOUBLE-counts;")
+    print("    treat the spread rows as directional-only, not a shrink recommendation.")
     for market in MARKETS:
         mobs = obs[market]
         print(f"\n  {market.upper()} ({len(mobs)} graded obs):")
