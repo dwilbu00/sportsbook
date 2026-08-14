@@ -188,7 +188,7 @@ class RefitSportRealLinesTests(unittest.TestCase):
             return sel_map.get(pk)
         _harvest = (harvest if harvest is not None
                     else [{"prop_key": "batter_hits"}])
-        with patch.object(refit_calibration, "load_calibration",
+        with patch.object(refit_calibration, "load_calibration_for_refit",
                           return_value=existing), \
              patch.object(refit_calibration, "save_calibration", save_mock), \
              patch.object(blc, "harvest_real_line_book_lines",
@@ -271,7 +271,8 @@ class RefitSportRealLinesTests(unittest.TestCase):
 
     def test_no_existing_calibration_is_noop(self):
         save_mock = MagicMock()
-        with patch.object(refit_calibration, "load_calibration", return_value={}), \
+        with patch.object(refit_calibration, "load_calibration_for_refit",
+                          return_value={}), \
              patch.object(refit_calibration, "save_calibration", save_mock):
             refit_calibration.refit_sport_real_lines("mlb")
         save_mock.assert_not_called()

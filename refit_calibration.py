@@ -26,7 +26,11 @@ from backtest import (
     _score_calibration_methods, _team_defense_lookup,
     run_player_props_backtest,
 )
-from calibration_loader import load_calibration, save_calibration
+from calibration_loader import (
+    load_calibration, save_calibration, set_candidate_mode, active_write_label,
+    has_candidate, promote_calibration, discard_candidate, diff_calibration,
+    candidate_path, load_calibration_for_refit, existing_candidate_notice,
+)
 from espn_cache import seed_athlete_id
 from espn_client import list_season_athletes
 
@@ -794,7 +798,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         "warmup_present": bool(warmup_winners),
     }
     save_calibration(sport_key, props_cfg, meta=meta)
-    print(f"\n✓ Wrote calibration/{sport_key}.json "
+    print(f"\n✓ Wrote calibration/{active_write_label(sport_key)} "
           f"({len(props_cfg)} props)")
 
 
@@ -824,10 +828,14 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     import book_line_calibration as blc
 
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
-    existing = load_calibration(sport_key)
+    # Staging-aware: when a candidate is staged (e.g. from a just-run sweep), the
+    # real-line pass re-selects methods against THAT candidate's methods/residuals
+    # so the two steps compose — mirroring how the pre-staging flow chained
+    # through the live file. Falls back to the live props otherwise.
+    existing = load_calibration_for_refit(sport_key)
     if not existing:
-        print(f"No existing calibration/{sport_key}.json props to refit; run the "
-              f"synthetic sweep (refit_sport) first.")
+        print(f"No existing calibration/{active_write_label(sport_key)} props to "
+              f"refit; run the synthetic sweep (refit_sport) first.")
         return
     target_props = list(existing.keys())
 
@@ -1103,7 +1111,7 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             "store_label": store_label or "default",
         }},
         merge_props=True)
-    print(f"\n✓ Updated calibration/{sport_key}.json "
+    print(f"\n✓ Updated calibration/{active_write_label(sport_key)} "
           f"({len(changed)} prop(s) re-selected at real book lines; "
           f"other props/blocks preserved)")
 
@@ -2647,6 +2655,65 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50):
           "map per line-bucket and apply g(p) after calibrate_prob.)")
 
 
+def _print_calibration_diff(sport):
+    """Human-readable candidate-vs-live diff for --diff."""
+    _, _, sport_key = SPORT_MAP[sport]
+    d = diff_calibration(sport_key)
+    if not d.get("has_candidate"):
+        print(f"No staged candidate for {sport_key} "
+              f"({candidate_path(sport_key)} does not exist).")
+        return
+    print(f"\n=== candidate vs live: {sport_key} ===")
+    print(f"  candidate fit: {d.get('candidate_ts')}")
+    print(f"  live fit:      {d.get('live_ts') or '(no live file)'}")
+    props = d["props"]
+    if props["added"]:
+        print(f"  + props added ({len(props['added'])}): "
+              f"{', '.join(props['added'])}")
+    if props["removed"]:
+        print(f"  - props removed ({len(props['removed'])}): "
+              f"{', '.join(props['removed'])}")
+    method_changes = [c for c in props["changed"]
+                      if c["live_method"] != c["candidate_method"]]
+    nobs_changes = [c for c in props["changed"]
+                    if c["live_method"] == c["candidate_method"]]
+    if method_changes:
+        print(f"  ~ METHOD changes ({len(method_changes)}) — review these:")
+        for c in method_changes:
+            print(f"      {c['prop']}: {c['live_method']} -> "
+                  f"{c['candidate_method']} "
+                  f"(n {c['live_nobs']} -> {c['candidate_nobs']})")
+    if nobs_changes:
+        print(f"  ~ re-fit, method unchanged ({len(nobs_changes)}): "
+              f"{', '.join(c['prop'] for c in nobs_changes)}")
+    blocks = d["blocks"]
+    for label, keys in (("added", blocks["added"]),
+                        ("removed", blocks["removed"]),
+                        ("changed", blocks["changed"])):
+        if keys:
+            print(f"  block {label}: {', '.join(keys)}")
+    if not (props["added"] or props["removed"] or props["changed"]
+            or blocks["added"] or blocks["removed"] or blocks["changed"]):
+        print("  (candidate is identical to live)")
+    print(f"\n  Promote: python refit_calibration.py --sport {sport} --promote")
+    print(f"  Discard: python refit_calibration.py --sport {sport} --discard")
+
+
+def _report_staging(sport, staging, wrote=True):
+    """Post-refit pointer telling the user where the fit landed."""
+    _, _, sport_key = SPORT_MAP[sport]
+    if not staging:
+        print(f"\n⇢ Wrote LIVE calibration/{sport_key}.json directly (--live).")
+        return
+    if not (wrote and has_candidate(sport_key)):
+        return  # dry-run or nothing written
+    print(f"\n⇢ Staged to calibration/{sport_key}.candidate.json — the live "
+          f"file the app serves is UNTOUCHED.")
+    print(f"    Review:  python refit_calibration.py --sport {sport} --diff")
+    print(f"    Promote: python refit_calibration.py --sport {sport} --promote")
+    print(f"    Discard: python refit_calibration.py --sport {sport} --discard")
+
+
 def main():
     p = argparse.ArgumentParser(description="Refit persistent calibration files")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), required=True)
@@ -2756,7 +2823,46 @@ def main():
                         "isotonic) on the SHIPPED per-line-bucket batter_hits "
                         "probability and show, OUT-OF-SAMPLE, the reliability curve "
                         "flatten and the fake edges collapse (no write).")
+    # ── candidate-file staging (default-safe calibration writes) ──
+    # A refit writes to calibration/<sport>.candidate.json, NEVER the live file
+    # the app serves — so an accidental/experimental run can't clobber a carefully
+    # tuned live calibration. Review with --diff, then --promote to make it live
+    # (the old live is archived first) or --discard to throw it away.
+    p.add_argument("--live", action="store_true",
+                   help="Write straight to the LIVE calibration file, skipping "
+                        "candidate staging (advanced; the default stages a "
+                        "candidate you review then --promote).")
+    p.add_argument("--promote", action="store_true",
+                   help="Promote the staged candidate to live (archives the "
+                        "current live file first), then exit. No refit is run.")
+    p.add_argument("--diff", action="store_true",
+                   help="Show how the staged candidate differs from the live "
+                        "calibration (methods, n_obs, added/removed props and "
+                        "blocks), then exit.")
+    p.add_argument("--discard", action="store_true",
+                   help="Delete the staged candidate without promoting, then exit.")
     args = p.parse_args()
+
+    # Candidate-file management (--promote/--diff/--discard) are pure local-file
+    # operations: handle + exit before any SQL/backend setup so they always work.
+    if args.promote or args.diff or args.discard:
+        _, _, sport_key = SPORT_MAP[args.sport]
+        if args.diff:
+            _print_calibration_diff(args.sport)
+        elif args.discard:
+            removed = discard_candidate(sport_key)
+            print(f"{'✓ Discarded' if removed else 'No'} staged candidate for "
+                  f"{sport_key}.")
+        else:  # --promote
+            try:
+                archived = promote_calibration(sport_key)
+            except FileNotFoundError as e:
+                p.error(str(e))
+            print(f"✓ Promoted candidate → calibration/{sport_key}.json (live).")
+            if archived:
+                import os as _os
+                print(f"  Previous live archived to {_os.path.relpath(archived)}")
+        return
 
     # Target the SQL backend when the SQL_* secrets are configured (mirrors the
     # app's boot promotion + forward_tracker; outside Streamlit these aren't in
@@ -2820,6 +2926,15 @@ def main():
                                min_cell_n=args.min_cell_n)
         return
 
+    # Default-safe: a refit stages a candidate; --live writes the live file.
+    staging = not args.live
+    set_candidate_mode(staging)
+    if staging:
+        _, _, _sk = SPORT_MAP[args.sport]
+        _notice = existing_candidate_notice(_sk)
+        if _notice:
+            print(_notice)
+
     if args.real_lines:
         refit_sport_real_lines(args.sport, store_label=args.store_label,
                                warmup_games=args.warmup_games,
@@ -2827,6 +2942,7 @@ def main():
                                xstats_strength=args.xstats_strength,
                                dry_run=args.dry_run,
                                roi_tiebreak=not args.no_roi_tiebreak)
+        _report_staging(args.sport, staging, wrote=not args.dry_run)
         return
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None
@@ -2841,6 +2957,7 @@ def main():
                 mlb_max_pitchers=args.mlb_max_pitchers,
                 nba_max_players=args.nba_max_players,
                 nba_min_games=args.nba_min_games)
+    _report_staging(args.sport, staging)
 
 
 if __name__ == "__main__":

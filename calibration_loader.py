@@ -53,6 +53,7 @@ the projection seam:
 import json
 import math
 import os
+import shutil
 from datetime import datetime, timezone
 
 from stats import _norm_cdf  # canonical shared implementation (P3 dedup)
@@ -67,10 +68,60 @@ SPORT_SEASON_START_MONTH = {
 
 CALIBRATION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "calibration")
+# Old live files are copied here on promotion, as timestamped rollback points.
+ARCHIVE_DIR = os.path.join(CALIBRATION_DIR, "archive")
 
 
 def calibration_path(sport_key):
     return os.path.join(CALIBRATION_DIR, f"{sport_key}.json")
+
+
+# ─── candidate-file staging ────────────────────────────────────────────────
+# A calibration refit is expensive to get right (incumbent method E/D splices,
+# real-line re-selection) and easy to clobber by an accidental re-run. When
+# candidate mode is active, EVERY calibration write (all save_* helpers) targets
+# calibration/<sport>.candidate.json instead of the live file, and a
+# block-preserving save reads back from the candidate so successive refits in one
+# staging cycle accumulate into a single staged file. The live file the app
+# serves from is never touched until promote_calibration() atomically swaps the
+# candidate in. Default OFF, so all existing callers (the online recalibration
+# loop, tests, ad-hoc save_*) write the live file exactly as before — only the
+# offline refit/backtest entrypoints opt in via set_candidate_mode(True).
+_CANDIDATE_MODE = False
+
+
+def set_candidate_mode(on):
+    """Enable/disable candidate-file staging for calibration writes (process-global)."""
+    global _CANDIDATE_MODE
+    _CANDIDATE_MODE = bool(on)
+
+
+def candidate_mode_active():
+    return _CANDIDATE_MODE
+
+
+def candidate_path(sport_key):
+    return os.path.join(CALIBRATION_DIR, f"{sport_key}.candidate.json")
+
+
+def has_candidate(sport_key):
+    """True if a staged (un-promoted) candidate exists for this sport."""
+    return os.path.exists(candidate_path(sport_key))
+
+
+def _write_path(sport_key):
+    """The file a save writes to: the candidate when staging, else the live file."""
+    return candidate_path(sport_key) if _CANDIDATE_MODE else calibration_path(sport_key)
+
+
+def active_write_path(sport_key):
+    """Full path a save would write to right now (candidate when staging, else live)."""
+    return _write_path(sport_key)
+
+
+def active_write_label(sport_key):
+    """Basename of the current write target — for user-facing messages."""
+    return os.path.basename(_write_path(sport_key))
 
 
 def load_calibration(sport_key):
@@ -90,16 +141,74 @@ def load_calibration(sport_key):
     return blob.get("props", {})
 
 
-def _load_blob(sport_key):
-    """Load the raw calibration blob (all top-level keys), or {} if missing."""
-    path = calibration_path(sport_key)
+def _read_json(path):
+    """Parse a JSON file, or None if missing/unreadable."""
     if not os.path.exists(path):
-        return {}
+        return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return None
+
+
+def _load_blob(sport_key):
+    """Load the raw LIVE calibration blob (all top-level keys), or {} if missing.
+
+    Always reads the live file — every runtime/serving reader (load_calibration,
+    load_market_blend, load_prob_shrink, ...) goes through here, so staging a
+    candidate never changes what the app serves.
+    """
+    return _read_json(calibration_path(sport_key)) or {}
+
+
+def _load_write_blob(sport_key):
+    """The blob a save STARTS from (to preserve other props/blocks).
+
+    In candidate mode, read the candidate if it exists so successive fits in one
+    staging cycle accumulate into a single staged file; otherwise seed from the
+    live file so the candidate begins as a complete copy of live plus the new
+    fit. Outside candidate mode this is identical to _load_blob (the live file),
+    so existing write behavior is byte-for-byte unchanged.
+    """
+    if _CANDIDATE_MODE:
+        cand = _read_json(candidate_path(sport_key))
+        if cand is not None:
+            return cand
+    return _load_blob(sport_key)
+
+
+def load_calibration_for_refit(sport_key):
+    """Props a REFIT should build its decisions on (NOT for serving).
+
+    When staging (candidate mode) and a candidate already exists, return the
+    candidate's props so a multi-step staged refit composes — e.g. a staged
+    ``--real-lines`` pass re-selects each method against the methods/residuals a
+    staged sweep just wrote, exactly as the pre-staging flow chained through the
+    live file. Falls back to the live props (load_calibration) otherwise, so a
+    first staged pass reads the live incumbents (e.g. a spliced-in method E).
+    Serving/analysis code must keep using load_calibration (always live).
+    """
+    if _CANDIDATE_MODE:
+        cand = _read_json(candidate_path(sport_key))
+        if cand is not None:
+            return cand.get("props", {}) or {}
+    return load_calibration(sport_key)
+
+
+def existing_candidate_notice(sport_key):
+    """Warning text when a staged candidate already exists at the start of a new
+    staged refit: the run ACCUMULATES onto it (it is not reseeded from live), so a
+    forgotten candidate could carry stale blocks into a later promotion. Returns
+    None when nothing is staged.
+    """
+    if not has_candidate(sport_key):
+        return None
+    blob = _read_json(candidate_path(sport_key)) or {}
+    return (f"[candidate] A staged candidate already exists for {sport_key} "
+            f"(fit {blob.get('fit_timestamp', '?')}); this run ACCUMULATES onto "
+            f"it rather than reseeding from live. Inspect it with --diff or start "
+            f"fresh with --discard.")
 
 
 def save_calibration(sport_key, props_cfg, meta=None, merge_props=True):
@@ -112,7 +221,7 @@ def save_calibration(sport_key, props_cfg, meta=None, merge_props=True):
     already-calibrated props. Meta is merged shallowly for the same reason.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = _load_blob(sport_key)
+    blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob["fit_timestamp"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     existing_props = blob.get("props")
@@ -128,8 +237,95 @@ def save_calibration(sport_key, props_cfg, meta=None, merge_props=True):
             blob["meta"] = existing_meta
         else:
             blob["meta"] = meta
-    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
+
+
+def discard_candidate(sport_key):
+    """Delete a staged candidate (if any). Returns True if one was removed."""
+    cand = candidate_path(sport_key)
+    if os.path.exists(cand):
+        os.remove(cand)
+        return True
+    return False
+
+
+def promote_calibration(sport_key):
+    """Make the staged candidate the live calibration.
+
+    Archives the current live file to calibration/archive/<sport>.<ts>.json first
+    (a non-destructive rollback point), then atomically replaces the live file
+    with the candidate (os.replace within one directory is atomic and consumes
+    the candidate). Returns the archive path, or None if there was no prior live
+    file. Raises FileNotFoundError when no candidate is staged.
+    """
+    cand = candidate_path(sport_key)
+    if not os.path.exists(cand):
+        raise FileNotFoundError(
+            f"No staged candidate for {sport_key} (expected {cand}).")
+    live = calibration_path(sport_key)
+    archived = None
+    if os.path.exists(live):
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archived = os.path.join(ARCHIVE_DIR, f"{sport_key}.{ts}.json")
+        shutil.copy2(live, archived)
+    os.replace(cand, live)
+    return archived
+
+
+def diff_calibration(sport_key):
+    """Summarize how a staged candidate differs from the live file, for review.
+
+    Returns ``{"has_candidate": False}`` when nothing is staged, else:
+        {has_candidate, live_exists, candidate_ts, live_ts,
+         props: {added: [...], removed: [...],
+                 changed: [{prop, live_method, candidate_method,
+                            live_nobs, candidate_nobs}]},
+         blocks: {added: [...], removed: [...], changed: [...]}}
+    where ``blocks`` covers top-level non-props config (market_blend,
+    prob_shrink, starter_adjustment, ...).
+    """
+    cand_blob = _read_json(candidate_path(sport_key))
+    if cand_blob is None:
+        return {"has_candidate": False}
+    live_blob = _read_json(calibration_path(sport_key)) or {}
+    cand_props = cand_blob.get("props") or {}
+    live_props = live_blob.get("props") or {}
+
+    def _field(props, k, field):
+        v = props.get(k)
+        return v.get(field) if isinstance(v, dict) else None
+
+    changed = []
+    for k in sorted(set(cand_props) & set(live_props)):
+        cm = _field(cand_props, k, "method")
+        lm = _field(live_props, k, "method")
+        cn = _field(cand_props, k, "n_obs")
+        ln = _field(live_props, k, "n_obs")
+        if cm != lm or cn != ln:
+            changed.append({"prop": k, "live_method": lm, "candidate_method": cm,
+                            "live_nobs": ln, "candidate_nobs": cn})
+    _skip = {"props", "sport_key", "fit_timestamp", "meta"}
+    cand_blocks = set(cand_blob) - _skip
+    live_blocks = set(live_blob) - _skip
+    return {
+        "has_candidate": True,
+        "live_exists": bool(live_blob),
+        "candidate_ts": cand_blob.get("fit_timestamp"),
+        "live_ts": live_blob.get("fit_timestamp"),
+        "props": {
+            "added": sorted(set(cand_props) - set(live_props)),
+            "removed": sorted(set(live_props) - set(cand_props)),
+            "changed": changed,
+        },
+        "blocks": {
+            "added": sorted(cand_blocks - live_blocks),
+            "removed": sorted(live_blocks - cand_blocks),
+            "changed": sorted(b for b in (cand_blocks & live_blocks)
+                              if cand_blob.get(b) != live_blob.get(b)),
+        },
+    }
 
 
 def load_market_blend(sport_key):
@@ -149,7 +345,7 @@ def save_market_blend(sport_key, blend, meta=None):
     the existing 'props' calibration block.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = _load_blob(sport_key)
+    blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
     blob["market_blend"] = blend
@@ -159,7 +355,7 @@ def save_market_blend(sport_key, blend, meta=None):
             blob["meta"]["market_blend"] = meta
         else:
             blob["meta"] = {"market_blend": meta}
-    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 
 
@@ -189,7 +385,7 @@ def load_expected_runs_challenger(sport_key):
 def save_starter_adjustment(sport_key, adj, meta=None):
     """Persist starter-adjustment weights, preserving other calibration blocks."""
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = _load_blob(sport_key)
+    blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
     blob["starter_adjustment"] = adj
@@ -204,7 +400,7 @@ def save_starter_adjustment(sport_key, adj, meta=None):
                 blob["meta"]["starter_adjustment"] = meta
         else:
             blob["meta"] = {"starter_adjustment": meta}
-    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 
 
@@ -218,7 +414,7 @@ def load_lineup_adjustment(sport_key):
 def save_lineup_adjustment(sport_key, adjustment, meta=None):
     """Persist batting-order exposure settings without replacing other fits."""
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = _load_blob(sport_key)
+    blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
     blob["lineup_adjustment"] = adjustment
@@ -228,7 +424,7 @@ def save_lineup_adjustment(sport_key, adjustment, meta=None):
             blob["meta"]["lineup_adjustment"] = meta
         else:
             blob["meta"] = {"lineup_adjustment": meta}
-    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 
 
@@ -264,7 +460,7 @@ def save_prob_shrink(sport_key, shrink, meta=None, holdout=None):
     reads ``brier``/``raw_brier``/``n`` and ignores the extra keys.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
-    blob = _load_blob(sport_key)
+    blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
     existing = blob.get("prob_shrink")
@@ -286,7 +482,7 @@ def save_prob_shrink(sport_key, shrink, meta=None, holdout=None):
             blob["meta"]["prob_shrink_holdout"] = merged_holdout
         else:
             blob["meta"]["prob_shrink_holdout"] = dict(holdout)
-    with open(calibration_path(sport_key), "w", encoding="utf-8") as f:
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 
 

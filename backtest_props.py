@@ -70,6 +70,9 @@ from calibration_loader import (
     load_starter_adjustment,
     save_lineup_adjustment,
     save_starter_adjustment,
+    set_candidate_mode,
+    has_candidate,
+    existing_candidate_notice,
     _load_blob,
 )
 
@@ -1170,11 +1173,24 @@ if __name__ == "__main__":
     ap.add_argument("--fetch", action="store_true",
                     help="pre-cache all schedules + gameLogs (slow, one-time)")
     ap.add_argument("--save", action="store_true",
-                    help="write the fitted props weight to calibration")
+                    help="write the fitted props weight to calibration (stages a "
+                         "candidate; promote via refit_calibration.py --sport mlb "
+                         "--promote)")
+    ap.add_argument("--live", action="store_true",
+                    help="with --save, write the LIVE calibration file directly "
+                         "(skip candidate staging)")
     ap.add_argument("--xstats", action="store_true",
                     help="P2.4a: validate the batter_hits xBA projection blend "
                          "(prints per-weight holdout MAE + ship weight)")
     args = ap.parse_args()
+
+    # Default-safe: --save stages a candidate unless --live is given.
+    staging = not args.live
+    set_candidate_mode(staging)
+    if staging and args.save:
+        _n = existing_candidate_notice("baseball_mlb")
+        if _n:
+            print(_n)
 
     seasons = _parse_seasons(args.season)
     props = [p.strip() for p in args.props.split(",") if p.strip()]
@@ -1184,3 +1200,7 @@ if __name__ == "__main__":
         fit_xstats(seasons, top_n=args.max_batters)
     else:
         fit(seasons, props, top_n=args.max_batters, do_save=args.save)
+        if args.save and staging and has_candidate("baseball_mlb"):
+            print("\n⇢ Staged to calibration/baseball_mlb.candidate.json — live "
+                  "file UNTOUCHED. Promote: python refit_calibration.py "
+                  "--sport mlb --promote (review with --diff).")

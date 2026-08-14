@@ -22,7 +22,10 @@ Usage:
 import argparse
 
 import nfl_epa
-from calibration_loader import load_starter_adjustment, save_starter_adjustment
+from calibration_loader import (
+    load_starter_adjustment, save_starter_adjustment, set_candidate_mode,
+    has_candidate, active_write_label, existing_candidate_notice,
+)
 
 SPORT_KEY = "americanfootball_nfl"
 
@@ -110,16 +113,31 @@ def fit(seasons, do_save=False):
             "games": len(data),
         })
         print(f"\n  [save] wrote starter_adjustment['spreads']={round(w,3)} "
-              f"to calibration/{SPORT_KEY}.json")
+              f"to calibration/{active_write_label(SPORT_KEY)}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seasons", required=True,
                     help="e.g. 2023-2025 or 2023,2024,2025")
-    ap.add_argument("--save", action="store_true", help="write fitted weight")
+    ap.add_argument("--save", action="store_true", help="write fitted weight "
+                    "(stages a candidate; promote via refit_calibration.py "
+                    "--sport nfl --promote)")
+    ap.add_argument("--live", action="store_true",
+                    help="with --save, write the LIVE calibration file directly "
+                         "(skip candidate staging)")
     args = ap.parse_args()
+    staging = not args.live
+    set_candidate_mode(staging)
+    if staging and args.save:
+        _n = existing_candidate_notice(SPORT_KEY)
+        if _n:
+            print(_n)
     fit(_parse_seasons(args.seasons), do_save=args.save)
+    if args.save and staging and has_candidate(SPORT_KEY):
+        print(f"\n⇢ Staged to calibration/{SPORT_KEY}.candidate.json — live file "
+              f"UNTOUCHED. Promote: python refit_calibration.py --sport nfl "
+              f"--promote (review with --diff).")
 
 
 if __name__ == "__main__":

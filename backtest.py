@@ -67,6 +67,10 @@ from calibration_loader import (
     save_calibration,
     load_calibration,
     apply_calibration_with_warmup,
+    set_candidate_mode,
+    has_candidate,
+    active_write_label,
+    existing_candidate_notice,
 )
 
 
@@ -983,7 +987,8 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None,
         "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
     print(f"\n  [write-calibration] Wrote prob_shrink to "
-          f"calibration/{sport_key}.json: shrink={shrink}, holdout={holdout}")
+          f"calibration/{active_write_label(sport_key)}: shrink={shrink}, "
+          f"holdout={holdout}")
 
 
 def _inflate_samples(samples, weights, k):
@@ -1467,7 +1472,7 @@ def _write_blend_calibration(sport_key, results):
         "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
     print(f"\n  [write-calibration] Wrote blend weights (variant '{variant}') "
-          f"to calibration/{sport_key}.json:")
+          f"to calibration/{active_write_label(sport_key)}:")
     for market, cfg in blend.items():
         print(f"    {market:<10} w={cfg['w']:.2f}  (n={cfg['n']}, "
               f"blendBrier={cfg['blend_brier']})")
@@ -3886,7 +3891,12 @@ def main():
                    help="(odds mode) Min edge %% over the de-vigged market to place a bet.")
     p.add_argument("--write-calibration", action="store_true",
                    help="(odds mode) Save the best model⇄market blend weight per "
-                        "market to calibration/<sport>.json for live use.")
+                        "market to calibration/<sport>.json for live use. Stages a "
+                        "candidate by default (promote via refit_calibration.py "
+                        "--promote); pass --live to write the live file directly.")
+    p.add_argument("--live", action="store_true",
+                   help="Write calibration straight to the LIVE file, skipping the "
+                        "candidate staging that --write-calibration uses by default.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -3974,6 +3984,17 @@ def main():
                         "sample can't clobber a good fit. The Holdout Brier "
                         "column still fills.")
     args = p.parse_args()
+
+    # Default-safe: calibration writes stage a candidate (never the live file the
+    # app serves) unless --live is passed. Promotion is a separate, explicit step
+    # (refit_calibration.py --promote). Setting the mode is harmless when no write
+    # occurs (it only affects the save_* helpers).
+    staging = not args.live
+    set_candidate_mode(staging)
+    if staging and args.write_calibration:
+        _notice = existing_candidate_notice(SPORT_MAP[args.sport][2])
+        if _notice:
+            print(_notice)
 
     # Target the Azure SQL warehouse/logs when the SQL_* secrets are configured
     # (outside Streamlit they aren't in the env yet). Guarded; a no-op when SQL
@@ -4075,6 +4096,15 @@ def main():
                                   quantile_mode=args.quantile_mode,
                                   calibrate=args.calibrate,
                                   cross_season=args.cross_season)
+
+    # Point the user at the promotion step whenever a calibration write staged a
+    # candidate (or tell them a --live run went straight to the live file).
+    if args.write_calibration and not staging:
+        print(f"\n⇢ Wrote LIVE calibration/{sport_key}.json directly (--live).")
+    elif args.write_calibration and staging and has_candidate(sport_key):
+        print(f"\n⇢ Staged to calibration/{sport_key}.candidate.json — the live "
+              f"file is UNTOUCHED. Promote: python refit_calibration.py "
+              f"--sport {args.sport} --promote (review with --diff).")
 
 
 if __name__ == "__main__":

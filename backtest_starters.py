@@ -46,7 +46,10 @@ import os
 
 import mlb_starters
 import savant_history as sh
-from calibration_loader import load_starter_adjustment, save_starter_adjustment
+from calibration_loader import (
+    load_starter_adjustment, save_starter_adjustment, set_candidate_mode,
+    has_candidate, existing_candidate_notice,
+)
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
@@ -1730,7 +1733,12 @@ if __name__ == "__main__":
                     help="single '2024', list '2021,2022', or range '2021-2024'")
     ap.add_argument("--fetch", action="store_true",
                     help="fetch+cache each season's Statcast days first (slow)")
-    ap.add_argument("--save", action="store_true", help="write fitted weights")
+    ap.add_argument("--save", action="store_true", help="write fitted weights "
+                    "(stages a candidate; promote via refit_calibration.py "
+                    "--sport mlb --promote)")
+    ap.add_argument("--live", action="store_true",
+                    help="with --save, write the LIVE calibration file directly "
+                         "(skip candidate staging)")
     ap.add_argument("--test-ip", action="store_true",
                     help="A/B test innings-weighted starter/bullpen blend "
                          "(ML, spreads, totals); reports metrics, no save")
@@ -1745,6 +1753,14 @@ if __name__ == "__main__":
                          "and prior-season actual-venue park factors against "
                          "the latest season's untouched chronological holdout")
     args = ap.parse_args()
+
+    # Default-safe: --save stages a candidate unless --live is given.
+    staging = not args.live
+    set_candidate_mode(staging)
+    if staging and args.save:
+        _n = existing_candidate_notice("baseball_mlb")
+        if _n:
+            print(_n)
 
     seasons = _parse_seasons(args.season)
     if args.fetch:
@@ -1763,3 +1779,7 @@ if __name__ == "__main__":
         test_expected_runs_challenger(seasons)
     else:
         fit(seasons, do_save=args.save)
+        if args.save and staging and has_candidate("baseball_mlb"):
+            print("\n⇢ Staged to calibration/baseball_mlb.candidate.json — live "
+                  "file UNTOUCHED. Promote: python refit_calibration.py "
+                  "--sport mlb --promote (review with --diff).")

@@ -19,6 +19,12 @@ cache/
 # Local odds-warehouse fallback (durable copy lives in Azure Blob at run time)
 warehouse/
 
+# Staged (un-promoted) calibration candidates + promotion archives — local only.
+# The LIVE calibration/<sport>.json files ARE committed; these staging artifacts
+# are not (a refit stages a candidate; --promote swaps it into the live file).
+calibration/*.candidate.json
+calibration/archive/
+
 # Local-only sql scripts
 clear_tables.sql
 
