@@ -308,6 +308,19 @@ def fetch_teams(season):
     return data
 
 
+def fetch_players(season):
+    """Raw /sports/1/players roster for a season. Unlike the boxscore person object
+    (id/fullName only), each person here carries batSide.code / pitchHand.code — the
+    source for mlb_player handedness (see populate_handedness). Cached 7d."""
+    cache = f"warehouse_players_{season}"
+    cached = mlb_starters._read_cache(cache, max_age=7 * 24 * 3600)
+    if cached is not None:
+        return cached
+    data = mlb_starters._get("sports/1/players", {"season": season})
+    mlb_starters._write_cache(cache, data)
+    return data
+
+
 def fetch_schedule(date):
     """Raw /schedule payload (with linescore hydrate) for one YYYY-MM-DD date.
 
@@ -898,7 +911,56 @@ def ingest_maintenance(days_back=2, days_forward=2, straggler_days=14):
             summary["pitcher_rows"] += res.get("pitcher_rows", 0)
         except Exception:
             continue
+    summary["handedness_updated"] = populate_handedness()
     return summary
+
+
+def populate_handedness(season=None):
+    """Fill mlb_player.bats / throws from the season roster (/sports/1/players
+    batSide.code / pitchHand.code) for players already in mlb_player. The boxscore
+    person object carries no handedness, so it can't come from the game-ingest path;
+    this is a pure UPDATE of the two columns, which the boxscore player upsert NEVER
+    writes (upsert_bulk only touches the keys it's handed), so it survives re-ingest.
+    Non-destructive, idempotent (only writes a genuine change), fail-open. Unblocks the
+    built-but-dormant platoon feature (which needs a stored batter/pitcher hand).
+    Returns the number of mlb_player rows updated."""
+    if not enabled():
+        return 0
+    season = int(season) if season else _current_season()
+    try:
+        people = (fetch_players(season) or {}).get("people", []) or []
+    except Exception:
+        return 0
+    hand = {}
+    for p in people:
+        pid = p.get("id")
+        if pid is None:
+            continue
+        b = (p.get("batSide") or {}).get("code")
+        t = (p.get("pitchHand") or {}).get("code")
+        if b or t:
+            hand[str(pid)] = (b, t)
+    if not hand:
+        return 0
+    updated = 0
+    try:
+        with db_store.get_engine().begin() as conn:
+            # mlb_player holds only players who've appeared (small), so read it all and
+            # match against the roster rather than a large IN-list.
+            rows = conn.execute(select(
+                mlb_player.c.player_id, mlb_player.c.bats,
+                mlb_player.c.throws)).fetchall()
+            for pid, cur_b, cur_t in rows:
+                b, t = hand.get(pid, (None, None))
+                if (b and b != cur_b) or (t and t != cur_t):
+                    conn.execute(
+                        update(mlb_player)
+                        .where(mlb_player.c.player_id == pid)
+                        .values(bats=(b or cur_b), throws=(t or cur_t)))
+                    updated += 1
+    except (OperationalError, ValueError, TypeError):
+        return updated
+    return updated
 
 
 def ingest_standings(season=None, as_of_date=None):
@@ -1881,6 +1943,10 @@ def _main_cli():
                     help="Ingest an inclusive date range.")
     ap.add_argument("--standings", nargs="?", const=0, type=int, metavar="SEASON",
                     help="Snapshot standings for SEASON (default: current year).")
+    ap.add_argument("--handedness", nargs="?", const=0, type=int, metavar="SEASON",
+                    help="Backfill mlb_player.bats/throws from the SEASON roster "
+                         "(default: current year). Non-destructive; also runs each "
+                         "ingest_maintenance cycle for the current season.")
     ap.add_argument("--no-boxscores", action="store_true",
                     help="Schedule/game dims only; skip boxscore player dims.")
     ap.add_argument("--no-bronze", action="store_true",
@@ -1922,6 +1988,10 @@ def _main_cli():
         did = True
         season = args.standings if args.standings and args.standings > 0 else None
         print(_fmt(ingest_standings(season)))
+    if args.handedness is not None:
+        did = True
+        season = args.handedness if args.handedness and args.handedness > 0 else None
+        print(f"handedness: updated {populate_handedness(season)} mlb_player rows")
     if args.purge_boxscores:
         did = True
         print(f"purged {purge_processed_boxscores()} processed boxscore rows")
@@ -1933,7 +2003,8 @@ def _main_cli():
         print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))
     if not did:
         ap.error("nothing to do — pass --ingest, --ingest-range, --standings, "
-                 "--purge-boxscores, --backfill-game-pk, or --purge-non-franchise")
+                 "--handedness, --purge-boxscores, --backfill-game-pk, or "
+                 "--purge-non-franchise")
 
 
 if __name__ == "__main__":

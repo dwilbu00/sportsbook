@@ -907,7 +907,8 @@ class IngestMaintenanceTests(_Backend, unittest.TestCase):
         called = []
         with mock.patch.object(mlb_warehouse, "ingest_date",
                                side_effect=lambda d, **k: called.append(d) or
-                               {"games": 0, "batter_rows": 0, "pitcher_rows": 0}):
+                               {"games": 0, "batter_rows": 0, "pitcher_rows": 0}), \
+             mock.patch.object(mlb_warehouse, "populate_handedness", return_value=0):
             mlb_warehouse.ingest_maintenance(days_back=2, days_forward=2)
         for d in range(-2, 3):                         # rolling window present
             self.assertIn((today + datetime.timedelta(days=d)).isoformat(), called)
@@ -922,13 +923,15 @@ class IngestMaintenanceTests(_Backend, unittest.TestCase):
                 "game_date": old_final + "T18:00:00Z", "status": "Final"})
         called = []
         with mock.patch.object(mlb_warehouse, "ingest_date",
-                               side_effect=lambda d, **k: called.append(d) or {}):
+                               side_effect=lambda d, **k: called.append(d) or {}), \
+             mock.patch.object(mlb_warehouse, "populate_handedness", return_value=0):
             mlb_warehouse.ingest_maintenance(days_back=1, days_forward=0)
         self.assertNotIn(old_final, called)            # already Final → not re-swept
 
     def test_fail_open(self):
         with mock.patch.object(mlb_warehouse, "ingest_date",
-                               side_effect=RuntimeError("boom")):
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(mlb_warehouse, "populate_handedness", return_value=0):
             summary = mlb_warehouse.ingest_maintenance(days_back=1, days_forward=0)
         self.assertEqual(summary["dates"], 0)          # all failed, but no raise
 
@@ -1553,6 +1556,58 @@ class CalibParkNameGoldenTests(_Backend, unittest.TestCase):
         self.assertIn("Boston Red Sox", resolved)
         self.assertIn("Los Angeles Dodgers", resolved)
         self.assertNotIn("Nowhere FC", resolved)          # a bogus name is flagged
+
+
+class PopulateHandednessTests(_Backend, unittest.TestCase):
+    """populate_handedness fills mlb_player.bats/throws from the roster — non-
+    destructive, idempotent, and it survives the boxscore player upsert (which never
+    writes those columns)."""
+
+    _ROSTER = {"people": [
+        {"id": 592450, "batSide": {"code": "R"}, "pitchHand": {"code": "R"}},
+        {"id": 660271, "batSide": {"code": "L"}, "pitchHand": {"code": "L"}},
+        {"id": 999999, "batSide": {"code": "S"}, "pitchHand": {"code": "R"}},  # not stored
+    ]}
+
+    def _player(self, pid, name, bats=None, throws=None):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_player), {
+                "player_id": pid, "full_name": name,
+                "name_norm": db_store.normalize_name(name),
+                "is_pitcher": False, "bats": bats, "throws": throws})
+
+    def _bt(self, pid):
+        with db_store.get_engine().connect() as conn:
+            r = conn.execute(
+                select(mlb_warehouse.mlb_player.c.bats,
+                       mlb_warehouse.mlb_player.c.throws)
+                .where(mlb_warehouse.mlb_player.c.player_id == pid)).first()
+        return (r[0], r[1]) if r else None
+
+    def test_fills_and_is_idempotent(self):
+        self._player("592450", "Aaron Judge")
+        self._player("660271", "Shohei Ohtani")
+        with mock.patch.object(mlb_warehouse, "fetch_players",
+                               return_value=self._ROSTER):
+            n1 = mlb_warehouse.populate_handedness(2026)
+            n2 = mlb_warehouse.populate_handedness(2026)   # idempotent
+        self.assertEqual(n1, 2)                             # 999999 not in mlb_player
+        self.assertEqual(n2, 0)                             # no change 2nd time
+        self.assertEqual(self._bt("592450"), ("R", "R"))
+        self.assertEqual(self._bt("660271"), ("L", "L"))
+
+    def test_survives_boxscore_player_upsert(self):
+        self._player("592450", "Aaron Judge")
+        with mock.patch.object(mlb_warehouse, "fetch_players",
+                               return_value=self._ROSTER):
+            mlb_warehouse.populate_handedness(2026)
+        # Re-upsert the player exactly as ingest does (no bats/throws in the dict).
+        with db_store.get_engine().begin() as conn:
+            db_store.upsert_bulk(conn, mlb_warehouse.mlb_player, [{
+                "player_id": "592450", "full_name": "Aaron Judge",
+                "name_norm": db_store.normalize_name("Aaron Judge"),
+                "is_pitcher": False}], ("player_id",), ignore_cols=("fetched_at",))
+        self.assertEqual(self._bt("592450"), ("R", "R"))   # NOT clobbered to NULL
 
 
 if __name__ == "__main__":
