@@ -1588,6 +1588,37 @@ def get_team_defense(season=None, as_of_date=None):
     return out
 
 
+def get_team_offense(season=None, as_of_date=None):
+    """{team display name: avg runs SCORED per game} — the offensive analog of
+    get_team_defense, from the latest /standings snapshot's cumulative runs_scored /
+    games (wins+losses). Supplies opponent-OFFENSE strength (a strong lineup inflates
+    an opposing pitcher's ER/hits/BF) and the run-environment side. Optional as_of_date
+    picks the latest snapshot <= that date (leakage-safe). Fail-open → {}."""
+    if not enabled():
+        return {}
+    season = int(season) if season else _current_season()
+    s = mlb_team_standings
+    try:
+        with db_store.get_engine().connect() as conn:
+            asof = _latest_standings_asof(conn, season, as_of_date)
+            if asof is None:
+                return {}
+            rows = conn.execute(
+                select(s.c.team_id, s.c.wins, s.c.losses, s.c.runs_scored)
+                .where(s.c.season == season)
+                .where(s.c.as_of_date == asof)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    names = _team_name_map()
+    out = {}
+    for tid, w, losses, rs in rows:
+        games = (int(w) if w else 0) + (int(losses) if losses else 0)
+        nm = names.get(tid)
+        if nm and rs is not None and games > 0:
+            out[nm] = float(rs) / games
+    return out
+
+
 # ── P4 unified resolution: refresh an ACTIVE game, freeze a HISTORICAL one ─────
 _HISTORICAL_MIN_AGE_HOURS = 48   # after this (+ one post-window refresh) → frozen
 _BOXSCORE_ACTIVE_TTL = 900       # a recent game's box is re-pulled at most this often

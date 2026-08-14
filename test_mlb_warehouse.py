@@ -1240,6 +1240,22 @@ class TeamMarketReaderTests(_Backend, unittest.TestCase):
         self.assertAlmostEqual(
             mlb_warehouse.get_team_defense(season=2024)["New York Yankees"], 4.0)
 
+    def test_get_team_offense_from_standings_runs(self):
+        self._stand("147", 50, 50, 0.5, 500, 400)   # 100 g, 500 scored → 5.0
+        self._stand("111", 40, 40, 0.5, 720, 360)   #  80 g, 720 scored → 9.0
+        o = mlb_warehouse.get_team_offense(season=2024)
+        self.assertAlmostEqual(o["New York Yankees"], 5.0)
+        self.assertAlmostEqual(o["Boston Red Sox"], 9.0)
+
+    def test_get_team_offense_uses_latest_snapshot_and_asof(self):
+        self._stand("147", 10, 10, 0.5, 60, 100, as_of="2024-06-01")   # 3.0
+        self._stand("147", 50, 50, 0.5, 500, 400, as_of="2024-07-04")  # 5.0
+        self.assertAlmostEqual(
+            mlb_warehouse.get_team_offense(season=2024)["New York Yankees"], 5.0)
+        self.assertAlmostEqual(
+            mlb_warehouse.get_team_offense(
+                season=2024, as_of_date="2024-06-15")["New York Yankees"], 3.0)
+
 
 class WarehouseFindTeamTests(_Backend, unittest.TestCase):
     """warehouse_find_team / team_id_for_name_tolerant — the find_team replacement
