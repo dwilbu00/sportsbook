@@ -1479,24 +1479,43 @@ def _write_blend_calibration(sport_key, results):
               f"blendBrier={cfg['blend_brier']})")
 
 
-def _player_stat_series(espn_sport, espn_league, name, prop_key):
+def _player_stat_series(espn_sport, espn_league, name, prop_key,
+                        warehouse_inputs=False):
     """
     Return a player's dated per-game stat values for a prop as a sorted list of
     (game_date_iso, value). Empty if the player can't be resolved or the source
     lacks dated per-game data (e.g. ESPN MLB pitcher splits have no game dates).
+
+    ``warehouse_inputs`` (MLB only, P3c/P6) sources the per-game log from the StatsAPI
+    warehouse (mlb_warehouse.get_calib_gamelog, by the name resolved to a role-verified
+    MLBAM id via mlb_starters.resolve_mlbam_id) instead of ESPN. Current-season scoped,
+    matching the ESPN path (cached_gamelog defaults to the current season). OFF
+    (default) = the unchanged ESPN path (also the path NBA/NFL always take).
     """
-    aid = cached_athlete_id(espn_sport, espn_league, name)
-    if not aid:
-        return []
-    gamelog = cached_gamelog(espn_sport, espn_league, aid, player_name=name) or []
-    if not gamelog and espn_sport == "baseball" and prop_key in (
-            "pitcher_outs", "pitcher_strikeouts", "pitcher_earned_runs"):
-        # Real StatsAPI per-game log (dated) when the name resolves; otherwise the
-        # synthesized ESPN splits, whose dateless rows are dropped by the
-        # (date, value) filter below.
+    if warehouse_inputs and espn_sport == "baseball":
+        import mlb_warehouse
         import mlb_starters
-        gamelog = mlb_starters._pitcher_gamelog_or_synth(
-            espn_league, aid, name, None) or []
+        # prop_key role-gates the resolution, so a batter-prop name can't bind a
+        # same-name pitcher (and vice-versa); role also picks the fact table.
+        resolved = mlb_starters.resolve_mlbam_id(
+            name, mlb_warehouse._current_season(), prop_key=prop_key)
+        if not resolved:
+            return []
+        role = "pitcher" if str(prop_key).startswith("pitcher_") else "batter"
+        gamelog = mlb_warehouse.get_calib_gamelog(str(resolved[0]), role) or []
+    else:
+        aid = cached_athlete_id(espn_sport, espn_league, name)
+        if not aid:
+            return []
+        gamelog = cached_gamelog(espn_sport, espn_league, aid, player_name=name) or []
+        if not gamelog and espn_sport == "baseball" and prop_key in (
+                "pitcher_outs", "pitcher_strikeouts", "pitcher_earned_runs"):
+            # Real StatsAPI per-game log (dated) when the name resolves; otherwise the
+            # synthesized ESPN splits, whose dateless rows are dropped by the
+            # (date, value) filter below.
+            import mlb_starters
+            gamelog = mlb_starters._pitcher_gamelog_or_synth(
+                espn_league, aid, name, None) or []
     # Never resolve a pitcher prop from a batter's gamelog (or vice-versa): the
     # "K"/"SO" strikeout labels collide across roles (see _role_matches_gamelog).
     if not _role_matches_gamelog(prop_key, gamelog):
@@ -1573,7 +1592,8 @@ def _write_market_prior_calibration(sport_key, results):
 
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
-                            store_label="", write_calibration=False):
+                            store_label="", write_calibration=False,
+                            warehouse_inputs=None):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -1582,6 +1602,13 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     Brier + the optimal model⇄market blend, per prop market.
     """
     threshold = threshold_pct / 100.0
+    # P3c/P6: source MLB player gamelogs from the StatsAPI warehouse instead of ESPN
+    # (env-gated ODI_MLB_WAREHOUSE_BACKTEST unless forced; MLB-only → NBA/NFL identical).
+    use_warehouse = (espn_sport == "baseball") and (
+        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
+        else bool(warehouse_inputs))
+    if use_warehouse:
+        print("=== props-odds player logs: StatsAPI warehouse (ESPN bypassed) ===")
     store = hist_store.load_store(sport_key, store_label)
     games = store.get("games", {})
     if not games:
@@ -1611,7 +1638,9 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     def series(player, prop):
         k = (player, prop)
         if k not in series_cache:
-            series_cache[k] = _player_stat_series(espn_sport, espn_league, player, prop)
+            series_cache[k] = _player_stat_series(
+                espn_sport, espn_league, player, prop,
+                warehouse_inputs=use_warehouse)
         return series_cache[k]
 
     print(f"\n=== Props odds backtest: {sport_key} {props} ===")
@@ -4034,7 +4063,8 @@ def main():
                                 props=props, min_prior=args.min_sample,
                                 threshold_pct=args.threshold,
                                 store_label=args.store_label,
-                                write_calibration=args.write_calibration)
+                                write_calibration=args.write_calibration,
+                                warehouse_inputs=args.warehouse_inputs)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         run_odds_backtest(sport_key, espn_sport, espn_league,

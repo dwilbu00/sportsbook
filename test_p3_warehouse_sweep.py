@@ -370,5 +370,78 @@ class TeamMarketGateTests(unittest.TestCase):
         gat.assert_not_called()
 
 
+class PlayerStatSeriesTests(unittest.TestCase):
+    """P3c: run_props_odds_backtest's _player_stat_series sources MLB player logs from
+    the warehouse (role-verified id → get_calib_gamelog) instead of ESPN when gated."""
+
+    def test_warehouse_path_role_verified(self):
+        log = [{"H": 2.0, "game_date": "2026-07-20T18:00:00Z", "completed": True},
+               {"H": 1.0, "game_date": "2026-07-19T18:00:00Z", "completed": True}]
+        with mock.patch("mlb_starters.resolve_mlbam_id",
+                        return_value=(592450, False)) as rz, \
+             mock.patch("mlb_warehouse.get_calib_gamelog", return_value=log) as gcg, \
+             mock.patch("mlb_warehouse._current_season", return_value=2026), \
+             mock.patch.object(backtest, "cached_athlete_id") as caid, \
+             mock.patch.object(backtest, "cached_gamelog") as cgl:
+            ser = backtest._player_stat_series(
+                "baseball", "mlb", "Aaron Judge", "batter_hits",
+                warehouse_inputs=True)
+        self.assertEqual(ser, [("2026-07-19T18:00:00Z", 1.0),
+                               ("2026-07-20T18:00:00Z", 2.0)])   # sorted ascending
+        gcg.assert_called_once_with("592450", "batter")
+        self.assertEqual(rz.call_args.kwargs.get("prop_key"), "batter_hits")
+        caid.assert_not_called()          # ESPN id lookup bypassed
+        cgl.assert_not_called()           # ESPN gamelog bypassed
+
+    def test_warehouse_pitcher_role(self):
+        log = [{"IP": 6.0, "K": 7.0, "ER": 2.0,
+                "game_date": "2026-07-20T18:00:00Z", "completed": True}]
+        with mock.patch("mlb_starters.resolve_mlbam_id", return_value=(543037, True)), \
+             mock.patch("mlb_warehouse.get_calib_gamelog", return_value=log) as gcg, \
+             mock.patch("mlb_warehouse._current_season", return_value=2026):
+            ser = backtest._player_stat_series(
+                "baseball", "mlb", "Gerrit Cole", "pitcher_strikeouts",
+                warehouse_inputs=True)
+        gcg.assert_called_once_with("543037", "pitcher")
+        self.assertEqual(ser, [("2026-07-20T18:00:00Z", 7.0)])
+
+    def test_warehouse_unresolved_name_empty(self):
+        with mock.patch("mlb_starters.resolve_mlbam_id", return_value=None), \
+             mock.patch("mlb_warehouse._current_season", return_value=2026), \
+             mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
+            ser = backtest._player_stat_series(
+                "baseball", "mlb", "Ghost", "batter_hits", warehouse_inputs=True)
+        self.assertEqual(ser, [])
+        gcg.assert_not_called()
+
+    def test_flag_off_uses_espn(self):
+        with mock.patch.object(backtest, "cached_athlete_id",
+                               return_value="e1") as caid, \
+             mock.patch.object(backtest, "cached_gamelog",
+                               return_value=[{"H": 1.0, "game_date": "2026-07-01",
+                                              "completed": True}]), \
+             mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
+            ser = backtest._player_stat_series(
+                "baseball", "mlb", "Aaron Judge", "batter_hits",
+                warehouse_inputs=False)
+        caid.assert_called_once()
+        gcg.assert_not_called()
+        self.assertEqual(ser, [("2026-07-01", 1.0)])
+
+    def test_run_props_odds_threads_warehouse_flag(self):
+        store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z", "props": {
+            "batter_hits": {"Guy": {"line": 0.5, "over_implied": 0.5,
+                                    "under_implied": 0.5}}}}}, "bookmaker": "dk"}
+        spy = mock.Mock(return_value=[])
+        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
+             mock.patch.object(backtest.hist_store, "load_store", return_value=store), \
+             mock.patch.object(backtest, "load_calibration", return_value={}), \
+             mock.patch.object(backtest, "_player_stat_series", spy):
+            backtest.run_props_odds_backtest(
+                "mlb", "baseball", "mlb", "baseball_mlb", props=["batter_hits"])
+        self.assertTrue(spy.called)
+        self.assertTrue(spy.call_args.kwargs.get("warehouse_inputs"))
+
+
 if __name__ == "__main__":
     unittest.main()
