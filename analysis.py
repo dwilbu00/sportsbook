@@ -53,15 +53,22 @@ def _apply_starter_logit(p, edge, weight):
     return max(0.02, min(0.98, 1.0 / (1.0 + math.exp(-lg))))
 
 
-# ── Pythagorean team strength (WIRING ONLY, inert by default) ─────────────────
+# ── Pythagorean team strength (ACTIVE moneyline blend) ────────────────────────
 # Expected win% from run differential via the canonical, None-safe 1.83-exponent
 # helper mlb_starters.pythagorean_win_probability (RS^e/(RS^e+RA^e)) — a better
 # season strength estimate than raw W-L%. Runs come from the warehouse /standings
 # season block (runs_scored/runs_allowed); the ESPN block has none, so this is a
-# warehouse-enabled signal (None when runs absent → skipped). DEFAULT_PYTHAG_WEIGHT
-# =0.0 keeps it INERT (computed + exposed in the candidate, but zero effect on the
-# model) until it is backtested and weighted.
-DEFAULT_PYTHAG_WEIGHT = 0.0
+# warehouse-enabled signal (None when runs absent → skipped).
+#
+# Weight 0.35 chosen from the 2023-2026 backtest (backtest_starters --test-final,
+# per-season holdouts): the raw run-differential Pythagorean beat the current
+# win%-based moneyline model in 2024 (0.2460 vs 0.2490) and 2026 (0.2471 vs
+# 0.2492) — both years the current model was near coin-flip — and lagged only in
+# 2025 (0.2486 vs 0.2461), when the current model was unusually strong. A modest
+# blend (pull toward, not replace) captures the hedge-when-weak upside while
+# keeping the worst-year downside small (~0.0016 Brier). Spreads/run-line already
+# run on the validated expected_runs_challenger; totals stay on the current model.
+DEFAULT_PYTHAG_WEIGHT = 0.35
 
 
 # ──────────────────────────────────────────────────────────────────────────────

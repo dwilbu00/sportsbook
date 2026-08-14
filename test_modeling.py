@@ -712,16 +712,25 @@ class ExpectedRunsTests(unittest.TestCase):
                 self._game_odds(), home_stats, away_stats, sport_key="baseball_mlb")
         return {c["team"]: c for c in cands}
 
-    def test_pythag_exposed_and_inert_by_default(self):
+    def test_pythag_exposed_and_blended_by_default(self):
         with_runs = self._ml_by_team(*self._stats_with_runs())
         no_runs = self._ml_by_team(*self._team_stats())
         # exposed from the warehouse season block; None on the ESPN (run-less) block
         self.assertIsNotNone(with_runs["Home"]["pythag_win_pct"])
         self.assertGreater(with_runs["Home"]["pythag_win_pct"], 50.0)  # strong team
         self.assertIsNone(no_runs["Home"]["pythag_win_pct"])
-        # INERT: default weight 0 → runs do not move the model probability
-        self.assertEqual(with_runs["Home"]["model_prob"],
-                         no_runs["Home"]["model_prob"])
+        # ACTIVE at the default weight: the run-differential Pythagorean now pulls
+        # the model probability toward the Pythagorean win% (blend, not replace).
+        # The run-less fixture is otherwise identical, so it isolates the blend.
+        # model_prob and pythag_win_pct are both percentages (0-100).
+        base = no_runs["Home"]["model_prob"]
+        pythag = with_runs["Home"]["pythag_win_pct"]
+        w = analysis.DEFAULT_PYTHAG_WEIGHT
+        self.assertGreater(w, 0.0)  # activated
+        # delta covers the 2-dp rounding of base/pythag/model_prob in the output.
+        self.assertAlmostEqual(with_runs["Home"]["model_prob"],
+                               (1.0 - w) * base + w * pythag, delta=0.02)
+        self.assertNotEqual(with_runs["Home"]["model_prob"], base)
 
     def test_pythag_blends_when_weighted(self):
         with patch.object(analysis, "DEFAULT_PYTHAG_WEIGHT", 1.0):
