@@ -819,7 +819,8 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 
 def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                            shrinkage_k_default=0, xstats_strength=0.0,
-                           dry_run=False, roi_tiebreak=True):
+                           dry_run=False, roi_tiebreak=True,
+                           min_override_obs=MIN_REAL_LINE_OVERRIDE_OBS):
     """Re-select each prop's calibration METHOD at REAL book lines (roadmap 0.3).
 
     The synthetic-line sweep (`refit_sport`) chooses each prop's A/B/C method by
@@ -973,7 +974,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         # below evaluates to False. Only the shipped pooled method is protected;
         # a projection-basis re-fit (xBA blend) and per-bucket overrides are
         # unaffected. Deep props (batter_hits) never trip this.
-        protect_note = _incumbent_protected(sel, old_method)
+        protect_note = _incumbent_protected(sel, old_method,
+                                            min_override_obs=min_override_obs)
         if protect_note:
             sel["method"] = old_method
 
@@ -2769,6 +2771,13 @@ def main():
                         "within the Brier noise band fall back to A / lowest "
                         "Brier). Default: ROI breaks ties. Use to A/B a run "
                         "against the pure-Brier selection.")
+    p.add_argument("--min-override-obs", type=int,
+                   default=MIN_REAL_LINE_OVERRIDE_OBS,
+                   help="With --real-lines, the real-line obs floor below which a "
+                        "prop keeps its incumbent method (anti-noise churn guard; "
+                        f"default {MIN_REAL_LINE_OVERRIDE_OBS}). Lower it to adopt "
+                        "a confirmed-better method on a prop just under the floor "
+                        "(e.g. a losing-ROI incumbent backed by --roi-diag).")
     p.add_argument("--xstats-strength", type=float, default=0.0,
                    help="P2.4a: with --real-lines, re-fit batter_hits residuals "
                         "under the Statcast xBA projection blend at this weight "
@@ -2956,7 +2965,8 @@ def main():
                                shrinkage_k_default=args.shrinkage_k,
                                xstats_strength=args.xstats_strength,
                                dry_run=args.dry_run,
-                               roi_tiebreak=not args.no_roi_tiebreak)
+                               roi_tiebreak=not args.no_roi_tiebreak,
+                               min_override_obs=args.min_override_obs)
         _report_staging(args.sport, staging, wrote=not args.dry_run)
         return
 
