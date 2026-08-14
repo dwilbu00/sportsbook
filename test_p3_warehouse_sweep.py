@@ -1,72 +1,21 @@
-"""P3/P6: the offline synthetic-sweep calibration engine sources MLB inputs from the
-StatsAPI warehouse instead of ESPN.
+"""P3/P3b/P3c + P4: the offline backtest engines source ALL MLB inputs from the
+StatsAPI warehouse (ESPN fully removed for MLB in P4; NBA/NFL stay on ESPN).
 
-These lock the gate + the four re-keyed seams WITHOUT touching a DB or ESPN:
-  * the env/param gate (ODI_MLB_WAREHOUSE_BACKTEST), MLB-only so NBA/NFL are byte-id
-  * fetch_player_data → mlb_warehouse.get_calib_gamelog (by MLBAM id+role), no ESPN
+These lock the re-keyed seams WITHOUT touching a DB or ESPN:
+  * fetch_player_data / _player_stat_series → mlb_warehouse.get_calib_gamelog (by
+    MLBAM id+role) for MLB; ESPN for NBA/NFL
+  * _warehouse_team_schedules mirrors get_all_teams + build_schedules (canonical names)
   * _mlb_warehouse_defense_lookup keys on the CANONICAL name the player rows carry
-    (opponent-name match by construction — the whole point of the re-key)
+    (opponent-name match by construction)
   * _mlb_player_pool enriched to (mlb_id, role, name)
+Post-P4 there is no ODI_MLB_WAREHOUSE_BACKTEST flag: MLB is unconditionally warehouse.
 """
 
-import os
 import unittest
 from unittest import mock
 
 import backtest
 import refit_calibration
-
-
-class GateTests(unittest.TestCase):
-    def test_env_flag_reads_truthy_values(self):
-        for val in ("1", "true", "on", "yes", "TRUE"):
-            with mock.patch.dict(os.environ,
-                                 {"ODI_MLB_WAREHOUSE_BACKTEST": val}):
-                self.assertTrue(backtest._mlb_warehouse_backtest_enabled())
-        for val in ("", "0", "no", "off"):
-            with mock.patch.dict(os.environ,
-                                 {"ODI_MLB_WAREHOUSE_BACKTEST": val}):
-                self.assertFalse(backtest._mlb_warehouse_backtest_enabled())
-
-    def _gate_call(self, espn_sport, env, warehouse_inputs=None):
-        """Run run_player_props_backtest just far enough to capture the
-        warehouse_inputs fetch_player_data received (empty data → early return)."""
-        fpd = mock.Mock(return_value={})
-        with mock.patch.dict(os.environ, env), \
-             mock.patch.object(backtest, "fetch_player_data", fpd):
-            backtest.run_player_props_backtest(
-                "mlb" if espn_sport == "baseball" else "nba",
-                espn_sport, "x", "sk", players=["A"], props=["batter_hits"],
-                games_per_player=5, min_sample=5,
-                variants={"base": {"half_life": 10}},
-                warehouse_inputs=warehouse_inputs)
-        return fpd.call_args.kwargs.get("warehouse_inputs")
-
-    def test_mlb_env_on_uses_warehouse(self):
-        self.assertTrue(
-            self._gate_call("baseball", {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}))
-
-    def test_mlb_env_off_uses_espn(self):
-        self.assertFalse(
-            self._gate_call("baseball", {"ODI_MLB_WAREHOUSE_BACKTEST": ""}))
-
-    def test_non_baseball_never_uses_warehouse_even_if_forced(self):
-        # NBA with the flag ON AND an explicit force must stay ESPN (byte-identical).
-        fpd = mock.Mock(return_value={})
-        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
-             mock.patch.object(backtest, "fetch_player_data", fpd):
-            backtest.run_player_props_backtest(
-                "nba", "basketball", "nba", "basketball_nba",
-                players=["A"], props=["player_points"], games_per_player=5,
-                min_sample=5, variants={"base": {"half_life": 10}},
-                warehouse_inputs=True)
-        self.assertFalse(fpd.call_args.kwargs.get("warehouse_inputs"))
-
-    def test_explicit_param_overrides_env(self):
-        # warehouse_inputs=False forces ESPN even with the env flag ON.
-        self.assertFalse(
-            self._gate_call("baseball", {"ODI_MLB_WAREHOUSE_BACKTEST": "1"},
-                            warehouse_inputs=False))
 
 
 class IterPoolPlayersTests(unittest.TestCase):
@@ -77,33 +26,33 @@ class IterPoolPlayersTests(unittest.TestCase):
         self.assertEqual(out[1], (None, None, "Bare Name"))
 
 
-class FetchPlayerDataWarehouseTests(unittest.TestCase):
+class FetchPlayerDataTests(unittest.TestCase):
     _WH_LOG = [{"H": 2.0, "game_date": "2026-07-20T18:00:00Z",
                 "is_home": True, "opponent": "Boston Red Sox", "team_id": "147",
                 "completed": True}]
 
-    def test_baseball_warehouse_path_uses_get_calib_gamelog_not_espn(self):
+    def test_mlb_uses_get_calib_gamelog_not_espn(self):
         gcg = mock.Mock(return_value=list(self._WH_LOG))
         with mock.patch.object(backtest, "cached_athlete_id") as caid, \
              mock.patch.object(backtest, "cached_gamelog") as cgl, \
              mock.patch("mlb_warehouse.get_calib_gamelog", gcg):
             data = backtest.fetch_player_data(
                 "baseball", "mlb", [("592450", "batter", "Aaron Judge")],
-                season_year=2026, warehouse_inputs=True)
+                season_year=2026)
         self.assertIn("Aaron Judge", data)
         self.assertEqual(data["Aaron Judge"][0]["H"], 2.0)
         gcg.assert_called_once_with("592450", "batter", season=2026)
         caid.assert_not_called()          # ESPN id lookup bypassed
         cgl.assert_not_called()           # ESPN gamelog bypassed
 
-    def test_bare_name_resolved_via_resolver_under_flag(self):
+    def test_bare_name_resolved_via_resolver(self):
         gcg = mock.Mock(return_value=list(self._WH_LOG))
         with mock.patch("mlb_starters.resolve_mlbam_id",
                         return_value=(605483, True)) as rz, \
              mock.patch("mlb_warehouse.get_calib_gamelog", gcg), \
              mock.patch("mlb_warehouse._current_season", return_value=2026):
             data = backtest.fetch_player_data(
-                "baseball", "mlb", ["Some Pitcher"], warehouse_inputs=True)
+                "baseball", "mlb", ["Some Pitcher"])
         rz.assert_called_once()
         gcg.assert_called_once_with("605483", "pitcher", season=None)
         self.assertIn("Some Pitcher", data)
@@ -111,38 +60,23 @@ class FetchPlayerDataWarehouseTests(unittest.TestCase):
     def test_warehouse_miss_skips_player(self):
         with mock.patch("mlb_warehouse.get_calib_gamelog", return_value=[]):
             data = backtest.fetch_player_data(
-                "baseball", "mlb", [("1", "batter", "Ghost")],
-                season_year=2026, warehouse_inputs=True)
+                "baseball", "mlb", [("1", "batter", "Ghost")], season_year=2026)
         self.assertEqual(data, {})
 
-    def test_flag_off_uses_espn_path_with_name_from_tuple(self):
-        with mock.patch.object(backtest, "cached_athlete_id",
-                               return_value="e1") as caid, \
-             mock.patch.object(backtest, "cached_gamelog",
-                               return_value=[{"H": 1.0, "game_date": "2026-07-01"}]), \
-             mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
-            data = backtest.fetch_player_data(
-                "baseball", "mlb", [("592450", "batter", "Aaron Judge")],
-                season_year=2026, warehouse_inputs=False)
-        caid.assert_called_once_with("baseball", "mlb", "Aaron Judge")
-        gcg.assert_not_called()
-        self.assertIn("Aaron Judge", data)
-
-    def test_non_baseball_ignores_warehouse_flag(self):
+    def test_non_baseball_uses_espn(self):
         with mock.patch.object(backtest, "cached_athlete_id",
                                return_value="e1") as caid, \
              mock.patch.object(backtest, "cached_gamelog",
                                return_value=[{"PTS": 20.0, "game_date": "2026-01-01"}]), \
              mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
-            backtest.fetch_player_data(
-                "basketball", "nba", ["Star"], warehouse_inputs=True)
+            backtest.fetch_player_data("basketball", "nba", ["Star"])
         caid.assert_called_once()          # ESPN path
         gcg.assert_not_called()
 
     def test_same_name_namesakes_both_survive(self):
-        # Fix A: two distinct MLBAM ids sharing a fullName each keep their own gamelog
+        # Two distinct MLBAM ids sharing a fullName each keep their own gamelog
         # (name collision disambiguated by id) instead of the second overwriting the
-        # first — the id-dedup pool's stated intent, now true downstream.
+        # first — the id-dedup pool's stated intent, true downstream.
         def _gcg(rid, role, season=None):
             label = "K" if role == "pitcher" else "H"
             return [{label: 1.0, "game_date": "2026-07-20T18:00Z",
@@ -152,8 +86,7 @@ class FetchPlayerDataWarehouseTests(unittest.TestCase):
             data = backtest.fetch_player_data(
                 "baseball", "mlb",
                 [("669257", "batter", "Will Smith"),
-                 ("592858", "pitcher", "Will Smith")],
-                season_year=2026, warehouse_inputs=True)
+                 ("592858", "pitcher", "Will Smith")], season_year=2026)
         self.assertEqual(len(data), 2)                     # both survived
         self.assertIn("Will Smith", data)
         self.assertIn("Will Smith (592858)", data)
@@ -162,8 +95,8 @@ class FetchPlayerDataWarehouseTests(unittest.TestCase):
 
 
 class NoneStatFilterTests(unittest.TestCase):
-    """Fix B: a legacy warehouse row with a present-but-None served stat (pre-a68f4e6
-    TB/RBI capture) must be dropped from prior_games, not poison prior_values/sum()."""
+    """A legacy warehouse row with a present-but-None served stat (pre-a68f4e6 TB/RBI
+    capture) must be dropped from prior_games, not poison prior_values/sum()."""
 
     def test_none_stat_games_dropped_no_crash(self):
         gl = []
@@ -191,8 +124,8 @@ class NoneStatFilterTests(unittest.TestCase):
 
 
 class WarmupMetaTests(unittest.TestCase):
-    """Fix C: a requested warmup that yields nothing (e.g. warehouse lacks the prior
-    season) is flagged in meta (warmup_present=False), not silently omitted."""
+    """A requested warmup that yields nothing (e.g. warehouse lacks the prior season)
+    is flagged in meta (warmup_present=False), not silently omitted."""
 
     def test_missing_warmup_flags_meta_present_false(self):
         captured = {}
@@ -204,8 +137,7 @@ class WarmupMetaTests(unittest.TestCase):
                  side_effect=lambda sk, cfg, meta=None: captured.update(meta=meta)):
             refit_calibration.refit_sport(
                 "mlb", season=2026, prior_season=2025,
-                players=[("1", "batter", "Guy")], props=["batter_hits"],
-                warehouse_inputs=True)
+                players=[("1", "batter", "Guy")], props=["batter_hits"])
         self.assertFalse(captured["meta"]["warmup_present"])
         self.assertEqual(captured["meta"]["warmup_season"], 2025)
 
@@ -280,8 +212,8 @@ class MlbPlayerPoolTests(unittest.TestCase):
 
 
 class WarehouseTeamSchedulesTests(unittest.TestCase):
-    """P3b: _warehouse_team_schedules mirrors get_all_teams + build_schedules for the
-    team-market backtests, pooling seasons, canonical names."""
+    """_warehouse_team_schedules mirrors get_all_teams + build_schedules for the
+    team-market backtests, pooling seasons, canonical names, with win_pct."""
 
     NAMES = {"147": "New York Yankees", "111": "Boston Red Sox"}
 
@@ -321,14 +253,13 @@ class WarehouseTeamSchedulesTests(unittest.TestCase):
         self.assertEqual(teams["NYY"]["win_pct"], 0.5)
 
 
-class TeamMarketGateTests(unittest.TestCase):
-    """P3b: run_backtest / run_odds_backtest source MLB team schedules from the
-    warehouse when gated, ESPN otherwise; non-baseball is byte-identical."""
+class TeamMarketWarehouseTests(unittest.TestCase):
+    """run_backtest / run_odds_backtest source MLB team schedules from the warehouse
+    (unconditionally post-P4); non-baseball stays on ESPN."""
 
-    def test_run_backtest_baseball_env_on_uses_warehouse(self):
+    def test_run_backtest_baseball_uses_warehouse(self):
         wh = mock.Mock(return_value=({}, {}))   # empty → clean "No games" early return
-        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
-             mock.patch.object(backtest, "_warehouse_team_schedules", wh), \
+        with mock.patch.object(backtest, "_warehouse_team_schedules", wh), \
              mock.patch.object(backtest, "get_all_teams") as gat:
             backtest.run_backtest("baseball_mlb", "baseball", "mlb", limit=10,
                                   window=10, variants={"base": {"half_life": 10}},
@@ -336,9 +267,8 @@ class TeamMarketGateTests(unittest.TestCase):
         wh.assert_called_once()
         gat.assert_not_called()
 
-    def test_run_backtest_nba_ignores_flag(self):
-        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
-             mock.patch.object(backtest, "_warehouse_team_schedules") as wh, \
+    def test_run_backtest_nba_uses_espn(self):
+        with mock.patch.object(backtest, "_warehouse_team_schedules") as wh, \
              mock.patch.object(backtest, "get_all_teams", return_value={}) as gat, \
              mock.patch.object(backtest, "build_schedules", return_value={}):
             backtest.run_backtest("basketball_nba", "basketball", "nba", limit=10,
@@ -347,13 +277,12 @@ class TeamMarketGateTests(unittest.TestCase):
         gat.assert_called_once()
         wh.assert_not_called()
 
-    def test_run_odds_backtest_baseball_env_on_uses_warehouse(self):
+    def test_run_odds_backtest_baseball_uses_warehouse(self):
         store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z",
                                   "home_team": "A", "away_team": "B"}},
                  "bookmaker": "dk"}
         wh = mock.Mock(return_value=({}, {}))
-        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
-             mock.patch.object(backtest, "_load_odds_store",
+        with mock.patch.object(backtest, "_load_odds_store",
                                return_value=(store, "store")), \
              mock.patch.object(backtest, "_build_odds_lookup", return_value=({}, 0)), \
              mock.patch.object(backtest, "_warehouse_team_schedules", wh), \
@@ -371,10 +300,10 @@ class TeamMarketGateTests(unittest.TestCase):
 
 
 class PlayerStatSeriesTests(unittest.TestCase):
-    """P3c: run_props_odds_backtest's _player_stat_series sources MLB player logs from
-    the warehouse (role-verified id → get_calib_gamelog) instead of ESPN when gated."""
+    """run_props_odds_backtest's _player_stat_series sources MLB player logs from the
+    warehouse (role-verified id → get_calib_gamelog); NBA/NFL use ESPN."""
 
-    def test_warehouse_path_role_verified(self):
+    def test_mlb_warehouse_path_role_verified(self):
         log = [{"H": 2.0, "game_date": "2026-07-20T18:00:00Z", "completed": True},
                {"H": 1.0, "game_date": "2026-07-19T18:00:00Z", "completed": True}]
         with mock.patch("mlb_starters.resolve_mlbam_id",
@@ -384,8 +313,7 @@ class PlayerStatSeriesTests(unittest.TestCase):
              mock.patch.object(backtest, "cached_athlete_id") as caid, \
              mock.patch.object(backtest, "cached_gamelog") as cgl:
             ser = backtest._player_stat_series(
-                "baseball", "mlb", "Aaron Judge", "batter_hits",
-                warehouse_inputs=True)
+                "baseball", "mlb", "Aaron Judge", "batter_hits")
         self.assertEqual(ser, [("2026-07-19T18:00:00Z", 1.0),
                                ("2026-07-20T18:00:00Z", 2.0)])   # sorted ascending
         gcg.assert_called_once_with("592450", "batter")
@@ -393,54 +321,54 @@ class PlayerStatSeriesTests(unittest.TestCase):
         caid.assert_not_called()          # ESPN id lookup bypassed
         cgl.assert_not_called()           # ESPN gamelog bypassed
 
-    def test_warehouse_pitcher_role(self):
+    def test_mlb_warehouse_pitcher_role(self):
         log = [{"IP": 6.0, "K": 7.0, "ER": 2.0,
                 "game_date": "2026-07-20T18:00:00Z", "completed": True}]
         with mock.patch("mlb_starters.resolve_mlbam_id", return_value=(543037, True)), \
              mock.patch("mlb_warehouse.get_calib_gamelog", return_value=log) as gcg, \
              mock.patch("mlb_warehouse._current_season", return_value=2026):
             ser = backtest._player_stat_series(
-                "baseball", "mlb", "Gerrit Cole", "pitcher_strikeouts",
-                warehouse_inputs=True)
+                "baseball", "mlb", "Gerrit Cole", "pitcher_strikeouts")
         gcg.assert_called_once_with("543037", "pitcher")
         self.assertEqual(ser, [("2026-07-20T18:00:00Z", 7.0)])
 
-    def test_warehouse_unresolved_name_empty(self):
+    def test_mlb_unresolved_name_empty(self):
         with mock.patch("mlb_starters.resolve_mlbam_id", return_value=None), \
              mock.patch("mlb_warehouse._current_season", return_value=2026), \
              mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
             ser = backtest._player_stat_series(
-                "baseball", "mlb", "Ghost", "batter_hits", warehouse_inputs=True)
+                "baseball", "mlb", "Ghost", "batter_hits")
         self.assertEqual(ser, [])
         gcg.assert_not_called()
 
-    def test_flag_off_uses_espn(self):
+    def test_non_baseball_uses_espn(self):
         with mock.patch.object(backtest, "cached_athlete_id",
                                return_value="e1") as caid, \
              mock.patch.object(backtest, "cached_gamelog",
-                               return_value=[{"H": 1.0, "game_date": "2026-07-01",
+                               return_value=[{"PTS": 20.0, "game_date": "2026-01-01",
                                               "completed": True}]), \
              mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
             ser = backtest._player_stat_series(
-                "baseball", "mlb", "Aaron Judge", "batter_hits",
-                warehouse_inputs=False)
+                "basketball", "nba", "Star", "player_points")
         caid.assert_called_once()
         gcg.assert_not_called()
-        self.assertEqual(ser, [("2026-07-01", 1.0)])
+        self.assertEqual(ser, [("2026-01-01", 20.0)])
 
-    def test_run_props_odds_threads_warehouse_flag(self):
+    def test_run_props_odds_calls_series(self):
+        # The wiring: run_props_odds_backtest resolves each odds-store player's series
+        # via _player_stat_series (which, for MLB, hits the warehouse).
         store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z", "props": {
             "batter_hits": {"Guy": {"line": 0.5, "over_implied": 0.5,
                                     "under_implied": 0.5}}}}}, "bookmaker": "dk"}
         spy = mock.Mock(return_value=[])
-        with mock.patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_BACKTEST": "1"}), \
-             mock.patch.object(backtest.hist_store, "load_store", return_value=store), \
+        with mock.patch.object(backtest.hist_store, "load_store", return_value=store), \
              mock.patch.object(backtest, "load_calibration", return_value={}), \
              mock.patch.object(backtest, "_player_stat_series", spy):
             backtest.run_props_odds_backtest(
                 "mlb", "baseball", "mlb", "baseball_mlb", props=["batter_hits"])
         self.assertTrue(spy.called)
-        self.assertTrue(spy.call_args.kwargs.get("warehouse_inputs"))
+        self.assertEqual(spy.call_args.args[:4],
+                         ("baseball", "mlb", "Guy", "batter_hits"))
 
 
 if __name__ == "__main__":

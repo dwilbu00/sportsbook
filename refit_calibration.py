@@ -683,7 +683,7 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
-                nba_max_players=150, nba_min_games=15, warehouse_inputs=None):
+                nba_max_players=150, nba_min_games=15):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     if sport in ("mlb", "nba") and season is None:
         season = datetime.now(timezone.utc).year
@@ -719,7 +719,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         season_year=season, safe_mode=True,
         cushion_sweep=False, safe_target=0.80,
         quantile_mode=False, calibrate=True,
-        cross_season="strict", warehouse_inputs=warehouse_inputs,
+        cross_season="strict",
     )
     if not curr_results:
         print("Current-season run produced no results; aborting.")
@@ -740,7 +740,6 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             cushion_sweep=False, safe_target=0.80,
             quantile_mode=False, calibrate=True,
             cross_season="all",  # within a single prior season this is fine
-            warehouse_inputs=warehouse_inputs,
         )
         if warmup_results:
             warmup_winners = _best_per_prop(warmup_results, props)
@@ -748,11 +747,11 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             # A requested warmup that yields nothing would otherwise ship a calibration
             # with NO warmup block (degrading players with < warmup_games current-season
             # games) behind a single buried "Aborting." line. Make it loud + auditable —
-            # the likeliest cause under --warehouse-inputs is missing prior-season facts.
+            # for MLB the likeliest cause is the warehouse lacking prior-season facts.
             print(f"  [WARN] WARMUP (prior season {prior_season}) produced NO results "
                   f"— shipping calibration WITHOUT a warmup block."
-                  + (" The warehouse may lack prior-season facts; backfill that season "
-                     "or drop --warehouse-inputs." if warehouse_inputs else ""))
+                  + (" The MLB warehouse may lack that season's facts; backfill it."
+                     if sport == "mlb" else ""))
 
     # Build final cfg
     props_cfg = {}
@@ -2672,11 +2671,6 @@ def main():
     p.add_argument("--nba-max-players", type=int, default=150,
                    help="Data-driven NBA pool size (top-N by minutes) when "
                         "--players is omitted.")
-    p.add_argument("--warehouse-inputs", action="store_true", default=None,
-                   help="MLB only (P3/P6): source the sweep's player gamelogs + team "
-                        "apparatus from the StatsAPI warehouse instead of ESPN. "
-                        "Defaults to the ODI_MLB_WAREHOUSE_BACKTEST env flag when "
-                        "unset; ignored for NBA/NFL.")
     p.add_argument("--nba-min-games", type=int, default=15,
                    help="Minimum games played for an NBA player to enter the "
                         "data-driven pool.")
@@ -2846,8 +2840,7 @@ def main():
                 mlb_max_batters=args.mlb_max_batters,
                 mlb_max_pitchers=args.mlb_max_pitchers,
                 nba_max_players=args.nba_max_players,
-                nba_min_games=args.nba_min_games,
-                warehouse_inputs=args.warehouse_inputs)
+                nba_min_games=args.nba_min_games)
 
 
 if __name__ == "__main__":

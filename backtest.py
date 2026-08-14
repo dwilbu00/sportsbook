@@ -413,16 +413,13 @@ def prior_games_for(team_name, schedules, espn_teams, before_date, window):
 
 def run_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
                  min_sample=5, season_year=None, sweep=False,
-                 quantile_mode=False, safe_target=0.80, warehouse_inputs=None):
+                 quantile_mode=False, safe_target=0.80):
     # Resolve "auto" half-life in variants
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
 
-    # P3b/P6: source MLB team schedules from the StatsAPI warehouse instead of ESPN.
-    # Env-gated (ODI_MLB_WAREHOUSE_BACKTEST) unless a caller forces it; MLB-only, so
-    # NBA/NFL stay byte-identical.
-    use_warehouse = (espn_sport == "baseball") and (
-        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
-        else bool(warehouse_inputs))
+    # P3b/P4/P6: MLB team schedules come from the StatsAPI warehouse; NBA/NFL stay on
+    # ESPN. (ESPN was fully removed for MLB in P4.)
+    use_warehouse = espn_sport == "baseball"
 
     print(f"\n=== Loading {sport_key} team list ===")
     season_label = f"season {season_year}" if season_year else "current season"
@@ -1107,8 +1104,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       min_sample=5, season_year=None, threshold_pct=5.0,
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
-                      supplement_log=True, min_shrink_n=MIN_SHRINK_N,
-                      warehouse_inputs=None):
+                      supplement_log=True, min_shrink_n=MIN_SHRINK_N):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1147,12 +1143,10 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         print(f"\n[store-label: {store_label}] grading ROI at the "
               f"{store.get('snapshot_time','labeled')} price, not the close.")
 
-    # P3b/P6: source MLB team schedules from the StatsAPI warehouse instead of ESPN
-    # (env-gated ODI_MLB_WAREHOUSE_BACKTEST unless forced; MLB-only). The odds-store
-    # join below prefers SFBB team CODES, so the canonical warehouse names join fine.
-    use_warehouse = (espn_sport == "baseball") and (
-        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
-        else bool(warehouse_inputs))
+    # P3b/P4/P6: MLB team schedules come from the StatsAPI warehouse; NBA/NFL stay on
+    # ESPN. The odds-store join below prefers SFBB team CODES, so the canonical
+    # warehouse names join fine. (ESPN was fully removed for MLB in P4.)
+    use_warehouse = espn_sport == "baseball"
     # season_year may be a single year (int/None) or an iterable of years. When
     # several years are given we pool each season's schedule so the fit can span
     # multiple seasons (e.g. NFL, whose ~200 games/season are too thin alone).
@@ -1479,20 +1473,18 @@ def _write_blend_calibration(sport_key, results):
               f"blendBrier={cfg['blend_brier']})")
 
 
-def _player_stat_series(espn_sport, espn_league, name, prop_key,
-                        warehouse_inputs=False):
+def _player_stat_series(espn_sport, espn_league, name, prop_key):
     """
     Return a player's dated per-game stat values for a prop as a sorted list of
     (game_date_iso, value). Empty if the player can't be resolved or the source
     lacks dated per-game data (e.g. ESPN MLB pitcher splits have no game dates).
 
-    ``warehouse_inputs`` (MLB only, P3c/P6) sources the per-game log from the StatsAPI
-    warehouse (mlb_warehouse.get_calib_gamelog, by the name resolved to a role-verified
-    MLBAM id via mlb_starters.resolve_mlbam_id) instead of ESPN. Current-season scoped,
-    matching the ESPN path (cached_gamelog defaults to the current season). OFF
-    (default) = the unchanged ESPN path (also the path NBA/NFL always take).
+    For MLB (P3c/P6) the per-game log comes from the StatsAPI warehouse
+    (mlb_warehouse.get_calib_gamelog, by the name resolved to a role-verified MLBAM id
+    via mlb_starters.resolve_mlbam_id), current-season scoped. NBA/NFL use the ESPN
+    path. (ESPN was fully removed for MLB in P4.)
     """
-    if warehouse_inputs and espn_sport == "baseball":
+    if espn_sport == "baseball":
         import mlb_warehouse
         import mlb_starters
         # prop_key role-gates the resolution, so a batter-prop name can't bind a
@@ -1592,8 +1584,7 @@ def _write_market_prior_calibration(sport_key, results):
 
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
-                            store_label="", write_calibration=False,
-                            warehouse_inputs=None):
+                            store_label="", write_calibration=False):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -1602,11 +1593,9 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     Brier + the optimal model⇄market blend, per prop market.
     """
     threshold = threshold_pct / 100.0
-    # P3c/P6: source MLB player gamelogs from the StatsAPI warehouse instead of ESPN
-    # (env-gated ODI_MLB_WAREHOUSE_BACKTEST unless forced; MLB-only → NBA/NFL identical).
-    use_warehouse = (espn_sport == "baseball") and (
-        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
-        else bool(warehouse_inputs))
+    # P3c/P4/P6: MLB player gamelogs come from the StatsAPI warehouse; NBA/NFL stay on
+    # ESPN. (ESPN was fully removed for MLB in P4.)
+    use_warehouse = espn_sport == "baseball"
     if use_warehouse:
         print("=== props-odds player logs: StatsAPI warehouse (ESPN bypassed) ===")
     store = hist_store.load_store(sport_key, store_label)
@@ -1639,8 +1628,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
         k = (player, prop)
         if k not in series_cache:
             series_cache[k] = _player_stat_series(
-                espn_sport, espn_league, player, prop,
-                warehouse_inputs=use_warehouse)
+                espn_sport, espn_league, player, prop)
         return series_cache[k]
 
     print(f"\n=== Props odds backtest: {sport_key} {props} ===")
@@ -2231,15 +2219,6 @@ def _weighted_quantile(values, weights, q):
     return pairs[-1][0]
 
 
-def _mlb_warehouse_backtest_enabled():
-    """P3/P6 env gate: source the MLB synthetic-sweep inputs (player gamelogs + team
-    apparatus) from the StatsAPI warehouse instead of ESPN. OFF (default) keeps the
-    unchanged ESPN path. Read here (not app-boot-promoted) because the sweep is an
-    offline, operator-run tool."""
-    return os.environ.get("ODI_MLB_WAREHOUSE_BACKTEST", "").strip().lower() in (
-        "1", "true", "on", "yes")
-
-
 def _iter_pool_players(players):
     """Normalize each player-pool entry to (mlb_id, role, name). The MLB pool is
     enriched to (mlb_id, role, name) tuples (refit_calibration._mlb_player_pool) so the
@@ -2253,21 +2232,19 @@ def _iter_pool_players(players):
             yield None, None, entry
 
 
-def fetch_player_data(espn_sport, espn_league, players, season_year=None,
-                      warehouse_inputs=False):
+def fetch_player_data(espn_sport, espn_league, players, season_year=None):
     """Resolve each player → (athlete_id, gamelog). Returns {name: gamelog_list}.
 
-    ``warehouse_inputs`` (MLB only, the P3/P6 sweep cutover) sources each player's
-    per-game log from the StatsAPI warehouse (mlb_warehouse.get_calib_gamelog by the
-    pool's authoritative MLBAM id + role) — no name→ESPN-id round trip, no ESPN gamelog
-    fetch. A bare-name --players override under the flag is resolved to its MLBAM id via
-    the game-context-free resolver. OFF (default) = the unchanged ESPN path (also the
-    path NBA/NFL always take)."""
+    For MLB (P3/P4/P6) each player's per-game log comes from the StatsAPI warehouse
+    (mlb_warehouse.get_calib_gamelog by the pool's authoritative MLBAM id + role) — no
+    name→ESPN-id round trip, no ESPN gamelog fetch. A bare-name --players override is
+    resolved to its MLBAM id via the game-context-free resolver. NBA/NFL use the ESPN
+    path. (ESPN was fully removed for MLB in P4.)"""
     data = {}
     for mlb_id, role, name in _iter_pool_players(players):
         if not name:
             continue
-        if warehouse_inputs and espn_sport == "baseball":
+        if espn_sport == "baseball":
             import mlb_warehouse
             rid, rrole = mlb_id, role
             if not rid:
@@ -2511,15 +2488,11 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               variants, sweep=False, season_year=None,
                               safe_mode=False, cushion_sweep=False,
                               safe_target=0.80, quantile_mode=False,
-                              calibrate=False, cross_season="strict",
-                              warehouse_inputs=None):
+                              calibrate=False, cross_season="strict"):
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
-    # P3/P6: source MLB sweep inputs (player gamelogs + team apparatus) from the
-    # StatsAPI warehouse instead of ESPN. Env-gated (ODI_MLB_WAREHOUSE_BACKTEST) unless
-    # a caller forces it explicitly; MLB-only, so NBA/NFL stay byte-identical.
-    use_warehouse = (espn_sport == "baseball") and (
-        _mlb_warehouse_backtest_enabled() if warehouse_inputs is None
-        else bool(warehouse_inputs))
+    # P3/P4/P6: MLB sweep inputs (player gamelogs + team apparatus) come from the
+    # StatsAPI warehouse; NBA/NFL stay on ESPN. (ESPN fully removed for MLB in P4.)
+    use_warehouse = espn_sport == "baseball"
     if use_warehouse:
         print("=== MLB sweep inputs: StatsAPI warehouse (ESPN bypassed) ===")
     # Sweep mode + cushion-sweep mode always use the fine-grained offsets so
@@ -2536,8 +2509,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     season_label = f" (season {season_year})" if season_year else ""
     print(f"\n=== Fetching gamelogs for {len(players)} players{season_label} ===")
     player_data = fetch_player_data(espn_sport, espn_league, players,
-                                    season_year=season_year,
-                                    warehouse_inputs=use_warehouse)
+                                    season_year=season_year)
     if not player_data:
         print("No player data resolved. Aborting.")
         return
@@ -3995,11 +3967,6 @@ def main():
                         "'warehouse' forces the warehouse; 'store' forces the "
                         "local JSON. Under 'auto', a --store-label forces the "
                         "local JSON (the warehouse has no label concept).")
-    p.add_argument("--warehouse-inputs", action="store_true", default=None,
-                   help="MLB only (P3b/P6): source team schedules + player gamelogs "
-                        "from the StatsAPI warehouse instead of ESPN. Defaults to the "
-                        "ODI_MLB_WAREHOUSE_BACKTEST env flag when unset; ignored for "
-                        "NBA/NFL.")
     p.add_argument("--supplement-log", dest="supplement_log",
                    action="store_true", default=True,
                    help="(odds mode, live engine) Fold resolved market_prediction_"
@@ -4063,8 +4030,7 @@ def main():
                                 props=props, min_prior=args.min_sample,
                                 threshold_pct=args.threshold,
                                 store_label=args.store_label,
-                                write_calibration=args.write_calibration,
-                                warehouse_inputs=args.warehouse_inputs)
+                                write_calibration=args.write_calibration)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         run_odds_backtest(sport_key, espn_sport, espn_league,
@@ -4076,15 +4042,13 @@ def main():
                           variance_inflate=args.variance_inflate,
                           engine=args.engine, prob_shrink=args.prob_shrink,
                           source=args.source, supplement_log=args.supplement_log,
-                          min_shrink_n=args.min_shrink_n,
-                          warehouse_inputs=args.warehouse_inputs)
+                          min_shrink_n=args.min_shrink_n)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
                      min_sample=args.min_sample, season_year=args.season,
                      sweep=args.sweep, quantile_mode=args.quantile_mode,
-                     safe_target=args.safe_target,
-                     warehouse_inputs=args.warehouse_inputs)
+                     safe_target=args.safe_target)
     else:
         # Player-props mode
         if args.players:
@@ -4118,8 +4082,7 @@ def main():
                                   safe_target=args.safe_target,
                                   quantile_mode=args.quantile_mode,
                                   calibrate=args.calibrate,
-                                  cross_season=args.cross_season,
-                                  warehouse_inputs=args.warehouse_inputs)
+                                  cross_season=args.cross_season)
 
 
 if __name__ == "__main__":

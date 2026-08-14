@@ -314,14 +314,18 @@ class PlayerStatSeriesInProgressTests(unittest.TestCase):
     game so a same-day partial box score isn't graded as a final observation."""
 
     def test_in_progress_game_excluded(self):
+        # P4: MLB player logs come from the warehouse (get_calib_gamelog); the shared
+        # (date,value) tail still drops the in-progress (completed=False) game.
         import backtest
         gl = [
             {"game_date": "2024-07-24", "ER": 3.0, "IP": 6.0, "completed": False},
             {"game_date": "2024-07-20", "ER": 2.0, "IP": 6.0, "completed": True},
             {"game_date": "2024-07-15", "ER": 1.0, "IP": 6.0, "completed": True},
         ]
-        with patch.object(backtest, "cached_athlete_id", return_value="42"), \
-             patch.object(backtest, "cached_gamelog", return_value=gl):
+        with patch.object(mlb_starters, "resolve_mlbam_id",
+                          return_value=(543037, True)), \
+             patch("mlb_warehouse.get_calib_gamelog", return_value=gl), \
+             patch("mlb_warehouse._current_season", return_value=2024):
             out = backtest._player_stat_series("baseball", "mlb", "Ace",
                                                "pitcher_earned_runs")
         self.assertEqual(out, [("2024-07-15", 1.0), ("2024-07-20", 2.0)])
