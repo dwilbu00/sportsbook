@@ -486,6 +486,55 @@ def save_prob_shrink(sport_key, shrink, meta=None, holdout=None):
         json.dump(blob, f, indent=2)
 
 
+def load_value_gate(sport_key):
+    """Load the player-prop recommendation-gate config, e.g.:
+        {"ev_floor": 0.04, "edge_floor": 0.01, "suppress": ["pitcher_outs"]}
+    ``ev_floor``/``edge_floor`` are fractions; a prop is flagged value only when
+    its EV at the DK price >= ev_floor AND its fair-market edge >= edge_floor, and
+    never when its key is in ``suppress``. Returns {} when none is configured —
+    the analyzer then falls back to the legacy edge-threshold gate (edge >=
+    threshold_pct AND EV > 0), so untuned sports are unaffected. Failures silent.
+    """
+    if not sport_key:
+        return {}
+    gate = _load_blob(sport_key).get("value_gate", {})
+    if not isinstance(gate, dict):
+        return {}
+    # Coerce/validate field types so a misconfigured block fails SAFE rather than
+    # silently mis-gating: a string ev_floor/edge_floor would raise at the gate
+    # comparison, and a string ``suppress`` would iterate into per-character keys
+    # (disabling real suppression). Drop bad numerics (→ legacy gate) and accept a
+    # bare-string suppress as a single-key list.
+    out = {}
+    for key in ("ev_floor", "edge_floor"):
+        v = gate.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[key] = float(v)
+    supp = gate.get("suppress")
+    if isinstance(supp, str):
+        out["suppress"] = [supp]
+    elif isinstance(supp, (list, tuple, set)):
+        out["suppress"] = [str(s) for s in supp]
+    return out
+
+
+def save_value_gate(sport_key, gate, meta=None):
+    """Persist the player-prop recommendation-gate config, preserving other
+    blocks (props/prob_shrink/...). Replaces the value_gate block wholesale (it's
+    small + selected as one unit, unlike the per-market prob_shrink merge)."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_write_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["value_gate"] = gate
+    if meta:
+        if not isinstance(blob.get("meta"), dict):
+            blob["meta"] = {}
+        blob["meta"]["value_gate"] = meta
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
 # ─── season-aware date helpers ────────────────────────────────────────────
 
 def _season_start_iso(now=None, sport_key=None):

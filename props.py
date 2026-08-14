@@ -15,6 +15,7 @@ from calibration_loader import (
     count_current_season_games,
     load_calibration,
     load_lineup_adjustment,
+    load_value_gate,
 )
 from odds_client import PROP_LABELS
 from park_factors import PROP_PARK_KIND, park_factor
@@ -894,6 +895,44 @@ def _player_prop_half_life(sport_key):
 _DK_SELFDEVIG_EDGE_MULT = 2.0
 
 
+def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
+                        suppress, legacy_threshold, dk_alone):
+    """Recommendation-gate decision for one prop side (pure + unit-testable).
+
+    Two gate shapes, selected by whether a calibrated ``ev_floor`` is present:
+      * ROI-primary (value_gate configured): profit-led — take the bet when its
+        EV at the DK price >= ``ev_floor`` AND its fair-market edge >= ``edge_floor``
+        (a light sanity floor that the model agrees the bet beats the fair market).
+        Backtested via refit_calibration --gate-diag; beats the legacy gate on
+        realized holdout ROI (esp. long-odds / generous-DK-price bets a flat edge
+        floor wrongly suppressed).
+      * legacy edge-threshold gate (no value_gate): edge >= ``legacy_threshold``
+        AND EV > 0 (see _prop_is_value / P1.1) — unchanged for untuned sports.
+
+    ``dk_alone`` (DK is the sole book at this line → degraded de-vig, no
+    independent market check) requires MORE margin in both shapes: the legacy gate
+    doubles its edge threshold, and the ROI-primary gate doubles BOTH its EV floor
+    and its edge floor by _DK_SELFDEVIG_EDGE_MULT — so a miscalibrated model can't
+    rubber-stamp a DK-only line off a thin EV any more than off a thin edge. A prop
+    in ``suppress`` is never value (e.g. a market that loses under every
+    calibration method, pending a projection fix).
+    """
+    if prop_key in (suppress or ()):
+        return False
+    if ev_floor is not None:
+        ev = ev_floor
+        floor = (edge_floor or 0.0)
+        if dk_alone:
+            ev *= _DK_SELFDEVIG_EDGE_MULT
+            floor *= _DK_SELFDEVIG_EDGE_MULT
+        return (expected_roi is not None
+                and expected_roi >= ev
+                and edge >= floor)
+    eff_threshold = (legacy_threshold * _DK_SELFDEVIG_EDGE_MULT if dk_alone
+                     else legacy_threshold)
+    return _prop_is_value(edge, eff_threshold, expected_roi)
+
+
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
@@ -924,6 +963,14 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # Persistent per-(sport, prop) calibration overrides the in-code defaults
     # when available; absent file → falls back to defaults below.
     calibration = load_calibration(sport_key) if sport_key else {}
+    # Recommendation gate config. When a value_gate is calibrated, the gate is
+    # ROI-primary (EV >= ev_floor AND edge >= edge_floor) + a per-prop suppress
+    # list; absent → legacy edge-threshold gate (edge >= threshold AND EV > 0).
+    # Backtested via refit_calibration --gate-diag; promoted like any calib block.
+    value_gate = load_value_gate(sport_key) if sport_key else {}
+    gate_ev_floor = value_gate.get("ev_floor")
+    gate_edge_floor = value_gate.get("edge_floor", 0.0) or 0.0
+    gate_suppress = set(value_gate.get("suppress") or [])
 
     # Self-updating Platt recalibration: on first call per process per sport,
     # resolve any past-game predictions to outcomes and refit Platt params
@@ -1747,15 +1794,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 dk_price,
             )
 
-            # Value requires clearing the fair-market edge AND being +EV at the
-            # DraftKings price (see _prop_is_value / P1.1). DK-alone guard: when DK
-            # is the sole book at its line (no independent market check), the de-vig
-            # degrades to DK-self-devig and the edge/EV gates collapse into one, so
-            # require a larger edge (else a miscalibrated model rubber-stamps it).
-            eff_threshold = threshold
-            if odds_info.get("market_implied_method") == "dk_selfdevig_fallback":
-                eff_threshold = threshold * _DK_SELFDEVIG_EDGE_MULT
-            is_value = _prop_is_value(edge, eff_threshold, expected_roi)
+            dk_alone = (odds_info.get("market_implied_method")
+                        == "dk_selfdevig_fallback")
+            is_value = _prop_gate_is_value(
+                edge, expected_roi, prop_key, gate_ev_floor, gate_edge_floor,
+                gate_suppress, threshold, dk_alone)
 
             # §2.4b-2 direction split: demote losing UNDER picks on cheap lines
             # (batter_hits under 0.5 wins only ~43% OOS) from recommendations.

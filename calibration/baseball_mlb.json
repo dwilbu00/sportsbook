@@ -71765,7 +71765,11 @@
         "n_log": 33
       }
     },
-    "warmup_present": true
+    "warmup_present": true,
+    "value_gate": {
+      "source": "refit_calibration --gate-diag A/B (2023-present real-line holdout)",
+      "basis": "EV>=4% & edge>=1% won slate ROI +3.3%/+59u vs current edge>=5% +2.0%/+31u; pitcher_outs loses under every gate (projection issue)"
+    }
   },
   "prob_shrink": {
     "spreads": 0.25,
@@ -71970,5 +71974,12 @@
       }
     },
     "_note": "Announced batting order adjusts expected at-bats for batter hits only; strikeout exposure failed forward validation and remains disabled."
+  },
+  "value_gate": {
+    "ev_floor": 0.04,
+    "edge_floor": 0.01,
+    "suppress": [
+      "pitcher_outs"
+    ]
   }
 }

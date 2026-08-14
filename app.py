@@ -155,6 +155,12 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
             except Exception as e:
                 warnings.append(f"Failed to fetch alt lines for event {eid}: {e}")
 
+    # value_gate suppression applies in EVERY mode: a suppressed market must never
+    # be recommended, and the safe-mode alt path below re-decides is_value outside
+    # the standard props gate, so re-apply the suppress list here.
+    from calibration_loader import load_value_gate
+    _gate_suppress = set(load_value_gate(sport_key).get("suppress") or [])
+
     # Attach alt prices to safe-mode prop candidates.
     for c in all_props:
         if not c.get("safe_mode") or not c.get("event_id"):
@@ -176,7 +182,8 @@ def fetch_and_attach_alt_lines(ar, api_key, sport_key, bookmakers_str):
             c["expected_roi_pct"] = round(expected_roi * 100, 2)
             c["best_price"] = match["over_price"]
             c["value_pending"] = False
-            c["is_value"] = edge >= (ar.get("threshold_pct", 5.0) / 100.0)
+            c["is_value"] = (edge >= (ar.get("threshold_pct", 5.0) / 100.0)
+                             and c["prop"] not in _gate_suppress)
         if ladder:
             c["alt_ladder"] = ladder
 

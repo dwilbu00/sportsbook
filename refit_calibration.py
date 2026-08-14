@@ -1827,6 +1827,169 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
     print("\n  (Diagnostic only — nothing written.)")
 
 
+def _roi_sim_gate(rows, ev_floor, edge_floor):
+    """Slate ROI sim under a parameterized recommendation gate.
+
+    Each row already carries ``r['p_ship']`` (the SHIPPED method's P(over)).
+    Backs the higher-edge side (vs de-vigged ``mkt_over``) and takes the bet only
+    when ``edge >= edge_floor AND expected_roi >= ev_floor`` — a generalization of
+    _prop_is_value that lets us A/B the edge-floor gate against an EV-primary gate.
+    Flat 1u payoff (win = dec-1, loss = -1); unpriced rows skipped.
+    Returns {n_bets, pnl, roi, hit}."""
+    from pricing_common import _expected_roi
+    pnl = won = 0.0
+    n_bets = 0
+    for r in rows:
+        if (r["mkt_over"] is None or r["over_dec"] is None
+                or r["under_dec"] is None):
+            continue
+        p = r["p_ship"]
+        over_edge = p - r["mkt_over"]
+        if over_edge > 0.0:
+            side_prob, price, dec, edge, over = (
+                p, r["over_price"], r["over_dec"], over_edge, True)
+        else:
+            side_prob, price, dec, edge, over = (
+                1.0 - p, r["under_price"], r["under_dec"], -over_edge, False)
+        er = _expected_roi(side_prob, price)
+        if er is None or edge < edge_floor or er < ev_floor:
+            continue
+        win = (r["o"] == 1) if over else (r["o"] == 0)
+        pnl += (dec - 1.0) if win else -1.0
+        won += 1.0 if win else 0.0
+        n_bets += 1
+    return {"n_bets": n_bets, "pnl": pnl,
+            "roi": (pnl / n_bets) if n_bets else None,
+            "hit": (won / n_bets) if n_bets else None}
+
+
+def diagnose_gate(sport, store_label=""):
+    """Value-GATE lens (NO WRITE): replay each prop's SHIPPED method through a set
+    of recommendation GATES over the real-line holdout and report aggregate flat-1u
+    ROI + volume per gate, so the current edge-floor gate can be A/B'd against
+    EV-primary gates (the "what makes a bet a suggestion?" question).
+
+    Same population + chronological 50/50 split + shipped-method params as
+    diagnose_roi (params fit on TRAIN; gate simulated on TEST). Consensus-priced
+    (OPTIMISTIC vs DK) but the price is common across gates, so the RELATIVE gate
+    ranking is sound. batter_hits' shipped xBA blend is approximated by the plain
+    projection here (consistent across gates). INFORMS the gate choice; writes
+    nothing."""
+    import book_line_calibration as blc
+    from props import PROP_NEGBIN_ELIGIBLE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = sorted(existing.keys())
+    if not props_to_check:
+        print(f"No calibrated props in calibration/{sport_key}.json; run refit first.")
+        return
+
+    print(f"\n=== VALUE-GATE lens (A/B recommendation gates): {sport_key} ===")
+    print("  ⚠ Consensus-priced (optimistic vs DK) + shipped-method params on a")
+    print("    chronological TEST half; the price is common across gates so the")
+    print("    RELATIVE gate ranking is sound. batter_hits xBA approx by plain proj.")
+
+    book_lines, _n_store, _n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _defense_lookup(espn_sport, espn_league)
+
+    slate = []            # all props' TEST rows carrying r['p_ship']
+    per_prop_rows = {}     # prop_key -> its TEST rows (for the per-prop breakdown)
+    for prop_key in props_to_check:
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        rows = _roi_build_rows(enriched, params, sport_key, prop_key,
+                               team_defense, league_avg_def)
+        rows = [r for r in rows if r["actual"] != r["line"]]
+        if len(rows) < 40:
+            continue
+        rows.sort(key=lambda r: r["game_date"])
+        split = len(rows) // 2
+        train, test = rows[:split], rows[split:]
+        resid = sorted(r["actual"] - r["projected"] for r in train)
+        mu = sum(resid) / len(resid)
+        var = sum((x - mu) ** 2 for x in resid) / len(resid)
+        sigma = math.sqrt(var) if var > 0 else 1e-6
+        nb = (blc._fit_negbin_real(train)
+              if prop_key in PROP_NEGBIN_ELIGIBLE else None)
+
+        kept = []
+        for r in test:
+            r["o"] = 1 if r["actual"] > r["line"] else 0
+            corrected = r["projected"] + mu
+            if incumbent == "A":
+                p = max(0.0, min(1.0, r["empirical_over"]))
+            elif incumbent == "B":
+                p = blc._norm_cdf((corrected - r["line"]) / sigma)
+            elif incumbent == "C":
+                p = 1.0 - blc._empirical_cdf(resid, r["line"] - corrected)
+            elif incumbent == "E" and nb is not None:
+                ms, disp = nb
+                p = blc.negbin_at_least(int(r["line"]) + 1,
+                                        max(1e-9, ms * r["projected"]), disp)
+            else:
+                continue     # D/other shipped methods not simulated here
+            if r["mkt_over"] is None:
+                continue
+            r["p_ship"] = p
+            kept.append(r)
+        if kept:
+            per_prop_rows[prop_key] = kept
+            slate.extend(kept)
+
+    if not slate:
+        print("  No priced shipped-method test rows; nothing to compare.")
+        return
+
+    GATES = [
+        ("current  edge>=5% & EV>0", 1e-9, 0.05),
+        ("flat     edge>=3% & EV>0", 1e-9, 0.03),
+        ("ROI-1    EV>=2% & edge>=1%", 0.02, 0.01),
+        ("ROI-2    EV>=3% & edge>=1%", 0.03, 0.01),
+        ("ROI-3    EV>=4% & edge>=1%", 0.04, 0.01),
+        ("ROI-4    EV>=5% & edge>=1%", 0.05, 0.01),
+    ]
+    print(f"\n  SLATE-WIDE (all shipped methods, {len(slate)} priced test rows):")
+    print("    {:<28}{:>8}{:>9}{:>8}{:>10}".format(
+        "gate", "n_bets", "ROI%", "hit%", "P/L(u)"))
+    for label, ev_floor, edge_floor in GATES:
+        s = _roi_sim_gate(slate, ev_floor, edge_floor)
+        roi_s = f"{s['roi'] * 100:+.1f}" if s["roi"] is not None else "-"
+        hit_s = f"{s['hit'] * 100:.1f}" if s["hit"] is not None else "-"
+        print("    {:<28}{:>8}{:>9}{:>8}{:>+10.2f}".format(
+            label, s["n_bets"], roi_s, hit_s, s["pnl"]))
+
+    print("\n  PER-PROP (n_bets / ROI% under each gate):")
+    hdr = "    {:<22}" + "{:>15}" * len(GATES)
+    print(hdr.format("prop", *[g[0].split()[0] for g in GATES]))
+    for prop_key in sorted(per_prop_rows):
+        cells = []
+        for _label, ev_floor, edge_floor in GATES:
+            s = _roi_sim_gate(per_prop_rows[prop_key], ev_floor, edge_floor)
+            roi_s = f"{s['roi'] * 100:+.0f}" if s["roi"] is not None else "-"
+            cells.append(f"{s['n_bets']}/{roi_s}")
+        print(hdr.format(prop_key, *cells))
+    print("\n  (Diagnostic only — nothing written.)")
+
+
 # ── §2.6 candidate-feature evaluation harness (NO WRITE) ──
 # Generalizes the confirmation-gate philosophy across a curated FEATURE set
 # (prop_features.FEATURE_REGISTRY): for each calibrated prop and each candidate
@@ -2827,6 +2990,12 @@ def main():
     p.add_argument("--roi-threshold-pct", type=float, default=5.0,
                    help="Edge threshold (percent) the --roi-diag gate requires, "
                         "matching props.analyze_player_props_value (default 5.0).")
+    p.add_argument("--gate-diag", action="store_true",
+                   help="Value-GATE lens: replay each prop's SHIPPED method through "
+                        "the current edge-floor gate vs EV-primary gates over the "
+                        "real-line holdout, and report aggregate + per-prop ROI/"
+                        "volume per gate (answers 'what should make a bet a "
+                        "suggestion?'). No write.")
     p.add_argument("--roi-xstats-strength", type=float, default=0.0,
                    help="xBA blend weight for method D under --roi-diag. >0 builds "
                         "the leakage-safe as-of xBA index (needs cached raw "
@@ -2938,6 +3107,10 @@ def main():
         diagnose_roi(args.sport, store_label=args.store_label,
                      threshold_pct=args.roi_threshold_pct,
                      xstats_strength=args.roi_xstats_strength)
+        return
+
+    if args.gate_diag:
+        diagnose_gate(args.sport, store_label=args.store_label)
         return
 
     if args.reliability:
