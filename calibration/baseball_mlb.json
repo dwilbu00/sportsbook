@@ -72000,9 +72000,9 @@
     },
     "starter_adjustment": {
       "team_markets": {
-        "source": "backtest_starters:2021,2022,2023,2024",
+        "source": "backtest_starters:2023,2024,2025,2026",
         "fit": true,
-        "n_games": 7915
+        "n_games": 7197
       },
       "props": {
         "source": "backtest_props:2024,2025",
@@ -72338,8 +72338,8 @@
   },
   "starter_adjustment": {
     "enabled": true,
-    "moneyline": 1.896,
-    "run_scale": 2.169,
+    "moneyline": 1.531,
+    "run_scale": 1.82,
     "props": {
       "batter_hits": 0.5,
       "batter_strikeouts": 0.5,
@@ -72347,10 +72347,10 @@
       "pitcher_outs": 0.0,
       "pitcher_earned_runs": 0.0
     },
-    "bullpen": 1.115,
+    "bullpen": 1.836,
     "bvp": 0.0,
-    "_note": "per-prop weights fit from 2024,2025; chronological holdout starts 2025-01-01; live recent window =20; two rolling validation folds required; selected {'batter_hits': 0.5, 'batter_strikeouts': 0.5, 'pitcher_strikeouts': 0.0, 'pitcher_outs': 0.0, 'pitcher_earned_runs': 0.0}. method-A props read empirical over-rate at shifted line (safe).",
-    "spreads": 5.261
+    "_note": "moneyline/spreads/run_scale/bullpen fit from 2023,2024,2025,2026 (7197 games, 7197 w/ bullpen); moneyline & spreads use the innings-weighted edge; independently fitted prop weights and bvp setting preserved.",
+    "spreads": 4.319
   },
   "expected_runs_challenger": {
     "enabled": true,
