@@ -24,6 +24,7 @@ from backtest import (
     SPORT_MAP, DEFAULT_STARTERS, DEFAULT_PROPS, VARIANT_PRESETS,
     _build_props_sweep_grid, _evaluate_calibration_methods,
     _score_calibration_methods, _team_defense_lookup,
+    _mlb_warehouse_defense_lookup,
     run_player_props_backtest,
 )
 from calibration_loader import (
@@ -33,6 +34,20 @@ from calibration_loader import (
 )
 from espn_cache import seed_athlete_id
 from espn_client import list_season_athletes
+
+
+def _defense_lookup(espn_sport, espn_league, season_year=None):
+    """Opponent-defense lookup for the calibration/diagnostic paths.
+
+    MLB routes to the warehouse (mlb_game scores, canonical StatsAPI names that
+    match the warehouse-joined obs) so no calibration path touches ESPN — the
+    live-analog of the sweep's own defense source. Other sports keep the ESPN
+    schedule lookup. Same (avg_lookup, series_lookup, league_avg) return shape.
+    """
+    if espn_sport == "baseball":
+        return _mlb_warehouse_defense_lookup(season_year=season_year)
+    return _team_defense_lookup(espn_sport, espn_league, season_year=season_year)
+
 
 # A non-empirical method (B pooled-Gaussian / C pooled-ECDF) must beat the
 # empirical baseline (method A) by at least this much holdout Brier AND confirm
@@ -869,7 +884,7 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in existing):
         print("  Building team-defense lookup (a variant uses opp_defense)...")
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     # ── P2.4a: leakage-safe as-of xBA index for the projection blend ──
@@ -1154,7 +1169,7 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
     # Weight-side opp-defense lookup only if the shipped variant uses it.
     team_defense, league_avg_def = {}, None
     if (cfg.get("opp_defense_strength") or 0.0) > 0:
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     # Leakage-safe as-of xBA + contact-quality indices from the raw pitch cache.
@@ -1363,7 +1378,7 @@ def diagnose_negbin(sport, store_label=""):
     team_defense, league_avg_def = {}, None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     from props import PROP_XSTATS_KIND
@@ -1487,7 +1502,7 @@ def diagnose_center(sport, prop_filter=None, store_label=""):
     team_defense, league_avg_def = {}, None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     for prop_key in props_to_check:
@@ -1710,7 +1725,7 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
     team_defense, league_avg_def = {}, None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     # Leakage-safe as-of xBA index for method D, only if requested (mirror
@@ -1927,7 +1942,7 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label=""):
     team_defense, league_avg_def = {}, None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
 
     threshold = 0.05   # edge threshold for the ROI sim (matches diagnose_roi)
@@ -2240,7 +2255,7 @@ def _cc_load_scored_rows(sport, store_label=""):
     # Weight-side opp-defense lookup only if the shipped variant uses it.
     team_defense, league_avg_def = {}, None
     if (cfg.get("opp_defense_strength") or 0.0) > 0:
-        team_defense, _, league_avg_def = _team_defense_lookup(
+        team_defense, _, league_avg_def = _defense_lookup(
             espn_sport, espn_league)
     params = {
         "half_life": cfg.get("half_life"),

@@ -387,6 +387,10 @@ DEFAULT_PLAYER_PROP_REST_STRENGTH = 0.0
 # Widening this needs an espn_client.PROP_STAT_MAP entry + a synthetic refit first.
 PROP_NEGBIN_ELIGIBLE = {
     "pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs", "batter_hits",
+    # Total bases / RBI are low-count, over-dispersed per-game integer counts —
+    # the same shape NegBin (method E) models well. Eligibility only makes E a
+    # CANDIDATE in the real-line selection; it ships only if it clears the gate.
+    "batter_total_bases", "batter_rbis",
 }
 
 
