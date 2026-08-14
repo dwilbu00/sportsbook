@@ -813,114 +813,6 @@ def ip_to_outs(ip):
     return whole * 3 + frac
 
 
-def outs_to_ip(outs):
-    """Inverse of ip_to_outs: an out count -> IP notation (X.0/.1/.2).
-
-    Used to synthesize per-game IP estimates (get_pitcher_stats) that downstream
-    code converts back via ip_to_outs — so the average must be taken in OUT space
-    and re-encoded here, never divided as a decimal. Rounds a fractional out
-    count to the nearest whole out."""
-    if outs is None:
-        return None
-    total = int(round(outs))
-    whole = total // 3
-    rem = total - whole * 3
-    return whole + rem / 10.0
-
-
-def get_pitcher_stats(league, athlete_id, season=None):
-    """
-    Fetch pitcher stats from ESPN splits endpoint.
-    The gamelog endpoint doesn't support MLB pitchers, so we use splits
-    to get per-opponent game data which approximates game-by-game stats.
-
-    Parameters:
-        league (str): ESPN league (e.g., 'mlb')
-        athlete_id (str): ESPN athlete ID
-        season (int): Season year (default: current)
-
-    Returns:
-        list: List of dicts with per-game-approximated pitching stats,
-              each containing keys like 'K', 'IP', 'H', 'ER', 'BB', 'GP'
-    """
-    url = f"https://site.web.api.espn.com/apis/common/v3/sports/baseball/{league}/athletes/{athlete_id}/splits"
-    params = {}
-    if season:
-        params["season"] = season
-
-    try:
-        resp = requests.get(url, params=params, timeout=TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return []
-
-    labels = data.get("labels", [])
-    if not labels:
-        return []
-
-    # Get overall season totals to compute per-start averages
-    games = []
-    overall_stats = None
-
-    for sc in data.get("splitCategories", []):
-        cat_name = sc.get("displayName", "")
-
-        if cat_name == "Overall":
-            for sp in sc.get("splits", []):
-                stats = sp.get("stats", [])
-                if len(labels) == len(stats):
-                    overall_stats = _parse_stat_row(labels, stats)
-
-        # Per-opponent splits give us the closest to game-by-game data
-        if cat_name == "Opponent":
-            for sp in sc.get("splits", []):
-                stats = sp.get("stats", [])
-                if len(labels) == len(stats):
-                    row = _parse_stat_row(labels, stats)
-                    gp = row.get("GP", 1)
-                    # Expand per-opponent aggregates into per-game estimates
-                    for _ in range(max(1, int(gp))):
-                        game_row = {}
-                        for key, val in row.items():
-                            if key in ("ERA", "WHIP", "W%", "OBA"):
-                                game_row[key] = val  # rates stay as-is
-                            elif key == "GP":
-                                game_row[key] = 1
-                            elif key == "IP":
-                                # IP is base-3 notation: average in OUT space,
-                                # then re-encode so the downstream ip_to_outs
-                                # converter reads it correctly (dividing the
-                                # notation as a decimal scrambles the outs).
-                                game_row[key] = (outs_to_ip(ip_to_outs(val) / gp)
-                                                 if gp > 0 else val)
-                            else:
-                                game_row[key] = round(val / gp, 1) if gp > 0 else val
-                        games.append(game_row)
-
-    # If no per-opponent data, create per-start averages from overall
-    if not games and overall_stats:
-        gs = overall_stats.get("GS", overall_stats.get("GP", 1))
-        if gs < 1:
-            gs = 1
-        for _ in range(int(gs)):
-            game_row = {}
-            for key, val in overall_stats.items():
-                if key in ("ERA", "WHIP", "W%", "OBA"):
-                    game_row[key] = val
-                elif key in ("GP", "GS"):
-                    game_row[key] = 1
-                elif key == "IP":
-                    # Average IP in OUT space, then re-encode (see the per-
-                    # opponent branch above).
-                    game_row[key] = outs_to_ip(ip_to_outs(val) / gs)
-                else:
-                    game_row[key] = round(val / gs, 1)
-            games.append(game_row)
-
-    return games
-
-
 def _parse_stat_row(labels, stats_list):
     """
     Parse a row of stat values into a dict, converting strings to floats.
@@ -1205,9 +1097,9 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     # Durable SQL path (Phase C): swap ONLY the two source lookups so the exact
     # extraction/return below is reused (identical result-dict shape). Gated on a
     # sport that has a fact table; other sports (e.g. NHL) keep the direct path
-    # unchanged. gamelog_store.get_gamelog handles the MLB pitcher fallback.
+    # unchanged. (MLB never reaches here — it's warehouse-only / fails closed above.)
     use_sql = (db_store is not None and db_store.enabled()
-               and sport in ("baseball", "basketball", "football"))
+               and sport in ("basketball", "football"))
     if use_sql:
         import gamelog_store
         athlete = gamelog_store.get_athlete_id(sport, league, player_name,
@@ -1229,14 +1121,6 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         result["team_id"] = athlete.get("team_id")
 
         gamelog = get_athlete_gamelog(sport, league, athlete["id"])
-
-        # For MLB pitchers, the gamelog endpoint returns empty. Prefer the TRUE
-        # StatsAPI per-game log (real variance + game_date); fall back to the
-        # synthesized ESPN splits when the name can't be resolved.
-        if not gamelog and sport == "baseball":
-            import mlb_starters
-            gamelog = mlb_starters._pitcher_gamelog_or_synth(
-                league, athlete["id"], player_name, None)
 
         if not gamelog:
             return result

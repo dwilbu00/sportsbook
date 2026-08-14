@@ -1500,14 +1500,6 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
         if not aid:
             return []
         gamelog = cached_gamelog(espn_sport, espn_league, aid, player_name=name) or []
-        if not gamelog and espn_sport == "baseball" and prop_key in (
-                "pitcher_outs", "pitcher_strikeouts", "pitcher_earned_runs"):
-            # Real StatsAPI per-game log (dated) when the name resolves; otherwise the
-            # synthesized ESPN splits, whose dateless rows are dropped by the
-            # (date, value) filter below.
-            import mlb_starters
-            gamelog = mlb_starters._pitcher_gamelog_or_synth(
-                espn_league, aid, name, None) or []
     # Never resolve a pitcher prop from a batter's gamelog (or vice-versa): the
     # "K"/"SO" strikeout labels collide across roles (see _role_matches_gamelog).
     if not _role_matches_gamelog(prop_key, gamelog):

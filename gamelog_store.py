@@ -197,44 +197,23 @@ def _now():
 # ESPN fetch (raw) + classification
 # ──────────────────────────────────────────────────────────────────────────────
 def _sport_has_table(sport):
-    return sport in ("baseball", "basketball", "football")
+    return sport in ("basketball", "football")
 
 
-def _fetch_espn(sport, league, athlete_id, season_year, player_name=None):
-    """Fetch the raw gamelog exactly as espn_cache does. Returns
-    (rows, via_pitcher_fallback).
-
-    For MLB, an empty standard gamelog (pitchers have none) falls back to the
-    per-game log: TRUE StatsAPI data when ``player_name`` is known, else the
-    synthesized ESPN season-splits. ``player_name=None`` -> synth only, matching
-    the historical behavior byte-for-byte."""
+def _fetch_espn(sport, league, athlete_id, season_year):
+    """Fetch the raw ESPN gamelog for NBA/NFL. (MLB is warehouse-only post-P6, so the
+    old empty-gamelog pitcher/synth fallback is gone.)"""
     from espn_client import get_athlete_gamelog
-    gamelog = get_athlete_gamelog(sport, league, athlete_id,
-                                  season_year=season_year)
-    via_pitcher = False
-    if not gamelog and sport == "baseball":
-        try:
-            import mlb_starters
-            gamelog = mlb_starters._pitcher_gamelog_or_synth(
-                league, athlete_id, player_name, season_year)
-        except Exception:
-            gamelog = []
-        via_pitcher = True
-    return (gamelog or []), via_pitcher
+    return get_athlete_gamelog(sport, league, athlete_id,
+                               season_year=season_year) or []
 
 
-def _classify(sport, rows, via_pitcher):
-    """player_type for the fetched rows. Sport first; within baseball, pitcher =
-    has 'IP' (pitcher-exclusive), else batter (never key on 'H' -- pitcher rows
-    contain H). The splits fallback is always pitcher."""
+def _classify(sport, rows):
+    """player_type for the fetched rows (NBA/NFL only — MLB is warehouse-only)."""
     if sport == "basketball":
         return "nba"
     if sport == "football":
         return "nfl"
-    if sport == "baseball":
-        if via_pitcher or any("IP" in r for r in rows):
-            return "pitcher"
-        return "batter"
     return None
 
 
@@ -406,13 +385,11 @@ def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None,
 
     Returns the full gamelog (most-recent-first, same shape as
     get_athlete_gamelog); the caller applies any [:n] slice. Sports without a
-    fact table (NFL/other) pass through to the direct ESPN fetch with no
-    persistence. ``player_name`` (optional) enables the TRUE StatsAPI per-game
-    pitcher log fallback for MLB; omitted -> synthesized splits as before."""
+    fact table (NHL/other) pass through to the direct ESPN fetch with no
+    persistence. ``player_name`` is accepted for call-site compatibility but no
+    longer used (MLB is warehouse-only post-P6)."""
     if not _sport_has_table(sport):
-        rows, _ = _fetch_espn(sport, league, athlete_id, season_year,
-                              player_name=player_name)
-        return rows
+        return _fetch_espn(sport, league, athlete_id, season_year)
 
     bucket = int(season_year) if season_year else 0
     ttl_hours = _resolve_ttl(ttl_hours, bucket)
@@ -431,9 +408,8 @@ def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None,
             if _meta_fresh(meta, ttl_hours):
                 return _read_rows(conn, meta["player_type"], athlete_id, bucket)
 
-        rows, via_pitcher = _fetch_espn(sport, league, athlete_id, season_year,
-                                        player_name=player_name)
-        player_type = _classify(sport, rows, via_pitcher)
+        rows = _fetch_espn(sport, league, athlete_id, season_year)
+        player_type = _classify(sport, rows)
 
         for attempt in range(3):
             try:
@@ -472,27 +448,6 @@ def get_gamelog(sport, league, athlete_id, season_year=None, ttl_hours=None,
     return rows
 
 
-def _mlb_espn_id(name):
-    """Authoritative ESPN athlete id for an MLB player via the SFBB cross-map, or
-    None. Tries the name directly, then bridges name -> MLBAM -> ESPN. Fail-open:
-    a missing map / SQL-off / ambiguous name simply returns None so the caller
-    falls back to search_athlete."""
-    try:
-        import player_id_map
-    except Exception:                       # pragma: no cover - import guard
-        return None
-    try:
-        eid = player_id_map.espn_id_for_name(name)
-        if eid:
-            return eid
-        mid = player_id_map.mlb_id_for_name(name)
-        if mid:
-            return player_id_map.espn_id_for_mlb_id(mid)
-    except Exception:                       # pragma: no cover - never break lookup
-        return None
-    return None
-
-
 def _put_athlete_cache(sport, league, name_lower, team_key, row):
     """WS15: surgical upsert of the single athlete_id_cache row keyed by
     (sport, league, player_name_lower, team_key) via db_store.reconcile — an
@@ -519,10 +474,9 @@ def _put_athlete_cache(sport, league, name_lower, team_key, row):
 
 def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOURS):
     """Durable name->id lookup. Returns {'id','name','team_id'} or None, matching
-    espn_client.search_athlete. Works for all sports (sport-agnostic cache).
-
-    For MLB, an authoritative ESPN id is seeded from the SFBB cross-map on a cache
-    miss (skipping search_athlete's lossy first-name match entirely)."""
+    espn_client.search_athlete. Works for all sports (sport-agnostic cache); on a
+    cache miss it resolves via search_athlete. (MLB is warehouse-only post-P6 and no
+    longer reaches here.)"""
     name_lower = (name or "").lower()
     team_key = "|".join(sorted(str(t) for t in team_ids if t)) if team_ids else ""
     engine = db_store.get_engine()
@@ -547,15 +501,6 @@ def get_athlete_id(sport, league, name, team_ids=None, ttl_hours=ATHLETE_TTL_HOU
             m = row._mapping
             return ({"id": m["athlete_id"], "name": m["name"] or name,
                      "team_id": m["team_id"]} if m["athlete_id"] else None)
-
-    # MLB: seed the AUTHORITATIVE ESPN athlete id from the SFBB cross-map before
-    # falling back to search_athlete's lossy first-name match (the "two Will
-    # Smiths" bug). Fail-open — any miss/unavailable map drops through to search.
-    if sport == "baseball":
-        eid = _mlb_espn_id(name)
-        if eid:
-            seed_athlete_id(sport, league, name, eid, team_ids=team_ids)
-            return {"id": str(eid), "name": name, "team_id": None}
 
     from espn_client import search_athlete
     athlete = search_athlete(sport, league, name, team_ids=team_ids)

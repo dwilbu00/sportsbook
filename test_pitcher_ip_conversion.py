@@ -28,61 +28,6 @@ class IpHelperTests(unittest.TestCase):
         self.assertEqual(f(0.0), 0)
         self.assertIsNone(f(None))
 
-    def test_outs_to_ip(self):
-        g = espn_client.outs_to_ip
-        self.assertEqual(g(18), 6.0)
-        self.assertEqual(g(19), 6.1)
-        self.assertEqual(g(20), 6.2)
-        self.assertEqual(g(0), 0.0)
-        self.assertIsNone(g(None))
-
-    def test_roundtrip_for_valid_notation(self):
-        for ip in (0.0, 5.0, 5.1, 5.2, 6.0, 6.1, 6.2, 7.1, 9.0):
-            self.assertAlmostEqual(
-                espn_client.outs_to_ip(espn_client.ip_to_outs(ip)), ip)
-
-
-class SplitsFallbackTests(unittest.TestCase):
-    """Cluster 4: get_pitcher_stats must average IP in OUT space, not decimal."""
-
-    def _resp(self, payload):
-        class _R:
-            def raise_for_status(self_):
-                pass
-
-            def json(self_):
-                return payload
-        return _R()
-
-    def test_opponent_split_ip_averaged_in_outs(self):
-        # 16.1 IP (= 49 outs) over gp=3 -> 16.3 outs/game -> 16 outs -> 5.1 IP.
-        # The old decimal path gave round(16.1/3,1)=5.4 -> a bogus 19 outs.
-        payload = {"labels": ["GP", "IP", "K"],
-                   "splitCategories": [
-                       {"displayName": "Opponent",
-                        "splits": [{"stats": ["3", "16.1", "24"]}]}]}
-        with patch.object(espn_client.requests, "get",
-                          return_value=self._resp(payload)):
-            rows = espn_client.get_pitcher_stats("mlb", "1")
-        self.assertEqual(len(rows), 3)
-        for r in rows:
-            self.assertEqual(r["IP"], 5.1)
-            self.assertEqual(espn_client.ip_to_outs(r["IP"]), 16)
-
-    def test_overall_fallback_ip_averaged_in_outs(self):
-        # 100.0 IP (= 300 outs) over GS=15 -> 20 outs/game -> 6.2 IP.
-        # The old decimal path gave round(100/15,1)=6.7 -> a bogus 25 outs.
-        payload = {"labels": ["GS", "IP"],
-                   "splitCategories": [
-                       {"displayName": "Overall",
-                        "splits": [{"stats": ["15", "100.0"]}]}]}
-        with patch.object(espn_client.requests, "get",
-                          return_value=self._resp(payload)):
-            rows = espn_client.get_pitcher_stats("mlb", "2")
-        self.assertEqual(len(rows), 15)
-        self.assertEqual(rows[0]["IP"], 6.2)
-        self.assertEqual(espn_client.ip_to_outs(rows[0]["IP"]), 20)
-
 
 class GradingFallbackTests(unittest.TestCase):
     """Cluster 1 (P6 cutover): MLB grades from the WAREHOUSE + statsapi ONLY. When

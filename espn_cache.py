@@ -139,8 +139,8 @@ def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
     season and the cache file is keyed by season so different seasons
     don't collide.
 
-    `player_name` (optional) enables the TRUE StatsAPI per-game pitcher log for
-    MLB; omitted -> synthesized ESPN splits, byte-identical to before.
+    `player_name` is accepted for call-site compatibility but no longer used
+    (MLB is warehouse-only post-P6; this path serves NBA/NFL).
 
     Set ODI_GAMELOG_TTL_HOURS env var to override (e.g., "8760" for a year).
     """
@@ -168,17 +168,8 @@ def cached_gamelog(espn_sport, espn_league, athlete_id, ttl_hours=24 * 30,
         if _is_fresh(path, ttl_hours if cached else NEGATIVE_TTL_HOURS):
             return cached
     gamelog = get_athlete_gamelog(espn_sport, espn_league, athlete_id,
-                                  season_year=season_year)
-    # MLB pitcher fallback: the standard gamelog endpoint returns nothing for
-    # pitchers. Prefer the TRUE StatsAPI per-game log when the name is known;
-    # otherwise fall back to the synthesized ESPN splits (per-game approximation).
-    if not gamelog and espn_sport == "baseball":
-        try:
-            import mlb_starters
-            gamelog = mlb_starters._pitcher_gamelog_or_synth(
-                espn_league, athlete_id, player_name, season_year)
-        except Exception:
-            gamelog = []
+                                  season_year=season_year) or []
+    # (MLB is warehouse-only post-P6; NBA/NFL have no pitcher/synth fallback.)
     with open(path, "w") as f:
         json.dump(gamelog, f)
     return gamelog
