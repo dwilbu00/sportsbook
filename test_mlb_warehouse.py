@@ -16,7 +16,6 @@ from sqlalchemy import insert, select
 
 import db_store
 import mlb_warehouse
-import mlb_warehouse_parity as parity
 
 
 # ─────────────────────────────────────────────────────────────────── fixtures
@@ -479,86 +478,6 @@ class StandingsTests(_Backend, unittest.TestCase):
         self._snapshot("2024-07-04")
         self._snapshot("2024-07-05")
         self.assertEqual(_count(mlb_warehouse.mlb_team_standings), 6)
-
-
-# ───────────────────────────────────────────────────────────── parity diff core
-class ParityDiffTests(unittest.TestCase):
-    def test_diff_value_maps(self):
-        a = {"x": 1.0, "y": 2.0, "z": 3.0}
-        b = {"x": 1.0, "y": 2.5, "w": 9.0}
-        rep = parity.diff_value_maps(a, b, tol=1e-6)
-        self.assertEqual(rep["compared"], 2)
-        self.assertEqual(rep["matches"], 1)
-        self.assertEqual(rep["mismatches"], 1)
-        self.assertEqual(rep["only_statsapi"], 1)
-        self.assertEqual(rep["only_espn"], 1)
-        self.assertAlmostEqual(rep["match_rate"], 0.5)
-
-    def test_statsapi_player_game_stats_batter(self):
-        m = parity.statsapi_player_game_stats(BOXSCORE, GAME, "batter", "H")
-        self.assertEqual(m[("aaron judge", "2024-07-04")], 2.0)
-        self.assertEqual(m[("rafael devers", "2024-07-04")], 1.0)
-        self.assertNotIn(("gerrit cole", "2024-07-04"), m)
-
-    def test_statsapi_player_game_stats_pitcher(self):
-        m = parity.statsapi_player_game_stats(BOXSCORE, GAME, "pitcher", "K")
-        self.assertEqual(m, {("gerrit cole", "2024-07-04"): 8.0})
-
-    def test_statsapi_standings_winpct(self):
-        # /standings gives nicknames; the lens resolves full names via /teams so
-        # the keys align with ESPN's displayName — both fetchers are mocked.
-        nick = copy.deepcopy(STANDINGS)
-        nick["records"][0]["teamRecords"][0]["team"]["name"] = "Yankees"
-        nick["records"][1]["teamRecords"][0]["team"]["name"] = "Dodgers"
-        with mock.patch.object(mlb_warehouse, "fetch_standings", return_value=nick), \
-             mock.patch.object(mlb_warehouse, "fetch_teams", return_value=TEAMS):
-            m = parity.statsapi_standings_winpct(2024)
-        self.assertAlmostEqual(m["new york yankees"], 0.647)   # resolved from id 147
-        self.assertAlmostEqual(m["los angeles dodgers"], 0.612)  # resolved from id 119
-
-
-class ParityAlignTests(unittest.TestCase):
-    """The UTC/local ±1-day + doubleheader realignment that keeps the batter
-    parity lens from silently dropping night games out of `compared`."""
-
-    def test_prev_day(self):
-        self.assertEqual(parity._prev_day("2024-07-05"), "2024-07-04")
-        self.assertEqual(parity._prev_day("2024-07-05T02:10:00Z"), "2024-07-04")
-        self.assertIsNone(parity._prev_day(None))
-
-    def test_align_remaps_utc_night_game_to_official(self):
-        # ESPN filed a west-coast night game one UTC day ahead of official date.
-        keys = {("mookie betts", "2024-07-04")}
-        out = parity._align_espn_to_official(
-            {("mookie betts", "2024-07-05"): 2.0}, keys)
-        self.assertEqual(out, {("mookie betts", "2024-07-04"): 2.0})
-
-    def test_align_keeps_aligned_day_game(self):
-        keys = {("aaron judge", "2024-07-04")}
-        out = parity._align_espn_to_official(
-            {("aaron judge", "2024-07-04"): 1.0}, keys)
-        self.assertEqual(out, {("aaron judge", "2024-07-04"): 1.0})
-
-    def test_align_sums_doubleheader_across_utc_dates(self):
-        # G1 afternoon (UTC == official) + G2 night (UTC == official+1) → one total.
-        keys = {("aaron judge", "2024-07-04")}
-        out = parity._align_espn_to_official(
-            {("aaron judge", "2024-07-04"): 1.0,
-             ("aaron judge", "2024-07-05"): 3.0}, keys)
-        self.assertEqual(out, {("aaron judge", "2024-07-04"): 4.0})
-
-    def test_align_bounds_to_window(self):
-        out = parity._align_espn_to_official(
-            {("x", "2024-07-10"): 5.0}, set(),
-            start="2024-07-01", end="2024-07-04")
-        self.assertEqual(out, {})
-
-    def test_align_unmatched_date_kept_as_is(self):
-        # No official key to snap to and inside window → passes through unchanged.
-        out = parity._align_espn_to_official(
-            {("y", "2024-07-03"): 2.0}, set(),
-            start="2024-07-01", end="2024-07-04")
-        self.assertEqual(out, {("y", "2024-07-03"): 2.0})
 
 
 # ───────────────────────────────────── P2 StatsAPI-native game facts (writer)
@@ -1211,103 +1130,6 @@ class GetPlayerHistoryTests(_Backend, unittest.TestCase):
         self.assertEqual([g["game_date"][:10] for g in log], ["2024-07-01"])
 
 
-class PlayerInputParityTests(_Backend, unittest.TestCase):
-    """The model-input shadow lens reads the STORED facts (not a fresh boxscore)
-    and diffs vs ESPN; only_espn also flags backfill gaps. ESPN side monkeypatched."""
-
-    def setUp(self):
-        super().setUp()
-        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox")):
-            with db_store.get_engine().begin() as conn:
-                conn.execute(insert(mlb_warehouse.mlb_team), {
-                    "team_id": tid, "name": nm,
-                    "name_norm": db_store.normalize_name(nm)})
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_player), {
-                "player_id": "592450", "full_name": "Aaron Judge",
-                "name_norm": db_store.normalize_name("Aaron Judge")})
-        self.nm = db_store.normalize_name("Aaron Judge")
-
-    def _game(self, game_pk, official_date, game_type="R"):
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_game), {
-                "game_pk": game_pk, "official_date": official_date,
-                "game_date": official_date + "T18:00:00Z", "season": 2024,
-                "game_type": game_type, "home_team_id": "147",
-                "away_team_id": "111"})
-
-    def _batter(self, game_pk, H, athlete_id="592450"):
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_batter_game), {
-                "athlete_id": athlete_id, "game_pk": game_pk, "team_id": "147",
-                "season_bucket": 2024, "H": H, "AB": 4.0})
-
-    def test_warehouse_map_keys_and_dh_sum(self):
-        self._game(1, "2024-07-04")
-        self._game(2, "2024-07-04")          # split DH, same official date
-        self._game(3, "2024-07-05")
-        self._batter(1, 1.0)
-        self._batter(2, 2.0)
-        self._batter(3, 0.0)
-        m, disp = parity._warehouse_player_game_stats(
-            "2024-07-04", "2024-07-05", "batter", "batter_hits")
-        self.assertEqual(m[(self.nm, "2024-07-04")], 3.0)        # DH summed
-        self.assertEqual(m[(self.nm, "2024-07-05")], 0.0)
-        self.assertEqual(disp[self.nm], "Aaron Judge")
-
-    def test_window_and_game_type_exclusion(self):
-        self._game(1, "2024-07-04")
-        self._game(2, "2024-07-10")                              # out of window
-        self._game(3, "2024-07-04", game_type="S")              # spring → excluded
-        self._batter(1, 1.0)
-        self._batter(2, 5.0)
-        self._batter(3, 9.0)
-        m, _ = parity._warehouse_player_game_stats(
-            "2024-07-04", "2024-07-06", "batter", "batter_hits")
-        self.assertEqual(m, {(self.nm, "2024-07-04"): 1.0})     # in-window regular only
-
-    def test_pitcher_ip_to_outs(self):
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_player), {
-                "player_id": "543037", "full_name": "Gerrit Cole",
-                "name_norm": db_store.normalize_name("Gerrit Cole")})
-        self._game(1, "2024-07-04")
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_pitcher_game), {
-                "athlete_id": "543037", "game_pk": 1, "team_id": "147",
-                "season_bucket": 2024, "IP": 6.1, "K": 8.0, "ER": 2.0})
-        cole = db_store.normalize_name("Gerrit Cole")
-        m, _ = parity._warehouse_player_game_stats(
-            "2024-07-04", "2024-07-04", "pitcher", "pitcher_strikeouts")
-        self.assertEqual(m[(cole, "2024-07-04")], 8.0)          # K raw
-        m2, _ = parity._warehouse_player_game_stats(
-            "2024-07-04", "2024-07-04", "pitcher", "pitcher_outs")
-        self.assertEqual(m2[(cole, "2024-07-04")], 19.0)        # 6.1 IP → 19 outs
-
-    def test_player_input_parity_matches_espn(self):
-        self._game(1, "2024-07-04")
-        self._batter(1, 2.0)
-        with mock.patch.object(parity, "_espn_player_game_stats",
-                               return_value={(self.nm, "2024-07-04"): 2.0}):
-            rep = parity.player_input_parity("2024-07-04", "2024-07-04")
-        self.assertEqual(rep["compared"], 1)
-        self.assertEqual(rep["matches"], 1)
-        self.assertEqual(rep["only_espn"], 0)
-        self.assertEqual(rep["source"], "warehouse_facts")
-
-    def test_player_input_parity_flags_backfill_gap(self):
-        # ESPN has 07-10 (prev-day 07-09 also absent, so no ±1-day remap) that the
-        # warehouse hasn't ingested → surfaces as only_espn.
-        self._game(1, "2024-07-04")
-        self._batter(1, 2.0)
-        with mock.patch.object(parity, "_espn_player_game_stats",
-                               return_value={(self.nm, "2024-07-04"): 2.0,
-                                             (self.nm, "2024-07-10"): 1.0}):
-            rep = parity.player_input_parity("2024-07-04", "2024-07-10")
-        self.assertEqual(rep["matches"], 1)
-        self.assertEqual(rep["only_espn"], 1)                   # 07-10 not in warehouse
-
-
 class TeamMarketReaderTests(_Backend, unittest.TestCase):
     """StatsAPI-native team-market model inputs: recent_games from mlb_game;
     win%/record + team defense from the standings snapshot (cumulative runs)."""
@@ -1417,30 +1239,6 @@ class TeamMarketReaderTests(_Backend, unittest.TestCase):
         self._stand("147", 50, 50, 0.5, 500, 400, as_of="2024-07-04")  # 4.0
         self.assertAlmostEqual(
             mlb_warehouse.get_team_defense(season=2024)["New York Yankees"], 4.0)
-
-
-class TeamDefenseParityTests(_Backend, unittest.TestCase):
-    """team_defense_parity diffs the standings-derived warehouse map vs ESPN
-    (monkeypatched); reuses the pure diff core."""
-
-    def test_diff_warehouse_vs_espn(self):
-        for tid, nm in (("147", "New York Yankees"),):
-            with db_store.get_engine().begin() as conn:
-                conn.execute(insert(mlb_warehouse.mlb_team), {
-                    "team_id": tid, "name": nm,
-                    "name_norm": db_store.normalize_name(nm)})
-        with db_store.get_engine().begin() as conn:
-            conn.execute(insert(mlb_warehouse.mlb_team_standings), {
-                "team_id": "147", "season": 2024, "as_of_date": "2024-07-04",
-                "wins": 50, "losses": 50, "win_pct": 0.5,
-                "runs_scored": 500, "runs_allowed": 400})     # → 4.0/game
-        nm = db_store.normalize_name("New York Yankees")
-        with mock.patch.object(parity, "_espn_team_defense_map",
-                               return_value={nm: 4.1}):        # within 0.25 tol
-            rep = parity.team_defense_parity(2024)
-        self.assertEqual(rep["compared"], 1)
-        self.assertEqual(rep["matches"], 1)
-        self.assertEqual(rep["mismatches"], 0)
 
 
 class WarehouseFindTeamTests(_Backend, unittest.TestCase):
@@ -1608,26 +1406,6 @@ class NonFranchiseTeamTests(_Backend, unittest.TestCase):
         self.assertNotIn("160", team_ids)
 
 
-class CalibNameParityTests(_Backend, unittest.TestCase):
-    """calib_name_parity flags warehouse team names that won't resolve in the
-    calib consumers' name-keyed lookups (PARK_FACTORS + ESPN team_defense)."""
-
-    def test_resolves_real_flags_bogus(self):
-        for nm in ("New York Yankees", "Nowhere FC"):
-            with db_store.get_engine().begin() as conn:
-                conn.execute(insert(mlb_warehouse.mlb_team), {
-                    "team_id": nm[:3], "name": nm,
-                    "name_norm": db_store.normalize_name(nm)})
-        with mock.patch("espn_client.get_all_teams",
-                        return_value={"New York Yankees": {}, "Boston Red Sox": {}}):
-            rep = parity.calib_name_parity()
-        self.assertEqual(rep["warehouse_teams"], 2)
-        self.assertIn("Nowhere FC", rep["team_defense_unresolved"])
-        self.assertNotIn("New York Yankees", rep["team_defense_unresolved"])
-        self.assertIn("Nowhere FC", rep["park_unresolved"])
-        self.assertNotIn("New York Yankees", rep["park_unresolved"])
-
-
 class BackfillLegacyGamePkTests(unittest.TestCase):
     """P5: player-anchor game_pk backfill onto legacy prediction_log/wagers rows —
     DH-safe, non-destructive (fill-NULL-only), idempotent, dry-run vs apply. Needs
@@ -1734,6 +1512,31 @@ class BackfillLegacyGamePkTests(unittest.TestCase):
         s = mlb_warehouse.backfill_legacy_game_pk(dry_run=False)   # must not raise
         self.assertIsNone(self._gpks()["dhnaive"])
         self.assertEqual(s["prediction_log"]["candidates"], 1)
+
+
+class CalibParkNameGoldenTests(_Backend, unittest.TestCase):
+    """Golden replacement for the retired calib_name_parity park half (no ESPN): the
+    canonical mlb_team.name get_calib_gamelog stamps as the opponent must resolve in
+    park_factors — the real-line fit's park feature keys on that name, so a miss would
+    silently no-op the feature for that team. (The team_defense half of the old parity
+    check is obsolete: MLB team defense now ships from mlb_warehouse.get_team_defense,
+    not the ESPN build_team_defense_lookup.)"""
+
+    def test_canonical_names_resolve_in_park_factors(self):
+        import park_factors
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox"),
+                        ("119", "Los Angeles Dodgers"), ("ZZZ", "Nowhere FC")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+        names = {v for v in (mlb_warehouse._team_name_map() or {}).values() if v}
+        resolved = {n for n in names
+                    if park_factors._park_key(n) in park_factors._NORMALIZED}
+        self.assertIn("New York Yankees", resolved)
+        self.assertIn("Boston Red Sox", resolved)
+        self.assertIn("Los Angeles Dodgers", resolved)
+        self.assertNotIn("Nowhere FC", resolved)          # a bogus name is flagged
 
 
 if __name__ == "__main__":

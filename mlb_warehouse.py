@@ -4,9 +4,10 @@ Read-only DUAL-RUN. Populates durable, StatsAPI-native dims (team / game / playe
 a per-season standings fact, a provider→MLBAM alias scaffold, a transient bronze
 raw-JSON landing table (all P1), and — P2 — the game-centric per-game batter /
 pitcher stat FACTS (mlb_batter_game / mlb_pitcher_game), all in parallel with the
-live ESPN path. NOTHING in the app consumes these tables yet (that begins at the
-P4 cutover); the parity harness (mlb_warehouse_parity.py) diffs the StatsAPI-
-derived shapes against the ESPN path before anything is switched over.
+live ESPN path. As of the P6 teardown these tables are the SOLE MLB source (live
+history, team markets, grading, calibration, and the offline backtests) — ESPN was
+removed for MLB; the read shapes are pinned by golden fixture tests in
+test_mlb_warehouse.py (the ESPN-vs-warehouse parity harness has been retired).
 
 House conventions (mirrors gamelog_store.py / player_id_map.py):
   * Owns its OWN SQLAlchemy Core MetaData + Tables + create_all() (create_all is
@@ -1328,12 +1329,12 @@ def get_calib_gamelog(mlb_player_id, role, season=None):
     season by default AND spring/all-star/exhibition excluded (_NON_REGULAR_GAME_
     TYPES), matching the ESPN reader's scope — an all-star game also carries a non-
     team squad id absent from mlb_team, so excluding it avoids a None opponent /
-    garbage is_home in the fit. Fail-open → [] so the caller falls back to ESPN.
+    garbage is_home in the fit. Fail-open → [] (the offline backtest then skips that
+    player; there is no ESPN fallback for MLB post-P6).
 
-    ⚠ Before FLIPPING the consumer (env flag), run a per-game-dict parity check — the
-    opponent NAME must match the PARK_FACTORS + team_defense keys (canonical StatsAPI
-    vs ESPN spelling), or those features silently no-op. Value parity is covered by
-    mlb_warehouse_parity.gamelog_parity."""
+    The opponent NAME is the canonical mlb_team.name, which the real-line fit's
+    park/opp-defense features key on; that resolution is pinned by golden tests in
+    test_mlb_warehouse.py (CalibParkNameGoldenTests + the reader shape tests)."""
     if not enabled() or not mlb_player_id:
         return []
     season = season if season is not None else _current_season()
