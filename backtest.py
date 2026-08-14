@@ -1109,7 +1109,8 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       min_sample=5, season_year=None, threshold_pct=5.0,
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
-                      supplement_log=True, min_shrink_n=MIN_SHRINK_N):
+                      supplement_log=True, min_shrink_n=MIN_SHRINK_N,
+                      collect_obs=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1253,6 +1254,10 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                 _grade(r["moneyline"], _shrink_prob(mwin, prob_shrink),
                        fair_home, home_won, price_home, price_away, threshold)
                 graded_keys.update((t, "moneyline") for t in ekeys)
+                if collect_obs is not None:
+                    # RAW model prob (pre-shrink) so the shrink can be swept offline.
+                    collect_obs["moneyline"].append(
+                        (mwin, fair_home, home_won, price_home, price_away))
             if sp and mhc is not None:
                 home_spread, fair_cover, price_h, price_a = sp
                 model_spread, model_cover = mhc
@@ -1262,6 +1267,9 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     _grade(r["spreads"], _shrink_prob(model_cover, prob_shrink),
                            fair_cover, home_covers, price_h, price_a, threshold)
                     graded_keys.update((t, "spreads") for t in ekeys)
+                    if collect_obs is not None:
+                        collect_obs["spreads"].append(
+                            (model_cover, fair_cover, home_covers, price_h, price_a))
             if tot and mov is not None:
                 line, fair_over, price_o, price_u = tot
                 model_line, model_over = mov
@@ -1271,6 +1279,9 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     _grade(r["totals"], _shrink_prob(model_over, prob_shrink),
                            fair_over, over_hit, price_o, price_u, threshold)
                     graded_keys.update((t, "totals") for t in ekeys)
+                    if collect_obs is not None:
+                        collect_obs["totals"].append(
+                            (model_over, fair_over, over_hit, price_o, price_u))
             continue
 
         for variant_name, params in variants.items():
@@ -3879,6 +3890,85 @@ def _print_props_sweep_results(results, props, top_k=10, safe_target=0.80):
     print("    accuracy-optimized production model.")
 
 
+def _team_gate_tally(obs, shrink, ev_floor, edge_floor, legacy_threshold):
+    """Flat-1u ROI over one team market's RAW obs under one (shrink, gate) combo.
+
+    ``obs`` = [(raw_model_p, market_p, outcome, price_yes, price_no)] (yes = the
+    modelled home/over side). Shrink pulls the raw prob toward 0.5 (p' = 0.5 +
+    shrink*(p-0.5)); the higher-edge side is backed. Gate is ROI-primary
+    (EV >= ev_floor AND edge >= edge_floor) when ev_floor is not None, else legacy
+    (edge >= legacy_threshold AND EV > 0). Returns {n, pnl, roi, hit}."""
+    pnl = won = 0.0
+    n = 0
+    for raw_p, mkt_p, outcome, price_yes, price_no in obs:
+        if mkt_p is None:
+            continue
+        p = 0.5 + shrink * (raw_p - 0.5)
+        if p >= mkt_p:
+            side_prob, price, edge, win = p, price_yes, p - mkt_p, (outcome == 1)
+        else:
+            side_prob, price, edge, win = (1.0 - p, price_no, mkt_p - p,
+                                           (outcome == 0))
+        if price is None:
+            continue
+        dec = american_to_decimal(price)
+        er = side_prob * dec - 1.0
+        ok = ((er >= ev_floor and edge >= edge_floor) if ev_floor is not None
+              else (edge >= legacy_threshold and er > 0))
+        if not ok:
+            continue
+        pnl += (dec - 1.0) if win else -1.0
+        won += 1.0 if win else 0.0
+        n += 1
+    return {"n": n, "pnl": pnl,
+            "roi": (pnl / n) if n else None, "hit": (won / n) if n else None}
+
+
+def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
+                       limit=100000, store_label="", source="auto"):
+    """Team-market GATE + SHRINK lens (NO WRITE): grade ML/spread/total over the
+    warehoused closing-line holdout, collect each obs's RAW (pre-shrink) model
+    prob + market prob + outcome + prices, then sweep probability-shrink x
+    recommendation-gate and report realized flat-1u ROI + volume per combo.
+
+    Answers whether the live moneyline shrink (0.25) + edge-5% gate double-
+    suppress ML, and which (shrink, gate) maximizes realized team-market ROI — the
+    team-market analog of the props --gate-diag. Consensus/closing-priced; INFORMS,
+    never auto-writes."""
+    obs = {m: [] for m in MARKETS}
+    # Grade once (RAW obs collected via the hook); prob_shrink=1.0 so the printed
+    # Brier table is the unshrunk baseline — the sweep applies shrink itself.
+    run_odds_backtest(sport_key, espn_sport, espn_league, limit=limit, window=10,
+                      variants={"live": VARIANT_PRESETS.get("all", {})},
+                      season_year=season_year, threshold_pct=5.0,
+                      write_calibration=False, store_label=store_label,
+                      engine="live", prob_shrink=1.0, source=source,
+                      supplement_log=False, collect_obs=obs)
+
+    SHRINKS = (1.0, 0.75, 0.5, 0.25)
+    GATES = [
+        ("edge>=5% & EV>0 (legacy)", None, 0.0, 0.05),
+        ("EV>=3% & edge>=1%", 0.03, 0.01, 0.0),
+        ("EV>=4% & edge>=1%", 0.04, 0.01, 0.0),
+        ("EV>=5% & edge>=1%", 0.05, 0.01, 0.0),
+    ]
+    print("\n=== TEAM-MARKET gate x shrink lens (realized flat-1u ROI) ===")
+    print("  shrink pulls the model prob toward 0.5 (1.0 = none, 0.25 = live ML/"
+          "spread). Closing-priced; RELATIVE ranking is the signal.")
+    for market in MARKETS:
+        mobs = obs[market]
+        print(f"\n  {market.upper()} ({len(mobs)} graded obs):")
+        print("    {:<26}{:>7}{:>8}{:>9}{:>10}".format(
+            "gate", "shrink", "n_bets", "ROI%", "P/L(u)"))
+        for label, ev_floor, edge_floor, legacy in GATES:
+            for s in SHRINKS:
+                t = _team_gate_tally(mobs, s, ev_floor, edge_floor, legacy)
+                roi = f"{t['roi'] * 100:+.1f}" if t["roi"] is not None else "-"
+                print("    {:<26}{:>7}{:>8}{:>9}{:>+10.2f}".format(
+                    label, f"{s:.2f}", t["n"], roi, t["pnl"]))
+    print("\n  (Diagnostic only — nothing written.)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
     p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
@@ -3897,6 +3987,12 @@ def main():
     p.add_argument("--live", action="store_true",
                    help="Write calibration straight to the LIVE file, skipping the "
                         "candidate staging that --write-calibration uses by default.")
+    p.add_argument("--team-gate-sweep", action="store_true",
+                   help="(odds mode) Team-market gate x shrink lens: grade ML/"
+                        "spread/total on the closing-line holdout, then sweep "
+                        "probability-shrink x recommendation-gate and report "
+                        "realized flat-1u ROI per combo (finds whether the live "
+                        "shrink+edge gate over-suppress moneyline). No write.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -4046,16 +4142,21 @@ def main():
                                 write_calibration=args.write_calibration)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
-        run_odds_backtest(sport_key, espn_sport, espn_league,
-                          limit=args.limit, window=args.window, variants=variants,
-                          min_sample=args.min_sample, season_year=odds_seasons,
-                          threshold_pct=args.threshold,
-                          write_calibration=args.write_calibration,
-                          store_label=args.store_label,
-                          variance_inflate=args.variance_inflate,
-                          engine=args.engine, prob_shrink=args.prob_shrink,
-                          source=args.source, supplement_log=args.supplement_log,
-                          min_shrink_n=args.min_shrink_n)
+        if args.team_gate_sweep:
+            diagnose_team_gate(sport_key, espn_sport, espn_league,
+                               season_year=odds_seasons, limit=args.limit,
+                               store_label=args.store_label, source=args.source)
+        else:
+            run_odds_backtest(sport_key, espn_sport, espn_league,
+                              limit=args.limit, window=args.window, variants=variants,
+                              min_sample=args.min_sample, season_year=odds_seasons,
+                              threshold_pct=args.threshold,
+                              write_calibration=args.write_calibration,
+                              store_label=args.store_label,
+                              variance_inflate=args.variance_inflate,
+                              engine=args.engine, prob_shrink=args.prob_shrink,
+                              source=args.source, supplement_log=args.supplement_log,
+                              min_shrink_n=args.min_shrink_n)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
