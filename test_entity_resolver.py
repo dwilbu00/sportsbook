@@ -241,6 +241,22 @@ class StampResolverGateTests(_Backend, unittest.TestCase):
         self.assertEqual(r["reason"], "ambiguous_or_unknown")
         self.assertEqual(r["game_pk"], 700)
 
+    def test_on_off_dict_contract_parity(self):
+        # The envelope returns the SAME dict key-set under both gate states (resolved
+        # AND unresolved), so every stamp consumer reads identical keys on a flip.
+        with mock.patch("player_id_map.mlb_id_for_name", return_value="592450"):
+            off = self._resolve(on=False)
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id",
+                               return_value=(592450, False)):
+            on = self._resolve(on=True)
+        self.assertEqual(set(off.keys()), set(on.keys()))
+        with mock.patch("player_id_map.mlb_id_for_name", return_value=None):
+            off_miss = self._resolve(name="Nobody", on=False)
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id", return_value=None):
+            on_miss = self._resolve(name="Nobody", on=True)
+        self.assertEqual(set(off_miss.keys()), set(on_miss.keys()))
+        self.assertEqual(set(off.keys()), set(off_miss.keys()))
+
     def test_on_delegate_raise_is_swallowed_to_unresolved(self):
         # resolve_mlbam_id already swallows infra errors to None, but belt-and-
         # suspenders: a raise from the delegate is treated as an ordinary
