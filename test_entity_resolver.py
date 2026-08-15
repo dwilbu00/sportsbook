@@ -7,6 +7,7 @@ globally-unique alias write vs the shared-name no-write, game_pk independence,
 and the never-raises contract.
 """
 
+import os
 import unittest
 from unittest import mock
 
@@ -14,6 +15,7 @@ from sqlalchemy import insert, select
 
 import db_store
 import entity_resolver as er
+import mlb_starters
 import mlb_warehouse
 
 
@@ -163,6 +165,92 @@ class GapFillTests(_Backend, unittest.TestCase):
                            "Boston Red Sox", commence="2026-08-09T23:00:00Z")
         self.assertEqual(r["game_pk"], 700)
         ing.assert_not_called()            # already resolvable → no ingest on the hot path
+
+
+class StampResolverGateTests(_Backend, unittest.TestCase):
+    """Commit C Phase 1: the ODI_MLB_STAMP_RESOLVER gate. OFF (default) is
+    byte-identical (SFBB-only id-core, mlb_starters untouched); ON delegates the
+    id-core to mlb_starters.resolve_mlbam_id while the envelope (game_pk, gap-fill,
+    dict contract) is unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox")):
+            with db_store.get_engine().begin() as conn:
+                conn.execute(insert(mlb_warehouse.mlb_team), {
+                    "team_id": tid, "name": nm,
+                    "name_norm": db_store.normalize_name(nm)})
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": 700, "official_date": "2026-08-09",
+                "game_date": "2026-08-09T23:05:00Z", "home_team_id": "147",
+                "away_team_id": "111", "season": 2026})
+
+    def _resolve(self, name="Aaron Judge", on=True, **kw):
+        env = {er._STAMP_RESOLVER_ENV: "1" if on else ""}
+        with mock.patch.dict(os.environ, env):
+            return er.resolve(name, "baseball_mlb", "New York Yankees",
+                              "Boston Red Sox", game_date="2026-08-09",
+                              commence="2026-08-09T23:05:00Z", **kw)
+
+    def test_off_uses_sfbb_core_and_never_calls_new_resolver(self):
+        # Gate OFF: the legacy SFBB id-core runs; the game-context resolver is not
+        # touched (byte-identical to pre-Commit-C).
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id") as new, \
+             mock.patch("player_id_map.mlb_id_for_name", return_value="592450"):
+            r = self._resolve(on=False)
+        new.assert_not_called()
+        self.assertTrue(r["resolved"])
+        self.assertEqual(r["mlb_player_id"], "592450")
+        self.assertEqual(r["method"], "sfbb_unique")
+
+    def test_on_delegates_and_bypasses_sfbb_core(self):
+        # Gate ON: delegate resolves; the SFBB player_id_map lookup is not used.
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id",
+                               return_value=(592450, False)) as new, \
+             mock.patch("player_id_map.mlb_id_for_name") as sfbb:
+            r = self._resolve()
+        new.assert_called_once()
+        sfbb.assert_not_called()
+        self.assertTrue(r["resolved"])
+        self.assertEqual(r["mlb_player_id"], "592450")   # int → str
+        self.assertIs(r["is_pitcher"], False)            # statsapi-authoritative
+        self.assertEqual(r["method"], "game_context_resolver")
+        self.assertEqual(r["game_pk"], 700)              # envelope unchanged
+        self.assertEqual(_count(mlb_warehouse.player_alias), 0)  # no bare alias
+
+    def test_on_threads_prop_key_lineup_probables(self):
+        lineup = {"players": {}}
+        probs = {"new york yankees": {"pitcher_id": 1, "name": "Gerrit Cole"}}
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id",
+                               return_value=(543037, True)) as new:
+            self._resolve(name="Gerrit Cole", prop_key="pitcher_strikeouts",
+                          confirmed_lineup=lineup, probable_starters=probs)
+        kw = new.call_args.kwargs
+        self.assertEqual(kw["prop_key"], "pitcher_strikeouts")
+        self.assertEqual(kw["teams"], ["New York Yankees", "Boston Red Sox"])
+        self.assertIs(kw["confirmed_lineup"], lineup)
+        self.assertIs(kw["probable_starters"], probs)
+
+    def test_on_none_is_fail_closed_but_game_pk_resolves(self):
+        # Delegate fails closed (None) → unresolved, but game_pk still resolves.
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id", return_value=None):
+            r = self._resolve(name="Ambiguous Nobody")
+        self.assertFalse(r["resolved"])
+        self.assertIsNone(r["mlb_player_id"])
+        self.assertEqual(r["reason"], "ambiguous_or_unknown")
+        self.assertEqual(r["game_pk"], 700)
+
+    def test_on_delegate_raise_is_swallowed_to_unresolved(self):
+        # resolve_mlbam_id already swallows infra errors to None, but belt-and-
+        # suspenders: a raise from the delegate is treated as an ordinary
+        # unresolved (fail-open shadow row), NOT the envelope's resolver_error.
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id",
+                               side_effect=RuntimeError("boom")):
+            r = self._resolve()
+        self.assertFalse(r["resolved"])
+        self.assertEqual(r["reason"], "ambiguous_or_unknown")
+        self.assertEqual(r["game_pk"], 700)              # envelope still ran
 
 
 if __name__ == "__main__":

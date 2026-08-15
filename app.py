@@ -41,7 +41,8 @@ except Exception:
 # the app's Secrets to flip a gate; str() handles a TOML boolean (true → "True").
 try:
     for _gate_key in ("ODI_MLB_WAREHOUSE_HIST", "ODI_MLB_WAREHOUSE_TEAM",
-                      "ODI_MLB_WAREHOUSE_CALIB", "ODI_MLB_ENFORCE_IDENTITY"):
+                      "ODI_MLB_WAREHOUSE_CALIB", "ODI_MLB_ENFORCE_IDENTITY",
+                      "ODI_MLB_STAMP_RESOLVER"):
         _gate_val = st.secrets.get(_gate_key)
         if _gate_val is not None:
             os.environ.setdefault(_gate_key, str(_gate_val))
@@ -1240,6 +1241,7 @@ def render_model_guide():
                 ("team-markets", "team"),
                 ("calibration", "calib"),
                 ("identity-enforce", "enforce_identity"),
+                ("identity-stamp", "stamp_resolver"),
             ) if _wh.get(key)]
             if _wh.get("sql") and _on:
                 st.caption("MLB warehouse (StatsAPI) active: " + ", ".join(_on) + ".")

@@ -37,6 +37,7 @@ Every path is defensive — the resolver NEVER raises into the live prediction p
 from __future__ import annotations
 
 import datetime
+import os
 
 import db_store
 import mlb_warehouse
@@ -45,6 +46,25 @@ import mlb_warehouse
 # "baseball_mlb"). Other baseball keys (e.g. "baseball_kbo") and NBA/NFL stay on
 # the ESPN path untouched.
 _MLB_SPORT_PREFIX = "baseball_mlb"
+
+
+# ── Commit C — STAMP-resolver flip (env-gated, default OFF) ───────────────────
+# When ON (+ MLB), the identity STAMP this envelope writes at prediction time
+# delegates its id-CORE to the game-context/role-verified resolver
+# (mlb_starters.resolve_mlbam_id: today's lineup/probables → statsapi season-roster
+# unique-exact → role-checked SFBB) instead of the SFBB-only, two-team-hinted,
+# role-BLIND player_id_map lookup below. The envelope is UNCHANGED either way — it
+# still owns game_pk derivation, the schedule gap-fill, and the resolved/crash dict
+# contract the P4 circuit breaker (props._enforce) reads. OFF (the default) is
+# byte-identical to the pre-Commit-C behavior. Mirrors the espn_client warehouse
+# gate helpers; boot-promoted from st.secrets in app.py and reported by
+# espn_client.mlb_warehouse_gate_status (key "stamp_resolver").
+_STAMP_RESOLVER_ENV = "ODI_MLB_STAMP_RESOLVER"
+
+
+def _stamp_resolver_enabled():
+    return os.environ.get(_STAMP_RESOLVER_ENV, "").strip().lower() in (
+        "1", "true", "on", "yes")
 
 
 _GAP_FILLED = set()   # official dates whose schedule we've gap-ingested this process
@@ -90,7 +110,8 @@ def _unresolved(reason, game_pk=None):
 
 
 def resolve(name, sport_key, home_team, away_team, game_date=None,
-            commence=None, prop_key=None, season=None):
+            commence=None, prop_key=None, season=None,
+            confirmed_lineup=None, probable_starters=None):
     """Resolve an odds-feed player NAME + game event → identity. Returns a dict:
 
         {resolved, mlb_player_id, game_pk, is_pitcher, confidence, method, reason}
@@ -98,7 +119,12 @@ def resolve(name, sport_key, home_team, away_team, game_date=None,
     ``resolved`` is True only when an MLBAM id was pinned (fail-closed otherwise).
     ``game_pk`` is derived independently and may be present even when the player is
     unresolved (or absent — e.g. a doubleheader-ambiguous commence). MLB only;
-    other sports and a blank name return unresolved. NEVER raises."""
+    other sports and a blank name return unresolved. NEVER raises.
+
+    ``prop_key`` + ``confirmed_lineup`` / ``probable_starters`` (today's posted
+    lineup / announced probables) feed the game-context/role-verified id-core only
+    when the ``ODI_MLB_STAMP_RESOLVER`` gate is ON (Commit C); with the gate OFF
+    (default) they are ignored and the SFBB-only lookup runs unchanged."""
     try:
         if not str(sport_key or "").startswith(_MLB_SPORT_PREFIX) or not name:
             return _unresolved("non_mlb_or_no_name")
@@ -121,6 +147,36 @@ def resolve(name, sport_key, home_team, away_team, game_date=None,
                 if home_id and away_id:
                     game_pk = mlb_warehouse.find_game_pk_by_commence(
                         home_id, away_id, commence)
+
+        # Commit C id-core (env-gated): delegate to the game-context/role-verified
+        # resolver. It resolves TODAY'S posted game (lineup/probables) first — trade-
+        # aware + namesake-safe — then statsapi season-roster unique-exact, then a
+        # role-checked SFBB fallback (rejects the cross-role drift the SFBB-only path
+        # below can't see). It also fails CLOSED (None) on ambiguity/unknown AND
+        # swallows infra errors to None, so a None here is treated as an ordinary
+        # unresolved (fail-open shadow row); a systemic outage is caught by the
+        # slate-level ≥50%-unpinned circuit breaker in props, not conflated here. The
+        # bare-name audit alias is deliberately NOT written on this path: the id is
+        # context-specific (role/team/lineup), not proven globally unique, so a bare
+        # alias could later serve the wrong namesake — and the alias table is write-
+        # only (never read) anyway. is_pitcher is statsapi-authoritative here.
+        if _stamp_resolver_enabled():
+            try:
+                import mlb_starters
+                found = mlb_starters.resolve_mlbam_id(
+                    name, season, prop_key=prop_key,
+                    teams=[home_team, away_team],
+                    confirmed_lineup=confirmed_lineup,
+                    probable_starters=probable_starters)
+            except Exception:
+                found = None
+            if not found:
+                return _unresolved("ambiguous_or_unknown", game_pk=game_pk)
+            mlb_id, is_pitcher = found
+            return {"resolved": True, "mlb_player_id": str(mlb_id),
+                    "game_pk": game_pk, "is_pitcher": is_pitcher,
+                    "confidence": 1.0, "method": "game_context_resolver",
+                    "reason": None}
 
         # MLBAM id via the SFBB map, FAIL-CLOSED on namesake ambiguity. Try the
         # bare name first (globally unique → safe to bare-alias); else narrow by the

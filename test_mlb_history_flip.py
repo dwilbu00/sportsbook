@@ -461,7 +461,7 @@ class GateStatusTests(unittest.TestCase):
         s = self._status({})
         self.assertEqual(
             s, {"history": False, "team": False, "calib": False,
-                "enforce_identity": False, "sql": True})
+                "enforce_identity": False, "stamp_resolver": False, "sql": True})
 
     def test_each_flag_reads_its_env_key(self):
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_HIST": "1"})["history"])
@@ -469,6 +469,8 @@ class GateStatusTests(unittest.TestCase):
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_CALIB": "on"})["calib"])
         self.assertTrue(
             self._status({"ODI_MLB_ENFORCE_IDENTITY": "yes"})["enforce_identity"])
+        self.assertTrue(
+            self._status({"ODI_MLB_STAMP_RESOLVER": "1"})["stamp_resolver"])
 
     def test_falsey_values_stay_off(self):
         self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "0"})["history"])
