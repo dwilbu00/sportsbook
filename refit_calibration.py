@@ -57,6 +57,12 @@ def _defense_lookup(espn_sport, espn_league, season_year=None):
 # gets shipped and advertises an optimistic fit_brier. See P1.4.
 MIN_CALIB_BRIER_GAIN = 0.002
 
+# Max Statcast days a single --real-lines refit will auto-fetch to fill the durable
+# SQL store (savant_history.ensure_days) before building the xBA index. Bounds a
+# first run (before the one-time bulk backfill) to the RECENT gap instead of a slow
+# multi-season Savant pull; a larger gap is left for `savant_history.py --ensure`.
+STATCAST_GAPFILL_CAP = 45
+
 # ── Incumbent protection at real book lines (anti-churn on thin samples) ──
 # The 2-fold real-line confirmation gate is unreliable below a few hundred obs:
 # a thin prop's fold verdict flips run-to-run as the chronological split boundary
@@ -916,6 +922,23 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         import backtest_props
         years = sorted({str(o["game_date"])[:4] for o in enriched
                         if isinstance(o, dict) and o.get("game_date")})
+        # Statcast SQL gap-fill (incremental): ensure the obs-season days are ingested
+        # to the durable store BEFORE loading them, so the xBA index + method D are
+        # available on ANY box (no machine-local cache). Capped so a first run before
+        # the one-time bulk backfill fills only the RECENT gap + warns to run the bulk,
+        # rather than blocking on a multi-season Savant pull.
+        if years:
+            _s, _e = f"{years[0]}-03-01", f"{years[-1]}-11-30"
+            try:
+                _n_new, _n_missing = sh.ensure_days(
+                    _s, _e, cap=STATCAST_GAPFILL_CAP, verbose=True)
+                if _n_missing > _n_new:
+                    print(f"  [statcast] {_n_missing - _n_new} day(s) still missing "
+                          f"in {_s}..{_e} (cap={STATCAST_GAPFILL_CAP}) — run "
+                          f"`python savant_history.py --ensure --start {_s} "
+                          f"--end {_e}` for the one-time bulk backfill.")
+            except Exception as _exc:
+                print(f"  [statcast] gap-fill skipped: {type(_exc).__name__}: {_exc}")
         raw = []
         for y in years:
             try:

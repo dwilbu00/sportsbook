@@ -584,6 +584,57 @@ CREATE INDEX ix_statcast_player_asof_player
     ON dbo.statcast_player_asof (player_id, season_bucket, role);
 GO
 
+----------------------------------------------------------------- statcast_pitch
+-- Durable home for the RAW per-day Statcast pitch rows (previously the local,
+-- machine-specific cache/statcast_days_v5/ files). This is the FULL per-date
+-- as-of curve the OFFLINE backtest/refit reads via savant_history.load_days —
+-- distinct from statcast_player_asof (a small single-cutoff DERIVED table the
+-- live app reads). Moving it here makes the refit's xBA index + method D
+-- available on ANY box and removes the silent "no Statcast cached → batter_hits
+-- mis-selects" trap. One row per pitch (trimmed v5 shape); day-atomic replace
+-- (DELETE WHERE game_date + bulk INSERT) via savant_history.ingest_day. ~700K
+-- rows/season; fully rebuildable from Baseball Savant. Mirrors savant_history.py
+-- (test_statcast_pitch.py::SchemaParityTests enforces the column set).
+IF OBJECT_ID('dbo.statcast_pitch', 'U') IS NULL
+CREATE TABLE dbo.statcast_pitch (
+    id                 BIGINT IDENTITY(1,1) PRIMARY KEY,
+    game_date          NVARCHAR(16) NOT NULL,           -- YYYY-MM-DD (official date)
+    pitcher            NVARCHAR(16),                     -- MLBAM id
+    batter             NVARCHAR(16),                     -- MLBAM id
+    p_throws           NVARCHAR(2),                      -- L|R
+    batting_team       NVARCHAR(8),                      -- Savant team abbr
+    stand              NVARCHAR(2),                      -- batter side L|R
+    xwoba              FLOAT,                             -- xwOBAcon (batted balls)
+    xba                FLOAT,                             -- expected BA (per official AB)
+    description        NVARCHAR(40),                     -- pitch outcome (whiff/CSW)
+    [type]             NVARCHAR(2),                      -- S|B|X (X = batted ball)
+    launch_speed       FLOAT,
+    launch_speed_angle INT,                              -- 1..6 (6 = barrel)
+    launch_angle       FLOAT,
+    bb_type            NVARCHAR(20)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_statcast_pitch_date'
+                 AND object_id = OBJECT_ID('dbo.statcast_pitch'))
+CREATE INDEX ix_statcast_pitch_date ON dbo.statcast_pitch (game_date);
+GO
+
+------------------------------------------------------------------- statcast_day
+-- Per-day INGEST MANIFEST for statcast_pitch. One row per fetched game_date with
+-- its row count — so an ingested-but-EMPTY offseason day (n_rows=0) is
+-- distinguishable from a NOT-yet-fetched day. savant_history.missing_days /
+-- ensure_days drive incremental gap-fill off this table (a bare game_date query
+-- against statcast_pitch could not tell "empty" from "unfetched", re-pulling
+-- empty days forever).
+IF OBJECT_ID('dbo.statcast_day', 'U') IS NULL
+CREATE TABLE dbo.statcast_day (
+    game_date  NVARCHAR(16) NOT NULL PRIMARY KEY,        -- YYYY-MM-DD
+    n_rows     INT NOT NULL,                             -- pitches ingested (0 = empty)
+    fetched_at NVARCHAR(32)                              -- ISO-8601 UTC of the ingest
+);
+GO
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Smart Fantasy Baseball ID cross-maps (data-integrity backbone). Two authoritative
 -- maps, refreshed from smartfantasybaseball.com, that finally LINK the id-spaces the
