@@ -1054,28 +1054,14 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # can't uniquely pin. MLB only; cached across this event's prop loops.
     _is_mlb_props = str(sport_key or "").startswith("baseball_mlb")
     _enforce_identity = _is_mlb_props and _identity_enforced()
-    # Commit C: whether the stamp resolver is flipped ON decides ONLY the role-
-    # partition UNIT of the enforce circuit-breaker below. OFF keeps the pre-Commit-C
-    # distinct-NAME unit so the ENFORCE breaker is byte-identical when the stamp flip
-    # is off (ENFORCE is independently ON in prod); ON uses the (name, prop_key) unit
-    # the role-partitioned per-row drop actually enforces.
-    _stamp_resolver_on = False
-    if _is_mlb_props:
-        try:
-            import entity_resolver
-            _stamp_resolver_on = entity_resolver._stamp_resolver_enabled()
-        except Exception:
-            _stamp_resolver_on = False
     _ident_cache = {}
 
     def _resolve_ident(pname, prop_key=None):
-        # Commit C: the id-core is now ROLE-PARTITIONED (a pitcher-prop name binds
-        # off the announced probable, a batter-prop name off the confirmed lineup),
-        # so the cache is keyed by (name, role) — a same-name cross-role pair (e.g. a
-        # two-way player offered as both) must not share one cached id. role is the
-        # only prop_key-derived input; None (no prop_key) is its own bucket. prop_key
-        # + the game context are ignored by the resolver until ODI_MLB_STAMP_RESOLVER
-        # is ON, so the stamped ids are byte-identical with the gate OFF.
+        # Commit C: the id-core is ROLE-PARTITIONED (a pitcher-prop name binds off the
+        # announced probable, a batter-prop name off the confirmed lineup), so the
+        # cache is keyed by (name, role) — a same-name cross-role pair (e.g. a two-way
+        # player offered as both) must not share one cached id. role is the only
+        # prop_key-derived input; None (no prop_key) is its own bucket.
         if not _is_mlb_props:
             return None
         role = (None if prop_key is None
@@ -1109,24 +1095,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # isn't silently suppressed (the NULL-id shadow rows reappear as the signal).
     _enforce_active = _enforce_identity
     if _enforce_identity:
-        # Systemic-failure pre-scan. The unit MUST match the per-row drop's unit so
-        # the breaker measures what actually gets dropped. With the stamp resolver ON
-        # the resolver is role-partitioned → count (name, prop_key) pairs (the per-row
-        # drop's unit). With it OFF resolution is role-independent, so count distinct
-        # NAMES — byte-identical to the pre-Commit-C breaker even when ENFORCE is on.
-        if _stamp_resolver_on:
-            _units = {(p, pk) for pk, _pl in prop_data.get("props", {}).items()
-                      for p in _pl}
-            _unpinned = sum(1 for p, pk in _units if not _ident_pinned(p, pk))
-            _unit_label = "prop-players"
-        else:
-            _units = {p for _pl in prop_data.get("props", {}).values() for p in _pl}
-            _unpinned = sum(1 for p in _units if not _ident_pinned(p))
-            _unit_label = "players"
+        # Systemic-failure pre-scan. The id-core is role-partitioned (a name can be
+        # pinnable as a pitcher but not a batter) and the per-row drop is per
+        # (name, prop_key), so the breaker counts that same (name, prop_key) unit.
+        _units = {(p, pk) for pk, _pl in prop_data.get("props", {}).items()
+                  for p in _pl}
+        _unpinned = sum(1 for p, pk in _units if not _ident_pinned(p, pk))
         if _units and _unpinned / len(_units) >= _ENFORCE_FAILOPEN_FRACTION:
             _enforce_active = False
             print(f"[identity-enforce] slate-level FAIL-OPEN: {_unpinned}/"
-                  f"{len(_units)} MLB {_unit_label} unresolved "
+                  f"{len(_units)} MLB prop-players unresolved "
                   f"(>= {int(_ENFORCE_FAILOPEN_FRACTION * 100)}%) — likely systemic; "
                   f"enforcement skipped this run")
 

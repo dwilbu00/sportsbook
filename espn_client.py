@@ -951,7 +951,6 @@ def mlb_warehouse_gate_status():
         "team": _on(_MLB_WAREHOUSE_TEAM_ENV),           # ODI_MLB_WAREHOUSE_TEAM
         "calib": _on("ODI_MLB_WAREHOUSE_CALIB"),        # book_line_calibration
         "enforce_identity": _on("ODI_MLB_ENFORCE_IDENTITY"),   # props
-        "stamp_resolver": _on("ODI_MLB_STAMP_RESOLVER"),  # entity_resolver (Commit C)
         "sql": bool(db_store is not None and db_store.enabled()),
     }
 

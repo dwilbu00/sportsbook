@@ -447,12 +447,12 @@ class EnforceIdentityTests(unittest.TestCase):
             self._run({"A": False, "B": False}, enforce=True, hiccup=True),
             {"A", "B"})
 
-    def test_breaker_unit_gated_by_stamp_resolver(self):
-        # The systemic-failure breaker's UNIT must follow ODI_MLB_STAMP_RESOLVER so
-        # its trip point is byte-identical to pre-Commit-C when the stamp flip is OFF
-        # (ENFORCE is independently ON in prod). Slate: resolved star A in 3 markets
-        # + unresolved B in 1. distinct-NAMES → 1/2 = 50% ≥ 50% → TRIP (fail-open,
-        # keep B); (name, prop_key) pairs → 1/4 = 25% < 50% → hold (enforce, drop B).
+    def test_breaker_counts_name_prop_key_pairs(self):
+        # The systemic-failure breaker counts the (name, prop_key) unit (the same unit
+        # the per-row drop enforces), since the resolver is role-partitioned. Slate:
+        # resolved star A in 3 markets + unresolved B in 1 → pairs 1/4 = 25% < 50% →
+        # breaker HOLDS → enforce → B dropped (a distinct-NAMES count would be 1/2 =
+        # 50% → fail-open → keep B, which is NOT what happens).
         od = {"line": 0.5, "over_implied": 0.5, "under_implied": 0.5,
               "over_price": -110, "under_price": -110,
               "over_book": "DK", "under_book": "DK"}
@@ -470,19 +470,15 @@ class EnforceIdentityTests(unittest.TestCase):
                     if resolved.get(name) else
                     {"resolved": False, "mlb_player_id": None, "game_pk": None})
 
-        def _run_stamp(stamp_on):
-            env = {props._MLB_ENFORCE_IDENTITY_ENV: "1",
-                   "ODI_MLB_STAMP_RESOLVER": "1" if stamp_on else ""}
-            with mock.patch.dict(os.environ, env), \
-                 mock.patch("entity_resolver.resolve", side_effect=_resolve), \
-                 mock.patch.object(props, "maybe_auto_refit"), \
-                 mock.patch.object(props, "load_recalibration", return_value={}), \
-                 mock.patch.object(props, "log_prediction_rows"):
-                return {c["player"] for c in props.analyze_player_props_value(
-                    prop_data, {}, threshold_pct=1.0, sport_key="baseball_mlb")}
-
-        self.assertIn("B", _run_stamp(stamp_on=False))     # names unit → fail-open
-        self.assertNotIn("B", _run_stamp(stamp_on=True))   # pairs unit → enforce drop
+        with mock.patch.dict(os.environ, {props._MLB_ENFORCE_IDENTITY_ENV: "1"}), \
+             mock.patch("entity_resolver.resolve", side_effect=_resolve), \
+             mock.patch.object(props, "maybe_auto_refit"), \
+             mock.patch.object(props, "load_recalibration", return_value={}), \
+             mock.patch.object(props, "log_prediction_rows"):
+            kept = {c["player"] for c in props.analyze_player_props_value(
+                prop_data, {}, threshold_pct=1.0, sport_key="baseball_mlb")}
+        self.assertIn("A", kept)
+        self.assertNotIn("B", kept)                        # pairs 1/4 < 50% → enforced
 
 
 class GateStatusTests(unittest.TestCase):
@@ -498,7 +494,7 @@ class GateStatusTests(unittest.TestCase):
         s = self._status({})
         self.assertEqual(
             s, {"history": False, "team": False, "calib": False,
-                "enforce_identity": False, "stamp_resolver": False, "sql": True})
+                "enforce_identity": False, "sql": True})
 
     def test_each_flag_reads_its_env_key(self):
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_HIST": "1"})["history"])
@@ -506,8 +502,6 @@ class GateStatusTests(unittest.TestCase):
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_CALIB": "on"})["calib"])
         self.assertTrue(
             self._status({"ODI_MLB_ENFORCE_IDENTITY": "yes"})["enforce_identity"])
-        self.assertTrue(
-            self._status({"ODI_MLB_STAMP_RESOLVER": "1"})["stamp_resolver"])
 
     def test_falsey_values_stay_off(self):
         self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "0"})["history"])

@@ -73,11 +73,10 @@ class PropsStampThreadingTests(unittest.TestCase):
         lineup = {"players": {}}
         probs = {"houston astros": {"pitcher_id": 1, "name": "x"}}
         # Enforce ON makes the slate pre-scan resolve every (name, prop_key) pair
-        # deterministically (candidate production aside); STAMP ON makes that pre-scan
-        # use the role-partitioned (name, prop_key) unit, so the role-partition is
-        # observable as exactly one call per role (the per-row stamps then cache-hit).
-        with mock.patch.dict(os.environ, {props._MLB_ENFORCE_IDENTITY_ENV: "1",
-                                          "ODI_MLB_STAMP_RESOLVER": "1"}), \
+        # deterministically (candidate production aside); the pre-scan uses the role-
+        # partitioned (name, prop_key) unit, so the role-partition is observable as
+        # exactly one call per role (the per-row stamps then cache-hit).
+        with mock.patch.dict(os.environ, {props._MLB_ENFORCE_IDENTITY_ENV: "1"}), \
              mock.patch("entity_resolver.resolve", side_effect=_resolve), \
              mock.patch.object(props, "maybe_auto_refit"), \
              mock.patch.object(props, "load_recalibration", return_value={}), \

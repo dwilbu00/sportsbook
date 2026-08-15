@@ -520,19 +520,27 @@ class EnrichThreadingTests(_Backend, unittest.TestCase):
         self.assertTrue(row["player_key"].startswith("name:"))
 
     def test_warehouse_enrich_uses_home_away(self):
+        # Commit C: enrich delegates to the game-context resolver. Empty the statsapi
+        # roster index (mock) so resolution falls to the tier-3 team-hinted SFBB path
+        # the CSV fixtures drive — hermetic + exercises the real team threading.
         import warehouse
+        import mlb_starters
         meta = {"home": "Washington Nationals", "away": "Atlanta Braves"}
         lines = [{"bet_type": "player_prop", "player": "Luis Garcia Jr."}]
-        warehouse._enrich_ids("baseball_mlb", meta, lines)
+        with patch.object(mlb_starters, "_player_index", return_value={}):
+            warehouse._enrich_ids("baseball_mlb", meta, lines)
         self.assertEqual(lines[0]["player_mlb_id"], "671277")
 
     def test_warehouse_enrich_both_teams_are_namesakes_is_none(self):
         # The away team is the two-word "Chicago White Sox" — the tuple caller most
-        # exposed to the misbind. Both namesakes are in the game → fail open.
+        # exposed to the misbind. Both namesakes are in the game → SFBB two-team
+        # fail-closed (with the statsapi tier emptied). Stamp stays NULL.
         import warehouse
+        import mlb_starters
         meta = {"home": "Washington Nationals", "away": "Chicago White Sox"}
         lines = [{"bet_type": "player_prop", "player": "Luis Garcia Jr."}]
-        warehouse._enrich_ids("baseball_mlb", meta, lines)
+        with patch.object(mlb_starters, "_player_index", return_value={}):
+            warehouse._enrich_ids("baseball_mlb", meta, lines)
         self.assertIsNone(lines[0]["player_mlb_id"])
 
     def test_backfill_mlb_id_threads_team(self):

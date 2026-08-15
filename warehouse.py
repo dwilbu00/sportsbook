@@ -302,16 +302,14 @@ def _enrich_ids(sport, meta, lines):
         # odds warehouse carries game_pk too. Team lines still get team_code.
         import entity_resolver
         # Commit C: prime the season roster index ONCE before the per-line batch so
-        # the (gated) game-context resolver's statsapi tier doesn't fetch inline per
-        # player. Guarded on the gate so it stays a true no-op (no network) when OFF.
-        if entity_resolver._stamp_resolver_enabled():
-            _when = meta.get("game_date") or meta.get("commence_time")
-            if _when:
-                try:
-                    import mlb_starters
-                    mlb_starters.warm_player_index(int(str(_when)[:4]))
-                except Exception:                      # never break odds capture
-                    pass
+        # the game-context resolver's statsapi tier doesn't fetch inline per player.
+        _when = meta.get("game_date") or meta.get("commence_time")
+        if _when:
+            try:
+                import mlb_starters
+                mlb_starters.warm_player_index(int(str(_when)[:4]))
+            except Exception:                          # never break odds capture
+                pass
         _ident = {}
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
