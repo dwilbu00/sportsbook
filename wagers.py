@@ -128,11 +128,16 @@ def _enrich_ids(row):
             # P3: resolve player → (MLBAM id, game_pk) fail-closed with the game's
             # BOTH teams as the namesake-tie hint (stronger than the old single-team
             # SFBB call). An unresolved player keeps NULL ids (shadow signal).
+            # Commit C: pass prop_key so the (gated) game-context resolver role-
+            # partitions this stamp; inert until ODI_MLB_STAMP_RESOLVER is ON. This
+            # is a single-row submit (no batch), so the resolver lazily loads the
+            # season roster index on first use — no warm_player_index needed here.
             import entity_resolver
             ident = entity_resolver.resolve(
                 row.get("player"), row.get("sport_key"),
                 row.get("home_team"), row.get("away_team"),
-                game_date=row.get("game_date"), commence=row.get("commence_time"))
+                game_date=row.get("game_date"), commence=row.get("commence_time"),
+                prop_key=row.get("prop_key"))
             row["player_mlb_id"] = ident.get("mlb_player_id")
             row["game_pk"] = ident.get("game_pk")
     except Exception:                       # pragma: no cover - never break submit

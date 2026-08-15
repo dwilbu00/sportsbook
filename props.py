@@ -937,7 +937,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
                                team_schedules=None, matchup_features=None,
-                               weather=None):
+                               weather=None, confirmed_lineup=None,
+                               probable_starters=None):
     """
     Compare player prop lines against historical stat values from ESPN.
 
@@ -1055,24 +1056,37 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     _enforce_identity = _is_mlb_props and _identity_enforced()
     _ident_cache = {}
 
-    def _resolve_ident(pname):
+    def _resolve_ident(pname, prop_key=None):
+        # Commit C: the id-core is now ROLE-PARTITIONED (a pitcher-prop name binds
+        # off the announced probable, a batter-prop name off the confirmed lineup),
+        # so the cache is keyed by (name, role) — a same-name cross-role pair (e.g. a
+        # two-way player offered as both) must not share one cached id. role is the
+        # only prop_key-derived input; None (no prop_key) is its own bucket. prop_key
+        # + the game context are ignored by the resolver until ODI_MLB_STAMP_RESOLVER
+        # is ON, so the stamped ids are byte-identical with the gate OFF.
         if not _is_mlb_props:
             return None
-        if pname not in _ident_cache:
+        role = (None if prop_key is None
+                else ("P" if str(prop_key).startswith("pitcher_") else "B"))
+        ckey = (pname, role)
+        if ckey not in _ident_cache:
             try:
                 import entity_resolver
-                _ident_cache[pname] = entity_resolver.resolve(
+                _ident_cache[ckey] = entity_resolver.resolve(
                     pname, sport_key, home_team_name, away_team_name,
-                    game_date=log_game_date, commence=commence_iso)
+                    game_date=log_game_date, commence=commence_iso,
+                    prop_key=prop_key, confirmed_lineup=confirmed_lineup,
+                    probable_starters=probable_starters)
             except Exception:               # never break analysis on a resolver hiccup
-                _ident_cache[pname] = None
-        return _ident_cache[pname]
+                _ident_cache[ckey] = None
+        return _ident_cache[ckey]
 
-    def _ident_pinned(pname):
+    def _ident_pinned(pname, prop_key=None):
         """True if the resolver UNIQUELY pinned this MLB player (resolved +
-        mlb_player_id). A systemic hiccup (_resolve_ident → None, e.g. an import
-        break) counts as pinned = kept (a crash must not drop a player)."""
-        ident = _resolve_ident(pname)
+        mlb_player_id) FOR THIS PROP'S ROLE. A systemic hiccup (_resolve_ident →
+        None, e.g. an import break) counts as pinned = kept (a crash must not drop a
+        player)."""
+        ident = _resolve_ident(pname, prop_key)
         if ident is None:
             return True
         return bool(ident.get("resolved") and ident.get("mlb_player_id"))
@@ -1083,12 +1097,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # isn't silently suppressed (the NULL-id shadow rows reappear as the signal).
     _enforce_active = _enforce_identity
     if _enforce_identity:
-        _names = {p for _pl in prop_data.get("props", {}).values() for p in _pl}
-        _unpinned = sum(1 for p in _names if not _ident_pinned(p))
-        if _names and _unpinned / len(_names) >= _ENFORCE_FAILOPEN_FRACTION:
+        # Enumerate (name, prop_key) pairs — the resolver is role-partitioned, so a
+        # player can be pinnable as a pitcher but not a batter (or vice versa); the
+        # per-row drop below is per (name, prop_key), so the systemic-failure check
+        # counts the same unit rather than distinct names.
+        _name_props = {(p, pk) for pk, _pl in prop_data.get("props", {}).items()
+                       for p in _pl}
+        _unpinned = sum(1 for p, pk in _name_props if not _ident_pinned(p, pk))
+        if _name_props and _unpinned / len(_name_props) >= _ENFORCE_FAILOPEN_FRACTION:
             _enforce_active = False
             print(f"[identity-enforce] slate-level FAIL-OPEN: {_unpinned}/"
-                  f"{len(_names)} MLB players unresolved "
+                  f"{len(_name_props)} MLB prop-players unresolved "
                   f"(>= {int(_ENFORCE_FAILOPEN_FRACTION * 100)}%) — likely systemic; "
                   f"enforcement skipped this run")
 
@@ -1112,7 +1131,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # resolver can't uniquely pin — no candidate, no prediction row. Default
             # OFF → the P3 shadow posture (a NULL-id prediction still emits).
             # _enforce_active folds in the systemic-failure circuit breaker above.
-            if _enforce_active and not _ident_pinned(player_name):
+            if _enforce_active and not _ident_pinned(player_name, prop_key):
                 continue
             line = odds_info["line"]
             over_implied = odds_info["over_implied"]
@@ -1823,7 +1842,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # We log the *raw* (pre-Platt) probability — that's what Platt
             # was fit against and what subsequent refits should map.
             if log_game_date and sport_key and not lineup_out:
-                _ident = _resolve_ident(player_name)
+                _ident = _resolve_ident(player_name, prop_key)
                 prediction_row = log_prediction(
                     sport_key=sport_key,
                     event_id=prop_data.get("game_id"),

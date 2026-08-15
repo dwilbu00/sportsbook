@@ -3180,7 +3180,12 @@ if analyze_clicked and selected_game_labels:
                                                   safe_target=safe_target,
                                                   team_schedules=schedule_results,
                                                   matchup_features=matchup_features,
-                                                  weather=event_weather.get(eid))
+                                                  weather=event_weather.get(eid),
+                                                  # Commit C: game-context identity
+                                                  # stamp (role-partitioned; inert
+                                                  # until ODI_MLB_STAMP_RESOLVER on).
+                                                  confirmed_lineup=confirmed_lineup,
+                                                  probable_starters=probable_starters)
             for c in new_props:
                 c["event_id"] = eid
             all_props.extend(new_props)

@@ -301,18 +301,36 @@ def _enrich_ids(sport, meta, lines):
         # teams as the hint. Replaces the bare single-call mlb_id_for_name so the
         # odds warehouse carries game_pk too. Team lines still get team_code.
         import entity_resolver
+        # Commit C: prime the season roster index ONCE before the per-line batch so
+        # the (gated) game-context resolver's statsapi tier doesn't fetch inline per
+        # player. Guarded on the gate so it stays a true no-op (no network) when OFF.
+        if entity_resolver._stamp_resolver_enabled():
+            _when = meta.get("game_date") or meta.get("commence_time")
+            if _when:
+                try:
+                    import mlb_starters
+                    mlb_starters.warm_player_index(int(str(_when)[:4]))
+                except Exception:                      # never break odds capture
+                    pass
         _ident = {}
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
                 nm = ln.get("player")
-                if nm not in _ident:
-                    _ident[nm] = entity_resolver.resolve(
+                # Commit C: key the per-snapshot cache by (name, role), not name —
+                # the role-partitioned resolver can bind a same-name batter and
+                # pitcher (a two-way player offered as both) to DIFFERENT ids.
+                _pk = ln.get("prop_key")
+                _role = (None if _pk is None
+                         else ("P" if str(_pk).startswith("pitcher_") else "B"))
+                _ck = (nm, _role)
+                if _ck not in _ident:
+                    _ident[_ck] = entity_resolver.resolve(
                         nm, sport, meta.get("home"), meta.get("away"),
                         game_date=meta.get("game_date"),
                         commence=meta.get("commence_time"),
-                        prop_key=ln.get("prop_key"))
-                ln["player_mlb_id"] = _ident[nm].get("mlb_player_id")
-                ln["game_pk"] = _ident[nm].get("game_pk")
+                        prop_key=_pk)
+                ln["player_mlb_id"] = _ident[_ck].get("mlb_player_id")
+                ln["game_pk"] = _ident[_ck].get("game_pk")
             else:
                 ln["team_code"] = player_id_map.team_code_for_name(
                     ln.get("selection"))
