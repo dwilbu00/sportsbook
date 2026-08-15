@@ -15,9 +15,11 @@ Policy (owner-chosen 2026-08-15):
     non-null id only when the resolver confidently returns a DIFFERENT id, fill a
     NULL id, and leave the stored id untouched when the resolver returns None.
   * BOTH-TEAMS hint — prediction_log stores only the player's OWN team, so recover
-    home/away via market_prediction_log -> odds_snapshot -> mlb_game, giving the
-    offline re-stamp the SAME two-team hint the live stamp uses (wagers/odds_line
-    carry both teams directly / via the snapshot).
+    home/away from the row's real event_id via odds_snapshot / market_prediction_log
+    (id-INDEPENDENT). A row with only a game_date event_key (no event_id) falls back to
+    the own team rather than risk a wrong-game guess. game_pk is NOT a teams source —
+    it was P5-pinned off the OLD id, so it would mis-hint the very drift rows being
+    corrected. wagers/odds_line carry both teams directly / via the snapshot.
   * game_pk — when a row's id CHANGES off a non-null old id, NULL its (now-stale,
     P5-pinned-off-the-old-id) game_pk so `mlb_warehouse.py --backfill-game-pk
     --apply` re-pins it for the corrected player.
@@ -91,11 +93,12 @@ def _moved(old_id, eff_id):
 
 
 def _team_hint_maps(conn):
-    """Both-teams recovery lookups for a prediction_log row (own-team-only): by
-    (sport_key, event_key) [market log], by event_id [odds snapshot], by game_pk
-    [mlb_game -> mlb_team names]. First non-empty source wins per row."""
-    import mlb_warehouse as w
-    by_event_key, by_event_id, by_game_pk = {}, {}, {}
+    """Both-teams recovery lookups for a prediction_log row (own-team-only), keyed on
+    the UNAMBIGUOUS, id-INDEPENDENT odds event_id: by event_id [odds snapshot] and by
+    (sport_key, event_key) [market log]. game_pk is deliberately NOT a source — it was
+    P5-pinned FROM the (possibly wrong) OLD player id, so for the very drift rows this
+    re-stamp corrects it would encode the wrong game's teams and mis-hint the resolve."""
+    by_event_key, by_event_id = {}, {}
     m = db_store.market_prediction_log
     for sk, ek, home, away in conn.execute(
             select(m.c.sport_key, m.c.event_key, m.c.home_team, m.c.away_team)
@@ -108,28 +111,22 @@ def _team_hint_maps(conn):
             .where(s.c.sport == "baseball_mlb")):
         if eid and home and away:
             by_event_id.setdefault(str(eid), (home, away))
-    names = {tid: nm for tid, nm in conn.execute(
-        select(w.mlb_team.c.team_id, w.mlb_team.c.name))}
-    for gpk, hid, aid in conn.execute(
-            select(w.mlb_game.c.game_pk, w.mlb_game.c.home_team_id,
-                   w.mlb_game.c.away_team_id)):
-        home, away = names.get(str(hid)), names.get(str(aid))
-        if gpk is not None and home and away:
-            by_game_pk[int(gpk)] = (home, away)
-    return by_event_key, by_event_id, by_game_pk
+    return by_event_key, by_event_id
 
 
 def _pred_teams(row, maps):
-    """Two-team hint for a prediction_log row; falls back to the player's own team."""
-    by_event_key, by_event_id, by_game_pk = maps
-    ek = row.get("event_key")
-    t = by_event_key.get((row.get("sport_key"), str(ek))) if ek else None
-    if not t and row.get("event_id"):
-        t = by_event_id.get(str(row["event_id"]))
-    if not t and row.get("game_pk") is not None:
-        t = by_game_pk.get(int(row["game_pk"]))
-    if t:
-        return [t[0], t[1]]
+    """Two-team hint for a prediction_log row, derived ONLY from a real (unambiguous)
+    event_id via the odds snapshot / market log; falls back to the player's own team.
+    A row whose event_key is a game_date (event_id NULL) is NOT looked up by that date
+    (multiple games share one date → wrong-game teams), because a correct single
+    own-team hint beats a possibly-wrong two-team one."""
+    by_event_key, by_event_id = maps
+    eid = row.get("event_id")
+    if eid:
+        t = (by_event_id.get(str(eid))
+             or by_event_key.get((row.get("sport_key"), str(eid))))
+        if t:
+            return [t[0], t[1]]
     own = row.get("team")
     return [own] if own else None
 

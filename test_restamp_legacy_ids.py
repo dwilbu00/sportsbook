@@ -138,6 +138,28 @@ class PredictionPolicyTests(_Backend, unittest.TestCase):
             rs.restamp(dry_run=True)
         self.assertEqual(seen["teams"], ["New York Yankees", "Boston Red Sox"])
 
+    def test_event_id_null_falls_back_to_own_team_not_ambiguous_date(self):
+        # A row with NO event_id (event_key == game_date) must NOT borrow teams from a
+        # game_date-matched market row (many games share a date → wrong game). game_pk
+        # is likewise never a teams source (it was pinned off the OLD id). Expect the
+        # own single-team hint, not the unrelated Dodgers/Padres game.
+        self._pred(player_mlb_id="677651", game_pk=999, team="New York Yankees")
+        with db_store.get_engine().begin() as c:
+            c.execute(insert(db_store.market_prediction_log), {
+                "sport_key": "baseball_mlb", "event_key": "2026-08-10",
+                "bet_type": "moneyline", "side": "home",
+                "home_team": "Los Angeles Dodgers", "away_team": "San Diego Padres"})
+        seen = {}
+
+        def _resolve(name, season, prop_key=None, teams=None, **k):
+            seen["teams"] = teams
+            return (671277, False)
+        with mock.patch.object(mlb_starters, "resolve_mlbam_id", side_effect=_resolve), \
+             mock.patch.object(mlb_starters, "warm_player_index"), \
+             mock.patch.object(mlb_starters, "_player_index", side_effect=_idx_nonempty):
+            rs.restamp(dry_run=True)
+        self.assertEqual(seen["teams"], ["New York Yankees"])
+
 
 class WagerRestampTests(_Backend, unittest.TestCase):
     def test_wager_drift_corrected_and_game_pk_nulled(self):
