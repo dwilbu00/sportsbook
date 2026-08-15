@@ -437,7 +437,13 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             props_candidates = analyze_player_props_value(prop_data, player_histories, threshold,
                                                           sport_key=sport_key,
                                                           team_defense=team_defense,
-                                                          espn_teams=espn_teams)
+                                                          espn_teams=espn_teams,
+                                                          # Commit C: same game-context
+                                                          # identity stamp as the app
+                                                          # (role-partitioned; inert
+                                                          # until the gate is on).
+                                                          confirmed_lineup=mlb_lineup,
+                                                          probable_starters=mlb_probables)
             all_props_candidates.extend(props_candidates)
 
     # Print reports

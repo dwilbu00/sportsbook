@@ -82,7 +82,10 @@ def shadow(sport_key="baseball_mlb", limit=None, days=None):
         season = _season_of(r)
         if not (name and season):
             continue
-        role = "P" if str(prop_key or "").startswith("pitcher_") else "B"
+        # Role mirrors the resolver (None → role-agnostic); real prop rows always
+        # carry a prop_key, so this only affects the dedup key defensively.
+        role = (None if prop_key is None
+                else ("P" if str(prop_key).startswith("pitcher_") else "B"))
         key = (name, role, home, away, season)
         seen.setdefault(key, (name, prop_key, home, away, season))
 

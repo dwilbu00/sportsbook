@@ -1054,6 +1054,18 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # can't uniquely pin. MLB only; cached across this event's prop loops.
     _is_mlb_props = str(sport_key or "").startswith("baseball_mlb")
     _enforce_identity = _is_mlb_props and _identity_enforced()
+    # Commit C: whether the stamp resolver is flipped ON decides ONLY the role-
+    # partition UNIT of the enforce circuit-breaker below. OFF keeps the pre-Commit-C
+    # distinct-NAME unit so the ENFORCE breaker is byte-identical when the stamp flip
+    # is off (ENFORCE is independently ON in prod); ON uses the (name, prop_key) unit
+    # the role-partitioned per-row drop actually enforces.
+    _stamp_resolver_on = False
+    if _is_mlb_props:
+        try:
+            import entity_resolver
+            _stamp_resolver_on = entity_resolver._stamp_resolver_enabled()
+        except Exception:
+            _stamp_resolver_on = False
     _ident_cache = {}
 
     def _resolve_ident(pname, prop_key=None):
@@ -1097,17 +1109,24 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # isn't silently suppressed (the NULL-id shadow rows reappear as the signal).
     _enforce_active = _enforce_identity
     if _enforce_identity:
-        # Enumerate (name, prop_key) pairs — the resolver is role-partitioned, so a
-        # player can be pinnable as a pitcher but not a batter (or vice versa); the
-        # per-row drop below is per (name, prop_key), so the systemic-failure check
-        # counts the same unit rather than distinct names.
-        _name_props = {(p, pk) for pk, _pl in prop_data.get("props", {}).items()
-                       for p in _pl}
-        _unpinned = sum(1 for p, pk in _name_props if not _ident_pinned(p, pk))
-        if _name_props and _unpinned / len(_name_props) >= _ENFORCE_FAILOPEN_FRACTION:
+        # Systemic-failure pre-scan. The unit MUST match the per-row drop's unit so
+        # the breaker measures what actually gets dropped. With the stamp resolver ON
+        # the resolver is role-partitioned → count (name, prop_key) pairs (the per-row
+        # drop's unit). With it OFF resolution is role-independent, so count distinct
+        # NAMES — byte-identical to the pre-Commit-C breaker even when ENFORCE is on.
+        if _stamp_resolver_on:
+            _units = {(p, pk) for pk, _pl in prop_data.get("props", {}).items()
+                      for p in _pl}
+            _unpinned = sum(1 for p, pk in _units if not _ident_pinned(p, pk))
+            _unit_label = "prop-players"
+        else:
+            _units = {p for _pl in prop_data.get("props", {}).values() for p in _pl}
+            _unpinned = sum(1 for p in _units if not _ident_pinned(p))
+            _unit_label = "players"
+        if _units and _unpinned / len(_units) >= _ENFORCE_FAILOPEN_FRACTION:
             _enforce_active = False
             print(f"[identity-enforce] slate-level FAIL-OPEN: {_unpinned}/"
-                  f"{len(_name_props)} MLB prop-players unresolved "
+                  f"{len(_units)} MLB {_unit_label} unresolved "
                   f"(>= {int(_ENFORCE_FAILOPEN_FRACTION * 100)}%) — likely systemic; "
                   f"enforcement skipped this run")
 
