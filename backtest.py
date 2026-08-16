@@ -1130,7 +1130,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
                       supplement_log=True, min_shrink_n=MIN_SHRINK_N,
-                      collect_obs=None):
+                      collect_obs=None, collect_dated=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1311,6 +1311,9 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     # RAW model prob (pre-shrink) so the shrink can be swept offline.
                     collect_obs["moneyline"].append(
                         (mwin, fair_home, home_won, price_home, price_away))
+                if collect_dated is not None:
+                    collect_dated["moneyline"].append(
+                        (date_et, mwin, fair_home, home_won))
             if sp and mhc is not None:
                 home_spread, fair_cover, price_h, price_a = sp
                 model_spread, model_cover = mhc
@@ -1323,6 +1326,9 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     if collect_obs is not None:
                         collect_obs["spreads"].append(
                             (model_cover, fair_cover, home_covers, price_h, price_a))
+                    if collect_dated is not None:
+                        collect_dated["spreads"].append(
+                            (date_et, model_cover, fair_cover, home_covers))
             if tot and mov is not None:
                 line, fair_over, price_o, price_u = tot
                 model_line, model_over = mov
@@ -1335,6 +1341,9 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     if collect_obs is not None:
                         collect_obs["totals"].append(
                             (model_over, fair_over, over_hit, price_o, price_u))
+                    if collect_dated is not None:
+                        collect_dated["totals"].append(
+                            (date_et, model_over, fair_over, over_hit))
             continue
 
         for variant_name, params in variants.items():
@@ -3977,6 +3986,53 @@ def _team_gate_tally(obs, shrink, ev_floor, edge_floor, legacy_threshold):
             "roi": (pnl / n) if n else None, "hit": (won / n) if n else None}
 
 
+def _calibration_bakeoff(dated):
+    """OOS Platt-vs-scalar-shrink bake-off per market (READ-ONLY, #2).
+
+    dated[market] = [(date, raw_model_p, market_p, outcome), ...]. Fits BOTH a
+    scalar shrink and a Platt curve on a chronological TRAIN split (first 80% by
+    date) and scores each on the untouched HOLDOUT (last 20%) — the fair test,
+    since Platt has 2 params vs the shrink's 1 and an in-sample comparison would
+    flatter Platt. Also runs recalibration.fit_platt_chronological (its strict
+    2-fold expanding champion gate: calibrated must beat RAW on Brier AND log-loss
+    in every later fold) to say whether a Platt fit is ship-worthy. Nothing is
+    written — this only answers 'does a learned curve beat the flat scalar?'."""
+    from recalibration import fit_platt, apply_platt, fit_platt_chronological
+    print("\n=== CALIBRATION BAKE-OFF: Platt vs scalar-shrink (OOS holdout Brier) ===")
+    print("  lower = better; TRAIN=first 80% by date, HOLDOUT=last 20%. 'platt-gate'"
+          " = passes the strict beat-raw-OOS champion gate (ship-worthy).")
+    print("  {:<10}{:>7}{:>9}{:>9}{:>9}{:>9}   {}".format(
+        "market", "n_hold", "raw", "shrink", "platt", "market", "platt-gate"))
+    for market in MARKETS:
+        rows = sorted((r for r in dated.get(market, []) if r[0]),
+                      key=lambda r: r[0])
+        if len(rows) < 300:
+            print(f"  {market:<10} (thin: {len(rows)} obs)")
+            continue
+        cut_date = rows[int(len(rows) * 0.8)][0]
+        train = [r for r in rows if r[0] < cut_date]
+        hold = [r for r in rows if r[0] >= cut_date]
+        if len(train) < 100 or len(hold) < 50:
+            print(f"  {market:<10} (thin split)")
+            continue
+        fit = fit_platt([r[1] for r in train], [r[3] for r in train])
+        sres = _best_shrink([(r[1], r[2], r[3]) for r in train])
+        s = sres[0] if sres else 1.0
+
+        def _brier(fn):
+            return sum((fn(r) - r[3]) ** 2 for r in hold) / len(hold)
+        raw_b = _brier(lambda r: r[1])
+        mkt_b = _brier(lambda r: r[2])
+        shr_b = _brier(lambda r: 0.5 + s * (r[1] - 0.5))
+        plt_b = (_brier(lambda r: apply_platt(r[1], fit[0], fit[1]))
+                 if fit else float("nan"))
+        gate = fit_platt_chronological([(r[0], r[1], r[3]) for r in rows])
+        print("  {:<10}{:>7}{:>9.4f}{:>9.4f}{:>9.4f}{:>9.4f}   {} (shrink s={})".format(
+            market, len(hold), raw_b, shr_b, plt_b, mkt_b,
+            "PASS" if gate else "fail", s))
+    print("  (Diagnostic only — nothing written.)")
+
+
 def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                        limit=100000, store_label="", source="auto"):
     """Team-market GATE + SHRINK lens (NO WRITE): grade ML/spread/total over the
@@ -3989,6 +4045,7 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     team-market analog of the props --gate-diag. Consensus/closing-priced; INFORMS,
     never auto-writes."""
     obs = {m: [] for m in MARKETS}
+    dated = {m: [] for m in MARKETS}   # (date, raw_p, market_p, outcome) for #2 bake-off
     # Grade once (RAW obs collected via the hook); prob_shrink=1.0 so the printed
     # Brier table is the unshrunk baseline — the sweep applies shrink itself.
     run_odds_backtest(sport_key, espn_sport, espn_league, limit=limit, window=10,
@@ -3996,14 +4053,21 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                       season_year=season_year, threshold_pct=5.0,
                       write_calibration=False, store_label=store_label,
                       engine="live", prob_shrink=1.0, source=source,
-                      supplement_log=False, collect_obs=obs)
+                      supplement_log=False, collect_obs=obs, collect_dated=dated)
 
-    SHRINKS = (1.0, 0.75, 0.5, 0.25)
+    SHRINKS = (1.0, 0.5, 0.25, 0.15, 0.10)
+    # Expanded toward RARER, higher-edge gates — the disqualification lens: at
+    # edge>=5% the model bets ~80% of games (overconfidence fabricates edges), so
+    # sweep up to edge>=15% / EV>=12% to find where fewer, larger disagreements
+    # actually turn profitable. '%bet' below = share of graded games recommended.
     GATES = [
         ("edge>=5% & EV>0 (legacy)", None, 0.0, 0.05),
-        ("EV>=3% & edge>=1%", 0.03, 0.01, 0.0),
-        ("EV>=4% & edge>=1%", 0.04, 0.01, 0.0),
+        ("edge>=7% & EV>0", None, 0.0, 0.07),
+        ("edge>=10% & EV>0", None, 0.0, 0.10),
+        ("edge>=15% & EV>0", None, 0.0, 0.15),
         ("EV>=5% & edge>=1%", 0.05, 0.01, 0.0),
+        ("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
+        ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0),
     ]
     print("\n=== TEAM-MARKET gate x shrink lens (realized flat-1u ROI) ===")
     print("  shrink pulls the model prob toward 0.5 (1.0 = none, 0.25 = live ML).")
@@ -4015,16 +4079,20 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     print("    treat the spread rows as directional-only, not a shrink recommendation.")
     for market in MARKETS:
         mobs = obs[market]
+        n_obs = len(mobs) or 1
         print(f"\n  {market.upper()} ({len(mobs)} graded obs):")
-        print("    {:<26}{:>7}{:>8}{:>9}{:>10}".format(
-            "gate", "shrink", "n_bets", "ROI%", "P/L(u)"))
+        print("    {:<24}{:>7}{:>8}{:>7}{:>9}{:>10}".format(
+            "gate", "shrink", "n_bets", "%bet", "ROI%", "P/L(u)"))
         for label, ev_floor, edge_floor, legacy in GATES:
             for s in SHRINKS:
                 t = _team_gate_tally(mobs, s, ev_floor, edge_floor, legacy)
                 roi = f"{t['roi'] * 100:+.1f}" if t["roi"] is not None else "-"
-                print("    {:<26}{:>7}{:>8}{:>9}{:>+10.2f}".format(
-                    label, f"{s:.2f}", t["n"], roi, t["pnl"]))
+                print("    {:<24}{:>7}{:>8}{:>6.0f}%{:>9}{:>+10.2f}".format(
+                    label, f"{s:.2f}", t["n"], 100 * t["n"] / n_obs, roi,
+                    t["pnl"]))
     print("\n  (Diagnostic only — nothing written.)")
+    # #2: does a learned Platt curve beat the flat scalar shrink OOS?
+    _calibration_bakeoff(dated)
 
 
 def main():
