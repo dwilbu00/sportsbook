@@ -198,6 +198,26 @@ class UnleashSweepTests(unittest.TestCase):
         self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)
         self.assertNotIn(sport, pricing_common._PROB_SHRINK_CACHE)
 
+    def test_pythag_sweep_regrades_per_weight_and_restores(self):
+        import backtest
+        import analysis
+        import pricing_common
+        sport = "baseball_mlb"
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.35
+        seen_weights = []
+
+        def fake_run(*a, **k):
+            seen_weights.append(analysis.DEFAULT_PYTHAG_WEIGHT)
+
+        with patch.object(backtest, "run_odds_backtest", side_effect=fake_run), \
+                patch.object(pricing_common, "_shrink_factor",
+                             side_effect=lambda sk, m: 0.25):
+            backtest.pythag_sweep(sport, "baseball", "mlb")
+        # one re-grade per swept weight, and it actually varied the weight
+        self.assertEqual(seen_weights, [0.0, 0.15, 0.25, 0.35, 0.50, 0.70, 1.0])
+        # DEFAULT_PYTHAG_WEIGHT restored to its pre-sweep value
+        self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)
+
     def test_globals_restored_even_when_backtest_raises(self):
         import backtest
         import analysis
