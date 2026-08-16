@@ -966,6 +966,34 @@ def _names_match(left, right):
     return left.split()[-1] == right.split()[-1]
 
 
+def _asof_pitcher_quality_from_warehouse(pitcher_id, as_of_date):
+    """As-of starter quality from the warehouse mlb_pitcher_game facts (ZERO
+    network, O(1 query)/season) — the backtest-fast, leakage-safe source for
+    get_pitcher_quality's as-of mode. Same dict shape as the StatsAPI path with the
+    Savant xERA fields None (as-of always skips them). Returns None when the
+    warehouse has no in-season games for him yet, so the caller can fall back to
+    the byDateRange StatsAPI path."""
+    try:
+        import mlb_warehouse
+        st = mlb_warehouse.asof_pitcher_stats(pitcher_id, as_of_date)
+        if not st:
+            return None
+        throws = mlb_warehouse.pitcher_throws(pitcher_id)
+    except Exception:
+        return None
+    era = st.get("era")
+    out = {"name": None, "throws": throws, "era": era, "ip": None,
+           "avg_ip": st.get("avg_ip"), "bf": None, "k_pct": None,
+           "bb_pct": None, "xera": None, "xwoba": None, "xba": None}
+    if era and era > 0:
+        out["run_suppression"] = max(0.5, min(2.0, LEAGUE_AVG["era"] / era))
+        out["run_suppression_basis"] = "warehouse_era"
+    else:
+        out["run_suppression"] = 1.0
+        out["run_suppression_basis"] = "none"
+    return out
+
+
 def get_pitcher_quality(pitcher_id, season, as_of_date=None):
     """
     Pitching quality + handedness for a starter.
@@ -995,6 +1023,14 @@ def get_pitcher_quality(pitcher_id, season, as_of_date=None):
     cached = _read_cache(cache, max_age=max_age)
     if cached is not None:
         return cached
+    # As-of (backtest): prefer the warehouse facts — zero network, scales O(1) per
+    # season as the data grows. Fall back to the StatsAPI byDateRange below only
+    # when the warehouse has no in-season games for him yet.
+    if as_of_date:
+        wh = _asof_pitcher_quality_from_warehouse(pitcher_id, as_of_date)
+        if wh is not None:
+            _write_cache(cache, wh)
+            return wh
     if as_of_date:
         hydrate = (f"stats(group=pitching,type=byDateRange,"
                    f"startDate={season}-03-01,endDate={cutoff},season={season})")

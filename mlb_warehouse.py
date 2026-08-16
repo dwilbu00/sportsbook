@@ -1425,6 +1425,96 @@ def get_calib_gamelog(mlb_player_id, role, season=None):
 # scan-and-average, and it unlocks run differential / Pythagorean strength for a
 # future team-market signal. Dual-run: nothing app-facing consumes these until the
 # team-market flip. Fail-open; leakage-safe via as_of_date.
+# ── As-of starter line from the warehouse facts (backtest, ZERO network) ──────
+# Replaces the per-(pitcher, game-date) StatsAPI byDateRange storm: one query per
+# season builds an in-memory index, then as-of cumulative stats are computed
+# locally — O(1 query)/season regardless of how large the warehouse grows.
+_PITCHER_IDX = {}                # season -> {athlete_id: [(official_date, outs, er, k)]}
+_PITCHER_IDX_LOCK = threading.Lock()
+_THROWS_CACHE = {}
+_THROWS_LOADED = [False]
+
+
+def _pitcher_game_index(season):
+    """{athlete_id: [(official_date, outs, er, k), ...] sorted} for a season, from
+    mlb_pitcher_game joined to mlb_game for the play date. Loaded ONCE per season
+    (thread-safe); an empty/failed load is not cached so it can retry."""
+    season = int(season)
+    idx = _PITCHER_IDX.get(season)
+    if idx is not None:
+        return idx
+    with _PITCHER_IDX_LOCK:
+        idx = _PITCHER_IDX.get(season)
+        if idx is not None:
+            return idx
+        pg, g = mlb_pitcher_game, mlb_game
+        joined = pg.join(g, pg.c.game_pk == g.c.game_pk)
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(
+                    select(pg.c.athlete_id, g.c.official_date,
+                           pg.c.IP, pg.c.ER, pg.c.K)
+                    .select_from(joined)
+                    .where(pg.c.season_bucket == season)).all()
+        except (OperationalError, ValueError, TypeError):
+            return {}                          # transient — don't cache the miss
+        built = {}
+        for aid, od, ip, er, k in rows:
+            if not od:
+                continue
+            built.setdefault(str(aid), []).append(
+                (str(od)[:10], _ip_to_outs(ip) or 0, float(er or 0), float(k or 0)))
+        for lst in built.values():
+            lst.sort(key=lambda x: x[0])
+        _PITCHER_IDX[season] = built
+        return built
+
+
+def asof_pitcher_stats(athlete_id, as_of_date):
+    """Cumulative pitching line for a starter through the day BEFORE as_of_date
+    (leakage-safe), from the warehouse facts — ZERO network. Returns
+    {'era','ip','k','games','avg_ip'} or None (no prior games in-season / SQL off).
+    IP is summed in OUTS (facts store StatsAPI 6.1 = 6 IP + 1 out notation)."""
+    if not enabled() or not athlete_id or not as_of_date:
+        return None
+    cutoff = str(as_of_date)[:10]              # games STRICTLY before the game day
+    games = _pitcher_game_index(int(cutoff[:4])).get(str(athlete_id))
+    if not games:
+        return None
+    outs = er = k = 0.0
+    n = 0
+    for od, o, e, kk in games:
+        if od < cutoff:
+            outs += o
+            er += e
+            k += kk
+            n += 1
+    if n == 0 or outs <= 0:
+        return None
+    ip = outs / 3.0
+    return {"era": (er / ip) * 9.0, "ip": ip, "k": k, "games": n,
+            "avg_ip": ip / n}
+
+
+def pitcher_throws(athlete_id):
+    """Handedness ('L'/'R') for a pitcher from mlb_player, batch-loaded once."""
+    if not enabled() or not athlete_id:
+        return None
+    if not _THROWS_LOADED[0]:
+        with _PITCHER_IDX_LOCK:
+            if not _THROWS_LOADED[0]:
+                try:
+                    with db_store.get_engine().connect() as conn:
+                        for pid, thr in conn.execute(
+                                select(mlb_player.c.player_id,
+                                       mlb_player.c.throws)).all():
+                            _THROWS_CACHE[str(pid)] = thr
+                except (OperationalError, ValueError, TypeError):
+                    pass
+                _THROWS_LOADED[0] = True
+    return _THROWS_CACHE.get(str(athlete_id))
+
+
 def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
     """Most-recent-first FINAL regular/postseason games for a team (home or away),
     from mlb_game joined to mlb_team for the home/away display names. Each dict
