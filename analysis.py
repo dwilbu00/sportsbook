@@ -70,7 +70,8 @@ def _apply_starter_logit(p, edge, weight):
 # run on the validated expected_runs_challenger; totals stay on the current model.
 DEFAULT_PYTHAG_WEIGHT = 0.35
 
-# Lineup-offense margin shift (runs) per unit of tanh(home-away lineup OPS edge).
+# Lineup-offense margin shift: runs of margin per unit of the home-minus-away
+# lineup OPS edge (PA-shrunk, slot-PA-weighted, in OPS units, clamped +/-0.3).
 # INERT by default (0.0) — a v1 experiment: build_matchup_features supplies a
 # warehouse-sourced lineup_edge (today's 9 batters' as-of OPS), and this weight is
 # swept/fit in the backtest (backtest.py --lineup-weight) before any live use.

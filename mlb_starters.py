@@ -96,6 +96,10 @@ LEAGUE_AVG = {
     "ops": 0.711,    # team OPS baseline
 }
 PYTHAGOREAN_EXPONENT = 1.83
+# Expected plate appearances per lineup slot (9-inning game): the top of the order
+# bats ~20% more than the bottom, so lineup-offense is a PA-weighted mean of the 9
+# batters' OPS, not a flat mean (leadoff → 9-hole).
+_SLOT_PA_WEIGHTS = (4.65, 4.54, 4.43, 4.32, 4.21, 4.10, 3.99, 3.88, 3.77)
 
 # ── §3.1 GameContext constants ──────────────────────────────────────────────
 # One shared, cached, leakage-safe run/hits environment per game (see
@@ -1365,14 +1369,19 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
     return result
 
 
-def lineup_offense_edge(home_team, away_team, date, team_index, season):
-    """Home-minus-away lineup offense edge from the warehouse (as-of, ZERO network,
-    O(queries)/season via cached indexes — no per-game round trips).
+def lineup_offense_edge(home_team, away_team, date, team_index, season,
+                        shrink_pa=100):
+    """Home-minus-away lineup offense edge, in OPS units, from the warehouse
+    (as-of, ZERO network, O(queries)/season via cached indexes).
 
-    Each side's de-facto starters' mean as-of OPS, league-relative; the difference
-    is tanh-bounded like starter_edge. Backtest uses the box-score starters (top-9
-    by PA) for the resolved game_pk; returns None for live games (no batter facts
-    yet) or on any miss, so the team model degrades gracefully."""
+    Each starter's as-of OPS is PA-SHRUNK toward league (a thin sample — a 2-PA
+    callup, or anyone early-season — is pulled toward the mean so it can't skew the
+    lineup), then combined per side as a SLOT-PA-WEIGHTED mean (the top of the order
+    bats more; see _SLOT_PA_WEIGHTS). The edge is the home-minus-away weighted OPS,
+    clamped to +/-0.3 for safety; a fitted runs-of-margin weight (DEFAULT_LINEUP_
+    WEIGHT) turns it into a margin shift. Backtest uses the box-score starters
+    (top-9 by PA, list order proxies the batting order); None for live games (no
+    batter facts yet) or on any miss."""
     try:
         import mlb_warehouse
         home = _match_team_id(home_team, team_index)
@@ -1384,17 +1393,29 @@ def lineup_offense_edge(home_team, away_team, date, team_index, season):
         if not game_pk:
             return None
         lineups = mlb_warehouse._game_lineup_index(season).get(game_pk) or {}
+        lg = LEAGUE_AVG["ops"]
 
         def _side_ops(tid):
-            ops = [o["ops"] for o in
-                   (mlb_warehouse.asof_batter_ops(a, date)
-                    for a in (lineups.get(str(tid)) or [])) if o]
-            return (sum(ops) / len(ops)) if ops else None
+            # Weight each batter's (PA-shrunk) OPS by their SLOT's expected PA per
+            # game — the top of the order bats more, so it drives more of the team's
+            # offense. Backtest: the top-9-by-PA list order proxies the batting
+            # order; live v2 will use the announced order.
+            num = den = 0.0
+            for i, a in enumerate(lineups.get(str(tid)) or []):
+                o = mlb_warehouse.asof_batter_ops(a, date)
+                if not o:
+                    continue
+                pa = o.get("pa") or 0.0
+                shrunk = (pa * o["ops"] + shrink_pa * lg) / (pa + shrink_pa)
+                w = _SLOT_PA_WEIGHTS[i] if i < len(_SLOT_PA_WEIGHTS) else _SLOT_PA_WEIGHTS[-1]
+                num += w * shrunk
+                den += w
+            return (num / den) if den else None
         h = _side_ops(home["id"])
         a = _side_ops(away["id"])
         if h is None or a is None:
             return None
-        return _tanh((h - a) / LEAGUE_AVG["ops"])
+        return max(-0.3, min(0.3, h - a))
     except Exception:
         return None
 

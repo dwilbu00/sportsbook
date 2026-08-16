@@ -42,12 +42,14 @@ class AsofBatterOpsTests(unittest.TestCase):
 
 
 class LineupOffenseEdgeTests(unittest.TestCase):
-    def _run(self, home_ops, away_ops, game_pk=123):
+    def _run(self, home, away, game_pk=123):
+        # home/away = {aid_prefix: (ops, pa)} lookups
         def _tid(name, idx):
             return {"id": "H"} if name == "Home" else {"id": "A"}
 
         def _ops(aid, d):
-            return {"ops": home_ops if aid.startswith("h") else away_ops}
+            ops, pa = home if aid.startswith("h") else away
+            return {"ops": ops, "pa": pa}
         with patch.object(ms, "_match_team_id", side_effect=_tid), \
                 patch.object(mw, "_game_pk_index",
                              return_value={("2024-07-01", "H", "A"): game_pk}), \
@@ -58,13 +60,52 @@ class LineupOffenseEdgeTests(unittest.TestCase):
             return ms.lineup_offense_edge("Home", "Away", "2024-07-01", {}, 2024)
 
     def test_home_stronger_positive_edge(self):
-        self.assertGreater(self._run(0.900, 0.700), 0)
+        # ample PA → little shrinkage → edge ≈ home-away OPS diff > 0
+        self.assertGreater(self._run((0.900, 400), (0.700, 400)), 0.1)
 
     def test_away_stronger_negative_edge(self):
-        self.assertLess(self._run(0.700, 0.900), 0)
+        self.assertLess(self._run((0.700, 400), (0.900, 400)), -0.1)
 
     def test_equal_lineups_zero_edge(self):
-        self.assertAlmostEqual(self._run(0.750, 0.750), 0.0, places=6)
+        self.assertAlmostEqual(self._run((0.750, 400), (0.750, 400)), 0.0, places=6)
+
+    def test_small_sample_batter_is_shrunk_not_explosive(self):
+        # A 2-PA callup batting 4.000 must NOT blow up the edge — PA-shrinkage pulls
+        # it toward league (~0.711), so vs a league-average opponent the edge stays
+        # small, not ~+3.3.
+        edge = self._run((4.000, 2), (0.711, 400))
+        self.assertLess(edge, 0.15)
+
+    def test_edge_clamped_to_range(self):
+        self.assertLessEqual(self._run((2.000, 400), (0.400, 400)), 0.3)
+
+    def test_slot_pa_weighting_favors_top_of_order(self):
+        # Strong leadoff + 8 weak hitters: the slot-PA weighting pulls the side mean
+        # ABOVE a flat mean (the top of the order counts more).
+        def _tid(n, i):
+            return {"id": "H"} if n == "Home" else {"id": "A"}
+
+        def _ops(aid, d):
+            if aid == "h1":
+                return {"ops": 1.000, "pa": 600}   # star leadoff
+            if aid.startswith("h"):
+                return {"ops": 0.650, "pa": 600}   # weak rest
+            return {"ops": 0.711, "pa": 600}       # league-avg away
+        home_ids = [f"h{i}" for i in range(1, 10)]
+        with patch.object(ms, "_match_team_id", side_effect=_tid), \
+                patch.object(mw, "_game_pk_index",
+                             return_value={("2024-07-01", "H", "A"): 1}), \
+                patch.object(mw, "_game_lineup_index",
+                             return_value={1: {"H": home_ids,
+                                               "A": [f"a{i}" for i in range(1, 10)]}}), \
+                patch.object(mw, "asof_batter_ops", side_effect=_ops):
+            edge = ms.lineup_offense_edge("Home", "Away", "2024-07-01", {}, 2024)
+        # flat-mean home ≈ (1.000 + 8*0.650)/9 = 0.689 → flat edge ≈ -0.022;
+        # slot-weighted lifts the star (slot 1, highest PA) → home mean higher →
+        # edge strictly greater than the flat-mean edge.
+        flat_home = (1.000 + 8 * 0.650) / 9
+        # shrink is negligible at pa=600, so compare against flat_home - league
+        self.assertGreater(edge, flat_home - 0.711)
 
     def test_none_when_game_not_resolved(self):
         with patch.object(ms, "_match_team_id",
