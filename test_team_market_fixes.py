@@ -218,6 +218,26 @@ class UnleashSweepTests(unittest.TestCase):
         # DEFAULT_PYTHAG_WEIGHT restored to its pre-sweep value
         self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)
 
+    def test_combo_sweep_one_regrade_per_weight_and_restores(self):
+        import backtest
+        import analysis
+        import pricing_common
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.35
+        seen = []
+
+        def fake_run(*a, **k):
+            seen.append(analysis.DEFAULT_PYTHAG_WEIGHT)
+
+        with patch.object(backtest, "run_odds_backtest", side_effect=fake_run), \
+                patch.object(pricing_common, "_shrink_factor",
+                             side_effect=lambda sk, m: 0.25):
+            backtest.pythag_shrink_combo(
+                "baseball_mlb", "baseball", "mlb",
+                weights=[0.0, 0.5, 1.0], shrinks=[0.1, 0.25, 1.0])
+        # ONE re-grade per pythag weight (shrink axis is offline → free)
+        self.assertEqual(seen, [0.0, 0.5, 1.0])
+        self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)   # restored
+
     def test_globals_restored_even_when_backtest_raises(self):
         import backtest
         import analysis

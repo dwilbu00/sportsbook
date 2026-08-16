@@ -4301,8 +4301,31 @@ def unleash_sweep(sport_key, espn_sport, espn_league, season_year=None,
     print("   ML/TOTALS shrink is the offline sweep on the pre-shrink obs.)")
 
 
+def _regrade_ml_obs(sport_key, espn_sport, espn_league, season_year, limit,
+                    store_label, source, pythag_weight):
+    """Re-grade the live ML analyzer with DEFAULT_PYTHAG_WEIGHT overridden; return the
+    collected PRE-shrink moneyline obs (the shrink axis is then swept OFFLINE). The
+    global is restored in a finally. Shared by --pythag-sweep and --combo-sweep so
+    the whole pythag x shrink grid costs only one re-grade per pythag weight."""
+    obs = {m: [] for m in MARKETS}
+    saved = analysis.DEFAULT_PYTHAG_WEIGHT
+    print(f"\n########## re-grade: pythag w={pythag_weight:.2f} ##########")
+    try:
+        analysis.DEFAULT_PYTHAG_WEIGHT = pythag_weight
+        run_odds_backtest(
+            sport_key, espn_sport, espn_league, limit=limit, window=10,
+            variants={"live": VARIANT_PRESETS.get("all", {})},
+            season_year=season_year, threshold_pct=5.0,
+            write_calibration=False, store_label=store_label,
+            engine="live", prob_shrink=1.0, source=source,
+            supplement_log=False, collect_obs=obs)
+    finally:
+        analysis.DEFAULT_PYTHAG_WEIGHT = saved
+    return obs["moneyline"]
+
+
 def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
-                 limit=100000, store_label="", source="auto"):
+                 limit=100000, store_label="", source="auto", weights=None):
     """Sweep DEFAULT_PYTHAG_WEIGHT x prob_shrink for MONEYLINE (NO WRITE).
 
     The Pythagorean blend is baked into the collected ML prob, so each weight is a
@@ -4310,11 +4333,12 @@ def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
     so every re-grade yields BOTH shrink columns (live + off) for free. Finds the
     weight that maximizes realized ROI-at-gate, and whether that optimum shifts when
     the shrink is on vs off. MONEYLINE only — pythag doesn't touch spreads/totals.
-    Requires the harness season-runs feed (else pythag is inert). Judge OOS via
+    Requires the harness season-runs feed (else pythag is inert). ``weights`` = a
+    custom grid (for a refined sweep); defaults to a coarse 0..1 grid. Judge OOS via
     --season/--seasons; nothing written."""
     import pricing_common
     live_ml = pricing_common._shrink_factor(sport_key, "moneyline")
-    WEIGHTS = [0.0, 0.15, 0.25, 0.35, 0.50, 0.70, 1.0]
+    WEIGHTS = weights if weights else [0.0, 0.15, 0.25, 0.35, 0.50, 0.70, 1.0]
     SHRINKS = [(f"SHRINK {live_ml:.2f} (live)", live_ml), ("SHRINK 1.00 (off)", 1.0)]
     GATES = [
         ("edge>=5%", None, 0.0, 0.05),
@@ -4323,24 +4347,8 @@ def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
         ("EV>=12%&edge>=3%", 0.12, 0.03, 0.0),
     ]
 
-    def _run_ml(pythag_weight):
-        obs = {m: [] for m in MARKETS}
-        saved = analysis.DEFAULT_PYTHAG_WEIGHT
-        print(f"\n########## pythag sweep re-grade: w={pythag_weight:.2f} ##########")
-        try:
-            analysis.DEFAULT_PYTHAG_WEIGHT = pythag_weight
-            run_odds_backtest(
-                sport_key, espn_sport, espn_league, limit=limit, window=10,
-                variants={"live": VARIANT_PRESETS.get("all", {})},
-                season_year=season_year, threshold_pct=5.0,
-                write_calibration=False, store_label=store_label,
-                engine="live", prob_shrink=1.0, source=source,
-                supplement_log=False, collect_obs=obs)
-        finally:
-            analysis.DEFAULT_PYTHAG_WEIGHT = saved
-        return obs["moneyline"]
-
-    results = {w: _run_ml(w) for w in WEIGHTS}
+    results = {w: _regrade_ml_obs(sport_key, espn_sport, espn_league, season_year,
+                                  limit, store_label, source, w) for w in WEIGHTS}
 
     print("\n\n############ PYTHAGOREAN WEIGHT x SHRINK — MONEYLINE ROI-at-gate ############")
     print("  Cell = flat-1u ROI%% (n bets). pythag baked per weight (re-grade); shrink")
@@ -4360,6 +4368,51 @@ def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
             print("  {:<7}".format(f"{w:.2f}")
                   + "".join("{:>17}".format(c) for c in cells))
     print("\n  (Diagnostic only — nothing written. MONEYLINE only.)")
+
+
+def pythag_shrink_combo(sport_key, espn_sport, espn_league, season_year=None,
+                        limit=100000, store_label="", source="auto",
+                        weights=None, shrinks=None):
+    """MONEYLINE Pythagorean-weight x prob-shrink COMBO grid (NO WRITE): find the
+    optimal marriage of the two ML mean-reversions.
+
+    One re-grade per pythag weight (baked into the ML prob); the shrink axis is swept
+    OFFLINE on the pre-shrink obs, so the FULL 2D grid costs only N re-grades. Prints
+    a pythag(rows) x shrink(cols) ROI grid per tight EV gate and flags the max cell
+    (the best combo). A diagonal ridge = SUBSTITUTES (more pythag compensates for
+    less shrink); a single peak = COMPLEMENTS. MONEYLINE only. Judge OOS; no write."""
+    PW = weights if weights else [0.0, 0.20, 0.35, 0.50, 0.70, 1.0]
+    SH = shrinks if shrinks else [0.10, 0.15, 0.25, 0.35, 0.50, 0.75, 1.0]
+    GATES = [("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
+             ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0)]
+    obs_by_w = {w: _regrade_ml_obs(sport_key, espn_sport, espn_league, season_year,
+                                   limit, store_label, source, w) for w in PW}
+
+    print("\n\n############ PYTHAG x SHRINK COMBO — MONEYLINE ROI-at-gate ############")
+    print("  Rows = pythag weight, cols = prob_shrink. Cell = flat-1u ROI%%. The MAX")
+    print("  cell is the best marriage; a diagonal ridge (high-pythag/low-shrink ==")
+    print("  low-pythag/high-shrink) means they are SUBSTITUTES. Judge OOS, not Brier.")
+    for glabel, evf, edf, leg in GATES:
+        print(f"\n=== {glabel} ===")
+        print("  {:<8}".format("py\\shr")
+              + "".join("{:>8}".format(f"{s:.2f}") for s in SH))
+        best = None
+        for w in PW:
+            obs = obs_by_w[w]
+            cells = []
+            for s in SH:
+                t = _team_gate_tally(obs, s, evf, edf, leg)
+                roi = t["roi"]
+                cells.append(f"{roi * 100:+.1f}" if roi is not None else "-")
+                if roi is not None and (best is None or roi > best[0]):
+                    best = (roi, w, s, t["n"])
+            print("  {:<8}".format(f"{w:.2f}")
+                  + "".join("{:>8}".format(c) for c in cells))
+        if best:
+            print(f"  -> best: pythag={best[1]:.2f} shrink={best[2]:.2f} "
+                  f"ROI={best[0] * 100:+.1f}% (n={best[3]})")
+    print("\n  (Diagnostic only — nothing written. MONEYLINE only; cell bet-counts")
+    print("   vary across the grid — see --pythag-sweep for per-cell n.)")
 
 
 def main():
@@ -4397,6 +4450,16 @@ def main():
                         "MONEYLINE: re-grade per pythag weight, tally ROI-at-gate at "
                         "shrink on AND off. Finds the best pythag weight + whether it "
                         "shifts with shrink. Judge OOS (--season/--seasons). No write.")
+    p.add_argument("--combo-sweep", action="store_true",
+                   help="(odds mode) MONEYLINE pythag-weight x prob-shrink 2D ROI-at-"
+                        "gate grid (the 'optimal marriage'). One re-grade per pythag "
+                        "weight; shrink swept offline. Flags the best cell. No write.")
+    p.add_argument("--pythag-weights", default=None,
+                   help="(--pythag-sweep/--combo-sweep) comma list of pythag weights, "
+                        "e.g. 0.35,0.4,0.45,0.5,0.55,0.6. Default: coarse 0..1 grid.")
+    p.add_argument("--combo-shrinks", default=None,
+                   help="(--combo-sweep) comma list of prob_shrink values for the grid "
+                        "columns, e.g. 0.1,0.2,0.3,0.4. Default: 0.10..1.0 grid.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -4568,9 +4631,21 @@ def main():
                           season_year=odds_seasons, limit=args.limit,
                           store_label=args.store_label, source=args.source)
         elif args.pythag_sweep:
+            _pw = ([float(x) for x in args.pythag_weights.split(",")]
+                   if args.pythag_weights else None)
             pythag_sweep(sport_key, espn_sport, espn_league,
                          season_year=odds_seasons, limit=args.limit,
-                         store_label=args.store_label, source=args.source)
+                         store_label=args.store_label, source=args.source,
+                         weights=_pw)
+        elif args.combo_sweep:
+            _pw = ([float(x) for x in args.pythag_weights.split(",")]
+                   if args.pythag_weights else None)
+            _sh = ([float(x) for x in args.combo_shrinks.split(",")]
+                   if args.combo_shrinks else None)
+            pythag_shrink_combo(sport_key, espn_sport, espn_league,
+                                season_year=odds_seasons, limit=args.limit,
+                                store_label=args.store_label, source=args.source,
+                                weights=_pw, shrinks=_sh)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,
