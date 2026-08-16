@@ -4139,8 +4139,8 @@ def _lineup_runs_diag(lineup):
         raw = _brier(idx)
         bs, bb = _best_shrunk(idx)
         print("  {:<12}{:>11.4f}{:>13.4f}{:>9}".format(label, raw, bb, f"{bs:.2f}"))
-    print("  lineup < recency ⇢ the runs-first estimator adds info the margin model")
-    print("  lacks; lineup → market ⇢ CLV potential. (Diagnostic only — nothing written.)")
+    print("  lineup < recency => the runs-first estimator adds info the margin model")
+    print("  lacks; lineup -> market => CLV potential. (Diagnostic only; nothing written.)")
 
 
 def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
@@ -4184,7 +4184,7 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     print("\n=== TEAM-MARKET gate x shrink lens (realized flat-1u ROI) ===")
     print("  shrink pulls the model prob toward 0.5 (1.0 = none, 0.25 = live ML).")
     print("  Closing-priced; RELATIVE ranking is the signal.")
-    print("  ⚠ MONEYLINE is the CLEAN row: it collects the PRE-shrink model_prob, so")
+    print("  !! MONEYLINE is the CLEAN row: it collects the PRE-shrink model_prob, so")
     print("    the shrink axis maps 1:1 to the live shrink. SPREADS is CONFOUNDED —")
     print("    model_cover_rate already bakes in the live spread shrink + the")
     print("    expected_runs_challenger blend, so the shrink axis DOUBLE-counts;")
@@ -4215,8 +4215,8 @@ def _warn_small_limit(limit):
     Warn loudly so a capped run is never mistaken for signal."""
     if limit and limit < 1000:
         bar = "!" * 74
-        print(f"\n{bar}\n⚠  --limit={limit}: this sweep is CAPPED to the last {limit} "
-              f"games → tiny per-cell\n   samples and NOISY ROI (the 'best cell' will "
+        print(f"\n{bar}\n!! --limit={limit}: this sweep is CAPPED to the last {limit} "
+              f"games -> tiny per-cell\n   samples and NOISY ROI (the 'best cell' will "
               f"jump around, and the gates will\n   disagree). Re-run with  --limit "
               f"100000  for the full window before trusting it.\n{bar}")
 
@@ -4345,6 +4345,30 @@ def _regrade_ml_obs(sport_key, espn_sport, espn_league, season_year, limit,
     finally:
         analysis.DEFAULT_PYTHAG_WEIGHT = saved
     return obs["moneyline"]
+
+
+def _regrade_ml_components(sport_key, espn_sport, espn_league, season_year, limit,
+                          store_label, source, tag=""):
+    """Re-grade the live ML analyzer at pythag=0 and return the collected COMPONENT
+    obs [(recency_p, pythag_p, market_p, outcome, price_yes, price_no)] — pure recency
+    + raw per-game pythag prob, for offline A(recency) x B(pythag) recombination.
+    Restores the global. Shared by --ab-sweep and --oos-ab."""
+    comp = {m: [] for m in MARKETS}
+    saved = analysis.DEFAULT_PYTHAG_WEIGHT
+    print(f"\n########## re-grade components (pythag=0){(' ' + tag) if tag else ''} "
+          f"##########")
+    try:
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.0
+        run_odds_backtest(
+            sport_key, espn_sport, espn_league, limit=limit, window=10,
+            variants={"live": VARIANT_PRESETS.get("all", {})},
+            season_year=season_year, threshold_pct=5.0,
+            write_calibration=False, store_label=store_label,
+            engine="live", prob_shrink=1.0, source=source,
+            supplement_log=False, collect_components=comp)
+    finally:
+        analysis.DEFAULT_PYTHAG_WEIGHT = saved
+    return comp["moneyline"]
 
 
 def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
@@ -4491,22 +4515,8 @@ def ab_sweep(sport_key, espn_sport, espn_league, season_year=None, limit=100000,
     GATES = [("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
              ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0)]
 
-    comp = {m: [] for m in MARKETS}
-    saved = analysis.DEFAULT_PYTHAG_WEIGHT
-    print("\n########## re-grade: capture (recency, pythag) components "
-          "(pythag forced to 0) ##########")
-    try:
-        analysis.DEFAULT_PYTHAG_WEIGHT = 0.0
-        run_odds_backtest(
-            sport_key, espn_sport, espn_league, limit=limit, window=10,
-            variants={"live": VARIANT_PRESETS.get("all", {})},
-            season_year=season_year, threshold_pct=5.0,
-            write_calibration=False, store_label=store_label,
-            engine="live", prob_shrink=1.0, source=source,
-            supplement_log=False, collect_components=comp)
-    finally:
-        analysis.DEFAULT_PYTHAG_WEIGHT = saved
-    obs = comp["moneyline"]
+    obs = _regrade_ml_components(sport_key, espn_sport, espn_league, season_year,
+                                 limit, store_label, source)
     n_pyth = sum(1 for r in obs if r[1] is not None)
     print(f"\n  captured {len(obs)} ML obs ({n_pyth} with a pythag prob).")
 
@@ -4534,6 +4544,91 @@ def ab_sweep(sport_key, espn_sport, espn_league, season_year=None, limit=100000,
             print(f"  -> best: A(recency)={best[1]:.2f} B(pythag)={best[2]:.2f} "
                   f"ROI={best[0] * 100:+.1f}% (n={best[3]})")
     print("\n  (Diagnostic only — nothing written. MONEYLINE only.)")
+
+
+def oos_ab(sport_key, espn_sport, espn_league, train_seasons, test_seasons,
+           limit=100000, store_label="", source="auto", a_weights=None,
+           b_weights=None):
+    """OUT-OF-SAMPLE MONEYLINE validation (NO WRITE): pick the A(recency) x B(pythag)
+    blend on a TRAIN window, then measure it — plus a GATE-tightening ladder — on a
+    disjoint TEST window it never saw. This is the honest antidote to the in-sample
+    argmax: the sweeps optimize over ~100 cells on one window (winner's curse), so
+    their peak overstates real ROI. Here the config is FIXED from train and the test
+    number is untouched. Answers 'does the pythag/shrink finding hold?' AND 'do we
+    need tighter gates?' (the ladder) in one pass. Judge the TEST column; the
+    train-vs-test gap at the selected cell is the overfit tax."""
+    _warn_small_limit(limit)
+    A_W = a_weights if a_weights else [0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
+    B_W = b_weights if b_weights else [0.0, 0.05, 0.10, 0.20, 0.30, 0.40]
+    # Gate used to PICK the best (A,B) on train (fixed, sensible; not itself swept):
+    SELECT = ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0)
+    # Gate-tightening ladder measured at the fixed (A,B) — EV gates AND pure-edge
+    # gates (edge gates need a big prob disagreement regardless of price, so they
+    # don't preferentially pass longshots the way EV gates do).
+    LADDER = [
+        ("edge>=5%", None, 0.0, 0.05), ("edge>=7%", None, 0.0, 0.07),
+        ("edge>=10%", None, 0.0, 0.10), ("edge>=12%", None, 0.0, 0.12),
+        ("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
+        ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0),
+        ("EV>=16% & edge>=4%", 0.16, 0.04, 0.0),
+        ("EV>=20% & edge>=5%", 0.20, 0.05, 0.0),
+        ("EV>=25% & edge>=6%", 0.25, 0.06, 0.0),
+    ]
+    train = _regrade_ml_components(sport_key, espn_sport, espn_league, train_seasons,
+                                   limit, store_label, source, tag="TRAIN")
+    test = _regrade_ml_components(sport_key, espn_sport, espn_league, test_seasons,
+                                  limit, store_label, source, tag="TEST")
+
+    # Select best (A,B) on TRAIN at the SELECT gate.
+    best = None
+    for a in A_W:
+        for b in B_W:
+            t = _ab_gate_tally(train, a, b, SELECT[1], SELECT[2], SELECT[3])
+            if t["roi"] is not None and (best is None or t["roi"] > best[0]):
+                best = (t["roi"], a, b, t["n"])
+    # Test-optimal at the SELECT gate (the ceiling test COULD hit) — for the gap.
+    test_ceil = None
+    for a in A_W:
+        for b in B_W:
+            t = _ab_gate_tally(test, a, b, SELECT[1], SELECT[2], SELECT[3])
+            if t["roi"] is not None and (test_ceil is None or t["roi"] > test_ceil[0]):
+                test_ceil = (t["roi"], a, b, t["n"])
+
+    print("\n\n############ OOS MONEYLINE — train-selected A x B, tested out-of-sample "
+          "############")
+    print(f"  TRAIN seasons={train_seasons}  ({len(train)} ML obs)")
+    print(f"  TEST  seasons={test_seasons}  ({len(test)} ML obs)")
+    if not best:
+        print("  (train produced no qualifying cell — widen the window/grid)")
+        return
+    A, B = best[1], best[2]
+    tr_sel = _ab_gate_tally(train, A, B, SELECT[1], SELECT[2], SELECT[3])
+    te_sel = _ab_gate_tally(test, A, B, SELECT[1], SELECT[2], SELECT[3])
+    print(f"\n  Selected on TRAIN @ {SELECT[0]}:  A(recency)={A:.2f}  B(pythag)={B:.2f}")
+    print(f"    train ROI {tr_sel['roi']*100:+.1f}% (n={tr_sel['n']})   "
+          f"->  TEST ROI {te_sel['roi']*100:+.1f}% (n={te_sel['n']})"
+          if te_sel['roi'] is not None else "    (thin test)")
+    if test_ceil:
+        print(f"    overfit tax: test-OPTIMAL cell would be A={test_ceil[1]:.2f} "
+              f"B={test_ceil[2]:.2f} @ {test_ceil[0]*100:+.1f}% -- the gap vs our "
+              f"{te_sel['roi']*100:+.1f}% is what in-sample tuning can't capture.")
+
+    print(f"\n  GATE LADDER at the FIXED train-selected (A={A:.2f}, B={B:.2f}) — does "
+          "tightening help OOS?")
+    n_tr = len(train) or 1
+    n_te = len(test) or 1
+    print("  {:<20}{:>20}{:>20}".format("gate", "TRAIN n/%bet/ROI", "TEST n/%bet/ROI"))
+    for label, evf, edf, leg in LADDER:
+        tt = _ab_gate_tally(train, A, B, evf, edf, leg)
+        te = _ab_gate_tally(test, A, B, evf, edf, leg)
+        tr_s = (f"{tt['n']}/{100*tt['n']/n_tr:.0f}%/{tt['roi']*100:+.1f}"
+                if tt['roi'] is not None else f"{tt['n']}/-/-")
+        te_s = (f"{te['n']}/{100*te['n']/n_te:.0f}%/{te['roi']*100:+.1f}"
+                if te['roi'] is not None else f"{te['n']}/-/-")
+        print("  {:<20}{:>20}{:>20}".format(label, tr_s, te_s))
+    print("\n  Read the TEST column: if ROI CLIMBS as the gate tightens, tighter gates")
+    print("  help (fewer, better bets); if it flattens/falls into tiny n, they don't.")
+    print("  (Diagnostic only — nothing written. MONEYLINE only.)")
 
 
 def main():
@@ -4587,9 +4682,18 @@ def main():
                         "B*(pythag-0.5). One re-grade (pythag forced to 0); A x B swept "
                         "offline. The decoupled view of --combo-sweep. No write.")
     p.add_argument("--a-weights", default=None,
-                   help="(--ab-sweep) comma list of A (recency) weights. Default grid.")
+                   help="(--ab-sweep/--oos-ab) comma list of A (recency) weights.")
     p.add_argument("--b-weights", default=None,
-                   help="(--ab-sweep) comma list of B (pythag) weights. Default grid.")
+                   help="(--ab-sweep/--oos-ab) comma list of B (pythag) weights.")
+    p.add_argument("--oos-ab", action="store_true",
+                   help="(odds mode) OUT-OF-SAMPLE ML validation: pick the A x B blend "
+                        "on --train-seasons, then measure it + a gate-tightening ladder "
+                        "on --test-seasons (never seen). The honest antidote to the "
+                        "in-sample sweep argmax. No write.")
+    p.add_argument("--train-seasons", default=None,
+                   help="(--oos-ab) seasons to SELECT the A x B blend on, e.g. 2023,2024.")
+    p.add_argument("--test-seasons", default=None,
+                   help="(--oos-ab) disjoint seasons to TEST on, e.g. 2025,2026.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -4785,6 +4889,20 @@ def main():
                      season_year=odds_seasons, limit=args.limit,
                      store_label=args.store_label, source=args.source,
                      a_weights=_aw, b_weights=_bw)
+        elif args.oos_ab:
+            _aw = ([float(x) for x in args.a_weights.split(",")]
+                   if args.a_weights else None)
+            _bw = ([float(x) for x in args.b_weights.split(",")]
+                   if args.b_weights else None)
+            _tr = _parse_seasons(args.train_seasons) if args.train_seasons else None
+            _te = _parse_seasons(args.test_seasons) if args.test_seasons else odds_seasons
+            if not _tr:
+                print("--oos-ab requires --train-seasons (e.g. 2023,2024) and "
+                      "--test-seasons (e.g. 2025,2026).")
+            else:
+                oos_ab(sport_key, espn_sport, espn_league, _tr, _te,
+                       limit=args.limit, store_label=args.store_label,
+                       source=args.source, a_weights=_aw, b_weights=_bw)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,

@@ -183,6 +183,32 @@ class AbTallyTests(unittest.TestCase):
         self.assertIn(t["n"], (0, 1))
 
 
+class OosAbTests(unittest.TestCase):
+    """--oos-ab: two component re-grades (train + test), global restored, selection
+    picks the train-best cell. Mocks the backtest so no data is needed."""
+
+    def test_two_regrades_and_restore(self):
+        import backtest
+        import analysis
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.35
+        calls = []
+
+        def fake_run(*a, **k):
+            calls.append(analysis.DEFAULT_PYTHAG_WEIGHT)   # must be 0 mid-run
+            comp = k.get("collect_components")
+            if comp is not None:
+                # one synthetic game: recency 0.70, pythag 0.65, market 0.50, home won
+                comp["moneyline"].append((0.70, 0.65, 0.50, 1, 100, 100))
+
+        with patch.object(backtest, "run_odds_backtest", side_effect=fake_run):
+            backtest.oos_ab("baseball_mlb", "baseball", "mlb",
+                            [2023, 2024], [2025, 2026],
+                            a_weights=[0.2, 0.4], b_weights=[0.0, 0.2])
+        self.assertEqual(len(calls), 2)                    # train + test re-grade
+        self.assertTrue(all(c == 0.0 for c in calls))      # pythag forced to 0
+        self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)   # restored
+
+
 class UnleashSweepTests(unittest.TestCase):
     """The risky part of unleash_sweep is the per-variant override of two GLOBALS
     (analysis.DEFAULT_PYTHAG_WEIGHT + pricing_common._PROB_SHRINK_CACHE) — they
