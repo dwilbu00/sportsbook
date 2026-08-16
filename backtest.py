@@ -4153,6 +4153,108 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     _lineup_runs_diag(lineup)
 
 
+def unleash_sweep(sport_key, espn_sport, espn_league, season_year=None,
+                  limit=100000, store_label="", source="auto"):
+    """Team-market UNLEASH sweep (NO WRITE): re-grade the LIVE pipeline with each
+    market-anchoring knob RELEASED one at a time, and report realized flat-1u
+    ROI-at-gate vs the live baseline. Resolves the anchoring-audit team-market
+    shortlist: prob_shrink {moneyline, spreads, totals} + DEFAULT_PYTHAG_WEIGHT.
+
+    Why this is more than --team-gate-sweep: ML and totals collect the PRE-shrink
+    prob, so their shrink is swept offline (clean, no re-grade). But the SPREADS
+    cover prob is baked (post-shrink + expected-runs challenger), and the 0.35
+    Pythagorean blend is baked into the ML prob, so those two must be true
+    override RE-GRADES — spreads via the prob_shrink cache (spreads->1.0, the
+    challenger share held fixed), pythag via analysis.DEFAULT_PYTHAG_WEIGHT->0.0.
+    This runs 3 live re-grades (baseline / pythag-off / spreads-unshrunk); the
+    first pays the matchup-feature network cost, the next two hit the disk cache.
+
+    Judge on ROI-at-gate; pass a --season / --seasons TEST window for an OOS read.
+    'more extreme + rare gate' wins here ONLY if ROI rises at a LOW-%bet gate.
+    Nothing is written — this is the evidence feed for the disqualification step."""
+    import pricing_common
+
+    live_shrink = {m: pricing_common._shrink_factor(sport_key, m) for m in MARKETS}
+    live_pythag = analysis.DEFAULT_PYTHAG_WEIGHT
+    _SENT = object()
+
+    def _run(pythag_weight, shrink_cache, tag):
+        obs = {m: [] for m in MARKETS}
+        saved_pythag = analysis.DEFAULT_PYTHAG_WEIGHT
+        saved_cache = pricing_common._PROB_SHRINK_CACHE.get(sport_key, _SENT)
+        print(f"\n########## unleash variant: {tag} "
+              f"(pythag={pythag_weight}, shrink={shrink_cache}) ##########")
+        try:
+            analysis.DEFAULT_PYTHAG_WEIGHT = pythag_weight
+            pricing_common._PROB_SHRINK_CACHE[sport_key] = dict(shrink_cache)
+            run_odds_backtest(
+                sport_key, espn_sport, espn_league, limit=limit, window=10,
+                variants={"live": VARIANT_PRESETS.get("all", {})},
+                season_year=season_year, threshold_pct=5.0,
+                write_calibration=False, store_label=store_label,
+                engine="live", prob_shrink=1.0, source=source,
+                supplement_log=False, collect_obs=obs)
+        finally:
+            analysis.DEFAULT_PYTHAG_WEIGHT = saved_pythag
+            if saved_cache is _SENT:
+                pricing_common._PROB_SHRINK_CACHE.pop(sport_key, None)
+            else:
+                pricing_common._PROB_SHRINK_CACHE[sport_key] = saved_cache
+        return obs
+
+    base = _run(live_pythag, live_shrink, "baseline (live)")
+    pyth = _run(0.0, live_shrink, "pythag OFF")
+    spun = _run(live_pythag, {**live_shrink, "spreads": 1.0}, "spreads UNSHRUNK")
+
+    GATES = [
+        ("edge>=5% (legacy)", None, 0.0, 0.05),
+        ("edge>=10%",         None, 0.0, 0.10),
+        ("edge>=15%",         None, 0.0, 0.15),
+        ("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
+        ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0),
+    ]
+
+    def _cmp(title, a_lbl, a_obs, a_shr, b_lbl, b_obs, b_shr):
+        na = len(a_obs) or 1
+        nb = len(b_obs) or 1
+        print(f"\n=== {title} ===")
+        print("  {:<20}|{:>18}|{:>18}".format("gate", a_lbl, b_lbl))
+        print("  {:<20}|{:>6}{:>5}{:>7}|{:>6}{:>5}{:>7}".format(
+            "", "n", "%bet", "ROI%", "n", "%bet", "ROI%"))
+        for label, evf, edf, leg in GATES:
+            ta = _team_gate_tally(a_obs, a_shr, evf, edf, leg)
+            tb = _team_gate_tally(b_obs, b_shr, evf, edf, leg)
+            ra = f"{ta['roi'] * 100:+.1f}" if ta["roi"] is not None else "-"
+            rb = f"{tb['roi'] * 100:+.1f}" if tb["roi"] is not None else "-"
+            print("  {:<20}|{:>6}{:>4.0f}%{:>7}|{:>6}{:>4.0f}%{:>7}".format(
+                label, ta["n"], 100 * ta["n"] / na, ra,
+                tb["n"], 100 * tb["n"] / nb, rb))
+
+    print("\n\n############ UNLEASH SWEEP — ROI-at-gate: LIVE vs UNLEASHED ############")
+    print("  Closing-priced flat-1u ROI on the same games. A HIGHER ROI at a RARE")
+    print("  (low %bet) gate = the leash was suppressing harvestable edge. A higher")
+    print("  ROI only at the broad edge>=5% gate is usually just more variance.")
+    print("  Judge OOS (pass a --season/--seasons test window), never on Brier.")
+
+    _cmp("MONEYLINE — prob_shrink",
+         f"LIVE s={live_shrink['moneyline']:.2f}", base["moneyline"],
+         live_shrink["moneyline"], "RAW s=1.00", base["moneyline"], 1.0)
+    _cmp(f"MONEYLINE — Pythagorean (ML shrink held at {live_shrink['moneyline']:.2f})",
+         f"LIVE w={live_pythag:.2f}", base["moneyline"], live_shrink["moneyline"],
+         "w=0.00", pyth["moneyline"], live_shrink["moneyline"])
+    _cmp("MONEYLINE — BOTH released (pythag 0 + raw prob)",
+         "LIVE", base["moneyline"], live_shrink["moneyline"],
+         "pyth0+raw", pyth["moneyline"], 1.0)
+    _cmp("TOTALS — prob_shrink",
+         f"LIVE s={live_shrink['totals']:.2f}", base["totals"],
+         live_shrink["totals"], "RAW s=1.00", base["totals"], 1.0)
+    _cmp("SPREADS — prob_shrink (expected-runs challenger held fixed)",
+         f"LIVE s={live_shrink['spreads']:.2f}", base["spreads"], 1.0,
+         "RAW s=1.00", spun["spreads"], 1.0)
+    print("\n  (Diagnostic only — nothing written. SPREADS rows are a true re-grade;")
+    print("   ML/TOTALS shrink is the offline sweep on the pre-shrink obs.)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
     p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
@@ -4177,6 +4279,12 @@ def main():
                         "probability-shrink x recommendation-gate and report "
                         "realized flat-1u ROI per combo (finds whether the live "
                         "shrink+edge gate over-suppress moneyline). No write.")
+    p.add_argument("--unleash-sweep", action="store_true",
+                   help="(odds mode) UNLEASH sweep: re-grade the LIVE pipeline with "
+                        "each market-anchoring knob released one at a time "
+                        "(prob_shrink ML/spreads/totals + Pythagorean), and print "
+                        "ROI-at-gate LIVE vs UNLEASHED. Spreads/pythag are true "
+                        "override re-grades. Judge OOS (--season/--seasons). No write.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -4343,6 +4451,10 @@ def main():
             diagnose_team_gate(sport_key, espn_sport, espn_league,
                                season_year=odds_seasons, limit=args.limit,
                                store_label=args.store_label, source=args.source)
+        elif args.unleash_sweep:
+            unleash_sweep(sport_key, espn_sport, espn_league,
+                          season_year=odds_seasons, limit=args.limit,
+                          store_label=args.store_label, source=args.source)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,

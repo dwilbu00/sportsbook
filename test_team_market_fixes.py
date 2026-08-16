@@ -122,5 +122,65 @@ class GetPitcherQualityAsofTests(unittest.TestCase):
         self.assertIn("asof_2024-06-14", keys[1])
 
 
+class UnleashSweepTests(unittest.TestCase):
+    """The risky part of unleash_sweep is the per-variant override of two GLOBALS
+    (analysis.DEFAULT_PYTHAG_WEIGHT + pricing_common._PROB_SHRINK_CACHE) — they
+    MUST be restored even though run_odds_backtest is a no-op here. Mocks the
+    backtest so no data/network is needed."""
+
+    def test_overrides_applied_per_variant_then_restored(self):
+        import backtest
+        import analysis
+        import pricing_common
+        sport = "baseball_mlb"
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.35
+        pricing_common._PROB_SHRINK_CACHE.pop(sport, None)   # absent before
+        seen = []
+
+        def fake_run(*a, **k):
+            # snapshot the globals AS THE ANALYZERS WOULD SEE THEM mid-run
+            seen.append((analysis.DEFAULT_PYTHAG_WEIGHT,
+                         dict(pricing_common._PROB_SHRINK_CACHE.get(sport, {}))))
+
+        live = {"moneyline": 0.25, "spreads": 0.25, "totals": 0.1}
+        with patch.object(backtest, "run_odds_backtest", side_effect=fake_run), \
+                patch.object(pricing_common, "_shrink_factor",
+                             side_effect=lambda sk, m: live[m]):
+            backtest.unleash_sweep(sport, "baseball", "mlb")
+
+        # 3 variants: baseline, pythag-off, spreads-unshrunk
+        self.assertEqual(len(seen), 3)
+        pyths = [s[0] for s in seen]
+        self.assertEqual(pyths.count(0.35), 2)               # baseline + spreads-unshrunk
+        self.assertIn(0.0, pyths)                            # pythag-off variant
+        # exactly one variant unshrinks spreads to 1.0 (challenger held fixed)
+        self.assertEqual(
+            sum(1 for _, c in seen if abs(c.get("spreads", 0.25) - 1.0) < 1e-9), 1)
+        # baseline variant kept spreads at the live 0.25
+        self.assertTrue(any(abs(c.get("spreads") - 0.25) < 1e-9
+                            for p, c in seen if p == 0.35))
+        # GLOBALS restored to their pre-call state (no leakage into live pricing)
+        self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)
+        self.assertNotIn(sport, pricing_common._PROB_SHRINK_CACHE)
+
+    def test_globals_restored_even_when_backtest_raises(self):
+        import backtest
+        import analysis
+        import pricing_common
+        sport = "baseball_mlb"
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.35
+        pricing_common._PROB_SHRINK_CACHE.pop(sport, None)
+        live = {"moneyline": 0.25, "spreads": 0.25, "totals": 0.1}
+        with patch.object(backtest, "run_odds_backtest",
+                          side_effect=RuntimeError("boom")), \
+                patch.object(pricing_common, "_shrink_factor",
+                             side_effect=lambda sk, m: live[m]):
+            with self.assertRaises(RuntimeError):
+                backtest.unleash_sweep(sport, "baseball", "mlb")
+        # a mid-run failure must NOT leave the overrides installed
+        self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)
+        self.assertNotIn(sport, pricing_common._PROB_SHRINK_CACHE)
+
+
 if __name__ == "__main__":
     unittest.main()
