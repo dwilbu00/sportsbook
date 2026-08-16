@@ -1393,29 +1393,62 @@ def lineup_offense_edge(home_team, away_team, date, team_index, season,
         if not game_pk:
             return None
         lineups = mlb_warehouse._game_lineup_index(season).get(game_pk) or {}
-        lg = LEAGUE_AVG["ops"]
-
-        def _side_ops(tid):
-            # Weight each batter's (PA-shrunk) OPS by their SLOT's expected PA per
-            # game — the top of the order bats more, so it drives more of the team's
-            # offense. Backtest: the top-9-by-PA list order proxies the batting
-            # order; live v2 will use the announced order.
-            num = den = 0.0
-            for i, a in enumerate(lineups.get(str(tid)) or []):
-                o = mlb_warehouse.asof_batter_ops(a, date)
-                if not o:
-                    continue
-                pa = o.get("pa") or 0.0
-                shrunk = (pa * o["ops"] + shrink_pa * lg) / (pa + shrink_pa)
-                w = _SLOT_PA_WEIGHTS[i] if i < len(_SLOT_PA_WEIGHTS) else _SLOT_PA_WEIGHTS[-1]
-                num += w * shrunk
-                den += w
-            return (num / den) if den else None
-        h = _side_ops(home["id"])
-        a = _side_ops(away["id"])
+        h = _lineup_side_ops(lineups, home["id"], date, shrink_pa)
+        a = _lineup_side_ops(lineups, away["id"], date, shrink_pa)
         if h is None or a is None:
             return None
         return max(-0.3, min(0.3, h - a))
+    except Exception:
+        return None
+
+
+def _lineup_side_ops(lineups, team_id, date, shrink_pa=100):
+    """Slot-PA-weighted, PA-shrunk mean as-of OPS for one side's starters, or None.
+
+    Each batter's as-of OPS is shrunk toward league by sample size (a thin callup
+    can't skew it), then combined weighted by the batting slot's expected PA (the
+    top of the order bats more). ``lineups`` = mlb_warehouse._game_lineup_index
+    entry; list order proxies the batting order (backtest) / is the announced order
+    (live v2)."""
+    import mlb_warehouse
+    lg = LEAGUE_AVG["ops"]
+    num = den = 0.0
+    for i, a in enumerate(lineups.get(str(team_id)) or []):
+        o = mlb_warehouse.asof_batter_ops(a, date)
+        if not o:
+            continue
+        pa = o.get("pa") or 0.0
+        shrunk = (pa * o["ops"] + shrink_pa * lg) / (pa + shrink_pa)
+        w = _SLOT_PA_WEIGHTS[i] if i < len(_SLOT_PA_WEIGHTS) else _SLOT_PA_WEIGHTS[-1]
+        num += w * shrunk
+        den += w
+    return (num / den) if den else None
+
+
+def lineup_offense_factors(home_team, away_team, date, team_index, season,
+                           shrink_pa=100):
+    """Per-team lineup offense FACTOR (1.0-centered: lineup OPS / league OPS) for a
+    game, from the warehouse (as-of, zero network). Returns {'home': f, 'away': f}
+    or None on any miss. Unlike the refuted additive edge, this is the multiplier
+    that feeds a bottom-up expected-RUNS projection (expected_runs_from_factors),
+    so the lineup actually drives predicted runs — see analysis.lineup_expected_runs."""
+    try:
+        import mlb_warehouse
+        home = _match_team_id(home_team, team_index)
+        away = _match_team_id(away_team, team_index)
+        if not home or not away:
+            return None
+        game_pk = mlb_warehouse._game_pk_index(season).get(
+            (str(date)[:10], str(home["id"]), str(away["id"])))
+        if not game_pk:
+            return None
+        lineups = mlb_warehouse._game_lineup_index(season).get(game_pk) or {}
+        h = _lineup_side_ops(lineups, home["id"], date, shrink_pa)
+        a = _lineup_side_ops(lineups, away["id"], date, shrink_pa)
+        if h is None or a is None:
+            return None
+        lg = LEAGUE_AVG["ops"]
+        return {"home": h / lg, "away": a / lg}
     except Exception:
         return None
 

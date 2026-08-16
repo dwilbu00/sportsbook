@@ -115,5 +115,41 @@ class LineupOffenseEdgeTests(unittest.TestCase):
                 ms.lineup_offense_edge("Home", "Away", "2024-07-01", {}, 2024))
 
 
+class LineupOffenseFactorsTests(unittest.TestCase):
+    """The 1.0-centered per-team factor that feeds the expected-runs projection."""
+    def _run(self, home_ops, away_ops):
+        def _tid(n, i):
+            return {"id": "H"} if n == "Home" else {"id": "A"}
+
+        def _ops(aid, d):
+            ops = home_ops if aid.startswith("h") else away_ops
+            return {"ops": ops, "pa": 600}
+        with patch.object(ms, "_match_team_id", side_effect=_tid), \
+                patch.object(mw, "_game_pk_index",
+                             return_value={("2024-07-01", "H", "A"): 1}), \
+                patch.object(mw, "_game_lineup_index",
+                             return_value={1: {"H": ["h1", "h2"],
+                                               "A": ["a1", "a2"]}}), \
+                patch.object(mw, "asof_batter_ops", side_effect=_ops):
+            return ms.lineup_offense_factors("Home", "Away", "2024-07-01", {}, 2024)
+
+    def test_league_average_lineup_is_one(self):
+        f = self._run(0.711, 0.711)
+        self.assertAlmostEqual(f["home"], 1.0, places=2)
+        self.assertAlmostEqual(f["away"], 1.0, places=2)
+
+    def test_strong_above_one_weak_below(self):
+        f = self._run(0.900, 0.600)
+        self.assertGreater(f["home"], 1.0)
+        self.assertLess(f["away"], 1.0)
+
+    def test_none_when_no_game(self):
+        with patch.object(ms, "_match_team_id",
+                          side_effect=lambda n, i: {"id": "H"}), \
+                patch.object(mw, "_game_pk_index", return_value={}):
+            self.assertIsNone(
+                ms.lineup_offense_factors("Home", "Away", "2024-07-01", {}, 2024))
+
+
 if __name__ == "__main__":
     unittest.main()
