@@ -55,6 +55,27 @@ class TransformTests(unittest.TestCase):
         self.assertIsNone(ing._num("−195"))
         self.assertIsNone(ing._num(None))
 
+    def test_price_rejects_sub_100(self):
+        # Points can be < 100 (via _num) but PRICES cannot.
+        self.assertEqual(ing._price(-195), -195)
+        self.assertEqual(ing._price(100), 100)
+        self.assertIsNone(ing._price(0))      # junk 0/0
+        self.assertIsNone(ing._price(50))
+        self.assertIsNone(ing._price(-99))
+        self.assertIsNone(ing._price(None))
+
+    def test_build_payload_drops_junk_price_keeps_valid_totals(self):
+        gv = _game()["gameView"]
+        # ml + spread carry junk 0/0 prices; totals are valid → only totals survive.
+        payload, present = ing.build_payload(
+            "sbr-x", gv,
+            {"homeOdds": 0, "awayOdds": 0},
+            {"homeOdds": 0, "awayOdds": 0, "homeSpread": -1.5, "awaySpread": 1.5},
+            {"overOdds": -105, "underOdds": -117, "total": 8.5})
+        self.assertEqual(present, ["total"])
+        self.assertEqual({m["key"] for m in payload["bookmakers"][0]["markets"]},
+                         {"totals"})
+
     def test_clean_team_athletics_rebrand(self):
         self.assertEqual(ing._clean_team("Athletics Athletics"), "Athletics")
         self.assertEqual(ing._clean_team("Oakland Athletics"), "Oakland Athletics")
@@ -107,7 +128,8 @@ class TransformTests(unittest.TestCase):
             "2024-10-01": [_game(start="2024-10-01T17:00:00+00:00",
                                  gtype="W")],                             # postseason keep
         }
-        cands, skips = ing.scan(data, min_year=2023)
+        # admit_unknown off so the spring 'S' game is a clean wrong_type skip.
+        cands, skips = ing.scan(data, min_year=2023, admit_unknown=False)
         years = sorted(c["year"] for c in cands)
         self.assertEqual(years, [2023, 2024])
         self.assertEqual(skips["pre_year"], 1)
@@ -120,6 +142,28 @@ class TransformTests(unittest.TestCase):
                                      gtype="S")]}
         cands, _ = ing.scan(data, min_year=2023, allowed_types=None)
         self.assertEqual(len(cands), 1)
+
+    def test_scan_admits_unknown_with_distinct_codes(self):
+        # The relocated-A's case: gameType 'Unknown' but two distinct real teams.
+        code = {"Toronto Blue Jays": "TOR", "New York Yankees": "NYY"}.get
+        data = {"2025-05-01": [_game(start="2025-05-01T17:00:00+00:00",
+                                     gtype="Unknown")]}
+        cands, skips = ing.scan(data, min_year=2023, resolver=code)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(skips["admitted_offtype"], 1)
+        self.assertEqual(skips["wrong_type"], 0)
+
+    def test_scan_drops_unknown_when_codes_unresolved_or_same(self):
+        # Unresolved (stub returns None) → dropped.
+        data = {"2025-05-01": [_game(start="2025-05-01T17:00:00+00:00",
+                                     gtype="Unknown")]}
+        cands, skips = ing.scan(data, min_year=2023, resolver=lambda n: None)
+        self.assertEqual(len(cands), 0)
+        self.assertEqual(skips["wrong_type"], 1)
+        # Same code both sides (team-vs-itself junk) → dropped.
+        cands2, skips2 = ing.scan(data, min_year=2023, resolver=lambda n: "XXX")
+        self.assertEqual(len(cands2), 0)
+        self.assertEqual(skips2["wrong_type"], 1)
 
     def test_doubleheader_id_guard(self):
         # Same matchup + date twice → the second gets a -g2 suffix, deterministically.

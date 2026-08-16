@@ -49,27 +49,30 @@ def _shift(date10, days):
 def compute_gap(games, snapshots):
     """Diff authoritative games against existing team-snapshot coverage.
 
-    ``games``: list of {official_date, commence, codeset(frozenset of 2 codes),
-        game_pk} for completed regular/postseason games (codes already resolved;
-        a game with an unresolved code carries codeset=None).
-    ``snapshots``: list of {date10, codeset} for existing team snapshots.
+    ``games``: list of {official_date (ET play date), codeset (frozenset of 2
+        distinct codes, else None), game_pk} for completed reg/postseason games.
+    ``snapshots``: list of {date10 (ET date of the snapshot's commence), codeset}
+        for existing team snapshots THAT CARRY A TEAM LINE (empty snapshots are
+        excluded upstream in load_snapshots).
 
-    A game is COVERED when an existing snapshot with the SAME code-set falls on
-    its official_date ±1 day; matching is a MULTISET (each snapshot covers at most
-    one game, so a doubleheader needs two). Returns
-    (missing_games, missing_dates, unresolved) where missing_dates maps
-    official_date -> count of missing games that date."""
-    # available snapshots indexed by codeset -> Counter(date10)
-    avail = defaultdict(Counter)
+    Coverage is EXACT-membership on (ET date, code-set) — no ±1-day window and no
+    per-row consumption. Both sides are ET calendar dates (official_date from
+    StatsAPI; et_local_date(commence) for snapshots), so a UTC/ET boundary can't
+    make a game look uncovered, and — critically — a game can no longer be marked
+    covered by a *same-matchup neighbor's* snapshot a day away (the old ±1 greedy
+    multiset bug). A doubleheader (two games, same date+code-set) is covered by a
+    single snapshot: that matches how the backtest's code-key join collapses a DH
+    to one entry (and calibration drops DHs), so requiring two would only force
+    pointless re-fetches. Returns (missing_games, missing_dates, unresolved) where
+    missing_dates maps official_date -> count of missing games that date."""
+    covered = set()
     for s in snapshots:
-        cs = s.get("codeset")
-        d = s.get("date10")
+        cs, d = s.get("codeset"), s.get("date10")
         if cs and d:
-            avail[cs][d] += 1
+            covered.add((d, cs))
 
     missing_games, unresolved = [], []
     missing_dates = Counter()
-    # Process in a stable order so multiset consumption is deterministic.
     for g in sorted(games, key=lambda x: (x.get("official_date") or "",
                                           x.get("game_pk") or 0)):
         cs = g.get("codeset")
@@ -77,16 +80,10 @@ def compute_gap(games, snapshots):
         if not cs or not od:
             unresolved.append(g)
             continue
-        # Try to consume a snapshot on od, od-1, od+1 (nearest day first).
-        consumed = False
-        for d in (od, _shift(od, -1), _shift(od, 1)):
-            if avail.get(cs, {}).get(d, 0) > 0:
-                avail[cs][d] -= 1
-                consumed = True
-                break
-        if not consumed:
-            missing_games.append(g)
-            missing_dates[od] += 1
+        if (od, cs) in covered:
+            continue
+        missing_games.append(g)
+        missing_dates[od] += 1
     return missing_games, dict(missing_dates), unresolved
 
 
@@ -143,19 +140,31 @@ def load_games(conn, date_from, date_to):
 
 
 def load_snapshots(conn, date_from, date_to):
-    """Existing team snapshots in [date_from-1, date_to+1] as gap-diff dicts."""
+    """Existing team snapshots that CARRY A TEAM LINE, in [date_from-1, date_to+1],
+    as gap-diff dicts keyed by the ET date of their commence.
+
+    Joins odds_snapshot -> odds_line (bet_type in moneyline/spread/total) so a
+    lineless snapshot (DK absent, or a too-early live capture) does NOT read as
+    coverage — the top-up can then upgrade it to a real closing line. date10 is
+    the ET calendar date of commence_time (matches mlb_game.official_date)."""
     from sqlalchemy import select
     import db_store
-    t = db_store.odds_snapshot
+    from pricing_common import et_local_date
+    t, ln = db_store.odds_snapshot, db_store.odds_line
     lo, hi = _shift(date_from, -1), _shift(date_to, 1)
+    joined = t.join(ln, ln.c.snapshot_id == t.c.id)
     rows = conn.execute(
-        select(t.c.game_date, t.c.home_code, t.c.away_code, t.c.event_id)
+        select(t.c.commence_time, t.c.home_code, t.c.away_code)
+        .select_from(joined)
         .where((t.c.sport == SPORT_KEY) & (t.c.kind == "team")
-               & (t.c.game_date >= lo) & (t.c.game_date <= hi))).all()
+               & (t.c.game_date >= lo) & (t.c.game_date <= hi)
+               & ln.c.bet_type.in_(("moneyline", "spread", "total")))
+        .distinct()).all()
     out = []
-    for gd, hc, ac, eid in rows:
+    for commence, hc, ac in rows:
         cs = frozenset({hc, ac}) if (hc and ac and hc != ac) else None
-        out.append({"date10": (gd or "")[:10], "codeset": cs, "event_id": eid})
+        d = et_local_date(commence) or (commence or "")[:10]
+        out.append({"date10": d, "codeset": cs})
     return out
 
 
@@ -190,8 +199,9 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--from", dest="date_from", default="2023-04-01",
-                    help="earliest official_date (default 2023-04-01)")
+    ap.add_argument("--from", dest="date_from", default="2023-03-01",
+                    help="earliest official_date (default 2023-03-01, before any "
+                         "season opener so late-March games aren't skipped)")
     ap.add_argument("--to", dest="date_to", default=None,
                     help="latest official_date (default: today UTC)")
     ap.add_argument("--max-credits", type=int, default=8000,
@@ -237,9 +247,16 @@ def main():
     if not args.yes:
         print("\n  --apply requires --yes (confirms the credit spend). Aborting.")
         return 2
-    if cost > args.max_credits:
-        print(f"\n  planned {cost} cr exceeds --max-credits {args.max_credits}. "
-              f"Raise the cap or narrow the window. Aborting.")
+    dates = sorted(missing_dates.keys())
+    if args.max_dates is not None:
+        dates = dates[:args.max_dates]
+    # Abort on the EFFECTIVE cost (after --max-dates), not the full-window cost, so
+    # a small smoke run on a large window isn't refused. The in-loop guard is the
+    # true ceiling regardless.
+    effective_cost = len(dates) * FEATURED_COST
+    if effective_cost > args.max_credits:
+        print(f"\n  planned {effective_cost} cr exceeds --max-credits "
+              f"{args.max_credits}. Raise the cap or narrow the window. Aborting.")
         return 2
 
     # ── fetch loop ──────────────────────────────────────────────────────────
@@ -249,10 +266,6 @@ def main():
     cfg = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "config.json")))
     api_key = cfg["odds_api_key"]
-
-    dates = sorted(missing_dates.keys())
-    if args.max_dates is not None:
-        dates = dates[:args.max_dates]
     print(f"\n  fetching {len(dates)} daily snapshots (~{len(dates)*FEATURED_COST} "
           f"cr cap {args.max_credits}) ...")
     spent, captured, empty = 0, 0, 0

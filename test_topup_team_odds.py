@@ -38,12 +38,17 @@ class ComputeGapTests(unittest.TestCase):
         self.assertEqual(miss, [])
         self.assertEqual(dates, {})
 
-    def test_plus_minus_one_day_tolerance(self):
-        # UTC snapshot lands the day AFTER the ET official date.
+    def test_et_exact_match_no_off_by_one_steal(self):
+        # Both sides are ET calendar dates now (load_snapshots converts commence to
+        # ET), so a snapshot on a DIFFERENT ET date must NOT cover the game — this
+        # is the fix for the old ±1 neighbor-steal bug.
         games = [_g(1, "2025-08-17", NYY_TOR)]
         snaps = [_s("2025-08-18", NYY_TOR)]
         miss, dates, _ = tu.compute_gap(games, snaps)
-        self.assertEqual(miss, [])
+        self.assertEqual(len(miss), 1)
+        # Same ET date + code-set → covered.
+        miss2, _, _ = tu.compute_gap(games, [_s("2025-08-17", NYY_TOR)])
+        self.assertEqual(miss2, [])
 
     def test_wrong_codeset_not_covered(self):
         games = [_g(1, "2025-08-17", NYY_TOR)]
@@ -58,27 +63,26 @@ class ComputeGapTests(unittest.TestCase):
         miss, _, _ = tu.compute_gap(games, snaps)
         self.assertEqual(len(miss), 1)
 
-    def test_doubleheader_needs_two_snapshots(self):
-        # Two games, same date + same code-set; only ONE snapshot → one still missing.
+    def test_doubleheader_covered_by_one_snapshot(self):
+        # A DH (two games, same ET date + code-set) is covered by ONE snapshot —
+        # matching the backtest's code-key join, which collapses a DH to one entry
+        # (and calibration drops DHs). Requiring two would force pointless refetch.
         games = [_g(1, "2025-08-17", NYY_TOR), _g(2, "2025-08-17", NYY_TOR)]
         snaps = [_s("2025-08-17", NYY_TOR)]
         miss, dates, _ = tu.compute_gap(games, snaps)
-        self.assertEqual(len(miss), 1)
-        self.assertEqual(dates, {"2025-08-17": 1})
-        # Two snapshots → both covered.
-        miss2, _, _ = tu.compute_gap(games, [_s("2025-08-17", NYY_TOR),
-                                             _s("2025-08-17", NYY_TOR)])
-        self.assertEqual(miss2, [])
+        self.assertEqual(miss, [])
+        self.assertEqual(dates, {})
 
-    def test_snapshot_not_double_counted_across_games(self):
-        # One snapshot must not cover two different games on nearby dates.
-        games = [_g(1, "2025-08-17", NYY_TOR), _g(2, "2025-08-18", NYY_TOR)]
-        snaps = [_s("2025-08-17", NYY_TOR)]
+    def test_neighbor_snapshot_does_not_cover_missing_middle_game(self):
+        # Same-matchup series; the 08-18 game has NO snapshot. Under ET-exact
+        # membership it is correctly missing (the old ±1 greedy match would have
+        # let it steal the 08-17 or 08-19 snapshot).
+        games = [_g(1, "2025-08-17", NYY_TOR), _g(2, "2025-08-18", NYY_TOR),
+                 _g(3, "2025-08-19", NYY_TOR)]
+        snaps = [_s("2025-08-17", NYY_TOR), _s("2025-08-19", NYY_TOR)]
         miss, dates, _ = tu.compute_gap(games, snaps)
-        # The 08-17 game consumes the snapshot; 08-18 has none within ±1? 08-18
-        # would look at 08-17 (already consumed), 08-18, 08-19 → missing.
-        self.assertEqual(len(miss), 1)
-        self.assertEqual(miss[0]["game_pk"], 2)
+        self.assertEqual([m["game_pk"] for m in miss], [2])
+        self.assertEqual(dates, {"2025-08-18": 1})
 
     def test_unresolved_codeset_skipped_not_fetched(self):
         games = [_g(1, "2025-08-17", None)]

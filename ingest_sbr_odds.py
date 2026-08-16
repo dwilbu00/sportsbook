@@ -61,8 +61,17 @@ def _clean_team(name):
 
 
 def _num(v):
-    """A finite American-odds / point number, or None (rejects bool/str/null)."""
+    """A finite point number, or None (rejects bool/str/null). Used for spreads
+    and totals, which are legitimately < 100 (e.g. -1.5, 8.5)."""
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _price(v):
+    """A valid American ODDS price (|value| >= 100), or None. SBR occasionally
+    carries junk 0/0 (or other sub-100) prices for a market DK never posted;
+    those must not become corrupt moneyline/spread rows."""
+    n = _num(v)
+    return n if (n is not None and abs(n) >= 100) else None
 
 
 def _dk_current(offers):
@@ -89,14 +98,14 @@ def build_payload(event_id, gv, ml, ps, tt):
     dk_markets, present = [], []
 
     if ml:
-        ho, ao = _num(ml.get("homeOdds")), _num(ml.get("awayOdds"))
+        ho, ao = _price(ml.get("homeOdds")), _price(ml.get("awayOdds"))
         if ho is not None and ao is not None:
             dk_markets.append({"key": "h2h", "outcomes": [
                 {"name": home, "price": ho}, {"name": away, "price": ao}]})
             present.append("moneyline")
 
     if ps:
-        ho, ao = _num(ps.get("homeOdds")), _num(ps.get("awayOdds"))
+        ho, ao = _price(ps.get("homeOdds")), _price(ps.get("awayOdds"))
         hs, as_ = _num(ps.get("homeSpread")), _num(ps.get("awaySpread"))
         if None not in (ho, ao, hs, as_):
             dk_markets.append({"key": "spreads", "outcomes": [
@@ -105,7 +114,7 @@ def build_payload(event_id, gv, ml, ps, tt):
             present.append("spread")
 
     if tt:
-        oo, uo = _num(tt.get("overOdds")), _num(tt.get("underOdds"))
+        oo, uo = _price(tt.get("overOdds")), _price(tt.get("underOdds"))
         total = _num(tt.get("total"))
         if None not in (oo, uo, total):
             dk_markets.append({"key": "totals", "outcomes": [
@@ -126,9 +135,28 @@ def build_payload(event_id, gv, ml, ps, tt):
     return payload, present
 
 
-def scan(data, min_year=2023, max_year=None, allowed_types=DEFAULT_GAME_TYPES):
+def _default_resolver():
+    """Lazy player_id_map.team_code_for_name (fail-open to a None-returning stub)."""
+    try:
+        import player_id_map
+        return player_id_map.team_code_for_name
+    except Exception:
+        return lambda _n: None
+
+
+def scan(data, min_year=2023, max_year=None, allowed_types=DEFAULT_GAME_TYPES,
+         admit_unknown=True, resolver=None):
     """Full pass over the dataset → (candidates list, skips Counter). Skip reasons:
-    pre_year, wrong_type, not_final, no_dk_line, no_startdate."""
+    pre_year, wrong_type, not_final, no_dk_line, no_startdate.
+
+    ``admit_unknown``: also ingest games whose SBR gameType is NOT in
+    ``allowed_types`` (typically 'Unknown') WHEN both team full-names resolve to
+    two DISTINCT canonical codes via ``resolver`` — this rescues the ~125
+    relocated-Athletics 2025 regular-season games SBR mislabels 'Unknown' while
+    dropping junk like a team-vs-itself placeholder. ``resolver`` defaults to
+    player_id_map.team_code_for_name (needs SQL); pass a stub in tests."""
+    if admit_unknown and resolver is None:
+        resolver = _default_resolver()
     skips = Counter()
     cands = []
     seen_ids = set()
@@ -147,8 +175,16 @@ def scan(data, min_year=2023, max_year=None, allowed_types=DEFAULT_GAME_TYPES):
                 continue
             gt = gv.get("gameType")
             if allowed_types is not None and gt not in allowed_types:
-                skips["wrong_type"] += 1
-                continue
+                # Rescue off-type games (e.g. the relocated A's, tagged 'Unknown')
+                # only when they resolve to two distinct real teams.
+                hn = ((gv.get("homeTeam") or {}).get("fullName"))
+                an = ((gv.get("awayTeam") or {}).get("fullName"))
+                hc = resolver(hn) if admit_unknown else None
+                ac = resolver(an) if admit_unknown else None
+                if not (admit_unknown and hc and ac and hc != ac):
+                    skips["wrong_type"] += 1
+                    continue
+                skips["admitted_offtype"] += 1
             if not str(gv.get("gameStatusText") or "").startswith("Final"):
                 skips["not_final"] += 1
                 continue
