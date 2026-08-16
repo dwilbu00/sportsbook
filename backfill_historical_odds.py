@@ -170,6 +170,18 @@ def main():
             print("  [note] --snapshot-time only applies to --featured-cadence "
                   "daily; ignoring for featured 'commence'.")
 
+    # --warehouse writes to the Azure odds warehouse via warehouse.capture_event_odds,
+    # which needs db_store.enabled(); outside Streamlit the SQL_* secrets aren't in the
+    # env yet, so promote them (mirrors backtest.py / refit_calibration main()). Guarded
+    # + only for --warehouse. Without this the --warehouse writes SILENTLY no-op
+    # (db_store disabled) and the fetched lines land only in the local store.
+    if args.warehouse:
+        try:
+            import db_store
+            db_store.promote_secrets_from_toml()
+        except Exception:
+            pass
+
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
     cfg = load_config()
     api_key = cfg["odds_api_key"]
