@@ -367,16 +367,17 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                     model_prob, sign * matchup_features["starter_edge"],
                     _starter_adjustment(sport_key, "moneyline"))
 
-        # Pythagorean blend (WIRING ONLY — inert while DEFAULT_PYTHAG_WEIGHT==0.0).
-        # When weighted, pull the model win prob toward the run-differential
-        # estimate; skipped when runs are absent (ESPN path).
+        # Pythagorean blend (LIVE: DEFAULT_PYTHAG_WEIGHT=0.35 — see header note).
+        # Pulls the model win prob toward the season run-differential estimate; a
+        # mean-reverting transform, skipped when runs are absent (ESPN path).
         if DEFAULT_PYTHAG_WEIGHT > 0 and pythag_wp is not None:
             model_prob = ((1.0 - DEFAULT_PYTHAG_WEIGHT) * model_prob
                           + DEFAULT_PYTHAG_WEIGHT * pythag_wp)
 
-        # Calibrated overconfidence correction (no-op until an ML shrink is fit
-        # from backfilled h2h history), then optional model⇄market blend toward
-        # the de-vigged closing line (blend_w=1.0 → pure model).
+        # Calibrated overconfidence correction (LIVE: prob_shrink.moneyline=0.25
+        # pulls the prob 75% toward 0.5 — a revert-to-mean leash applied BEFORE
+        # edge/EV are scored), then optional model⇄market blend toward the
+        # de-vigged closing line (blend_w=1.0 → blend OFF). See [[team-market-audit]].
         shrunk = _apply_shrink(model_prob, sport_key, "moneyline")
         final_prob = shrunk
         opp = away_team if team_name == home_team else home_team
