@@ -1020,25 +1020,63 @@ def _inflate_samples(samples, weights, k):
     return [mean + k * (s - mean) for s in samples]
 
 
-def _live_stats(prior_games):
+def _asof_season_runs(team_name, schedules, espn_teams, before_date):
+    """As-of cumulative (runs_scored, runs_allowed) for a team over all its games
+    this season STRICTLY BEFORE ``before_date``, summed from the already-loaded
+    schedules (zero extra queries). Feeds the Pythagorean season block so the odds
+    backtest grades production's run-differential blend (DEFAULT_PYTHAG_WEIGHT),
+    which was otherwise inert in the harness (_live_stats carried no runs → pythag
+    skipped). Returns None when the team has no prior games (blend then safely
+    skips). MLB-only by construction — the caller gates on the warehouse path."""
+    info = espn_teams.get(team_name)
+    if not info:
+        for name, i in espn_teams.items():
+            if name.lower() == team_name.lower():
+                info = i
+                break
+    if not info:
+        return None
+    rs = ra = 0
+    for g in schedules.get(info["id"], []):
+        if (g.get("date") or "") >= before_date:
+            continue
+        if g.get("home_team") == team_name:
+            rs += g.get("home_score") or 0
+            ra += g.get("away_score") or 0
+        elif g.get("away_team") == team_name:
+            rs += g.get("away_score") or 0
+            ra += g.get("home_score") or 0
+    return (rs, ra) if (rs or ra) else None
+
+
+def _live_stats(prior_games, season_runs=None):
     """Minimal stats dict accepted by analyze_spreads_value / analyze_totals_value.
     Only 'recent_games' is used when a team has matching games (always true here);
-    the 'recent'/'season' fallbacks are present to avoid KeyErrors."""
+    the 'recent'/'season' fallbacks are present to avoid KeyErrors. ``season_runs``
+    = (runs_scored, runs_allowed) as-of, populated for MLB so the Pythagorean blend
+    (analyze_moneyline_value) is actually graded — production feeds these from
+    /standings; the backtest sums them from the schedule."""
+    season = {"win_pct": 0.0}
+    if season_runs:
+        season["runs_scored"], season["runs_allowed"] = season_runs
     return {
         "recent_games": prior_games,
         "recent": {"avg_scored": 0.0, "avg_allowed": 0.0, "win_pct": 0.0},
-        "season": {"win_pct": 0.0},
+        "season": season,
     }
 
 
 def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport_key,
-                             matchup_features=None):
+                             matchup_features=None, home_season_runs=None,
+                             away_season_runs=None):
     """Run the ACTUAL live analyzers and return the PURE-model (pre-blend)
     probabilities: (home_win_prob, (home_spread, P_home_cover),
     (total_line, P_over)). This makes the backtest grade exactly what
     production computes — including the MLB starter adjustment when
-    ``matchup_features`` is supplied."""
-    stats_h, stats_a = _live_stats(home_prior), _live_stats(away_prior)
+    ``matchup_features`` is supplied and the Pythagorean blend when
+    ``home_season_runs`` / ``away_season_runs`` are supplied (MLB)."""
+    stats_h = _live_stats(home_prior, home_season_runs)
+    stats_a = _live_stats(away_prior, away_season_runs)
     home_win = home_cover = total_over = None
     for c in analyze_moneyline_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                      matchup_features=matchup_features):
@@ -1300,9 +1338,17 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
             matchup_features = (prewarm_features[_mk] if _mk in prewarm_features
                                 else _matchup_features_for(home, away, date_et,
                                                            sport_key))
+            # As-of season run-differential for the Pythagorean blend (MLB only;
+            # DEFAULT_PYTHAG_WEIGHT). Zero extra queries — summed from the already-
+            # loaded schedules through the day before this game (leakage-safe).
+            home_sr = (_asof_season_runs(home, schedules, espn_teams, date)
+                       if use_warehouse else None)
+            away_sr = (_asof_season_runs(away, schedules, espn_teams, date)
+                       if use_warehouse else None)
             mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
-                matchup_features=matchup_features)
+                matchup_features=matchup_features,
+                home_season_runs=home_sr, away_season_runs=away_sr)
             if ml and mwin is not None:
                 fair_home, price_home, price_away = ml
                 _grade(r["moneyline"], _shrink_prob(mwin, prob_shrink),

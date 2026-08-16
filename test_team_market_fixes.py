@@ -122,6 +122,41 @@ class GetPitcherQualityAsofTests(unittest.TestCase):
         self.assertIn("asof_2024-06-14", keys[1])
 
 
+class AsofSeasonRunsTests(unittest.TestCase):
+    """Harness-faithfulness fix: the odds backtest now feeds as-of season runs so
+    the Pythagorean blend is actually graded (it was silently inert before)."""
+    _TEAMS = {"Rockies": {"id": "COL"}, "Brewers": {"id": "MIL"}}
+    _SCHED = {"COL": [
+        {"date": "2025-04-01", "home_team": "Rockies", "away_team": "Brewers",
+         "home_score": 5, "away_score": 3},   # Rockies home: +5 scored, +3 allowed
+        {"date": "2025-04-02", "home_team": "Brewers", "away_team": "Rockies",
+         "home_score": 2, "away_score": 7},   # Rockies away: +7 scored, +2 allowed
+        {"date": "2025-04-10", "home_team": "Rockies", "away_team": "Brewers",
+         "home_score": 1, "away_score": 9},   # ON the as-of date → excluded
+    ]}
+
+    def test_cumulative_and_leakage(self):
+        import backtest
+        rs_ra = backtest._asof_season_runs(
+            "Rockies", self._SCHED, self._TEAMS, "2025-04-10")   # strictly before
+        self.assertEqual(rs_ra, (12, 5))                          # (5+7, 3+2)
+
+    def test_none_when_no_prior_games(self):
+        import backtest
+        self.assertIsNone(backtest._asof_season_runs(
+            "Rockies", self._SCHED, self._TEAMS, "2025-04-01"))   # first game
+        self.assertIsNone(backtest._asof_season_runs(
+            "Padres", self._SCHED, self._TEAMS, "2025-07-01"))    # unknown team
+
+    def test_live_stats_populates_season_runs_only_when_given(self):
+        import backtest
+        s = backtest._live_stats([], (12, 5))
+        self.assertEqual(s["season"]["runs_scored"], 12)
+        self.assertEqual(s["season"]["runs_allowed"], 5)
+        # unchanged (no runs keys) when None → pythag safely skipped (NBA/NFL path)
+        self.assertNotIn("runs_scored", backtest._live_stats([])["season"])
+
+
 class UnleashSweepTests(unittest.TestCase):
     """The risky part of unleash_sweep is the per-variant override of two GLOBALS
     (analysis.DEFAULT_PYTHAG_WEIGHT + pricing_common._PROB_SHRINK_CACHE) — they

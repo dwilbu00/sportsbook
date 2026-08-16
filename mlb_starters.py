@@ -1330,9 +1330,19 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
                 return None
             league = expected_inputs.get("league_xwoba")
             starter_xwoba = quality[side].get("xwoba")
-            if not league or not starter_xwoba:
-                return None
-            starter = max(0.5, min(2.0, league / starter_xwoba))
+            if league and starter_xwoba:
+                starter = max(0.5, min(2.0, league / starter_xwoba))
+            else:
+                # As-of (backtest) grading omits Savant xwOBA to stay leakage-safe,
+                # which used to drop the whole expected-runs challenger. Fall back to
+                # the ERA-based run_suppression (already computed as-of; same 1.0-
+                # centered run-prevention scale) so the challenger is GRADED
+                # historically. Live keeps xwOBA (present), so production pricing is
+                # byte-unchanged; a live pitcher missing Savant xwOBA now degrades
+                # gracefully instead of silently disabling the challenger.
+                starter = quality[side].get("run_suppression")
+                if not starter:
+                    return None
             bullpen_xwoba = ((expected_inputs.get("bullpen_xwoba") or {})
                               .get(abbr))
             bullpen_league = expected_inputs.get("league_bullpen_xwoba")
