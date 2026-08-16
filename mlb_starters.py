@@ -84,6 +84,7 @@ CACHE_MAX_AGE = 3600  # 1 hour
 # a bygone date) never changes — cache it ~forever so backtests don't re-fetch the
 # same ~18k byDateRange responses on every (or every hour of a) run.
 PERMANENT_CACHE_AGE = 3650 * 24 * 3600  # ~10 years
+_COVERAGE_WARNED = set()  # (season, unmapped, missing) → expected-runs gap warned once
 
 # League-average baselines used purely as *priors* for normalization / log5-style
 # matchup blending. These are stable year-to-year but drift slowly; they are NOT
@@ -310,7 +311,12 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
         offense_keys = {k for rows in offense_vs_hand.values() for k in rows}
         unmapped = sorted(offense_keys - statsapi_abbrs)
         missing = sorted(statsapi_abbrs - offense_keys)
-        if unmapped or missing:
+        # Warn ONCE per unique gap (season+keys): get_expected_runs_team_factors is
+        # called per game-date, and the parallel backtest pre-warm would otherwise
+        # print this thousands of times.
+        _sig = (int(season), tuple(unmapped), tuple(missing))
+        if (unmapped or missing) and _sig not in _COVERAGE_WARNED:
+            _COVERAGE_WARNED.add(_sig)
             _warn(f"expected-runs team-key coverage gap for season {season}: "
                   f"Savant keys outside the StatsAPI namespace={unmapped}; "
                   f"StatsAPI teams with no Savant offense data={missing}. The "
