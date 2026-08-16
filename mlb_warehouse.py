@@ -1515,6 +1515,146 @@ def pitcher_throws(athlete_id):
     return _THROWS_CACHE.get(str(athlete_id))
 
 
+# ── As-of LINEUP offense from the warehouse facts (backtest, ZERO network) ────
+# The offense analog of the pitcher index: one query/season → in-memory batter
+# index → as-of cumulative OBP/SLG/OPS computed locally. Feeds a lineup-offense
+# edge for team predictions (today's actual 9, not a team-season blob).
+_BATTER_IDX = {}                 # season -> {athlete_id: [(official_date, ab,h,bb,hbp,sf,tb)]}
+_BATTER_IDX_LOCK = threading.Lock()
+
+
+def _batter_game_index(season):
+    """{athlete_id: [(official_date, ab, h, bb, hbp, sf, tb), ...] sorted} for a
+    season. Loaded ONCE per season (thread-safe); empty/failed loads not cached."""
+    season = int(season)
+    idx = _BATTER_IDX.get(season)
+    if idx is not None:
+        return idx
+    with _BATTER_IDX_LOCK:
+        idx = _BATTER_IDX.get(season)
+        if idx is not None:
+            return idx
+        b, g = mlb_batter_game, mlb_game
+        joined = b.join(g, b.c.game_pk == g.c.game_pk)
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(
+                    select(b.c.athlete_id, g.c.official_date, b.c.AB, b.c.H,
+                           b.c.BB, b.c.HBP, b.c.SF, b.c.TB)
+                    .select_from(joined)
+                    .where(b.c.season_bucket == season)).all()
+        except (OperationalError, ValueError, TypeError):
+            return {}
+        built = {}
+        for aid, od, ab, h, bb, hbp, sf, tb in rows:
+            if not od:
+                continue
+            built.setdefault(str(aid), []).append(
+                (str(od)[:10], float(ab or 0), float(h or 0), float(bb or 0),
+                 float(hbp or 0), float(sf or 0), float(tb or 0)))
+        for lst in built.values():
+            lst.sort(key=lambda x: x[0])
+        _BATTER_IDX[season] = built
+        return built
+
+
+def asof_batter_ops(athlete_id, as_of_date):
+    """Cumulative OBP/SLG/OPS for a batter through the day BEFORE as_of_date
+    (leakage-safe), from the warehouse facts — ZERO network. Returns
+    {'obp','slg','ops','pa'} or None (no prior PAs in-season / SQL off)."""
+    if not enabled() or not athlete_id or not as_of_date:
+        return None
+    cutoff = str(as_of_date)[:10]
+    games = _batter_game_index(int(cutoff[:4])).get(str(athlete_id))
+    if not games:
+        return None
+    ab = h = bb = hbp = sf = tb = 0.0
+    for od, a, hh, w, hp, f, t in games:
+        if od < cutoff:
+            ab += a
+            h += hh
+            bb += w
+            hbp += hp
+            sf += f
+            tb += t
+    denom = ab + bb + hbp + sf
+    if denom <= 0 or ab <= 0:
+        return None
+    obp = (h + bb + hbp) / denom
+    slg = tb / ab
+    return {"obp": obp, "slg": slg, "ops": obp + slg, "pa": denom}
+
+
+_GAME_PK_IDX = {}       # season -> {(official_date, home_id, away_id): game_pk}
+_GAME_LINEUP_IDX = {}   # season -> {game_pk: {team_id: [top-9 aids by PA]}}
+
+
+def _game_pk_index(season):
+    """{(official_date, home_id, away_id): game_pk} for a season — one query, so
+    the backtest resolves a game_pk without a per-game find_game_pk round trip.
+    Doubleheaders (same key, 2 game_pks) are dropped (ambiguous)."""
+    season = int(season)
+    idx = _GAME_PK_IDX.get(season)
+    if idx is not None:
+        return idx
+    with _BATTER_IDX_LOCK:
+        idx = _GAME_PK_IDX.get(season)
+        if idx is not None:
+            return idx
+        g = mlb_game
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(
+                    select(g.c.official_date, g.c.home_team_id,
+                           g.c.away_team_id, g.c.game_pk)
+                    .where(g.c.season == season)).all()
+        except (OperationalError, ValueError, TypeError):
+            return {}
+        built, dupes = {}, set()
+        for od, h, a, pk in rows:
+            k = (str(od)[:10], str(h), str(a))
+            if k in built:
+                dupes.add(k)
+            built[k] = pk
+        for k in dupes:
+            built.pop(k, None)                 # doubleheader → ambiguous, skip
+        _GAME_PK_IDX[season] = built
+        return built
+
+
+def _game_lineup_index(season):
+    """{game_pk: {team_id: [top-9 athlete_ids by PA]}} for a season — one query.
+    De-facto starters = the batters with the most plate appearances in the box
+    score (no batting order is stored; the backtest's lineup stand-in)."""
+    season = int(season)
+    idx = _GAME_LINEUP_IDX.get(season)
+    if idx is not None:
+        return idx
+    with _BATTER_IDX_LOCK:
+        idx = _GAME_LINEUP_IDX.get(season)
+        if idx is not None:
+            return idx
+        b = mlb_batter_game
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(
+                    select(b.c.game_pk, b.c.team_id, b.c.athlete_id, b.c.AB,
+                           b.c.BB, b.c.HBP, b.c.SF, b.c.SH)
+                    .where(b.c.season_bucket == season)).all()
+        except (OperationalError, ValueError, TypeError):
+            return {}
+        acc = {}
+        for pk, tid, aid, ab, bb, hbp, sf, sh in rows:
+            pa = (float(ab or 0) + float(bb or 0) + float(hbp or 0)
+                  + float(sf or 0) + float(sh or 0))
+            acc.setdefault(pk, {}).setdefault(str(tid), []).append((pa, str(aid)))
+        built = {pk: {tid: [a for _p, a in sorted(lst, reverse=True)[:9]]
+                      for tid, lst in teams.items()}
+                 for pk, teams in acc.items()}
+        _GAME_LINEUP_IDX[season] = built
+        return built
+
+
 def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
     """Most-recent-first FINAL regular/postseason games for a team (home or away),
     from mlb_game joined to mlb_team for the home/away display names. Each dict

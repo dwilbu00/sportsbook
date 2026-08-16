@@ -4210,7 +4210,20 @@ def main():
                         "written; the existing shrink factor is kept so a thin "
                         "sample can't clobber a good fit. The Holdout Brier "
                         "column still fills.")
+    p.add_argument("--lineup-weight", type=float, default=None,
+                   help="(odds mode, EXPERIMENT) Override analysis.DEFAULT_LINEUP_"
+                        "WEIGHT for this run — the runs-of-margin shift per unit of"
+                        " lineup-offense edge (today's 9 batters' as-of OPS). Use to"
+                        " sweep whether the lineup input helps, e.g. --lineup-weight"
+                        " 3. Default None keeps the inert 0.0.")
     args = p.parse_args()
+
+    # EXPERIMENT hook: activate the lineup-offense margin shift for THIS backtest
+    # run only (live stays inert until fit + wired). Set before any analyzer runs.
+    if args.lineup_weight is not None:
+        import analysis
+        analysis.DEFAULT_LINEUP_WEIGHT = args.lineup_weight
+        print(f"[experiment] analysis.DEFAULT_LINEUP_WEIGHT = {args.lineup_weight}")
 
     # Default-safe: calibration writes stage a candidate (never the live file the
     # app serves) unless --live is passed. Promotion is a separate, explicit step

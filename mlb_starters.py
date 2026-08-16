@@ -1355,7 +1355,48 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
             "away_staff_suppression": away_staff,
         }
 
+    # Lineup-offense edge (today's actual 9, not the team-season blob). Warehouse
+    # as-of, zero network; None for live games (no batter facts yet) so it's
+    # inert live until a confirmed-lineup path is wired. Weighted (inert by
+    # default) in analysis._predict_margin.
+    result["lineup_edge"] = lineup_offense_edge(
+        home_team, away_team, as_of_date or date, team_index, season)
+
     return result
+
+
+def lineup_offense_edge(home_team, away_team, date, team_index, season):
+    """Home-minus-away lineup offense edge from the warehouse (as-of, ZERO network,
+    O(queries)/season via cached indexes — no per-game round trips).
+
+    Each side's de-facto starters' mean as-of OPS, league-relative; the difference
+    is tanh-bounded like starter_edge. Backtest uses the box-score starters (top-9
+    by PA) for the resolved game_pk; returns None for live games (no batter facts
+    yet) or on any miss, so the team model degrades gracefully."""
+    try:
+        import mlb_warehouse
+        home = _match_team_id(home_team, team_index)
+        away = _match_team_id(away_team, team_index)
+        if not home or not away:
+            return None
+        game_pk = mlb_warehouse._game_pk_index(season).get(
+            (str(date)[:10], str(home["id"]), str(away["id"])))
+        if not game_pk:
+            return None
+        lineups = mlb_warehouse._game_lineup_index(season).get(game_pk) or {}
+
+        def _side_ops(tid):
+            ops = [o["ops"] for o in
+                   (mlb_warehouse.asof_batter_ops(a, date)
+                    for a in (lineups.get(str(tid)) or [])) if o]
+            return (sum(ops) / len(ops)) if ops else None
+        h = _side_ops(home["id"])
+        a = _side_ops(away["id"])
+        if h is None or a is None:
+            return None
+        return _tanh((h - a) / LEAGUE_AVG["ops"])
+    except Exception:
+        return None
 
 
 def _tanh(x):

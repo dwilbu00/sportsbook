@@ -70,6 +70,14 @@ def _apply_starter_logit(p, edge, weight):
 # run on the validated expected_runs_challenger; totals stay on the current model.
 DEFAULT_PYTHAG_WEIGHT = 0.35
 
+# Lineup-offense margin shift (runs) per unit of tanh(home-away lineup OPS edge).
+# INERT by default (0.0) — a v1 experiment: build_matchup_features supplies a
+# warehouse-sourced lineup_edge (today's 9 batters' as-of OPS), and this weight is
+# swept/fit in the backtest (backtest.py --lineup-weight) before any live use.
+# Only affects the backtest until proven; live games have no batter facts yet so
+# lineup_edge is None regardless.
+DEFAULT_LINEUP_WEIGHT = 0.0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Pure-Python statistics helpers now live in stats.py (imported + re-exported
@@ -144,6 +152,11 @@ def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
     if matchup_features and matchup_features.get("starter_edge") is not None:
         pred_margin += (_starter_adjustment(sport_key, "spreads")
                         * matchup_features["starter_edge"])
+    # Lineup-offense edge (today's 9 vs the team blob). Inert until fit — see
+    # DEFAULT_LINEUP_WEIGHT. Positive edge = home lineup stronger → home margin up.
+    if (DEFAULT_LINEUP_WEIGHT and matchup_features
+            and matchup_features.get("lineup_edge") is not None):
+        pred_margin += DEFAULT_LINEUP_WEIGHT * matchup_features["lineup_edge"]
     # Floor each team's std at 1.0 to avoid degenerate certainty on thin samples.
     home_var = max(home_stats["std"], 1.0) ** 2
     away_var = max(away_stats["std"], 1.0) ** 2
