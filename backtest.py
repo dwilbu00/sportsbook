@@ -1077,11 +1077,15 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
     ``home_season_runs`` / ``away_season_runs`` are supplied (MLB)."""
     stats_h = _live_stats(home_prior, home_season_runs)
     stats_a = _live_stats(away_prior, away_season_runs)
-    home_win = home_cover = total_over = None
+    home_win = home_cover = total_over = home_pythag = None
     for c in analyze_moneyline_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                      matchup_features=matchup_features):
         if c["home_away"] == "HOME":
             home_win = c["model_prob"] / 100.0
+            # Raw home Pythagorean win prob (computed regardless of blend weight) —
+            # captured so an A(recency) x B(pythag) sweep can recombine them offline.
+            if c.get("pythag_win_pct") is not None:
+                home_pythag = c["pythag_win_pct"] / 100.0
     for c in analyze_spreads_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                    matchup_features=matchup_features):
         if c["home_away"] == "HOME":
@@ -1090,7 +1094,7 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
                                matchup_features=matchup_features)
     if tot:
         total_over = (tot[0]["line"], tot[0]["model_over_hit_rate"] / 100.0)
-    return home_win, home_cover, total_over
+    return home_win, home_cover, total_over, home_pythag
 
 
 # Cache the MLB starter matchup-feature builder + per-season team index so the
@@ -1169,7 +1173,8 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
                       supplement_log=True, min_shrink_n=MIN_SHRINK_N,
-                      collect_obs=None, collect_dated=None, collect_lineup=None):
+                      collect_obs=None, collect_dated=None, collect_lineup=None,
+                      collect_components=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1345,7 +1350,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                        if use_warehouse else None)
             away_sr = (_asof_season_runs(away, schedules, espn_teams, date)
                        if use_warehouse else None)
-            mwin, mhc, mov = _live_spread_total_probs(
+            mwin, mhc, mov, mpyth = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features,
                 home_season_runs=home_sr, away_season_runs=away_sr)
@@ -1358,6 +1363,11 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                     # RAW model prob (pre-shrink) so the shrink can be swept offline.
                     collect_obs["moneyline"].append(
                         (mwin, fair_home, home_won, price_home, price_away))
+                if collect_components is not None:
+                    # (recency prob [=mwin when run at pythag=0], raw pythag prob,
+                    # market, outcome, prices) for the A(recency) x B(pythag) sweep.
+                    collect_components["moneyline"].append(
+                        (mwin, mpyth, fair_home, home_won, price_home, price_away))
                 if collect_dated is not None:
                     collect_dated["moneyline"].append(
                         (date_et, mwin, fair_home, home_won))
@@ -4199,6 +4209,18 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     _lineup_runs_diag(lineup)
 
 
+def _warn_small_limit(limit):
+    """These ROI sweeps need the full window; the global --limit default (200) caps
+    to the last 200 games → ~100 bets/cell → noisy 'best cell' that jumps corners.
+    Warn loudly so a capped run is never mistaken for signal."""
+    if limit and limit < 1000:
+        bar = "!" * 74
+        print(f"\n{bar}\n⚠  --limit={limit}: this sweep is CAPPED to the last {limit} "
+              f"games → tiny per-cell\n   samples and NOISY ROI (the 'best cell' will "
+              f"jump around, and the gates will\n   disagree). Re-run with  --limit "
+              f"100000  for the full window before trusting it.\n{bar}")
+
+
 def unleash_sweep(sport_key, espn_sport, espn_league, season_year=None,
                   limit=100000, store_label="", source="auto"):
     """Team-market UNLEASH sweep (NO WRITE): re-grade the LIVE pipeline with each
@@ -4218,6 +4240,7 @@ def unleash_sweep(sport_key, espn_sport, espn_league, season_year=None,
     Judge on ROI-at-gate; pass a --season / --seasons TEST window for an OOS read.
     'more extreme + rare gate' wins here ONLY if ROI rises at a LOW-%bet gate.
     Nothing is written — this is the evidence feed for the disqualification step."""
+    _warn_small_limit(limit)
     import pricing_common
 
     live_shrink = {m: pricing_common._shrink_factor(sport_key, m) for m in MARKETS}
@@ -4336,6 +4359,7 @@ def pythag_sweep(sport_key, espn_sport, espn_league, season_year=None,
     Requires the harness season-runs feed (else pythag is inert). ``weights`` = a
     custom grid (for a refined sweep); defaults to a coarse 0..1 grid. Judge OOS via
     --season/--seasons; nothing written."""
+    _warn_small_limit(limit)
     import pricing_common
     live_ml = pricing_common._shrink_factor(sport_key, "moneyline")
     WEIGHTS = weights if weights else [0.0, 0.15, 0.25, 0.35, 0.50, 0.70, 1.0]
@@ -4381,6 +4405,7 @@ def pythag_shrink_combo(sport_key, espn_sport, espn_league, season_year=None,
     a pythag(rows) x shrink(cols) ROI grid per tight EV gate and flags the max cell
     (the best combo). A diagonal ridge = SUBSTITUTES (more pythag compensates for
     less shrink); a single peak = COMPLEMENTS. MONEYLINE only. Judge OOS; no write."""
+    _warn_small_limit(limit)
     PW = weights if weights else [0.0, 0.20, 0.35, 0.50, 0.70, 1.0]
     SH = shrinks if shrinks else [0.10, 0.15, 0.25, 0.35, 0.50, 0.75, 1.0]
     GATES = [("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
@@ -4413,6 +4438,102 @@ def pythag_shrink_combo(sport_key, espn_sport, espn_league, season_year=None,
                   f"ROI={best[0] * 100:+.1f}% (n={best[3]})")
     print("\n  (Diagnostic only — nothing written. MONEYLINE only; cell bet-counts")
     print("   vary across the grid — see --pythag-sweep for per-cell n.)")
+
+
+def _ab_gate_tally(obs, a, b, ev_floor, edge_floor, legacy_threshold):
+    """Flat-1u ROI over ML component obs under INDEPENDENT recency/pythag weights:
+    final = 0.5 + a*(recency-0.5) + b*(pythag-0.5), clamped to [0,1]. obs =
+    [(recency_p, pythag_p, market_p, outcome, price_yes, price_no)]; a None pythag_p
+    (no season runs yet) is treated as neutral 0.5 so its term drops — matching the
+    production skip. Backs the higher-edge side; gate is ROI-primary or legacy."""
+    pnl = won = 0.0
+    n = 0
+    for rec, pyt, mkt, outcome, price_yes, price_no in obs:
+        if mkt is None or rec is None:
+            continue
+        q = pyt if pyt is not None else 0.5
+        p = 0.5 + a * (rec - 0.5) + b * (q - 0.5)
+        p = max(0.0, min(1.0, p))
+        if p >= mkt:
+            side_prob, price, edge, win = p, price_yes, p - mkt, (outcome == 1)
+        else:
+            side_prob, price, edge, win = (1.0 - p, price_no, mkt - p,
+                                           (outcome == 0))
+        if price is None:
+            continue
+        dec = american_to_decimal(price)
+        er = side_prob * dec - 1.0
+        ok = ((er >= ev_floor and edge >= edge_floor) if ev_floor is not None
+              else (edge >= legacy_threshold and er > 0))
+        if not ok:
+            continue
+        pnl += (dec - 1.0) if win else -1.0
+        won += 1.0 if win else 0.0
+        n += 1
+    return {"n": n, "pnl": pnl,
+            "roi": (pnl / n) if n else None, "hit": (won / n) if n else None}
+
+
+def ab_sweep(sport_key, espn_sport, espn_league, season_year=None, limit=100000,
+             store_label="", source="auto", a_weights=None, b_weights=None):
+    """MONEYLINE independent recency-weight (A) x pythag-weight (B) ROI grid (NO WRITE).
+
+    final = 0.5 + A*(recency-0.5) + B*(pythag-0.5). This is the (pythag w, shrink s)
+    combo REPARAMETRIZED onto independent axes (the current order gives A=s(1-w),
+    B=s*w, which couples them; here A and B move freely). Costs ONE re-grade: pythag
+    is forced to 0 so the collected ML prob IS the pure recency prob, and the raw
+    per-game pythag prob is captured alongside it — the whole A x B grid is then
+    offline. Reads directly as 'trust recent margins this much, trust season run-
+    differential that much'. Judge OOS; nothing written."""
+    _warn_small_limit(limit)
+    A_W = a_weights if a_weights else [0.10, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.0]
+    B_W = b_weights if b_weights else [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80]
+    GATES = [("EV>=8% & edge>=2%", 0.08, 0.02, 0.0),
+             ("EV>=12% & edge>=3%", 0.12, 0.03, 0.0)]
+
+    comp = {m: [] for m in MARKETS}
+    saved = analysis.DEFAULT_PYTHAG_WEIGHT
+    print("\n########## re-grade: capture (recency, pythag) components "
+          "(pythag forced to 0) ##########")
+    try:
+        analysis.DEFAULT_PYTHAG_WEIGHT = 0.0
+        run_odds_backtest(
+            sport_key, espn_sport, espn_league, limit=limit, window=10,
+            variants={"live": VARIANT_PRESETS.get("all", {})},
+            season_year=season_year, threshold_pct=5.0,
+            write_calibration=False, store_label=store_label,
+            engine="live", prob_shrink=1.0, source=source,
+            supplement_log=False, collect_components=comp)
+    finally:
+        analysis.DEFAULT_PYTHAG_WEIGHT = saved
+    obs = comp["moneyline"]
+    n_pyth = sum(1 for r in obs if r[1] is not None)
+    print(f"\n  captured {len(obs)} ML obs ({n_pyth} with a pythag prob).")
+
+    print("\n\n############ A (recency) x B (pythag) — MONEYLINE ROI-at-gate ############")
+    print("  final = 0.5 + A*(recency-0.5) + B*(pythag-0.5). Rows = A (recency trust),")
+    print("  cols = B (pythag trust) — INDEPENDENT axes. Cell = flat-1u ROI%%; best")
+    print("  cell flagged. A rising-B ridge = run-differential carries the signal.")
+    print("  Judge OOS, not Brier.")
+    for glabel, evf, edf, leg in GATES:
+        print(f"\n=== {glabel} ===")
+        print("  {:<7}".format("A\\B")
+              + "".join("{:>8}".format(f"{b:.2f}") for b in B_W))
+        best = None
+        for a in A_W:
+            cells = []
+            for b in B_W:
+                t = _ab_gate_tally(obs, a, b, evf, edf, leg)
+                roi = t["roi"]
+                cells.append(f"{roi * 100:+.1f}" if roi is not None else "-")
+                if roi is not None and (best is None or roi > best[0]):
+                    best = (roi, a, b, t["n"])
+            print("  {:<7}".format(f"{a:.2f}")
+                  + "".join("{:>8}".format(c) for c in cells))
+        if best:
+            print(f"  -> best: A(recency)={best[1]:.2f} B(pythag)={best[2]:.2f} "
+                  f"ROI={best[0] * 100:+.1f}% (n={best[3]})")
+    print("\n  (Diagnostic only — nothing written. MONEYLINE only.)")
 
 
 def main():
@@ -4460,6 +4581,15 @@ def main():
     p.add_argument("--combo-shrinks", default=None,
                    help="(--combo-sweep) comma list of prob_shrink values for the grid "
                         "columns, e.g. 0.1,0.2,0.3,0.4. Default: 0.10..1.0 grid.")
+    p.add_argument("--ab-sweep", action="store_true",
+                   help="(odds mode) MONEYLINE independent recency-weight A x pythag-"
+                        "weight B ROI grid: final = 0.5 + A*(recency-0.5) + "
+                        "B*(pythag-0.5). One re-grade (pythag forced to 0); A x B swept "
+                        "offline. The decoupled view of --combo-sweep. No write.")
+    p.add_argument("--a-weights", default=None,
+                   help="(--ab-sweep) comma list of A (recency) weights. Default grid.")
+    p.add_argument("--b-weights", default=None,
+                   help="(--ab-sweep) comma list of B (pythag) weights. Default grid.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -4646,6 +4776,15 @@ def main():
                                 season_year=odds_seasons, limit=args.limit,
                                 store_label=args.store_label, source=args.source,
                                 weights=_pw, shrinks=_sh)
+        elif args.ab_sweep:
+            _aw = ([float(x) for x in args.a_weights.split(",")]
+                   if args.a_weights else None)
+            _bw = ([float(x) for x in args.b_weights.split(",")]
+                   if args.b_weights else None)
+            ab_sweep(sport_key, espn_sport, espn_league,
+                     season_year=odds_seasons, limit=args.limit,
+                     store_label=args.store_label, source=args.source,
+                     a_weights=_aw, b_weights=_bw)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,

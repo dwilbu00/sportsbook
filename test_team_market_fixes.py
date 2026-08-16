@@ -157,6 +157,32 @@ class AsofSeasonRunsTests(unittest.TestCase):
         self.assertNotIn("runs_scored", backtest._live_stats([])["season"])
 
 
+class AbTallyTests(unittest.TestCase):
+    """The A(recency) x B(pythag) blend: final = 0.5 + A*(rec-0.5) + B*(pyt-0.5)."""
+
+    def test_independent_weights_and_pythag_none_is_neutral(self):
+        import backtest
+        # one game: recency 0.80, pythag 0.60, market 0.50, home won, +100/+100
+        obs = [(0.80, 0.60, 0.50, 1, 100, 100)]
+        # A=0.5, B=0.5 → p = 0.5 + 0.5*0.30 + 0.5*0.10 = 0.70; edge 0.20; bets, wins
+        t = backtest._ab_gate_tally(obs, 0.5, 0.5, None, 0.0, 0.05)
+        self.assertEqual(t["n"], 1)
+        self.assertEqual(t["hit"], 1.0)
+        # pythag None → treated as neutral 0.5, so B contributes nothing:
+        obs_none = [(0.80, None, 0.50, 1, 100, 100)]
+        # A=0.5,B=0.9 → p = 0.5 + 0.5*0.30 + 0.9*0 = 0.65 (B irrelevant)
+        t2 = backtest._ab_gate_tally(obs_none, 0.5, 0.9, None, 0.0, 0.05)
+        t3 = backtest._ab_gate_tally(obs_none, 0.5, 0.1, None, 0.0, 0.05)
+        self.assertEqual(t2["n"], t3["n"])          # B has no effect when pythag None
+
+    def test_clamped_to_unit_interval(self):
+        import backtest
+        # extreme weights can't push p out of [0,1]; backs a side, no crash
+        obs = [(0.95, 0.95, 0.50, 1, -110, -110)]
+        t = backtest._ab_gate_tally(obs, 1.0, 1.0, None, 0.0, 0.05)
+        self.assertIn(t["n"], (0, 1))
+
+
 class UnleashSweepTests(unittest.TestCase):
     """The risky part of unleash_sweep is the per-variant override of two GLOBALS
     (analysis.DEFAULT_PYTHAG_WEIGHT + pricing_common._PROB_SHRINK_CACHE) — they
