@@ -72,11 +72,16 @@ DEFAULT_PYTHAG_WEIGHT = 0.35
 
 # Lineup-offense margin shift: runs of margin per unit of the home-minus-away
 # lineup OPS edge (PA-shrunk, slot-PA-weighted, in OPS units, clamped +/-0.3).
-# INERT by default (0.0) — a v1 experiment: build_matchup_features supplies a
-# warehouse-sourced lineup_edge (today's 9 batters' as-of OPS), and this weight is
-# swept/fit in the backtest (backtest.py --lineup-weight) before any live use.
-# Only affects the backtest until proven; live games have no batter facts yet so
-# lineup_edge is None regardless.
+# STAYS 0.0 (inert) — the experiment is DONE and REFUTED. A 2024-2026 sweep
+# (weights 5/10/15/25/50/75/100) MONOTONICALLY worsened moneyline Brier
+# (0.279→0.312) and spreads (0.281→0.330) at EVERY weight, and RAISED the bet
+# rate. Reason: the margin baseline already encodes offense (recent results +
+# season runs), so an additive lineup shift DOUBLE-COUNTS and amplifies the
+# model's overconfidence — the disease here isn't missing inputs, it's an
+# over-extreme point estimate vs an efficient close that already prices the
+# lineup. Kept wired-but-inert (the warehouse batter/lineup indices are reusable);
+# a bottom-up runs REBUILD that REPLACES the offense term — not this additive
+# layer — is the only lineup approach worth revisiting. See [[team-market-audit]].
 DEFAULT_LINEUP_WEIGHT = 0.0
 
 
