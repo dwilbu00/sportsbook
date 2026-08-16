@@ -1850,6 +1850,187 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
     print("\n  (Diagnostic only — nothing written.)")
 
 
+def _consensus_prop_stats(test, threshold):
+    """Cross-method AGREEMENT lens on the held-out TEST rows (see diagnose_consensus).
+
+    Each PRICED row already carries r["m"] (per-method P(over)), r["o"] (outcome),
+    and r["mkt_over"] (de-vigged consensus). For each model method A/B/C/D/E present,
+    the VALUE side is OVER iff P(over) > mkt_over; ``edge_agree`` is True when every
+    method points to the SAME value side. The consensus prob is the mean of the
+    present methods. Then — as the live edge+EV gate would actually bet (via
+    _roi_sim_method at ``threshold``, backing the consensus side) — realized hit-rate
+    + flat-1u ROI are split by all-agree vs split, and by A/B/C dispersion tercile.
+    Returns a dict (None if no priced rows). ROI is de-vigged CONSENSUS (optimistic
+    vs DK) so only the RELATIVE agree-vs-split comparison is trustworthy."""
+    methods = [k for k in ("A", "B", "C", "D", "E")
+               if any(k in r["m"] for r in test)]
+    priced = [r for r in test if r.get("mkt_over") is not None]
+    if not priced:
+        return None
+    for r in priced:
+        present = [k for k in methods if k in r["m"]]
+        r["_cons_p"] = sum(r["m"][k] for k in present) / len(present)
+        abc = [r["m"][k] for k in ("A", "B", "C") if k in r["m"]]
+        r["_abc_disp"] = (max(abc) - min(abc)) if len(abc) >= 2 else 0.0
+        # value side per method (over iff P(over) > market); agree = all one side.
+        r["_edge_agree"] = len({r["m"][k] > r["mkt_over"] for k in present}) == 1
+        # absolute-direction agreement among A/B/C (p>0.5) — confirms A/B/C rarely
+        # split on SIGN (only near the coin-flip line), unlike on magnitude.
+        r["_abc_sign_agree"] = len(
+            {r["m"][k] > 0.5 for k in ("A", "B", "C") if k in r["m"]}) == 1
+
+    def _sim(rows):
+        return _roi_sim_method(rows, lambda r: r["_cons_p"], threshold)
+
+    out = {
+        "methods": methods, "n_test": len(test), "n_priced": len(priced),
+        "edge_agree_pct": 100.0 * sum(r["_edge_agree"] for r in priced) / len(priced),
+        "abc_sign_agree_pct":
+            100.0 * sum(r["_abc_sign_agree"] for r in priced) / len(priced),
+        "all": _sim(priced),
+        "agree": _sim([r for r in priced if r["_edge_agree"]]),
+        "split": _sim([r for r in priced if not r["_edge_agree"]]),
+    }
+    srt = sorted(priced, key=lambda r: r["_abc_disp"])
+    if len(srt) >= 6:
+        t = len(srt) // 3
+        out["disp_tight"] = _sim(srt[:t])
+        out["disp_wide"] = _sim(srt[-t:])
+    return out
+
+
+def diagnose_consensus(sport, store_label="", xstats_strength=0.5, threshold_pct=5.0):
+    """Cross-method AGREEMENT lens (NO WRITE): does agreement among the calibration
+    methods (A/B/C/D/E) on the VALUE side predict a better bet? For each prop, on the
+    held-out test half at the live edge+EV gate, report flat-1u ROI + hit-rate when
+    ALL methods agree on the value side vs when they SPLIT, plus the A/B/C dispersion
+    split. Evidence for whether a consensus/agreement bet-selection layer would add a
+    real edge BEFORE building one. OFFLINE + FREE; writes nothing.
+
+    Same population + chronological 50/50 split + prep as diagnose_roi (params fit on
+    TRAIN; probs + betting on TEST). Prices are de-vigged CONSENSUS (optimistic vs DK,
+    common across methods) so the RELATIVE agree-vs-split comparison is sound but the
+    ABSOLUTE ROI is not a DK claim. Method D needs xstats_strength>0 (default 0.5)."""
+    import book_line_calibration as blc
+    from props import PROP_NEGBIN_ELIGIBLE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    props_to_check = sorted(existing.keys())
+    if not props_to_check:
+        print(f"No calibrated props in calibration/{sport_key}.json; run refit first.")
+        return
+
+    print(f"\n=== Consensus/agreement diagnostic: {sport_key} ===")
+    print("  Q: when the methods AGREE on the value side, is the bet better?")
+    print("     (evidence for a consensus/agreement bet-selection layer)")
+    print("  ⚠ ROI at de-vigged CONSENSUS prices (optimistic vs DK; RELATIVE only);")
+    print("    method params fit on TRAIN only (out-of-sample, not shipped params).")
+
+    book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, props_to_check, store_label)
+    print(f"  {len(book_lines):,} real book lines "
+          f"({n_primary:,} store + {n_pred:,} prediction log)")
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = blc.join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
+    if not enriched:
+        print("  No observations joined to actuals; nothing to diagnose.")
+        return
+
+    team_defense, league_avg_def = {}, None
+    if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
+           for pk in props_to_check):
+        team_defense, _, league_avg_def = _defense_lookup(espn_sport, espn_league)
+
+    xba_index = None
+    if xstats_strength > 0:
+        import savant_history as sh
+        import backtest_props
+        years = sorted({str(o["game_date"])[:4]
+                        for o in enriched if o.get("game_date")})
+        raw = []
+        for y in years:
+            try:
+                raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+            except Exception:
+                pass
+        xba_index = backtest_props.build_batter_xba_index(raw) if raw else None
+        if xba_index is None:
+            print(f"  [warn] no raw Statcast cached for {years}; method D excluded.")
+
+    threshold = threshold_pct / 100.0
+
+    def _fmt(sim):
+        if not sim or sim.get("roi") is None:
+            return f"n_bets={(sim or {}).get('n_bets', 0):>4}  ROI=    -    hit=   - "
+        return (f"n_bets={sim['n_bets']:>4}  ROI={sim['roi'] * 100:+6.1f}%  "
+                f"hit={sim['hit'] * 100:5.1f}%")
+
+    for prop_key in props_to_check:
+        cfg = existing[prop_key]
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        rows = _roi_build_rows(enriched, params, sport_key, prop_key,
+                               team_defense, league_avg_def)
+        rows = [r for r in rows if r["actual"] != r["line"]]
+        if len(rows) < 40:
+            print(f"\n  {prop_key}: only {len(rows)} usable obs (<40) — too thin.")
+            continue
+        rows.sort(key=lambda r: r["game_date"])
+        split = len(rows) // 2
+        train, test = rows[:split], rows[split:]
+
+        resid = sorted(r["actual"] - r["projected"] for r in train)
+        mu = sum(resid) / len(resid)
+        var = sum((x - mu) ** 2 for x in resid) / len(resid)
+        sigma = math.sqrt(var) if var > 0 else 1e-6
+        nb = (blc._fit_negbin_real(train)
+              if prop_key in PROP_NEGBIN_ELIGIBLE else None)
+        for r in test:
+            r["o"] = 1 if r["actual"] > r["line"] else 0
+            corrected = r["projected"] + mu
+            m = {
+                "A": max(0.0, min(1.0, r["empirical_over"])),
+                "B": blc._norm_cdf((corrected - r["line"]) / sigma),
+                "C": 1.0 - blc._empirical_cdf(resid, r["line"] - corrected),
+            }
+            if prop_key == "batter_hits" and xba_index is not None:
+                p_d = blc.project_distributional(
+                    r["obs"], params, sport_key, team_defense, league_avg_def,
+                    xstats_strength=xstats_strength, xba_index=xba_index)
+                if p_d is not None:
+                    m["D"] = p_d
+            if nb is not None:
+                ms, disp = nb
+                mean = max(1e-9, ms * r["projected"])
+                m["E"] = blc.negbin_at_least(int(r["line"]) + 1, mean, disp)
+            r["m"] = m
+
+        st = _consensus_prop_stats(test, threshold)
+        if st is None:
+            print(f"\n  {prop_key}: no priced test rows.")
+            continue
+        print(f"\n  {prop_key} (methods={'/'.join(st['methods'])}, "
+              f"n_test={st['n_test']}, priced={st['n_priced']}):")
+        print(f"    A/B/C agree on SIGN {st['abc_sign_agree_pct']:.0f}%   |   "
+              f"all methods agree on VALUE SIDE {st['edge_agree_pct']:.0f}%")
+        print(f"    bet ALL:     {_fmt(st['all'])}")
+        print(f"    bet AGREE:   {_fmt(st['agree'])}")
+        print(f"    bet SPLIT:   {_fmt(st['split'])}")
+        if "disp_tight" in st:
+            print(f"    A/B/C tight: {_fmt(st['disp_tight'])}")
+            print(f"    A/B/C wide:  {_fmt(st['disp_wide'])}")
+
+    print("\n  (Diagnostic only — nothing written. If AGREE ROI/hit clearly beats "
+          "SPLIT, an agreement bet-filter has teeth.)")
+
+
 def _roi_sim_gate(rows, ev_floor, edge_floor):
     """Slate ROI sim under a parameterized recommendation gate.
 
@@ -3035,6 +3216,15 @@ def main():
                         "the leakage-safe as-of xBA index (needs cached raw "
                         "Statcast); 0 (default) scores D on plain projections and "
                         "keeps the diagnostic free.")
+    p.add_argument("--consensus-diag", action="store_true",
+                   help="Cross-method AGREEMENT lens: does agreement among methods "
+                        "A/B/C/D/E on the value side predict a better bet? Reports "
+                        "ROI/hit when methods AGREE vs SPLIT (+ A/B/C dispersion) "
+                        "over the real-line holdout — evidence for a consensus bet-"
+                        "selection layer. Uses --roi-threshold-pct. No write.")
+    p.add_argument("--consensus-xstats-strength", type=float, default=0.5,
+                   help="xBA blend weight for method D under --consensus-diag "
+                        "(default 0.5 so D is in the mix; needs Statcast in SQL).")
     p.add_argument("--reliability", action="store_true",
                    help="Conditional-calibration report for batter_hits: "
                         "reliability (are 60-percent predictions right 60 percent "
@@ -3144,6 +3334,12 @@ def main():
         diagnose_roi(args.sport, store_label=args.store_label,
                      threshold_pct=args.roi_threshold_pct,
                      xstats_strength=args.roi_xstats_strength)
+        return
+
+    if args.consensus_diag:
+        diagnose_consensus(args.sport, store_label=args.store_label,
+                           xstats_strength=args.consensus_xstats_strength,
+                           threshold_pct=args.roi_threshold_pct)
         return
 
     if args.gate_diag:
