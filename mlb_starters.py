@@ -80,6 +80,10 @@ SAVANT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SportsbookValueFinder/
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 # Probable starters and daily splits move during the day, so keep this short.
 CACHE_MAX_AGE = 3600  # 1 hour
+# Immutable historical data (as-of/past-dated pulls, e.g. a starter's line through
+# a bygone date) never changes — cache it ~forever so backtests don't re-fetch the
+# same ~18k byDateRange responses on every (or every hour of a) run.
+PERMANENT_CACHE_AGE = 3650 * 24 * 3600  # ~10 years
 
 # League-average baselines used purely as *priors* for normalization / log5-style
 # matchup blending. These are stable year-to-year but drift slowly; they are NOT
@@ -982,9 +986,13 @@ def get_pitcher_quality(pitcher_id, season, as_of_date=None):
     if as_of_date:
         cutoff = (_date.fromisoformat(as_of_date[:10]) - timedelta(days=1)).isoformat()
         cache = f"pitcher_{pitcher_id}_{season}_asof_{cutoff}"
+        # A bygone as-of line is immutable → cache ~forever (kills the backtest's
+        # per-(pitcher,date) re-fetch storm).
+        max_age = PERMANENT_CACHE_AGE
     else:
         cache = f"pitcher_{pitcher_id}_{season}"
-    cached = _read_cache(cache)
+        max_age = CACHE_MAX_AGE
+    cached = _read_cache(cache, max_age=max_age)
     if cached is not None:
         return cached
     if as_of_date:

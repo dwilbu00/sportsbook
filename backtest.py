@@ -1204,6 +1204,33 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
     if limit and limit < len(all_games):
         all_games = all_games[-limit:]
 
+    # PERF: matchup features are I/O-bound (StatsAPI probables + as-of starter
+    # lines) and are the backtest's dominant cost when built per-game inside the
+    # serial grading loop. Pre-warm them across a thread pool up front — the
+    # sub-fetches share the atomic disk cache, so the grading loop then reads from
+    # `prewarm_features` instead of blocking on network. Only the live engine
+    # consumes matchup features. (Reuses the build_schedules ThreadPool pattern.)
+    prewarm_features = {}
+    if engine == "live":
+        _pw = [g for g in all_games
+               if g.get("date") and g.get("home_team") and g.get("away_team")]
+
+        def _pw_one(g):
+            d10 = _et_date10(g["date"])
+            return ((d10, g["home_team"], g["away_team"]),
+                    _matchup_features_for(g["home_team"], g["away_team"],
+                                          d10, sport_key))
+        if _pw:
+            print(f"  [prewarm] matchup features for {len(_pw)} games "
+                  f"(thread pool) ...")
+            with ThreadPoolExecutor(max_workers=16) as _pool:
+                for _fut in as_completed([_pool.submit(_pw_one, g) for g in _pw]):
+                    try:
+                        _k, _v = _fut.result()
+                        prewarm_features[_k] = _v
+                    except Exception:
+                        pass
+
     if engine == "live":
         print("\n[engine: live] grading the exact production analyzers "
               "(analyze_spreads_value / analyze_totals_value); variants ignored.")
@@ -1268,7 +1295,10 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                 entry.get("commence_time"), entry.get("home_team"),
                 entry.get("away_team"))
             ekeys = (gkey, ev_id) if ev_id else (gkey,)
-            matchup_features = _matchup_features_for(home, away, date_et, sport_key)
+            _mk = (date_et, home, away)
+            matchup_features = (prewarm_features[_mk] if _mk in prewarm_features
+                                else _matchup_features_for(home, away, date_et,
+                                                           sport_key))
             mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features)
