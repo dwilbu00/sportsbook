@@ -175,13 +175,16 @@ def scan(data, min_year=2023, max_year=None, allowed_types=DEFAULT_GAME_TYPES,
                 continue
             gt = gv.get("gameType")
             if allowed_types is not None and gt not in allowed_types:
-                # Rescue off-type games (e.g. the relocated A's, tagged 'Unknown')
-                # only when they resolve to two distinct real teams.
+                # Rescue ONLY the 'Unknown' bucket (where SBR mislabels the
+                # relocated A's 2025 regular-season games) — and only when both
+                # teams resolve to two DISTINCT real codes. Spring ('S'),
+                # All-Star ('A'), etc. are correctly typed and stay excluded; a
+                # blanket off-type admit would sweep in ~940 spring games.
                 hn = ((gv.get("homeTeam") or {}).get("fullName"))
                 an = ((gv.get("awayTeam") or {}).get("fullName"))
-                hc = resolver(hn) if admit_unknown else None
-                ac = resolver(an) if admit_unknown else None
-                if not (admit_unknown and hc and ac and hc != ac):
+                hc = resolver(hn) if (admit_unknown and gt == "Unknown") else None
+                ac = resolver(an) if (admit_unknown and gt == "Unknown") else None
+                if not (gt == "Unknown" and hc and ac and hc != ac):
                     skips["wrong_type"] += 1
                     continue
                 skips["admitted_offtype"] += 1

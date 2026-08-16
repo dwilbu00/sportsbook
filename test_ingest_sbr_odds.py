@@ -153,6 +153,17 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(skips["admitted_offtype"], 1)
         self.assertEqual(skips["wrong_type"], 0)
 
+    def test_scan_does_not_admit_spring_even_with_valid_codes(self):
+        # Spring ('S') games resolve to two real teams too — they must stay
+        # excluded; only the 'Unknown' bucket is rescued.
+        code = {"Toronto Blue Jays": "TOR", "New York Yankees": "NYY"}.get
+        data = {"2025-03-05": [_game(start="2025-03-05T17:00:00+00:00",
+                                     gtype="S")]}
+        cands, skips = ing.scan(data, min_year=2023, resolver=code)
+        self.assertEqual(len(cands), 0)
+        self.assertEqual(skips["wrong_type"], 1)
+        self.assertEqual(skips.get("admitted_offtype", 0), 0)
+
     def test_scan_drops_unknown_when_codes_unresolved_or_same(self):
         # Unresolved (stub returns None) → dropped.
         data = {"2025-05-01": [_game(start="2025-05-01T17:00:00+00:00",
