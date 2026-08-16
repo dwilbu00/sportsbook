@@ -41,6 +41,7 @@ from espn_client import (
 # imports `from backtest import cached_athlete_id, cached_gamelog` keep
 # working in book_line_calibration.py, eval_min_streak.py, etc.
 from espn_cache import cached_athlete_id, cached_gamelog, _cache_key
+import analysis
 from analysis import (
     _recency_weights,
     _weighted_mean,
@@ -1130,7 +1131,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                       write_calibration=False, store_label="", variance_inflate=1.0,
                       engine="live", prob_shrink=1.0, source="auto",
                       supplement_log=True, min_shrink_n=MIN_SHRINK_N,
-                      collect_obs=None, collect_dated=None):
+                      collect_obs=None, collect_dated=None, collect_lineup=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1314,6 +1315,14 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                 if collect_dated is not None:
                     collect_dated["moneyline"].append(
                         (date_et, mwin, fair_home, home_won))
+                # #3 v2 (DIAGNOSTIC): bottom-up lineup-runs P(home win), graded
+                # head-to-head vs the recency model (mwin) + market (fair_home).
+                if collect_lineup is not None:
+                    _lr = analysis.lineup_runs_win_prob(
+                        home, away, date_et, int(date_et[:4]), matchup_features)
+                    if _lr is not None:
+                        collect_lineup["moneyline"].append(
+                            (date_et, _lr[0], mwin, fair_home, home_won))
             if sp and mhc is not None:
                 home_spread, fair_cover, price_h, price_a = sp
                 model_spread, model_cover = mhc
@@ -4038,6 +4047,46 @@ def _calibration_bakeoff(dated):
     print("  (Diagnostic only — nothing written.)")
 
 
+def _lineup_runs_diag(lineup):
+    """#3 v2 (READ-ONLY): grade the bottom-up lineup-runs P(home win) head-to-head
+    vs the recency model + the market on the SAME games (Brier; raw + best-shrunk).
+
+    lineup["moneyline"] = [(date, lineup_p, recency_p, market_p, outcome), ...].
+    Answers whether a runs-FIRST lineup estimator (today's 9, as-of PA-weighted OPS
+    → expected_runs_from_factors vs the opposing starter → Poisson margin) beats the
+    recency margin model, and how close it gets to the close, BEFORE any live
+    wiring. The additive lineup nudge was refuted (b14b9d6); this is the replace-
+    the-offense-term rebuild. Nothing written."""
+    rows = [r for r in lineup.get("moneyline", []) if r[0]]
+    print("\n=== #3 v2 LINEUP-RUNS model vs recency vs market (moneyline Brier) ===")
+    if len(rows) < 100:
+        print(f"  (thin: {len(rows)} games with a resolvable lineup-runs prob — "
+              "need as-of lineups + both starters; expected sparse for old seasons)")
+        return
+    n = len(rows)
+
+    def _brier(idx, s=1.0):
+        return sum((0.5 + s * (r[idx] - 0.5) - r[4]) ** 2 for r in rows) / n
+
+    def _best_shrunk(idx):
+        best_s, best_b = 1.0, None
+        for s in (1.0, 0.75, 0.5, 0.35, 0.25, 0.15, 0.10):
+            b = _brier(idx, s)
+            if best_b is None or b < best_b:
+                best_s, best_b = s, b
+        return best_s, best_b
+    print(f"  games graded: {n}   home-win base rate = {sum(r[4] for r in rows)/n:.3f}")
+    print("  (same games for all three rows — apples-to-apples; lower Brier better)")
+    print("  {:<12}{:>11}{:>13}{:>9}".format(
+        "model", "raw Brier", "best-shrunk", "@shrink"))
+    for label, idx in (("lineup", 1), ("recency", 2), ("market", 3)):
+        raw = _brier(idx)
+        bs, bb = _best_shrunk(idx)
+        print("  {:<12}{:>11.4f}{:>13.4f}{:>9}".format(label, raw, bb, f"{bs:.2f}"))
+    print("  lineup < recency ⇢ the runs-first estimator adds info the margin model")
+    print("  lacks; lineup → market ⇢ CLV potential. (Diagnostic only — nothing written.)")
+
+
 def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                        limit=100000, store_label="", source="auto"):
     """Team-market GATE + SHRINK lens (NO WRITE): grade ML/spread/total over the
@@ -4051,6 +4100,7 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     never auto-writes."""
     obs = {m: [] for m in MARKETS}
     dated = {m: [] for m in MARKETS}   # (date, raw_p, market_p, outcome) for #2 bake-off
+    lineup = {m: [] for m in MARKETS}  # #3 v2 lineup-runs head-to-head (moneyline)
     # Grade once (RAW obs collected via the hook); prob_shrink=1.0 so the printed
     # Brier table is the unshrunk baseline — the sweep applies shrink itself.
     run_odds_backtest(sport_key, espn_sport, espn_league, limit=limit, window=10,
@@ -4058,7 +4108,8 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                       season_year=season_year, threshold_pct=5.0,
                       write_calibration=False, store_label=store_label,
                       engine="live", prob_shrink=1.0, source=source,
-                      supplement_log=False, collect_obs=obs, collect_dated=dated)
+                      supplement_log=False, collect_obs=obs, collect_dated=dated,
+                      collect_lineup=lineup)
 
     SHRINKS = (1.0, 0.5, 0.25, 0.15, 0.10)
     # Expanded toward RARER, higher-edge gates — the disqualification lens: at
@@ -4098,6 +4149,8 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     print("\n  (Diagnostic only — nothing written.)")
     # #2: does a learned Platt curve beat the flat scalar shrink OOS?
     _calibration_bakeoff(dated)
+    # #3 v2: does the bottom-up lineup-runs model beat the recency model?
+    _lineup_runs_diag(lineup)
 
 
 def main():

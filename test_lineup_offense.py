@@ -151,5 +151,56 @@ class LineupOffenseFactorsTests(unittest.TestCase):
                 ms.lineup_offense_factors("Home", "Away", "2024-07-01", {}, 2024))
 
 
+class LineupRunsWinProbTests(unittest.TestCase):
+    """#3 v2: bottom-up P(home win) from lineup offense factors + opposing starter
+    run-suppression → expected_runs_from_factors → Poisson margin. Patches the
+    lineup-factor lookup (SQL) but exercises the REAL runs/Poisson math."""
+    import analysis as _an
+
+    def _feat(self, home_rs, away_rs):
+        return {"home": {"starter": {"run_suppression": home_rs}},
+                "away": {"starter": {"run_suppression": away_rs}}}
+
+    def _run(self, factors, home_rs=1.0, away_rs=1.0):
+        with patch.object(ms, "get_team_index", return_value={}), \
+                patch.object(ms, "lineup_offense_factors", return_value=factors):
+            return self._an.lineup_runs_win_prob(
+                "Home", "Away", "2024-07-01", 2024, self._feat(home_rs, away_rs))
+
+    def test_symmetric_matchup_is_half(self):
+        # equal lineups (1.0/1.0) + equal starters (1.0/1.0) → coin flip.
+        res = self._run({"home": 1.0, "away": 1.0})
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res[0], 0.5, places=6)
+        self.assertAlmostEqual(res[1], res[2], places=6)   # equal expected runs
+
+    def test_strong_home_offense_raises_prob(self):
+        res = self._run({"home": 1.15, "away": 0.85})
+        self.assertGreater(res[0], 0.5)
+        self.assertGreater(res[1], res[2])                 # home scores more
+
+    def test_tough_home_starter_raises_prob(self):
+        # home starter suppresses away runs (rs=1.4 > away rs=0.8) → home favored
+        # even with league-average bats on both sides.
+        res = self._run({"home": 1.0, "away": 1.0}, home_rs=1.4, away_rs=0.8)
+        self.assertGreater(res[0], 0.5)
+        self.assertLess(res[2], res[1])                    # away scores fewer
+
+    def test_none_when_no_factors(self):
+        self.assertIsNone(self._run(None))
+
+    def test_none_when_missing_starter(self):
+        with patch.object(ms, "get_team_index", return_value={}), \
+                patch.object(ms, "lineup_offense_factors",
+                             return_value={"home": 1.0, "away": 1.0}):
+            self.assertIsNone(self._an.lineup_runs_win_prob(
+                "Home", "Away", "2024-07-01", 2024,
+                {"home": {"starter": {}}, "away": {"starter": {}}}))
+
+    def test_none_when_no_matchup_features(self):
+        self.assertIsNone(self._an.lineup_runs_win_prob(
+            "Home", "Away", "2024-07-01", 2024, None))
+
+
 if __name__ == "__main__":
     unittest.main()

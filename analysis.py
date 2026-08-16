@@ -229,6 +229,46 @@ def _mlb_expected_runs_projection(sport_key, matchup_features):
     }
 
 
+def lineup_runs_win_prob(home_team, away_team, date, season, matchup_features,
+                         base_runs=4.48):
+    """#3 v2 (DIAGNOSTIC): bottom-up P(home win) from a lineup-driven runs model.
+
+    lineup offense factors (today's 9, as-of, PA-weighted + PA-shrunk) → expected
+    runs per team vs the OPPOSING starter's run-suppression
+    (expected_runs_from_factors) → Poisson margin (ties split 50/50). Returns
+    (win_prob, home_runs, away_runs) or None. NOT wired to live pricing — graded
+    head-to-head vs the recency model + market in the backtest before any decision.
+    base_runs ~ league runs/team/game (2023-2026 ~4.48)."""
+    try:
+        import mlb_starters
+        if not matchup_features:
+            return None
+        factors = mlb_starters.lineup_offense_factors(
+            home_team, away_team, date, mlb_starters.get_team_index(season), season)
+        if not factors:
+            return None
+        hs = ((matchup_features.get("home") or {}).get("starter")
+              or {}).get("run_suppression")
+        as_ = ((matchup_features.get("away") or {}).get("starter")
+               or {}).get("run_suppression")
+        if not hs or not as_:
+            return None
+        # home runs = base * home offense / AWAY pitching; away = mirror.
+        home_runs = mlb_starters.expected_runs_from_factors(
+            base_runs, factors["home"], as_)
+        away_runs = mlb_starters.expected_runs_from_factors(
+            base_runs, factors["away"], hs)
+        if home_runs is None or away_runs is None:
+            return None
+        p_h = mlb_starters.poisson_margin_probability(home_runs, away_runs, 0.0)
+        p_a = mlb_starters.poisson_margin_probability(away_runs, home_runs, 0.0)
+        if p_h is None or p_a is None:
+            return None
+        return (0.5 * (p_h + (1.0 - p_a)), home_runs, away_runs)
+    except Exception:
+        return None
+
+
 def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare moneyline implied probabilities against historical win rates.
