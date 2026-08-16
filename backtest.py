@@ -4024,12 +4024,17 @@ def _calibration_bakeoff(dated):
         raw_b = _brier(lambda r: r[1])
         mkt_b = _brier(lambda r: r[2])
         shr_b = _brier(lambda r: 0.5 + s * (r[1] - 0.5))
-        plt_b = (_brier(lambda r: apply_platt(r[1], fit[0], fit[1]))
-                 if fit else float("nan"))
+        # fit_platt returns None when the optimal slope a<=0.2 (the raw prob has
+        # ~no calibratable signal → Platt would squash to the base rate) — report
+        # that as "degen", not a silent nan.
+        plt_str = ("{:.4f}".format(_brier(lambda r: apply_platt(r[1], fit[0], fit[1])))
+                   if fit else "  degen")
         gate = fit_platt_chronological([(r[0], r[1], r[3]) for r in rows])
-        print("  {:<10}{:>7}{:>9.4f}{:>9.4f}{:>9.4f}{:>9.4f}   {} (shrink s={})".format(
-            market, len(hold), raw_b, shr_b, plt_b, mkt_b,
+        print("  {:<10}{:>7}{:>9.4f}{:>9.4f}{:>9}{:>9.4f}   {} (shrink s={})".format(
+            market, len(hold), raw_b, shr_b, plt_str, mkt_b,
             "PASS" if gate else "fail", s))
+    print("  platt 'degen' / gate 'fail' = a learned curve is degenerate or can't")
+    print("  beat raw OOS → the scalar shrink is the calibration ceiling here.")
     print("  (Diagnostic only — nothing written.)")
 
 
