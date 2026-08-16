@@ -578,6 +578,24 @@ def _match_espn_name(espn_teams, api_name):
     return None
 
 
+def _et_date10(ts):
+    """US-Eastern calendar date (YYYY-MM-DD) for a commence/timestamp, falling back
+    to the raw prefix. The odds<->schedule join keys on the ET PLAY date so
+    consecutive-day same-matchup games (which can share a UTC date) stay distinct —
+    the same normalization game_key uses. Both sides must use this or the collapse
+    persists. A bare date (no time component) is returned unshifted — there is no
+    time-of-day to convert, and treating it as UTC-midnight would wrongly roll it
+    back a day."""
+    s = ts or ""
+    if "T" not in s:                 # bare 'YYYY-MM-DD' (or empty) → no conversion
+        return s[:10]
+    try:
+        from pricing_common import et_local_date
+        return et_local_date(ts) or s[:10]
+    except Exception:
+        return s[:10]
+
+
 def _build_odds_lookup(store, espn_teams):
     """
     Index a historical-odds store by (date10, espn_home, espn_away) using
@@ -597,7 +615,7 @@ def _build_odds_lookup(store, espn_teams):
     lookup = {}
     unmatched = 0
     for entry in store.get("games", {}).values():
-        date10 = (entry.get("commence_time") or "")[:10]
+        date10 = _et_date10(entry.get("commence_time"))
         if player_id_map is not None:
             try:
                 hc = entry.get("home_code") or player_id_map.team_code_for_name(
@@ -1207,7 +1225,10 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         home, away = game.get("home_team"), game.get("away_team")
         if not (date and home and away):
             continue
-        entry = _lookup_game_odds(lookup, date[:10], home, away)
+        # ET play date for the odds join / feature keys (game["date"] is a UTC
+        # timestamp); the full-ISO `date` is kept for prior_games_for's chronology.
+        date_et = _et_date10(date)
+        entry = _lookup_game_odds(lookup, date_et, home, away)
         if not entry:
             continue
         ml = _moneyline_market(entry)
@@ -1227,7 +1248,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         actual_total = game.get("total_score") or (game["home_score"] + game["away_score"])
         home_won = 1 if actual_margin > 0 else 0
         matched += 1
-        d10 = date[:10]
+        d10 = date_et
         if graded_lo is None or d10 < graded_lo:
             graded_lo = d10
         if graded_hi is None or d10 > graded_hi:
@@ -1245,7 +1266,7 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
                 entry.get("commence_time"), entry.get("home_team"),
                 entry.get("away_team"))
             ekeys = (gkey, ev_id) if ev_id else (gkey,)
-            matchup_features = _matchup_features_for(home, away, date[:10], sport_key)
+            matchup_features = _matchup_features_for(home, away, date_et, sport_key)
             mwin, mhc, mov = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features)

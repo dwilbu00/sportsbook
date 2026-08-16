@@ -46,8 +46,21 @@ def store_path(sport_key, label=""):
 
 
 def game_key(commence_time, home_team, away_team):
-    """Stable key for a game: '<YYYY-MM-DD>|<away> @ <home>' (UTC date)."""
-    date10 = (commence_time or "")[:10]
+    """Stable key for a game: '<ET play date>|<away> @ <home>'.
+
+    Uses the US-Eastern calendar date, not the UTC date: a night game (which rolls
+    to the next UTC day) and the next day's afternoon game of the SAME matchup
+    otherwise share a UTC date and collapse to one key, dropping one game's line.
+    Falls back to the raw UTC prefix if the ET conversion is unavailable."""
+    s = commence_time or ""
+    if "T" not in s:                 # bare 'YYYY-MM-DD' → no time to convert
+        date10 = s[:10]
+    else:
+        try:
+            from pricing_common import et_local_date
+            date10 = et_local_date(commence_time) or s[:10]
+        except Exception:
+            date10 = s[:10]
     return f"{date10}|{away_team} @ {home_team}"
 
 
