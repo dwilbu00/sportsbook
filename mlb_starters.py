@@ -962,21 +962,37 @@ def _names_match(left, right):
     return left.split()[-1] == right.split()[-1]
 
 
-def get_pitcher_quality(pitcher_id, season):
+def get_pitcher_quality(pitcher_id, season, as_of_date=None):
     """
-    Season pitching quality + handedness for a starter.
+    Pitching quality + handedness for a starter.
 
     Returns {'name','throws','era','k_pct','bb_pct','ip','bf',
              'run_suppression'} where run_suppression >1 means better than a
     league-average pitcher (LEAGUE_AVG['era'] / era), clamped to a sane range.
+
+    ``as_of_date`` (YYYY-MM-DD): LEAKAGE-SAFE mode for backtests — the line stats
+    are pulled via ``type=byDateRange`` up to as_of_date-1 (never the full season),
+    and the Savant xERA is SKIPPED (only a full-season aggregate exists, which
+    would leak the future), so run_suppression falls back to the as-of ERA. Live
+    callers leave it None → the original season+xERA behavior is byte-identical.
+    (The teams-endpoint splits/bullpen can't be date-bounded — StatsAPI ignores
+    the range on statSplits — so the opposing-offense factor stays season-based;
+    that residual leak is small + from a stable stat.)
     """
-    cache = f"pitcher_{pitcher_id}_{season}"
+    if as_of_date:
+        cutoff = (_date.fromisoformat(as_of_date[:10]) - timedelta(days=1)).isoformat()
+        cache = f"pitcher_{pitcher_id}_{season}_asof_{cutoff}"
+    else:
+        cache = f"pitcher_{pitcher_id}_{season}"
     cached = _read_cache(cache)
     if cached is not None:
         return cached
-    data = _get(f"people/{pitcher_id}", {
-        "hydrate": f"stats(group=pitching,type=season,season={season})",
-    })
+    if as_of_date:
+        hydrate = (f"stats(group=pitching,type=byDateRange,"
+                   f"startDate={season}-03-01,endDate={cutoff},season={season})")
+    else:
+        hydrate = f"stats(group=pitching,type=season,season={season})"
+    data = _get(f"people/{pitcher_id}", {"hydrate": hydrate})
     people = data.get("people", [])
     if not people:
         return None
@@ -1016,10 +1032,14 @@ def get_pitcher_quality(pitcher_id, season):
 
     # Prefer Savant expected stats (luck-stripped "true" quality) when the
     # pitcher is in the leaderboard; fall back to traditional ERA otherwise.
-    try:
-        xstats = get_pitcher_expected_stats(season).get(str(pitcher_id))
-    except requests.RequestException:
-        xstats = None  # Savant unreachable — degrade to ERA-based quality.
+    # SKIP in as-of mode: the Savant leaderboard is season-aggregate only, so
+    # using it for a past-dated backtest game would leak the future.
+    xstats = None
+    if not as_of_date:
+        try:
+            xstats = get_pitcher_expected_stats(season).get(str(pitcher_id))
+        except requests.RequestException:
+            xstats = None  # Savant unreachable — degrade to ERA-based quality.
     if xstats:
         out["xera"] = xstats.get("xera")
         out["xwoba"] = xstats.get("xwoba")
@@ -1134,9 +1154,14 @@ def get_bvp(batter_id, pitcher_id, season=None):
     return None
 
 
-def build_matchup_features(home_team, away_team, date, season, team_index=None):
+def build_matchup_features(home_team, away_team, date, season, team_index=None,
+                           as_of_date=None):
     """
     Assemble Phase 1 starter/opponent features for one game.
+
+    ``as_of_date`` (backtests): bound the starter's line stats to before that date
+    (leakage-safe; see get_pitcher_quality). Live callers leave it None so the
+    season+xERA path is unchanged.
 
     For each side returns the probable starter's quality and the *opposing*
     lineup's offense vs that starter's handedness, plus a single normalized
@@ -1159,7 +1184,7 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None):
         pinfo = probables.get(_norm(tname))
         if not pinfo:
             continue
-        q = get_pitcher_quality(pinfo["pitcher_id"], season)
+        q = get_pitcher_quality(pinfo["pitcher_id"], season, as_of_date=as_of_date)
         if not q:
             continue
         quality[side] = q

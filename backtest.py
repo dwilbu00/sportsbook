@@ -1073,8 +1073,10 @@ def _mlb_matchup_features(home, away, date, sport_key):
         if idx is None:
             idx = mlb_starters.get_team_index(season)
             _MLB_TEAM_INDEX[season] = idx
+        # as_of_date=date makes the starter line stats leakage-safe (byDateRange up
+        # to date-1) — the backtest must not see the pitcher's full-season line.
         return mlb_starters.build_matchup_features(home, away, date, season,
-                                                   team_index=idx)
+                                                   team_index=idx, as_of_date=date)
     except Exception:
         return None
 

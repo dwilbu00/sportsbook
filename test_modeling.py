@@ -576,7 +576,7 @@ class ExpectedRunsTests(unittest.TestCase):
                 mlb_starters, "get_probable_starters",
                 return_value=probables), patch.object(
                 mlb_starters, "get_pitcher_quality",
-                side_effect=lambda pitcher_id, season: qualities[pitcher_id]), patch.object(
+                side_effect=lambda pitcher_id, season, as_of_date=None: qualities[pitcher_id]), patch.object(
                 mlb_starters, "get_team_offense_splits",
                 side_effect=lambda team_id, season: offense_splits[team_id]), patch.object(
                 mlb_starters, "get_team_bullpen_quality",
