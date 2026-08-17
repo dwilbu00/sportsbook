@@ -89,6 +89,19 @@ class GradeByGamePkTests(unittest.TestCase):
                                              None, 7.5),
                 ("won", "5-3"))
 
+    def test_total_under_and_push_side_passthrough(self):
+        # The total 'side' is passed straight through (over/under). Exercise UNDER +
+        # push so a regression to the pass-through can't hide behind the OVER case.
+        with patch.object(mw, "final_game_by_pk", return_value=self._FINAL):
+            self.assertEqual(                                # 8 under 7.5 -> lost
+                gr.grade_team_bet_by_game_pk("baseball_mlb", 1, "total", "under",
+                                             None, 7.5),
+                ("lost", "5-3"))
+            self.assertEqual(                                # 8 vs line 8.0 -> push
+                gr.grade_team_bet_by_game_pk("baseball_mlb", 1, "total", "under",
+                                             None, 8.0),
+                ("push", "5-3"))
+
     def test_moneyline_home_from_team_id(self):
         with patch.object(mw, "final_game_by_pk", return_value=self._FINAL), \
              patch.object(mw, "team_id_for_name_tolerant", return_value="111"):
