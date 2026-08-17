@@ -422,6 +422,44 @@ def expected_runs_from_factors(base_runs, offense_factor,
     return max(0.5, min(12.0, expected))
 
 
+def expected_runs_additive(starter_rate9, bullpen_rate9, exp_ip,
+                           offense_factor=1.0, run_env=1.0, full_game_ip=9.0):
+    """Additive innings x rate projection of a team's expected runs — the Savant
+    "xERA-lite" formulation (the challenger to expected_runs_from_factors).
+
+    expected = [starter_rate9 * (exp_ip/9) + bullpen_rate9 * ((9 - exp_ip)/9)]
+               * offense_factor * run_env
+
+    The OPPOSING starter's expected runs/9 for his expected innings + the OPPOSING
+    bullpen's runs/9 for the rest, scaled by the batting team's league-relative
+    offense and the park/weather run environment. Unlike the multiplicative
+    power-of-ratio model, ``*_rate9`` are already on the runs/9 scale (fitted by
+    backtest_starters to ACTUAL total runs allowed per 9), so this is a direct
+    run-scale sum and NEVER divides two different-scale xwOBAs — which is what
+    dissolves the fit<->serve<->grade scale trap: xwOBAcon enters only as an input
+    FEATURE to the fitted rate9 map, not as a ratio numerator. ``offense_factor`` /
+    ``run_env`` are centered on 1.0 and applied ONCE (rate9 already assumes a
+    neutral park + league-average opponent). Returns expected runs clamped to
+    0.5..12.0, or None on bad input."""
+    try:
+        starter_rate9 = float(starter_rate9)
+        bullpen_rate9 = float(bullpen_rate9)
+        exp_ip = float(exp_ip)
+        offense_factor = float(offense_factor)
+        run_env = float(run_env)
+        full_game_ip = float(full_game_ip)
+    except (TypeError, ValueError):
+        return None
+    if (starter_rate9 <= 0 or bullpen_rate9 <= 0 or full_game_ip <= 0
+            or offense_factor <= 0 or run_env <= 0):
+        return None
+    exp_ip = max(0.0, min(full_game_ip, exp_ip))       # bound the starter's share
+    starter_share = exp_ip / full_game_ip
+    base = starter_rate9 * starter_share + bullpen_rate9 * (1.0 - starter_share)
+    expected = base * offense_factor * run_env
+    return max(0.5, min(12.0, expected))
+
+
 def pythagorean_win_probability(runs_scored, runs_allowed,
                                 exponent=PYTHAGOREAN_EXPONENT):
     """Return Bill James's modern-baseball Pythagorean win probability."""
