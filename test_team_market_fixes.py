@@ -28,11 +28,11 @@ _STAT_PAYLOAD = {"people": [{
 
 
 class WarehouseAsofPitcherTests(unittest.TestCase):
-    # index rows are (official_date, outs, er, k)
+    # index rows are (official_date, outs, er, k, bb, bf)  [Tier A #1c 6-tuples]
     _IDX = {"111": [
-        ("2024-04-01", 18, 2.0, 6.0),   # 6.0 IP, 2 ER
-        ("2024-04-08", 21, 1.0, 8.0),   # 7.0 IP, 1 ER
-        ("2024-04-15", 15, 3.0, 5.0),   # 5.0 IP, 3 ER — ON the as-of date
+        ("2024-04-01", 18, 2.0, 6.0, 2.0, 24.0),   # 6.0 IP, 2 ER, 2 BB, 24 BF
+        ("2024-04-08", 21, 1.0, 8.0, 1.0, 26.0),   # 7.0 IP, 1 ER, 1 BB, 26 BF
+        ("2024-04-15", 15, 3.0, 5.0, 3.0, 22.0),   # 5.0 IP, 3 ER — ON the as-of date
     ]}
 
     def test_asof_cumulative_and_leakage_cutoff(self):
@@ -43,6 +43,8 @@ class WarehouseAsofPitcherTests(unittest.TestCase):
         self.assertAlmostEqual(st["ip"], (18 + 21) / 3.0)      # 13.0 IP
         self.assertAlmostEqual(st["era"], 3.0 / 13.0 * 9.0)    # (2+1)ER / 13IP *9
         self.assertAlmostEqual(st["avg_ip"], 13.0 / 2)
+        self.assertAlmostEqual(st["bb"], 3.0)                  # 2+1 BB (04-15 excluded)
+        self.assertAlmostEqual(st["bf"], 50.0)                 # 24+26 BF
 
     def test_asof_none_when_no_prior_games(self):
         with patch.object(mw, "enabled", return_value=True), \
