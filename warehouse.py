@@ -846,7 +846,7 @@ def _assemble_team_entry(event_id, rows):
     entry = {"commence_time": commence, "home_team": home, "away_team": away,
              "home_code": first.get("home_code"),
              "away_code": first.get("away_code"),
-             "event_id": event_id, "props": {},
+             "event_id": event_id, "game_pk": first.get("game_pk"), "props": {},
              "moneyline": {}, "spreads": {}, "totals": {}}
     _fill_moneyline(entry, snap_rows, home, away)
     _fill_spreads(entry, snap_rows, home, away)
@@ -924,8 +924,12 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False):
         # collapses them: _assemble_team_entry returns one entry per group and
         # the later game is silently dropped. Adding game_date separates them;
         # for correctly-unique data one event_id maps to exactly one game_date,
-        # so this is byte-identical (2026-live, SBR).
-        by_event.setdefault((eid, r.get("game_date")), []).append(r)
+        # so this is byte-identical (2026-live, SBR). #2b: also key on game_pk so a
+        # SAME-commence doubleheader (one event_id + one game_date, two game_pks)
+        # splits into its two games; NULL game_pk (legacy) is one shared bucket ->
+        # byte-identical to the pre-#2b (eid, game_date) grouping.
+        by_event.setdefault((eid, r.get("game_date"), r.get("game_pk")),
+                            []).append(r)
     if sbr_excluded:
         # Visible, never silent: a 2023-only run legitimately empties out here.
         # Count is the ALL-DATES warehouse total (the reader is called unscoped),
@@ -933,12 +937,17 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False):
         print(f"  [warehouse] excluded {len(sbr_excluded)} SBR-sourced event(s) "
               f"across all dates (poisoned closes; include_sbr=True to restore).")
     games = {}
-    for (event_id, _game_date), ev_rows in by_event.items():
+    for (event_id, _game_date, _gpk), ev_rows in by_event.items():
         entry = _assemble_team_entry(event_id, ev_rows)
         if entry is None:
             continue
         key = store_mod.game_key(entry.get("commence_time"),
                                  entry.get("home_team"), entry.get("away_team"))
+        # #2b: a same-commence DH shares one game_key -> disambiguate by game_pk so
+        # the second game's odds aren't overwritten. NULL game_pk keeps the bare key
+        # (byte-identical to today).
+        if entry.get("game_pk") is not None:
+            key = f"{key}|pk={entry['game_pk']}"
         games[key] = entry
     empty["games"] = games
     return empty

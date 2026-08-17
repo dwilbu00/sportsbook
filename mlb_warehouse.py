@@ -1103,6 +1103,36 @@ def _parse_ts(v):
         return None
 
 
+def _score_commence_candidates(cands, commence, tol_hours=20):
+    """From {game_pk: game_date} candidates for ONE matchup, the single game_pk whose
+    game_date is nearest ``commence`` within tol_hours, or None (no candidate, out of
+    tolerance, or a ~tied same-timestamp DH — the 2nd-closest is within 60s). tz-naive
+    / mixed-awareness / bad timestamps are skipped, never raised. Shared scorer for
+    find_game_pk_by_commence (per-matchup SQL) and the team backfill (in-memory index)
+    so both resolve identically."""
+    ts = _parse_ts(commence)
+    if ts is None or ts.tzinfo is None:      # tz-naive can't be compared → fail-closed
+        return None
+    scored = []
+    for pk, gd in cands.items():
+        gts = _parse_ts(gd)
+        if gts is None or gts.tzinfo is None:
+            continue
+        try:
+            scored.append((abs((gts - ts).total_seconds()), pk))
+        except (TypeError, ValueError):      # mixed awareness / bad ts → skip, never raise
+            continue
+    if not scored:
+        return None
+    scored.sort()
+    best_delta, best_pk = scored[0]
+    if best_delta > tol_hours * 3600:
+        return None
+    if len(scored) > 1 and (scored[1][0] - best_delta) <= 60:   # ~tied → DH ambiguity
+        return None
+    return best_pk
+
+
 def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20):
     """Resolve a game_pk for a matchup by the NEAREST game_date to the odds commence
     time — robust to a series (picks the right day) and a SPLIT doubleheader (picks
@@ -1128,24 +1158,7 @@ def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20)
             ).fetchall()
     except (OperationalError, ValueError, TypeError):
         return None
-    scored = []
-    for pk, gd in rows:
-        gts = _parse_ts(gd)
-        if gts is None or gts.tzinfo is None:
-            continue
-        try:
-            scored.append((abs((gts - ts).total_seconds()), pk))
-        except (TypeError, ValueError):      # mixed awareness / bad ts → skip, never raise
-            continue
-    if not scored:
-        return None
-    scored.sort()
-    best_delta, best_pk = scored[0]
-    if best_delta > tol_hours * 3600:
-        return None
-    if len(scored) > 1 and (scored[1][0] - best_delta) <= 60:   # ~tied → DH ambiguity
-        return None
-    return best_pk
+    return _score_commence_candidates({pk: gd for pk, gd in rows}, commence, tol_hours)
 
 
 def record_player_alias(provider, provider_key, mlb_player_id,
@@ -1760,7 +1773,8 @@ def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
             continue
         out.append({"date": m["game_date"], "home_team": m["home_name"],
                     "away_team": m["away_name"], "home_score": hs,
-                    "away_score": as_, "total_score": hs + as_})
+                    "away_score": as_, "total_score": hs + as_,
+                    "game_pk": m["game_pk"]})   # #2b: DH-safe backtest dedup/join key
     return out
 
 
@@ -2162,21 +2176,57 @@ def backfill_legacy_game_pk(dry_run=True, season=None):
     return summary
 
 
-def _resolve_team_game_pk(home_team, away_team, commence, game_date):
-    """DH-safe game_pk for a TEAM row from its team NAMES + commence/date, or None.
-    team_id_for_name_tolerant -> find_game_pk_by_commence (split-DH safe) -> a
-    find_game_pk(official_date) UNIQUE-ONLY fallback (returns None on any DH). Wrapped
-    so a bad timestamp can never abort the backfill (belt-and-suspenders over
-    find_game_pk_by_commence's own fail-closed tz guard)."""
+def _team_game_index():
+    """{(home_team_id, away_team_id, official_date): {game_pk: game_date}} over ALL
+    mlb_game rows — loaded ONCE so the team-market backfill resolves in memory instead
+    of a per-row SQL round-trip (thousands of remote round-trips → one bulk read).
+    {} on error."""
+    out = {}
     try:
-        hid = team_id_for_name_tolerant(home_team) if home_team else None
-        aid = team_id_for_name_tolerant(away_team) if away_team else None
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(select(
+                mlb_game.c.home_team_id, mlb_game.c.away_team_id,
+                mlb_game.c.official_date, mlb_game.c.game_pk,
+                mlb_game.c.game_date)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    for hid, aid, offd, gpk, gd in rows:
+        if hid and aid and offd:
+            out.setdefault((str(hid), str(aid), str(offd)[:10]), {})[gpk] = gd
+    return out
+
+
+def _resolve_team_game_pk_indexed(home_team, away_team, commence, game_date,
+                                  name_cache, index):
+    """DH-safe game_pk for a TEAM row from its team NAMES + commence/date, resolved
+    IN MEMORY against `index` (_team_game_index) + a per-run team-name cache — zero
+    per-row SQL. Same policy as the live stamp: commence-nearest (split-DH safe) over
+    a ±1-day window, then a UNIQUE-official-date fallback (None on any DH). Wrapped so
+    a bad row can never abort the backfill."""
+    try:
+        if home_team not in name_cache:
+            name_cache[home_team] = (team_id_for_name_tolerant(home_team)
+                                     if home_team else None)
+        if away_team not in name_cache:
+            name_cache[away_team] = (team_id_for_name_tolerant(away_team)
+                                     if away_team else None)
+        hid, aid = name_cache[home_team], name_cache[away_team]
         if not (hid and aid):
             return None
-        gpk = find_game_pk_by_commence(hid, aid, commence) if commence else None
-        if gpk is None and game_date:
-            gpk = find_game_pk(str(game_date)[:10], hid, aid)   # unique-only, DH-safe
-        return gpk
+        ts = _parse_ts(commence)
+        if ts is not None and ts.tzinfo is not None:
+            cands = {}
+            for d in (-1, 0, 1):
+                day = (ts.date() + datetime.timedelta(days=d)).isoformat()
+                cands.update(index.get((str(hid), str(aid), day), {}))
+            gpk = _score_commence_candidates(cands, commence)
+            if gpk is not None:
+                return gpk
+        if game_date:                        # unique-official-date fallback (DH-safe)
+            same = index.get((str(hid), str(aid), str(game_date)[:10]), {})
+            if len(same) == 1:
+                return next(iter(same))
+        return None
     except Exception:
         return None
 
@@ -2184,11 +2234,16 @@ def _resolve_team_game_pk(home_team, away_team, commence, game_date):
 def backfill_team_game_pk(dry_run=True, season=None):
     """Tier A #2: retro-match game_pk onto legacy MLB TEAM-market rows (wagers +
     odds_line) that predate #2 stamping. TEAM-ANCHOR (no player id): resolve the game
-    from the row's team NAMES + commence_time via find_game_pk_by_commence (split-DH
-    safe), with a find_game_pk(official_date) unique-only fallback. An ambiguous
-    same-timestamp DH / unknown team / tz-naive-or-missing commence -> left NULL
-    (additive; the row still grades by name+date). All odds lines of one snapshot
-    share the game, so the odds_line pass resolves ONCE per snapshot_id.
+    from the row's team NAMES + commence_time by commence-nearest match (split-DH
+    safe), with a unique-official-date fallback. An ambiguous same-timestamp DH /
+    unknown team / tz-naive-or-missing commence -> left NULL (additive; the row still
+    grades by name+date). All odds lines of one snapshot share the game, so the
+    odds_line pass resolves ONCE per snapshot_id.
+
+    PERFORMANCE: the whole mlb_game table is loaded ONCE into an in-memory index
+    (_team_game_index) and every row resolves against it with NO per-row SQL — team
+    names hit team_id_for_name_tolerant once per DISTINCT name (cached). So the run is
+    ~4 queries + in-memory work, not thousands of remote round-trips.
 
     NON-DESTRUCTIVE + idempotent: only ever WRITES game_pk on a row whose game_pk IS
     NULL (guarded in both the SELECT and the UPDATE .where), MLB team-markets only.
@@ -2198,6 +2253,14 @@ def backfill_team_game_pk(dry_run=True, season=None):
         return summary
     eng = db_store.get_engine()
     team_types = ("moneyline", "spread", "total")
+    index = _team_game_index()        # ONE bulk load; all resolution is in-memory
+    name_cache = {}                   # distinct team name -> id (≈30-60 resolver calls)
+    print(f"  [team-backfill] indexed {sum(len(v) for v in index.values())} games; "
+          f"resolving in memory (dry_run={dry_run})…")
+
+    def _resolve(home, away, commence, gdate):
+        return _resolve_team_game_pk_indexed(home, away, commence, gdate,
+                                             name_cache, index)
 
     # --- wagers pass (team-market money rows; player IS NULL) ---
     w = db_store.wagers
@@ -2211,8 +2274,7 @@ def backfill_team_game_pk(dry_run=True, season=None):
                    w.c.commence_time).where(wpred)).fetchall()
     wmatched = [{"rid": rid, "gpk": int(gpk)}
                 for rid, home, away, gdate, commence in wrows
-                if (gpk := _resolve_team_game_pk(home, away, commence, gdate))
-                is not None]
+                if (gpk := _resolve(home, away, commence, gdate)) is not None]
     if wmatched and not dry_run:
         with _WRITE_LOCK:
             with eng.begin() as conn:
@@ -2221,6 +2283,7 @@ def backfill_team_game_pk(dry_run=True, season=None):
                                     & (w.c.game_pk.is_(None)))
                     .values(game_pk=bindparam("gpk")), wmatched)
     summary["wagers"] = {"candidates": len(wrows), "matched": len(wmatched)}
+    print(f"  [team-backfill] wagers: {len(wmatched)}/{len(wrows)} matched")
 
     # --- odds_line pass (team-market lines; resolve ONCE per snapshot, fan out) ---
     ol, os_ = db_store.odds_line, db_store.odds_snapshot
@@ -2238,7 +2301,7 @@ def backfill_team_game_pk(dry_run=True, season=None):
     omatched = []
     for rid, sid, home, away, gdate, commence in orows:
         if sid not in snap_gpk:
-            snap_gpk[sid] = _resolve_team_game_pk(home, away, commence, gdate)
+            snap_gpk[sid] = _resolve(home, away, commence, gdate)
         if snap_gpk[sid] is not None:
             omatched.append({"rid": rid, "gpk": int(snap_gpk[sid])})
     if omatched and not dry_run:
@@ -2250,6 +2313,8 @@ def backfill_team_game_pk(dry_run=True, season=None):
                                          & (ol.c.game_pk.is_(None)))
                         .values(game_pk=bindparam("gpk")), omatched[i:i + 500])
     summary["odds_line"] = {"candidates": len(orows), "matched": len(omatched)}
+    print(f"  [team-backfill] odds_line: {len(omatched)}/{len(orows)} matched "
+          f"({len(snap_gpk)} snapshots)")
     return summary
 
 

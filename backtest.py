@@ -387,7 +387,11 @@ def all_completed_games(schedules):
     games = []
     for tid, sched in schedules.items():
         for g in sched:
-            key = (g.get("date"), g.get("home_team"), g.get("away_team"))
+            # #2b: include game_pk so a doubleheader's two results (same date+teams)
+            # are NOT deduped down to one. NULL game_pk (non-warehouse schedules)
+            # -> 4th element None for every row -> identical dedup to the pre-#2b key.
+            key = (g.get("date"), g.get("home_team"), g.get("away_team"),
+                   g.get("game_pk"))
             if key in seen:
                 continue
             seen.add(key)
@@ -617,6 +621,12 @@ def _build_odds_lookup(store, espn_teams):
     unmatched = 0
     for entry in store.get("games", {}).values():
         date10 = _et_date10(entry.get("commence_time"))
+        # #2b: a positive StatsAPI game_pk is a globally-unique, DH-exact join key
+        # (no date/teams needed) — emit it so the results side can prefer it. NULL
+        # game_pk (legacy) emits nothing here -> the id/name keys below are unchanged.
+        gpk = entry.get("game_pk")
+        if gpk is not None:
+            lookup[("pk", gpk)] = entry
         if player_id_map is not None:
             try:
                 hc = entry.get("home_code") or player_id_map.team_code_for_name(
@@ -636,10 +646,16 @@ def _build_odds_lookup(store, espn_teams):
     return lookup, unmatched
 
 
-def _lookup_game_odds(lookup, date10, home, away):
-    """Find a stored game by date (±1 day), preferring canonical SFBB team codes
-    (robust to franchise renames / name-spelling drift) and falling back to the
-    ESPN team-name key. Fail-open on the code resolution."""
+def _lookup_game_odds(lookup, date10, home, away, game_pk=None):
+    """Find a stored game, preferring an exact StatsAPI game_pk (#2b: DH-exact, so a
+    doubleheader's two games never cross-match), then canonical SFBB team codes
+    (robust to franchise renames / name-spelling drift), then the ESPN team-name key
+    over a ±1-day window. Fail-open on the code resolution. NULL game_pk skips the
+    pk key -> byte-identical to the pre-#2b lookup."""
+    if game_pk is not None:
+        hit = lookup.get(("pk", game_pk))
+        if hit:
+            return hit
     try:
         import player_id_map
         hc = player_id_map.team_code_for_name(home)
@@ -1312,7 +1328,8 @@ def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variant
         # ET play date for the odds join / feature keys (game["date"] is a UTC
         # timestamp); the full-ISO `date` is kept for prior_games_for's chronology.
         date_et = _et_date10(date)
-        entry = _lookup_game_odds(lookup, date_et, home, away)
+        entry = _lookup_game_odds(lookup, date_et, home, away,
+                                  game_pk=game.get("game_pk"))   # #2b: DH-exact join
         if not entry:
             continue
         ml = _moneyline_market(entry)

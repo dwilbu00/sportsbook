@@ -1354,6 +1354,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
             odds_snapshot.c.away_code, odds_line.c.snapshot_id,
             odds_line.c.bet_type, odds_line.c.selection, odds_line.c.point,
             odds_line.c.price, odds_line.c.implied_prob, odds_line.c.team_code,
+            odds_line.c.game_pk,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
@@ -1389,6 +1390,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
                 "price": r._mapping["price"],
                 "implied_prob": r._mapping["implied_prob"],
                 "team_code": r._mapping["team_code"],
+                "game_pk": r._mapping["game_pk"],   # #2b: DH-safe backtest join key
             } for r in rows]
         except OperationalError as exc:  # transient (cold resume / lock / timeout)
             last_exc = exc

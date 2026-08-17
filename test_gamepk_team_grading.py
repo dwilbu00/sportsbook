@@ -416,5 +416,97 @@ class BackfillTeamGamePkTests(unittest.TestCase):
         self.assertIsNone(self._wager_gpks()["w-dhnaive"])    # DH + naive -> NULL
 
 
+class BacktestDHJoinTests(unittest.TestCase):
+    """#2b: game_pk threads through the offline team-market backtest so a doubleheader's
+    two games don't collapse. Pure dict functions — no SQL. NULL game_pk == pre-#2b."""
+    def _entry(self, gpk, commence="2026-07-20T22:05:00Z", home="NYY", away="BOS"):
+        return {"commence_time": commence, "home_team": home, "away_team": away,
+                "home_code": None, "away_code": None, "game_pk": gpk}
+
+    def test_build_lookup_emits_pk_key(self):
+        import backtest
+        store = {"games": {"g1": self._entry(700), "g2": self._entry(701)}}
+        lookup, _ = backtest._build_odds_lookup(store, {})
+        self.assertIn(("pk", 700), lookup)
+        self.assertIn(("pk", 701), lookup)
+        self.assertEqual(lookup[("pk", 701)]["game_pk"], 701)
+
+    def test_build_lookup_null_pk_emits_no_pk_key(self):
+        import backtest
+        store = {"games": {"g1": self._entry(None)}}
+        lookup, _ = backtest._build_odds_lookup(store, {})
+        self.assertFalse(any(k[0] == "pk" for k in lookup))   # byte-identical to pre-#2b
+
+    def test_lookup_prefers_pk(self):
+        import backtest
+        e700, e701 = self._entry(700), self._entry(701)
+        lookup = {("pk", 700): e700, ("pk", 701): e701}
+        self.assertIs(backtest._lookup_game_odds(lookup, "2026-07-20", "NYY", "BOS",
+                                                 game_pk=701), e701)
+
+    def test_lookup_null_pk_falls_back_to_name(self):
+        import backtest
+        e = self._entry(None)
+        lookup = {("2026-07-20", "NYY", "BOS"): e}       # only the name key
+        self.assertIs(backtest._lookup_game_odds(lookup, "2026-07-20", "NYY", "BOS"), e)
+
+    def test_all_completed_games_keeps_both_dh_games(self):
+        import backtest
+        g1 = {"date": "2026-07-20T18:00:00Z", "home_team": "NYY", "away_team": "BOS",
+              "home_score": 5, "away_score": 3, "game_pk": 700}
+        g2 = {"date": "2026-07-20T18:00:00Z", "home_team": "NYY", "away_team": "BOS",
+              "home_score": 1, "away_score": 2, "game_pk": 701}   # same date+teams, DH
+        # Each team's schedule lists BOTH games -> must dedup to 2 (not 4), not 1.
+        games = backtest.all_completed_games({"147": [g1, g2], "111": [g1, g2]})
+        self.assertEqual(len(games), 2)
+        self.assertEqual({g["game_pk"] for g in games}, {700, 701})
+
+    def test_all_completed_games_null_pk_dedups_as_before(self):
+        import backtest
+        dup = {"date": "2026-07-20T18:00:00Z", "home_team": "NYY", "away_team": "BOS",
+               "home_score": 5, "away_score": 3}                # no game_pk
+        self.assertEqual(len(backtest.all_completed_games({"147": [dup, dict(dup)]})), 1)
+
+
+class LoadTeamMarketStoreDHTests(unittest.TestCase):
+    """#2b: load_team_market_store splits a same-commence DH by game_pk (was collapsing
+    last-write-wins on the game_key); NULL game_pk collapses exactly as before."""
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+
+    def _meta(self, hour):
+        return {"sport": "baseball_mlb", "game_date": "2026-07-20", "event_id": "e1",
+                "kind": "team", "snapshot_hour": hour,
+                "captured_at": f"2026-07-20T{hour[-3:-1]}:00:00Z",
+                "commence_time": "2026-07-20T18:00:00Z",     # SAME commence (DH)
+                "home": "Yankees", "away": "Red Sox"}
+
+    def _lines(self, gpk):
+        return [{"bet_type": "moneyline", "selection": "Yankees", "price": -120,
+                 "implied_prob": 0.55, "game_pk": gpk},
+                {"bet_type": "moneyline", "selection": "Red Sox", "price": 100,
+                 "implied_prob": 0.5, "game_pk": gpk}]
+
+    def test_same_commence_dh_split_by_game_pk(self):
+        import warehouse
+        db_store.capture_odds_snapshot(self._meta("20260720T10Z"), self._lines(700))
+        db_store.capture_odds_snapshot(self._meta("20260720T11Z"), self._lines(701))
+        store = warehouse.load_team_market_store("baseball_mlb")
+        self.assertEqual(len(store["games"]), 2)             # both DH games kept
+        self.assertEqual({e.get("game_pk") for e in store["games"].values()},
+                         {700, 701})
+
+    def test_null_game_pk_collapses_as_before(self):
+        import warehouse
+        db_store.capture_odds_snapshot(self._meta("20260720T10Z"), self._lines(None))
+        db_store.capture_odds_snapshot(self._meta("20260720T11Z"), self._lines(None))
+        store = warehouse.load_team_market_store("baseball_mlb")
+        self.assertEqual(len(store["games"]), 1)             # byte-identical: one entry
+
+
 if __name__ == "__main__":
     unittest.main()
