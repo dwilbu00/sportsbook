@@ -145,5 +145,57 @@ class GradeByGamePkTests(unittest.TestCase):
                 "baseball_mlb", 2, "total", "over", None, 7.5), ("lost", "1-2"))
 
 
+class GradeWagerRoutingTests(unittest.TestCase):
+    """wagers._grade_wager routing: fast path vs the unchanged name+date fallback."""
+    def _row(self, **kw):
+        base = {"sport_key": "baseball_mlb", "bet_type": "moneyline", "game_pk": 1,
+                "side": "home", "team": "NYY", "point": None,
+                "commence_time": "2024-04-01T23:05:00Z", "game_date": "2024-04-01"}
+        base.update(kw)
+        return base
+
+    def test_fast_result_short_circuits_name_date(self):
+        import wagers
+        with patch.object(gr, "grade_team_bet_by_game_pk",
+                          return_value=("won", "5-3")), \
+             patch.object(gr, "final_score") as fsm:
+            self.assertEqual(wagers._grade_wager(self._row()), ("won", "5-3"))
+            fsm.assert_not_called()          # game_pk path won -> never hit name+date
+
+    def test_pending_stays_pending_no_fallback(self):
+        import wagers
+        with patch.object(gr, "grade_team_bet_by_game_pk",
+                          return_value=gr.GRADE_PENDING), \
+             patch.object(gr, "final_score") as fsm:
+            self.assertIsNone(wagers._grade_wager(self._row()))
+            fsm.assert_not_called()          # critical: do NOT fall back on PENDING
+
+    def test_fast_none_falls_back_to_name_date(self):
+        import wagers
+        with patch.object(gr, "grade_team_bet_by_game_pk", return_value=None), \
+             patch.object(gr, "final_score", return_value=(5.0, 3.0)) as fsm, \
+             patch.object(gr, "side_for_team", return_value="home"):
+            self.assertEqual(wagers._grade_wager(self._row()), ("won", "5-3"))
+            fsm.assert_called_once()          # fell through to name+date
+
+    def test_absent_game_pk_skips_fast_path(self):
+        import wagers
+        with patch.object(gr, "grade_team_bet_by_game_pk") as fastm, \
+             patch.object(gr, "final_score", return_value=(5.0, 3.0)), \
+             patch.object(gr, "side_for_team", return_value="home"):
+            self.assertEqual(wagers._grade_wager(self._row(game_pk=None)),
+                             ("won", "5-3"))
+            fastm.assert_not_called()          # byte-identical to pre-#2
+
+    def test_non_mlb_skips_fast_path(self):
+        import wagers
+        with patch.object(gr, "grade_team_bet_by_game_pk") as fastm, \
+             patch.object(gr, "final_score", return_value=(110.0, 100.0)), \
+             patch.object(gr, "side_for_team", return_value="home"):
+            wagers._grade_wager(self._row(sport_key="basketball_nba",
+                                          bet_type="moneyline"))
+            fastm.assert_not_called()          # NBA never enters the fast path
+
+
 if __name__ == "__main__":
     unittest.main()

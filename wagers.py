@@ -441,6 +441,22 @@ def _grade_wager(row):
         return status, actual
 
     # Team markets (moneyline / spread / total).
+    # Fast path (Tier A #2, MLB only): when the wager carries a game_pk, grade off
+    # the EXACT warehouse game (doubleheader-safe) instead of name+date. A positive
+    # 'still live' verdict returns None-from-GRADE_PENDING and stays pending — we do
+    # NOT fall back, because name+date could grade off a near-same-commence DH
+    # sibling. Anything uncertain returns None and falls through to the unchanged
+    # name+date path below (byte-identical to pre-#2 when game_pk is absent / non-MLB).
+    game_pk = row.get("game_pk")
+    if row.get("sport_key") == "baseball_mlb" and game_pk:
+        fast = game_results.grade_team_bet_by_game_pk(
+            row.get("sport_key"), game_pk, bet_type, row.get("side"),
+            row.get("team"), row.get("point"))
+        if fast is game_results.GRADE_PENDING:
+            return None
+        if fast is not None:
+            return fast
+
     score = game_results.final_score(
         row.get("sport_key"), game_date, row.get("home_team"),
         row.get("away_team"), commence)
