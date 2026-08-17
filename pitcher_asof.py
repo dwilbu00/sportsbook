@@ -148,6 +148,23 @@ def _now():
     return datetime.now(timezone.utc).timestamp()
 
 
+# Every inserted row MUST carry the SAME keys: a bulk executemany compiles the
+# INSERT from the first row's keys, so a later row missing e.g. 'era' raises
+# "A value is required for bind parameter 'era'". A row with only statcast (no
+# warehouse line) and a row with only a warehouse line (no BBE) otherwise differ.
+_FEATURE_KEYS = ("era", "ip", "avg_ip", "k9", "games", "xwobacon", "n_bbe",
+                 "whiff_pct", "csw_pct", "barrel_pct", "hard_hit_pct", "gb_pct",
+                 "n_pitches", "k_pct", "bb_pct", "n_bf")
+
+
+def _blank_row(entity_id, as_of_date, role, season, now):
+    """A full-keyed row (all feature columns None) so every insert is homogeneous."""
+    r = {k: None for k in _FEATURE_KEYS}
+    r.update({"entity_id": str(entity_id), "as_of_date": str(as_of_date)[:10],
+              "role": role, "season_bucket": season, "fetched_at": now})
+    return r
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # As-of computation (pure; unit-tested)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -247,11 +264,11 @@ def build_season(season, verbose=True):
             xwobacon, n_bbe = xw.asof(aid, date10)
             if wh is None and xwobacon is None:
                 continue   # nothing as-of -> no row (consumer would fall back anyway)
-            row = {"entity_id": str(aid), "as_of_date": date10, "role": "SP",
-                   "season_bucket": season, "xwobacon": xwobacon,
-                   "n_bbe": n_bbe or None, "fetched_at": now}
+            row = _blank_row(aid, date10, "SP", season, now)
+            row["xwobacon"] = xwobacon
+            row["n_bbe"] = n_bbe or None
             if wh:
-                row.update(wh)
+                row.update(wh)          # era/ip/avg_ip/k9/games
             rows.append(row)
 
     engine = db_store.get_engine()
@@ -324,9 +341,9 @@ def _compute_asof_row(entity_id, as_of_date, role):
     xwobacon, n_bbe = _asof_xwobacon_sql(entity_id, d10, season_start)
     if wh is None and xwobacon is None:
         return None
-    row = {"entity_id": str(entity_id), "as_of_date": d10, "role": "SP",
-           "season_bucket": int(d10[:4]), "xwobacon": xwobacon,
-           "n_bbe": n_bbe or None, "fetched_at": _now()}
+    row = _blank_row(entity_id, d10, "SP", int(d10[:4]), _now())
+    row["xwobacon"] = xwobacon
+    row["n_bbe"] = n_bbe or None
     if wh:
         row.update({"era": wh.get("era"), "ip": wh.get("ip"),
                     "avg_ip": wh.get("avg_ip"), "games": wh.get("games"),

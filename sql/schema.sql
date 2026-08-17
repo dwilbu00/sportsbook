@@ -635,6 +635,63 @@ CREATE TABLE dbo.statcast_day (
 );
 GO
 
+-------------------------------------------------------------- pitcher_asof_daily
+-- Durable per-(pitcher, game-date) as-of PITCHER feature store — the FULL per-DATE
+-- as-of curve statcast_player_asof (a single season-to-date snapshot) does NOT hold.
+-- One row per (entity_id, as_of_date, role); features are the cumulative line
+-- STRICTLY BEFORE as_of_date (leakage-safe). role='SP' -> entity_id = pitcher MLBAM
+-- id (one row per pitcher per game-date); role='RP' -> entity_id = team_id (team
+-- relief aggregate; follow-up). Unifies the expected-runs pitcher signal across the
+-- fitter / backtest / live onto ONE source (fit==serve==grade) and removes the
+-- per-run in-memory load of the ~3M-row statcast_pitch corpus. RAW features only —
+-- the fitted runs/9 ("xERA-lite") map is applied in code, so re-fitting never
+-- rebuilds this table. Populated by pitcher_asof.build_season (bulk backfill) +
+-- pitcher_asof.get_or_fill (lazy read-through; no cron). v1 columns are filled now;
+-- the k_pct/bb_pct/n_bf columns need the mlb_pitcher_game BB/BF/HR unlock (v2) and
+-- stay NULL until then. Mirrors pitcher_asof.py (SchemaParityTests enforces cols).
+IF OBJECT_ID('dbo.pitcher_asof_daily', 'U') IS NULL
+CREATE TABLE dbo.pitcher_asof_daily (
+    id             INT IDENTITY(1,1) PRIMARY KEY,
+    entity_id      NVARCHAR(32) NOT NULL,               -- MLBAM pitcher id (SP) | team_id (RP)
+    as_of_date     NVARCHAR(16) NOT NULL,               -- the game date; features are < this
+    role           NVARCHAR(4)  NOT NULL,               -- SP | RP
+    season_bucket  INT,                                 -- derived; indexed, not in key
+    -- warehouse mlb_pitcher_game as-of (v1)
+    era            FLOAT,                               -- earned runs / 9, as-of
+    ip             FLOAT,                               -- innings pitched, as-of (cumulative)
+    avg_ip         FLOAT,                               -- ip / games (starter workload)
+    k9             FLOAT,                               -- K / 9, as-of
+    games          INT,                                 -- games behind the line
+    -- statcast_pitch as-of contact quality (v1: xwobacon; rest nullable)
+    xwobacon       FLOAT,                               -- mean xwOBAcon allowed (per BBE)
+    n_bbe          INT,                                 -- batted balls behind xwobacon
+    whiff_pct      FLOAT,
+    csw_pct        FLOAT,
+    barrel_pct     FLOAT,
+    hard_hit_pct   FLOAT,
+    gb_pct         FLOAT,
+    n_pitches      INT,
+    -- needs the mlb_pitcher_game BB/BF/HR unlock (v2; NULL until then)
+    k_pct          FLOAT,
+    bb_pct         FLOAT,
+    n_bf           INT,
+    fetched_at     FLOAT,
+    CONSTRAINT uq_pitcher_asof_daily UNIQUE (entity_id, as_of_date, role)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_pitcher_asof_key'
+                 AND object_id = OBJECT_ID('dbo.pitcher_asof_daily'))
+CREATE INDEX ix_pitcher_asof_key
+    ON dbo.pitcher_asof_daily (entity_id, role, as_of_date);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_pitcher_asof_season'
+                 AND object_id = OBJECT_ID('dbo.pitcher_asof_daily'))
+CREATE INDEX ix_pitcher_asof_season
+    ON dbo.pitcher_asof_daily (season_bucket, role);
+GO
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Smart Fantasy Baseball ID cross-maps (data-integrity backbone). Two authoritative
 -- maps, refreshed from smartfantasybaseball.com, that finally LINK the id-spaces the

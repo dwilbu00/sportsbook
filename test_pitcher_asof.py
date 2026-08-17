@@ -66,9 +66,14 @@ class BuildAndReadSqliteTests(unittest.TestCase):
     def tearDown(self):
         db_store.configure_engine(None)
 
-    def test_build_then_read(self):
-        pit_idx = {"1": [("2024-04-01", 18, 2.0, 6.0),
-                         ("2024-04-07", 15, 4.0, 5.0)]}
+    def test_build_then_read_mixed_key_rows(self):
+        # HETEROGENEOUS rows in one bulk insert (the executemany bug): warehouse
+        # games start 04-05, but statcast BBE exist 04-01/04-03 (before the first
+        # warehouse game). So the 04-05 row has xwOBAcon but NO warehouse line, while
+        # the 04-11 row has BOTH. Every row must be full-keyed or the bulk insert
+        # raises "A value is required for bind parameter 'era'".
+        pit_idx = {"1": [("2024-04-05", 18, 2.0, 6.0),
+                         ("2024-04-11", 15, 4.0, 5.0)]}
         savant_rows = [
             {"pitcher": "1", "game_date": "2024-04-01", "xwoba": 0.35},
             {"pitcher": "1", "game_date": "2024-04-03", "xwoba": 0.30},
@@ -76,18 +81,18 @@ class BuildAndReadSqliteTests(unittest.TestCase):
         with patch("mlb_warehouse._pitcher_game_index", return_value=pit_idx), \
              patch("savant_history.load_days", return_value=savant_rows):
             n = pa.build_season(2024, verbose=False)
-        # 04-01 has no as-of warehouse line AND no BBE before it -> skipped;
-        # only the 04-07 row is written.
-        self.assertEqual(n, 1)
+        self.assertEqual(n, 2)                             # both rows written
 
-        row = pa.asof_pitcher_features("1", "2024-04-07")
-        self.assertIsNotNone(row)
-        self.assertAlmostEqual(row["era"], 3.0)
-        self.assertEqual(row["games"], 1)
-        self.assertAlmostEqual(row["xwobacon"], 0.325)   # mean(0.35, 0.30)
-        self.assertEqual(row["n_bbe"], 2)
-        self.assertEqual(row["role"], "SP")
-        # A date with no row reads back None (fail-open).
+        r5 = pa.asof_pitcher_features("1", "2024-04-05")   # xwOBAcon only, no wh line
+        self.assertIsNone(r5["era"])
+        self.assertIsNone(r5["games"])
+        self.assertAlmostEqual(r5["xwobacon"], 0.325)      # mean(0.35, 0.30)
+        r11 = pa.asof_pitcher_features("1", "2024-04-11")   # both
+        self.assertAlmostEqual(r11["era"], 3.0)            # from the 04-05 game
+        self.assertEqual(r11["games"], 1)
+        self.assertAlmostEqual(r11["xwobacon"], 0.325)
+        self.assertEqual(r11["role"], "SP")
+        # A date with nothing as-of (04-05's own first game, no prior) reads None.
         self.assertIsNone(pa.asof_pitcher_features("1", "2024-04-01"))
 
     def test_rebuild_is_idempotent(self):
@@ -103,6 +108,14 @@ class BuildAndReadSqliteTests(unittest.TestCase):
             total = c.execute(select(func.count()).select_from(
                 pa.pitcher_asof_daily)).scalar()
         self.assertEqual(total, n1)
+
+
+class SchemaParityTests(unittest.TestCase):
+    def test_cols_spec_matches_table(self):
+        # _COLS (the drift SPEC) must equal the Table's columns in order — mirrors
+        # statcast_asof/db_store SchemaParity; guards sql/schema.sql from drifting.
+        self.assertEqual(list(pa._COLS),
+                         [c.name for c in pa.pitcher_asof_daily.columns])
 
 
 class GetOrFillSqliteTests(unittest.TestCase):
