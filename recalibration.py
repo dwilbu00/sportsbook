@@ -2143,6 +2143,50 @@ def _count_resolved_since(sport_key, since_ts):
     return n
 
 
+_last_statcast_derived_build = 0.0     # module gate for the heavier daily rebuild
+
+
+def _statcast_maintenance(recent_days=4, ensure_cap=12, derived_interval_h=20):
+    """Bounded, CRON-FREE statcast freshness for the app's hourly loop (owner has no
+    scheduler). Two steps, both MLB Savant-network + fail-open so neither blocks
+    maintenance:
+
+      (1) EVERY call: ensure the recent raw statcast_pitch days are ingested (cheap +
+          idempotent via the day manifest — only genuinely-missing recent days are
+          fetched, capped). This keeps the raw corpus current so pitcher_asof
+          .get_or_fill computes FRESH as-of pitcher rows on demand (pitcher_asof
+          needs no rebuild — it self-fills lazily on read).
+      (2) DAILY-gated: rebuild the derived per-batter statcast_asof snapshot the LIVE
+          prop path reads (get_batter_xba) — heavier (season aggregate), so at most
+          every derived_interval_h hours per process.
+
+    Historical seasons are a one-time offline prime (savant_history --ensure +
+    statcast_asof --build + pitcher_asof --build); this only keeps the CURRENT season
+    live-fresh."""
+    try:
+        import savant_history as sh
+    except Exception:
+        return
+    if not sh.enabled():
+        return
+    import datetime as _dt
+    today = _dt.date.today()
+    lo = (today - _dt.timedelta(days=recent_days)).isoformat()
+    try:
+        sh.ensure_days(lo, today.isoformat(), cap=ensure_cap, verbose=False)
+    except Exception:                   # network / vendor hiccup — never block
+        pass
+    global _last_statcast_derived_build
+    now = time.time()
+    if now - _last_statcast_derived_build >= derived_interval_h * 3600:
+        _last_statcast_derived_build = now
+        try:
+            import statcast_asof
+            statcast_asof.build(today.year, fetch=False, verbose=False)
+        except Exception:
+            pass
+
+
 def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
     """Resolve pending rows and refit only when the existing gates allow it.
 
@@ -2159,6 +2203,13 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
         try:
             import mlb_warehouse
             mlb_warehouse.ingest_maintenance()
+        except Exception:               # pragma: no cover - never block maintenance
+            pass
+        # Cron-free statcast freshness: keep the raw Savant corpus + derived
+        # snapshots current so pitcher_asof (via get_or_fill) and live batter-prop
+        # xBA don't go stale. Bounded + fail-open (see _statcast_maintenance).
+        try:
+            _statcast_maintenance()
         except Exception:               # pragma: no cover - never block maintenance
             pass
     newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
