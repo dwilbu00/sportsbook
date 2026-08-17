@@ -200,49 +200,107 @@ def _warehouse_asof_curve(games):
     return out
 
 
-class _XwobaconAsOf:
-    """Per-pitcher prefix-sum of xwOBAcon over batted balls, for O(log n) as-of
-    means (strictly game_date < as_of). Built once from statcast_pitch rows."""
+# Count keys accumulated per pitcher (numerators/denominators for the rates).
+_COUNT_KEYS = ("pitches", "swings", "whiff", "called", "bip", "hardhit",
+               "barrel", "ground", "xwoba_sum", "n_xwoba")
+
+
+def _rates_from_counts(c):
+    """As-of statcast feature values from a counts dict (None where a denominator is
+    0). Rate definitions mirror savant_history._finalize_rates so pitcher_asof,
+    asof_rates, and statcast_asof agree. Raw (unshrunk) + the denominators (n_bbe/
+    n_pitches) so a consumer can threshold/shrink."""
+    def _r(num, den):
+        return (num / den) if den else None
+    return {
+        "xwobacon": (c["xwoba_sum"] / c["n_xwoba"]) if c["n_xwoba"] else None,
+        "n_bbe": int(c["n_xwoba"]) or None,
+        "whiff_pct": _r(c["whiff"], c["swings"]),
+        "csw_pct": _r(c["called"] + c["whiff"], c["pitches"]),
+        "barrel_pct": _r(c["barrel"], c["bip"]),
+        "hard_hit_pct": _r(c["hardhit"], c["bip"]),
+        "gb_pct": _r(c["ground"], c["bip"]),
+        "n_pitches": int(c["pitches"]) or None,
+    }
+
+
+class _StatcastAsOf:
+    """Per-pitcher as-of statcast features. Collapses pitches to DAILY counts, then
+    prefix-sums over distinct dates for O(log n) as-of lookups (strictly
+    game_date < as_of). Reuses savant_history's rate predicates so the values match
+    asof_rates / statcast_asof. Built once from statcast_pitch rows (the bulk path;
+    the on-demand path uses _asof_statcast_sql)."""
 
     def __init__(self, rows):
-        # pid -> (sorted dates, prefix_sum_of_xwoba, count) parallel arrays.
-        acc = {}
-        for r in rows:
-            x = r.get("xwoba")
-            pid, d = r.get("pitcher"), r.get("game_date")
-            if x is None or not pid or not d:
+        import savant_history as sh
+        daily = {}                       # pid -> {date -> counts}
+        for row in rows:
+            pid, d = row.get("pitcher"), row.get("game_date")
+            if not pid or not d:
                 continue
-            acc.setdefault(str(pid), []).append((d, x))
-        self._idx = {}
-        for pid, pairs in acc.items():
-            pairs.sort(key=lambda p: p[0])
-            dates = [p[0] for p in pairs]
-            psum, s = [], 0.0
-            for _, x in pairs:
-                s += x
-                psum.append(s)
-            self._idx[pid] = (dates, psum)
+            c = daily.setdefault(str(pid), {}).setdefault(
+                d, dict.fromkeys(_COUNT_KEYS, 0.0))
+            c["pitches"] += 1
+            desc = row.get("description")
+            if desc in sh._SWING_DESCRIPTIONS:
+                c["swings"] += 1
+            if desc in sh._WHIFF_DESCRIPTIONS:
+                c["whiff"] += 1
+            if desc == "called_strike":
+                c["called"] += 1
+            if row.get("type") == "X":                       # batted ball
+                c["bip"] += 1
+                ls = row.get("launch_speed")
+                if ls is not None and ls >= sh.HARD_HIT_MPH:
+                    c["hardhit"] += 1
+                if row.get("launch_speed_angle") == sh.BARREL_LSA:
+                    c["barrel"] += 1
+                if row.get("bb_type") == "ground_ball":
+                    c["ground"] += 1
+            x = row.get("xwoba")
+            if x is not None:
+                c["xwoba_sum"] += x
+                c["n_xwoba"] += 1
+        self._idx = {}                   # pid -> (sorted dates, cumulative-inclusive prefix)
+        for pid, bydate in daily.items():
+            dates = sorted(bydate)
+            pref, run = [], dict.fromkeys(_COUNT_KEYS, 0.0)
+            for d in dates:
+                for k in _COUNT_KEYS:
+                    run[k] += bydate[d][k]
+                pref.append(dict(run))
+            self._idx[pid] = (dates, pref)
 
     def asof(self, pid, as_of):
-        """(mean_xwobacon, n_bbe) over BBE strictly before as_of, or (None, n)."""
+        """Feature dict over pitches strictly before as_of, or None (no prior day)."""
         entry = self._idx.get(str(pid))
         if not entry:
-            return None, 0
-        dates, psum = entry
-        i = bisect.bisect_left(dates, as_of)   # count of dates strictly < as_of
+            return None
+        dates, pref = entry
+        i = bisect.bisect_left(dates, as_of)   # dates strictly < as_of
         if i <= 0:
-            return None, 0
-        return psum[i - 1] / i, i
+            return None
+        return _rates_from_counts(pref[i - 1])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Build (offline) + read
 # ──────────────────────────────────────────────────────────────────────────────
 
+_STAT_COLS = ("xwobacon", "n_bbe", "whiff_pct", "csw_pct", "barrel_pct",
+              "hard_hit_pct", "gb_pct", "n_pitches")
+
+
 def build_season(season, verbose=True):
-    """Materialize role='SP' as-of rows for every (pitcher, game-date) in `season`.
-    Replace-writes the season's SP rows (idempotent rebuild). Returns n rows written.
-    Reads mlb_warehouse (warehouse as-of line) + savant_history (xwOBAcon). SQL-only."""
+    """Materialize role='SP' as-of rows for every (pitcher, game-date) in `season`
+    (warehouse line + statcast contact/discipline rates). Replace-writes the season
+    (idempotent). Returns n rows written. SQL-only.
+
+    NOTE: the role='RP' team-bullpen aggregate is DEFERRED to the schema unlock that
+    adds games_started (GS) to mlb_pitcher_game — relief must be classified GS==0,
+    not by an IP threshold (a short start would be miscounted as relief, a long
+    reliever missed). Until then the additive model's bullpen term uses a league
+    -average fallback."""
     if not enabled():
         raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
     import mlb_warehouse
@@ -254,21 +312,22 @@ def build_season(season, verbose=True):
         if verbose:
             print(f"  [build] no mlb_pitcher_game rows for {season}; nothing to build.")
         return 0
-    xw = _XwobaconAsOf(sh.load_days(f"{season}-01-01", f"{season}-12-31"))
+    sc = _StatcastAsOf(sh.load_days(f"{season}-01-01", f"{season}-12-31"))
 
     now = _now()
     rows = []
     for aid, games in pit_idx.items():
         curve = _warehouse_asof_curve(games)
         for date10, wh in curve.items():
-            xwobacon, n_bbe = xw.asof(aid, date10)
-            if wh is None and xwobacon is None:
+            st = sc.asof(aid, date10)         # feature dict or None
+            if wh is None and st is None:
                 continue   # nothing as-of -> no row (consumer would fall back anyway)
             row = _blank_row(aid, date10, "SP", season, now)
-            row["xwobacon"] = xwobacon
-            row["n_bbe"] = n_bbe or None
+            if st:
+                for k in _STAT_COLS:
+                    row[k] = st.get(k)
             if wh:
-                row.update(wh)          # era/ip/avg_ip/k9/games
+                row.update(wh)                # era/ip/avg_ip/k9/games
             rows.append(row)
 
     engine = db_store.get_engine()

@@ -33,28 +33,29 @@ class WarehouseAsofCurveTests(unittest.TestCase):
         self.assertAlmostEqual(curve["2024-04-07"]["ip"], 6.0)
 
 
-class XwobaconAsOfTests(unittest.TestCase):
+class StatcastAsOfTests(unittest.TestCase):
     def setUp(self):
         self.rows = [
-            {"pitcher": "1", "game_date": "2024-04-01", "xwoba": 0.300},
-            {"pitcher": "1", "game_date": "2024-04-05", "xwoba": 0.400},
-            {"pitcher": "1", "game_date": "2024-04-10", "xwoba": 0.200},
-            {"pitcher": "2", "game_date": "2024-04-01", "xwoba": 0.500},
-            {"pitcher": "1", "game_date": "2024-04-05", "xwoba": None},   # ignored
+            {"pitcher": "1", "game_date": "2024-04-01", "xwoba": 0.300, "type": "X"},
+            {"pitcher": "1", "game_date": "2024-04-05", "xwoba": 0.400, "type": "X"},
+            {"pitcher": "1", "game_date": "2024-04-10", "xwoba": 0.200, "type": "X"},
+            {"pitcher": "2", "game_date": "2024-04-01", "xwoba": 0.500, "type": "X"},
+            {"pitcher": "1", "game_date": "2024-04-05", "xwoba": None,   # not a BBE
+             "type": "S", "description": "swinging_strike"},
         ]
-        self.xw = pa._XwobaconAsOf(self.rows)
+        self.sc = pa._StatcastAsOf(self.rows)
 
     def test_strict_before(self):
-        self.assertEqual(self.xw.asof("1", "2024-04-01"), (None, 0))
-        m, n = self.xw.asof("1", "2024-04-05")     # only 04-01 BBE
-        self.assertAlmostEqual(m, 0.300); self.assertEqual(n, 1)
-        m, n = self.xw.asof("1", "2024-04-10")     # 04-01 + 04-05
-        self.assertAlmostEqual(m, 0.350); self.assertEqual(n, 2)
-        m, n = self.xw.asof("1", "2024-04-11")     # all three
-        self.assertAlmostEqual(m, 0.300); self.assertEqual(n, 3)
+        self.assertIsNone(self.sc.asof("1", "2024-04-01"))
+        r = self.sc.asof("1", "2024-04-05")        # only 04-01 BBE
+        self.assertAlmostEqual(r["xwobacon"], 0.300); self.assertEqual(r["n_bbe"], 1)
+        r = self.sc.asof("1", "2024-04-10")        # 04-01 + 04-05 BBE
+        self.assertAlmostEqual(r["xwobacon"], 0.350); self.assertEqual(r["n_bbe"], 2)
+        r = self.sc.asof("1", "2024-04-11")        # all three BBE
+        self.assertAlmostEqual(r["xwobacon"], 0.300); self.assertEqual(r["n_bbe"], 3)
 
     def test_unknown_pitcher(self):
-        self.assertEqual(self.xw.asof("999", "2024-04-05"), (None, 0))
+        self.assertIsNone(self.sc.asof("999", "2024-04-05"))
 
 
 class BuildAndReadSqliteTests(unittest.TestCase):
@@ -66,33 +67,43 @@ class BuildAndReadSqliteTests(unittest.TestCase):
     def tearDown(self):
         db_store.configure_engine(None)
 
-    def test_build_then_read_mixed_key_rows(self):
+    def test_build_then_read_mixed_key_rows_with_rates(self):
         # HETEROGENEOUS rows in one bulk insert (the executemany bug): warehouse
-        # games start 04-05, but statcast BBE exist 04-01/04-03 (before the first
-        # warehouse game). So the 04-05 row has xwOBAcon but NO warehouse line, while
-        # the 04-11 row has BOTH. Every row must be full-keyed or the bulk insert
-        # raises "A value is required for bind parameter 'era'".
+        # games start 04-05, but statcast pitches exist 04-01..03 (before the first
+        # warehouse game). So the 04-05 row has statcast but NO warehouse line, the
+        # 04-11 row has BOTH. Every row must be full-keyed. Also verifies the
+        # statcast rate columns (whiff/barrel/gb/xwobacon) populate.
         pit_idx = {"1": [("2024-04-05", 18, 2.0, 6.0),
                          ("2024-04-11", 15, 4.0, 5.0)]}
-        savant_rows = [
-            {"pitcher": "1", "game_date": "2024-04-01", "xwoba": 0.35},
-            {"pitcher": "1", "game_date": "2024-04-03", "xwoba": 0.30},
+        savant_rows = [   # two BBE + one whiff, all before both warehouse dates
+            {"pitcher": "1", "game_date": "2024-04-01", "xwoba": 0.35,
+             "description": "hit_into_play", "type": "X", "launch_speed": 100.0,
+             "launch_speed_angle": 6, "bb_type": "fly_ball"},          # barrel + hard-hit
+            {"pitcher": "1", "game_date": "2024-04-02", "xwoba": 0.30,
+             "description": "hit_into_play", "type": "X", "launch_speed": 80.0,
+             "launch_speed_angle": 3, "bb_type": "ground_ball"},       # GB, soft
+            {"pitcher": "1", "game_date": "2024-04-03", "xwoba": None,
+             "description": "swinging_strike", "type": "S"},           # whiff
         ]
         with patch("mlb_warehouse._pitcher_game_index", return_value=pit_idx), \
              patch("savant_history.load_days", return_value=savant_rows):
             n = pa.build_season(2024, verbose=False)
-        self.assertEqual(n, 2)                             # both rows written
+        self.assertEqual(n, 2)                             # both SP rows written
 
-        r5 = pa.asof_pitcher_features("1", "2024-04-05")   # xwOBAcon only, no wh line
+        r5 = pa.asof_pitcher_features("1", "2024-04-05")   # statcast only, no wh line
         self.assertIsNone(r5["era"])
-        self.assertIsNone(r5["games"])
-        self.assertAlmostEqual(r5["xwobacon"], 0.325)      # mean(0.35, 0.30)
+        self.assertAlmostEqual(r5["xwobacon"], 0.325)      # mean(0.35, 0.30) over BBE
         r11 = pa.asof_pitcher_features("1", "2024-04-11")   # both
         self.assertAlmostEqual(r11["era"], 3.0)            # from the 04-05 game
         self.assertEqual(r11["games"], 1)
         self.assertAlmostEqual(r11["xwobacon"], 0.325)
+        self.assertEqual(r11["n_bbe"], 2)
+        self.assertEqual(r11["n_pitches"], 3)
+        self.assertAlmostEqual(r11["whiff_pct"], 1 / 3)    # 1 whiff / 3 swings
+        self.assertAlmostEqual(r11["barrel_pct"], 0.5)     # 1 barrel / 2 BBE
+        self.assertAlmostEqual(r11["hard_hit_pct"], 0.5)   # 1 hard-hit / 2 BBE
+        self.assertAlmostEqual(r11["gb_pct"], 0.5)         # 1 GB / 2 BBE
         self.assertEqual(r11["role"], "SP")
-        # A date with nothing as-of (04-05's own first game, no prior) reads None.
         self.assertIsNone(pa.asof_pitcher_features("1", "2024-04-01"))
 
     def test_rebuild_is_idempotent(self):
