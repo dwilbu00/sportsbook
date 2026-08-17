@@ -310,6 +310,18 @@ def _enrich_ids(sport, meta, lines):
                 mlb_starters.warm_player_index(int(str(_when)[:4]))
             except Exception:                          # never break odds capture
                 pass
+        # Tier A #2: resolve the DH-safe game_pk ONCE per snapshot for the team lines
+        # (every team line of a snapshot shares one game). Fails closed (None) on an
+        # ambiguous same-timestamp DH / unknown team / tz-naive commence, so team
+        # lines keep game_pk NULL and grade by name+date (today's behavior).
+        import mlb_warehouse
+        _hid = (mlb_warehouse.team_id_for_name_tolerant(meta.get("home"))
+                if meta.get("home") else None)
+        _aid = (mlb_warehouse.team_id_for_name_tolerant(meta.get("away"))
+                if meta.get("away") else None)
+        _team_gpk = (mlb_warehouse.find_game_pk_by_commence(
+            _hid, _aid, meta.get("commence_time"))
+            if _hid and _aid and meta.get("commence_time") else None)
         _ident = {}
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
@@ -332,6 +344,7 @@ def _enrich_ids(sport, meta, lines):
             else:
                 ln["team_code"] = player_id_map.team_code_for_name(
                     ln.get("selection"))
+                ln["game_pk"] = _team_gpk        # Tier A #2 (NULL when unresolved)
     except Exception:
         pass
     return meta, lines

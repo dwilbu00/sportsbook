@@ -197,5 +197,77 @@ class GradeWagerRoutingTests(unittest.TestCase):
             fastm.assert_not_called()          # NBA never enters the fast path
 
 
+class WagerEnrichStampTests(unittest.TestCase):
+    """wagers._enrich_ids stamps a DH-safe game_pk on MLB team wagers (Tier A #2)."""
+    def _row(self, **kw):
+        base = {"sport_key": "baseball_mlb", "bet_type": "moneyline",
+                "home_team": "NYY", "away_team": "BOS", "team": "NYY",
+                "commence_time": "2024-04-01T23:05:00Z"}
+        base.update(kw)
+        return base
+
+    def test_team_wager_gets_game_pk(self):
+        import wagers
+        with patch.object(mw, "team_id_for_name_tolerant", side_effect=["111", "222"]), \
+             patch.object(mw, "find_game_pk_by_commence", return_value=777) as f:
+            row = wagers._enrich_ids(self._row())
+        self.assertEqual(row.get("game_pk"), 777)
+        f.assert_called_once()
+
+    def test_ambiguous_dh_leaves_game_pk_none(self):
+        import wagers
+        with patch.object(mw, "team_id_for_name_tolerant", side_effect=["111", "222"]), \
+             patch.object(mw, "find_game_pk_by_commence", return_value=None):
+            self.assertIsNone(wagers._enrich_ids(self._row()).get("game_pk"))
+
+    def test_missing_commence_not_stamped(self):
+        import wagers
+        with patch.object(mw, "team_id_for_name_tolerant", side_effect=["111", "222"]), \
+             patch.object(mw, "find_game_pk_by_commence") as f:
+            self.assertIsNone(
+                wagers._enrich_ids(self._row(commence_time=None)).get("game_pk"))
+        f.assert_not_called()
+
+    def test_non_baseball_untouched(self):
+        import wagers
+        with patch.object(mw, "find_game_pk_by_commence") as f:
+            self.assertIsNone(
+                wagers._enrich_ids(self._row(sport_key="basketball_nba")).get("game_pk"))
+        f.assert_not_called()
+
+
+class WarehouseEnrichStampTests(unittest.TestCase):
+    """warehouse._enrich_ids stamps one shared game_pk on all team odds lines."""
+    def test_team_lines_share_one_game_pk(self):
+        import warehouse
+        meta = {"home": "NYY", "away": "BOS", "game_date": "2024-04-01",
+                "commence_time": "2024-04-01T23:05:00Z"}
+        lines = [{"bet_type": "moneyline", "selection": "NYY"},
+                 {"bet_type": "total", "selection": "Over"},
+                 {"bet_type": "player_prop", "player": "Aaron Judge",
+                  "prop_key": "batter_hits"}]
+        with patch.object(mw, "team_id_for_name_tolerant", side_effect=["111", "222"]), \
+             patch.object(mw, "find_game_pk_by_commence", return_value=777), \
+             patch("entity_resolver.resolve",
+                   return_value={"mlb_player_id": "5", "game_pk": 777}), \
+             patch("mlb_starters.warm_player_index"):
+            _meta, out = warehouse._enrich_ids("baseball_mlb", meta, lines)
+        self.assertEqual(out[0]["game_pk"], 777)     # moneyline (team branch)
+        self.assertEqual(out[1]["game_pk"], 777)     # total (team branch)
+        self.assertEqual(out[2]["game_pk"], 777)     # prop (entity_resolver branch)
+
+    def test_unresolved_team_leaves_lines_null(self):
+        import warehouse
+        meta = {"home": "NYY", "away": "BOS", "game_date": "2024-04-01",
+                "commence_time": "2024-04-01T23:05:00Z"}
+        lines = [{"bet_type": "spread", "selection": "NYY"}]
+        with patch.object(mw, "team_id_for_name_tolerant", return_value=None), \
+             patch.object(mw, "find_game_pk_by_commence") as f, \
+             patch("mlb_starters.warm_player_index"):
+            _meta, out = warehouse._enrich_ids("baseball_mlb", meta, lines)
+        self.assertIsNone(out[0].get("game_pk"))
+        f.assert_not_called()                        # both team ids None -> no resolve
+
+
 if __name__ == "__main__":
     unittest.main()

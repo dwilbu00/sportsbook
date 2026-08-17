@@ -139,6 +139,20 @@ def _enrich_ids(row):
                 prop_key=row.get("prop_key"))
             row["player_mlb_id"] = ident.get("mlb_player_id")
             row["game_pk"] = ident.get("game_pk")
+        elif row.get("bet_type") in ("moneyline", "spread", "total"):
+            # Tier A #2: stamp the DH-safe game_pk on a TEAM wager so grading can take
+            # the game_pk fast path. find_game_pk_by_commence fails CLOSED on an
+            # ambiguous same-timestamp DH (60s tie) / unknown team / tz-naive commence
+            # -> game_pk stays None -> grading uses name+date (today's behavior).
+            # MLB-gated by the startswith('baseball') guard above.
+            import mlb_warehouse
+            hid = (mlb_warehouse.team_id_for_name_tolerant(row.get("home_team"))
+                   if row.get("home_team") else None)
+            aid = (mlb_warehouse.team_id_for_name_tolerant(row.get("away_team"))
+                   if row.get("away_team") else None)
+            if hid and aid and row.get("commence_time"):
+                row["game_pk"] = mlb_warehouse.find_game_pk_by_commence(
+                    hid, aid, row.get("commence_time"))
     except Exception:                       # pragma: no cover - never break submit
         pass
     return row
