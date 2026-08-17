@@ -1023,6 +1023,38 @@ def get_game(game_pk):
         return None
 
 
+def final_game_by_pk(game_pk):
+    """Classify one warehouse game for game_pk-based team-market grading (Tier A #2).
+    Returns {'state','home_score','away_score','home_team_id','away_team_id',
+    'commence_time'} or None. ``state``:
+      'final'    — status=='Final', NOT terminal, and BOTH scores present. A legit
+                   0-0 grades (the check is ``is None``, not falsy).
+      'terminal' — postponed / suspended / cancelled (never a gradable score on this
+                   game_pk; the caller falls back so a next-day makeup still grades).
+      'live'     — anything else (scheduled / in progress / final-but-score-not-yet).
+    Reads get_game (a SNAKE_CASE row) directly — deliberately NOT via
+    mlb_starters._is_genuine_final, which reads camelCase status/detailedState and
+    would misclassify this snake_case row (e.g. a postponed game would pass as final).
+    Fail-open: no row / SQL off / bad id -> None (caller uses the name+date path)."""
+    g = get_game(game_pk)
+    if not g:
+        return None
+    import mlb_starters
+    detailed = str(g.get("detailed_state") or "").lower()
+    terminal = any(bad in detailed for bad in mlb_starters._NON_FINAL_DETAILED)
+    hs, as_ = g.get("home_score"), g.get("away_score")
+    if terminal:
+        state = "terminal"
+    elif g.get("status") == "Final" and hs is not None and as_ is not None:
+        state = "final"
+    else:
+        state = "live"
+    return {"state": state, "home_score": hs, "away_score": as_,
+            "home_team_id": g.get("home_team_id"),
+            "away_team_id": g.get("away_team_id"),
+            "commence_time": g.get("game_date")}
+
+
 def find_game_pk(official_date, home_team_id, away_team_id):
     """Retro-match a durable row to its game_pk on (date, home, away). Returns the
     single matching game_pk, or None if 0 or >1 (doubleheader → caller decides)."""

@@ -150,6 +150,85 @@ def grade_team_bet(bet_type, side, point, home_score, away_score):
     return "push"
 
 
+# Sentinel: the bet's game is POSITIVELY identified (by game_pk) but not yet final,
+# so the caller must stay pending WITHOUT falling back to the name+date path (which
+# could grade off a near-same-commence doubleheader sibling). Distinct from None
+# (uncertain → fall back) and from a (status, score) result.
+GRADE_PENDING = object()
+_GRADE_PK_STALE_HOURS = 6   # a still-'live' warehouse row this long past commence is
+                            # stale (ingest lag/miss) → stop waiting, fall back
+
+
+def _grade_pk_stale(commence_time, hours=_GRADE_PK_STALE_HOURS):
+    """True when ``commence_time`` (ISO ts) + ``hours`` is in the past. False when
+    commence is missing/unparseable/naive — a stamped game_pk's commence is normally
+    tz-aware & parseable (find_game_pk_by_commence required it), so the rare
+    unparseable case stays pending (mis-grade-safe) rather than falling back."""
+    if not commence_time:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        ts = datetime.fromisoformat(str(commence_time).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            return False
+        return datetime.now(timezone.utc) >= ts + timedelta(hours=hours)
+    except (ValueError, TypeError):
+        return False
+
+
+def grade_team_bet_by_game_pk(sport_key, game_pk, bet_type, side, team, point):
+    """DH-exact fast path (Tier A #2): grade a team bet off the warehouse game
+    identified by ``game_pk`` instead of the name+date slate. Returns:
+      (status, 'hs-as')  graded from the warehouse final score;
+      GRADE_PENDING      game positively identified but not yet final — stay pending
+                         (caller must NOT fall back to name+date);
+      None               anything uncertain → caller falls back to name+date
+                         (byte-identical to today).
+    MLB-only (hard sport gate). ML/spread orientation is derived from the bet team's
+    MLBAM id vs the warehouse game's home/away ids — never a stored 'side' label.
+    Every uncertainty (non-MLB, no pk, warehouse off, missing row, terminal game,
+    team unmappable, unknown bet_type, any exception) → None."""
+    if sport_key != "baseball_mlb" or not game_pk:
+        return None
+    try:
+        import mlb_warehouse
+        fg = mlb_warehouse.final_game_by_pk(game_pk)
+        if not fg:
+            return None
+        state = fg["state"]
+        if state == "terminal":
+            return None                    # postponed/suspended → name+date (makeup)
+        if state == "live":
+            # Positively-identified but not final → stay pending so a DH sibling's
+            # already-final score can't grade this game via name+date. Staleness
+            # guard so a lagging/missed ingest can't strand the bet forever: once
+            # commence + N hours has passed and the row STILL isn't final, fall back
+            # to the (fresh-StatsAPI) name+date path. Safe: a stamped pk is always
+            # commence-disambiguable, so name+date can't cross-grade a simultaneous
+            # DH sibling.
+            if _grade_pk_stale(fg.get("commence_time")):
+                return None
+            return GRADE_PENDING
+        # state == 'final'
+        if (bet_type or "").lower() == "total":
+            graded_side = side             # over/under is orientation-invariant
+        else:
+            tid = mlb_warehouse.team_id_for_name_tolerant(team)
+            if tid is not None and str(tid) == str(fg.get("home_team_id")):
+                graded_side = "home"
+            elif tid is not None and str(tid) == str(fg.get("away_team_id")):
+                graded_side = "away"
+            else:
+                return None                # can't confirm orientation → fall back
+        status = grade_team_bet(bet_type, graded_side, point,
+                                fg["home_score"], fg["away_score"])
+        if status is None:
+            return None
+        return (status, f"{fg['home_score']:g}-{fg['away_score']:g}")
+    except Exception:
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-date final-score fetch
 # ──────────────────────────────────────────────────────────────────────────────
