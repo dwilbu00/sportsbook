@@ -4498,6 +4498,64 @@ def _ab_gate_tally(obs, a, b, ev_floor, edge_floor, legacy_threshold):
             "roi": (pnl / n) if n else None, "hit": (won / n) if n else None}
 
 
+def _ab_returns(obs, a, b, ev_floor, edge_floor, legacy_threshold):
+    """Per-bet profit-per-unit list under an (A,B) blend + gate — feeds the
+    overfit-brake deflated_roi (which needs the raw return series, not aggregates)."""
+    out = []
+    for rec, pyt, mkt, outcome, price_yes, price_no in obs:
+        if mkt is None or rec is None:
+            continue
+        q = pyt if pyt is not None else 0.5
+        p = max(0.0, min(1.0, 0.5 + a * (rec - 0.5) + b * (q - 0.5)))
+        if p >= mkt:
+            side_prob, price, edge, win = p, price_yes, p - mkt, (outcome == 1)
+        else:
+            side_prob, price, edge, win = 1.0 - p, price_no, mkt - p, (outcome == 0)
+        if price is None:
+            continue
+        dec = american_to_decimal(price)
+        er = side_prob * dec - 1.0
+        ok = ((er >= ev_floor and edge >= edge_floor) if ev_floor is not None
+              else (edge >= legacy_threshold and er > 0))
+        if ok:
+            out.append((dec - 1.0) if win else -1.0)
+    return out
+
+
+def _pbo_over_ab_grid(obs, a_weights, b_weights, gate, n_blocks=10):
+    """Build the CSCV perf matrix (chronological block x A*B config, cell = block
+    P/L) over the A x B grid at one gate, and return overfit_stats.pbo_cscv(...).
+
+    ``obs`` is appended in date order by the backtest, so contiguous index-slices
+    are chronological blocks — no date field needed. Returns None if too thin."""
+    import overfit_stats
+    _, evf, edf, leg = gate
+    n = len(obs)
+    if n < n_blocks * 4:
+        return None
+    size = n // n_blocks
+    blocks = [obs[i * size:(i + 1) * size] for i in range(n_blocks - 1)]
+    blocks.append(obs[(n_blocks - 1) * size:])   # remainder into the last block
+    cells = [(a, b) for a in a_weights for b in b_weights]
+    matrix = [[_ab_gate_tally(blk, a, b, evf, edf, leg)["pnl"] for (a, b) in cells]
+              for blk in blocks]
+    return overfit_stats.pbo_cscv(matrix)
+
+
+def _append_experiment(record):
+    """Append-only experiment registry (mining idea #2): one JSON line per selection
+    run so every sweep/OOS decision is auditable. Best-effort; never raises."""
+    try:
+        import json
+        from datetime import datetime, timezone
+        record = dict(record)
+        record["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with open("experiment_registry.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
 def ab_sweep(sport_key, espn_sport, espn_league, season_year=None, limit=100000,
              store_label="", source="auto", a_weights=None, b_weights=None):
     """MONEYLINE independent recency-weight (A) x pythag-weight (B) ROI grid (NO WRITE).
@@ -4543,7 +4601,18 @@ def ab_sweep(sport_key, espn_sport, espn_league, season_year=None, limit=100000,
         if best:
             print(f"  -> best: A(recency)={best[1]:.2f} B(pythag)={best[2]:.2f} "
                   f"ROI={best[0] * 100:+.1f}% (n={best[3]})")
-    print("\n  (Diagnostic only — nothing written. MONEYLINE only.)")
+            # Overfit brake (idea #2): is this best-of-N in-sample cell more than
+            # search noise? deflated_prob << the ROI suggests => yes, it's noise.
+            import overfit_stats
+            _dfl = overfit_stats.deflated_roi(
+                _ab_returns(obs, best[1], best[2], evf, edf, leg), len(A_W) * len(B_W))
+            if _dfl:
+                print(f"     haircut (best of {len(A_W)*len(B_W)}): deflated P(edge "
+                      f"real)={_dfl['deflated_prob']*100:.0f}% "
+                      f"[{'CREDIBLE' if _dfl['credible'] else 'LIKELY NOISE'}] — "
+                      f"confirm with --oos-ab before trusting.")
+    print("\n  (Diagnostic only — nothing written. MONEYLINE only. In-sample: the")
+    print("   'best cell' is a best-of-many pick — see the haircut, then --oos-ab.)")
 
 
 def oos_ab(sport_key, espn_sport, espn_league, train_seasons, test_seasons,
@@ -4612,6 +4681,35 @@ def oos_ab(sport_key, espn_sport, espn_league, train_seasons, test_seasons,
         print(f"    overfit tax: test-OPTIMAL cell would be A={test_ceil[1]:.2f} "
               f"B={test_ceil[2]:.2f} @ {test_ceil[0]*100:+.1f}% -- the gap vs our "
               f"{te_sel['roi']*100:+.1f}% is what in-sample tuning can't capture.")
+
+    # OVERFIT BRAKES (mining idea #2): was the TRAIN selection (best of N=|grid|
+    # cells) more than noise, and does the selection procedure itself overfit?
+    import overfit_stats
+    ncfg = len(A_W) * len(B_W)
+    dfl = overfit_stats.deflated_roi(
+        _ab_returns(train, A, B, SELECT[1], SELECT[2], SELECT[3]), ncfg)
+    pbo = _pbo_over_ab_grid(train, A_W, B_W, SELECT)
+    print(f"\n  OVERFIT BRAKES (train selection was best of {ncfg} A x B cells):")
+    if dfl:
+        print(f"    haircut: train t-stat {dfl['t_stat']:.2f} vs multiple-testing bar "
+              f"{dfl['noise_bar']:.2f} -> deflated P(edge real) "
+              f"{dfl['deflated_prob']*100:.0f}%  "
+              f"[{'CREDIBLE' if dfl['credible'] else 'LIKELY NOISE'}]")
+    if pbo:
+        print(f"    PBO (prob the A x B selection overfits, CSCV over "
+              f"{pbo['n_splits']} splits x {pbo['n_blocks']} blocks): "
+              f"{pbo['pbo']*100:.0f}%  [{'OK' if pbo['pbo'] < 0.5 else 'HIGH'}]")
+    print("    (Low deflated-prob / high PBO => the train pick is search noise; the "
+          "TEST column is the truth.)")
+    _append_experiment({
+        "tool": "oos_ab", "sport": sport_key,
+        "train_seasons": str(train_seasons), "test_seasons": str(test_seasons),
+        "select_gate": SELECT[0], "n_configs": ncfg,
+        "selected_A": A, "selected_B": B,
+        "train_roi": tr_sel["roi"], "test_roi": te_sel["roi"],
+        "deflated_prob": (dfl or {}).get("deflated_prob"),
+        "pbo": (pbo or {}).get("pbo"),
+    })
 
     print(f"\n  GATE LADDER at the FIXED train-selected (A={A:.2f}, B={B:.2f}) — does "
           "tightening help OOS?")
