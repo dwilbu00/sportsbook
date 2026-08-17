@@ -1113,7 +1113,7 @@ def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20)
     if not (home_team_id and away_team_id) or not enabled():
         return None
     ts = _parse_ts(commence)
-    if ts is None:
+    if ts is None or ts.tzinfo is None:      # tz-naive can't be compared → fail-closed
         return None
     day = ts.date()
     cand_dates = {(day + datetime.timedelta(days=d)).isoformat() for d in (-1, 0, 1)}
@@ -1131,8 +1131,12 @@ def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20)
     scored = []
     for pk, gd in rows:
         gts = _parse_ts(gd)
-        if gts is not None:
+        if gts is None or gts.tzinfo is None:
+            continue
+        try:
             scored.append((abs((gts - ts).total_seconds()), pk))
+        except (TypeError, ValueError):      # mixed awareness / bad ts → skip, never raise
+            continue
     if not scored:
         return None
     scored.sort()
@@ -2158,6 +2162,97 @@ def backfill_legacy_game_pk(dry_run=True, season=None):
     return summary
 
 
+def _resolve_team_game_pk(home_team, away_team, commence, game_date):
+    """DH-safe game_pk for a TEAM row from its team NAMES + commence/date, or None.
+    team_id_for_name_tolerant -> find_game_pk_by_commence (split-DH safe) -> a
+    find_game_pk(official_date) UNIQUE-ONLY fallback (returns None on any DH). Wrapped
+    so a bad timestamp can never abort the backfill (belt-and-suspenders over
+    find_game_pk_by_commence's own fail-closed tz guard)."""
+    try:
+        hid = team_id_for_name_tolerant(home_team) if home_team else None
+        aid = team_id_for_name_tolerant(away_team) if away_team else None
+        if not (hid and aid):
+            return None
+        gpk = find_game_pk_by_commence(hid, aid, commence) if commence else None
+        if gpk is None and game_date:
+            gpk = find_game_pk(str(game_date)[:10], hid, aid)   # unique-only, DH-safe
+        return gpk
+    except Exception:
+        return None
+
+
+def backfill_team_game_pk(dry_run=True, season=None):
+    """Tier A #2: retro-match game_pk onto legacy MLB TEAM-market rows (wagers +
+    odds_line) that predate #2 stamping. TEAM-ANCHOR (no player id): resolve the game
+    from the row's team NAMES + commence_time via find_game_pk_by_commence (split-DH
+    safe), with a find_game_pk(official_date) unique-only fallback. An ambiguous
+    same-timestamp DH / unknown team / tz-naive-or-missing commence -> left NULL
+    (additive; the row still grades by name+date). All odds lines of one snapshot
+    share the game, so the odds_line pass resolves ONCE per snapshot_id.
+
+    NON-DESTRUCTIVE + idempotent: only ever WRITES game_pk on a row whose game_pk IS
+    NULL (guarded in both the SELECT and the UPDATE .where), MLB team-markets only.
+    dry_run=True writes nothing and just reports coverage. Owner runs with --apply."""
+    summary = {"dry_run": dry_run, "skipped": not enabled()}
+    if not enabled():
+        return summary
+    eng = db_store.get_engine()
+    team_types = ("moneyline", "spread", "total")
+
+    # --- wagers pass (team-market money rows; player IS NULL) ---
+    w = db_store.wagers
+    wpred = ((w.c.sport_key == "baseball_mlb") & (w.c.game_pk.is_(None))
+             & (w.c.player.is_(None)) & (w.c.bet_type.in_(team_types)))
+    if season:
+        wpred = wpred & (w.c.game_date.like(f"{int(season)}%"))
+    with eng.connect() as conn:
+        wrows = conn.execute(
+            select(w.c.id, w.c.home_team, w.c.away_team, w.c.game_date,
+                   w.c.commence_time).where(wpred)).fetchall()
+    wmatched = [{"rid": rid, "gpk": int(gpk)}
+                for rid, home, away, gdate, commence in wrows
+                if (gpk := _resolve_team_game_pk(home, away, commence, gdate))
+                is not None]
+    if wmatched and not dry_run:
+        with _WRITE_LOCK:
+            with eng.begin() as conn:
+                conn.execute(
+                    update(w).where((w.c.id == bindparam("rid"))
+                                    & (w.c.game_pk.is_(None)))
+                    .values(game_pk=bindparam("gpk")), wmatched)
+    summary["wagers"] = {"candidates": len(wrows), "matched": len(wmatched)}
+
+    # --- odds_line pass (team-market lines; resolve ONCE per snapshot, fan out) ---
+    ol, os_ = db_store.odds_line, db_store.odds_snapshot
+    opred = ((os_.c.sport == "baseball_mlb") & (ol.c.game_pk.is_(None))
+             & (ol.c.bet_type.in_(team_types)))
+    if season:
+        opred = opred & (os_.c.game_date.like(f"{int(season)}%"))
+    with eng.connect() as conn:
+        orows = conn.execute(
+            select(ol.c.id, ol.c.snapshot_id, os_.c.home, os_.c.away,
+                   os_.c.game_date, os_.c.commence_time)
+            .select_from(ol.join(os_, ol.c.snapshot_id == os_.c.id))
+            .where(opred)).fetchall()
+    snap_gpk = {}          # snapshot_id -> resolved gpk (a snapshot's lines share it)
+    omatched = []
+    for rid, sid, home, away, gdate, commence in orows:
+        if sid not in snap_gpk:
+            snap_gpk[sid] = _resolve_team_game_pk(home, away, commence, gdate)
+        if snap_gpk[sid] is not None:
+            omatched.append({"rid": rid, "gpk": int(snap_gpk[sid])})
+    if omatched and not dry_run:
+        with _WRITE_LOCK:
+            with eng.begin() as conn:
+                for i in range(0, len(omatched), 500):     # chunk the large pass
+                    conn.execute(
+                        update(ol).where((ol.c.id == bindparam("rid"))
+                                         & (ol.c.game_pk.is_(None)))
+                        .values(game_pk=bindparam("gpk")), omatched[i:i + 500])
+    summary["odds_line"] = {"candidates": len(orows), "matched": len(omatched)}
+    return summary
+
+
 def purge_non_franchise_teams(dry_run=True):
     """Remove non-real 'teams' that leaked into mlb_team via the schedule — all-star
     squads + postseason bracket-seed placeholders (league_id AND division_id NULL;
@@ -2238,13 +2333,18 @@ def _main_cli():
     ap.add_argument("--backfill-game-pk", action="store_true",
                     help="P5: retro-match game_pk onto legacy MLB prediction_log + "
                          "wagers rows (player-anchor). DRY-RUN unless --apply.")
+    ap.add_argument("--backfill-team-game-pk", action="store_true",
+                    help="Tier A #2: retro-match game_pk onto legacy MLB TEAM-market "
+                         "rows (wagers + odds_line, team-anchor). DRY-RUN unless "
+                         "--apply.")
     ap.add_argument("--purge-non-franchise", action="store_true",
                     help="Cleanup: remove non-real teams (all-star squads + "
                          "postseason bracket placeholders) + their games/facts from "
                          "the dim. DRY-RUN unless --apply.")
     ap.add_argument("--apply", action="store_true",
-                    help="With --backfill-game-pk / --purge-non-franchise: WRITE the "
-                         "changes (default is a no-write dry-run preview).")
+                    help="With --backfill-game-pk / --backfill-team-game-pk / "
+                         "--purge-non-franchise: WRITE the changes (default is a "
+                         "no-write dry-run preview).")
     args = ap.parse_args()
 
     db_store.promote_secrets_from_toml()
@@ -2277,13 +2377,16 @@ def _main_cli():
     if args.backfill_game_pk:
         did = True
         print(_fmt(backfill_legacy_game_pk(dry_run=not args.apply)))
+    if args.backfill_team_game_pk:
+        did = True
+        print(_fmt(backfill_team_game_pk(dry_run=not args.apply)))
     if args.purge_non_franchise:
         did = True
         print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))
     if not did:
         ap.error("nothing to do — pass --ingest, --ingest-range, --standings, "
-                 "--handedness, --purge-boxscores, --backfill-game-pk, or "
-                 "--purge-non-franchise")
+                 "--handedness, --purge-boxscores, --backfill-game-pk, "
+                 "--backfill-team-game-pk, or --purge-non-franchise")
 
 
 if __name__ == "__main__":

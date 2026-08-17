@@ -8,6 +8,9 @@ grader by patching final_game_by_pk + team_id_for_name_tolerant.
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy import insert, select
+
+import db_store
 import game_results as gr
 import mlb_warehouse as mw
 
@@ -267,6 +270,137 @@ class WarehouseEnrichStampTests(unittest.TestCase):
             _meta, out = warehouse._enrich_ids("baseball_mlb", meta, lines)
         self.assertIsNone(out[0].get("game_pk"))
         f.assert_not_called()                        # both team ids None -> no resolve
+
+
+class BackfillTeamGamePkTests(unittest.TestCase):
+    """Team-anchor game_pk backfill (Tier A #2) over wagers + odds_line: DH-safe,
+    non-destructive (fill-NULL-only), idempotent, dry-run vs apply. team_id_for_name_
+    tolerant is patched (name->id is resolver-tested elsewhere); find_game_pk_by_commence
+    / find_game_pk run for real against seeded mlb_game so DH resolution is end-to-end."""
+    _NAMES = {"Yankees": "147", "Red Sox": "111"}
+
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        mw.create_all()
+        mw._TEAMS_ENSURED.clear()
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+        mw._TEAMS_ENSURED.clear()
+
+    def _game(self, pk, official_date, game_date, home="147", away="111"):
+        with db_store.get_engine().begin() as conn:
+            for tid in (home, away):
+                if not conn.execute(select(mw.mlb_team).where(
+                        mw.mlb_team.c.team_id == tid)).first():
+                    conn.execute(insert(mw.mlb_team), {"team_id": tid, "name": tid})
+            conn.execute(insert(mw.mlb_game), {
+                "game_pk": pk, "official_date": official_date, "game_date": game_date,
+                "season": 2026, "home_team_id": home, "away_team_id": away})
+
+    def _wager(self, wid, **kw):
+        row = {"wager_id": wid, "sport_key": "baseball_mlb", "bet_type": "moneyline",
+               "home_team": "Yankees", "away_team": "Red Sox", "team": "Yankees",
+               "player": None, "game_pk": None, "game_date": "2026-08-01",
+               "commence_time": "2026-08-01T18:00:00Z"}
+        row.update(kw)
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(db_store.wagers), row)
+
+    def _snapshot(self, event_id, commence, lines, game_date="2026-08-01"):
+        # Every line dict must carry the SAME keys (executemany compiles from the
+        # first row) — full-key with None defaults.
+        cols = ("bet_type", "selection", "point", "player", "prop_key")
+        with db_store.get_engine().begin() as conn:
+            sid = conn.execute(insert(db_store.odds_snapshot), {
+                "sport": "baseball_mlb", "game_date": game_date, "event_id": event_id,
+                "kind": "team", "snapshot_hour": event_id, "commence_time": commence,
+                "home": "Yankees", "away": "Red Sox"}).inserted_primary_key[0]
+            conn.execute(insert(db_store.odds_line),
+                         [{**{c: None for c in cols}, "snapshot_id": sid, **ln}
+                          for ln in lines])
+
+    def _wager_gpks(self):
+        with db_store.get_engine().connect() as conn:
+            return {r._mapping["wager_id"]: r._mapping["game_pk"]
+                    for r in conn.execute(select(db_store.wagers))}
+
+    def _oline_gpks(self):
+        with db_store.get_engine().connect() as conn:
+            return {r._mapping["bet_type"]: r._mapping["game_pk"]
+                    for r in conn.execute(select(db_store.odds_line))}
+
+    def _seed(self):
+        self._game(700, "2026-08-01", "2026-08-01T18:00:00Z")
+        self._game(800, "2026-08-02", "2026-08-02T17:00:00Z")
+        self._game(801, "2026-08-02", "2026-08-02T21:00:00Z")   # split DH
+        self._game(810, "2026-08-04", "2026-08-04T18:00:00Z")
+        self._game(811, "2026-08-04", "2026-08-04T18:00:00Z")   # same-timestamp DH
+        self._wager("w-single")                                 # -> 700
+        self._wager("w-dh", game_date="2026-08-02",
+                    commence_time="2026-08-02T20:55:00Z")       # -> 801 (nearest)
+        self._wager("w-tie", game_date="2026-08-04",
+                    commence_time="2026-08-04T18:00:00Z")       # -> None (DH tie)
+        self._wager("w-stamped", game_pk=999)                   # already set
+        self._wager("w-nba", sport_key="basketball_nba")        # non-MLB
+        self._wager("w-prop", player="Aaron Judge")             # player row (excluded)
+        self._snapshot("evt-1", "2026-08-01T18:00:00Z", [
+            {"bet_type": "moneyline", "selection": "Yankees"},
+            {"bet_type": "total", "selection": "Over", "point": 8.5},
+            {"bet_type": "player_prop", "player": "Aaron Judge",
+             "prop_key": "batter_hits"}])
+
+    def _run(self, dry_run):
+        with patch.object(mw, "team_id_for_name_tolerant",
+                          side_effect=lambda nm: self._NAMES.get(nm)):
+            return mw.backfill_team_game_pk(dry_run=dry_run)
+
+    def test_dry_run_reports_but_does_not_write(self):
+        self._seed()
+        s = self._run(dry_run=True)
+        self.assertEqual(s["wagers"]["candidates"], 3)          # single, dh, tie
+        self.assertEqual(s["wagers"]["matched"], 2)            # single + dh
+        self.assertEqual(s["odds_line"]["candidates"], 2)      # ml + total (not prop)
+        self.assertEqual(s["odds_line"]["matched"], 2)
+        self.assertIsNone(self._wager_gpks()["w-single"])      # nothing written
+        self.assertTrue(all(v is None for v in self._oline_gpks().values()))
+
+    def test_apply_fills_dh_safe_and_nondestructive(self):
+        self._seed()
+        self._run(dry_run=False)
+        w = self._wager_gpks()
+        self.assertEqual(w["w-single"], 700)
+        self.assertEqual(w["w-dh"], 801)                       # nearest commence
+        self.assertIsNone(w["w-tie"])                          # same-timestamp DH -> NULL
+        self.assertEqual(w["w-stamped"], 999)                  # not overwritten
+        self.assertIsNone(w["w-nba"])                          # non-MLB untouched
+        self.assertIsNone(w["w-prop"])                         # player row untouched
+        ol = self._oline_gpks()
+        self.assertEqual(ol["moneyline"], 700)
+        self.assertEqual(ol["total"], 700)
+        self.assertIsNone(ol["player_prop"])                  # prop line untouched
+
+    def test_idempotent(self):
+        self._seed()
+        self._run(dry_run=False)
+        again = self._run(dry_run=False)
+        self.assertEqual(again["wagers"]["matched"], 0)
+        self.assertEqual(again["odds_line"]["matched"], 0)
+
+    def test_naive_commence_unique_date_resolves_via_fallback(self):
+        self._game(700, "2026-08-01", "2026-08-01T18:00:00Z")
+        self._wager("w-naive", commence_time="2026-08-01T18:00:00")   # no Z (tz-naive)
+        self._run(dry_run=False)                               # must not raise
+        self.assertEqual(self._wager_gpks()["w-naive"], 700)  # find_game_pk fallback
+
+    def test_naive_commence_dh_left_null_no_crash(self):
+        self._game(810, "2026-08-04", "2026-08-04T17:00:00Z")
+        self._game(811, "2026-08-04", "2026-08-04T21:00:00Z")
+        self._wager("w-dhnaive", game_date="2026-08-04",
+                    commence_time="2026-08-04T20:55:00")       # no Z (tz-naive)
+        self._run(dry_run=False)                               # must not raise
+        self.assertIsNone(self._wager_gpks()["w-dhnaive"])    # DH + naive -> NULL
 
 
 if __name__ == "__main__":
