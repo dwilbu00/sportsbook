@@ -125,7 +125,14 @@ def main():
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g. 2025 = 2024-25 NBA). Default: current.")
     p.add_argument("--days", type=int, default=30,
-                   help="Number of most-recent distinct game-dates to backfill.")
+                   help="Number of most-recent distinct game-dates to backfill "
+                        "(ignored when --start/--end are given).")
+    p.add_argument("--start", default=None,
+                   help="Inclusive start date YYYY-MM-DD. With --end, backfills the "
+                        "FULL date RANGE (overrides --days) — e.g. reload just the "
+                        "SBR-era 2025 games with --start 2025-01-01 --end 2025-08-16.")
+    p.add_argument("--end", default=None,
+                   help="Inclusive end date YYYY-MM-DD (see --start).")
     p.add_argument("--markets", default="h2h,spreads,totals",
                    help="Comma-separated FEATURED markets (h2h,spreads,totals). "
                         "Use '' to skip featured and fetch props only.")
@@ -207,12 +214,18 @@ def main():
         return
 
     all_dates = sorted({(g.get("date") or "")[:10] for g in games if g.get("date")})
-    keep_dates = set(all_dates[-args.days:])
+    if args.start or args.end:
+        lo, hi = (args.start or "0000-00-00"), (args.end or "9999-99-99")
+        keep_dates = {d for d in all_dates if lo <= d <= hi}
+        span_desc = f"in range {lo}..{hi}"
+    else:
+        keep_dates = set(all_dates[-args.days:])
+        span_desc = "most-recent dates"
     sample = [g for g in games if (g.get("date") or "")[:10] in keep_dates]
     # Most-recent first so trimming to budget keeps the freshest data.
     sample.sort(key=lambda g: g.get("date") or "", reverse=True)
     print(f"  {len(games)} completed games; sampling {len(sample)} "
-          f"across {len(keep_dates)} most-recent dates.\n")
+          f"across {len(keep_dates)} dates ({span_desc}).\n")
 
     if args.label:
         print(f"  Store label: '{args.label}'  -> "
