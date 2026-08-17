@@ -137,9 +137,10 @@ class AsofSeasonRunsTests(unittest.TestCase):
 
     def test_cumulative_and_leakage(self):
         import backtest
-        rs_ra = backtest._asof_season_runs(
+        got = backtest._asof_season_runs(
             "Rockies", self._SCHED, self._TEAMS, "2025-04-10")   # strictly before
-        self.assertEqual(rs_ra, (12, 5))                          # (5+7, 3+2)
+        # (rs=5+7, ra=3+2, win_pct): both prior games are Rockies wins -> 1.0
+        self.assertEqual(got, (12, 5, 1.0))
 
     def test_none_when_no_prior_games(self):
         import backtest
@@ -207,6 +208,45 @@ class OosAbTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)                    # train + test re-grade
         self.assertTrue(all(c == 0.0 for c in calls))      # pythag forced to 0
         self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)   # restored
+
+
+class PythagResidualTests(unittest.TestCase):
+    """#29 pythag-residual contrarian signal: helper math + INERT-by-default."""
+
+    def test_residual_math(self):
+        import analysis
+        stats = {"season": {"runs_scored": 500, "runs_allowed": 450, "win_pct": 0.60}}
+        pw = ms.pythagorean_win_probability(500, 450)
+        self.assertAlmostEqual(analysis._pythag_residual(stats), 0.60 - pw)
+
+    def test_residual_none_when_missing(self):
+        import analysis
+        self.assertIsNone(analysis._pythag_residual({"season": {"win_pct": 0.6}}))
+        self.assertIsNone(analysis._pythag_residual(
+            {"season": {"runs_scored": 500, "runs_allowed": 450}}))
+        self.assertIsNone(analysis._pythag_residual({}))
+
+    def test_default_is_inert(self):
+        import analysis
+        # 0.0 is falsy -> the residual shift block never runs (byte-identical live)
+        self.assertEqual(analysis.DEFAULT_PYTHAG_RESIDUAL_WEIGHT, 0.0)
+
+    def test_asof_season_runs_returns_winpct(self):
+        import backtest
+        teams = {"Rox": {"id": "COL"}}
+        sched = {"COL": [
+            {"date": "2025-04-01", "home_team": "Rox", "away_team": "X",
+             "home_score": 5, "away_score": 3},   # home W
+            {"date": "2025-04-02", "home_team": "X", "away_team": "Rox",
+             "home_score": 2, "away_score": 7},   # away W
+            {"date": "2025-04-03", "home_team": "Rox", "away_team": "X",
+             "home_score": 1, "away_score": 4},   # home L
+            {"date": "2025-04-10", "home_team": "Rox", "away_team": "X",
+             "home_score": 9, "away_score": 0},   # after -> excluded
+        ]}
+        rs, ra, wp = backtest._asof_season_runs("Rox", sched, teams, "2025-04-10")
+        self.assertEqual((rs, ra), (13, 9))       # 5+7+1, 3+2+4
+        self.assertAlmostEqual(wp, 2 / 3)          # 2 wins of 3
 
 
 class SpreadDispersionTests(unittest.TestCase):

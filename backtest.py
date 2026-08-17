@@ -1021,13 +1021,13 @@ def _inflate_samples(samples, weights, k):
 
 
 def _asof_season_runs(team_name, schedules, espn_teams, before_date):
-    """As-of cumulative (runs_scored, runs_allowed) for a team over all its games
-    this season STRICTLY BEFORE ``before_date``, summed from the already-loaded
+    """As-of cumulative (runs_scored, runs_allowed, win_pct) for a team over all its
+    games this season STRICTLY BEFORE ``before_date``, summed from the already-loaded
     schedules (zero extra queries). Feeds the Pythagorean season block so the odds
-    backtest grades production's run-differential blend (DEFAULT_PYTHAG_WEIGHT),
-    which was otherwise inert in the harness (_live_stats carried no runs → pythag
-    skipped). Returns None when the team has no prior games (blend then safely
-    skips). MLB-only by construction — the caller gates on the warehouse path."""
+    backtest grades production's run-differential blend (DEFAULT_PYTHAG_WEIGHT) AND
+    the #29 residual (actual win% − pythag), both otherwise inert in the harness
+    (_live_stats carried no runs/record). Returns None when the team has no prior
+    games. MLB-only by construction — the caller gates on the warehouse path."""
     info = espn_teams.get(team_name)
     if not info:
         for name, i in espn_teams.items():
@@ -1036,29 +1036,40 @@ def _asof_season_runs(team_name, schedules, espn_teams, before_date):
                 break
     if not info:
         return None
-    rs = ra = 0
+    rs = ra = wins = games = 0
     for g in schedules.get(info["id"], []):
         if (g.get("date") or "") >= before_date:
             continue
+        hs, as_ = g.get("home_score"), g.get("away_score")
         if g.get("home_team") == team_name:
-            rs += g.get("home_score") or 0
-            ra += g.get("away_score") or 0
+            rs += hs or 0
+            ra += as_ or 0
+            games += 1
+            wins += 1 if (hs is not None and as_ is not None and hs > as_) else 0
         elif g.get("away_team") == team_name:
-            rs += g.get("away_score") or 0
-            ra += g.get("home_score") or 0
-    return (rs, ra) if (rs or ra) else None
+            rs += as_ or 0
+            ra += hs or 0
+            games += 1
+            wins += 1 if (hs is not None and as_ is not None and as_ > hs) else 0
+    if not games:
+        return None
+    return (rs, ra, wins / games)
 
 
 def _live_stats(prior_games, season_runs=None):
     """Minimal stats dict accepted by analyze_spreads_value / analyze_totals_value.
     Only 'recent_games' is used when a team has matching games (always true here);
     the 'recent'/'season' fallbacks are present to avoid KeyErrors. ``season_runs``
-    = (runs_scored, runs_allowed) as-of, populated for MLB so the Pythagorean blend
-    (analyze_moneyline_value) is actually graded — production feeds these from
-    /standings; the backtest sums them from the schedule."""
+    = (runs_scored, runs_allowed[, win_pct]) as-of, populated for MLB so the
+    Pythagorean blend + #29 residual (analyze_moneyline_value) are actually graded —
+    production feeds these from /standings; the backtest sums them from the
+    schedule."""
     season = {"win_pct": 0.0}
     if season_runs:
-        season["runs_scored"], season["runs_allowed"] = season_runs
+        season["runs_scored"] = season_runs[0]
+        season["runs_allowed"] = season_runs[1]
+        if len(season_runs) > 2:
+            season["win_pct"] = season_runs[2]
     return {
         "recent_games": prior_games,
         "recent": {"avg_scored": 0.0, "avg_allowed": 0.0, "win_pct": 0.0},
@@ -4826,6 +4837,71 @@ def spread_dispersion_sweep(sport_key, espn_sport, espn_league, season_year=None
     print("   calib slope toward 1 AND holds ROI, backtest-confirm then set live.)")
 
 
+def pythag_residual_sweep(sport_key, espn_sport, espn_league, season_year=None,
+                          limit=100000, store_label="", source="auto", weights=None):
+    """MONEYLINE Pythagorean-RESIDUAL contrarian-weight sweep (mining idea #29, NO
+    WRITE). Fades over-performers (actual win% > pythag win%). Re-grade per weight
+    (residual baked into the ML prob, on top of the live pythag 0.35), then report
+    per weight: calibration slope + Brier-skill-vs-market + ROI-at-gate at the LIVE
+    ML shrink. INERT until analysis.DEFAULT_PYTHAG_RESIDUAL_WEIGHT is set live —
+    judge here first. Unlike the shrink family, this is a directional inefficiency
+    bet, so watch ROI (not just calibration)."""
+    _warn_small_limit(limit)
+    import prob_metrics
+    import pricing_common
+    W = weights if weights else [0.0, 0.10, 0.20, 0.30, 0.50, 0.75, 1.0]
+    live_shrink = pricing_common._shrink_factor(sport_key, "moneyline")
+    GATES = [("edge>=5%", None, 0.0, 0.05), ("edge>=10%", None, 0.0, 0.10),
+             ("EV>=8%&edge>=2%", 0.08, 0.02, 0.0),
+             ("EV>=12%&edge>=3%", 0.12, 0.03, 0.0)]
+    saved = analysis.DEFAULT_PYTHAG_RESIDUAL_WEIGHT
+    results = {}
+    try:
+        for w in W:
+            analysis.DEFAULT_PYTHAG_RESIDUAL_WEIGHT = w
+            obs = {m: [] for m in MARKETS}
+            print(f"\n########## re-grade: pythag-residual w={w:.2f} ##########")
+            run_odds_backtest(
+                sport_key, espn_sport, espn_league, limit=limit, window=10,
+                variants={"live": VARIANT_PRESETS.get("all", {})},
+                season_year=season_year, threshold_pct=5.0,
+                write_calibration=False, store_label=store_label,
+                engine="live", prob_shrink=1.0, source=source,
+                supplement_log=False, collect_obs=obs)
+            results[w] = obs["moneyline"]
+    finally:
+        analysis.DEFAULT_PYTHAG_RESIDUAL_WEIGHT = saved
+
+    print("\n\n############ MONEYLINE pythag-residual sweep (mining #29) ############")
+    print(f"  Fade over-performers. ROI at the live ML shrink ({live_shrink:.2f}); "
+          "calibSlope<1=overconfident; BSS>0=beat close.")
+    print("  {:<6}{:>7}{:>11}{:>8}".format("w", "n", "calibSlope", "BSS")
+          + "".join("{:>16}".format(g[0]) for g in GATES))
+    for w in W:
+        obs = results[w]
+        rows = [(o[0], o[1], o[2]) for o in obs if o[1] is not None]
+        if len(rows) < 50:
+            print(f"  {w:<6.2f}(thin {len(rows)})")
+            continue
+        probs = [r[0] for r in rows]
+        refs = [r[1] for r in rows]
+        ys = [r[2] for r in rows]
+        cs = prob_metrics.calibration_slope(probs, ys)
+        bss = prob_metrics.brier_skill_score(probs, ys, refs)
+        cells = []
+        for _, evf, edf, leg in GATES:
+            t = _team_gate_tally(obs, live_shrink, evf, edf, leg)
+            cells.append(f"{t['roi']*100:+.1f}%({t['n']})" if t["roi"] is not None
+                         else "-")
+        print("  {:<6.2f}{:>7}{:>11}{:>8}".format(
+            w, len(rows),
+            f"{cs['slope']:.2f}" if cs else "-",
+            f"{bss*100:+.1f}%" if bss is not None else "-")
+            + "".join("{:>16}".format(c) for c in cells))
+    print("\n  (Diagnostic only — nothing written. MONEYLINE only. w=0 = today. A w>0")
+    print("   that LIFTS ROI at a gate is a real edge — confirm OOS via train/test.)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
     p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
@@ -4896,6 +4972,12 @@ def main():
                         "live. No write.")
     p.add_argument("--dispersions", default=None,
                    help="(--spread-dispersion-sweep) comma list, e.g. 0,0.05,0.1,0.2.")
+    p.add_argument("--pythag-residual-sweep", action="store_true",
+                   help="(odds mode) MONEYLINE Pythagorean-residual contrarian sweep "
+                        "(fade over-performers): re-grade per weight, report calib "
+                        "slope + BSS + ROI-at-gate. INERT until set live. No write.")
+    p.add_argument("--residual-weights", default=None,
+                   help="(--pythag-residual-sweep) comma list, e.g. 0,0.1,0.2,0.3,0.5.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -5112,6 +5194,13 @@ def main():
                                     season_year=odds_seasons, limit=args.limit,
                                     store_label=args.store_label, source=args.source,
                                     dispersions=_ds)
+        elif args.pythag_residual_sweep:
+            _rw = ([float(x) for x in args.residual_weights.split(",")]
+                   if args.residual_weights else None)
+            pythag_residual_sweep(sport_key, espn_sport, espn_league,
+                                  season_year=odds_seasons, limit=args.limit,
+                                  store_label=args.store_label, source=args.source,
+                                  weights=_rw)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,

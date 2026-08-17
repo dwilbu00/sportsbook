@@ -70,6 +70,16 @@ def _apply_starter_logit(p, edge, weight):
 # run on the validated expected_runs_challenger; totals stay on the current model.
 DEFAULT_PYTHAG_WEIGHT = 0.35
 
+# Pythagorean RESIDUAL contrarian signal (mining idea #29). DISTINCT from the
+# strength BLEND above: residual = actual season win% − Pythagorean win% is a LUCK
+# estimate — a team over-performing its run differential tends to regress, so we
+# FADE it (and boost a team its opponent is over-performing against). Unlike shrink
+# / the pythag blend (both mean-reversion toward a prior), this is a DIRECTIONAL bet
+# that the close over-weights recent W-L vs run differential — a market-inefficiency
+# lever, not shrinkage. Ships INERT (0.0); backtest via --pythag-residual-sweep
+# before any live set. See [[baseballpredictions-mining]], [[team-market-audit]].
+DEFAULT_PYTHAG_RESIDUAL_WEIGHT = 0.0
+
 # Lineup-offense margin shift: runs of margin per unit of the home-minus-away
 # lineup OPS edge (PA-shrunk, slot-PA-weighted, in OPS units, clamped +/-0.3).
 # STAYS 0.0 (inert) — the experiment is DONE and REFUTED. A 2024-2026 sweep
@@ -279,6 +289,19 @@ def lineup_runs_win_prob(home_team, away_team, date, season, matchup_features,
         return None
 
 
+def _pythag_residual(stats):
+    """#29: actual season win% − Pythagorean win% (a luck/regression signal). >0 =
+    team is over-performing its run differential (fade it). None when season runs
+    OR record are absent (ESPN path / early season) so the shift stays off."""
+    s = (stats or {}).get("season") or {}
+    pw = mlb_starters.pythagorean_win_probability(
+        s.get("runs_scored"), s.get("runs_allowed"))
+    aw = s.get("win_pct")
+    if pw is None or aw is None:
+        return None
+    return float(aw) - pw
+
+
 def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, threshold_pct=5.0, sport_key=None, matchup_features=None):
     """
     Compare moneyline implied probabilities against historical win rates.
@@ -320,6 +343,15 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
     if margin is not None:
         pred_margin, pred_std, _, _ = margin
         home_win = _norm_cdf(pred_margin / pred_std)
+        # #29 Pythagorean-residual contrarian shift (INERT at weight 0). Fade the
+        # over-performer: lower home when home is lucky (rh>0), raise home when the
+        # away side is lucky (ra>0). Coherent because away = 1 - home_win.
+        if DEFAULT_PYTHAG_RESIDUAL_WEIGHT:
+            rh = _pythag_residual(home_team_stats)
+            ra = _pythag_residual(away_team_stats)
+            if rh is not None and ra is not None:
+                home_win = max(0.01, min(0.99, home_win
+                               + DEFAULT_PYTHAG_RESIDUAL_WEIGHT * (ra - rh)))
         model_win_by_team[home_team] = home_win
         model_win_by_team[away_team] = 1.0 - home_win
 
