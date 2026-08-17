@@ -825,5 +825,49 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(by_type[0]["label"], "Player Prop — Batter Total Bases")
 
 
+class AttributionTests(unittest.TestCase):
+    """P&L attribution (mining idea #6): model-skill vs CLV decomposition in
+    _metrics + the one-line verdict."""
+
+    def test_implied_from_american(self):
+        self.assertAlmostEqual(wagers._implied(-110), 110 / 210, places=4)
+        self.assertAlmostEqual(wagers._implied(100), 0.5, places=4)
+        self.assertIsNone(wagers._implied(None))
+        self.assertIsNone(wagers._implied(0))
+
+    def test_metrics_decomposition(self):
+        group = [
+            {"status": "won", "stake": 1, "profit": 0.91, "model_prob": 0.60,
+             "close_price": -120, "clv_pct": 2.0},
+            {"status": "lost", "stake": 1, "profit": -1.0, "model_prob": 0.60,
+             "close_price": -110, "clv_pct": -1.0},
+            {"status": "won", "stake": 1, "profit": 0.95, "model_prob": 0.58,
+             "close_price": 100, "clv_pct": 0.5},
+        ]
+        m = wagers._metrics(group)
+        self.assertEqual(m["n_decided"], 3)
+        self.assertAlmostEqual(m["hit_rate"], 2 / 3, places=4)
+        self.assertAlmostEqual(m["avg_model_prob"], (0.60 + 0.60 + 0.58) / 3, places=4)
+        # close-implied avg of -120/-110/+100
+        exp_close = (120 / 220 + 110 / 210 + 0.5) / 3
+        self.assertAlmostEqual(m["avg_close_implied"], exp_close, places=4)
+        self.assertAlmostEqual(m["model_calib_gap"], m["avg_model_prob"] - 2 / 3, places=4)
+        self.assertAlmostEqual(m["skill_vs_close"], 2 / 3 - exp_close, places=4)
+        self.assertAlmostEqual(m["avg_clv_pct"], (2.0 - 1.0 + 0.5) / 3, places=4)
+
+    def test_verdict_flags_overconfident_losing_bucket(self):
+        # 20 decided, hit 40% but model said 60% -> overconfident; ROI negative
+        group = ([{"status": "won", "stake": 1, "profit": 0.91, "model_prob": 0.60,
+                   "close_price": -110, "clv_pct": 0.0}] * 8
+                 + [{"status": "lost", "stake": 1, "profit": -1.0, "model_prob": 0.60,
+                     "close_price": -110, "clv_pct": 0.0}] * 12)
+        v = wagers._attribution_verdict(wagers._metrics(group))
+        self.assertIn("OVERCONFIDENT", v)
+        self.assertIn("over-recommends", v)
+
+    def test_verdict_thin(self):
+        self.assertIn("thin", wagers._attribution_verdict({"n_decided": 5}))
+
+
 if __name__ == "__main__":
     unittest.main()

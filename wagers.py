@@ -683,6 +683,17 @@ def _num(value):
         return 0.0
 
 
+def _implied(price):
+    """American odds -> vigged implied probability (our side). None if unusable."""
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    return (-price) / (-price + 100.0) if price < 0 else 100.0 / (price + 100.0)
+
+
 def _metrics(group):
     # A VOID (scratch/DNP refund) is RESOLVED but ROI-neutral: the stake is
     # returned, so it carries no won/lost/push, no staked amount, and no realized
@@ -698,6 +709,20 @@ def _metrics(group):
     clvs = [_num(r.get("clv_pct")) for r in group if r.get("clv_pct") is not None]
     decided = won + lost
     resolved = len(graded) + voided
+    hit_rate = (won / decided) if decided else None
+    # P&L ATTRIBUTION (mining idea #6): decompose realized edge into MODEL SKILL vs
+    # LINE/TIMING value (CLV). We bet DK-only, so there is no cross-book line-
+    # shopping and no decision-vs-fill slippage (executed price IS the analyzed
+    # price) — the two live levers are (a) did our SIDE win more than the close
+    # priced it (skill vs the efficient close), and (b) did we bet a BETTER NUMBER
+    # than the close (CLV). Over won/lost (push excluded):
+    decided_rows = [r for r in graded if r.get("status") in ("won", "lost")]
+    mps = [_num(r.get("model_prob")) for r in decided_rows
+           if r.get("model_prob") is not None]
+    avg_model_prob = (sum(mps) / len(mps)) if mps else None
+    closes = [_implied(r.get("close_price")) for r in decided_rows]
+    closes = [c for c in closes if c is not None]
+    avg_close_implied = (sum(closes) / len(closes)) if closes else None
     return {
         "total": len(group),
         "resolved": resolved,
@@ -709,8 +734,20 @@ def _metrics(group):
         "lost": lost,
         "push": push,
         "void": voided,
-        "hit_rate": (won / decided) if decided else None,
+        "hit_rate": hit_rate,
         "avg_clv_pct": (sum(clvs) / len(clvs)) if clvs else None,
+        # attribution:
+        "avg_model_prob": avg_model_prob,
+        "avg_close_implied": avg_close_implied,
+        # model overconfidence on this bucket (model said this %, we hit this %):
+        "model_calib_gap": ((avg_model_prob - hit_rate)
+                            if (avg_model_prob is not None and hit_rate is not None)
+                            else None),
+        # did our side beat the CLOSE (skill/luck vs the efficient line):
+        "skill_vs_close": ((hit_rate - avg_close_implied)
+                           if (avg_close_implied is not None and hit_rate is not None)
+                           else None),
+        "n_decided": decided,
     }
 
 
@@ -763,3 +800,77 @@ def summarize_wagers(rows):
             by_type.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1])))
     ]
     return summary
+
+
+def _attribution_verdict(m):
+    """One-line diagnosis of WHERE a bucket's realized ROI comes from / leaks to
+    (mining idea #6): model overconfidence, bad numbers (CLV), or variance."""
+    n = m.get("n_decided") or 0
+    if n < 20:
+        return "thin (n<20) — not diagnosable"
+    roi, clv = m.get("roi"), m.get("avg_clv_pct")
+    gap, skill = m.get("model_calib_gap"), m.get("skill_vs_close")
+    tags = []
+    if clv is not None:
+        tags.append("CLV+" if clv > 0.5 else ("CLV-" if clv < -0.5 else "CLV~0"))
+    if gap is not None and gap > 0.05:
+        tags.append("model OVERCONFIDENT")
+    if skill is not None and skill > 0.01:
+        tags.append("beats close")
+    if roi is not None and roi < -0.005:
+        if clv is not None and clv < -0.5:
+            tags.append("=> bad NUMBERS (timing/price leak, not just model)")
+        elif gap is not None and gap > 0.05:
+            tags.append("=> model over-recommends here; shrink/tighten this bucket")
+        else:
+            tags.append("=> prices ok — likely variance/small-sample")
+    elif roi is not None and roi > 0.005:
+        tags.append("=> healthy")
+    return " ".join(tags) or "flat"
+
+
+def print_attribution(rows=None):
+    """Standalone P&L ATTRIBUTION report over SETTLED wagers, per market: realized
+    ROI split into model-skill (hit vs close-implied), model calibration gap
+    (model_prob vs hit), and CLV (executed vs close). Answers 'is a losing bucket a
+    MODEL problem or a PRICING/timing problem?' — the actionable read behind our
+    open neg-ROI findings. Read-only."""
+    if rows is None:
+        rows = read_wagers()
+    summary = summarize_wagers(rows)
+    print("\n=== P&L ATTRIBUTION (settled wagers, per market) ===")
+    print("  ROI = realized flat/stake-wtd; CLV% = executed-vs-close (>0 = beat the "
+          "close);")
+    print("  calib_gap = model_prob − hit (>0 = overconfident); skill = hit − "
+          "close_implied.")
+    print("  {:<26}{:>6}{:>8}{:>8}{:>9}{:>9}{:>8}".format(
+        "market", "n", "ROI%", "hit%", "calibGap", "CLV%", "skill%"))
+    groups = sorted(summary.get("by_bet_type", []),
+                    key=lambda g: -(g.get("n_decided") or 0))
+    for g in groups:
+        n = g.get("n_decided") or 0
+        if n == 0:
+            continue
+
+        def _p(v, scale=100.0, dec=1):
+            return f"{v*scale:+.{dec}f}" if v is not None else "-"
+        print("  {:<26}{:>6}{:>8}{:>8}{:>9}{:>9}{:>8}".format(
+            (g.get("label") or g.get("bet_type") or "?")[:26], n,
+            _p(g.get("roi")), _p(g.get("hit_rate")),
+            _p(g.get("model_calib_gap")),
+            (f"{g.get('avg_clv_pct'):+.1f}" if g.get("avg_clv_pct") is not None
+             else "-"),
+            _p(g.get("skill_vs_close"))))
+        print(f"      -> {_attribution_verdict(g)}")
+    print("\n  (Read-only. DK-only, so no cross-book line-shopping / decision-vs-fill")
+    print("   slippage component; the two live levers are model-skill and CLV.)")
+
+
+if __name__ == "__main__":
+    # Offline read of the prod ledger needs SQL secrets promoted first.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
+    print_attribution()
