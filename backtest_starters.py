@@ -46,6 +46,7 @@ import os
 
 import mlb_starters
 import savant_history as sh
+import xera_lite
 from calibration_loader import (
     load_starter_adjustment, save_starter_adjustment, set_candidate_mode,
     has_candidate, existing_candidate_notice,
@@ -1725,9 +1726,240 @@ def test_two_sided(seasons):
           "delta means keep the pitcher-only edge (like the props matchup).")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Additive (xERA-lite) bake-off: additive Savant runs model vs the multiplicative
+# incumbent, graded by IDENTICAL code on a chronological holdout. (Tier A #1b)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ADDITIVE_FEATURES = ("xwobacon", "k9")   # v1 (owner-endorsed); + whiff/barrel later
+
+
+def _variant_metrics_projfn(train, holdout, project_fn,
+                            distribution="poisson", dispersion=0.0):
+    """Grade a model given ONLY a project_fn(row) -> (home_runs, away_runs), so the
+    additive and multiplicative projectors are scored by identical code (fair
+    comparison). Mirrors _challenger_variant_metrics but projector-agnostic and with
+    the Poisson/NegBin NLL computed inline (no _score_nll(model) dependency)."""
+    prob_fn = (mlb_starters.negative_binomial_margin_probability
+               if distribution == "negative_binomial"
+               else mlb_starters.poisson_margin_probability)
+
+    def _spread_p(hr, ar):
+        return (prob_fn(hr, ar, -1.5, dispersion)
+                if distribution == "negative_binomial" else prob_fn(hr, ar, -1.5))
+
+    tr_ml, tr_spread, tr_win, tr_cover = [], [], [], []
+    for row in train:
+        hr, ar = project_fn(row)
+        tr_ml.append(mlb_starters.pythagorean_win_probability(hr, ar))
+        tr_spread.append(_spread_p(hr, ar))
+        tr_win.append(row["home_win"])
+        tr_cover.append(1 if row["margin"] > 1.5 else 0)
+    ml_shrink = _fit_probability_shrink(tr_ml, tr_win)
+    spread_shrink = _fit_probability_shrink(tr_spread, tr_cover)
+
+    ho_ml, ho_spread, exp_margin, exp_total = [], [], [], []
+    a_win, a_cover, a_margin, a_total, nll = [], [], [], [], []
+    for row in holdout:
+        hr, ar = project_fn(row)
+        ho_ml.append(0.5 + ml_shrink * (
+            mlb_starters.pythagorean_win_probability(hr, ar) - 0.5))
+        ho_spread.append(0.5 + spread_shrink * (_spread_p(hr, ar) - 0.5))
+        exp_margin.append(hr - ar)
+        exp_total.append(hr + ar)
+        a_win.append(row["home_win"])
+        a_cover.append(1 if row["margin"] > 1.5 else 0)
+        a_margin.append(row["margin"])
+        a_total.append(row["total_runs"])
+        for actual, expected in ((row["home_runs"], hr), (row["away_runs"], ar)):
+            nll.append(_negative_binomial_score_nll(actual, expected, dispersion)
+                       if distribution == "negative_binomial"
+                       else _poisson_score_nll(actual, expected))
+    return {
+        "ml": _probability_metrics(ho_ml, a_win),
+        "spread": _probability_metrics(ho_spread, a_cover),
+        "margin": _margin_metrics(exp_margin, a_margin),
+        "total_rmse": rmse(exp_total, a_total),
+        "score_nll": sum(nll) / len(nll) if nll else float("nan"),
+    }
+
+
+def _load_pitcher_asof(season):
+    """{(entity_id, as_of_date): {xwobacon,k9,n_bbe,whiff_pct,barrel_pct}} for SP
+    rows of `season` from pitcher_asof_daily — bulk-loaded once for fast in-memory
+    lookups instead of per-game SQL. {} on SQL off / missing table."""
+    try:
+        import db_store
+        import pitcher_asof
+        from sqlalchemy import select
+        t = pitcher_asof.pitcher_asof_daily
+        out = {}
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(t.c.entity_id, t.c.as_of_date, t.c.xwobacon, t.c.k9,
+                       t.c.n_bbe, t.c.whiff_pct, t.c.barrel_pct)
+                .where((t.c.season_bucket == int(season))
+                       & (t.c.role == "SP"))).all()
+        for eid, d, xw, k9, nb, wh, br in rows:
+            out[(str(eid), str(d)[:10])] = {
+                "xwobacon": xw, "k9": k9, "n_bbe": nb,
+                "whiff_pct": wh, "barrel_pct": br}
+        return out
+    except Exception:
+        return {}
+
+
+def _sp_feats(asof, sp_id, date, feature_keys):
+    """(feature dict, n_bbe) for a starter's as-of row, or (None, None)."""
+    r = asof.get((str(sp_id), str(date)[:10]))
+    if not r:
+        return None, None
+    return {k: r.get(k) for k in feature_keys}, r.get("n_bbe")
+
+
+def _exp_ip(v, default=5.2, lo=3.5, hi=7.0):
+    """As-of avg innings/start, defaulted + clamped to a sane starter range."""
+    try:
+        return max(lo, min(hi, float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _additive_training_rows(rows, asof, feature_keys):
+    """Per starter-game training rows: features -> label = the OPPONENT's actual
+    runs that game (runs the starter's team allowed). Rows missing a feature drop."""
+    train = []
+    for r in rows:
+        if r.get("home_runs") is None or r.get("away_runs") is None:
+            continue
+        hf, _ = _sp_feats(asof, r["home_sp"], r["date"], feature_keys)
+        af, _ = _sp_feats(asof, r["away_sp"], r["date"], feature_keys)
+        if hf and all(v is not None for v in hf.values()):
+            train.append({**hf, "label": r["away_runs"]})   # home SP -> allowed away_runs
+        if af and all(v is not None for v in af.values()):
+            train.append({**af, "label": r["home_runs"]})   # away SP -> allowed home_runs
+    return train
+
+
+def _make_additive_projector(asof, xera_model, league_bp, feature_keys):
+    """A project_fn(row) -> (home_runs, away_runs) via mlb_starters.expected_runs_
+    additive: home batting faces the AWAY starter (+ away exp-IP + home-lineup
+    offense a_off_faced), away batting faces the HOME starter. rate9 from xera_lite;
+    league_bp fallback when a starter's as-of features are missing."""
+    def project(row):
+        af, an = _sp_feats(asof, row["away_sp"], row["date"], feature_keys)
+        hf, hn = _sp_feats(asof, row["home_sp"], row["date"], feature_keys)
+        away_rate9 = xera_lite.predict(af, xera_model, n_sample=an) if af else None
+        home_rate9 = xera_lite.predict(hf, xera_model, n_sample=hn) if hf else None
+        away_rate9 = away_rate9 if away_rate9 is not None else league_bp
+        home_rate9 = home_rate9 if home_rate9 is not None else league_bp
+        home_runs = mlb_starters.expected_runs_additive(
+            away_rate9, league_bp, _exp_ip(row.get("a_ip")),
+            offense_factor=row.get("a_off_faced") or 1.0)
+        away_runs = mlb_starters.expected_runs_additive(
+            home_rate9, league_bp, _exp_ip(row.get("h_ip")),
+            offense_factor=row.get("h_off_faced") or 1.0)
+        return home_runs, away_runs
+    return project
+
+
+def _print_bakeoff(mult, add, n_train, n_holdout, feature_keys, xera_model):
+    def _row(label, m):
+        return (f"  {label:14} margin_rmse {m['margin']['rmse']:.3f}  "
+                f"ML_brier {m['ml']['brier']:.4f}  "
+                f"spread_brier {m['spread']['brier']:.4f}  "
+                f"total_rmse {m['total_rmse']:.3f}  "
+                f"pois_nll {m['score_nll']:.4f}")
+    print(f"\n=== Additive (xERA-lite) bake-off — train {n_train} / holdout "
+          f"{n_holdout} ===")
+    print(f"  features: {list(feature_keys)}   "
+          f"xera_lite fit n={xera_model.get('n') if xera_model else 'NONE'}")
+    print(_row("A multiplic.", mult))
+    print(_row("B additive", add))
+    # Lower is better on every metric; flag per-metric winner.
+    wins = {k: ("B" if add_v < mult_v else "A")
+            for k, mult_v, add_v in (
+                ("margin_rmse", mult["margin"]["rmse"], add["margin"]["rmse"]),
+                ("ML_brier", mult["ml"]["brier"], add["ml"]["brier"]),
+                ("spread_brier", mult["spread"]["brier"], add["spread"]["brier"]),
+                ("total_rmse", mult["total_rmse"], add["total_rmse"]),
+                ("pois_nll", mult["score_nll"], add["score_nll"]))}
+    print(f"  per-metric winner (lower=better): {wins}")
+    print("  NOTE: additive bullpen term = league-avg fallback until the GS-based "
+          "RP aggregate (schema unlock #1c); v1 features only.")
+
+
+def test_additive_expected_runs(seasons, holdout_start=None,
+                                feature_keys=_ADDITIVE_FEATURES):
+    """Bake-off: additive Savant xERA-lite runs model vs the multiplicative
+    incumbent, fit on a chronological train split and graded by identical code on
+    the holdout. Reads pitcher_asof_daily for the as-of starter features."""
+    all_rows, asof = [], {}
+    for s in seasons:
+        games = get_season_games(s)
+        rows, _lg = build_dataset(games, s)
+        # get_season_games stores margin + total_runs (not per-team runs); derive
+        # home_runs/away_runs (margin = home-away, total = home+away) which both the
+        # multiplicative fit and the additive labels need.
+        for r in rows:
+            if (r.get("home_runs") is None and r.get("margin") is not None
+                    and r.get("total_runs") is not None):
+                r["home_runs"] = (r["total_runs"] + r["margin"]) / 2.0
+                r["away_runs"] = (r["total_runs"] - r["margin"]) / 2.0
+        all_rows.extend(rows)
+        asof.update(_load_pitcher_asof(s))
+    if not all_rows:
+        print("No dataset rows (need Statcast days cached / warehouse games).")
+        return None
+    if not asof:
+        print("!! pitcher_asof_daily is EMPTY for these seasons — run "
+              "`python pitcher_asof.py --build` first. Aborting additive bake-off.")
+        return None
+    all_rows.sort(key=lambda r: r["date"])
+    if holdout_start is None:
+        cut = int(len(all_rows) * 0.7)
+        train, holdout = all_rows[:cut], all_rows[cut:]
+    else:
+        train = [r for r in all_rows if r["date"] < holdout_start]
+        holdout = [r for r in all_rows if r["date"] >= holdout_start]
+    if not train or not holdout:
+        print("Empty train or holdout split.")
+        return None
+
+    mult_model = fit_expected_run_model(train)
+    if mult_model is None:
+        print("Could not fit the multiplicative incumbent.")
+        return None
+    mult_metrics = _variant_metrics_projfn(
+        train, holdout, lambda r: project_expected_runs(r, mult_model))
+
+    xera_model = xera_lite.fit(
+        _additive_training_rows(train, asof, feature_keys), list(feature_keys))
+    if xera_model is None:
+        print("!! xera_lite fit failed (too few complete as-of rows). Check that "
+              "pitcher_asof_daily covers the train seasons.")
+        return None
+    league_bp = xera_model.get("league_rate9", 4.3)
+    add_metrics = _variant_metrics_projfn(
+        train, holdout,
+        _make_additive_projector(asof, xera_model, league_bp, feature_keys))
+
+    _print_bakeoff(mult_metrics, add_metrics, len(train), len(holdout),
+                   feature_keys, xera_model)
+    return {"multiplicative": mult_metrics, "additive": add_metrics,
+            "xera_model": xera_model}
+
+
 if __name__ == "__main__":
     from cli_encoding import configure_stdio
     configure_stdio()
+    # Promote SQL_* secrets so load_days / pitcher_asof read the Azure warehouse
+    # outside Streamlit (mirrors warehouse.py / refit_calibration mains). Guarded.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True,
                     help="single '2024', list '2021,2022', or range '2021-2024'")
@@ -1752,6 +1984,13 @@ if __name__ == "__main__":
                     help="test raw Pythagorean, current/Pythagorean ensemble, "
                          "and prior-season actual-venue park factors against "
                          "the latest season's untouched chronological holdout")
+    ap.add_argument("--additive-bakeoff", action="store_true",
+                    help="Tier A #1b: additive Savant xERA-lite runs model vs the "
+                         "multiplicative incumbent on a chronological holdout "
+                         "(reads pitcher_asof_daily; no save).")
+    ap.add_argument("--holdout-start", default=None,
+                    help="YYYY-MM-DD chronological holdout cutoff for "
+                         "--additive-bakeoff (default: last 30%% of games).")
     args = ap.parse_args()
 
     # Default-safe: --save stages a candidate unless --live is given.
@@ -1775,6 +2014,8 @@ if __name__ == "__main__":
         test_two_sided(seasons)
     elif args.test_final:
         test_final_expected_run_candidates(seasons)
+    elif args.additive_bakeoff:
+        test_additive_expected_runs(seasons, holdout_start=args.holdout_start)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:
