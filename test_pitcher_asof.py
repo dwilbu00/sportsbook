@@ -32,6 +32,22 @@ class WarehouseAsofCurveTests(unittest.TestCase):
         self.assertEqual(curve["2024-04-07"]["games"], 1)   # only 04-01, not the DH
         self.assertAlmostEqual(curve["2024-04-07"]["ip"], 6.0)
 
+    def test_kpct_bbpct_from_bf(self):
+        # 6-tuples (date, outs, er, k, bb, bf) -> k_pct/bb_pct/n_bf (Tier A #1c).
+        games = [("2024-04-01", 18, 2.0, 6.0, 2.0, 24.0),
+                 ("2024-04-07", 15, 4.0, 5.0, 3.0, 22.0)]
+        c = pa._warehouse_asof_curve(games)["2024-04-07"]   # only the 04-01 line
+        self.assertAlmostEqual(c["k_pct"], 6.0 / 24.0)
+        self.assertAlmostEqual(c["bb_pct"], 2.0 / 24.0)
+        self.assertEqual(c["n_bf"], 24)
+
+    def test_no_bf_leaves_rates_none(self):
+        # 4-tuples (pre-re-backfill: no BB/BF) -> k_pct/bb_pct None.
+        c = pa._warehouse_asof_curve(
+            [("2024-04-01", 18, 2.0, 6.0), ("2024-04-07", 15, 4.0, 5.0)])["2024-04-07"]
+        self.assertIsNone(c["k_pct"])
+        self.assertIsNone(c["bb_pct"])
+
 
 class StatcastAsOfTests(unittest.TestCase):
     def setUp(self):
@@ -120,6 +136,26 @@ class BuildAndReadSqliteTests(unittest.TestCase):
                 pa.pitcher_asof_daily)).scalar()
         self.assertEqual(total, n1)
 
+    def test_build_writes_rp_bullpen_rows(self):
+        # role='RP' team-bullpen aggregate from GS==0 relief (Tier A #1c). Patch
+        # _team_relief_index (the real one needs mlb_pitcher_game.GS, NULL pre-backfill)
+        # -> (date, outs, er, k, bb, bf) per team, no SP rows / no statcast.
+        relief_idx = {"100": [("2024-04-01", 3, 1.0, 2.0, 1.0, 5.0),   # 1 IP,1 ER,2 K,1 BB,5 BF
+                              ("2024-04-05", 6, 0.0, 3.0, 0.0, 6.0)]}
+        with patch("mlb_warehouse._pitcher_game_index", return_value={}), \
+             patch("pitcher_asof._team_relief_index", return_value=relief_idx), \
+             patch("savant_history.load_days", return_value=[]):
+            n = pa.build_season(2024, verbose=False)
+        self.assertEqual(n, 1)                              # only 04-05 has a prior line
+        rp = pa.asof_pitcher_features("100", "2024-04-05", role="RP")
+        self.assertIsNotNone(rp)
+        self.assertEqual(rp["role"], "RP")
+        self.assertAlmostEqual(rp["era"], 9.0)             # 1 ER / 1 IP * 9
+        self.assertAlmostEqual(rp["k9"], 18.0)             # 2 K / 1 IP * 9
+        self.assertAlmostEqual(rp["k_pct"], 2.0 / 5.0)     # 2 K / 5 BF
+        self.assertAlmostEqual(rp["bb_pct"], 1.0 / 5.0)    # 1 BB / 5 BF
+        self.assertIsNone(pa.asof_pitcher_features("100", "2024-04-05"))  # no SP row
+
 
 class SchemaParityTests(unittest.TestCase):
     def test_cols_spec_matches_table(self):
@@ -147,12 +183,15 @@ class GetOrFillSqliteTests(unittest.TestCase):
         db_store.configure_engine(None)
 
     def test_fill_on_miss_then_hit(self):
-        wh = {"era": 3.0, "ip": 6.0, "k": 6.0, "games": 1, "avg_ip": 6.0}
+        wh = {"era": 3.0, "ip": 6.0, "k": 6.0, "games": 1, "avg_ip": 6.0,
+              "bb": 2.0, "bf": 24.0}
         with patch("mlb_warehouse.asof_pitcher_stats", return_value=wh) as m:
             # Miss -> compute + persist.
             row = pa.get_or_fill("1", "2024-04-07")
             self.assertAlmostEqual(row["era"], 3.0)
             self.assertAlmostEqual(row["k9"], 9.0)          # (6/6)*9
+            self.assertAlmostEqual(row["k_pct"], 6.0 / 24.0)   # 6 K / 24 BF (#1c)
+            self.assertAlmostEqual(row["bb_pct"], 2.0 / 24.0)  # 2 BB / 24 BF
             self.assertAlmostEqual(row["xwobacon"], 0.35)   # mean(0.30,0.40), 04-09 excluded
             self.assertEqual(row["n_bbe"], 2)
             self.assertEqual(m.call_count, 1)

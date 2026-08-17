@@ -170,13 +170,15 @@ def _blank_row(entity_id, as_of_date, role, season, now):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _warehouse_asof_curve(games):
-    """games = [(date10, outs, er, k), ...] for ONE pitcher (any order). Returns
-    {date10: {era, ip, avg_ip, k9, games}} — the cumulative line over games STRICTLY
-    before that date (matches mlb_warehouse.asof_pitcher_stats' `od < cutoff`). One
-    entry per DISTINCT date; a same-date second appearance shares the pre-date line."""
+    """games = [(date10, outs, er, k, bb, bf), ...] for ONE pitcher/bullpen (any
+    order; bb/bf optional -> 0). Returns {date10: {era, ip, avg_ip, k9, games,
+    k_pct, bb_pct, n_bf}} — the cumulative line over games STRICTLY before that date
+    (matches mlb_warehouse.asof_pitcher_stats' `od < cutoff`). One entry per DISTINCT
+    date; a same-date second appearance shares the pre-date line. k_pct/bb_pct are
+    None until BF is populated (the #1c re-backfill)."""
     by_date = sorted(games, key=lambda g: g[0])
     out = {}
-    cum_outs = cum_er = cum_k = 0.0
+    cum_outs = cum_er = cum_k = cum_bb = cum_bf = 0.0
     cum_games = 0
     i, n = 0, len(by_date)
     for date10 in sorted({g[0] for g in by_date}):
@@ -188,13 +190,19 @@ def _warehouse_asof_curve(games):
                 "era": (cum_er / ip) * 9.0, "ip": ip,
                 "avg_ip": ip / cum_games, "k9": (cum_k / ip) * 9.0,
                 "games": cum_games,
+                "k_pct": (cum_k / cum_bf) if cum_bf > 0 else None,
+                "bb_pct": (cum_bb / cum_bf) if cum_bf > 0 else None,
+                "n_bf": int(cum_bf) or None,
             }
         else:
             out[date10] = None   # no prior in-season games -> caller falls back
         while i < n and by_date[i][0] == date10:      # now absorb this date
-            cum_outs += by_date[i][1]
-            cum_er += by_date[i][2]
-            cum_k += by_date[i][3]
+            g = by_date[i]
+            cum_outs += g[1]
+            cum_er += g[2]
+            cum_k += g[3]
+            cum_bb += g[4] if len(g) > 4 else 0.0
+            cum_bf += g[5] if len(g) > 5 else 0.0
             cum_games += 1
             i += 1
     return out
@@ -291,24 +299,52 @@ _STAT_COLS = ("xwobacon", "n_bbe", "whiff_pct", "csw_pct", "barrel_pct",
               "hard_hit_pct", "gb_pct", "n_pitches")
 
 
-def build_season(season, verbose=True):
-    """Materialize role='SP' as-of rows for every (pitcher, game-date) in `season`
-    (warehouse line + statcast contact/discipline rates). Replace-writes the season
-    (idempotent). Returns n rows written. SQL-only.
+def _team_relief_index(season):
+    """{team_id: [(date, outs, er, k, bb, bf), ...]} over RELIEF appearances (GS==0)
+    in `season`, from mlb_pitcher_game joined to mlb_game. Feeds the role='RP'
+    team-bullpen as-of aggregate. GS is NULL until the #1c re-backfill, so this is
+    {} (no RP rows) until then — accurate relief classification, not an IP proxy."""
+    import mlb_warehouse as w
+    pg, g = w.mlb_pitcher_game, w.mlb_game
+    out = {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(pg.c.team_id, g.c.official_date, pg.c.IP, pg.c.ER,
+                       pg.c.K, pg.c.BB, pg.c.BF, pg.c.GS)
+                .select_from(pg.join(g, pg.c.game_pk == g.c.game_pk))
+                .where((pg.c.season_bucket == int(season))
+                       & (pg.c.GS == 0))).all()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    for tid, od, ip, er, k, bb, bf, _gs in rows:
+        if not tid or not od:
+            continue
+        out.setdefault(str(tid), []).append(
+            (str(od)[:10], w._ip_to_outs(ip) or 0, float(er or 0),
+             float(k or 0), float(bb or 0), float(bf or 0)))
+    for lst in out.values():
+        lst.sort(key=lambda x: x[0])
+    return out
 
-    NOTE: the role='RP' team-bullpen aggregate is DEFERRED to the schema unlock that
-    adds games_started (GS) to mlb_pitcher_game — relief must be classified GS==0,
-    not by an IP threshold (a short start would be miscounted as relief, a long
-    reliever missed). Until then the additive model's bullpen term uses a league
-    -average fallback."""
+
+def build_season(season, verbose=True):
+    """Materialize as-of rows for `season`: one role='SP' row per (pitcher, game
+    -date) (warehouse line + statcast rates + K%/BB% once BF is backfilled) + one
+    role='RP' row per (team, game-date) team-bullpen aggregate (relief = GS==0).
+    Replace-writes the season (idempotent). Returns n rows written. SQL-only.
+
+    RP rows only appear after the #1c BB/BF/HR/HBP/GS unlock + re-backfill (GS drives
+    relief classification); until then relief_idx is empty and only SP rows write."""
     if not enabled():
         raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
     import mlb_warehouse
     import savant_history as sh
 
     season = int(season)
-    pit_idx = mlb_warehouse._pitcher_game_index(season)   # {aid: [(date,outs,er,k)]}
-    if not pit_idx:
+    pit_idx = mlb_warehouse._pitcher_game_index(season)   # {aid: [(date,outs,er,k,bb,bf)]}
+    relief_idx = _team_relief_index(season)               # {team_id: [...]} (GS==0)
+    if not pit_idx and not relief_idx:
         if verbose:
             print(f"  [build] no mlb_pitcher_game rows for {season}; nothing to build.")
         return 0
@@ -316,10 +352,10 @@ def build_season(season, verbose=True):
 
     now = _now()
     rows = []
-    for aid, games in pit_idx.items():
+    for aid, games in pit_idx.items():                    # role='SP'
         curve = _warehouse_asof_curve(games)
         for date10, wh in curve.items():
-            st = sc.asof(aid, date10)         # feature dict or None
+            st = sc.asof(aid, date10)         # statcast feature dict or None
             if wh is None and st is None:
                 continue   # nothing as-of -> no row (consumer would fall back anyway)
             row = _blank_row(aid, date10, "SP", season, now)
@@ -327,20 +363,29 @@ def build_season(season, verbose=True):
                 for k in _STAT_COLS:
                     row[k] = st.get(k)
             if wh:
-                row.update(wh)                # era/ip/avg_ip/k9/games
+                row.update(wh)                # era/ip/avg_ip/k9/games/k_pct/bb_pct/n_bf
             rows.append(row)
+    n_sp = len(rows)
+    for tid, games in relief_idx.items():                 # role='RP' (team bullpen)
+        curve = _warehouse_asof_curve(games)
+        for date10, wh in curve.items():
+            if wh is None:
+                continue                      # no prior relief line -> no row
+            row = _blank_row(tid, date10, "RP", season, now)
+            row.update(wh)                    # era/k9/ip/avg_ip/games/k_pct/bb_pct/n_bf
+            rows.append(row)
+    n_rp = len(rows) - n_sp
 
     engine = db_store.get_engine()
     with _WRITE_LOCK:
         with engine.begin() as conn:
             conn.execute(delete(pitcher_asof_daily).where(
-                (pitcher_asof_daily.c.season_bucket == season)
-                & (pitcher_asof_daily.c.role == "SP")))
+                pitcher_asof_daily.c.season_bucket == season))   # SP + RP for the season
             for i in range(0, len(rows), 500):        # chunked insert
                 conn.execute(pitcher_asof_daily.insert(), rows[i:i + 500])
     if verbose:
-        print(f"  [build] season {season}: wrote {len(rows)} SP as-of rows "
-              f"({len(pit_idx)} pitchers).")
+        print(f"  [build] season {season}: {n_sp} SP + {n_rp} RP as-of rows "
+              f"({len(pit_idx)} pitchers, {len(relief_idx)} teams).")
     return len(rows)
 
 
@@ -404,10 +449,14 @@ def _compute_asof_row(entity_id, as_of_date, role):
     row["xwobacon"] = xwobacon
     row["n_bbe"] = n_bbe or None
     if wh:
+        bf = wh.get("bf") or 0
         row.update({"era": wh.get("era"), "ip": wh.get("ip"),
                     "avg_ip": wh.get("avg_ip"), "games": wh.get("games"),
                     "k9": ((wh["k"] / wh["ip"]) * 9.0
-                           if wh.get("ip") else None)})
+                           if wh.get("ip") else None),
+                    "k_pct": (wh["k"] / bf) if bf > 0 else None,
+                    "bb_pct": ((wh.get("bb") or 0) / bf) if bf > 0 else None,
+                    "n_bf": int(bf) or None})
     return row
 
 
