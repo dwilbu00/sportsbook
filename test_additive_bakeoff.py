@@ -71,6 +71,54 @@ class AdditiveProjectorTests(unittest.TestCase):
         self.assertAlmostEqual(hr, 4.3, places=3)
 
 
+class BullpenGetterTests(unittest.TestCase):
+    def setUp(self):
+        self.series = {"10": [{"as_of_date": "2024-04-01", "era": 4.5},
+                              {"as_of_date": "2024-04-10", "era": 5.0}]}
+        self.abbr_to_id = {"NYY": "10"}
+        self.g = bs._make_bp_getter(self.series, self.abbr_to_id,
+                                    league_rp_era=4.0, league_bp=4.3)
+
+    def test_league_relative_scaling(self):
+        # as-of era 4.5 vs league 4.0 -> ratio 1.125 -> 4.3 * 1.125.
+        self.assertAlmostEqual(self.g("NYY", "2024-04-05"), 4.3 * (4.5 / 4.0))
+
+    def test_strict_before(self):
+        # 04-01 is not strictly before 04-01 -> no prior line -> flat league_bp.
+        self.assertAlmostEqual(self.g("NYY", "2024-04-01"), 4.3)
+
+    def test_unknown_team_falls_back(self):
+        self.assertAlmostEqual(self.g("BOS", "2024-04-05"), 4.3)  # no abbr->id
+
+    def test_ratio_is_clamped(self):
+        series = {"10": [{"as_of_date": "2024-04-01", "era": 100.0}]}
+        g = bs._make_bp_getter(series, {"NYY": "10"}, 4.0, 4.3)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3 * 2.0)  # clamp hi
+
+    def test_no_league_era_falls_back(self):
+        g = bs._make_bp_getter(self.series, self.abbr_to_id, None, 4.3)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)
+
+
+class ProjectorBullpenTests(unittest.TestCase):
+    def test_away_bullpen_backs_home_runs(self):
+        # Equal starters -> the bullpen term decides. home_runs is backed by the AWAY
+        # team's bullpen; a worse away pen (higher rate9) should raise home_runs.
+        asof = {("A", "2024-05-01"): {"xwobacon": 0.35, "k9": 8.0, "n_bbe": 200},
+                ("H", "2024-05-01"): {"xwobacon": 0.35, "k9": 8.0, "n_bbe": 200}}
+        model = {"feature_keys": ["xwobacon", "k9"], "intercept": 4.0,
+                 "coef": [0.0, 0.0], "league_rate9": 4.0, "n": 1000}
+        bp = {"AWY": 6.0, "HOM": 2.0}
+        proj = bs._make_additive_projector(
+            bs._dict_feat_getter(asof, ("xwobacon", "k9")), model, 4.0,
+            ("xwobacon", "k9"), bp_getter=lambda team, date: bp[team])
+        row = {"home_sp": "H", "away_sp": "A", "date": "2024-05-01",
+               "home_team": "HOM", "away_team": "AWY",
+               "a_ip": 6.0, "h_ip": 6.0, "a_off_faced": 1.0, "h_off_faced": 1.0}
+        home_runs, away_runs = proj(row)
+        self.assertGreater(home_runs, away_runs)   # bad away pen -> more home runs
+
+
 class WindowingTests(unittest.TestCase):
     def setUp(self):
         # One pitcher "P": a 2023 prior-season final + three 2024 as-of rows.

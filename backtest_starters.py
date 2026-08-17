@@ -1731,7 +1731,25 @@ def test_two_sided(seasons):
 # incumbent, graded by IDENTICAL code on a chronological holdout. (Tier A #1b)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_ADDITIVE_FEATURES = ("xwobacon", "k9")   # v1 (owner-endorsed); + whiff/barrel later
+_ADDITIVE_FEATURES = ("xwobacon", "k9")   # v1 (owner-endorsed), available now
+
+# Feature families for the bake-off, in increasing richness. The bake-off runs each
+# so the MARGINAL value of adding the contact-quality bundle, then the walk-rate
+# (FIP) bundle, is visible (the owner-endorsed marginal-then-joint read).
+#   v1      — xwOBAcon + K/9 (warehouse + statcast, populated now).
+#   contact — + barrel% + whiff% (statcast rates, ALSO populated now: no schema wait).
+#   fip     — + K% + BB% (need the #1c-a BB/BF unlock + re-backfill; NULL until then,
+#             so this family is auto-SKIPPED with a note on pre-unlock data).
+_ADDITIVE_FEATURE_SETS = {
+    "v1": ("xwobacon", "k9"),
+    "contact": ("xwobacon", "k9", "barrel_pct", "whiff_pct"),
+    "fip": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "k_pct", "bb_pct"),
+}
+
+# Every feature any family may request — the series loader pulls all of these so a
+# family can be selected without re-querying.
+_ALL_ASOF_FEATURES = ("xwobacon", "k9", "barrel_pct", "whiff_pct", "hard_hit_pct",
+                      "gb_pct", "k_pct", "bb_pct")
 
 
 def _variant_metrics_projfn(train, holdout, project_fn,
@@ -1824,23 +1842,33 @@ def _additive_training_rows(rows, feat_getter, feature_keys):
     return train
 
 
-def _make_additive_projector(feat_getter, xera_model, league_bp, feature_keys):
+def _make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
+                             bp_getter=None):
     """project_fn(row) -> (home_runs, away_runs) via mlb_starters.expected_runs_
     additive: home batting faces the AWAY starter (+ away exp-IP + home-lineup
-    offense a_off_faced), away batting faces the HOME starter. rate9 from xera_lite
-    on feat_getter(pid,date); league_bp fallback when a starter's feats are missing."""
+    offense a_off_faced), away batting faces the HOME starter. Starter rate9 from
+    xera_lite on feat_getter(pid,date); league_bp fallback when a starter's feats are
+    missing.
+
+    Bullpen term: the flat league_bp constant when bp_getter is None (v1 behavior),
+    else the pitching team's as-of bullpen rate9 from bp_getter(team_abbr, date) — the
+    AWAY bullpen backs the away starter for home_runs, the HOME bullpen for away_runs."""
+    def _bp(team_abbr, date):
+        return bp_getter(team_abbr, date) if bp_getter else league_bp
+
     def project(row):
-        af, an = feat_getter(row["away_sp"], row["date"])
-        hf, hn = feat_getter(row["home_sp"], row["date"])
+        date = row["date"]
+        af, an = feat_getter(row["away_sp"], date)
+        hf, hn = feat_getter(row["home_sp"], date)
         away_rate9 = xera_lite.predict(af, xera_model, n_sample=an) if af else None
         home_rate9 = xera_lite.predict(hf, xera_model, n_sample=hn) if hf else None
         away_rate9 = away_rate9 if away_rate9 is not None else league_bp
         home_rate9 = home_rate9 if home_rate9 is not None else league_bp
         home_runs = mlb_starters.expected_runs_additive(
-            away_rate9, league_bp, _exp_ip(row.get("a_ip")),
+            away_rate9, _bp(row.get("away_team"), date), _exp_ip(row.get("a_ip")),
             offense_factor=row.get("a_off_faced") or 1.0)
         away_runs = mlb_starters.expected_runs_additive(
-            home_rate9, league_bp, _exp_ip(row.get("h_ip")),
+            home_rate9, _bp(row.get("home_team"), date), _exp_ip(row.get("h_ip")),
             offense_factor=row.get("h_off_faced") or 1.0)
         return home_runs, away_runs
     return project
@@ -1850,9 +1878,10 @@ def _make_additive_projector(feat_getter, xera_model, league_bp, feature_keys):
 
 def _load_pitcher_asof_series(seasons):
     """{entity_id: [rows sorted by as_of_date]} spanning `seasons` + the season
-    BEFORE the earliest (so the current+prior blend has a prior). Each row:
-    as_of_date, season_bucket, xwobacon, n_bbe, k9, ip. Enables windowed (difference
-    two rows) + blended (prior-season final) as-of features. {} on error."""
+    BEFORE the earliest (so the current+prior blend has a prior). Each row carries
+    as_of_date, season_bucket, n_bbe, ip, and every feature in _ALL_ASOF_FEATURES
+    (v1 + contact + FIP). Enables windowed (difference two rows) + blended
+    (prior-season final) as-of features across feature families. {} on error."""
     try:
         import db_store
         import pitcher_asof
@@ -1860,22 +1889,83 @@ def _load_pitcher_asof_series(seasons):
         t = pitcher_asof.pitcher_asof_daily
         want = {int(s) for s in seasons}
         want |= {min(want) - 1}                       # prior season for the blend
+        cols = [t.c.entity_id, t.c.as_of_date, t.c.season_bucket, t.c.n_bbe, t.c.ip]
+        cols += [t.c[k] for k in _ALL_ASOF_FEATURES]
         by_pid = {}
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(
-                select(t.c.entity_id, t.c.as_of_date, t.c.season_bucket,
-                       t.c.xwobacon, t.c.n_bbe, t.c.k9, t.c.ip)
-                .where((t.c.season_bucket.in_(sorted(want)))
-                       & (t.c.role == "SP"))).all()
-        for eid, d, sb, xw, nb, k9, ip in rows:
-            by_pid.setdefault(str(eid), []).append({
-                "as_of_date": str(d)[:10], "season_bucket": sb,
-                "xwobacon": xw, "n_bbe": nb, "k9": k9, "ip": ip})
+                select(*cols).where((t.c.season_bucket.in_(sorted(want)))
+                                    & (t.c.role == "SP"))).mappings().all()
+        for r in rows:
+            rec = {"as_of_date": str(r["as_of_date"])[:10],
+                   "season_bucket": r["season_bucket"],
+                   "n_bbe": r["n_bbe"], "ip": r["ip"]}
+            rec.update({k: r[k] for k in _ALL_ASOF_FEATURES})
+            by_pid.setdefault(str(r["entity_id"]), []).append(rec)
         for lst in by_pid.values():
             lst.sort(key=lambda r: r["as_of_date"])
         return by_pid
     except Exception:
         return {}
+
+
+def _load_bullpen_asof_series(seasons):
+    """({team_id: [rows sorted by as_of_date]}, league_rp_era) for role='RP' team
+    bullpen aggregates — the GS==0 relief as-of curve materialized by
+    pitcher_asof.build_season (#1c-b). Each row: as_of_date, era. league_rp_era is
+    the innings-weighted league mean, used to make the per-team term league-relative
+    (so the earned-vs-total scale cancels). ({}, None) on error / empty."""
+    try:
+        import db_store
+        import pitcher_asof
+        from sqlalchemy import select
+        t = pitcher_asof.pitcher_asof_daily
+        want = {int(s) for s in seasons}
+        want |= {min(want) - 1}
+        by_tid = {}
+        num = den = 0.0
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(t.c.entity_id, t.c.as_of_date, t.c.era, t.c.ip)
+                .where((t.c.season_bucket.in_(sorted(want)))
+                       & (t.c.role == "RP"))).all()
+        for eid, d, era, ip in rows:
+            if era is None:
+                continue
+            by_tid.setdefault(str(eid), []).append(
+                {"as_of_date": str(d)[:10], "era": float(era)})
+            if ip:                                    # innings-weighted league mean
+                num += float(era) * float(ip)
+                den += float(ip)
+        for lst in by_tid.values():
+            lst.sort(key=lambda r: r["as_of_date"])
+        league_rp_era = (num / den) if den else None
+        return by_tid, league_rp_era
+    except Exception:
+        return {}, None
+
+
+def _make_bp_getter(bp_series, abbr_to_id, league_rp_era, league_bp):
+    """bp_getter(team_abbr, date) -> the team's as-of bullpen rate9 on the TOTAL-runs
+    scale used by the additive label. Computed LEAGUE-RELATIVE:
+        rate9 = league_bp * clamp(team_rp_era / league_rp_era, 0.5, 2.0)
+    so the earned-only RP era is rescaled by the same ratio the starter/bullpen
+    suppression terms use, and the earned-vs-total offset cancels. Falls back to the
+    flat league_bp when the team/date has no prior relief line."""
+    def getter(team_abbr, date):
+        if not (bp_series and league_rp_era):
+            return league_bp
+        tid = abbr_to_id.get(team_abbr)
+        rows = bp_series.get(str(tid)) if tid is not None else None
+        if not rows:
+            return league_bp
+        d = str(date)[:10]
+        prev = [r for r in rows if r["as_of_date"] < d]   # strictly before
+        if not prev:
+            return league_bp
+        ratio = max(0.5, min(2.0, prev[-1]["era"] / league_rp_era))
+        return league_bp * ratio
+    return getter
 
 
 def _feat_from_row(row, feature_keys):
@@ -1962,13 +2052,35 @@ def _bakeoff_row(label, m):
             f"pois_nll {m['score_nll']:.4f}")
 
 
+def _abbr_to_team_id(seasons):
+    """{team_abbr: MLBAM team_id} across `seasons`, inverting backtest_props._team_maps
+    (id->abbr). Bridges the abbr-keyed game rows to the team_id-keyed RP series. {} on
+    error (bp_getter then falls back to the flat league bullpen)."""
+    out = {}
+    try:
+        from backtest_props import _team_maps
+        for s in seasons:
+            id_abbr, _ = _team_maps(s)
+            for tid, abbr in id_abbr.items():
+                if abbr and tid is not None:
+                    out[abbr] = str(tid)
+    except Exception:
+        return {}
+    return out
+
+
 def test_additive_expected_runs(seasons, holdout_start=None,
-                                feature_keys=_ADDITIVE_FEATURES,
-                                window_modes=("cumulative", "blend", "window")):
+                                feature_sets=None,
+                                window_modes=("cumulative", "blend", "window"),
+                                rp_bullpen=False):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
-    model under several as-of WINDOW modes (cumulative season-to-date / prior-season
-    blend / trailing window), fit on a chronological train split and graded by
-    identical code on the holdout. Reads pitcher_asof_daily for the as-of features."""
+    model across FEATURE FAMILIES (v1 / contact / fip) x as-of WINDOW modes
+    (cumulative / prior-season blend / trailing window), fit on a chronological train
+    split and graded by identical code on the holdout. rp_bullpen=True swaps the flat
+    league bullpen term for the team's GS-based as-of RP aggregate (#1c-b, league-
+    relative). Reads pitcher_asof_daily. Families needing NULL columns (fip before the
+    #1c-a re-backfill) auto-skip with a note."""
+    feature_sets = feature_sets or _ADDITIVE_FEATURE_SETS
     all_rows = []
     for s in seasons:
         games = get_season_games(s)
@@ -2000,6 +2112,19 @@ def test_additive_expected_runs(seasons, holdout_start=None,
         print("Empty train or holdout split.")
         return None
 
+    # Optional GS-based RP bullpen term (league-relative so the earned/total scale
+    # cancels). None -> flat league bullpen (v1 behavior).
+    bp_getter = None
+    if rp_bullpen:
+        bp_series, league_rp_era = _load_bullpen_asof_series(seasons)
+        if not bp_series or not league_rp_era:
+            print("  !! --rp-bullpen: no role='RP' rows in pitcher_asof_daily "
+                  "(needs the #1c-a GS re-backfill + rebuild). Using league bullpen.")
+        else:
+            abbr_to_id = _abbr_to_team_id(seasons)
+            # league_bp is the additive fit's league_rate9; resolved per-family below.
+            bp_getter = ("pending", bp_series, abbr_to_id, league_rp_era)
+
     mult_model = fit_expected_run_model(train)
     if mult_model is None:
         print("Could not fit the multiplicative incumbent.")
@@ -2007,25 +2132,34 @@ def test_additive_expected_runs(seasons, holdout_start=None,
     results = {"multiplicative": _variant_metrics_projfn(
         train, holdout, lambda r: project_expected_runs(r, mult_model))}
 
-    for mode in window_modes:
-        getter = _make_feat_getter(series, mode, feature_keys)
-        xm = xera_lite.fit(
-            _additive_training_rows(train, getter, feature_keys),
-            list(feature_keys))
-        if xm is None:
-            print(f"  additive[{mode}]: xera_lite fit failed (too few rows).")
-            continue
-        league_bp = xm.get("league_rate9", 4.3)
-        results[f"additive_{mode}"] = _variant_metrics_projfn(
-            train, holdout,
-            _make_additive_projector(getter, xm, league_bp, feature_keys))
+    labels = []                                  # preserve family/mode print order
+    for fs_name, feature_keys in feature_sets.items():
+        for mode in window_modes:
+            getter = _make_feat_getter(series, mode, feature_keys)
+            xm = xera_lite.fit(
+                _additive_training_rows(train, getter, feature_keys),
+                list(feature_keys))
+            if xm is None:
+                print(f"  additive[{fs_name}/{mode}]: no fit (feature columns NULL "
+                      f"until re-backfill, or too few rows).")
+                continue
+            league_bp = xm.get("league_rate9", 4.3)
+            bpg = None
+            if bp_getter:                        # bind league_bp now that it's known
+                _, bp_series, abbr_to_id, league_rp_era = bp_getter
+                bpg = _make_bp_getter(bp_series, abbr_to_id, league_rp_era, league_bp)
+            key = f"additive_{fs_name}_{mode}"
+            results[key] = _variant_metrics_projfn(
+                train, holdout,
+                _make_additive_projector(getter, xm, league_bp, feature_keys, bpg))
+            labels.append((f"B additive[{fs_name}/{mode}]", key))
 
+    bp_tag = "team-RP" if bp_getter else "league-avg"
     print(f"\n=== Additive (xERA-lite) bake-off — train {len(train)} / holdout "
-          f"{len(holdout)} — features {list(feature_keys)} ===")
+          f"{len(holdout)} — bullpen {bp_tag} ===")
     print(_bakeoff_row("A multiplicative", results["multiplicative"]))
-    for mode in window_modes:
-        if f"additive_{mode}" in results:
-            print(_bakeoff_row(f"B additive[{mode}]", results[f"additive_{mode}"]))
+    for label, key in labels:
+        print(_bakeoff_row(label, results[key]))
     metric_of = {
         "margin_rmse": lambda m: m["margin"]["rmse"],
         "ML_brier": lambda m: m["ml"]["brier"],
@@ -2035,8 +2169,9 @@ def test_additive_expected_runs(seasons, holdout_start=None,
     best = {mk: min(results, key=lambda lbl: fn(results[lbl]))
             for mk, fn in metric_of.items()}
     print(f"  best per metric (lower=better): {best}")
-    print("  NOTE: additive bullpen term = league-avg fallback until the GS-based "
-          "RP aggregate (#1c); v1 features only.")
+    if not rp_bullpen:
+        print("  NOTE: bullpen = flat league-avg. Re-run with --rp-bullpen for the "
+              "GS-based team RP term (needs the #1c-a re-backfill).")
     return results
 
 
@@ -2084,6 +2219,13 @@ if __name__ == "__main__":
     ap.add_argument("--window-modes", default="cumulative,blend,window",
                     help="comma list of as-of feature modes for --additive-bakeoff "
                          "(cumulative|blend|window).")
+    ap.add_argument("--feature-sets", default=None,
+                    help="comma list of additive feature families for "
+                         "--additive-bakeoff (v1|contact|fip). Default: all three.")
+    ap.add_argument("--rp-bullpen", action="store_true",
+                    help="with --additive-bakeoff, use the GS-based team RP as-of "
+                         "bullpen term (league-relative) instead of the flat league "
+                         "average (needs the #1c-a re-backfill to populate GS).")
     args = ap.parse_args()
 
     # Default-safe: --save stages a candidate unless --live is given.
@@ -2109,8 +2251,14 @@ if __name__ == "__main__":
         test_final_expected_run_candidates(seasons)
     elif args.additive_bakeoff:
         _modes = tuple(m.strip() for m in args.window_modes.split(",") if m.strip())
+        _fs = None
+        if args.feature_sets:
+            _fs = {n.strip(): _ADDITIVE_FEATURE_SETS[n.strip()]
+                   for n in args.feature_sets.split(",")
+                   if n.strip() in _ADDITIVE_FEATURE_SETS}
         test_additive_expected_runs(seasons, holdout_start=args.holdout_start,
-                                    window_modes=_modes)
+                                    feature_sets=_fs, window_modes=_modes,
+                                    rp_bullpen=args.rp_bullpen)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:
