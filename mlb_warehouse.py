@@ -171,7 +171,13 @@ player_alias = Table(
 # just widens coverage, it isn't a correctness prerequisite. batter_home_runs (HR) is
 # captured but not yet an odds market, so it stays out of _ACTUAL_STAT_SPEC.
 _BATTER_GAME_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH", "HR", "TB", "RBI")
-_PITCHER_GAME_STATS = ("IP", "K", "ER")
+# BB/BF/HR/HBP/GS appended 2026-08-17 (Tier A #1c) to unlock the as-of pitcher
+# feature set the additive expected-runs model wants: K%/BB% (per BF), FIP
+# components (HR/HBP/BB/K), and GS==0 relief classification for the team-bullpen
+# aggregate. NULL on pre-ALTER/pre-re-backfill rows (get_player_history skips NULL
+# stat cells, so partial coverage is safe). ⚠ COORDINATED: the prod ALTER (see
+# sql/schema.sql) MUST run BEFORE this code deploys — _game_log SELECTs *stat_cols.
+_PITCHER_GAME_STATS = ("IP", "K", "ER", "BB", "BF", "HR", "HBP", "GS")
 
 
 def _game_fact_table(name, stat_cols):
@@ -579,6 +585,12 @@ def derive_pitcher_rows(box, game):
                 "IP": _f(ip_raw),
                 "K": _f(pit.get("strikeOuts")),
                 "ER": _f(pit.get("earnedRuns")),
+                # Tier A #1c: K%/BB% (per BF), FIP components, relief classification.
+                "BB": _f(pit.get("baseOnBalls")),
+                "BF": _f(pit.get("battersFaced")),
+                "HR": _f(pit.get("homeRuns")),
+                "HBP": _f(pit.get("hitByPitch")),
+                "GS": _f(pit.get("gamesStarted")),   # 1 = started, 0 = relief
             }
             outs = _ip_to_outs(_f(ip_raw)) or 0
             prev = by_ath.get(aid)
@@ -1436,9 +1448,10 @@ _THROWS_LOADED = [False]
 
 
 def _pitcher_game_index(season):
-    """{athlete_id: [(official_date, outs, er, k), ...] sorted} for a season, from
-    mlb_pitcher_game joined to mlb_game for the play date. Loaded ONCE per season
-    (thread-safe); an empty/failed load is not cached so it can retry."""
+    """{athlete_id: [(official_date, outs, er, k, bb, bf), ...] sorted} for a season,
+    from mlb_pitcher_game joined to mlb_game for the play date. Loaded ONCE per season
+    (thread-safe); an empty/failed load is not cached so it can retry. BB/BF (Tier A
+    #1c) are None on pre-re-backfill rows -> coerced to 0.0 here."""
     season = int(season)
     idx = _PITCHER_IDX.get(season)
     if idx is not None:
@@ -1453,17 +1466,18 @@ def _pitcher_game_index(season):
             with db_store.get_engine().connect() as conn:
                 rows = conn.execute(
                     select(pg.c.athlete_id, g.c.official_date,
-                           pg.c.IP, pg.c.ER, pg.c.K)
+                           pg.c.IP, pg.c.ER, pg.c.K, pg.c.BB, pg.c.BF)
                     .select_from(joined)
                     .where(pg.c.season_bucket == season)).all()
         except (OperationalError, ValueError, TypeError):
             return {}                          # transient — don't cache the miss
         built = {}
-        for aid, od, ip, er, k in rows:
+        for aid, od, ip, er, k, bb, bf in rows:
             if not od:
                 continue
             built.setdefault(str(aid), []).append(
-                (str(od)[:10], _ip_to_outs(ip) or 0, float(er or 0), float(k or 0)))
+                (str(od)[:10], _ip_to_outs(ip) or 0, float(er or 0),
+                 float(k or 0), float(bb or 0), float(bf or 0)))
         for lst in built.values():
             lst.sort(key=lambda x: x[0])
         _PITCHER_IDX[season] = built
@@ -1473,27 +1487,30 @@ def _pitcher_game_index(season):
 def asof_pitcher_stats(athlete_id, as_of_date):
     """Cumulative pitching line for a starter through the day BEFORE as_of_date
     (leakage-safe), from the warehouse facts — ZERO network. Returns
-    {'era','ip','k','games','avg_ip'} or None (no prior games in-season / SQL off).
-    IP is summed in OUTS (facts store StatsAPI 6.1 = 6 IP + 1 out notation)."""
+    {'era','ip','k','games','avg_ip','bb','bf'} or None (no prior games in-season /
+    SQL off). IP is summed in OUTS (facts store StatsAPI 6.1 = 6 IP + 1 out). bb/bf
+    are cumulative-as-of (0 when unpopulated -> K%/BB% consumers threshold on bf)."""
     if not enabled() or not athlete_id or not as_of_date:
         return None
     cutoff = str(as_of_date)[:10]              # games STRICTLY before the game day
     games = _pitcher_game_index(int(cutoff[:4])).get(str(athlete_id))
     if not games:
         return None
-    outs = er = k = 0.0
+    outs = er = k = bb = bf = 0.0
     n = 0
-    for od, o, e, kk in games:
+    for od, o, e, kk, w, f in games:
         if od < cutoff:
             outs += o
             er += e
             k += kk
+            bb += w
+            bf += f
             n += 1
     if n == 0 or outs <= 0:
         return None
     ip = outs / 3.0
     return {"era": (er / ip) * 9.0, "ip": ip, "k": k, "games": n,
-            "avg_ip": ip / n}
+            "avg_ip": ip / n, "bb": bb, "bf": bf}
 
 
 def pitcher_throws(athlete_id):

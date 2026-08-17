@@ -1073,6 +1073,11 @@ CREATE TABLE dbo.mlb_pitcher_game (
     IP            FLOAT,                                 -- base-3 float (6.1 == 6IP+1out)
     K             FLOAT,
     ER            FLOAT,
+    BB            FLOAT,                                 -- Tier A #1c (walks)
+    BF            FLOAT,                                 -- batters faced (K%/BB% denom)
+    HR            FLOAT,                                 -- HR allowed (FIP)
+    HBP           FLOAT,                                 -- HBP allowed (FIP)
+    GS            FLOAT,                                 -- games started (1) / relief (0)
     fetched_at    FLOAT,
     CONSTRAINT uq_mlb_pitcher_game UNIQUE (athlete_id, game_pk),
     CONSTRAINT fk_mlb_pitcher_game_game
@@ -1080,6 +1085,14 @@ CREATE TABLE dbo.mlb_pitcher_game (
     CONSTRAINT fk_mlb_pitcher_game_team
         FOREIGN KEY (team_id) REFERENCES dbo.mlb_team (team_id)
 );
+GO
+-- Tier A #1c UNLOCK for an EXISTING table (idempotent). ⚠ RUN THIS BEFORE deploying
+-- the code that adds BB/BF/HR/HBP/GS to _PITCHER_GAME_STATS — _game_log SELECTs
+-- *stat_cols, so the code expects these columns to exist. After the ALTER, re-derive
+-- from the cached bronze boxscores to populate them (mlb_warehouse re-ingest).
+IF COL_LENGTH('dbo.mlb_pitcher_game', 'BB') IS NULL
+    ALTER TABLE dbo.mlb_pitcher_game
+        ADD BB FLOAT, BF FLOAT, HR FLOAT, HBP FLOAT, GS FLOAT;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_mlb_pitcher_game_athlete'
