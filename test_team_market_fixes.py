@@ -209,6 +209,28 @@ class OosAbTests(unittest.TestCase):
         self.assertEqual(analysis.DEFAULT_PYTHAG_WEIGHT, 0.35)   # restored
 
 
+class SpreadDispersionTests(unittest.TestCase):
+    """#5 overdispersion ships INERT: NegBin at dispersion 0 must be byte-identical
+    to the Poisson the spread challenger used before, and the default must be 0."""
+
+    def test_negbin_zero_equals_poisson(self):
+        for h, a, s in [(4.5, 4.0, 0.5), (5.2, 3.1, -1.5), (3.0, 6.0, 1.5)]:
+            self.assertAlmostEqual(
+                ms.negative_binomial_margin_probability(h, a, s, 0.0),
+                ms.poisson_margin_probability(h, a, s), places=9)
+
+    def test_positive_dispersion_widens_toward_half(self):
+        # a confident cover (favorite) should move TOWARD 0.5 as dispersion rises
+        base = ms.negative_binomial_margin_probability(6.0, 3.0, -1.5, 0.0)
+        wide = ms.negative_binomial_margin_probability(6.0, 3.0, -1.5, 0.20)
+        self.assertGreater(base, 0.5)
+        self.assertLess(wide, base)   # overdispersion pulls the confident side down
+
+    def test_default_is_inert(self):
+        import analysis
+        self.assertEqual(analysis.DEFAULT_SPREAD_DISPERSION, 0.0)
+
+
 class UnleashSweepTests(unittest.TestCase):
     """The risky part of unleash_sweep is the per-variant override of two GLOBALS
     (analysis.DEFAULT_PYTHAG_WEIGHT + pricing_common._PROB_SHRINK_CACHE) — they

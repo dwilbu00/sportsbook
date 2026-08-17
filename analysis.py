@@ -84,6 +84,16 @@ DEFAULT_PYTHAG_WEIGHT = 0.35
 # layer — is the only lineup approach worth revisiting. See [[team-market-audit]].
 DEFAULT_LINEUP_WEIGHT = 0.0
 
+# Spread-challenger run-distribution OVERDISPERSION (mining idea #5). The expected-
+# runs spread challenger models each team's runs as independent Poisson, whose thin
+# tails under-price the overdispersed spread of real baseball scores (a variance-
+# floor overconfidence the audit flagged). NegBin variance = mean + d*mean**2; d=0.0
+# is BYTE-IDENTICAL to the current Poisson (shared _run_pmf), so this ships INERT.
+# Raise it (backtest via --spread-dispersion-sweep) to widen the run-line cover
+# distribution — pulling over-confident cover probs toward 0.5 — before any live
+# change. See [[team-market-audit]], [[baseballpredictions-mining]].
+DEFAULT_SPREAD_DISPERSION = 0.0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Pure-Python statistics helpers now live in stats.py (imported + re-exported
@@ -780,9 +790,9 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         current_home_cover = _norm_cdf(
             (current_pred_margin + home_spread) / pred_std)
         expected_home_cover = (
-            mlb_starters.poisson_margin_probability(
+            mlb_starters.negative_binomial_margin_probability(
                 expected_runs["home_runs"], expected_runs["away_runs"],
-                home_spread)
+                home_spread, DEFAULT_SPREAD_DISPERSION)
             if expected_runs else None)
         model_home_cover, home_cover_prob = _cover_probabilities(
             current_home_cover, expected_home_cover, market_home_cover)
@@ -797,9 +807,9 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         current_away_cover = _norm_cdf(
             (away_spread - current_pred_margin) / pred_std)
         expected_away_cover = (
-            mlb_starters.poisson_margin_probability(
+            mlb_starters.negative_binomial_margin_probability(
                 expected_runs["away_runs"], expected_runs["home_runs"],
-                away_spread)
+                away_spread, DEFAULT_SPREAD_DISPERSION)
             if expected_runs else None)
         market_away_cover = (1.0 - market_home_cover
                              if market_home_cover is not None else None)

@@ -4763,6 +4763,69 @@ def oos_ab(sport_key, espn_sport, espn_league, train_seasons, test_seasons,
     print("  (Diagnostic only — nothing written. MONEYLINE only.)")
 
 
+def spread_dispersion_sweep(sport_key, espn_sport, espn_league, season_year=None,
+                            limit=100000, store_label="", source="auto",
+                            dispersions=None):
+    """SPREADS overdispersion sweep (mining idea #5, NO WRITE): re-grade the run-
+    line challenger across NegBin dispersion d (variance = mean + d*mean**2; d=0 =
+    today's Poisson, byte-identical), and report per-d the spread calibration slope
+    (does widening the run distribution fix over-confidence? slope -> 1) + Brier-
+    skill-vs-market + ROI-at-gate. INERT until you set analysis.DEFAULT_SPREAD_
+    DISPERSION live; judge here first. One re-grade per d (challenger is baked)."""
+    _warn_small_limit(limit)
+    import prob_metrics
+    DS = dispersions if dispersions else [0.0, 0.02, 0.05, 0.10, 0.15, 0.20]
+    GATES = [("edge>=5%", None, 0.0, 0.05), ("edge>=10%", None, 0.0, 0.10),
+             ("EV>=8%&edge>=2%", 0.08, 0.02, 0.0),
+             ("EV>=12%&edge>=3%", 0.12, 0.03, 0.0)]
+    saved = analysis.DEFAULT_SPREAD_DISPERSION
+    results = {}
+    try:
+        for d in DS:
+            analysis.DEFAULT_SPREAD_DISPERSION = d
+            obs = {m: [] for m in MARKETS}
+            print(f"\n########## re-grade: spread dispersion d={d:.2f} ##########")
+            run_odds_backtest(
+                sport_key, espn_sport, espn_league, limit=limit, window=10,
+                variants={"live": VARIANT_PRESETS.get("all", {})},
+                season_year=season_year, threshold_pct=5.0,
+                write_calibration=False, store_label=store_label,
+                engine="live", prob_shrink=1.0, source=source,
+                supplement_log=False, collect_obs=obs)
+            results[d] = obs["spreads"]
+    finally:
+        analysis.DEFAULT_SPREAD_DISPERSION = saved
+
+    print("\n\n############ SPREADS overdispersion sweep (mining #5) ############")
+    print("  d=0 is today's Poisson. calibSlope<1 = overconfident (widening d should")
+    print("  raise it toward 1); BSS>0 = beat the close; ROI at closing prices.")
+    print("  {:<6}{:>7}{:>11}{:>8}".format("d", "n", "calibSlope", "BSS")
+          + "".join("{:>16}".format(g[0]) for g in GATES))
+    for d in DS:
+        obs = results[d]
+        rows = [(o[0], o[1], o[2]) for o in obs if o[1] is not None]
+        if len(rows) < 50:
+            print(f"  {d:<6.2f}(thin {len(rows)})")
+            continue
+        probs = [r[0] for r in rows]
+        refs = [r[1] for r in rows]
+        ys = [r[2] for r in rows]
+        cs = prob_metrics.calibration_slope(probs, ys)
+        bss = prob_metrics.brier_skill_score(probs, ys, refs)
+        cells = []
+        for _, evf, edf, leg in GATES:
+            t = _team_gate_tally(obs, 1.0, evf, edf, leg)
+            cells.append(f"{t['roi']*100:+.1f}%({t['n']})" if t["roi"] is not None
+                         else "-")
+        print("  {:<6.2f}{:>7}{:>11}{:>8}".format(
+            d, len(rows),
+            f"{cs['slope']:.2f}" if cs else "-",
+            f"{bss*100:+.1f}%" if bss is not None else "-")
+            + "".join("{:>16}".format(c) for c in cells))
+    print("\n  (Diagnostic only — nothing written. SPREADS only. If a d>0 lifts the")
+    print("   calib slope toward 1 AND holds ROI, backtest-confirm then set live.)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
     p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
@@ -4826,6 +4889,13 @@ def main():
                    help="(--oos-ab) seasons to SELECT the A x B blend on, e.g. 2023,2024.")
     p.add_argument("--test-seasons", default=None,
                    help="(--oos-ab) disjoint seasons to TEST on, e.g. 2025,2026.")
+    p.add_argument("--spread-dispersion-sweep", action="store_true",
+                   help="(odds mode) SPREADS NegBin overdispersion sweep: re-grade the "
+                        "run-line challenger across dispersion d (0=Poisson), report "
+                        "calibration slope + BSS + ROI-at-gate per d. INERT until set "
+                        "live. No write.")
+    p.add_argument("--dispersions", default=None,
+                   help="(--spread-dispersion-sweep) comma list, e.g. 0,0.05,0.1,0.2.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -5035,6 +5105,13 @@ def main():
                 oos_ab(sport_key, espn_sport, espn_league, _tr, _te,
                        limit=args.limit, store_label=args.store_label,
                        source=args.source, a_weights=_aw, b_weights=_bw)
+        elif args.spread_dispersion_sweep:
+            _ds = ([float(x) for x in args.dispersions.split(",")]
+                   if args.dispersions else None)
+            spread_dispersion_sweep(sport_key, espn_sport, espn_league,
+                                    season_year=odds_seasons, limit=args.limit,
+                                    store_label=args.store_label, source=args.source,
+                                    dispersions=_ds)
         else:
             run_odds_backtest(sport_key, espn_sport, espn_league,
                               limit=args.limit, window=args.window, variants=variants,
