@@ -745,7 +745,7 @@ def ensure_teams(season, force=False):
 
 
 # ───────────────────────────────────────────────────────────────── ingestion API
-def ingest_date(date, with_boxscores=True, land_bronze=True):
+def ingest_date(date, with_boxscores=True, land_bronze=True, skip_game_pks=None):
     """Ingest one YYYY-MM-DD slate → mlb_team/mlb_game (+ mlb_player and the
     StatsAPI-native per-game batter/pitcher stat facts from each genuine-final
     boxscore). Read-only DUAL-RUN: NO ESPN reads, and NOTHING app-facing consumes
@@ -809,6 +809,11 @@ def ingest_date(date, with_boxscores=True, land_bronze=True):
         g for g in games
         if mlb_starters._is_genuine_final(
             {"status": g["status"], "detailedState": g["detailed_state"]})]
+    if skip_game_pks:
+        # Resume/incremental: skip games already re-derived (boxscore fetch + write is
+        # the whole cost) — the dims upsert above still ran, keeping mlb_game current.
+        final_games = [g for g in final_games
+                       if g["game_pk"] not in skip_game_pks]
     summary["final"] = len(final_games)
 
     def _fetch(g):
@@ -865,10 +870,12 @@ def ingest_date(date, with_boxscores=True, land_bronze=True):
     return summary
 
 
-def ingest_range(start, end, with_boxscores=True, land_bronze=True):
+def ingest_range(start, end, with_boxscores=True, land_bronze=True,
+                 skip_game_pks=None):
     """Ingest an inclusive [start, end] date range; yields a per-date summary.
     ``land_bronze=False`` skips the transient raw-JSON audit trail for a fast
-    bulk backfill (see ingest_date)."""
+    bulk backfill (see ingest_date). ``skip_game_pks`` (a set) skips already-derived
+    games — see pitcher_cols_done_game_pks / the --skip-existing resume path."""
     d0 = datetime.date.fromisoformat(str(start))
     d1 = datetime.date.fromisoformat(str(end))
     results = []
@@ -876,9 +883,31 @@ def ingest_range(start, end, with_boxscores=True, land_bronze=True):
     step = datetime.timedelta(days=1)
     while cur <= d1:
         results.append(ingest_date(cur.isoformat(), with_boxscores=with_boxscores,
-                                   land_bronze=land_bronze))
+                                   land_bronze=land_bronze,
+                                   skip_game_pks=skip_game_pks))
         cur += step
     return results
+
+
+def pitcher_cols_done_game_pks(start, end, col="BF"):
+    """Set of game_pks whose mlb_pitcher_game rows already have ``col`` populated, for
+    games with official_date in [start, end]. The RESUME set for a #1c re-derive: a
+    game's facts are written atomically (one transaction), so any row having ``col``
+    means the whole game is done -> skip it. {} on error / SQL off."""
+    if not enabled():
+        return set()
+    try:
+        pg, g = mlb_pitcher_game, mlb_game
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(pg.c.game_pk).select_from(
+                    pg.join(g, pg.c.game_pk == g.c.game_pk))
+                .where((g.c.official_date >= str(start))
+                       & (g.c.official_date <= str(end))
+                       & (pg.c[col].isnot(None))).distinct()).fetchall()
+        return {r[0] for r in rows}
+    except (OperationalError, ValueError, TypeError, KeyError):
+        return set()
 
 
 def ingest_maintenance(days_back=2, days_forward=2, straggler_days=14):
@@ -2393,6 +2422,11 @@ def _main_cli():
                          "trail, writing only silver dims + facts (much less write "
                          "volume/round-trips per game). Use for bulk historical "
                          "re-ingest; the live/maintenance path keeps bronze.")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="With --ingest-range: RESUME a #1c re-derive by skipping "
+                         "games whose pitcher facts already have BB/BF populated (so a "
+                         "killed run doesn't redo finished dates). Pair with "
+                         "--no-bronze for the fastest catch-up.")
     ap.add_argument("--purge-boxscores", action="store_true",
                     help="Maintenance: delete processed boxscore bronze payloads.")
     ap.add_argument("--backfill-game-pk", action="store_true",
@@ -2425,8 +2459,15 @@ def _main_cli():
                                land_bronze=bronze)))
     if args.ingest_range:
         did = True
+        skip = None
+        if args.skip_existing:
+            skip = pitcher_cols_done_game_pks(args.ingest_range[0],
+                                              args.ingest_range[1])
+            print(f"  [skip-existing] {len(skip)} games already have BF — skipping "
+                  f"them (resume mode).")
         for res in ingest_range(args.ingest_range[0], args.ingest_range[1],
-                                with_boxscores=box, land_bronze=bronze):
+                                with_boxscores=box, land_bronze=bronze,
+                                skip_game_pks=skip):
             print(_fmt(res))
     if args.standings is not None:
         did = True

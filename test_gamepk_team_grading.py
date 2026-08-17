@@ -508,5 +508,63 @@ class LoadTeamMarketStoreDHTests(unittest.TestCase):
         self.assertEqual(len(store["games"]), 1)             # byte-identical: one entry
 
 
+class PitcherColsResumeTests(unittest.TestCase):
+    """#1c re-ingest RESUME: pitcher_cols_done_game_pks (the skip set) + ingest_date's
+    skip_game_pks filter (skipped games are never fetched)."""
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        mw.create_all()
+        mw._TEAMS_ENSURED.clear()
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "111"):
+                conn.execute(insert(mw.mlb_team), {"team_id": tid, "name": tid})
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+        mw._TEAMS_ENSURED.clear()
+
+    def _game(self, pk, official_date):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mw.mlb_game), {
+                "game_pk": pk, "official_date": official_date,
+                "game_date": official_date + "T18:00:00Z", "season": 2025,
+                "home_team_id": "147", "away_team_id": "111"})
+
+    def _pitcher(self, aid, pk, bf=None):
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mw.mlb_pitcher_game), {
+                "athlete_id": aid, "game_pk": pk, "team_id": "147",
+                "season_bucket": 2025, "IP": 6.0, "ER": 2.0, "K": 5.0, "BF": bf})
+
+    def test_done_set_is_games_with_bf_in_range(self):
+        self._game(10, "2025-04-01"); self._pitcher("p1", 10, bf=24.0)   # done
+        self._game(11, "2025-04-02"); self._pitcher("p2", 11, bf=None)   # not done
+        self._game(12, "2025-05-01"); self._pitcher("p3", 12, bf=25.0)   # out of range
+        self.assertEqual(
+            mw.pitcher_cols_done_game_pks("2025-04-01", "2025-04-30"), {10})
+
+    def test_ingest_date_skips_supplied_game_pks(self):
+        sched = [{"game_pk": 10, "status": "Final", "detailed_state": "Final",
+                  "home_team_id": "147", "away_team_id": "111", "season": 2025},
+                 {"game_pk": 11, "status": "Final", "detailed_state": "Final",
+                  "home_team_id": "147", "away_team_id": "111", "season": 2025}]
+        fetched = []
+
+        def _fake_box(pk):
+            fetched.append(pk)
+            return {}
+
+        with patch.object(mw, "ensure_teams"), \
+             patch.object(mw, "fetch_schedule", return_value={}), \
+             patch.object(mw, "parse_schedule", return_value=(list(sched), [])), \
+             patch.object(mw, "_real_franchise_ids", return_value=set()), \
+             patch.object(mw, "fetch_boxscore", side_effect=_fake_box), \
+             patch.object(mw, "parse_boxscore_players", return_value=[]), \
+             patch.object(mw, "_write_game_facts", return_value=(0, 0)):
+            mw.ingest_date("2025-04-01", land_bronze=False, skip_game_pks={10})
+        self.assertEqual(fetched, [11])           # 10 skipped, 11 still fetched
+
+
 if __name__ == "__main__":
     unittest.main()
