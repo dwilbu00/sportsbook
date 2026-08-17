@@ -844,7 +844,10 @@ def _assemble_team_entry(event_id, rows):
     return entry
 
 
-def load_team_market_store(sport_key, dates=None):
+SBR_EVENT_PREFIX = "sbr-"   # synthetic id prefix stamped by ingest_sbr_odds.py
+
+
+def load_team_market_store(sport_key, dates=None, include_sbr=False):
     """Assemble a historical_odds-shaped store from the SQL warehouse's captured
     team-market lines, for the team-market backtest.
 
@@ -853,9 +856,31 @@ def load_team_market_store(sport_key, dates=None):
     backtest._build_odds_lookup / _moneyline_market / _spread_market /
     _total_market consume it unchanged — one entry per event built from that
     event's closing snapshot. SQL-only and best-effort: returns an empty store
-    when SQL is off or on any error."""
+    when SQL is off or on any error.
+
+    SBR EXCLUSION (default): the 2023 -> ~2025-08-16 closes were ingested from
+    SBR (ingest_sbr_odds.py, ``sbr-``-prefixed synthetic event ids) and were
+    found to systematically poison ROI backtests (same games/model: ML SBR
+    -8.58% vs clean Odds-API +1.19%, Brier identical). SBR captured_at=commence
+    so it WINS _closing_sort_key, and its ``sbr-`` id sorts AFTER the API hash
+    id for the same game_key -> the SBR entry silently overwrites the clean API
+    one. We now reload those windows from the Odds API and seed them here
+    (warehouse.seed_from_store), so ``sbr-`` snapshots are dropped by default:
+    a game with clean API/live odds serves those; a game with ONLY SBR (2023,
+    until reloaded) serves NOTHING (correctly skipped, never poisoned) — the
+    owner's stance is "no odds are better than SBR odds". Pass include_sbr=True
+    to restore SBR for a deliberate SBR-vs-API diagnostic. Non-destructive: SBR
+    rows stay in the DB (reproducible via ingest_sbr_odds.py); this only filters
+    the read."""
+    # NOTE: "pre-close", not "closing". The reader picks each event's nearest
+    # at-or-before-commence snapshot, but the SEED timing varies by season:
+    # reloaded 2024/2025 are a fixed ~00:05Z daily capture (median ~18.5h before
+    # first pitch = prior-evening opening-ish lines), while live-captured 2026 is
+    # nearer the close. So this is NOT a true closing/CLV corpus; cross-season
+    # ABSOLUTE ROI mixes line timings (read it with the bet-early/timing lens).
+    # Relative idea evaluation is unaffected (each idea graded on identical odds).
     empty = {"sport_key": sport_key, "games": {},
-             "bookmaker": "warehouse (best-of-book, closing)"}
+             "bookmaker": "warehouse (DK best-available, pre-close; timing varies by season)"}
     _ensure_durable("read the team-market warehouse")
     if not _sql():
         return empty
@@ -872,10 +897,30 @@ def load_team_market_store(sport_key, dates=None):
     except Exception:
         return empty
     by_event = {}
+    sbr_excluded = set()
     for r in rows:
-        by_event.setdefault(r.get("event_id"), []).append(r)
+        eid = r.get("event_id")
+        if (not include_sbr and isinstance(eid, str)
+                and eid.startswith(SBR_EVENT_PREFIX)):
+            sbr_excluded.add(eid)
+            continue
+        # Group by (event_id, game_date), NOT event_id alone. The daily-cadence
+        # backfill can stamp ONE Odds-API event_id onto consecutive-day series
+        # games (same matchup, different dates — name-only match in
+        # backfill_historical_odds._find_sampled). Grouping by event_id alone
+        # collapses them: _assemble_team_entry returns one entry per group and
+        # the later game is silently dropped. Adding game_date separates them;
+        # for correctly-unique data one event_id maps to exactly one game_date,
+        # so this is byte-identical (2026-live, SBR).
+        by_event.setdefault((eid, r.get("game_date")), []).append(r)
+    if sbr_excluded:
+        # Visible, never silent: a 2023-only run legitimately empties out here.
+        # Count is the ALL-DATES warehouse total (the reader is called unscoped),
+        # not the run's graded window.
+        print(f"  [warehouse] excluded {len(sbr_excluded)} SBR-sourced event(s) "
+              f"across all dates (poisoned closes; include_sbr=True to restore).")
     games = {}
-    for event_id, ev_rows in by_event.items():
+    for (event_id, _game_date), ev_rows in by_event.items():
         entry = _assemble_team_entry(event_id, ev_rows)
         if entry is None:
             continue
@@ -998,7 +1043,15 @@ def doubleheader_event_ids(rows):
 
 def seed_from_store(sport_key, label=""):
     """Backfill the warehouse from historical_odds/<sport>.json (one snapshot
-    per stored game). Returns the number of snapshots written. Best-effort."""
+    per stored game). Returns the number of snapshots written. Best-effort.
+
+    Fails LOUD in a prod (require-SQL) context via _ensure_durable so a bare call
+    with SQL unconfigured can't silently write the ephemeral local warehouse/ and
+    report a false 'success' that leaves prod un-seeded. Outside prod it stays
+    best-effort (local backend). Entries with NO usable team/prop line are skipped
+    (they would otherwise write dead line-less snapshot rows that no reader ever
+    surfaces)."""
+    _ensure_durable("seed the warehouse from the historical_odds store")
     try:
         import historical_odds as store_mod
     except Exception:
@@ -1006,6 +1059,7 @@ def seed_from_store(sport_key, label=""):
     store = store_mod.load_store(sport_key, label)
     games = store.get("games") or {}
     written = 0
+    skipped_empty = 0
     for entry in games.values():
         commence = entry.get("commence_time")
         event_id = entry.get("event_id") or store_mod.game_key(
@@ -1022,6 +1076,10 @@ def seed_from_store(sport_key, label=""):
             "totals": entry.get("totals", {}),
             "props": entry.get("props", {}),
         }
+        lines = _enumerate_lines(payload, "historical_odds_store", "seed")
+        if not lines:
+            skipped_empty += 1   # market-less entry -> no dead snapshot row
+            continue
         envelope = {
             "captured_at": captured_at,
             "sport": sport_key,
@@ -1041,7 +1099,7 @@ def seed_from_store(sport_key, label=""):
                 "captured_at": captured_at, "commence_time": commence,
                 "home": entry.get("home_team"), "away": entry.get("away_team"),
                 "regions": None, "markets": "seed", "bookmakers": None,
-            }, _enumerate_lines(payload, "historical_odds_store", "seed"))
+            }, lines)
             if _db.capture_odds_snapshot(_snap, _lines):
                 written += 1
             continue
@@ -1058,6 +1116,8 @@ def seed_from_store(sport_key, label=""):
             "captured_at": captured_at,
             "markets": "seed",
         }])
+    if skipped_empty:
+        print(f"  [seed] skipped {skipped_empty} market-less store entries.")
     return written
 
 

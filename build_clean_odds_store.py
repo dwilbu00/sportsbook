@@ -15,13 +15,19 @@ clean Odds-API +1.19%, Brier identical). We reloaded clean Odds-API DK closes
 for those windows into labeled stores (api2024, api2025). 2026+ in the warehouse
 is already clean (live-captured, pre-close).
 
-Why a store and NOT a warehouse promote
----------------------------------------
-warehouse.load_team_market_store picks each event's CLOSING snapshot (nearest
-at-or-before commence via _closing_sort_key). If we promoted the reloaded ~noon
-API lines alongside the existing SBR closes, SBR (closer to commence) would keep
-winning that selection — the poison would never be replaced. A dedicated clean
-store sidesteps this entirely and keeps the live warehouse untouched.
+Store vs warehouse promote (SUPERSEDED — read this)
+---------------------------------------------------
+This local-store path is now DEV-ONLY. The production workflow is warehouse-
+native: warehouse.load_team_market_store defaults to include_sbr=False (drops
+``sbr-``-prefixed events on read), so the reloaded API lines are seeded INTO the
+warehouse (warehouse.seed_from_store / `python warehouse.py --seed-from-store
+--label api2024`) and served via `--source warehouse`, with SBR filtered out.
+
+Originally a local store was preferred because the reader picked each event's
+closing snapshot and SBR (captured at commence) would always beat a promoted
+pre-close API line — the poison could never be replaced. The read-time SBR
+exclusion removed that obstacle, so the warehouse seed is now the intended path.
+This tool remains handy for a fully-isolated local backtest source.
 
 What this does
 --------------

@@ -923,6 +923,92 @@ class TeamMarketLinesSqlTests(_SqliteBackend, unittest.TestCase):
         for side in (entry["totals"]["Over"] + entry["totals"]["Under"]):
             self.assertEqual(set(side), {"book", "line", "price"})
 
+    def test_sbr_excluded_by_default_clean_api_wins(self):
+        # Two snapshots for the SAME game (same date/teams -> same game_key): a
+        # clean API one (real hash id, captured ~noon before commence) and an
+        # SBR one (sbr- id, captured AT commence). Default: SBR is dropped and
+        # the API line is served. include_sbr=True restores SBR, which -- being
+        # captured at commence -- WINS _closing_sort_key and overwrites the API
+        # entry: that is exactly the poison the default exclusion prevents.
+        import warehouse
+
+        def _meta(event_id, hour, captured_at):
+            return {"sport": "baseball_mlb", "game_date": "2026-07-22",
+                    "event_id": event_id, "kind": "team", "snapshot_hour": hour,
+                    "captured_at": captured_at,
+                    "commence_time": "2026-07-22T23:00:00Z",
+                    "home": "Rockies", "away": "Astros", "regions": "us",
+                    "markets": "h2h,spreads,totals", "bookmakers": None}
+
+        # API: ML home 130; SBR: ML home 200 (distinct so we can tell them apart).
+        db_store.capture_odds_snapshot(
+            _meta("apihash1", "20260722T18Z", "2026-07-22T18:00:00Z"),
+            self._team_lines(130, -150))
+        db_store.capture_odds_snapshot(
+            _meta("sbr-2026-07-22-Astros-Rockies", "20260722T23Z",
+                  "2026-07-22T23:00:00Z"),
+            self._team_lines(200, -250))
+
+        # Default: SBR excluded -> the clean API line is served.
+        store = warehouse.load_team_market_store("baseball_mlb")
+        self.assertEqual(len(store["games"]), 1)
+        entry = next(iter(store["games"].values()))
+        self.assertEqual(entry["moneyline"]["Rockies"][0]["price"], 130)
+
+        # include_sbr=True: SBR restored and (captured at commence) wins -> poison.
+        store_sbr = warehouse.load_team_market_store(
+            "baseball_mlb", include_sbr=True)
+        entry_sbr = next(iter(store_sbr["games"].values()))
+        self.assertEqual(entry_sbr["moneyline"]["Rockies"][0]["price"], 200)
+
+    def test_shared_event_id_across_dates_not_collapsed(self):
+        # The daily-cadence reload can stamp ONE Odds-API event_id onto
+        # consecutive-day series games (same matchup, different dates, each an
+        # own-date capture with its own line). Grouping by (event_id, game_date)
+        # must keep BOTH; grouping by event_id alone would silently drop one.
+        import warehouse
+
+        def _meta(game_date, hour, captured_at, commence):
+            return {"sport": "baseball_mlb", "game_date": game_date,
+                    "event_id": "shared1", "kind": "team", "snapshot_hour": hour,
+                    "captured_at": captured_at, "commence_time": commence,
+                    "home": "Rockies", "away": "Astros", "regions": "us",
+                    "markets": "h2h,spreads,totals", "bookmakers": None}
+
+        db_store.capture_odds_snapshot(
+            _meta("2024-09-27", "20240927T00Z", "2024-09-27T00:05:00Z",
+                  "2024-09-27T23:10:00Z"),
+            self._team_lines(120, -140))
+        db_store.capture_odds_snapshot(
+            _meta("2024-09-28", "20240928T00Z", "2024-09-28T00:05:00Z",
+                  "2024-09-28T23:10:00Z"),
+            self._team_lines(-135, 115))
+
+        store = warehouse.load_team_market_store("baseball_mlb")
+        self.assertEqual(len(store["games"]), 2)   # both series games survive
+        # Each game_key carries its own date's line, not a collapsed single.
+        by_home_ml = sorted(
+            e["moneyline"]["Rockies"][0]["price"] for e in store["games"].values())
+        self.assertEqual(by_home_ml, [-135, 120])
+
+    def test_sbr_only_game_empties_out(self):
+        # A game with ONLY SBR odds (2023 case, until reloaded) serves NOTHING by
+        # default -- correctly skipped, never poisoned ("no odds > SBR odds").
+        import warehouse
+        db_store.capture_odds_snapshot(
+            {"sport": "baseball_mlb", "game_date": "2023-07-22",
+             "event_id": "sbr-2023-07-22-Astros-Rockies", "kind": "team",
+             "snapshot_hour": "20230722T23Z",
+             "captured_at": "2023-07-22T23:00:00Z",
+             "commence_time": "2023-07-22T23:00:00Z",
+             "home": "Rockies", "away": "Astros", "regions": "us",
+             "markets": "h2h,spreads,totals", "bookmakers": None},
+            self._team_lines(200, -250))
+        self.assertEqual(
+            warehouse.load_team_market_store("baseball_mlb")["games"], {})
+        self.assertTrue(warehouse.load_team_market_store(
+            "baseball_mlb", include_sbr=True)["games"])
+
     def test_store_empty_when_sql_off(self):
         import warehouse
         db_store.configure_engine(None)   # SQL disabled
