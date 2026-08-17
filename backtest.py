@@ -4143,6 +4143,38 @@ def _lineup_runs_diag(lineup):
     print("  lacks; lineup -> market => CLV potential. (Diagnostic only; nothing written.)")
 
 
+def _prob_metrics_panel(obs):
+    """#11: per-market probability metrics that match our creed better than raw
+    Brier — Brier-SKILL vs the market (>0 = we beat the close), ECE, and the
+    calibration SLOPE (<1 = overconfident, the disease we keep naming). obs =
+    {market: [(raw_model_p, market_p, outcome, price_yes, price_no)]}."""
+    import prob_metrics as pm
+    print("\n=== PROBABILITY METRICS: model vs market (mining #11) ===")
+    print("  BSS>0 = beat the close on Brier; ECE lower=better; calibSlope<1 = "
+          "OVERCONFIDENT.")
+    print("  {:<10}{:>7}{:>9}{:>8}{:>12}".format(
+        "market", "n", "BSS", "ECE", "calibSlope"))
+    for market in MARKETS:
+        rows = [(o[0], o[1], o[2]) for o in obs.get(market, [])
+                if o[1] is not None]
+        if len(rows) < 50:
+            print(f"  {market:<10} (thin: {len(rows)})")
+            continue
+        probs = [r[0] for r in rows]
+        refs = [r[1] for r in rows]
+        ys = [r[2] for r in rows]
+        bss = pm.brier_skill_score(probs, ys, refs)
+        e = pm.ece(probs, ys)
+        cs = pm.calibration_slope(probs, ys)
+        print("  {:<10}{:>7}{:>9}{:>8}{:>12}".format(
+            market, len(rows),
+            f"{bss*100:+.2f}%" if bss is not None else "-",
+            f"{e:.3f}" if e is not None else "-",
+            f"{cs['slope']:.2f}" if cs else "-"))
+    print("  (BSS<0 across markets = we don't beat the close on accuracy — expected "
+          "at the variance floor; watch calibSlope for overconfidence.)")
+
+
 def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                        limit=100000, store_label="", source="auto"):
     """Team-market GATE + SHRINK lens (NO WRITE): grade ML/spread/total over the
@@ -4203,6 +4235,8 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                     label, f"{s:.2f}", t["n"], 100 * t["n"] / n_obs, roi,
                     t["pnl"]))
     print("\n  (Diagnostic only — nothing written.)")
+    # #11: richer probability metrics (beat-market + calibration, not raw Brier).
+    _prob_metrics_panel(obs)
     # #2: does a learned Platt curve beat the flat scalar shrink OOS?
     _calibration_bakeoff(dated)
     # #3 v2: does the bottom-up lineup-runs model beat the recency model?
