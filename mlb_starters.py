@@ -267,18 +267,24 @@ def _warehouse_team_factors(season, as_of, min_pa=40):
         return None
     season_start = f"{int(season)}-01-01"
     sp = sh.statcast_pitch
-    try:
-        with db_store.get_engine().connect() as conn:
-            rows = conn.execute(
-                select(sp.c.batting_team, sp.c.p_throws,
-                       func.avg(sp.c.xwoba), func.count(sp.c.xwoba)).where(
-                    (sp.c.xwoba.isnot(None))
-                    & (sp.c.batting_team.isnot(None))
-                    & (sp.c.p_throws.in_(("L", "R")))
-                    & (sp.c.game_date >= season_start)
-                    & (sp.c.game_date <= cutoff.isoformat()))
-                .group_by(sp.c.batting_team, sp.c.p_throws)).all()
-    except Exception:
+    stmt = (select(sp.c.batting_team, sp.c.p_throws,
+                   func.avg(sp.c.xwoba), func.count(sp.c.xwoba)).where(
+                (sp.c.xwoba.isnot(None))
+                & (sp.c.batting_team.isnot(None))
+                & (sp.c.p_throws.in_(("L", "R")))
+                & (sp.c.game_date >= season_start)
+                & (sp.c.game_date <= cutoff.isoformat()))
+            .group_by(sp.c.batting_team, sp.c.p_throws))
+    rows = None
+    for _attempt in range(3):                 # tolerate a transient Azure SQL timeout
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(stmt).all()
+            break
+        except Exception:
+            if _attempt < 2:
+                time.sleep(0.5)
+    if not rows:                              # error (all retries) OR no data yet -> None
         return None
     raw = {"L": {}, "R": {}}
     for team, hand, avg, n in (rows or []):
@@ -346,8 +352,12 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
         return None
 
     if _mlb_warehouse_offense_enabled():
-        # Distinct cache key: warehouse and Savant numbers differ slightly, so never
-        # cross-serve. Fall through to Savant only when the warehouse can't answer.
+        # Warehouse-ONLY when the flag is on: the whole point is offline / no-Savant, so
+        # an empty result (early season — no team past min_pa yet) returns None (the
+        # challenger is correctly OFF, no offense data exists anywhere yet) rather than
+        # falling back to the (often unreachable) Savant endpoint, which would emit a
+        # misleading "Savant ... all teams missing" coverage warning. Flag OFF still runs
+        # the Savant path below, byte-identical. Distinct cache key (numbers differ).
         wcache = f"wh_expected_runs_teams_v1_{season}_{cutoff.isoformat()}_{min_pa}"
         wcached = _read_cache(wcache, max_age=24 * 3600)
         if wcached is not None:
@@ -355,7 +365,7 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
         wf = _warehouse_team_factors(season, as_of, min_pa)
         if wf is not None:
             _write_cache(wcache, wf)
-            return wf
+        return wf
 
     # v2: team keys are now normalized into the StatsAPI-abbreviation namespace
     # (see below); a stale v1 cache holds raw Savant keys, so bump to invalidate.

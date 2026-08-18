@@ -338,21 +338,20 @@ class WarehouseTeamOffenseTests(unittest.TestCase):
         self.assertEqual(out, wh)
         savant.assert_not_called()                            # no Savant HTTP
 
-    def test_flag_on_falls_back_to_savant_when_warehouse_none(self):
-        rows = _savant_rows(["NYY", "SEA"])
+    def test_flag_on_is_warehouse_only_no_savant_fallback(self):
+        # Flag on + warehouse returns None (early season, no team past min_pa) -> return
+        # None and do NOT fall back to Savant (avoids a misleading "Savant ... all teams
+        # missing" warning on a Savant-unreachable box; the challenger is correctly off).
         with patch.object(mlb_starters, "_mlb_warehouse_offense_enabled",
                           return_value=True), \
                 patch.object(mlb_starters, "_read_cache", return_value=None), \
                 patch.object(mlb_starters, "_write_cache"), \
                 patch.object(mlb_starters, "_warehouse_team_factors",
                              return_value=None), \
-                patch.object(mlb_starters, "_get_savant_csv",
-                             side_effect=[rows, rows, rows]), \
-                patch.object(mlb_starters, "get_team_index",
-                             return_value=_fake_index({"NYY", "SEA"})):
-            out = mlb_starters.get_expected_runs_team_factors(2024, "2024-09-01")
-        self.assertIsNotNone(out)                             # Savant fallback fired
-        self.assertIn("NYY", out["offense_vs_hand"]["R"])
+                patch.object(mlb_starters, "_get_savant_csv") as savant:
+            out = mlb_starters.get_expected_runs_team_factors(2024, "2024-04-01")
+        self.assertIsNone(out)                                # challenger off, no data
+        savant.assert_not_called()                            # NO Savant fallback
 
 
 if __name__ == "__main__":
