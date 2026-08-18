@@ -377,6 +377,7 @@ def build_dataset(games, season):
         h_bs = a_bs = None
         bullpen_excess = None
         gt = game_teams.get((g["date"], str(g["home_sp"]), str(g["away_sp"])))
+        ha, aa = gt if gt else (None, None)   # resolved team abbrs (None if unmatched)
         h_bp_workload = a_bp_workload = None
         if gt and league_bp:
             ha, aa = gt
@@ -416,6 +417,7 @@ def build_dataset(games, season):
             "date": g["date"],
             "home_team": g.get("home_team"),
             "away_team": g.get("away_team"),
+            "home_abbr": ha, "away_abbr": aa,   # resolved abbrs for the RP-bullpen join
             "venue_id": g.get("venue_id"),
             "home_sp": g["home_sp"],
             "away_sp": g["away_sp"],
@@ -1865,10 +1867,10 @@ def _make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
         away_rate9 = away_rate9 if away_rate9 is not None else league_bp
         home_rate9 = home_rate9 if home_rate9 is not None else league_bp
         home_runs = mlb_starters.expected_runs_additive(
-            away_rate9, _bp(row.get("away_team"), date), _exp_ip(row.get("a_ip")),
+            away_rate9, _bp(row.get("away_abbr"), date), _exp_ip(row.get("a_ip")),
             offense_factor=row.get("a_off_faced") or 1.0)
         away_runs = mlb_starters.expected_runs_additive(
-            home_rate9, _bp(row.get("home_team"), date), _exp_ip(row.get("h_ip")),
+            home_rate9, _bp(row.get("home_abbr"), date), _exp_ip(row.get("h_ip")),
             offense_factor=row.get("h_off_faced") or 1.0)
         return home_runs, away_runs
     return project

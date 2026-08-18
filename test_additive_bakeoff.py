@@ -113,7 +113,7 @@ class ProjectorBullpenTests(unittest.TestCase):
             bs._dict_feat_getter(asof, ("xwobacon", "k9")), model, 4.0,
             ("xwobacon", "k9"), bp_getter=lambda team, date: bp[team])
         row = {"home_sp": "H", "away_sp": "A", "date": "2024-05-01",
-               "home_team": "HOM", "away_team": "AWY",
+               "home_abbr": "HOM", "away_abbr": "AWY",
                "a_ip": 6.0, "h_ip": 6.0, "a_off_faced": 1.0, "h_off_faced": 1.0}
         home_runs, away_runs = proj(row)
         self.assertGreater(home_runs, away_runs)   # bad away pen -> more home runs
