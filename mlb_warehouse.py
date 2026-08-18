@@ -1421,6 +1421,141 @@ def _team_name_map():
         return {}
 
 
+# ───────────────────────────────────────────────────── venue dimension (run_env)
+_STADIUM_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "Major_League_Baseball_Stadiums.csv")
+
+
+def _stadium_csv_geo(path=_STADIUM_CSV):
+    """{park_factors._park_key(team) : (lat, lon)} from the ArcGIS stadium CSV — a
+    lat/lon fallback/cross-check for the venue dim. Rows with blank coords (e.g. the
+    A's Sutter Health placeholder) are skipped. Fail-open → {} on any read error."""
+    import csv
+    from park_factors import _park_key
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                team = row.get("TEAM")
+                try:
+                    lat = float(row.get("LATITUDE"))
+                    lon = float(row.get("LONGITUDE"))
+                except (TypeError, ValueError):
+                    continue
+                if team:
+                    out[_park_key(team)] = (lat, lon)
+    except OSError:
+        return {}
+    return out
+
+
+def _venue_dim_row(venue_id, api_rec, team_id, team_name, csv_geo, now):
+    """PURE enrichment of one mlb_venue row from: the StatsAPI /venues record
+    (name + location.defaultCoordinates + elevation), the venue's modal home team
+    (team_id/name, or None for a neutral site), and the CSV lat/lon fallback keyed by
+    park_factors._park_key. lat/lon precedence: StatsAPI > CSV(team) > MLB_PARK_GEO(team).
+    Park priors + cf_bearing/roof come from the authored team-keyed tables (1.0 / None
+    for an unmatched/neutral venue → run_env stays neutral)."""
+    import park_factors
+    import weather_factors
+    from park_factors import _park_key
+    api_rec = api_rec or {}
+    loc = api_rec.get("location") or {}
+    coords = loc.get("defaultCoordinates") or {}
+    lat = _f(coords.get("latitude"))
+    lon = _f(coords.get("longitude"))
+    geo = weather_factors.park_geo(team_name) if team_name else None
+    if lat is None and team_name and _park_key(team_name) in (csv_geo or {}):
+        lat, lon = csv_geo[_park_key(team_name)]
+    if lat is None and geo:
+        lat, lon = geo.get("lat"), geo.get("lon")
+    return {
+        "venue_id": str(venue_id),
+        "name": api_rec.get("name"),
+        "team_id": str(team_id) if team_id is not None else None,
+        "team_name": team_name,
+        "lat": lat,
+        "lon": lon,
+        "cf_bearing": _f((geo or {}).get("cf_bearing")),
+        "park_hits": park_factors.park_factor(team_name, "hits") if team_name else 1.0,
+        "park_runs": park_factors.park_factor(team_name, "runs") if team_name else 1.0,
+        "elevation_ft": _f(loc.get("elevation")),
+        "roof": (geo or {}).get("roof"),
+        "fetched_at": now,
+    }
+
+
+def _modal_home_team_by_venue():
+    """{venue_id: team_id} — the team that hosts the most games at each venue in
+    mlb_game (its resident team). Neutral sites resolve to whoever hosted most there
+    (park priors for those stay ~neutral). {} when SQL is off / empty."""
+    if not enabled():
+        return {}
+    from sqlalchemy import func
+    g = mlb_game
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.venue_id, g.c.home_team_id, func.count().label("n"))
+                .where(g.c.venue_id.isnot(None))
+                .group_by(g.c.venue_id, g.c.home_team_id)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    best = {}                       # venue_id -> (team_id, n)
+    for vid, tid, n in rows:
+        if vid is None:
+            continue
+        cur = best.get(str(vid))
+        if cur is None or (n or 0) > cur[1]:
+            best[str(vid)] = (str(tid) if tid is not None else None, n or 0)
+    return {vid: tv[0] for vid, tv in best.items()}
+
+
+def build_venue_dim(verbose=True):
+    """Populate mlb_venue: one row per distinct venue_id in mlb_game, enriched with the
+    StatsAPI /venues location (lat/lon/elevation) + the authored park/geo priors
+    (matched via the venue's modal home team). Idempotent upsert (never deletes).
+    OPERATOR-run (network + SQL). Returns rows written, or 0 when SQL is off/empty."""
+    if not enabled():
+        raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
+    venue_team = _modal_home_team_by_venue()
+    if not venue_team:
+        if verbose:
+            print("  [venue] no venue_ids in mlb_game; nothing to build.")
+        return 0
+    name_of = _team_name_map()
+    csv_geo = _stadium_csv_geo()
+    venue_ids = sorted(venue_team)
+    # StatsAPI /venues location (one batched call; hydrate gives lat/lon + elevation).
+    api = {}
+    try:
+        raw = mlb_starters._get("venues", params={
+            "venueIds": ",".join(venue_ids), "hydrate": "location"})
+        for v in (raw or {}).get("venues", []) or []:
+            if v.get("id") is not None:
+                api[str(v["id"])] = v
+    except Exception as exc:                       # noqa: BLE001 — fail-open on network
+        if verbose:
+            print(f"  [venue] StatsAPI /venues fetch failed ({exc}); "
+                  "using priors/CSV geo only.")
+    now = _now()
+    rows = []
+    for vid in venue_ids:
+        tid = venue_team.get(vid)
+        rows.append(_venue_dim_row(vid, api.get(vid), tid,
+                                   name_of.get(tid) if tid else None, csv_geo, now))
+    with _WRITE_LOCK:
+        with db_store.get_engine().begin() as conn:
+            db_store.upsert_bulk(conn, mlb_venue, rows, ("venue_id",),
+                                 ignore_cols=("fetched_at",))
+    if verbose:
+        n_geo = sum(1 for r in rows if r["lat"] is not None)
+        n_park = sum(1 for r in rows if (r["park_runs"] or 1.0) != 1.0)
+        print(f"  [venue] {len(rows)} venues upserted "
+              f"({n_geo} with lat/lon, {n_park} with a non-neutral park factor).")
+    return len(rows)
+
+
 def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
                        season=None, player_name=None):
     """Reproduce the ESPN ``get_player_stat_history`` dict for one MLB player+prop
@@ -2485,6 +2620,10 @@ def _main_cli():
                     help="Cleanup: remove non-real teams (all-star squads + "
                          "postseason bracket placeholders) + their games/facts from "
                          "the dim. DRY-RUN unless --apply.")
+    ap.add_argument("--build-venues", action="store_true",
+                    help="Batch A run_env: populate mlb_venue (StatsAPI /venues "
+                         "lat/lon/elevation + park/geo priors via each venue's modal "
+                         "home team). Idempotent upsert; run after the mlb_venue DDL.")
     ap.add_argument("--apply", action="store_true",
                     help="With --backfill-game-pk / --backfill-team-game-pk / "
                          "--purge-non-franchise: WRITE the changes (default is a "
@@ -2531,6 +2670,9 @@ def _main_cli():
     if args.backfill_team_game_pk:
         did = True
         print(_fmt(backfill_team_game_pk(dry_run=not args.apply)))
+    if args.build_venues:
+        did = True
+        print(_fmt(build_venue_dim()))
     if args.purge_non_franchise:
         did = True
         print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))

@@ -194,6 +194,66 @@ class SchemaParityTests(unittest.TestCase):
                          set(mlb_warehouse._VENUE_COLS))
 
 
+class VenueDimTests(unittest.TestCase):
+    """Pure venue-dimension enrichment (Batch A run_env): _venue_dim_row (lat/lon
+    precedence + park/geo prior join) and the CSV geo loader. No network/SQL."""
+
+    def _row(self, api_rec, team_name, csv_geo=None):
+        # team_id 147 = Yankees (arbitrary here); resident-team is derived elsewhere.
+        return mlb_warehouse._venue_dim_row(
+            "3313", api_rec, "147" if team_name else None, team_name,
+            csv_geo or {}, 1000.0)
+
+    def test_statsapi_location_is_primary(self):
+        row = self._row(
+            {"name": "Yankee Stadium",
+             "location": {"defaultCoordinates": {"latitude": 40.83, "longitude": -73.93},
+                          "elevation": 55}},
+            "New York Yankees")
+        self.assertEqual(row["name"], "Yankee Stadium")
+        self.assertAlmostEqual(row["lat"], 40.83)
+        self.assertAlmostEqual(row["lon"], -73.93)
+        self.assertAlmostEqual(row["elevation_ft"], 55.0)
+        # park priors + cf_bearing/roof from the authored team-keyed tables.
+        self.assertAlmostEqual(row["park_runs"], 1.03)   # Yankees runs prior
+        self.assertAlmostEqual(row["cf_bearing"], 76.0)  # MLB_PARK_GEO
+        self.assertEqual(row["roof"], "open")
+        self.assertEqual(row["team_id"], "147")
+
+    def test_csv_fallback_when_api_has_no_coords(self):
+        from park_factors import _park_key
+        csv_geo = {_park_key("New York Yankees"): (40.83, -73.93)}
+        row = self._row({"name": "Yankee Stadium"}, "New York Yankees", csv_geo)
+        self.assertAlmostEqual(row["lat"], 40.83)       # from CSV
+        self.assertAlmostEqual(row["lon"], -73.93)
+
+    def test_park_geo_fallback_when_api_and_csv_missing(self):
+        row = self._row({}, "New York Yankees")          # no API coords, empty CSV
+        self.assertAlmostEqual(row["lat"], 40.829)       # from MLB_PARK_GEO
+        self.assertAlmostEqual(row["cf_bearing"], 76.0)
+
+    def test_neutral_site_is_park_neutral(self):
+        row = self._row(
+            {"name": "London Stadium",
+             "location": {"defaultCoordinates": {"latitude": 51.5, "longitude": -0.01}}},
+            None)                                        # no resident team
+        self.assertEqual(row["park_hits"], 1.0)          # neutral priors
+        self.assertEqual(row["park_runs"], 1.0)
+        self.assertIsNone(row["cf_bearing"])
+        self.assertIsNone(row["roof"])
+        self.assertIsNone(row["team_id"])
+        self.assertAlmostEqual(row["lat"], 51.5)         # still geolocated from API
+
+    def test_stadium_csv_loads_and_skips_blank_coords(self):
+        from park_factors import _park_key
+        geo = mlb_warehouse._stadium_csv_geo()
+        self.assertIn(_park_key("New York Yankees"), geo)
+        lat, lon = geo[_park_key("New York Yankees")]
+        self.assertAlmostEqual(lat, 40.83, places=1)
+        # The A's Sutter Health placeholder row has blank lat/lon -> skipped.
+        self.assertNotIn(_park_key("Oakland Athletics"), geo)
+
+
 # ─────────────────────────────────────────────────────────── pure parse / derive
 class ParseTests(unittest.TestCase):
     def test_parse_teams_filters_non_mlb(self):
