@@ -1069,6 +1069,18 @@ class AdditiveMoneylineTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(mlb_starters._mlb_additive_ml_enabled())
 
+    def test_any_additive_enabled_covers_each_flag(self):
+        # build_matchup_features surfaces the live-additive keys under this gate; it must
+        # trigger on ANY single additive flag, incl. ML alone (the fixed gap where an
+        # ML-only run left live_additive_runs starved of ids -> silently inert).
+        for flag in ("ODI_MLB_ADDITIVE_RUNS", "ODI_MLB_ADDITIVE_TOTALS",
+                     "ODI_MLB_ADDITIVE_ML"):
+            with patch.dict(os.environ, {flag: "1"}, clear=True):
+                self.assertTrue(mlb_starters._any_additive_enabled(),
+                                f"{flag} alone must trigger surfacing")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(mlb_starters._any_additive_enabled())
+
 
 class AsOfReliabilityTests(unittest.TestCase):
     def test_future_games_do_not_complete_an_earlier_streak(self):

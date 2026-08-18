@@ -710,6 +710,16 @@ def _mlb_additive_ml_enabled():
         "1", "true", "on", "yes")
 
 
+def _any_additive_enabled():
+    """True when ANY additive-market flag (spreads/totals/ML) is on — i.e. when
+    live_additive_runs may be called and build_matchup_features must surface the keys
+    it needs (sp_ids, team_ids/names, game_date, avg_ip). Gating on only spreads+totals
+    silently starved the ML-only path (live_additive_runs saw no ids -> None -> ML fell
+    back), so ML additive was inert even with its flag on; this closes that gap."""
+    return (_mlb_additive_runs_enabled() or _mlb_additive_totals_enabled()
+            or _mlb_additive_ml_enabled())
+
+
 def live_additive_runs(sport_key, factors):
     """(home_runs, away_runs) from the ADDITIVE expected-runs model (Tier A #1d), or
     None to fall through to the multiplicative path. The live twin of the bake-off:
@@ -1740,9 +1750,9 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
             "away_staff_suppression": away_staff,
         }
         # #1d/Tier B: surface the keys the live additive model needs to hit
-        # pitcher_asof_daily — ONLY when an additive flag (spreads OR totals) is on, so
-        # with both OFF the expected_runs dict is byte-identical.
-        if _mlb_additive_runs_enabled() or _mlb_additive_totals_enabled():
+        # pitcher_asof_daily — ONLY when an additive flag (spreads/totals/ML) is on, so
+        # with all OFF the expected_runs dict is byte-identical.
+        if _any_additive_enabled():
             result["expected_runs"].update({
                 "home_sp_id": pitcher_ids.get("home"),
                 "away_sp_id": pitcher_ids.get("away"),
