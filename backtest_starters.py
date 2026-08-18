@@ -2058,6 +2058,58 @@ def test_additive_expected_runs(seasons, holdout_start=None,
     return results
 
 
+def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
+                        mode="blend", blend_k=200.0, n_starts=10):
+    """Fit the additive expected-runs model on the FULL span and STAGE it as the
+    calibration candidate block `expected_runs_additive` (Tier A #1d, commit 5).
+    Default = the bake-off winner: v1 features (xwOBAcon+K9) + prior-season BLEND +
+    team-RP bullpen (league-relative). Uses the SAME helpers the bake-off + live path
+    use, so the persisted model reproduces live. CANDIDATE-ONLY (forces
+    set_candidate_mode(True)); never writes the live file — owner promotes via
+    refit_calibration.py --promote. Returns the staged block, or None."""
+    import calibration_loader as _cl
+    all_rows = []
+    for s in seasons:
+        games = get_season_games(s)
+        rows, _lg = build_dataset(games, s)
+        for r in rows:
+            if (r.get("home_runs") is None and r.get("margin") is not None
+                    and r.get("total_runs") is not None):
+                r["home_runs"] = (r["total_runs"] + r["margin"]) / 2.0
+                r["away_runs"] = (r["total_runs"] - r["margin"]) / 2.0
+        all_rows.extend(rows)
+    series = _load_pitcher_asof_series(seasons)
+    if not all_rows or not series:
+        print("  [additive-save] no rows / empty pitcher_asof_daily — aborting.")
+        return None
+    getter = _make_feat_getter(series, mode, feature_keys, n_starts=n_starts,
+                               blend_k=blend_k)
+    xm = xera_lite.fit(_additive_training_rows(all_rows, getter, feature_keys),
+                       list(feature_keys))
+    if xm is None:
+        print("  [additive-save] xera_lite fit failed (too few rows / NULL features).")
+        return None
+    _bp_series, league_rp_era = _load_bullpen_asof_series(seasons)
+    block = {
+        "enabled": True,
+        "feature_keys": list(feature_keys),
+        "model": xm,
+        "blend": {"mode": mode, "blend_k": blend_k, "n_starts": n_starts},
+        "bullpen": {"league_rp_era": league_rp_era,
+                    "league_bp": xm.get("league_rate9")},
+    }
+    _cl.set_candidate_mode(True)                    # candidate-ONLY, never live
+    _cl.save_expected_runs_additive(
+        "baseball_mlb", block,
+        meta={"seasons": list(seasons), "n_train": len(all_rows)})
+    print(f"  [additive-save] STAGED expected_runs_additive candidate — "
+          f"features={list(feature_keys)} mode={mode} n={xm.get('n')} "
+          f"league_rate9={xm.get('league_rate9')} league_rp_era={league_rp_era}. "
+          f"Review: refit_calibration.py --sport mlb --diff ; promote: --promote. "
+          f"Activate live: set ODI_MLB_ADDITIVE_RUNS=1.")
+    return block
+
+
 if __name__ == "__main__":
     from cli_encoding import configure_stdio
     configure_stdio()
@@ -2109,6 +2161,12 @@ if __name__ == "__main__":
                     help="with --additive-bakeoff, use the GS-based team RP as-of "
                          "bullpen term (league-relative) instead of the flat league "
                          "average (needs the #1c-a re-backfill to populate GS).")
+    ap.add_argument("--additive-save", action="store_true",
+                    help="Tier A #1d: fit the additive expected-runs model (v1/blend/"
+                         "team-RP) on --season and STAGE it as the calibration "
+                         "candidate expected_runs_additive (never live). Promote via "
+                         "refit_calibration.py --promote; activate with "
+                         "ODI_MLB_ADDITIVE_RUNS=1.")
     args = ap.parse_args()
 
     # Default-safe: --save stages a candidate unless --live is given.
@@ -2142,6 +2200,8 @@ if __name__ == "__main__":
         test_additive_expected_runs(seasons, holdout_start=args.holdout_start,
                                     feature_sets=_fs, window_modes=_modes,
                                     rp_bullpen=args.rp_bullpen)
+    elif args.additive_save:
+        save_additive_model(seasons)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:

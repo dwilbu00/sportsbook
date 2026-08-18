@@ -3,9 +3,13 @@
 Covers the pure/logic pieces that don't need SQL or a cached Statcast corpus:
 label orientation, projector orientation, exp-IP clamping, grader shape.
 """
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import backtest_starters as bs
+import calibration_loader as cl
 
 
 class ExpIpTests(unittest.TestCase):
@@ -204,6 +208,49 @@ class GraderShapeTests(unittest.TestCase):
         self.assertIn("brier", m["ml"])
         self.assertIn("rmse", m["margin"])
         self.assertGreaterEqual(m["score_nll"], 0.0)
+
+
+class SaveAdditiveModelTests(unittest.TestCase):
+    """#1d commit 5: save_additive_model fits + STAGES the candidate block
+    (never live). Heavy data loaders + the fit are mocked; only the assembly +
+    candidate-staging is exercised."""
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._od, self._oa = cl.CALIBRATION_DIR, cl.ARCHIVE_DIR
+        cl.CALIBRATION_DIR = self._dir
+        cl.ARCHIVE_DIR = os.path.join(self._dir, "archive")
+        cl.set_candidate_mode(False)
+
+    def tearDown(self):
+        cl.CALIBRATION_DIR, cl.ARCHIVE_DIR = self._od, self._oa
+        cl.set_candidate_mode(False)
+
+    def test_stages_candidate_block_never_live(self):
+        rows = [{"date": "2026-05-01", "home_sp": "H", "away_sp": "A",
+                 "home_runs": 4.0, "away_runs": 3.0}]
+        model = {"feature_keys": ["xwobacon", "k9"], "intercept": 0.5,
+                 "coef": [8.0, -0.1], "league_rate9": 4.5, "n": 300}
+        with patch.object(bs, "get_season_games", return_value=[{}]), \
+             patch.object(bs, "build_dataset", return_value=(rows, 0.32)), \
+             patch.object(bs, "_load_pitcher_asof_series",
+                          return_value={"H": [{}], "A": [{}]}), \
+             patch.object(bs, "_additive_training_rows",
+                          return_value=[{"xwobacon": 0.3, "k9": 9.0, "label": 4.0}] * 20), \
+             patch.object(bs.xera_lite, "fit", return_value=model), \
+             patch.object(bs, "_load_bullpen_asof_series", return_value=({}, 4.2)):
+            block = bs.save_additive_model([2026])
+        self.assertTrue(block["enabled"])
+        self.assertEqual(block["model"], model)
+        self.assertEqual(block["feature_keys"], ["xwobacon", "k9"])
+        self.assertEqual(block["blend"]["mode"], "blend")
+        self.assertEqual(block["bullpen"]["league_rp_era"], 4.2)
+        self.assertEqual(block["bullpen"]["league_bp"], 4.5)   # == model league_rate9
+        # Wrote a CANDIDATE, never live.
+        self.assertTrue(os.path.exists(cl.candidate_path("baseball_mlb")))
+        self.assertFalse(os.path.exists(cl.calibration_path("baseball_mlb")))
+        staged = cl._read_json(cl.candidate_path("baseball_mlb"))
+        self.assertEqual(
+            staged["expected_runs_additive"]["model"]["league_rate9"], 4.5)
 
 
 if __name__ == "__main__":
