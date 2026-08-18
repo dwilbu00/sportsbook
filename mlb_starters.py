@@ -726,13 +726,20 @@ def live_additive_runs(sport_key, factors):
         season = int(str(gd)[:4])
         blend = cfg.get("blend") or {}
         bullpen = cfg.get("bullpen") or {}
-        # Warm today's SP as-of rows (on-demand compute if missing) so the series
-        # carries the row@game_date; RP has no on-demand path (strictly-before covers
-        # today), matching the bake-off.
-        for pid in (str(hsp), str(asp)):
-            pitcher_asof.get_or_fill(pid, gd, "SP")
+        # Load the SP as-of series first (cached per-process during a backtest). Only
+        # warm via get_or_fill when the EXACT game-date row is missing: in a fully-built
+        # store (the backtest replaying history) it already exists, so this skips ~2
+        # redundant SQL round-trips PER GAME and gives the live-engine backtest the
+        # bake-off's bulk-load speed. Live (today's row not yet materialized) still
+        # lazily fills then reloads — byte-identical result either way. RP has no
+        # on-demand fill (strictly-before covers today), matching the bake-off.
+        gd10 = str(gd)[:10]
         sp_series = {str(hsp): pitcher_asof.load_sp_series(hsp, season),
                      str(asp): pitcher_asof.load_sp_series(asp, season)}
+        for pid in (str(hsp), str(asp)):
+            if not any(r.get("as_of_date") == gd10 for r in sp_series.get(pid, [])):
+                pitcher_asof.get_or_fill(pid, gd, "SP")     # genuine miss -> lazy fill
+                sp_series[pid] = pitcher_asof.load_sp_series(pid, season)
         feat_getter = ar.make_feat_getter(
             sp_series, blend.get("mode", "blend"), feature_keys,
             n_starts=int(blend.get("n_starts", 10)),

@@ -110,6 +110,35 @@ class LiveAdditiveFallbackTests(unittest.TestCase):
             self.assertIsNone(mlb_starters.live_additive_runs("baseball_mlb", FACTORS))
 
 
+class GetOrFillSkipTests(unittest.TestCase):
+    """Backtest speedup: skip the per-game get_or_fill round-trips when the SP series
+    already carries the exact game-date row (fully-built store), lazily fill on a miss."""
+
+    def _run(self, sp_rows):
+        with contextlib.ExitStack() as s:
+            s.enter_context(patch.object(pitcher_asof, "load_sp_series",
+                                         return_value=list(sp_rows)))
+            s.enter_context(patch.object(pitcher_asof, "load_rp_series",
+                                         return_value=[]))
+            spy = s.enter_context(patch.object(pitcher_asof, "get_or_fill",
+                                               return_value=None))
+            s.enter_context(patch.object(calibration_loader,
+                                         "load_expected_runs_additive",
+                                         return_value=CFG))
+            mlb_starters.live_additive_runs("baseball_mlb", FACTORS)  # game_date 2026-06-01
+        return spy
+
+    def test_skips_get_or_fill_when_game_date_row_present(self):
+        spy = self._run([{"as_of_date": "2026-06-01", "season_bucket": 2026,
+                          "n_bbe": 400, "ip": 180.0, "xwobacon": 0.34, "k9": 9.0}])
+        spy.assert_not_called()                          # row present -> no round-trip
+
+    def test_fills_when_game_date_row_missing(self):
+        spy = self._run([{"as_of_date": "2026-05-01", "season_bucket": 2026,
+                          "n_bbe": 400, "ip": 180.0, "xwobacon": 0.34, "k9": 9.0}])
+        self.assertTrue(spy.called)                      # genuine miss -> lazy fill
+
+
 class FlagTests(unittest.TestCase):
     def test_flag_truth_table(self):
         for val, exp in [("1", True), ("true", True), ("on", True), ("yes", True),
