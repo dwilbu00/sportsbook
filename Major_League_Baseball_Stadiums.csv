@@ -1,0 +1,31 @@
+﻿X,Y,OBJECTID,NAME,CITY,STATE,CAPACITY,LATITUDE,LONGITUDE,LEAGUE,TEAM
+-13122643.6199,4002019.7141,1,Angel Stadium,Anaheim,CA,45050,33.80030823,-117.88271332,American,Los Angeles Angels
+-12475219.4424,3954556.4218,2,Chase Field,Phoeniz,AZ,48633,33.44527054,-112.06680298,National,Arizona Diamondbacks
+-8367493.5424,4852318.1583,3,Citizens Bank Park,Philadelphia,PA,43651,39.90618134,-75.16647339,National,Philadelphia Phillies
+-9244953.2579,5211938.0883,4,Comerica Park,Detroit,MI,41681,42.33927917,-83.04882813,American,Detroit Tigers
+-11687894.2707,4830598.8524,5,Coors Field,Denver,CO,50490,39.75635147,-104.99414063,National,Colorado Rockies
+-13162411.2578,4038726.5225,6,Dodger Stadium,Los Angeles,CA,56000,34.07387924,-118.23995209,National,Los Angeles Dodgers
+-7914560.8354,5212983.7293,7,Fenway Park,Boston,MA,37493,42.34622192,-71.09770966,American,Boston Red Sox
+-9407216.3294,4735605.642,8,Great American Ballpark,Cincinnati,OH,42319,39.09720993,-84.5064621,National,Cincinnati Reds
+-9093165.4564,5085747.713,9,Progressive Field,Cleveland,OH,43441,41.49578857,-81.6852951,American,Cleveland Guardians
+-10517513.4247,4729071.1976,10,Kauffman Stadium,Kansas City,MO,37903,39.05163956,-94.4804306,American,Kansas City Royals
+-9792907.3825,5316252.6934,11,Miller Park,Milwaukee,WI,41900,43.02811813,-87.97118378,National,Milwaukee Brewers
+-10614929.8693,3472375.5317,12,Daikin Park,Houston,TX,40963,29.75717926,-95.35553741,National,Houston Astros
+-10040245.7158,4667752.898,13,Busch Stadium,St. Louis,MO,43975,38.62258148,-90.19306183,National,St. Louis Cardinals
+-8529472.9476,4762427.0907,14,Oriole Park at Camden Yards,Baltimore,MD,45363,39.28395081,-76.62155914,American,Baltimore Orioles
+-13624358.4382,4548168.3487,15,Oracle Park,San Francisco,CA,41915,37.77840042,-122.38969421,National,San Francisco Giants
+-13041862.4205,3856552.6725,16,Petco Park,San Diego,CA,42302,32.70756912,-117.15704346,National,San Diego Padres
+-8906244.6488,4931120.3616,17,PNC Park,Pittsburgh,PA,38362,40.44704819,-80.00615692,National,Pittsburgh Pirates
+-13617975.0971,6039156.9234,18,T-Mobile Park,Seattle,WA,47878,47.59146881,-122.33235168,American,Seattle Mariners
+-8220486.4524,4976571.1841,19,Citi Field,Flushing,NY,41800,40.75704193,-73.84588623,National,New York Mets
+-10807180.0363,3862330.0475,20,Global Life Park in Arlington,Arlington,TX,48114,32.75122833,-97.08255005,American,Texas Rangers
+-9200940.817,3219771.053,21,Tropicana Field,St. Petersburg,FL,34078,27.76812553,-82.65345764,American,Tampa Bay Rays
+-9755333.4873,5135525.664,22,Guaranteed Rate Field,Chicago,IL,40615,41.82984924,-87.63365173,American,Chicago White Sox
+-9757782.0201,5153202.1191,23,Wrigley Field,Chicago,IL,41160,41.94805908,-87.65564728,National,Chicago Cubs
+-8229431.2833,4987244.7785,24,Yankee Stadium,Bronx,NY,49642,40.82963181,-73.92623901,American,New York Yankees
+-8572424.6124,4703503.4523,25,Nationals Park,Washington,DC,41418,38.87305069,-77.00740051,National,Washington Nationals
+-10383633.9696,5618648.9315,26,Target Field,Minneapolis,MN,39021,44.98175049,-93.277771,American,Minnesota Twins
+-8837589.7593,5410118.1047,27,Rogers Centre,Toronto,ON,48292,43.64142227,-79.38941956,American,Toronto Blue Jays
+-8929997.0307,2971622.2391,28,Marlins Park,Miami,FL,37000,25.77808952,-80.2195282,National,Miami Marlins
+-13526874.0226891,4661716.0138725,29,Sutter Health Park,West Sacramento,CA,,,,American,Oakland Athletics
+-9402890.8429,4014123.0278,30,SunTrust Park,Cumberland,GA,41084,33.89060974,-84.46760559,National,Atlanta Braves
