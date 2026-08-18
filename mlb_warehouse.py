@@ -83,6 +83,30 @@ mlb_team = Table(
     Index("ix_mlb_team_name", "name_norm"),
 )
 
+# Venue dimension (Batch A run_env): venue_id is the physical park a game is played in
+# (already on mlb_game, from the schedule). Keying park + weather on venue_id — not the
+# home team's name — is correct for neutral-site games (London/Tokyo/Field of Dreams/
+# Sacramento), relocations, and the A's/Rays venue limbo. Populated by build_venue_dim
+# (StatsAPI /venues hydrate=location for name+lat/lon) joined to the authored priors
+# (park_factors / weather_factors.MLB_PARK_GEO). park_hits/park_runs default 1.0
+# (neutral) for an unmatched venue → run_env fails open.
+mlb_venue = Table(
+    "mlb_venue", _META,
+    Column("venue_id", String(16), primary_key=True),    # StatsAPI venue id
+    Column("name", String(160)),
+    Column("team_id", String(32)),                       # canonical home team (None = neutral)
+    Column("team_name", String(160)),                    # for park/geo prior resolution
+    Column("lat", Float),
+    Column("lon", Float),
+    Column("cf_bearing", Float),                          # home plate → CF compass degrees
+    Column("park_hits", Float),                           # authored prior (1.0 = neutral)
+    Column("park_runs", Float),
+    Column("elevation_ft", Float),                        # nullable
+    Column("roof", String(16)),                           # open|retractable|dome
+    Column("fetched_at", Float),
+    Index("ix_mlb_venue_team", "team_id"),
+)
+
 mlb_game = Table(
     "mlb_game", _META,
     Column("game_pk", Integer, primary_key=True, autoincrement=False),  # MLBAM (supplied)
@@ -97,6 +121,11 @@ mlb_game = Table(
     Column("away_team_id", String(32), ForeignKey("mlb_team.team_id",
                                                    name="fk_mlb_game_away")),
     Column("venue_id", String(16)),
+    # Home-plate umpire (Batch A #4): parsed from the boxscore `officials` block during
+    # ingest; joins to umpire_asof by hp_umpire_id. NULL on pre-capture / schedule-only
+    # rows (fails open to a neutral umpire run_env).
+    Column("hp_umpire_id", String(32)),
+    Column("hp_umpire_name", String(160)),
     Column("status", String(32)),                        # abstractGameState
     Column("detailed_state", String(64)),                # detailedState
     Column("home_score", Float),
@@ -221,8 +250,11 @@ _TEAM_COLS = ("team_id", "name", "name_norm", "abbreviation", "league_id",
               "division_id", "fetched_at")
 _GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_type",
               "game_number", "double_header", "home_team_id", "away_team_id",
-              "venue_id", "status", "detailed_state", "home_score", "away_score",
-              "fetched_at")
+              "venue_id", "hp_umpire_id", "hp_umpire_name", "status",
+              "detailed_state", "home_score", "away_score", "fetched_at")
+_VENUE_COLS = ("venue_id", "name", "team_id", "team_name", "lat", "lon",
+               "cf_bearing", "park_hits", "park_runs", "elevation_ft", "roof",
+               "fetched_at")
 _PLAYER_COLS = ("player_id", "full_name", "name_norm", "primary_position",
                 "is_pitcher", "bats", "throws", "fetched_at")
 _STANDINGS_COLS = ("id", "team_id", "season", "as_of_date", "wins", "losses",

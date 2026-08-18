@@ -189,6 +189,10 @@ class SchemaParityTests(unittest.TestCase):
         self.assertEqual({c.name for c in mlb_warehouse.mlb_pitcher_game.columns},
                          set(mlb_warehouse._PITCHER_GAME_COLS))
 
+    def test_venue_cols(self):
+        self.assertEqual({c.name for c in mlb_warehouse.mlb_venue.columns},
+                         set(mlb_warehouse._VENUE_COLS))
+
 
 # ─────────────────────────────────────────────────────────── pure parse / derive
 class ParseTests(unittest.TestCase):

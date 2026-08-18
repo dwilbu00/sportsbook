@@ -952,6 +952,44 @@ GO
 IF COL_LENGTH('dbo.mlb_game', 'game_type') IS NULL
     ALTER TABLE dbo.mlb_game ADD game_type NVARCHAR(4);
 GO
+-- Guarded ALTER (Batch A #4 umpire): home-plate umpire parsed from the boxscore
+-- `officials` block during ingest; joins to umpire_asof by hp_umpire_id. NULL on
+-- schedule-only / pre-capture rows (umpire run_env fails open to neutral).
+IF COL_LENGTH('dbo.mlb_game', 'hp_umpire_id') IS NULL
+    ALTER TABLE dbo.mlb_game ADD hp_umpire_id NVARCHAR(32);
+GO
+IF COL_LENGTH('dbo.mlb_game', 'hp_umpire_name') IS NULL
+    ALTER TABLE dbo.mlb_game ADD hp_umpire_name NVARCHAR(160);
+GO
+
+------------------------------------------------------------------------- mlb_venue
+-- Venue dimension (Batch A run_env). venue_id is the physical park (already on
+-- mlb_game, from the schedule); keying park + weather on venue_id — not the home
+-- team name — is correct for neutral-site games, relocations, and the A's/Rays venue
+-- limbo. Populated by mlb_warehouse.build_venue_dim (StatsAPI /venues hydrate=location
+-- + the authored park_factors / weather_factors priors). park_hits/park_runs default
+-- 1.0 (neutral) so an unmatched venue leaves run_env neutral.
+IF OBJECT_ID('dbo.mlb_venue', 'U') IS NULL
+CREATE TABLE dbo.mlb_venue (
+    venue_id     NVARCHAR(16) NOT NULL PRIMARY KEY,  -- StatsAPI venue id
+    name         NVARCHAR(160),
+    team_id      NVARCHAR(32),                        -- canonical home team (NULL = neutral)
+    team_name    NVARCHAR(160),                       -- for park/geo prior resolution
+    lat          FLOAT,
+    lon          FLOAT,
+    cf_bearing   FLOAT,                               -- home plate -> CF compass degrees
+    park_hits    FLOAT,                               -- authored prior (1.0 = neutral)
+    park_runs    FLOAT,
+    elevation_ft FLOAT,
+    roof         NVARCHAR(16),                        -- open|retractable|dome
+    fetched_at   FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_venue_team'
+                 AND object_id = OBJECT_ID('dbo.mlb_venue'))
+CREATE INDEX ix_mlb_venue_team ON dbo.mlb_venue (team_id);
+GO
 
 ------------------------------------------------------------------------ mlb_player
 -- Player dim keyed on the MLBAM player_id (natural PK). bats/throws are nullable
