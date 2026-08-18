@@ -260,5 +260,93 @@ class LoadSeriesTests(unittest.TestCase):
         self.assertEqual(pa.load_rp_series("999", 2026), [])
 
 
+class SeriesCacheTests(unittest.TestCase):
+    """Opt-in process-level memo cache for load_sp_series / load_rp_series (the
+    backtest speedup). Invariants: OFF by default (byte-identical live), cached ==
+    uncached content, and a get_or_fill INSERT invalidates so no stale row is served."""
+
+    def setUp(self):
+        import savant_history as sh
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        pa.create_all()
+        sh.create_all()
+
+    def tearDown(self):
+        pa.disable_series_cache()          # never leak the cache across tests
+        db_store.configure_engine(None)
+
+    def _sp(self, eid, date, season):
+        with db_store.get_engine().begin() as c:
+            c.execute(pa.pitcher_asof_daily.insert(), {
+                "entity_id": eid, "as_of_date": date, "role": "SP",
+                "season_bucket": season, "xwobacon": 0.32, "k9": 8.0,
+                "n_bbe": 100, "ip": 60.0})
+
+    def test_off_by_default(self):
+        self.assertIsNone(pa._series_cache)
+
+    def test_context_manager_enables_then_always_disables(self):
+        with pa.series_cache():
+            self.assertIsNotNone(pa._series_cache)
+        self.assertIsNone(pa._series_cache)
+        with self.assertRaises(RuntimeError):          # exception mid-block
+            with pa.series_cache():
+                raise RuntimeError("boom")
+        self.assertIsNone(pa._series_cache)            # still torn down
+
+    def test_cached_content_equals_uncached(self):
+        self._sp("1", "2026-04-05", 2026)
+        self._sp("1", "2025-09-30", 2025)
+        uncached = pa.load_sp_series("1", 2026)
+        with pa.series_cache():
+            cached = pa.load_sp_series("1", 2026)
+        self.assertEqual(cached, uncached)             # fit==serve: identical inputs
+
+    def test_second_read_is_memoized(self):
+        self._sp("1", "2026-04-05", 2026)
+        with pa.series_cache():
+            first = pa.load_sp_series("1", 2026)
+            self._sp("1", "2026-05-05", 2026)          # sneak a row behind the cache
+            second = pa.load_sp_series("1", 2026)
+            self.assertIs(second, first)               # served from cache, not re-read
+            self.assertEqual(len(second), 1)           # the sneaked row NOT seen
+        self.assertEqual(len(pa.load_sp_series("1", 2026)), 2)   # off cache: visible
+
+    def test_no_cache_reflects_new_rows(self):
+        self._sp("1", "2026-04-05", 2026)
+        self.assertEqual(len(pa.load_sp_series("1", 2026)), 1)
+        self._sp("1", "2026-05-05", 2026)
+        self.assertEqual(len(pa.load_sp_series("1", 2026)), 2)   # fresh read each call
+
+    def test_invalidate_drops_only_that_entity(self):
+        self._sp("1", "2026-04-05", 2026)
+        self._sp("2", "2026-04-05", 2026)
+        with pa.series_cache():
+            pa.load_sp_series("1", 2026)
+            pa.load_sp_series("2", 2026)
+            self.assertIn(("SP", "1", 2026), pa._series_cache)
+            self.assertIn(("SP", "2", 2026), pa._series_cache)
+            pa._series_cache_invalidate("1")
+            self.assertNotIn(("SP", "1", 2026), pa._series_cache)
+            self.assertIn(("SP", "2", 2026), pa._series_cache)   # sibling untouched
+
+    def test_get_or_fill_insert_invalidates_cache(self):
+        import savant_history as sh
+        with db_store.get_engine().begin() as c:
+            c.execute(sh.statcast_pitch.insert(), [
+                {"game_date": "2024-04-01", "pitcher": "1", "xwoba": 0.30},
+                {"game_date": "2024-04-03", "pitcher": "1", "xwoba": 0.40},
+            ])
+        self._sp("1", "2024-04-02", 2024)              # one pre-existing row
+        wh = {"era": 3.0, "ip": 6.0, "k": 6.0, "games": 1, "avg_ip": 6.0,
+              "bb": 2.0, "bf": 24.0}
+        with pa.series_cache():
+            self.assertEqual(len(pa.load_sp_series("1", 2024)), 1)   # caches the series
+            with patch("mlb_warehouse.asof_pitcher_stats", return_value=wh):
+                pa.get_or_fill("1", "2024-04-07")      # miss -> insert -> invalidate
+            self.assertEqual(len(pa.load_sp_series("1", 2024)), 2)   # new row visible
+
+
 if __name__ == "__main__":
     unittest.main()

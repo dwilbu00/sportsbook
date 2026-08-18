@@ -45,6 +45,7 @@ create_all() is TEST-ONLY (SQLite). Reuses db_store's engine + feature flag.
 import argparse
 import bisect
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -416,6 +417,54 @@ _SERIES_FEATURES = ("xwobacon", "k9", "barrel_pct", "whiff_pct",
                     "hard_hit_pct", "gb_pct", "k_pct", "bb_pct")
 
 
+# ── Opt-in, process-level memo cache for the single-entity as-of series readers ──
+# The additive live-engine BACKTEST calls load_sp_series / load_rp_series ~4x PER
+# GAME with zero reuse — the RP series is re-read for every one of a team's ~486
+# games and the SP series for every start — so an odds backtest is dominated by
+# thousands of redundant Azure-SQL round-trips. When enabled it fetches each
+# (role, entity, season) series ONCE. DEFAULT OFF: the LIVE serving path never
+# enables it, so pricing is byte-identical; only the offline backtest opts in
+# (backtest.run_odds_backtest wraps its pass in series_cache()). Invalidated on any
+# get_or_fill INSERT so a lazily-filled row is never missed (partial-population) —
+# a correctness-preserving speedup, not a stale cache.
+_series_cache = None            # None = disabled; dict {(role, entity, season): rows}
+
+
+def enable_series_cache():
+    """Start memoizing load_sp_series / load_rp_series for THIS process (offline
+    backtest use only). Idempotent; resets any existing contents."""
+    global _series_cache
+    _series_cache = {}
+
+
+def disable_series_cache():
+    """Stop memoizing and drop the cache (restores byte-identical live behavior)."""
+    global _series_cache
+    _series_cache = None
+
+
+@contextmanager
+def series_cache():
+    """Scope the series memo cache to a block: enable on enter, ALWAYS drop on exit
+    (so an exception mid-backtest can't leak a stale cache into later work)."""
+    enable_series_cache()
+    try:
+        yield
+    finally:
+        disable_series_cache()
+
+
+def _series_cache_invalidate(entity_id):
+    """Drop every cached series for one entity — called after a get_or_fill INSERT so
+    the freshly-persisted row is re-read on the next load_*_series. No-op when the
+    cache is disabled."""
+    if _series_cache is None:
+        return
+    eid = str(entity_id)
+    for key in [k for k in _series_cache if k[1] == eid]:
+        del _series_cache[key]
+
+
 def load_sp_series(entity_id, season):
     """[rows sorted by as_of_date] for ONE starter (role='SP'), spanning season_bucket
     IN {season, season-1, season-2} — the single-entity LIVE analog of
@@ -424,11 +473,18 @@ def load_sp_series(entity_id, season):
     blends identically live and offline. The season-2 span matters: a starter's FIRST
     start of `season` selects the season-1 final row as the current line, and the
     prior-season BLEND then needs the season-2 final row (matching the bake-off's
-    min(seasons)-1 extra prior). [] on error / SQL off."""
+    min(seasons)-1 extra prior). [] on error / SQL off. Result is memoized when the
+    process-level series_cache() is active (offline backtest); OFF everywhere else."""
     if not enabled() or not entity_id:
         return []
     try:
         want = [int(season), int(season) - 1, int(season) - 2]
+    except (ValueError, TypeError):
+        return []
+    key = ("SP", str(entity_id), want[0])
+    if _series_cache is not None and key in _series_cache:
+        return _series_cache[key]
+    try:
         t = pitcher_asof_daily
         cols = [t.c.as_of_date, t.c.season_bucket, t.c.n_bbe, t.c.ip]
         cols += [t.c[k] for k in _SERIES_FEATURES]
@@ -445,9 +501,11 @@ def load_sp_series(entity_id, season):
             rec.update({k: r[k] for k in _SERIES_FEATURES})
             out.append(rec)
         out.sort(key=lambda x: x["as_of_date"])
-        return out
     except (OperationalError, ValueError, TypeError, KeyError):
         return []
+    if _series_cache is not None:
+        _series_cache[key] = out
+    return out
 
 
 def load_rp_series(team_id, season):
@@ -461,6 +519,12 @@ def load_rp_series(team_id, season):
         return []
     try:
         want = [int(season), int(season) - 1, int(season) - 2]
+    except (ValueError, TypeError):
+        return []
+    key = ("RP", str(team_id), want[0])
+    if _series_cache is not None and key in _series_cache:
+        return _series_cache[key]
+    try:
         t = pitcher_asof_daily
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(
@@ -469,9 +533,11 @@ def load_rp_series(team_id, season):
                     & (t.c.season_bucket.in_(want)) & (t.c.era.isnot(None)))).all()
         out = [{"as_of_date": str(d)[:10], "era": float(era)} for d, era in rows]
         out.sort(key=lambda x: x["as_of_date"])
-        return out
     except (OperationalError, ValueError, TypeError):
         return []
+    if _series_cache is not None:
+        _series_cache[key] = out
+    return out
 
 
 def _asof_xwobacon_sql(pitcher_id, as_of, season_start):
@@ -541,8 +607,10 @@ def get_or_fill(entity_id, as_of_date, role="SP"):
     try:
         with db_store.get_engine().begin() as conn:
             conn.execute(pitcher_asof_daily.insert(), [row])
+        _series_cache_invalidate(entity_id)   # new row -> re-read the cached series
     except Exception:
         # Lost a write race (uq) or transient error — prefer the persisted row.
+        _series_cache_invalidate(entity_id)   # a racing writer may have landed one
         persisted = asof_pitcher_features(entity_id, as_of_date, role)
         if persisted is not None:
             return persisted
