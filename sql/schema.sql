@@ -925,6 +925,17 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_mlb_game_teams
     ON dbo.mlb_game (official_date, home_team_id, away_team_id);  -- retro-match
 GO
+-- (season, status) COVERING scan (Azure missing-index rec): season-final-games reads
+-- with scores/teams/dates. away_score moved from Azure's key into the INCLUDE (scores
+-- aren't filter predicates). Add WITH (ONLINE = ON) on tiers that support it.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_game_season_status'
+                 AND object_id = OBJECT_ID('dbo.mlb_game'))
+CREATE INDEX ix_mlb_game_season_status
+    ON dbo.mlb_game (season, status)
+    INCLUDE (away_score, home_score, away_team_id, home_team_id, detailed_state,
+             game_date, game_type, official_date);
+GO
 -- Guarded ALTER for the existing prod mlb_game (added after the P1 create): the
 -- StatsAPI schedule gameType (R=regular, A=all-star, S=spring, P/D/F/L/W=postseason).
 -- Captured faithfully at silver; the P4 gold view uses it to exclude exhibitions.
@@ -1060,6 +1071,16 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_mlb_batter_game_athlete
     ON dbo.mlb_batter_game (athlete_id, season_bucket);
 GO
+-- game_pk-first COVERING index (Azure missing-index rec): the uq is (athlete_id,
+-- game_pk) so it can't seek game_pk-first; game_pk grading/as-of reads scan without it.
+-- Covers all batter stat cols -> index-only. Add WITH (ONLINE = ON) where supported.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_batter_game_gamepk'
+                 AND object_id = OBJECT_ID('dbo.mlb_batter_game'))
+CREATE INDEX ix_mlb_batter_game_gamepk
+    ON dbo.mlb_batter_game (game_pk, season_bucket)
+    INCLUDE (athlete_id, AB, H, SO, BB, HBP, SF, SH, HR, TB, RBI);
+GO
 -- Additive: HR/TB/RBI (StatsAPI homeRuns/totalBases/rbi). TB/RBI are fact-servable
 -- (in _ACTUAL_STAT_SPEC) for the batter_total_bases / batter_rbis props; HR awaits an
 -- odds market. Rows ingested before this landed have them NULL — get_player_history
@@ -1112,4 +1133,14 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.mlb_pitcher_game'))
 CREATE INDEX ix_mlb_pitcher_game_athlete
     ON dbo.mlb_pitcher_game (athlete_id, season_bucket);
+GO
+-- game_pk-first COVERING index (Azure missing-index rec): the uq is (athlete_id,
+-- game_pk) so it can't seek game_pk-first; game_pk grading/as-of reads scan without it.
+-- Covers all pitcher stat cols -> index-only. Add WITH (ONLINE = ON) where supported.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_mlb_pitcher_game_gamepk'
+                 AND object_id = OBJECT_ID('dbo.mlb_pitcher_game'))
+CREATE INDEX ix_mlb_pitcher_game_gamepk
+    ON dbo.mlb_pitcher_game (game_pk, season_bucket)
+    INCLUDE (athlete_id, IP, K, ER, BB, BF, HR, HBP, GS);
 GO

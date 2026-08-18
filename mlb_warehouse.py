@@ -104,6 +104,12 @@ mlb_game = Table(
     Column("fetched_at", Float),
     Index("ix_mlb_game_official_date", "official_date"),
     Index("ix_mlb_game_teams", "official_date", "home_team_id", "away_team_id"),
+    # (season, status) COVERING scan (Azure missing-index rec): season-final-games reads
+    # with scores/teams/dates. Azure keyed away_score too, but scores aren't filter
+    # predicates so it's moved into the INCLUDE. mssql_include ignored off SQL Server.
+    Index("ix_mlb_game_season_status", "season", "status",
+          mssql_include=["away_score", "home_score", "away_team_id", "home_team_id",
+                         "detailed_state", "game_date", "game_type", "official_date"]),
 )
 
 mlb_player = Table(
@@ -196,6 +202,13 @@ def _game_fact_table(name, stat_cols):
         Column("fetched_at", Float),
         UniqueConstraint("athlete_id", "game_pk", name=f"uq_{name}"),
         Index(f"ix_{name}_athlete", "athlete_id", "season_bucket"),
+        # game_pk-first COVERING index (Azure missing-index rec): the uq is
+        # (athlete_id, game_pk) so it can't seek game_pk-first, and grading / as-of
+        # reads that filter by game_pk otherwise scan. Covers all stat cols -> index-
+        # only. Append-only ingest, so the extra INCLUDE width is cheap. mssql_include
+        # is ignored off SQL Server (SQLite tests build the 2-col index).
+        Index(f"ix_{name}_gamepk", "game_pk", "season_bucket",
+              mssql_include=["athlete_id", *stat_cols]),
     )
 
 
