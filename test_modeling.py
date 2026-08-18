@@ -618,10 +618,16 @@ class ExpectedRunsTests(unittest.TestCase):
         game_odds = self._game_odds()
         home_stats, away_stats = self._team_stats()
         features = self._matchup_features()
+        # Isolate from the live prob_shrink value: analyze_spreads_value shrinks the
+        # cover via _apply_shrink (NOT _shrink_factor), so pin _apply_shrink to a
+        # deterministic 0.25 pull-to-0.5 — the value the assertions below assume. This
+        # keeps the test about the ENSEMBLE math, independent of calibration refits
+        # (e.g. the spreads-shrink 0.25 -> 0.6 promote that used to break it).
         with patch.object(
                 analysis, "load_expected_runs_challenger",
                 return_value=self._calibration()), patch.object(
-                analysis, "_shrink_factor", return_value=0.25), patch.object(
+                analysis, "_apply_shrink",
+                side_effect=lambda p, sk, mk: 0.5 + 0.25 * (p - 0.5)), patch.object(
                 analysis, "_blend_weight", return_value=1.0):
             current_margin, pred_std, _, _ = analysis._predict_margin(
                 game_odds, home_stats, away_stats,
