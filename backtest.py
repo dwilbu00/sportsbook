@@ -1195,13 +1195,25 @@ def _parse_seasons(spec):
     return sorted({int(x) for x in spec.split(",") if x.strip()})
 
 
-def run_odds_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
-                      min_sample=5, season_year=None, threshold_pct=5.0,
-                      write_calibration=False, store_label="", variance_inflate=1.0,
-                      engine="live", prob_shrink=1.0, source="auto",
-                      supplement_log=True, min_shrink_n=MIN_SHRINK_N,
-                      collect_obs=None, collect_dated=None, collect_lineup=None,
-                      collect_components=None):
+def run_odds_backtest(*args, **kwargs):
+    """Thin wrapper: scope the pitcher_asof series memo cache to the WHOLE backtest
+    pass (offline only) so the additive live-engine path fetches each (entity, season)
+    as-of series ONCE instead of re-reading it per game (the RP series is otherwise
+    re-read for every one of a team's games). The cache is OFF everywhere else, so
+    live serving is byte-identical. See pitcher_asof.series_cache()."""
+    import pitcher_asof
+    with pitcher_asof.series_cache():
+        return _run_odds_backtest_impl(*args, **kwargs)
+
+
+def _run_odds_backtest_impl(
+        sport_key, espn_sport, espn_league, limit, window, variants,
+        min_sample=5, season_year=None, threshold_pct=5.0,
+        write_calibration=False, store_label="", variance_inflate=1.0,
+        engine="live", prob_shrink=1.0, source="auto",
+        supplement_log=True, min_shrink_n=MIN_SHRINK_N,
+        collect_obs=None, collect_dated=None, collect_lineup=None,
+        collect_components=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
