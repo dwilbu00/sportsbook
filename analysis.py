@@ -269,6 +269,25 @@ def _mlb_expected_runs_projection(sport_key, matchup_features):
     }
 
 
+def _mlb_additive_ml_home_win(sport_key, matchup_features):
+    """Tier B (ODI_MLB_ADDITIVE_ML): P(home win) from the ADDITIVE expected runs, or
+    None to fall through to the recency margin model. Symmetric Poisson margin at 0
+    (ties split 50/50) — the same runs→win-prob convention as lineup_runs_win_prob.
+    Returns None on non-MLB, flag off, additive not firing, or any degenerate prob."""
+    if not mlb_starters._mlb_additive_ml_enabled() or not matchup_features:
+        return None
+    pair = mlb_starters.live_additive_runs(
+        sport_key, matchup_features.get("expected_runs") or {})
+    if not pair or pair[0] is None or pair[1] is None:
+        return None
+    home_runs, away_runs = pair
+    p_h = mlb_starters.poisson_margin_probability(home_runs, away_runs, 0.0)
+    p_a = mlb_starters.poisson_margin_probability(away_runs, home_runs, 0.0)
+    if p_h is None or p_a is None:
+        return None
+    return 0.5 * (p_h + (1.0 - p_a))
+
+
 def lineup_runs_win_prob(home_team, away_team, date, season, matchup_features,
                          base_runs=4.48):
     """#3 v2 (DIAGNOSTIC): bottom-up P(home win) from a lineup-driven runs model.
@@ -360,9 +379,19 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
     margin = _predict_margin(game_odds, home_team_stats, away_team_stats,
                              sport_key, matchup_features)
     model_win_by_team = {}
-    if margin is not None:
-        pred_margin, pred_std, _, _ = margin
-        home_win = _norm_cdf(pred_margin / pred_std)
+    # Tier B (ODI_MLB_ADDITIVE_ML): runs-first moneyline — P(home win) from the
+    # additive expected runs (symmetric Poisson margin). Self-sufficient: it becomes
+    # the base win prob even when the recency margin model is unavailable. Inert
+    # unless the flag is on AND the additive fires (mirrors the #1d spreads / totals
+    # substitutions); the #29 residual shift + season-pythag blend + shrink downstream
+    # apply unchanged. Flag OFF -> None -> the original margin-only path is byte-identical.
+    additive_home_win = _mlb_additive_ml_home_win(sport_key, matchup_features)
+    if additive_home_win is not None or margin is not None:
+        if additive_home_win is not None:
+            home_win = additive_home_win
+        else:
+            pred_margin, pred_std, _, _ = margin
+            home_win = _norm_cdf(pred_margin / pred_std)
         # #29 Pythagorean-residual contrarian shift (INERT at weight 0). Fade the
         # over-performer: lower home when home is lucky (rh>0), raise home when the
         # away side is lucky (ra>0). Coherent because away = 1 - home_win.

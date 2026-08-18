@@ -938,6 +938,138 @@ class AdditiveTotalsTests(unittest.TestCase):
             self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
 
 
+class AdditiveMoneylineTests(unittest.TestCase):
+    """Tier B: ODI_MLB_ADDITIVE_ML runs-first moneyline seam in
+    analyze_moneyline_value. When on and the additive fires, P(home win) comes
+    from the additive expected runs (symmetric Poisson margin at 0) as the base
+    win prob; the season-pythag blend + shrink apply downstream. Inert (byte-
+    identical) when off; falls back to the recency margin model on None."""
+
+    @staticmethod
+    def _team_stats():
+        games = [
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 6, "away_score": 3},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 2, "away_score": 4},
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 1, "away_score": 5},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 3, "away_score": 2},
+        ]
+        base = {
+            "season": {"win_pct": 0.5, "runs_scored": 700, "runs_allowed": 680},
+            "recent": {"win_pct": 0.5},
+            "recent_games": games,
+        }
+        return dict(base), dict(base)
+
+    @staticmethod
+    def _game_odds():
+        return {
+            "home_team": "Home",
+            "away_team": "Away",
+            "spreads": {
+                "Home": [{"spread": -1.5, "price": -110}],
+                "Away": [{"spread": 1.5, "price": -110}],
+            },
+            "moneyline": {
+                "Home": [{"implied_prob": 0.5, "price": 100, "book": "Test"}],
+                "Away": [{"implied_prob": 0.5, "price": 100, "book": "Test"}],
+            },
+        }
+
+    @staticmethod
+    def _matchup_features():
+        return {"starter_edge": 0.0, "expected_runs": {"complete": True}}
+
+    def _baseline(self):
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=False), \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            return analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="baseball_mlb",
+                matchup_features=self._matchup_features())
+
+    def test_additive_ml_inert_when_flag_off(self):
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=False), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=(9.0, 1.0)) as live, \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            candidates = analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="baseball_mlb",
+                matchup_features=self._matchup_features())
+        live.assert_not_called()
+        self.assertEqual(candidates, self._baseline())
+
+    def test_additive_ml_overrides_win_prob_when_enabled(self):
+        # Pin the pythag blend off so model_prob == the base (additive) win prob.
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=True), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=(6.5, 3.5)) as live, \
+                patch.object(analysis, "DEFAULT_PYTHAG_WEIGHT", 0.0), \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            candidates = analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="baseball_mlb",
+                matchup_features=self._matchup_features())
+        live.assert_called()
+        p_h = mlb_starters.poisson_margin_probability(6.5, 3.5, 0.0)
+        p_a = mlb_starters.poisson_margin_probability(3.5, 6.5, 0.0)
+        expected_home = 0.5 * (p_h + (1.0 - p_a))
+        home = next(c for c in candidates if c["home_away"] == "HOME")
+        away = next(c for c in candidates if c["home_away"] == "AWAY")
+        self.assertEqual(home["model_prob"], round(expected_home * 100, 2))
+        self.assertEqual(away["model_prob"],
+                         round((1.0 - expected_home) * 100, 2))
+        # Home is the clear favorite by runs -> above the 50% baseline.
+        self.assertGreater(home["model_prob"], 50.0)
+
+    def test_additive_ml_none_falls_back_to_recency(self):
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=True), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=None) as live, \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            candidates = analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="baseball_mlb",
+                matchup_features=self._matchup_features())
+        live.assert_called()
+        self.assertEqual(candidates, self._baseline())
+
+    def test_additive_ml_non_mlb_untouched(self):
+        # Flag on but a non-MLB sport: live_additive_runs returns None internally,
+        # so the seam is inert and the NBA path is unchanged.
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=True), \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            nba = analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="basketball_nba",
+                matchup_features=self._matchup_features())
+        with patch.object(mlb_starters, "_mlb_additive_ml_enabled",
+                          return_value=False), \
+                patch.object(analysis, "_blend_weight", return_value=1.0):
+            nba_baseline = analysis.analyze_moneyline_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="basketball_nba",
+                matchup_features=self._matchup_features())
+        self.assertEqual(nba, nba_baseline)
+
+    def test_additive_ml_flag_helper_reads_env(self):
+        with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_ML": "yes"}):
+            self.assertTrue(mlb_starters._mlb_additive_ml_enabled())
+        with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_ML": "0"}):
+            self.assertFalse(mlb_starters._mlb_additive_ml_enabled())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(mlb_starters._mlb_additive_ml_enabled())
+
+
 class AsOfReliabilityTests(unittest.TestCase):
     def test_future_games_do_not_complete_an_earlier_streak(self):
         games = [

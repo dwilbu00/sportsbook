@@ -700,6 +700,16 @@ def _mlb_additive_totals_enabled():
         "1", "true", "on", "yes")
 
 
+def _mlb_additive_ml_enabled():
+    """ODI_MLB_ADDITIVE_ML gate (Tier B): derive the moneyline model win prob from the
+    additive expected runs (runs-first, symmetric Poisson margin at 0) instead of the
+    recency margin Φ. OFF (unset) = byte-identical current moneyline model. Separate
+    flag from spreads/totals so each market's additive is an independent, evidence-
+    gated A/B."""
+    return os.environ.get("ODI_MLB_ADDITIVE_ML", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
 def live_additive_runs(sport_key, factors):
     """(home_runs, away_runs) from the ADDITIVE expected-runs model (Tier A #1d), or
     None to fall through to the multiplicative path. The live twin of the bake-off:
