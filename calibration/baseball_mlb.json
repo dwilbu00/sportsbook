@@ -71769,6 +71769,14 @@
     "value_gate": {
       "source": "refit_calibration --gate-diag A/B (2023-present real-line holdout)",
       "basis": "EV>=4% & edge>=1% won slate ROI +3.3%/+59u vs current edge>=5% +2.0%/+31u; pitcher_outs loses under every gate (projection issue)"
+    },
+    "expected_runs_additive": {
+      "seasons": [
+        2024,
+        2025,
+        2026
+      ],
+      "n_train": 5495
     }
   },
   "prob_shrink": {
@@ -71981,5 +71989,34 @@
     "suppress": [
       "pitcher_outs"
     ]
+  },
+  "expected_runs_additive": {
+    "enabled": true,
+    "feature_keys": [
+      "xwobacon",
+      "k9"
+    ],
+    "model": {
+      "feature_keys": [
+        "xwobacon",
+        "k9"
+      ],
+      "intercept": 2.81547850471873,
+      "coef": [
+        7.908663654585718,
+        -0.10604366967433443
+      ],
+      "league_rate9": 4.408462238398545,
+      "n": 10990
+    },
+    "blend": {
+      "mode": "blend",
+      "blend_k": 200.0,
+      "n_starts": 10
+    },
+    "bullpen": {
+      "league_rp_era": 4.369649923574748,
+      "league_bp": 4.408462238398545
+    }
   }
 }
