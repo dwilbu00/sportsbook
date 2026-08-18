@@ -68,7 +68,16 @@ def _apply_starter_logit(p, edge, weight):
 # blend (pull toward, not replace) captures the hedge-when-weak upside while
 # keeping the worst-year downside small (~0.0016 Brier). Spreads/run-line already
 # run on the validated expected_runs_challenger; totals stay on the current model.
-DEFAULT_PYTHAG_WEIGHT = 0.35
+#
+# 2026-08-18: RAISED 0.35 -> 0.50 after the clean-odds + DH-faithful grading (#2/#2b)
+# + prob_shrink refit (spreads 0.6 / ML 0.35 / totals 0.15) re-baseline. A pythag x
+# shrink combo sweep OOS-validated it (train 2024-2025 -> test 2026): pythag 0.50 @
+# shrink 0.5 held +6.7% (EV>=8%) / +9.8% (EV>=12%) flat-1u ROI on the 2026 holdout,
+# consistently beating 0.35 at both gates; the IN-sample climb to 0.70-1.0 did NOT
+# survive OOS (0.85/1.0 dropped train AND test), so 0.50 (not higher) is the robust
+# pick. The runs-based pythag prob is the moneyline lever — the additive runs model
+# (#1d) plausibly extends it.
+DEFAULT_PYTHAG_WEIGHT = 0.50
 
 # Pythagorean RESIDUAL contrarian signal (mining idea #29). DISTINCT from the
 # strength BLEND above: residual = actual season win% − Pythagorean win% is a LUCK
