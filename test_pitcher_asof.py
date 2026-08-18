@@ -303,6 +303,35 @@ class SeriesCacheTests(unittest.TestCase):
             cached = pa.load_sp_series("1", 2026)
         self.assertEqual(cached, uncached)             # fit==serve: identical inputs
 
+    def test_prewarm_matches_per_entity_loads(self):
+        # The bulk prewarm must fill the cache BYTE-IDENTICALLY to the per-entity
+        # loaders (else the odds backtest results would shift, not just speed up).
+        self._sp("1", "2024-09-30", 2024)
+        self._sp("1", "2025-09-30", 2025)
+        self._sp("1", "2026-04-05", 2026)
+        self._sp("2", "2026-05-01", 2026)
+        with db_store.get_engine().begin() as c:
+            c.execute(pa.pitcher_asof_daily.insert(), [
+                {"entity_id": "147", "as_of_date": "2025-09-30", "role": "RP",
+                 "season_bucket": 2025, "era": 4.1, "ip": 400.0},
+                {"entity_id": "147", "as_of_date": "2026-04-05", "role": "RP",
+                 "season_bucket": 2026, "era": 3.8, "ip": 20.0}])
+        ref_sp1 = pa.load_sp_series("1", 2026)          # per-entity references (no cache)
+        ref_sp2 = pa.load_sp_series("2", 2026)
+        ref_rp = pa.load_rp_series("147", 2026)
+        with pa.series_cache():
+            ns, nr = pa.prewarm_series_cache([2024, 2025, 2026])
+            self.assertEqual((ns, nr), (2, 1))          # 2 SP entities, 1 RP entity
+            self.assertIn(("SP", "1", 2026), pa._series_cache)
+            self.assertIn(("RP", "147", 2026), pa._series_cache)
+            self.assertEqual(pa.load_sp_series("1", 2026), ref_sp1)
+            self.assertEqual(pa.load_sp_series("2", 2026), ref_sp2)
+            self.assertEqual(pa.load_rp_series("147", 2026), ref_rp)
+
+    def test_prewarm_noop_without_active_cache(self):
+        self._sp("1", "2026-04-05", 2026)
+        self.assertEqual(pa.prewarm_series_cache([2026]), (0, 0))   # cache off -> no-op
+
     def test_second_read_is_memoized(self):
         self._sp("1", "2026-04-05", 2026)
         with pa.series_cache():

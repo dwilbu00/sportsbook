@@ -1264,6 +1264,20 @@ def _run_odds_backtest_impl(
     else:
         seasons_list = [season_year]
 
+    # MLB additive live-path speed: bulk-prewarm the pitcher_asof SP/RP series into the
+    # already-active series_cache (2 queries) so grading's per-pitcher load_sp_series /
+    # load_rp_series hit memory instead of ~1-2k remote round-trips. Byte-identical
+    # results (same cache the per-entity loaders would fill) — purely a speedup.
+    if use_warehouse:
+        try:
+            import pitcher_asof
+            ns, nr = pitcher_asof.prewarm_series_cache(seasons_list)
+            if ns or nr:
+                print(f"[prewarm] pitcher_asof series cache: {ns} SP + {nr} RP "
+                      f"entities (bulk).")
+        except Exception:
+            pass
+
     print(f"\n=== Loading {sport_key} team list ===")
     if use_warehouse:
         print("=== team-market inputs: StatsAPI warehouse (ESPN bypassed) ===")

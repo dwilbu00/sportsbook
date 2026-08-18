@@ -551,6 +551,58 @@ def load_rp_series(team_id, season):
     return out
 
 
+def prewarm_series_cache(seasons):
+    """Bulk-load ALL SP + RP as-of series into the ACTIVE series_cache in TWO queries
+    total, so an odds backtest's per-pitcher load_sp_series / load_rp_series calls hit
+    memory instead of ~1-2k separate remote round-trips (the live path is per-entity;
+    the bake-off is bulk — this closes that gap and is the fix for the odds-backtest
+    crawl). Produces cache entries BYTE-IDENTICAL to the per-entity loaders (same
+    season span {s, s-1, s-2}, same columns, same sort), so backtest results are
+    unchanged — purely a speedup. No-op if the cache isn't active / SQL off / no
+    seasons. Returns (n_sp_entities, n_rp_entities)."""
+    if _series_cache is None or not enabled():
+        return (0, 0)
+    try:
+        target = sorted({int(s) for s in seasons if s is not None})
+    except (TypeError, ValueError):
+        return (0, 0)
+    if not target:
+        return (0, 0)
+    spans = {s: {s, s - 1, s - 2} for s in target}
+    all_buckets = sorted({b for sp in spans.values() for b in sp})
+    t = pitcher_asof_daily
+    try:
+        sp_cols = [t.c.entity_id, t.c.as_of_date, t.c.season_bucket, t.c.n_bbe, t.c.ip]
+        sp_cols += [t.c[k] for k in _SERIES_FEATURES]
+        by_sp, by_rp = {}, {}
+        with db_store.get_engine().connect() as conn:
+            for r in conn.execute(select(*sp_cols).where(
+                    (t.c.role == "SP")
+                    & t.c.season_bucket.in_(all_buckets))).mappings():
+                rec = {"as_of_date": str(r["as_of_date"])[:10],
+                       "season_bucket": r["season_bucket"],
+                       "n_bbe": r["n_bbe"], "ip": r["ip"]}
+                rec.update({k: r[k] for k in _SERIES_FEATURES})
+                by_sp.setdefault(str(r["entity_id"]), []).append(rec)
+            for eid, d, era, ip, sb in conn.execute(select(
+                    t.c.entity_id, t.c.as_of_date, t.c.era, t.c.ip, t.c.season_bucket)
+                    .where((t.c.role == "RP") & t.c.season_bucket.in_(all_buckets)
+                           & t.c.era.isnot(None))).all():
+                by_rp.setdefault(str(eid), []).append(
+                    {"as_of_date": str(d)[:10], "era": float(era),
+                     "ip": (float(ip) if ip is not None else None),
+                     "season_bucket": sb})
+    except (OperationalError, ValueError, TypeError):
+        return (0, 0)
+    for role, by_ent in (("SP", by_sp), ("RP", by_rp)):
+        for ent, rows in by_ent.items():
+            rows.sort(key=lambda x: x["as_of_date"])
+            for s in target:
+                _series_cache[(role, ent, s)] = [
+                    r for r in rows if r["season_bucket"] in spans[s]]
+    return (len(by_sp), len(by_rp))
+
+
 def _asof_xwobacon_sql(pitcher_id, as_of, season_start):
     """Single-pitcher as-of xwOBAcon via one SQL aggregation over statcast_pitch
     (in-season, strictly game_date < as_of). Returns (mean, n_bbe) or (None, 0). For
