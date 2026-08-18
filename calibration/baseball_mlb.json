@@ -71430,7 +71430,7 @@
     "n_players": 240,
     "prob_shrink": {
       "source": "odds backtest --engine live",
-      "fit_timestamp": "2026-08-14T15:48:33.754740Z"
+      "fit_timestamp": "2026-08-18T02:57:27.027689Z"
     },
     "starter_adjustment": {
       "team_markets": {
@@ -71744,25 +71744,25 @@
     },
     "prob_shrink_holdout": {
       "moneyline": {
-        "brier": 0.2479,
-        "raw_brier": 0.2725,
-        "n": 257,
-        "n_warehouse": 245,
-        "n_log": 12
+        "brier": 0.2472,
+        "raw_brier": 0.2565,
+        "n": 6468,
+        "n_warehouse": 6457,
+        "n_log": 11
       },
       "spreads": {
-        "brier": 0.2334,
-        "raw_brier": 0.2334,
-        "n": 175,
-        "n_warehouse": 149,
-        "n_log": 26
+        "brier": 0.243,
+        "raw_brier": 0.2456,
+        "n": 4809,
+        "n_warehouse": 4771,
+        "n_log": 38
       },
       "totals": {
-        "brier": 0.2492,
-        "raw_brier": 0.2601,
-        "n": 113,
-        "n_warehouse": 80,
-        "n_log": 33
+        "brier": 0.249,
+        "raw_brier": 0.271,
+        "n": 5986,
+        "n_warehouse": 5941,
+        "n_log": 45
       }
     },
     "warmup_present": true,
@@ -71772,9 +71772,9 @@
     }
   },
   "prob_shrink": {
-    "spreads": 0.25,
-    "totals": 0.1,
-    "moneyline": 0.25
+    "spreads": 0.6,
+    "totals": 0.15,
+    "moneyline": 0.35
   },
   "starter_adjustment": {
     "enabled": true,
