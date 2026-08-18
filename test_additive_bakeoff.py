@@ -312,6 +312,48 @@ class ProjectorBullpenTests(unittest.TestCase):
         self.assertGreater(home_runs, away_runs)   # bad away pen -> more home runs
 
 
+class RunEnvProjectorTests(unittest.TestCase):
+    """Batch A park/weather: the per-game run_env multiplier on make_additive_projector.
+    INERT (byte-identical) when run_env_fn is None; scales BOTH teams equally when set."""
+
+    def _proj(self, run_env_fn):
+        asof = {("A", "2024-05-01"): {"xwobacon": 0.33, "k9": 8.0, "n_bbe": 200},
+                ("H", "2024-05-01"): {"xwobacon": 0.33, "k9": 8.0, "n_bbe": 200}}
+        model = {"feature_keys": ["xwobacon", "k9"], "intercept": 4.0,
+                 "coef": [0.0, 0.0], "league_rate9": 4.0, "n": 1000}
+        return bs._make_additive_projector(
+            bs._dict_feat_getter(asof, ("xwobacon", "k9")), model, 4.0,
+            ("xwobacon", "k9"), run_env_fn=run_env_fn)
+
+    _ROW = {"home_sp": "H", "away_sp": "A", "date": "2024-05-01",
+            "home_abbr": "HOM", "away_abbr": "AWY",
+            "a_ip": 6.0, "h_ip": 6.0, "a_off_faced": 1.0, "h_off_faced": 1.0}
+
+    def test_none_run_env_is_byte_identical(self):
+        base = bs._make_additive_projector(
+            bs._dict_feat_getter(
+                {("A", "2024-05-01"): {"xwobacon": 0.33, "k9": 8.0, "n_bbe": 200},
+                 ("H", "2024-05-01"): {"xwobacon": 0.33, "k9": 8.0, "n_bbe": 200}},
+                ("xwobacon", "k9")),
+            {"feature_keys": ["xwobacon", "k9"], "intercept": 4.0,
+             "coef": [0.0, 0.0], "league_rate9": 4.0, "n": 1000}, 4.0,
+            ("xwobacon", "k9"))(dict(self._ROW))
+        with_none = self._proj(None)(dict(self._ROW))
+        self.assertEqual(base, with_none)
+
+    def test_run_env_scales_both_teams_equally(self):
+        hr0, ar0 = self._proj(lambda row: 1.0)(dict(self._ROW))
+        hr1, ar1 = self._proj(lambda row: 1.10)(dict(self._ROW))
+        self.assertAlmostEqual(hr1, hr0 * 1.10)
+        self.assertAlmostEqual(ar1, ar0 * 1.10)
+
+    def test_falsy_run_env_falls_back_to_neutral(self):
+        hr0, ar0 = self._proj(lambda row: 1.0)(dict(self._ROW))
+        hrN, arN = self._proj(lambda row: None)(dict(self._ROW))   # None -> 1.0
+        self.assertAlmostEqual(hrN, hr0)
+        self.assertAlmostEqual(arN, ar0)
+
+
 class WindowingTests(unittest.TestCase):
     def setUp(self):
         # One pitcher "P": a 2023 prior-season final + three 2024 as-of rows.

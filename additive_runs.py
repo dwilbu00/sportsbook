@@ -164,7 +164,7 @@ def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp,
 
 
 def make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
-                            bp_getter=None):
+                            bp_getter=None, run_env_fn=None):
     """project_fn(row) -> (home_runs, away_runs) via mlb_starters.expected_runs_
     additive: home batting faces the AWAY starter (+ away exp-IP + home-lineup offense
     a_off_faced), away batting faces the HOME starter. Starter rate9 from xera_lite on
@@ -174,7 +174,13 @@ def make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
     else the pitching team's as-of bullpen rate9 from bp_getter(team_key, date) — the
     AWAY bullpen backs the away starter for home_runs, the HOME bullpen for away_runs.
     The row carries home_abbr/away_abbr (offline: team abbrs; live: team_ids) as the
-    bullpen keys."""
+    bullpen keys.
+
+    RUN ENVIRONMENT (Batch A park/weather, INERT when run_env_fn is None): a single
+    per-GAME multiplier from run_env_fn(row) scales BOTH teams' expected runs equally
+    (the park/weather environment is shared). None (or a returned falsy/1.0) -> the
+    expected_runs_additive default run_env=1.0 -> byte-identical to the pre-run_env
+    projector. The caller composes park x weather into one centered-on-1.0 factor."""
     def _bp(team_key, date):
         return bp_getter(team_key, date) if bp_getter else league_bp
 
@@ -187,11 +193,12 @@ def make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
         home_rate9 = xera_lite.predict(hf, xera_model, n_sample=hn) if hf else None
         away_rate9 = away_rate9 if away_rate9 is not None else league_bp
         home_rate9 = home_rate9 if home_rate9 is not None else league_bp
+        run_env = (run_env_fn(row) if run_env_fn else 1.0) or 1.0
         home_runs = mlb_starters.expected_runs_additive(
             away_rate9, _bp(row.get("away_abbr"), date), exp_ip(row.get("a_ip")),
-            offense_factor=row.get("a_off_faced") or 1.0)
+            offense_factor=row.get("a_off_faced") or 1.0, run_env=run_env)
         away_runs = mlb_starters.expected_runs_additive(
             home_rate9, _bp(row.get("home_abbr"), date), exp_ip(row.get("h_ip")),
-            offense_factor=row.get("h_off_faced") or 1.0)
+            offense_factor=row.get("h_off_faced") or 1.0, run_env=run_env)
         return home_runs, away_runs
     return project
