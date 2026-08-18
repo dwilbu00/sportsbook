@@ -2145,6 +2145,55 @@ def _count_resolved_since(sport_key, since_ts):
 
 _last_statcast_derived_build = 0.0     # module gate for the heavier daily rebuild
 
+# Durable completeness watermark for the raw statcast_pitch corpus: the last date
+# through which _statcast_maintenance has confirmed [.., date] fully ingested. Lets
+# the hourly loop SELF-HEAL a multi-day idle gap (the trailing recent-window alone
+# would skip the middle days) instead of needing an offline `savant_history --ensure`.
+# Stored in the shared app_settings KV store (alongside the Kelly knobs).
+_APP_SETTINGS_FILE = "app_settings.jsonl"
+_STATCAST_WATERMARK_KEY = "statcast_last_ensured"
+
+
+def _read_statcast_watermark():
+    """The date (datetime.date) through which statcast_pitch is known-complete, or
+    None. Fail-open (None) on any error so maintenance always still runs."""
+    try:
+        rows, _ = _read_ndjson_blob(_APP_SETTINGS_FILE, use_cache=False)
+    except Exception:
+        return None
+    for r in (rows or []):
+        if r.get("setting_key") == _STATCAST_WATERMARK_KEY:
+            try:
+                return datetime.fromisoformat(
+                    str(r.get("setting_value"))[:10]).date()
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _write_statcast_watermark(day):
+    """Upsert the completeness watermark to ``day`` (a date or ISO string), preserving
+    every other setting. Best-effort; never raises."""
+    val = day.isoformat() if hasattr(day, "isoformat") else str(day)[:10]
+
+    def _upsert(rows):
+        ts = datetime.now(timezone.utc).isoformat()
+        for r in rows:
+            if r.get("setting_key") == _STATCAST_WATERMARK_KEY:
+                if r.get("setting_value") == val:
+                    return 0
+                r["setting_value"] = val
+                r["updated_at"] = ts
+                return 1
+        rows.append({"setting_key": _STATCAST_WATERMARK_KEY,
+                     "setting_value": val, "updated_at": ts})
+        return 1
+
+    try:
+        return mutate_ndjson_log(_APP_SETTINGS_FILE, _upsert) or 0
+    except Exception:
+        return 0
+
 
 def _statcast_maintenance(recent_days=4, ensure_cap=12, derived_interval_h=20):
     """Bounded, CRON-FREE statcast freshness for the app's hourly loop (owner has no
@@ -2155,7 +2204,13 @@ def _statcast_maintenance(recent_days=4, ensure_cap=12, derived_interval_h=20):
           idempotent via the day manifest — only genuinely-missing recent days are
           fetched, capped). This keeps the raw corpus current so pitcher_asof
           .get_or_fill computes FRESH as-of pitcher rows on demand (pitcher_asof
-          needs no rebuild — it self-fills lazily on read).
+          needs no rebuild — it self-fills lazily on read). SELF-HEALING: a durable
+          watermark (statcast_last_ensured) widens the lookback to cover an idle gap
+          since the last confirmed-complete run, so a burst-usage owner who skips N
+          days still gets the middle days filled with no offline `--ensure`. A gap
+          bigger than ensure_cap drains newest-first over successive hourly calls (the
+          watermark advances only once the whole range is confirmed complete), floored
+          at the current season start (a deeper hole is a one-time offline prime).
       (2) DAILY-gated: rebuild the derived per-batter statcast_asof snapshot the LIVE
           prop path reads (get_batter_xba) — heavier (season aggregate), so at most
           every derived_interval_h hours per process.
@@ -2171,11 +2226,35 @@ def _statcast_maintenance(recent_days=4, ensure_cap=12, derived_interval_h=20):
         return
     import datetime as _dt
     today = _dt.date.today()
-    lo = (today - _dt.timedelta(days=recent_days)).isoformat()
+    base_lo = today - _dt.timedelta(days=recent_days)
+    lo = base_lo
+    wm = _read_statcast_watermark()
+    if wm is not None and wm < base_lo:
+        # Idle since `wm`: the trailing window alone would skip [wm+1, base_lo). Widen
+        # back to heal the gap, floored at this season's start and never NARROWER than
+        # the trailing window (the min guard covers the Jan year-boundary case).
+        season_start = _dt.date(today.year, 1, 1)
+        lo = min(base_lo, max(wm + _dt.timedelta(days=1), season_start))
+        gap = (base_lo - lo).days
+        if gap > 0:
+            print(f"  [statcast] self-heal: idle since {wm}; ensuring {lo}..{today} "
+                  f"({gap}d beyond the {recent_days}d window, cap {ensure_cap}/call)")
+    complete = False
     try:
-        sh.ensure_days(lo, today.isoformat(), cap=ensure_cap, verbose=False)
-    except Exception:                   # network / vendor hiccup — never block
-        pass
+        result = sh.ensure_days(lo.isoformat(), today.isoformat(),
+                                cap=ensure_cap, verbose=False)
+        try:
+            n_fetched, n_missing = result
+        except (TypeError, ValueError):
+            n_fetched = n_missing = 0        # non-tuple return (e.g. a test mock)
+        complete = n_fetched >= n_missing    # nothing left behind by the cap/failures
+    except Exception:                        # network / vendor hiccup — never block
+        complete = False
+    if complete:
+        # [lo, today] is fully ingested (and everything older was complete at the prior
+        # watermark) -> advance. On a partially-drained big gap, leave it so the next
+        # call retries the still-missing older days.
+        _write_statcast_watermark(today)
     global _last_statcast_derived_build
     now = time.time()
     if now - _last_statcast_derived_build >= derived_interval_h * 3600:
