@@ -258,6 +258,60 @@ class VenueDimTests(unittest.TestCase):
         self.assertNotIn(_park_key("Oakland Athletics"), geo)
 
 
+class UmpireTests(_Backend, unittest.TestCase):
+    """Batch A #4: HP-umpire capture (parse_boxscore_officials) + the backfill that
+    re-fetches boxscores for regular-final games missing hp_umpire_id."""
+
+    def setUp(self):
+        super().setUp()
+        from sqlalchemy import insert
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "999"):
+                conn.execute(insert(mlb_warehouse.mlb_team), {"team_id": tid})
+
+    def test_parse_officials_picks_home_plate(self):
+        box = {"officials": [
+            {"official": {"id": 1, "fullName": "First Base Ump"},
+             "officialType": "First Base"},
+            {"official": {"id": 490001, "fullName": "Angel Hernandez"},
+             "officialType": "Home Plate"}]}
+        self.assertEqual(mlb_warehouse.parse_boxscore_officials(box),
+                         ("490001", "Angel Hernandez"))
+        self.assertEqual(mlb_warehouse.parse_boxscore_officials({}), (None, None))
+        self.assertEqual(mlb_warehouse.parse_boxscore_officials(
+            {"officials": [{"officialType": "Third Base"}]}), (None, None))
+
+    def _game(self, pk, gtype, ump=None):
+        from sqlalchemy import insert
+        row = {"game_pk": pk, "season": 2024, "official_date": f"2024-04-0{pk}",
+               "home_team_id": "147", "away_team_id": "999", "game_type": gtype,
+               "status": "Final"}
+        if ump:
+            row["hp_umpire_id"] = ump
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), row)
+
+    def test_backfill_updates_regular_missing_only(self):
+        from unittest import mock
+        self._game(1, "R")                 # regular, missing -> should fill
+        self._game(2, "R", ump="111")      # already has ump -> excluded by query
+        self._game(3, "S")                 # spring -> excluded by game_type
+        box = {"officials": [{"official": {"id": 490001, "fullName": "AH"},
+                              "officialType": "Home Plate"}]}
+        self.assertEqual(mlb_warehouse.backfill_umpires([2024], apply=False), 0)  # dry
+        with mock.patch.object(mlb_warehouse, "fetch_boxscore", return_value=box):
+            n = mlb_warehouse.backfill_umpires([2024], apply=True)
+        self.assertEqual(n, 1)             # only game 1 (regular + missing)
+        g = mlb_warehouse.mlb_game.c
+        with db_store.get_engine().connect() as conn:
+            r1 = conn.execute(select(g.hp_umpire_id).where(g.game_pk == 1)).scalar()
+            r2 = conn.execute(select(g.hp_umpire_id).where(g.game_pk == 2)).scalar()
+            r3 = conn.execute(select(g.hp_umpire_id).where(g.game_pk == 3)).scalar()
+        self.assertEqual(r1, "490001")     # filled
+        self.assertEqual(r2, "111")        # untouched (already had one)
+        self.assertIsNone(r3)              # spring never fetched
+
+
 class ResidentVenueTests(_Backend, unittest.TestCase):
     """Only a team's PRIMARY regular-season home park earns its park factor — spring
     and neutral-site venues (a real home team plays there, but it isn't their park)

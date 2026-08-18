@@ -518,6 +518,20 @@ def parse_schedule(raw, season):
     return games, list(teams.values())
 
 
+def parse_boxscore_officials(box):
+    """(hp_umpire_id, hp_umpire_name) from a boxscore's `officials` block — the HOME-
+    PLATE umpire only (the run-environment-relevant one; Batch A #4). (None, None) when
+    absent. Robust to officialType spelling ('Home Plate')."""
+    for o in (box or {}).get("officials", []) or []:
+        otype = str((o or {}).get("officialType") or "").strip().lower()
+        if otype in ("home plate", "hp", "home plate umpire"):
+            person = o.get("official") or {}
+            pid = person.get("id")
+            if pid is not None:
+                return str(pid), person.get("fullName")
+    return None, None
+
+
 def parse_standings(raw, season, as_of_date):
     """Raw /standings payload → mlb_team_standings snapshot rows."""
     out = []
@@ -908,6 +922,14 @@ def ingest_date(date, with_boxscores=True, land_bronze=True, skip_game_pks=None)
                                              ("player_id",),
                                              ignore_cols=("fetched_at",))
                         nb, npi = _write_game_facts(conn, box, g)
+                        # Batch A #4: capture the HP umpire onto the game row (the
+                        # schedule upsert can't — officials are boxscore-only).
+                        ump_id, ump_name = parse_boxscore_officials(box)
+                        if ump_id is not None:
+                            conn.execute(mlb_game.update()
+                                         .where(mlb_game.c.game_pk == g["game_pk"])
+                                         .values(hp_umpire_id=ump_id,
+                                                 hp_umpire_name=ump_name))
                         if land_bronze:
                             _mark_bronze_processed(conn, "boxscore",
                                                    str(g["game_pk"]))
@@ -1790,6 +1812,79 @@ def build_weather(seasons, apply=False, force=False, verbose=True):
         print(f"  [weather] {written} weather_game rows upserted "
               f"({len(groups)} venue-season fetches).")
     return written
+
+
+def _apply_umpire_batch(rows):
+    """UPDATE mlb_game.hp_umpire_id/name for a batch of {game_pk, hp_umpire_id,
+    hp_umpire_name} rows (only those two columns). Returns rows applied."""
+    if not rows:
+        return 0
+    with _WRITE_LOCK:
+        with db_store.get_engine().begin() as conn:
+            for r in rows:
+                conn.execute(mlb_game.update()
+                             .where(mlb_game.c.game_pk == r["game_pk"])
+                             .values(hp_umpire_id=r["hp_umpire_id"],
+                                     hp_umpire_name=r["hp_umpire_name"]))
+    return len(rows)
+
+
+def backfill_umpires(seasons, apply=False, verbose=True):
+    """Backfill mlb_game.hp_umpire_id/name for genuine-final REGULAR games in `seasons`
+    that are missing it, by re-fetching each boxscore's officials block (Batch A #4;
+    the schedule ingest can't capture officials, and going-forward capture only fills
+    NEW ingests). DRY-RUN default (reports the count, no fetch/write). apply=True fetches
+    concurrently + updates in batches. Operator-run (~1 free StatsAPI call per game;
+    slow). Returns games updated (0 on dry-run)."""
+    if not enabled():
+        raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
+    try:
+        want = {int(s) for s in seasons}
+    except (TypeError, ValueError):
+        return 0
+    g = mlb_game
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.game_pk)
+                .where(g.c.season.in_(sorted(want)) & (g.c.status == "Final")
+                       & (g.c.game_type == "R") & g.c.hp_umpire_id.is_(None))).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return 0
+    game_pks = [int(r[0]) for r in rows]
+    if not game_pks:
+        if verbose:
+            print("  [umpire] no regular-final games missing hp_umpire_id.")
+        return 0
+    if not apply:
+        if verbose:
+            print(f"  [umpire] DRY-RUN: {len(game_pks)} regular-final games missing "
+                  f"hp_umpire_id would be re-fetched (~{len(game_pks)} StatsAPI calls). "
+                  f"Re-run with --apply to fetch + write.")
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch(pk):
+        try:
+            return pk, parse_boxscore_officials(fetch_boxscore(pk))
+        except Exception:                                  # noqa: BLE001 — skip a bad box
+            return pk, (None, None)
+
+    updated = 0
+    batch = []
+    with ThreadPoolExecutor(max_workers=_boxscore_fetch_workers()) as ex:
+        for i, (pk, (uid, uname)) in enumerate(ex.map(_fetch, game_pks), 1):
+            if uid is not None:
+                batch.append({"game_pk": pk, "hp_umpire_id": uid,
+                              "hp_umpire_name": uname})
+            if len(batch) >= 200:
+                updated += _apply_umpire_batch(batch); batch = []
+            if verbose and i % 500 == 0:
+                print(f"    [umpire] {i}/{len(game_pks)} fetched, {updated} updated.")
+    updated += _apply_umpire_batch(batch)
+    if verbose:
+        print(f"  [umpire] {updated}/{len(game_pks)} games updated with HP umpire.")
+    return updated
 
 
 def _weather_rows_with_windout():
@@ -2922,10 +3017,14 @@ def _main_cli():
                          "lat/lon/elevation + park/geo priors via each venue's modal "
                          "home team). Idempotent upsert; run after the mlb_venue DDL.")
     ap.add_argument("--build-weather", metavar="SEASONS", default=None,
-                    help="Batch A run_env: backfill weather_game (first-pitch-hour, "
-                         "Visual Crossing) for regular games in SEASONS ('2024-2026' | "
+                    help="Batch A run_env: backfill weather_game (daily, Visual "
+                         "Crossing) for regular games in SEASONS ('2024-2026' | "
                          "'2024,2025' | '2024'). DRY-RUN (reports fetch volume) unless "
                          "--apply. Incremental; needs WEATHER_API_KEY + --build-venues.")
+    ap.add_argument("--backfill-umpires", metavar="SEASONS", default=None,
+                    help="Batch A #4: backfill mlb_game.hp_umpire_id/name for regular-"
+                         "final games in SEASONS missing it, by re-fetching boxscore "
+                         "officials. DRY-RUN unless --apply (~1 free StatsAPI call/game).")
     ap.add_argument("--apply", action="store_true",
                     help="With --backfill-game-pk / --backfill-team-game-pk / "
                          "--purge-non-franchise: WRITE the changes (default is a "
@@ -2975,14 +3074,18 @@ def _main_cli():
     if args.build_venues:
         did = True
         print(_fmt(build_venue_dim()))
+    def _season_spec(spec):
+        if "-" in spec:                               # range 'A-B' -> inclusive list
+            lo, hi = spec.split("-")
+            return list(range(int(lo), int(hi) + 1))
+        return [int(s) for s in spec.split(",") if s.strip()]
     if args.build_weather:
         did = True
-        if "-" in args.build_weather:                 # range 'A-B' -> inclusive list
-            lo, hi = args.build_weather.split("-")
-            wx_seasons = list(range(int(lo), int(hi) + 1))
-        else:
-            wx_seasons = [int(s) for s in args.build_weather.split(",") if s.strip()]
-        print(_fmt(build_weather(wx_seasons, apply=args.apply)))
+        print(_fmt(build_weather(_season_spec(args.build_weather), apply=args.apply)))
+    if args.backfill_umpires:
+        did = True
+        print(_fmt(backfill_umpires(_season_spec(args.backfill_umpires),
+                                    apply=args.apply)))
     if args.purge_non_franchise:
         did = True
         print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))
