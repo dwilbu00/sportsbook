@@ -1485,10 +1485,27 @@ def _venue_dim_row(venue_id, api_rec, team_id, team_name, csv_geo, now):
     }
 
 
-def _modal_home_team_by_venue():
-    """{venue_id: team_id} — the team that hosts the most games at each venue in
-    mlb_game (its resident team). Neutral sites resolve to whoever hosted most there
-    (park priors for those stay ~neutral). {} when SQL is off / empty."""
+def _all_venue_ids():
+    """Every distinct venue_id in mlb_game (any game type) — the row set for the venue
+    dim, so weather/geo cover any park a game was played at. [] on SQL off."""
+    if not enabled():
+        return []
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(select(mlb_game.c.venue_id).distinct()
+                                .where(mlb_game.c.venue_id.isnot(None))).fetchall()
+        return sorted({str(r[0]) for r in rows if r[0] is not None})
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
+def _resident_team_by_venue():
+    """{venue_id: team_id} where the venue is that team's PRIMARY REGULAR-season home
+    park — i.e. the team's modal regular home venue, per season (so relocations like the
+    A's Oakland→Sacramento both count). This is what earns a venue its team's park
+    factor; SPRING and NEUTRAL-site venues (a real home team plays there, but it isn't
+    their home park) get NO resident team → neutral park priors, not e.g. Coors applied
+    to a Scottsdale spring field. {} on SQL off."""
     if not enabled():
         return {}
     from sqlalchemy import func
@@ -1496,19 +1513,22 @@ def _modal_home_team_by_venue():
     try:
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(
-                select(g.c.venue_id, g.c.home_team_id, func.count().label("n"))
-                .where(g.c.venue_id.isnot(None))
-                .group_by(g.c.venue_id, g.c.home_team_id)).fetchall()
+                select(g.c.season, g.c.home_team_id, g.c.venue_id,
+                       func.count().label("n"))
+                .where((g.c.venue_id.isnot(None))
+                       & (g.c.home_team_id.isnot(None))
+                       & (g.c.game_type == "R"))
+                .group_by(g.c.season, g.c.home_team_id, g.c.venue_id)).fetchall()
     except (OperationalError, ValueError, TypeError):
         return {}
-    best = {}                       # venue_id -> (team_id, n)
-    for vid, tid, n in rows:
-        if vid is None:
-            continue
-        cur = best.get(str(vid))
+    # Per (season, team) the modal regular home venue = that team's park that season.
+    best = {}                       # (season, team_id) -> (venue_id, n)
+    for season, tid, vid, n in rows:
+        key = (season, str(tid))
+        cur = best.get(key)
         if cur is None or (n or 0) > cur[1]:
-            best[str(vid)] = (str(tid) if tid is not None else None, n or 0)
-    return {vid: tv[0] for vid, tv in best.items()}
+            best[key] = (str(vid), n or 0)
+    return {vid: tid for (season, tid), (vid, _n) in best.items()}
 
 
 def build_venue_dim(verbose=True):
@@ -1518,14 +1538,14 @@ def build_venue_dim(verbose=True):
     OPERATOR-run (network + SQL). Returns rows written, or 0 when SQL is off/empty."""
     if not enabled():
         raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
-    venue_team = _modal_home_team_by_venue()
-    if not venue_team:
+    venue_ids = _all_venue_ids()
+    if not venue_ids:
         if verbose:
             print("  [venue] no venue_ids in mlb_game; nothing to build.")
         return 0
+    resident = _resident_team_by_venue()   # venue_id -> team_id (PRIMARY parks only)
     name_of = _team_name_map()
     csv_geo = _stadium_csv_geo()
-    venue_ids = sorted(venue_team)
     # StatsAPI /venues location (one batched call; hydrate gives lat/lon + elevation).
     api = {}
     try:
@@ -1541,7 +1561,7 @@ def build_venue_dim(verbose=True):
     now = _now()
     rows = []
     for vid in venue_ids:
-        tid = venue_team.get(vid)
+        tid = resident.get(vid)            # None for spring/neutral -> neutral priors
         rows.append(_venue_dim_row(vid, api.get(vid), tid,
                                    name_of.get(tid) if tid else None, csv_geo, now))
     with _WRITE_LOCK:

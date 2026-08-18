@@ -254,6 +254,46 @@ class VenueDimTests(unittest.TestCase):
         self.assertNotIn(_park_key("Oakland Athletics"), geo)
 
 
+class ResidentVenueTests(_Backend, unittest.TestCase):
+    """Only a team's PRIMARY regular-season home park earns its park factor — spring
+    and neutral-site venues (a real home team plays there, but it isn't their park)
+    must NOT (else e.g. Coors' factor lands on a Scottsdale spring field)."""
+
+    def setUp(self):
+        super().setUp()
+        from sqlalchemy import insert
+        with db_store.get_engine().begin() as conn:
+            for tid in ("147", "999"):
+                conn.execute(insert(mlb_warehouse.mlb_team), {"team_id": tid})
+
+    def _game(self, pk, season, home, venue, gtype):
+        from sqlalchemy import insert
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_game), {
+                "game_pk": pk, "season": season, "official_date": f"{season}-04-01",
+                "game_date": f"{season}-04-01T18:00:00Z", "home_team_id": home,
+                "away_team_id": "999", "venue_id": venue, "game_type": gtype,
+                "status": "Final"})
+
+    def test_resident_is_primary_regular_park_only(self):
+        # Team 147: 20 regular home games at venue "3313" (its park) + 5 SPRING games at
+        # venue "SPR" + 1 regular NEUTRAL game at "LON".
+        pk = 1
+        for _ in range(20):
+            self._game(pk, 2024, "147", "3313", "R"); pk += 1
+        for _ in range(5):
+            self._game(pk, 2024, "147", "SPR", "S"); pk += 1
+        self._game(pk, 2024, "147", "LON", "R"); pk += 1
+        resident = mlb_warehouse._resident_team_by_venue()
+        self.assertEqual(resident.get("3313"), "147")   # the real park -> team
+        self.assertNotIn("SPR", resident)               # spring venue -> no team
+        # "LON" is a lone regular game -> it IS 147's modal for... no: 3313 has 20 > 1,
+        # so 3313 is 147's modal regular venue; LON (1 game) is not primary -> excluded.
+        self.assertNotIn("LON", resident)
+        # All venues still enumerated for geo coverage.
+        self.assertEqual(set(mlb_warehouse._all_venue_ids()), {"3313", "SPR", "LON"})
+
+
 # ─────────────────────────────────────────────────────────── pure parse / derive
 class ParseTests(unittest.TestCase):
     def test_parse_teams_filters_non_mlb(self):
