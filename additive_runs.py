@@ -164,30 +164,31 @@ def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp,
 
 
 def make_run_env_fn(park_runs_of=None, park_weight=0.0,
-                    weather_of=None, weather_weight=0.0):
-    """Build run_env_fn(row) -> the per-game run-environment multiplier composing PARK
-    and WEATHER, each weight-gated (0 -> that term contributes exactly 1.0):
+                    weather_of=None, weather_weight=0.0,
+                    umpire_of=None, umpire_weight=0.0):
+    """Build run_env_fn(row) -> the per-game run-environment multiplier composing PARK,
+    WEATHER, and UMPIRE, each weight-gated (0 -> that term contributes exactly 1.0):
         park    = 1 + park_weight    * (park_runs_of(row) - 1)   # venue park RUNS factor
-        weather = 1 + weather_weight * (weather_of(row)   - 1)   # centered-1.0 [Phase 3]
-        run_env = park * weather
-    Resolvers return a value centered on 1.0 (park_runs_of via row['venue_id'] ->
-    mlb_venue.park_runs; a falsy/None result = neutral). Shared by the offline bake-off
-    and live so fit == serve. Both weights 0 (or no resolver) -> run_env_fn returns 1.0
-    for every row -> the projector is byte-identical to run_env_fn=None. Returns None
-    when nothing is enabled, so the caller can pass it straight to
-    make_additive_projector."""
-    if not (park_weight and park_runs_of) and not (weather_weight and weather_of):
+        weather = 1 + weather_weight * (weather_of(row)   - 1)   # centered-1.0 deviation
+        umpire  = 1 + umpire_weight  * (umpire_of(row)    - 1)   # HP-ump as-of tendency
+        run_env = park * weather * umpire
+    Each resolver returns a value centered on 1.0 (a falsy/None result = neutral).
+    Shared by the offline bake-off and live so fit == serve. All weights 0 (or no
+    resolvers) -> run_env_fn returns 1.0 for every row -> the projector is byte-identical
+    to run_env_fn=None. Returns None when nothing is enabled, so the caller can pass it
+    straight to make_additive_projector."""
+    terms = [(park_weight, park_runs_of), (weather_weight, weather_of),
+             (umpire_weight, umpire_of)]
+    if not any(w and fn for w, fn in terms):
         return None
+
     def run_env_fn(row):
         env = 1.0
-        if park_weight and park_runs_of is not None:
-            pr = park_runs_of(row)
-            if pr:
-                env *= 1.0 + park_weight * (float(pr) - 1.0)
-        if weather_weight and weather_of is not None:
-            w = weather_of(row)
-            if w:
-                env *= 1.0 + weather_weight * (float(w) - 1.0)
+        for weight, resolver in terms:
+            if weight and resolver is not None:
+                v = resolver(row)
+                if v:
+                    env *= 1.0 + weight * (float(v) - 1.0)
         return env
     return run_env_fn
 

@@ -1628,6 +1628,92 @@ def game_venue_index(seasons):
         return {}
 
 
+def game_umpire_index(seasons):
+    """{(official_date, home_team_id): hp_umpire_id} over `seasons` from mlb_game — the
+    OFFLINE umpire resolver for a game row. {} on SQL off."""
+    if not enabled():
+        return {}
+    try:
+        want = {int(s) for s in seasons}
+    except (TypeError, ValueError):
+        return {}
+    try:
+        g = mlb_game
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.official_date, g.c.home_team_id, g.c.hp_umpire_id)
+                .where(g.c.season.in_(sorted(want))
+                       & g.c.hp_umpire_id.isnot(None))).fetchall()
+        return {(str(d), str(t)): str(u) for d, t, u in rows
+                if d is not None and t is not None and u is not None}
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
+def umpire_residuals(seasons):
+    """{hp_umpire_id: [(official_date, r), ...] sorted} — per HP umpire, a PARK-ADJUSTED
+    per-game run ratio r = game_total / (league_avg_total * venue_park_runs) for each
+    regular-final game he worked. Averaging r STRICTLY-BEFORE a date (umpire_tendency_
+    asof) gives his leak-safe as-of run tendency (centered ~1.0). Park-adjusted so a
+    hitter's-park assignment pattern isn't mistaken for a hitter's ump; league-relative
+    (league_avg from the sample, like make_bp_getter's league_rp_era). Team/pitcher
+    confounds remain -> a weak prior, weight-gated + graded. {} on SQL off/empty."""
+    if not enabled():
+        return {}
+    try:
+        want = {int(s) for s in seasons}
+    except (TypeError, ValueError):
+        return {}
+    g = mlb_game
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.hp_umpire_id, g.c.official_date, g.c.home_score,
+                       g.c.away_score, mlb_venue.c.park_runs)
+                .select_from(g.join(mlb_venue, g.c.venue_id == mlb_venue.c.venue_id,
+                                    isouter=True))
+                .where(g.c.season.in_(sorted(want)) & (g.c.game_type == "R")
+                       & (g.c.status == "Final") & g.c.hp_umpire_id.isnot(None)
+                       & g.c.home_score.isnot(None)
+                       & g.c.away_score.isnot(None))).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    games = []                      # (ump, date, total, park_runs)
+    tot_sum = 0.0
+    for uid, od, hs, as_, pr in rows:
+        try:
+            total = float(hs) + float(as_)
+        except (TypeError, ValueError):
+            continue
+        games.append((str(uid), str(od)[:10], total,
+                      float(pr) if pr is not None else 1.0))
+        tot_sum += total
+    if not games:
+        return {}
+    league_avg = tot_sum / len(games)
+    out = {}
+    for uid, od, total, pr in games:
+        expected = league_avg * (pr or 1.0)
+        r = (total / expected) if expected > 0 else 1.0
+        out.setdefault(uid, []).append((od, r))
+    for lst in out.values():
+        lst.sort(key=lambda x: x[0])
+    return out
+
+
+def umpire_tendency_asof(r_list, date, min_games=20):
+    """Mean park-adjusted run ratio over the umpire's games STRICTLY BEFORE `date` (the
+    leak-safe as-of tendency, centered ~1.0), or 1.0 (neutral) when fewer than
+    `min_games` prior games — so a thin sample doesn't inject noise. Pure."""
+    if not r_list:
+        return 1.0
+    d = str(date)[:10]
+    prior = [r for (od, r) in r_list if od < d]
+    if len(prior) < min_games:
+        return 1.0
+    return sum(prior) / len(prior)
+
+
 def build_venue_dim(verbose=True):
     """Populate mlb_venue: one row per distinct venue_id in mlb_game, enriched with the
     StatsAPI /venues location (lat/lon/elevation) + the authored park/geo priors

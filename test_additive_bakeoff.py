@@ -379,6 +379,16 @@ class ParkRunEnvTests(unittest.TestCase):
                                  weather_of=lambda r: 1.1, weather_weight=1.0)
         self.assertAlmostEqual(fn({"venue_id": "V"}), 1.2 * 1.1)
 
+    def test_park_weather_umpire_all_compose(self):
+        fn = bs._make_run_env_fn(self._pr({"V": 1.2}), 1.0,
+                                 weather_of=lambda r: 1.1, weather_weight=1.0,
+                                 umpire_of=lambda r: 1.05, umpire_weight=1.0)
+        self.assertAlmostEqual(fn({"venue_id": "V"}), 1.2 * 1.1 * 1.05)
+        # umpire alone (park/weather off) also composes + None when all off.
+        u = bs._make_run_env_fn(umpire_of=lambda r: 0.9, umpire_weight=0.5)
+        self.assertAlmostEqual(u({}), 1 + 0.5 * (0.9 - 1))
+        self.assertIsNone(bs._make_run_env_fn(umpire_of=lambda r: 0.9))  # weight 0
+
     def test_falsy_resolver_value_is_neutral(self):
         fn = bs._make_run_env_fn(lambda r: None, 1.0)
         self.assertAlmostEqual(fn({"venue_id": "x"}), 1.0)

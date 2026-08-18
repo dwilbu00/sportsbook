@@ -1986,7 +1986,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
                                 feature_sets=None,
                                 window_modes=("cumulative", "blend", "window"),
                                 rp_bullpen=False, bullpen_fatigue_weight=0.0,
-                                park_weight=0.0, weather_weight=0.0):
+                                park_weight=0.0, weather_weight=0.0,
+                                umpire_weight=0.0):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
     model across FEATURE FAMILIES (v1/contact/fip/csw/gb/siera) x as-of WINDOW modes
     (cumulative / prior-season blend / trailing window), fit on a chronological train
@@ -2022,15 +2023,18 @@ def test_additive_expected_runs(seasons, holdout_start=None,
     # the venue-keyed run_env_fn composing PARK x WEATHER. INERT when both weights are
     # 0 (run_env_fn stays None -> projector byte-identical).
     run_env_fn = None
-    if park_weight or weather_weight:
+    if park_weight or weather_weight or umpire_weight:
         import mlb_warehouse
         import weather_factors as wf
         venue_idx = mlb_warehouse.game_venue_index(seasons)
+        ump_idx = (mlb_warehouse.game_umpire_index(seasons)
+                   if umpire_weight else {})
         abbr_id = _abbr_to_team_id(seasons)
         for r in all_rows:
             tid = abbr_id.get(r.get("home_abbr"))
-            r["venue_id"] = (venue_idx.get((str(r.get("date"))[:10], tid))
-                             if tid else None)
+            key = (str(r.get("date"))[:10], tid) if tid else None
+            r["venue_id"] = venue_idx.get(key) if key else None
+            r["hp_umpire_id"] = ump_idx.get(key) if key else None
         n_res = sum(1 for r in all_rows if r.get("venue_id"))
         park_runs_of = None
         if park_weight:
@@ -2053,9 +2057,20 @@ def test_additive_expected_runs(seasons, holdout_start=None,
                        if (r.get("venue_id"), str(r.get("date"))[:10]) in gw)
             print(f"  [weather] weather_weight={weather_weight}: {n_wx}/{len(all_rows)}"
                   f" games with weather, {len(base)} venue baselines.")
+        umpire_of = None
+        if umpire_weight:
+            ump_res = mlb_warehouse.umpire_residuals(seasons)
+
+            def umpire_of(row):
+                return mlb_warehouse.umpire_tendency_asof(
+                    ump_res.get(row.get("hp_umpire_id")), row.get("date"))
+            n_ump = sum(1 for r in all_rows if r.get("hp_umpire_id"))
+            print(f"  [umpire] umpire_weight={umpire_weight}: {n_ump}/{len(all_rows)}"
+                  f" games ump-resolved, {len(ump_res)} umpires with residuals.")
         run_env_fn = _make_run_env_fn(
             park_runs_of=park_runs_of, park_weight=park_weight,
-            weather_of=weather_of, weather_weight=weather_weight)
+            weather_of=weather_of, weather_weight=weather_weight,
+            umpire_of=umpire_of, umpire_weight=umpire_weight)
 
     all_rows.sort(key=lambda r: r["date"])
     if holdout_start is None:
@@ -2142,7 +2157,7 @@ def test_additive_expected_runs(seasons, holdout_start=None,
 def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
                         mode="blend", blend_k=200.0, n_starts=10,
                         bullpen_fatigue_weight=0.0, park_weight=0.0,
-                        weather_weight=0.0):
+                        weather_weight=0.0, umpire_weight=0.0):
     """Fit the additive expected-runs model on the FULL span and STAGE it as the
     calibration candidate block `expected_runs_additive` (Tier A #1d, commit 5).
     Default = the bake-off winner: v1 features (xwOBAcon+K9) + prior-season BLEND +
@@ -2182,8 +2197,9 @@ def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
                     "league_bp": xm.get("league_rate9"),
                     # Batch A #13; 0.0 -> inert (live make_bp_getter byte-identical).
                     "fatigue_weight": bullpen_fatigue_weight},
-        # Batch A run_env (park/weather); 0.0 weights -> inert (byte-identical live).
-        "run_env": {"park_weight": park_weight, "weather_weight": weather_weight},
+        # Batch A run_env (park/weather/umpire); 0.0 weights -> inert (byte-identical).
+        "run_env": {"park_weight": park_weight, "weather_weight": weather_weight,
+                    "umpire_weight": umpire_weight},
     }
     _cl.set_candidate_mode(True)                    # candidate-ONLY, never live
     _cl.save_expected_runs_additive(
@@ -2261,6 +2277,10 @@ if __name__ == "__main__":
                     help="with --additive-bakeoff, A/B the weather run_env term "
                          "(Batch A, baseline-relative temp+wind) at this weight (0 = "
                          "off). Needs `--build-weather ... --apply` populated first.")
+    ap.add_argument("--umpire-weight", type=float, default=0.0,
+                    help="with --additive-bakeoff, A/B the HP-umpire run_env term "
+                         "(Batch A #4, park-adjusted as-of run tendency) at this weight "
+                         "(0 = off). Needs `--backfill-umpires ... --apply` first.")
     ap.add_argument("--additive-save", action="store_true",
                     help="Tier A #1d: fit the additive expected-runs model (v1/blend/"
                          "team-RP) on --season and STAGE it as the calibration "
@@ -2302,7 +2322,8 @@ if __name__ == "__main__":
                                     rp_bullpen=args.rp_bullpen,
                                     bullpen_fatigue_weight=args.bullpen_fatigue_weight,
                                     park_weight=args.park_weight,
-                                    weather_weight=args.weather_weight)
+                                    weather_weight=args.weather_weight,
+                                    umpire_weight=args.umpire_weight)
     elif args.additive_save:
         save_additive_model(seasons,
                             bullpen_fatigue_weight=args.bullpen_fatigue_weight)

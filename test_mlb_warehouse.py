@@ -311,6 +311,41 @@ class UmpireTests(_Backend, unittest.TestCase):
         self.assertEqual(r2, "111")        # untouched (already had one)
         self.assertIsNone(r3)              # spring never fetched
 
+    def test_umpire_tendency_asof_strictly_before_and_min_games(self):
+        rl = [("2024-04-01", 1.1), ("2024-04-05", 0.9), ("2024-04-10", 1.2)]
+        # strictly before 04-10 = [1.1, 0.9] -> mean 1.0 (min_games=2 met).
+        self.assertAlmostEqual(
+            mlb_warehouse.umpire_tendency_asof(rl, "2024-04-10", min_games=2), 1.0)
+        # fewer than min_games prior -> neutral 1.0.
+        self.assertEqual(
+            mlb_warehouse.umpire_tendency_asof(rl, "2024-04-05", min_games=5), 1.0)
+        self.assertEqual(mlb_warehouse.umpire_tendency_asof([], "2024-04-10"), 1.0)
+
+    def test_umpire_residuals_park_adjusted_and_index(self):
+        from sqlalchemy import insert
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_venue),
+                         {"venue_id": "V", "park_runs": 1.0, "park_hits": 1.0})
+            conn.execute(insert(mlb_warehouse.mlb_game), [
+                {"game_pk": 10, "season": 2024, "official_date": "2024-04-01",
+                 "home_team_id": "147", "away_team_id": "999", "game_type": "R",
+                 "status": "Final", "venue_id": "V", "hp_umpire_id": "490001",
+                 "home_score": 7.0, "away_score": 3.0},               # total 10
+                {"game_pk": 11, "season": 2024, "official_date": "2024-04-08",
+                 "home_team_id": "147", "away_team_id": "999", "game_type": "R",
+                 "status": "Final", "venue_id": "V", "hp_umpire_id": "490001",
+                 "home_score": 4.0, "away_score": 2.0},               # total 6
+            ])
+        res = mlb_warehouse.umpire_residuals([2024])
+        # league_avg = (10+6)/2 = 8; park_runs 1.0 -> r = 10/8, 6/8, sorted by date.
+        self.assertEqual([od for od, _ in res["490001"]],
+                         ["2024-04-01", "2024-04-08"])
+        self.assertAlmostEqual(res["490001"][0][1], 10.0 / 8.0)
+        self.assertAlmostEqual(res["490001"][1][1], 6.0 / 8.0)
+        self.assertEqual(mlb_warehouse.game_umpire_index([2024]),
+                         {("2024-04-01", "147"): "490001",
+                          ("2024-04-08", "147"): "490001"})
+
 
 class ResidentVenueTests(_Backend, unittest.TestCase):
     """Only a team's PRIMARY regular-season home park earns its park factor — spring
