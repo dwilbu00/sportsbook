@@ -241,12 +241,23 @@ def _mlb_expected_runs_projection(sport_key, matchup_features):
             or not 0.0 <= margin_share <= 1.0):
         return None
 
-    home_runs = mlb_starters.expected_runs_from_factors(
-        home_base_runs, home_offense, away_staff,
-        offense_weight, pitching_weight)
-    away_runs = mlb_starters.expected_runs_from_factors(
-        away_base_runs, away_offense, home_staff,
-        offense_weight, pitching_weight)
+    # #1d: the ADDITIVE model substitutes ONLY the two run scalars when its flag is on
+    # and it produces a pair; everything downstream (spread_share/margin_share from the
+    # validated challenger ensemble, cover/shrink/market-blend) is unchanged. Flag OFF
+    # -> home_runs stays None -> the identical multiplicative assignments run ->
+    # byte-identical output.
+    home_runs = away_runs = None
+    if mlb_starters._mlb_additive_runs_enabled():
+        pair = mlb_starters.live_additive_runs(sport_key, factors)
+        if pair is not None:
+            home_runs, away_runs = pair
+    if home_runs is None:
+        home_runs = mlb_starters.expected_runs_from_factors(
+            home_base_runs, home_offense, away_staff,
+            offense_weight, pitching_weight)
+        away_runs = mlb_starters.expected_runs_from_factors(
+            away_base_runs, away_offense, home_staff,
+            offense_weight, pitching_weight)
     if home_runs is None or away_runs is None:
         return None
     return {

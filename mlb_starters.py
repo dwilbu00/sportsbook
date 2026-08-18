@@ -460,6 +460,83 @@ def expected_runs_additive(starter_rate9, bullpen_rate9, exp_ip,
     return max(0.5, min(12.0, expected))
 
 
+def _mlb_additive_runs_enabled():
+    """ODI_MLB_ADDITIVE_RUNS gate for the live additive expected-runs model (Tier A
+    #1d). OFF (unset) = byte-identical multiplicative path. Mirrors the espn_client
+    ODI_MLB_* env→bool idiom; promoted from st.secrets at boot in app.py."""
+    return os.environ.get("ODI_MLB_ADDITIVE_RUNS", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def live_additive_runs(sport_key, factors):
+    """(home_runs, away_runs) from the ADDITIVE expected-runs model (Tier A #1d), or
+    None to fall through to the multiplicative path. The live twin of the bake-off:
+    reuses the SHARED additive_runs helpers on the SAME as-of rows (pitcher_asof_daily,
+    on-demand-warmed for today), so it reproduces the validated bake-off number
+    (fit == serve). Returns None on: non-MLB, config disabled/missing, any surfaced
+    input absent, or any error → the caller keeps the multiplicative projection.
+
+    ``factors`` is matchup_features['expected_runs'] with the #1d surfaced keys
+    (home/away_sp_id, home/away_team_id, game_date, home/away_avg_ip) added ONLY when
+    the flag is on. CROSSED orientation matches additive_runs.make_additive_projector:
+    home_runs faces the AWAY starter + AWAY bullpen + HOME-lineup offense."""
+    if sport_key != "baseball_mlb" or not factors:
+        return None
+    try:
+        import additive_runs as ar
+        import pitcher_asof
+        from calibration_loader import load_expected_runs_additive
+        cfg = load_expected_runs_additive(sport_key)
+        if not cfg or not cfg.get("enabled"):
+            return None
+        hsp, asp = factors.get("home_sp_id"), factors.get("away_sp_id")
+        htid, atid = factors.get("home_team_id"), factors.get("away_team_id")
+        gd = factors.get("game_date")
+        if not (hsp and asp and htid and atid and gd):
+            return None
+        model = cfg.get("model") or {}
+        feature_keys = tuple(cfg.get("feature_keys")
+                             or model.get("feature_keys") or ())
+        league_bp = model.get("league_rate9")          # ONE source (stress fix #3):
+        if not feature_keys or not model.get("coef") or league_bp is None:
+            return None                                # feeds BOTH projector + bp scale
+        season = int(str(gd)[:4])
+        blend = cfg.get("blend") or {}
+        bullpen = cfg.get("bullpen") or {}
+        # Warm today's SP as-of rows (on-demand compute if missing) so the series
+        # carries the row@game_date; RP has no on-demand path (strictly-before covers
+        # today), matching the bake-off.
+        for pid in (str(hsp), str(asp)):
+            pitcher_asof.get_or_fill(pid, gd, "SP")
+        sp_series = {str(hsp): pitcher_asof.load_sp_series(hsp, season),
+                     str(asp): pitcher_asof.load_sp_series(asp, season)}
+        feat_getter = ar.make_feat_getter(
+            sp_series, blend.get("mode", "blend"), feature_keys,
+            n_starts=int(blend.get("n_starts", 10)),
+            blend_k=float(blend.get("blend_k", 200.0)))
+        bp_getter = None
+        league_rp_era = bullpen.get("league_rp_era")
+        if league_rp_era:
+            rp_series = {str(htid): pitcher_asof.load_rp_series(htid, season),
+                         str(atid): pitcher_asof.load_rp_series(atid, season)}
+            bp_getter = ar.make_bp_getter(rp_series, str, league_rp_era, league_bp)
+        projector = ar.make_additive_projector(
+            feat_getter, model, league_bp, feature_keys, bp_getter)
+        # CROSSED mapping (see make_additive_projector): home_runs uses the away
+        # starter + away bullpen + a_off_faced=home-lineup offense; away_runs mirrors.
+        row = {"date": str(gd)[:10], "home_sp": hsp, "away_sp": asp,
+               "home_abbr": str(htid), "away_abbr": str(atid),
+               "a_ip": factors.get("away_avg_ip"), "h_ip": factors.get("home_avg_ip"),
+               "a_off_faced": factors.get("home_offense_factor") or 1.0,
+               "h_off_faced": factors.get("away_offense_factor") or 1.0}
+        pair = projector(row)
+        if not pair or pair[0] is None or pair[1] is None:
+            return None
+        return pair
+    except Exception:
+        return None
+
+
 def pythagorean_win_probability(runs_scored, runs_allowed,
                                 exponent=PYTHAGOREAN_EXPONENT):
     """Return Bill James's modern-baseball Pythagorean win probability."""
@@ -1272,6 +1349,7 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
 
     sides = {"home": home_team, "away": away_team}
     quality = {}
+    pitcher_ids = {}                     # side -> MLBAM starter id (#1d live surfacing)
     for side, tname in sides.items():
         pinfo = probables.get(_norm(tname))
         if not pinfo:
@@ -1280,6 +1358,7 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
         if not q:
             continue
         quality[side] = q
+        pitcher_ids[side] = pinfo["pitcher_id"]
         # Opposing lineup offense vs this starter's hand.
         opp_name = away_team if side == "home" else home_team
         opp = _match_team_id(opp_name, team_index)
@@ -1406,6 +1485,18 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
             "home_staff_suppression": home_staff,
             "away_staff_suppression": away_staff,
         }
+        # #1d: surface the keys the live additive model needs to hit pitcher_asof_daily
+        # — ONLY when the flag is on, so OFF the expected_runs dict is byte-identical.
+        if _mlb_additive_runs_enabled():
+            result["expected_runs"].update({
+                "home_sp_id": pitcher_ids.get("home"),
+                "away_sp_id": pitcher_ids.get("away"),
+                "home_team_id": home_info.get("id") if home_info else None,
+                "away_team_id": away_info.get("id") if away_info else None,
+                "game_date": str(as_of_date or date)[:10],
+                "home_avg_ip": quality["home"].get("avg_ip"),
+                "away_avg_ip": quality["away"].get("avg_ip"),
+            })
 
     # Lineup-offense edge (today's actual 9, not the team-season blob). Warehouse
     # as-of, zero network; None for live games (no batter facts yet) so it's
