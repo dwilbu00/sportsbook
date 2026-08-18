@@ -2326,7 +2326,10 @@ if __name__ == "__main__":
                                     umpire_weight=args.umpire_weight)
     elif args.additive_save:
         save_additive_model(seasons,
-                            bullpen_fatigue_weight=args.bullpen_fatigue_weight)
+                            bullpen_fatigue_weight=args.bullpen_fatigue_weight,
+                            park_weight=args.park_weight,
+                            weather_weight=args.weather_weight,
+                            umpire_weight=args.umpire_weight)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:
