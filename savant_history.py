@@ -79,6 +79,13 @@ statcast_pitch = Table(
     Column("launch_angle", Float),
     Column("bb_type", String(20)),
     Index("ix_statcast_pitch_date", "game_date"),
+    # Covering index for the warehouse team-offense aggregate (mlb_starters.
+    # _warehouse_team_factors): GROUP BY batting_team, p_throws over a game_date range,
+    # AVG/COUNT(xwoba). Group keys first (stream aggregate, no sort), game_date last
+    # (range seek per group), xwoba covered (index-only). mssql_include is ignored off
+    # SQL Server (SQLite tests just build the 3-col index).
+    Index("ix_statcast_pitch_offense", "batting_team", "p_throws", "game_date",
+          mssql_include=["xwoba"]),
 )
 
 statcast_day = Table(

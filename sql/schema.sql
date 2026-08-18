@@ -619,6 +619,19 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                  AND object_id = OBJECT_ID('dbo.statcast_pitch'))
 CREATE INDEX ix_statcast_pitch_date ON dbo.statcast_pitch (game_date);
 GO
+-- Covering index for the warehouse team-offense aggregate (mlb_starters.
+-- _warehouse_team_factors, ODI_MLB_WAREHOUSE_OFFENSE): GROUP BY batting_team, p_throws
+-- over a game_date range with AVG/COUNT(xwoba). Group keys lead (stream aggregate, no
+-- sort), game_date last (range seek per group), xwoba covered (index-only scan). Turns
+-- the per-date backtest offense query from a growing base-table scan into an indexed
+-- lookup. Add WITH (ONLINE = ON) on tiers that support it to avoid blocking the hourly
+-- statcast maintenance during the build.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_statcast_pitch_offense'
+                 AND object_id = OBJECT_ID('dbo.statcast_pitch'))
+CREATE INDEX ix_statcast_pitch_offense
+    ON dbo.statcast_pitch (batting_team, p_throws, game_date) INCLUDE (xwoba);
+GO
 
 ------------------------------------------------------------------- statcast_day
 -- Per-day INGEST MANIFEST for statcast_pitch. One row per fetched game_date with
