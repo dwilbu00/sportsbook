@@ -404,13 +404,32 @@ def save_starter_adjustment(sport_key, adj, meta=None):
         json.dump(blob, f, indent=2)
 
 
+_ADDITIVE_CFG_CACHE = {}   # sport_key -> ((st_mtime_ns, st_size), block)
+
+
 def load_expected_runs_additive(sport_key):
     """Load the additive expected-runs model config (Tier A #1d), or {} if none.
     Read by mlb_starters.live_additive_runs on the flag-ON path; {} keeps the live
-    path on the multiplicative model (byte-identical)."""
+    path on the multiplicative model (byte-identical).
+
+    PROCESS-CACHED by the live file's (mtime_ns, size): live_additive_runs calls this
+    once PER GAME, and the MLB calibration blob is large (~2 MB) — re-parsing it every
+    game made the additive backtest crawl. The stat key auto-invalidates on any write
+    (--promote / save), so there's no staleness and no manual clear."""
     if not sport_key:
         return {}
-    return _load_blob(sport_key).get("expected_runs_additive", {})
+    path = calibration_path(sport_key)
+    try:
+        st = os.stat(path)
+        stat_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stat_key = None
+    cached = _ADDITIVE_CFG_CACHE.get(sport_key)
+    if cached is not None and cached[0] == stat_key:
+        return cached[1]
+    block = _load_blob(sport_key).get("expected_runs_additive", {})
+    _ADDITIVE_CFG_CACHE[sport_key] = (stat_key, block)
+    return block
 
 
 def save_expected_runs_additive(sport_key, model, meta=None):

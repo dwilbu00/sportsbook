@@ -86,6 +86,12 @@ statcast_pitch = Table(
     # SQL Server (SQLite tests just build the 3-col index).
     Index("ix_statcast_pitch_offense", "batting_team", "p_throws", "game_date",
           mssql_include=["xwoba"]),
+    # Per-PITCHER as-of query (pitcher_asof._asof_xwobacon_sql, the get_or_fill lazy-
+    # fill path): WHERE pitcher=? AND game_date range, AVG/COUNT(xwoba). No pitcher-
+    # leading index existed, so each miss scanned the whole table — the backtest hang.
+    # mssql_include ignored off SQL Server.
+    Index("ix_statcast_pitch_pitcher", "pitcher", "game_date",
+          mssql_include=["xwoba"]),
 )
 
 statcast_day = Table(

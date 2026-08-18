@@ -632,6 +632,16 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_statcast_pitch_offense
     ON dbo.statcast_pitch (batting_team, p_throws, game_date) INCLUDE (xwoba);
 GO
+-- Per-PITCHER as-of query (pitcher_asof._asof_xwobacon_sql, the get_or_fill lazy-fill
+-- path): WHERE pitcher=? AND game_date range with AVG/COUNT(xwoba). No pitcher-leading
+-- index existed, so each get_or_fill MISS scanned the whole 3.1M-row table -> the
+-- additive-backtest hang. Add WITH (ONLINE = ON) on tiers that support it.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_statcast_pitch_pitcher'
+                 AND object_id = OBJECT_ID('dbo.statcast_pitch'))
+CREATE INDEX ix_statcast_pitch_pitcher
+    ON dbo.statcast_pitch (pitcher, game_date) INCLUDE (xwoba);
+GO
 
 ------------------------------------------------------------------- statcast_day
 -- Per-day INGEST MANIFEST for statcast_pitch. One row per fetched game_date with
