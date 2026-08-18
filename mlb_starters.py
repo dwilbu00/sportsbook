@@ -298,6 +298,21 @@ def _warehouse_team_factors(season, as_of, min_pa=40):
         raw = {hand: {_canonical_team_key(k, statsapi_abbrs): v
                       for k, v in d.items()}
                for hand, d in raw.items()}
+        # Fail-VISIBLE coverage check (mirrors the Savant path): a warehouse team key
+        # outside the StatsAPI namespace silently disables the challenger for that team,
+        # so warn loudly instead. Distinct ("wh", ...) signature so it doesn't shadow
+        # the Savant warning. Offense-only (bullpen is intentionally empty in v1).
+        offense_keys = {k for d in raw.values() for k in d}
+        unmapped = sorted(offense_keys - statsapi_abbrs)
+        missing = sorted(statsapi_abbrs - offense_keys)
+        _sig = ("wh", int(season), tuple(unmapped), tuple(missing))
+        if (unmapped or missing) and _sig not in _COVERAGE_WARNED:
+            _COVERAGE_WARNED.add(_sig)
+            _warn(f"warehouse expected-runs team-key coverage gap for season {season}: "
+                  f"warehouse keys outside the StatsAPI namespace={unmapped}; "
+                  f"StatsAPI teams with no warehouse offense data={missing}. The "
+                  f"ensemble challenger is disabled for these teams — extend "
+                  f"_SAVANT_TO_STATSAPI_ABBR if 'unmapped' is a rename.")
     offense_rows = [v for d in raw.values() for v in d.values()]
     total_pa = sum(r["pa"] for r in offense_rows)
     if not total_pa:

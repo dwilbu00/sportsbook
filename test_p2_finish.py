@@ -283,6 +283,23 @@ class WarehouseTeamOffenseTests(unittest.TestCase):
         db_store.configure_engine(None)
         self.assertIsNone(mlb_starters._warehouse_team_factors(2024, "2024-09-01"))
 
+    def test_coverage_gap_warns_loudly(self):
+        # An unmapped warehouse key (ZZZ) + a StatsAPI team with no warehouse data
+        # (SEA) must warn loudly — mirrors the Savant path's fail-visible check.
+        for _ in range(60):
+            self._pitch("NYY", "R", 0.340)
+            self._pitch("ZZZ", "R", 0.300)                # unmapped, not in the index
+        stderr = io.StringIO()
+        with patch.object(mlb_starters, "get_team_index",
+                          return_value=_fake_index({"NYY", "SEA"})), \
+                redirect_stderr(stderr):
+            out = mlb_starters._warehouse_team_factors(2024, "2024-09-01")
+        log = stderr.getvalue()
+        self.assertIsNotNone(out)                         # partial coverage still returns
+        self.assertIn("coverage gap", log)
+        self.assertIn("ZZZ", log)                         # unmapped warehouse key
+        self.assertIn("SEA", log)                         # StatsAPI team, no warehouse data
+
     # ── the env flag ──
     def test_flag_env_truth_table(self):
         for val, exp in [("1", True), ("true", True), ("on", True), ("YES", True),
