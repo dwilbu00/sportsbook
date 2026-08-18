@@ -76,7 +76,7 @@ class BullpenGetterTests(unittest.TestCase):
         self.series = {"10": [{"as_of_date": "2024-04-01", "era": 4.5},
                               {"as_of_date": "2024-04-10", "era": 5.0}]}
         self.abbr_to_id = {"NYY": "10"}
-        self.g = bs._make_bp_getter(self.series, self.abbr_to_id,
+        self.g = bs._make_bp_getter(self.series, self.abbr_to_id.get,
                                     league_rp_era=4.0, league_bp=4.3)
 
     def test_league_relative_scaling(self):
@@ -92,12 +92,32 @@ class BullpenGetterTests(unittest.TestCase):
 
     def test_ratio_is_clamped(self):
         series = {"10": [{"as_of_date": "2024-04-01", "era": 100.0}]}
-        g = bs._make_bp_getter(series, {"NYY": "10"}, 4.0, 4.3)
+        g = bs._make_bp_getter(series, {"NYY": "10"}.get, 4.0, 4.3)
         self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3 * 2.0)  # clamp hi
 
     def test_no_league_era_falls_back(self):
-        g = bs._make_bp_getter(self.series, self.abbr_to_id, None, 4.3)
+        g = bs._make_bp_getter(self.series, self.abbr_to_id.get, None, 4.3)
         self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)
+
+    def test_resolve_id_identity_callable(self):
+        # #1d: the live path passes an IDENTITY resolver (team_id -> team_id) instead
+        # of a dict.get — the getter must work for any callable, same result.
+        g = bs._make_bp_getter(self.series, lambda k: k, 4.0, 4.3)  # series keyed "10"
+        self.assertAlmostEqual(g("10", "2024-04-05"), 4.3 * (4.5 / 4.0))
+        self.assertAlmostEqual(g("99", "2024-04-05"), 4.3)          # unknown -> league
+
+
+class AdditiveRunsExtractionTests(unittest.TestCase):
+    """#1d: the pure helpers moved to additive_runs.py; backtest_starters aliases them
+    so the OFFLINE bake-off and the LIVE path run the SAME code (fit==serve spine)."""
+    def test_aliases_are_the_extracted_functions(self):
+        import additive_runs as ar
+        self.assertIs(bs._exp_ip, ar.exp_ip)
+        self.assertIs(bs._feat_from_row, ar.feat_from_row)
+        self.assertIs(bs._window_diff, ar.window_diff)
+        self.assertIs(bs._make_feat_getter, ar.make_feat_getter)
+        self.assertIs(bs._make_bp_getter, ar.make_bp_getter)
+        self.assertIs(bs._make_additive_projector, ar.make_additive_projector)
 
 
 class ProjectorBullpenTests(unittest.TestCase):
