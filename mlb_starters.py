@@ -685,9 +685,18 @@ def expected_runs_additive(starter_rate9, bullpen_rate9, exp_ip,
 
 def _mlb_additive_runs_enabled():
     """ODI_MLB_ADDITIVE_RUNS gate for the live additive expected-runs model (Tier A
-    #1d). OFF (unset) = byte-identical multiplicative path. Mirrors the espn_client
-    ODI_MLB_* env→bool idiom; promoted from st.secrets at boot in app.py."""
+    #1d, SPREADS). OFF (unset) = byte-identical multiplicative path. Mirrors the
+    espn_client ODI_MLB_* env→bool idiom; promoted from st.secrets at boot in app.py."""
     return os.environ.get("ODI_MLB_ADDITIVE_RUNS", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def _mlb_additive_totals_enabled():
+    """ODI_MLB_ADDITIVE_TOTALS gate (Tier B): use the additive expected TOTAL runs as
+    the totals projection (runs-first) instead of the recency+starter-shift mean. OFF
+    (unset) = byte-identical current totals model. Separate flag from spreads so each
+    market's additive is an independent, evidence-gated A/B."""
+    return os.environ.get("ODI_MLB_ADDITIVE_TOTALS", "").strip().lower() in (
         "1", "true", "on", "yes")
 
 
@@ -1715,9 +1724,10 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
             "home_staff_suppression": home_staff,
             "away_staff_suppression": away_staff,
         }
-        # #1d: surface the keys the live additive model needs to hit pitcher_asof_daily
-        # — ONLY when the flag is on, so OFF the expected_runs dict is byte-identical.
-        if _mlb_additive_runs_enabled():
+        # #1d/Tier B: surface the keys the live additive model needs to hit
+        # pitcher_asof_daily — ONLY when an additive flag (spreads OR totals) is on, so
+        # with both OFF the expected_runs dict is byte-identical.
+        if _mlb_additive_runs_enabled() or _mlb_additive_totals_enabled():
             result["expected_runs"].update({
                 "home_sp_id": pitcher_ids.get("home"),
                 "away_sp_id": pitcher_ids.get("away"),

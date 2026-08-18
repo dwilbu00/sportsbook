@@ -799,6 +799,145 @@ class ExpectedRunsTests(unittest.TestCase):
         self.assertEqual(workload[("2024-04-02", "AWY")], 2.0)
 
 
+class AdditiveTotalsTests(unittest.TestCase):
+    """Tier B: ODI_MLB_ADDITIVE_TOTALS runs-first totals seam in
+    analyze_totals_value. Mirrors the #1d spreads substitution — replace the
+    recency + starter-shift projection with the additive expected TOTAL, keep
+    the Normal-CDF + shrink downstream. Inert (byte-identical) when the flag is
+    off; falls back to the recency projection when the additive returns None."""
+
+    @staticmethod
+    def _team_stats():
+        # recent_games carry total_score (totals model) + per-team scores
+        # (recency scoring means). Same list for both teams, mirroring
+        # ExpectedRunsTests._team_stats.
+        games = [
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 6, "away_score": 3, "total_score": 9},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 2, "away_score": 4, "total_score": 6},
+            {"home_team": "Home", "away_team": "Away",
+             "home_score": 1, "away_score": 5, "total_score": 6},
+            {"home_team": "Away", "away_team": "Home",
+             "home_score": 3, "away_score": 2, "total_score": 5},
+        ]
+        base = {
+            "season": {"win_pct": 0.5},
+            "recent": {"win_pct": 0.5, "avg_scored": 4.0, "avg_allowed": 4.0},
+            "recent_games": games,
+        }
+        return dict(base), dict(base)
+
+    @staticmethod
+    def _game_odds():
+        return {
+            "home_team": "Home",
+            "away_team": "Away",
+            "totals": {
+                "Over": [{"line": 8.5, "price": -110}],
+                "Under": [{"line": 8.5, "price": -110}],
+            },
+        }
+
+    @staticmethod
+    def _matchup_features():
+        # Truthy so the seam's `and matchup_features` guard passes; the
+        # expected_runs payload is only forwarded to (mocked) live_additive_runs.
+        return {"expected_runs": {"complete": True}}
+
+    def test_additive_totals_inert_when_flag_off(self):
+        # Flag OFF (default): the additive must never be consulted, and the
+        # projection must equal the pure recency + starter-shift baseline even
+        # if live_additive_runs would return something wildly different.
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        features = self._matchup_features()
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=False), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=(100.0, 100.0)) as live:
+            candidates = analysis.analyze_totals_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb", matchup_features=features)
+        over = next(c for c in candidates if c["type"] == "total_over")
+        live.assert_not_called()
+        # Recompute the baseline with the additive fully absent to confirm
+        # byte-identical projection.
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=False):
+            baseline = analysis.analyze_totals_value(
+                self._game_odds(), *self._team_stats(),
+                sport_key="baseball_mlb",
+                matchup_features=self._matchup_features())
+        self.assertEqual(over, next(
+            c for c in baseline if c["type"] == "total_over"))
+
+    def test_additive_totals_overrides_projection_when_enabled(self):
+        # Flag ON + additive fires: projected_total becomes home+away additive
+        # runs (a value distinct from the recency baseline), and the higher
+        # total pushes model_over_hit_rate up.
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        features = self._matchup_features()
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=True), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=(7.25, 6.75)) as live:
+            candidates = analysis.analyze_totals_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb", matchup_features=features)
+        live.assert_called_once()
+        over = next(c for c in candidates if c["type"] == "total_over")
+        self.assertEqual(over["projected_total"], round(7.25 + 6.75, 2))
+
+        # Baseline (flag off) projects well below the additive 14.0 total, so the
+        # additive must raise the modeled over probability.
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=False):
+            baseline = next(
+                c for c in analysis.analyze_totals_value(
+                    self._game_odds(), *self._team_stats(),
+                    sport_key="baseball_mlb",
+                    matchup_features=self._matchup_features())
+                if c["type"] == "total_over")
+        self.assertLess(baseline["projected_total"], over["projected_total"])
+        self.assertGreater(over["model_over_hit_rate"],
+                           baseline["model_over_hit_rate"])
+
+    def test_additive_totals_none_falls_back_to_recency(self):
+        # Flag ON but the additive returns None (non-MLB / thin data): the seam
+        # must fall through to the recency projection, byte-identical to off.
+        game_odds = self._game_odds()
+        home_stats, away_stats = self._team_stats()
+        features = self._matchup_features()
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=True), \
+                patch.object(mlb_starters, "live_additive_runs",
+                             return_value=None) as live:
+            candidates = analysis.analyze_totals_value(
+                game_odds, home_stats, away_stats,
+                sport_key="baseball_mlb", matchup_features=features)
+        live.assert_called_once()
+        over = next(c for c in candidates if c["type"] == "total_over")
+        with patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                          return_value=False):
+            baseline = next(
+                c for c in analysis.analyze_totals_value(
+                    self._game_odds(), *self._team_stats(),
+                    sport_key="baseball_mlb",
+                    matchup_features=self._matchup_features())
+                if c["type"] == "total_over")
+        self.assertEqual(over, baseline)
+
+    def test_additive_totals_flag_helper_reads_env(self):
+        with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_TOTALS": "1"}):
+            self.assertTrue(mlb_starters._mlb_additive_totals_enabled())
+        with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_TOTALS": "off"}):
+            self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
+
+
 class AsOfReliabilityTests(unittest.TestCase):
     def test_future_games_do_not_complete_an_earlier_streak(self):
         games = [

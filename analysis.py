@@ -578,6 +578,18 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         starter_total_shift = -(run_scale * excess) - (bullpen_w * bullpen_excess)
         projected_total += starter_total_shift
 
+    # Tier B (ODI_MLB_ADDITIVE_TOTALS): runs-first total — replace the recency +
+    # starter-shift projection with the additive expected TOTAL (already staff-adjusted
+    # via pitcher_asof rates + the warehouse offense factor). Inert unless the flag is on
+    # AND the additive fires; keeps the Normal-CDF + shrink downstream (mirrors the #1d
+    # spreads substitution). live_additive_runs returns None for non-MLB / thin data ->
+    # falls through to the recency projection.
+    if mlb_starters._mlb_additive_totals_enabled() and matchup_features:
+        _add_pair = mlb_starters.live_additive_runs(
+            sport_key, matchup_features.get("expected_runs") or {})
+        if _add_pair and _add_pair[0] is not None and _add_pair[1] is not None:
+            projected_total = _add_pair[0] + _add_pair[1]
+
     # Build the historical total-score spread around the projection. The same
     # projected_total used for display is the mean of the probability model;
     # this prevents the displayed projection and value probability from moving
