@@ -1743,13 +1743,26 @@ def build_weather(seasons, apply=False, force=False, verbose=True):
         return 0
     now = _now()
     written = 0
+    consecutive_empty = 0
+    _EMPTY_ABORT = 3                # stop after N straight empty fetches (quota hit)
     for (vid, yr), ts in sorted(groups.items()):
         dates = sorted(t["date"] for t in ts)
         lat, lon = ts[0]["lat"], ts[0]["lon"]
         day_wx = wf.fetch_visualcrossing_range(lat, lon, dates[0], dates[-1])
-        if not day_wx and verbose:                    # surface a failed/empty fetch
-            print(f"    [weather] {vid} {yr}: fetch returned NO data for "
-                  f"{dates[0]}..{dates[-1]} (API error / cost cap / no key?).")
+        if not day_wx:
+            consecutive_empty += 1
+            if verbose:                               # surface a failed/empty fetch
+                print(f"    [weather] {vid} {yr}: fetch returned NO data for "
+                      f"{dates[0]}..{dates[-1]} (API error / daily quota / no key?).")
+            if consecutive_empty >= _EMPTY_ABORT:
+                print(f"  [weather] STOPPING after {consecutive_empty} consecutive "
+                      f"empty fetches — likely the Visual Crossing DAILY QUOTA. "
+                      f"{written} rows written so far. Re-run the same command later "
+                      f"(it's incremental — already-stored venue-dates are skipped) "
+                      f"to resume where this left off.")
+                break
+        else:
+            consecutive_empty = 0
         rows = []
         for t in ts:
             w = day_wx.get(t["date"])
