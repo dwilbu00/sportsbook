@@ -1738,21 +1738,35 @@ _ADDITIVE_FEATURES = ("xwobacon", "k9")   # v1 (owner-endorsed), available now
 
 # Feature families for the bake-off, in increasing richness. The bake-off runs each
 # so the MARGINAL value of adding the contact-quality bundle, then the walk-rate
-# (FIP) bundle, is visible (the owner-endorsed marginal-then-joint read).
+# (FIP) bundle, then CSW, is visible (the owner-endorsed marginal-then-joint read).
 #   v1      — xwOBAcon + K/9 (warehouse + statcast, populated now).
 #   contact — + barrel% + whiff% (statcast rates, ALSO populated now: no schema wait).
 #   fip     — + K% + BB% (need the #1c-a BB/BF unlock + re-backfill; NULL until then,
 #             so this family is auto-SKIPPED with a note on pre-unlock data).
+#   csw     — contact + CSW% (called-strikes+whiffs / pitches): a compact swing-and-miss
+#             / pitcher-dominance summary already computed + stored in pitcher_asof_daily
+#             (Batch A #25 "activate inert CSW"). Built on CONTACT, not fip, on purpose:
+#             fip's K%/BB% are NULL until the #1c-a BB/BF re-backfill, and feat_from_row
+#             drops a row on ANY null key — so a fip-based csw would auto-skip until that
+#             backfill. contact is populated now, so csw grades on CURRENT data. Its
+#             MARGINAL over contact is what the bake-off measures; CSW correlates with
+#             whiff% so a near-zero marginal is the expected null. INERT until a
+#             csw-bearing additive config is fit + promoted (candidate staging) — live
+#             pricing reads the fitted config's feature_keys, never these lists, so this
+#             addition is byte-identical.
 _ADDITIVE_FEATURE_SETS = {
     "v1": ("xwobacon", "k9"),
     "contact": ("xwobacon", "k9", "barrel_pct", "whiff_pct"),
     "fip": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "k_pct", "bb_pct"),
+    "csw": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "csw_pct"),
 }
 
 # Every feature any family may request — the series loader pulls all of these so a
-# family can be selected without re-querying.
+# family can be selected without re-querying. MUST stay equal (as a set) to
+# pitcher_asof._SERIES_FEATURES or the live single-entity series omits a column a
+# family needs -> fit != serve (guarded by test_additive_bakeoff).
 _ALL_ASOF_FEATURES = ("xwobacon", "k9", "barrel_pct", "whiff_pct", "hard_hit_pct",
-                      "gb_pct", "k_pct", "bb_pct")
+                      "gb_pct", "k_pct", "bb_pct", "csw_pct")
 
 
 def _variant_metrics_projfn(train, holdout, project_fn,

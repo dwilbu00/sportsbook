@@ -8,8 +8,74 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import additive_runs as ar
 import backtest_starters as bs
 import calibration_loader as cl
+import pitcher_asof
+
+
+class FeatureListInvariantTests(unittest.TestCase):
+    """The fit==serve spine: the live single-entity series (pitcher_asof) and the
+    offline bulk series (backtest_starters) MUST carry the same feature columns, and
+    every bake-off family must be a subset of what the loaders pull. These were only
+    documented in comments before; enforce them so any future feature addition that
+    forgets one side is caught here, not by a silent live/offline projection drift."""
+
+    def test_series_features_match_all_asof_features(self):
+        self.assertEqual(set(pitcher_asof._SERIES_FEATURES),
+                         set(bs._ALL_ASOF_FEATURES))
+
+    def test_every_family_is_subset_of_loaded_features(self):
+        loaded = set(bs._ALL_ASOF_FEATURES)
+        for name, keys in bs._ADDITIVE_FEATURE_SETS.items():
+            missing = set(keys) - loaded
+            self.assertFalse(
+                missing, f"family {name!r} needs unloaded features {missing}")
+
+    def test_all_asof_features_are_stored_columns(self):
+        # Every loadable feature must be a real column populated by build_season
+        # (_STAT_COLS) or the warehouse curve (k9/k_pct/bb_pct), else the series
+        # loader would KeyError / return NULL for it.
+        stored = set(pitcher_asof._STAT_COLS) | {"k9", "k_pct", "bb_pct"}
+        self.assertTrue(set(bs._ALL_ASOF_FEATURES) <= stored)
+
+
+class CswFeatureFamilyTests(unittest.TestCase):
+    """Batch A #25 — activate the inert csw_pct as an additive bake-off feature."""
+
+    def test_csw_family_registered_and_carries_csw(self):
+        self.assertIn("csw", bs._ADDITIVE_FEATURE_SETS)
+        self.assertIn("csw_pct", bs._ADDITIVE_FEATURE_SETS["csw"])
+        # csw must be loadable on BOTH the offline and live series or fit != serve.
+        self.assertIn("csw_pct", bs._ALL_ASOF_FEATURES)
+        self.assertIn("csw_pct", pitcher_asof._SERIES_FEATURES)
+
+    def test_csw_is_marginal_over_contact(self):
+        # The csw family = contact + csw_pct (marginal-then-joint read); the ONLY extra
+        # key must be csw_pct, so the bake-off measures CSW's marginal cleanly.
+        extra = set(bs._ADDITIVE_FEATURE_SETS["csw"]) - set(
+            bs._ADDITIVE_FEATURE_SETS["contact"])
+        self.assertEqual(extra, {"csw_pct"})
+
+    def test_csw_family_avoids_null_until_backfill_columns(self):
+        # csw must NOT inherit k_pct/bb_pct (NULL until the #1c-a BB/BF re-backfill) or
+        # feat_from_row's any-null-key drop would auto-skip every row -> ungradable on
+        # current data. Guards the adversarial-review fix.
+        self.assertNotIn("k_pct", bs._ADDITIVE_FEATURE_SETS["csw"])
+        self.assertNotIn("bb_pct", bs._ADDITIVE_FEATURE_SETS["csw"])
+
+    def test_extra_series_column_does_not_perturb_a_non_csw_config(self):
+        # The live byte-identical mechanism: a config whose feature_keys omit csw_pct
+        # reads the SAME features whether or not the series row carries csw_pct, so
+        # adding the column to the series lists cannot move a non-csw projection.
+        keys = ("xwobacon", "k9")
+        without = {"xwobacon": 0.32, "k9": 8.0, "n_bbe": 150}
+        with_csw = dict(without, csw_pct=0.31)
+        f_without, n_without = ar.feat_from_row(without, keys)
+        f_with, n_with = ar.feat_from_row(with_csw, keys)
+        self.assertEqual(f_without, f_with)
+        self.assertEqual(n_without, n_with)
+        self.assertNotIn("csw_pct", f_with)
 
 
 class ExpIpTests(unittest.TestCase):

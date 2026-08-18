@@ -411,10 +411,14 @@ def asof_pitcher_features(entity_id, as_of_date, role="SP", max_retries=3):
 
 
 # Feature columns carried on an SP series row — MUST match backtest_starters.
-# _ALL_ASOF_FEATURES so the shared additive_runs.make_feat_getter produces identical
-# blended features live and in the bake-off (fit == serve).
+# _ALL_ASOF_FEATURES (as a set) so the shared additive_runs.make_feat_getter produces
+# identical blended features live and in the bake-off (fit == serve). csw_pct is
+# already populated in _STAT_COLS; carrying it here activates it for the additive
+# feature-family bake-off (Batch A #25). Live pricing reads the FITTED config's
+# feature_keys (mlb_starters.live_additive_runs), never this list, so adding a column
+# leaves live output byte-identical until a csw-bearing config is promoted.
 _SERIES_FEATURES = ("xwobacon", "k9", "barrel_pct", "whiff_pct",
-                    "hard_hit_pct", "gb_pct", "k_pct", "bb_pct")
+                    "hard_hit_pct", "gb_pct", "k_pct", "bb_pct", "csw_pct")
 
 
 # ── Opt-in, process-level memo cache for the single-entity as-of series readers ──
