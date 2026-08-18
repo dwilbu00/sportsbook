@@ -1868,6 +1868,7 @@ def _additive_training_rows(rows, feat_getter, feature_keys):
 
 
 _make_additive_projector = ar.make_additive_projector   # extracted (#1d shared spine)
+_make_run_env_fn = ar.make_run_env_fn                   # Batch A park/weather run_env
 
 
 # ── windowing / prior-blend as-of feature getters (recency vs cumulative) ─────
@@ -1984,7 +1985,8 @@ def _abbr_to_team_id(seasons):
 def test_additive_expected_runs(seasons, holdout_start=None,
                                 feature_sets=None,
                                 window_modes=("cumulative", "blend", "window"),
-                                rp_bullpen=False, bullpen_fatigue_weight=0.0):
+                                rp_bullpen=False, bullpen_fatigue_weight=0.0,
+                                park_weight=0.0):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
     model across FEATURE FAMILIES (v1/contact/fip/csw/gb/siera) x as-of WINDOW modes
     (cumulative / prior-season blend / trailing window), fit on a chronological train
@@ -2015,6 +2017,27 @@ def test_additive_expected_runs(seasons, holdout_start=None,
         print("!! pitcher_asof_daily is EMPTY — run `python pitcher_asof.py "
               "--build` first. Aborting additive bake-off.")
         return None
+    # Batch A PARK run_env: attach the ACTUAL venue_id per game (mlb_game
+    # (official_date, home_team_id) -> venue_id, so neutral-site games key their real
+    # park) and build the venue-keyed run_env_fn. INERT at park_weight=0 (run_env_fn
+    # stays None -> projector byte-identical).
+    run_env_fn = None
+    if park_weight:
+        import mlb_warehouse
+        venue_idx = mlb_warehouse.game_venue_index(seasons)
+        abbr_id = _abbr_to_team_id(seasons)
+        for r in all_rows:
+            tid = abbr_id.get(r.get("home_abbr"))
+            r["venue_id"] = (venue_idx.get((str(r.get("date"))[:10], tid))
+                             if tid else None)
+        park_runs = mlb_warehouse.venue_park_runs_map()
+        run_env_fn = _make_run_env_fn(
+            park_runs_of=lambda row: park_runs.get(row.get("venue_id"), 1.0),
+            park_weight=park_weight)
+        n_res = sum(1 for r in all_rows if r.get("venue_id"))
+        print(f"  [park] run_env park_weight={park_weight}: {n_res}/{len(all_rows)} "
+              f"games venue-resolved, {len(park_runs)} venues in mlb_venue.")
+
     all_rows.sort(key=lambda r: r["date"])
     if holdout_start is None:
         cut = int(len(all_rows) * 0.7)
@@ -2070,7 +2093,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
             key = f"additive_{fs_name}_{mode}"
             results[key] = _variant_metrics_projfn(
                 train, holdout,
-                _make_additive_projector(getter, xm, league_bp, feature_keys, bpg))
+                _make_additive_projector(getter, xm, league_bp, feature_keys, bpg,
+                                         run_env_fn=run_env_fn))
             labels.append((f"B additive[{fs_name}/{mode}]", key))
 
     bp_tag = "team-RP" if bp_getter else "league-avg"
@@ -2098,7 +2122,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
 
 def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
                         mode="blend", blend_k=200.0, n_starts=10,
-                        bullpen_fatigue_weight=0.0):
+                        bullpen_fatigue_weight=0.0, park_weight=0.0,
+                        weather_weight=0.0):
     """Fit the additive expected-runs model on the FULL span and STAGE it as the
     calibration candidate block `expected_runs_additive` (Tier A #1d, commit 5).
     Default = the bake-off winner: v1 features (xwOBAcon+K9) + prior-season BLEND +
@@ -2138,6 +2163,8 @@ def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
                     "league_bp": xm.get("league_rate9"),
                     # Batch A #13; 0.0 -> inert (live make_bp_getter byte-identical).
                     "fatigue_weight": bullpen_fatigue_weight},
+        # Batch A run_env (park/weather); 0.0 weights -> inert (byte-identical live).
+        "run_env": {"park_weight": park_weight, "weather_weight": weather_weight},
     }
     _cl.set_candidate_mode(True)                    # candidate-ONLY, never live
     _cl.save_expected_runs_additive(
@@ -2207,6 +2234,10 @@ if __name__ == "__main__":
                     help="with --additive-bakeoff --rp-bullpen, A/B the trailing-"
                          "workload bullpen fatigue term (Batch A #13) at this weight "
                          "(0 = off/current behavior; try e.g. 0.3).")
+    ap.add_argument("--park-weight", type=float, default=0.0,
+                    help="with --additive-bakeoff, A/B the venue park run_env term "
+                         "(Batch A) at this weight (0 = off; 1 = full mlb_venue park "
+                         "runs factor). Needs `--build-venues` populated first.")
     ap.add_argument("--additive-save", action="store_true",
                     help="Tier A #1d: fit the additive expected-runs model (v1/blend/"
                          "team-RP) on --season and STAGE it as the calibration "
@@ -2246,7 +2277,8 @@ if __name__ == "__main__":
         test_additive_expected_runs(seasons, holdout_start=args.holdout_start,
                                     feature_sets=_fs, window_modes=_modes,
                                     rp_bullpen=args.rp_bullpen,
-                                    bullpen_fatigue_weight=args.bullpen_fatigue_weight)
+                                    bullpen_fatigue_weight=args.bullpen_fatigue_weight,
+                                    park_weight=args.park_weight)
     elif args.additive_save:
         save_additive_model(seasons,
                             bullpen_fatigue_weight=args.bullpen_fatigue_weight)

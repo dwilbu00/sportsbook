@@ -784,12 +784,28 @@ def live_additive_runs(sport_key, factors):
             bp_getter = ar.make_bp_getter(
                 rp_series, str, league_rp_era, league_bp,
                 fatigue_weight=float(bullpen.get("fatigue_weight") or 0.0))
+        # Batch A PARK run_env: sourced from the fitted config's run_env block. Absent /
+        # park_weight=0 -> run_env_fn stays None -> the pre-run_env projector (byte-
+        # identical). venue_id = the home team's primary park (resident_venue_by_team);
+        # neutral-site live is a future refinement off the schedule.
+        run_env_cfg = cfg.get("run_env") or {}
+        park_weight = float(run_env_cfg.get("park_weight") or 0.0)
+        run_env_fn = None
+        venue_id = None
+        if park_weight:
+            import mlb_warehouse
+            venue_id = mlb_warehouse.resident_venue_by_team().get(str(htid))
+            park_runs = mlb_warehouse.venue_park_runs_map()
+            run_env_fn = ar.make_run_env_fn(
+                park_runs_of=lambda r: park_runs.get(r.get("venue_id"), 1.0),
+                park_weight=park_weight)
         projector = ar.make_additive_projector(
-            feat_getter, model, league_bp, feature_keys, bp_getter)
+            feat_getter, model, league_bp, feature_keys, bp_getter,
+            run_env_fn=run_env_fn)
         # CROSSED mapping (see make_additive_projector): home_runs uses the away
         # starter + away bullpen + a_off_faced=home-lineup offense; away_runs mirrors.
         row = {"date": str(gd)[:10], "home_sp": hsp, "away_sp": asp,
-               "home_abbr": str(htid), "away_abbr": str(atid),
+               "home_abbr": str(htid), "away_abbr": str(atid), "venue_id": venue_id,
                "a_ip": factors.get("away_avg_ip"), "h_ip": factors.get("home_avg_ip"),
                "a_off_faced": factors.get("home_offense_factor") or 1.0,
                "h_off_faced": factors.get("away_offense_factor") or 1.0}

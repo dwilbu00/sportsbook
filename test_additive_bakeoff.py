@@ -354,6 +354,36 @@ class RunEnvProjectorTests(unittest.TestCase):
         self.assertAlmostEqual(arN, ar0)
 
 
+class ParkRunEnvTests(unittest.TestCase):
+    """Batch A park/weather: make_run_env_fn composition. Returns None (byte-identical)
+    when nothing is enabled; scales by the weighted, centered-1.0 park/weather terms."""
+
+    def _pr(self, mapping):
+        return lambda row: mapping.get(row.get("venue_id"), 1.0)
+
+    def test_none_when_disabled(self):
+        self.assertIsNone(bs._make_run_env_fn())                       # no weights
+        self.assertIsNone(bs._make_run_env_fn(self._pr({}), 0.0))      # weight 0
+        self.assertIsNone(bs._make_run_env_fn(park_weight=0.5))        # no resolver
+
+    def test_full_and_partial_park_weight(self):
+        pr = self._pr({"COORS": 1.20})
+        full = bs._make_run_env_fn(pr, 1.0)
+        self.assertAlmostEqual(full({"venue_id": "COORS"}), 1.20)      # full factor
+        self.assertAlmostEqual(full({"venue_id": "?"}), 1.0)          # unknown -> neutral
+        half = bs._make_run_env_fn(pr, 0.5)
+        self.assertAlmostEqual(half({"venue_id": "COORS"}), 1.10)      # 1 + .5*(1.2-1)
+
+    def test_park_and_weather_compose_multiplicatively(self):
+        fn = bs._make_run_env_fn(self._pr({"V": 1.2}), 1.0,
+                                 weather_of=lambda r: 1.1, weather_weight=1.0)
+        self.assertAlmostEqual(fn({"venue_id": "V"}), 1.2 * 1.1)
+
+    def test_falsy_resolver_value_is_neutral(self):
+        fn = bs._make_run_env_fn(lambda r: None, 1.0)
+        self.assertAlmostEqual(fn({"venue_id": "x"}), 1.0)
+
+
 class WindowingTests(unittest.TestCase):
     def setUp(self):
         # One pitcher "P": a 2023 prior-season final + three 2024 as-of rows.

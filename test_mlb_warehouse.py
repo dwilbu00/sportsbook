@@ -293,6 +293,24 @@ class ResidentVenueTests(_Backend, unittest.TestCase):
         # All venues still enumerated for geo coverage.
         self.assertEqual(set(mlb_warehouse._all_venue_ids()), {"3313", "SPR", "LON"})
 
+    def test_run_env_venue_lookups(self):
+        from sqlalchemy import insert
+        self._game(1, 2024, "147", "3313", "R")
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_venue), [
+                {"venue_id": "3313", "team_id": "147", "park_runs": 1.03,
+                 "park_hits": 1.0},
+                {"venue_id": "SPR", "team_id": None, "park_runs": 1.0,
+                 "park_hits": 1.0},                                        # neutral
+            ])
+        self.assertEqual(mlb_warehouse.venue_park_runs_map(),
+                         {"3313": 1.03, "SPR": 1.0})
+        # resident_venue_by_team excludes the team-less (neutral) venue.
+        self.assertEqual(mlb_warehouse.resident_venue_by_team(), {"147": "3313"})
+        # game_venue_index resolves the ACTUAL venue per (date, home team).
+        self.assertEqual(mlb_warehouse.game_venue_index([2024]),
+                         {("2024-04-01", "147"): "3313"})
+
 
 # ─────────────────────────────────────────────────────────── pure parse / derive
 class ParseTests(unittest.TestCase):

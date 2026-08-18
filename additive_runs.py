@@ -163,6 +163,35 @@ def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp,
     return getter
 
 
+def make_run_env_fn(park_runs_of=None, park_weight=0.0,
+                    weather_of=None, weather_weight=0.0):
+    """Build run_env_fn(row) -> the per-game run-environment multiplier composing PARK
+    and WEATHER, each weight-gated (0 -> that term contributes exactly 1.0):
+        park    = 1 + park_weight    * (park_runs_of(row) - 1)   # venue park RUNS factor
+        weather = 1 + weather_weight * (weather_of(row)   - 1)   # centered-1.0 [Phase 3]
+        run_env = park * weather
+    Resolvers return a value centered on 1.0 (park_runs_of via row['venue_id'] ->
+    mlb_venue.park_runs; a falsy/None result = neutral). Shared by the offline bake-off
+    and live so fit == serve. Both weights 0 (or no resolver) -> run_env_fn returns 1.0
+    for every row -> the projector is byte-identical to run_env_fn=None. Returns None
+    when nothing is enabled, so the caller can pass it straight to
+    make_additive_projector."""
+    if not (park_weight and park_runs_of) and not (weather_weight and weather_of):
+        return None
+    def run_env_fn(row):
+        env = 1.0
+        if park_weight and park_runs_of is not None:
+            pr = park_runs_of(row)
+            if pr:
+                env *= 1.0 + park_weight * (float(pr) - 1.0)
+        if weather_weight and weather_of is not None:
+            w = weather_of(row)
+            if w:
+                env *= 1.0 + weather_weight * (float(w) - 1.0)
+        return env
+    return run_env_fn
+
+
 def make_additive_projector(feat_getter, xera_model, league_bp, feature_keys,
                             bp_getter=None, run_env_fn=None):
     """project_fn(row) -> (home_runs, away_runs) via mlb_starters.expected_runs_

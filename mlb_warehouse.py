@@ -1531,6 +1531,59 @@ def _resident_team_by_venue():
     return {vid: tid for (season, tid), (vid, _n) in best.items()}
 
 
+def venue_park_runs_map():
+    """{venue_id: park_runs} from mlb_venue — the bulk park run_env lookup. Missing/NULL
+    park_runs -> 1.0 (neutral). {} on SQL off/empty (park term then stays neutral)."""
+    if not enabled():
+        return {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(mlb_venue.c.venue_id, mlb_venue.c.park_runs)).fetchall()
+        return {str(v): (float(p) if p is not None else 1.0) for v, p in rows}
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
+def resident_venue_by_team():
+    """{team_id: venue_id} — each team's PRIMARY home park (mlb_venue rows that carry a
+    resident team). The LIVE venue resolver: a scheduled game's venue_id from its home
+    team_id (neutral-site live is a future refinement off the schedule). {} on SQL off."""
+    if not enabled():
+        return {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(mlb_venue.c.team_id, mlb_venue.c.venue_id)
+                .where(mlb_venue.c.team_id.isnot(None))).fetchall()
+        return {str(t): str(v) for t, v in rows if t is not None and v is not None}
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
+def game_venue_index(seasons):
+    """{(official_date, home_team_id): venue_id} over `seasons` from mlb_game — the
+    OFFLINE venue resolver (the ACTUAL venue per game, so neutral-site games key their
+    real park, not the home team's usual one). {} on SQL off."""
+    if not enabled():
+        return {}
+    try:
+        want = {int(s) for s in seasons}
+    except (TypeError, ValueError):
+        return {}
+    try:
+        g = mlb_game
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.official_date, g.c.home_team_id, g.c.venue_id)
+                .where(g.c.season.in_(sorted(want))
+                       & g.c.venue_id.isnot(None))).fetchall()
+        return {(str(d), str(t)): str(v) for d, t, v in rows
+                if d is not None and t is not None and v is not None}
+    except (OperationalError, ValueError, TypeError):
+        return {}
+
+
 def build_venue_dim(verbose=True):
     """Populate mlb_venue: one row per distinct venue_id in mlb_game, enriched with the
     StatsAPI /venues location (lat/lon/elevation) + the authored park/geo priors
