@@ -212,5 +212,53 @@ class GetOrFillSqliteTests(unittest.TestCase):
             self.assertIsNone(pa.get_or_fill("1", "2024-04-01"))
 
 
+class LoadSeriesTests(unittest.TestCase):
+    """#1d single-entity live readers: load_sp_series / load_rp_series span
+    {season, season-1, season-2} (season-2 needed for the first-start blend)."""
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        pa.create_all()
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+
+    def _sp(self, eid, date, season, xwobacon=0.32, k9=8.0, n_bbe=100, ip=60.0):
+        with db_store.get_engine().begin() as c:
+            c.execute(pa.pitcher_asof_daily.insert(), {
+                "entity_id": eid, "as_of_date": date, "role": "SP",
+                "season_bucket": season, "xwobacon": xwobacon, "k9": k9,
+                "n_bbe": n_bbe, "ip": ip})
+
+    def _rp(self, tid, date, season, era):
+        with db_store.get_engine().begin() as c:
+            c.execute(pa.pitcher_asof_daily.insert(), {
+                "entity_id": tid, "as_of_date": date, "role": "RP",
+                "season_bucket": season, "era": era})
+
+    def test_sp_series_spans_three_seasons_sorted(self):
+        self._sp("1", "2025-09-30", 2025)         # season-1
+        self._sp("1", "2026-04-05", 2026)         # season
+        self._sp("1", "2024-09-30", 2024)         # season-2 (first-start blend prior)
+        self._sp("1", "2023-09-30", 2023)         # season-3 -> EXCLUDED
+        s = pa.load_sp_series("1", 2026)
+        self.assertEqual([r["season_bucket"] for r in s], [2024, 2025, 2026])  # sorted
+        self.assertEqual(s[0]["as_of_date"], "2024-09-30")
+        self.assertAlmostEqual(s[-1]["xwobacon"], 0.32)
+        self.assertIn("k9", s[0])                 # feature cols carried
+
+    def test_rp_series_span_and_shape(self):
+        self._rp("147", "2026-04-05", 2026, 3.8)
+        self._rp("147", "2025-09-30", 2025, 4.1)
+        self._rp("147", "2023-09-30", 2023, 5.0)  # season-3 -> EXCLUDED
+        s = pa.load_rp_series("147", 2026)
+        self.assertEqual([r["as_of_date"] for r in s], ["2025-09-30", "2026-04-05"])
+        self.assertAlmostEqual(s[-1]["era"], 3.8)
+
+    def test_unknown_entity_returns_empty(self):
+        self.assertEqual(pa.load_sp_series("999", 2026), [])
+        self.assertEqual(pa.load_rp_series("999", 2026), [])
+
+
 if __name__ == "__main__":
     unittest.main()

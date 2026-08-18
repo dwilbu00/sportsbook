@@ -409,6 +409,71 @@ def asof_pitcher_features(entity_id, as_of_date, role="SP", max_retries=3):
     return None
 
 
+# Feature columns carried on an SP series row — MUST match backtest_starters.
+# _ALL_ASOF_FEATURES so the shared additive_runs.make_feat_getter produces identical
+# blended features live and in the bake-off (fit == serve).
+_SERIES_FEATURES = ("xwobacon", "k9", "barrel_pct", "whiff_pct",
+                    "hard_hit_pct", "gb_pct", "k_pct", "bb_pct")
+
+
+def load_sp_series(entity_id, season):
+    """[rows sorted by as_of_date] for ONE starter (role='SP'), spanning season_bucket
+    IN {season, season-1, season-2} — the single-entity LIVE analog of
+    backtest_starters._load_pitcher_asof_series (SAME row shape: as_of_date /
+    season_bucket / n_bbe / ip + _SERIES_FEATURES), so additive_runs.make_feat_getter
+    blends identically live and offline. The season-2 span matters: a starter's FIRST
+    start of `season` selects the season-1 final row as the current line, and the
+    prior-season BLEND then needs the season-2 final row (matching the bake-off's
+    min(seasons)-1 extra prior). [] on error / SQL off."""
+    if not enabled() or not entity_id:
+        return []
+    try:
+        want = [int(season), int(season) - 1, int(season) - 2]
+        t = pitcher_asof_daily
+        cols = [t.c.as_of_date, t.c.season_bucket, t.c.n_bbe, t.c.ip]
+        cols += [t.c[k] for k in _SERIES_FEATURES]
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(*cols).where(
+                    (t.c.entity_id == str(entity_id)) & (t.c.role == "SP")
+                    & (t.c.season_bucket.in_(want)))).mappings().all()
+        out = []
+        for r in rows:
+            rec = {"as_of_date": str(r["as_of_date"])[:10],
+                   "season_bucket": r["season_bucket"],
+                   "n_bbe": r["n_bbe"], "ip": r["ip"]}
+            rec.update({k: r[k] for k in _SERIES_FEATURES})
+            out.append(rec)
+        out.sort(key=lambda x: x["as_of_date"])
+        return out
+    except (OperationalError, ValueError, TypeError, KeyError):
+        return []
+
+
+def load_rp_series(team_id, season):
+    """[{as_of_date, era} sorted] for ONE team's bullpen (role='RP'), spanning
+    season_bucket IN {season, season-1, season-2} — single-entity LIVE analog of
+    backtest_starters._load_bullpen_asof_series' per-team rows. The league_rp_era
+    normalization is NOT computed here (it's a persisted config constant, so live is
+    stable per fit); this only supplies the per-team as-of era rows the shared
+    additive_runs.make_bp_getter selects strictly-before. [] on error / SQL off."""
+    if not enabled() or not team_id:
+        return []
+    try:
+        want = [int(season), int(season) - 1, int(season) - 2]
+        t = pitcher_asof_daily
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(t.c.as_of_date, t.c.era).where(
+                    (t.c.entity_id == str(team_id)) & (t.c.role == "RP")
+                    & (t.c.season_bucket.in_(want)) & (t.c.era.isnot(None)))).all()
+        out = [{"as_of_date": str(d)[:10], "era": float(era)} for d, era in rows]
+        out.sort(key=lambda x: x["as_of_date"])
+        return out
+    except (OperationalError, ValueError, TypeError):
+        return []
+
+
 def _asof_xwobacon_sql(pitcher_id, as_of, season_start):
     """Single-pitcher as-of xwOBAcon via one SQL aggregation over statcast_pitch
     (in-season, strictly game_date < as_of). Returns (mean, n_bbe) or (None, 0). For
