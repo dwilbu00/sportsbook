@@ -193,6 +193,10 @@ class SchemaParityTests(unittest.TestCase):
         self.assertEqual({c.name for c in mlb_warehouse.mlb_venue.columns},
                          set(mlb_warehouse._VENUE_COLS))
 
+    def test_weather_game_cols(self):
+        self.assertEqual({c.name for c in mlb_warehouse.weather_game.columns},
+                         set(mlb_warehouse._WEATHER_GAME_COLS))
+
 
 class VenueDimTests(unittest.TestCase):
     """Pure venue-dimension enrichment (Batch A run_env): _venue_dim_row (lat/lon
@@ -310,6 +314,26 @@ class ResidentVenueTests(_Backend, unittest.TestCase):
         # game_venue_index resolves the ACTUAL venue per (date, home team).
         self.assertEqual(mlb_warehouse.game_venue_index([2024]),
                          {("2024-04-01", "147"): "3313"})
+
+    def test_weather_targets_and_dry_run(self):
+        from sqlalchemy import insert, select
+        self._game(1, 2024, "147", "3313", "R")     # regular game at a geo'd venue
+        self._game(2, 2024, "147", "SPR", "S")      # spring -> excluded (game_type)
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_venue), [
+                {"venue_id": "3313", "lat": 40.83, "lon": -73.93, "park_hits": 1.0},
+                {"venue_id": "SPR", "lat": None, "lon": None, "park_hits": 1.0},
+            ])
+        targets = mlb_warehouse._weather_targets([2024])
+        self.assertEqual(len(targets), 1)            # only the regular, geo'd venue-date
+        t = targets[0]
+        self.assertEqual((t["venue_id"], t["date"]), ("3313", "2024-04-01"))
+        self.assertIsNotNone(t["first_pitch_epoch"])  # parsed from game_date ISO
+        # DRY-RUN writes nothing.
+        self.assertEqual(mlb_warehouse.build_weather([2024], apply=False), 0)
+        with db_store.get_engine().connect() as conn:
+            n = conn.execute(select(mlb_warehouse.weather_game)).fetchall()
+        self.assertEqual(n, [])
 
 
 # ─────────────────────────────────────────────────────────── pure parse / derive

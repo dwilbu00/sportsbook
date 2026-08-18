@@ -89,6 +89,97 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 _HTTP_HEADERS = {"User-Agent": "SportsbookValueFinder/1.0"}
 _FETCH_TIMEOUT = 15
 
+# Visual Crossing Timeline (HISTORICAL, needs WEATHER_API_KEY) — the backtest weather
+# source (Open-Meteo above stays the live prop forecast). One call fetches a whole
+# date RANGE with hourly data, so the venue×season backfill is ~90 calls, not per-game.
+VISUAL_CROSSING_URL = ("https://weather.visualcrossing.com/VisualCrossingWebServices"
+                       "/rest/services/timeline/")
+_VC_ELEMENTS = "datetime,datetimeEpoch,temp,humidity,pressure,windspeed,winddir"
+_VC_TIMEOUT = 60
+
+
+def _weather_api_key():
+    """WEATHER_API_KEY from env (promoted from secrets.toml at boot / by the CLI)."""
+    return (os.environ.get("WEATHER_API_KEY") or "").strip()
+
+
+def promote_weather_key_from_toml(path=None):
+    """Copy WEATHER_API_KEY from .streamlit/secrets.toml into os.environ for CLI/offline
+    tools (db_store.promote_secrets_from_toml only handles SQL_* keys). No-op if already
+    set. Returns True when the key ends up in the environment."""
+    if _weather_api_key():
+        return True
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".streamlit", "secrets.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            value = tomllib.load(handle).get("WEATHER_API_KEY")
+        if value:
+            os.environ.setdefault("WEATHER_API_KEY", str(value).strip())
+    except (ImportError, OSError, TypeError, ValueError):
+        pass
+    return bool(_weather_api_key())
+
+
+def fetch_visualcrossing_range(lat, lon, start_date, end_date=None,
+                               timeout=_VC_TIMEOUT):
+    """Historical hourly weather for [start_date, end_date] at lat/lon via the Visual
+    Crossing Timeline API (US units). Returns {date10: [hour_dict, ...]} where each
+    hour_dict = {epoch (UTC seconds), temp_f, humidity, pressure_mb, wind_mph,
+    wind_dir_deg}; a per-venue-season range is ONE networked call. {} on missing key /
+    coords / any network-parse error (fail-open → the backfill just skips that venue)."""
+    key = _weather_api_key()
+    if not key or lat is None or lon is None:
+        return {}
+    loc = "%s,%s" % (lat, lon)
+    date_part = str(start_date) if not end_date else "%s/%s" % (start_date, end_date)
+    url = "%s%s/%s" % (VISUAL_CROSSING_URL, loc, date_part)
+    try:
+        resp = requests.get(url, params={
+            "unitGroup": "us", "key": key, "include": "hours",
+            "elements": _VC_ELEMENTS, "contentType": "json"},
+            headers=_HTTP_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        days = resp.json().get("days", []) or []
+    except Exception:
+        return {}
+    out = {}
+    for d in days:
+        date10 = str(d.get("datetime"))[:10]
+        hours = []
+        for h in d.get("hours", []) or []:
+            hours.append({
+                "epoch": h.get("datetimeEpoch"),
+                "temp_f": h.get("temp"), "humidity": h.get("humidity"),
+                "pressure_mb": h.get("pressure"), "wind_mph": h.get("windspeed"),
+                "wind_dir_deg": h.get("winddir"),
+            })
+        if date10:
+            out[date10] = hours
+    return out
+
+
+def pick_hour_by_epoch(hours, target_epoch):
+    """The hour_dict whose UTC epoch is nearest target_epoch (the game's first pitch),
+    or None. Epoch-matching is timezone-robust (no local-hour parsing). Ignores hours
+    with no epoch."""
+    if not hours or target_epoch is None:
+        return None
+    try:
+        target = float(target_epoch)
+    except (TypeError, ValueError):
+        return None
+    best, best_delta = None, None
+    for h in hours:
+        e = h.get("epoch")
+        if e is None:
+            continue
+        delta = abs(float(e) - target)
+        if best_delta is None or delta < best_delta:
+            best, best_delta = h, delta
+    return best
+
 # File cache — forecasts are slate-stable, so a short TTL avoids re-hitting the
 # API on every Streamlit rerun without going stale within an analysis session.
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "weather")

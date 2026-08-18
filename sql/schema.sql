@@ -991,6 +991,27 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_mlb_venue_team ON dbo.mlb_venue (team_id);
 GO
 
+---------------------------------------------------------------------- weather_game
+-- Per-game weather (Batch A run_env), keyed by (venue_id, weather_date) so it joins
+-- mlb_game on venue_id AND official_date = weather_date. First-pitch-hour conditions
+-- from Visual Crossing (mlb_warehouse.build_weather). Used baseline-relative in the
+-- weather run_env term. Actual weather is a pre-outcome game condition (not leakage).
+IF OBJECT_ID('dbo.weather_game', 'U') IS NULL
+CREATE TABLE dbo.weather_game (
+    venue_id        NVARCHAR(16) NOT NULL,
+    weather_date    NVARCHAR(10) NOT NULL,               -- YYYY-MM-DD (official_date)
+    temp_f          FLOAT,
+    humidity        FLOAT,                               -- relative %, 0-100
+    pressure_mb     FLOAT,                               -- sea-level
+    wind_mph        FLOAT,
+    wind_dir_deg    FLOAT,                               -- direction wind blows FROM
+    first_pitch_utc NVARCHAR(40),                        -- game hour sampled (audit)
+    source          NVARCHAR(24),
+    fetched_at      FLOAT,
+    CONSTRAINT pk_weather_game PRIMARY KEY (venue_id, weather_date)
+);
+GO
+
 ------------------------------------------------------------------------ mlb_player
 -- Player dim keyed on the MLBAM player_id (natural PK). bats/throws are nullable
 -- in P1 (boxscore rosters give name/position/is_pitcher; handedness backfills from

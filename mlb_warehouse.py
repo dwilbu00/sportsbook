@@ -107,6 +107,25 @@ mlb_venue = Table(
     Index("ix_mlb_venue_team", "team_id"),
 )
 
+# Per-game weather (Batch A run_env), keyed by (venue_id, weather_date) so it joins
+# mlb_game on venue_id AND official_date = weather_date. First-pitch-hour conditions
+# from Visual Crossing (mlb_warehouse.build_weather), used baseline-relative in the
+# weather run_env term. Actual weather is a pre-outcome game condition (not leakage).
+weather_game = Table(
+    "weather_game", _META,
+    Column("venue_id", String(16), primary_key=True),
+    Column("weather_date", String(10), primary_key=True),  # YYYY-MM-DD (official_date)
+    Column("temp_f", Float),
+    Column("humidity", Float),                             # relative %, 0-100
+    Column("pressure_mb", Float),                          # sea-level (structural park
+                                                          # climate stays in park factor)
+    Column("wind_mph", Float),
+    Column("wind_dir_deg", Float),                         # direction wind blows FROM
+    Column("first_pitch_utc", String(40)),                # the game hour sampled (audit)
+    Column("source", String(24)),                         # "visualcrossing"
+    Column("fetched_at", Float),
+)
+
 mlb_game = Table(
     "mlb_game", _META,
     Column("game_pk", Integer, primary_key=True, autoincrement=False),  # MLBAM (supplied)
@@ -255,6 +274,9 @@ _GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_type",
 _VENUE_COLS = ("venue_id", "name", "team_id", "team_name", "lat", "lon",
                "cf_bearing", "park_hits", "park_runs", "elevation_ft", "roof",
                "fetched_at")
+_WEATHER_GAME_COLS = ("venue_id", "weather_date", "temp_f", "humidity",
+                      "pressure_mb", "wind_mph", "wind_dir_deg", "first_pitch_utc",
+                      "source", "fetched_at")
 _PLAYER_COLS = ("player_id", "full_name", "name_norm", "primary_position",
                 "is_pitcher", "bats", "throws", "fetched_at")
 _STANDINGS_COLS = ("id", "team_id", "season", "as_of_date", "wins", "losses",
@@ -1629,6 +1651,132 @@ def build_venue_dim(verbose=True):
     return len(rows)
 
 
+def _weather_targets(seasons):
+    """[{venue_id, date, lat, lon, first_pitch_epoch, first_pitch_iso}] — one per
+    (venue, official_date) REGULAR-season game in `seasons`, carrying the venue's
+    lat/lon (from mlb_venue) + the EARLIEST first-pitch UTC epoch that date (the game
+    hour to sample; doubleheaders share the venue-date weather row). Skips venues with
+    no lat/lon. [] on SQL off."""
+    if not enabled():
+        return []
+    try:
+        want = {int(s) for s in seasons}
+    except (TypeError, ValueError):
+        return []
+    import weather_factors as wf
+    g = mlb_game
+    try:
+        with db_store.get_engine().connect() as conn:
+            grows = conn.execute(
+                select(g.c.venue_id, g.c.official_date, g.c.game_date)
+                .where(g.c.season.in_(sorted(want)) & (g.c.game_type == "R")
+                       & g.c.venue_id.isnot(None)
+                       & g.c.official_date.isnot(None))).fetchall()
+            vrows = conn.execute(
+                select(mlb_venue.c.venue_id, mlb_venue.c.lat,
+                       mlb_venue.c.lon)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return []
+    latlon = {str(v): (la, lo) for v, la, lo in vrows
+              if la is not None and lo is not None}
+    best = {}                       # (venue, date) -> earliest first-pitch ISO
+    for vid, od, gd in grows:
+        vid = str(vid)
+        if vid not in latlon:
+            continue
+        key = (vid, str(od)[:10])
+        gd = str(gd) if gd else None
+        if key not in best or (gd and (best[key] is None or gd < best[key])):
+            best[key] = gd
+    out = []
+    for (vid, od), gd in best.items():
+        la, lo = latlon[vid]
+        epoch = None
+        if gd:
+            try:
+                epoch = wf._parse_iso_utc(gd).timestamp()
+            except (ValueError, TypeError, OSError):
+                epoch = None
+        out.append({"venue_id": vid, "date": od, "lat": la, "lon": lo,
+                    "first_pitch_epoch": epoch, "first_pitch_iso": gd})
+    return out
+
+
+def build_weather(seasons, apply=False, force=False, verbose=True):
+    """Backfill weather_game (first-pitch-hour) for regular-season games in `seasons`
+    from Visual Crossing (Batch A run_env). DRY-RUN by default: reports the fetch
+    volume, NO network / write. apply=True fetches per (venue, season) date-range (one
+    batched call each) and upserts. Incremental: skips (venue, date) already present
+    unless force. Needs WEATHER_API_KEY + populated mlb_venue lat/lon. Operator-run.
+    Returns weather_game rows written (0 on dry-run)."""
+    if not enabled():
+        raise RuntimeError("SQL is not configured (SQL_* secrets) — cannot build.")
+    import weather_factors as wf
+    targets = _weather_targets(seasons)
+    if not targets:
+        if verbose:
+            print("  [weather] no targets (need mlb_venue lat/lon + regular games "
+                  "for the seasons). Run --build-venues first?")
+        return 0
+    have = set()
+    if not force:
+        try:
+            with db_store.get_engine().connect() as conn:
+                for v, d in conn.execute(select(weather_game.c.venue_id,
+                                                weather_game.c.weather_date)):
+                    have.add((str(v), str(d)))
+        except (OperationalError, ValueError, TypeError):
+            pass
+    todo = [t for t in targets if (t["venue_id"], t["date"]) not in have]
+    groups = {}                     # (venue, YYYY) -> [targets] = one batched fetch
+    for t in todo:
+        groups.setdefault((t["venue_id"], t["date"][:4]), []).append(t)
+    if not apply:
+        if verbose:
+            print(f"  [weather] DRY-RUN: {len(todo)} venue-dates to fetch across "
+                  f"{len(groups)} (venue,season) calls "
+                  f"({len(targets) - len(todo)} already present, {len(targets)} total). "
+                  f"Re-run with --apply to fetch + write.")
+        return 0
+    if not wf.promote_weather_key_from_toml():
+        print("  [weather] WEATHER_API_KEY not set (secrets.toml / env) — aborting.")
+        return 0
+    now = _now()
+    written = 0
+    for (vid, yr), ts in sorted(groups.items()):
+        dates = sorted(t["date"] for t in ts)
+        lat, lon = ts[0]["lat"], ts[0]["lon"]
+        day_hours = wf.fetch_visualcrossing_range(lat, lon, dates[0], dates[-1])
+        rows = []
+        for t in ts:
+            pick = wf.pick_hour_by_epoch(day_hours.get(t["date"]),
+                                         t["first_pitch_epoch"])
+            if not pick:
+                continue
+            rows.append({
+                "venue_id": vid, "weather_date": t["date"],
+                "temp_f": pick.get("temp_f"), "humidity": pick.get("humidity"),
+                "pressure_mb": pick.get("pressure_mb"),
+                "wind_mph": pick.get("wind_mph"),
+                "wind_dir_deg": pick.get("wind_dir_deg"),
+                "first_pitch_utc": t.get("first_pitch_iso"),
+                "source": "visualcrossing", "fetched_at": now})
+        if rows:
+            with _WRITE_LOCK:
+                with db_store.get_engine().begin() as conn:
+                    db_store.upsert_bulk(conn, weather_game, rows,
+                                         ("venue_id", "weather_date"),
+                                         scope={"venue_id": vid},
+                                         ignore_cols=("fetched_at",))
+            written += len(rows)
+        if verbose:
+            print(f"    [weather] {vid} {yr}: {len(rows)}/{len(ts)} dates written.")
+    if verbose:
+        print(f"  [weather] {written} weather_game rows upserted "
+              f"({len(groups)} venue-season fetches).")
+    return written
+
+
 def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
                        season=None, player_name=None):
     """Reproduce the ESPN ``get_player_stat_history`` dict for one MLB player+prop
@@ -2697,6 +2845,11 @@ def _main_cli():
                     help="Batch A run_env: populate mlb_venue (StatsAPI /venues "
                          "lat/lon/elevation + park/geo priors via each venue's modal "
                          "home team). Idempotent upsert; run after the mlb_venue DDL.")
+    ap.add_argument("--build-weather", metavar="SEASONS", default=None,
+                    help="Batch A run_env: backfill weather_game (first-pitch-hour, "
+                         "Visual Crossing) for regular games in SEASONS ('2024-2026' | "
+                         "'2024,2025' | '2024'). DRY-RUN (reports fetch volume) unless "
+                         "--apply. Incremental; needs WEATHER_API_KEY + --build-venues.")
     ap.add_argument("--apply", action="store_true",
                     help="With --backfill-game-pk / --backfill-team-game-pk / "
                          "--purge-non-franchise: WRITE the changes (default is a "
@@ -2746,6 +2899,14 @@ def _main_cli():
     if args.build_venues:
         did = True
         print(_fmt(build_venue_dim()))
+    if args.build_weather:
+        did = True
+        if "-" in args.build_weather:                 # range 'A-B' -> inclusive list
+            lo, hi = args.build_weather.split("-")
+            wx_seasons = list(range(int(lo), int(hi) + 1))
+        else:
+            wx_seasons = [int(s) for s in args.build_weather.split(",") if s.strip()]
+        print(_fmt(build_weather(wx_seasons, apply=args.apply)))
     if args.purge_non_franchise:
         did = True
         print(_fmt(purge_non_franchise_teams(dry_run=not args.apply)))
