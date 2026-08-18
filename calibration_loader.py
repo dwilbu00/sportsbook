@@ -412,22 +412,28 @@ def load_expected_runs_additive(sport_key):
     Read by mlb_starters.live_additive_runs on the flag-ON path; {} keeps the live
     path on the multiplicative model (byte-identical).
 
-    PROCESS-CACHED by the live file's (mtime_ns, size): live_additive_runs calls this
-    once PER GAME, and the MLB calibration blob is large (~2 MB) — re-parsing it every
-    game made the additive backtest crawl. The stat key auto-invalidates on any write
-    (--promote / save), so there's no staleness and no manual clear."""
+    CANDIDATE-AWARE READ: under set_candidate_mode(True) with a staged candidate, this
+    reads <sport>.candidate.json so an OFFLINE backtest can grade a staged additive
+    config (park/fatigue run_env weights) WITHOUT promoting to live. The live app never
+    sets candidate mode, so SERVING always reads the live file (byte-identical). Mirrors
+    the write-side _load_write_blob / load_calibration_for_refit candidate pattern.
+
+    PROCESS-CACHED by (path, mtime_ns, size): live_additive_runs calls this once PER
+    GAME and the MLB blob is large (~2 MB). The path is in the key so a live<->candidate
+    switch never cross-serves, and any write (--promote / save) auto-invalidates."""
     if not sport_key:
         return {}
-    path = calibration_path(sport_key)
+    use_candidate = candidate_mode_active() and has_candidate(sport_key)
+    path = candidate_path(sport_key) if use_candidate else calibration_path(sport_key)
     try:
         st = os.stat(path)
-        stat_key = (st.st_mtime_ns, st.st_size)
+        stat_key = (path, st.st_mtime_ns, st.st_size)
     except OSError:
-        stat_key = None
+        stat_key = (path, None)
     cached = _ADDITIVE_CFG_CACHE.get(sport_key)
     if cached is not None and cached[0] == stat_key:
         return cached[1]
-    block = _load_blob(sport_key).get("expected_runs_additive", {})
+    block = (_read_json(path) or {}).get("expected_runs_additive", {})
     _ADDITIVE_CFG_CACHE[sport_key] = (stat_key, block)
     return block
 

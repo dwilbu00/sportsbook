@@ -24,6 +24,58 @@ import calibration_loader as cl
 SK = "baseball_mlb"
 
 
+class AdditiveCandidateReadTests(unittest.TestCase):
+    """load_expected_runs_additive is candidate-aware ONLY under candidate mode — so an
+    OFFLINE backtest can grade a staged additive config (park/fatigue run_env) without
+    promoting to live, while the live app (never in candidate mode) always reads live."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._orig_dir = cl.CALIBRATION_DIR
+        cl.CALIBRATION_DIR = self._dir
+        cl.set_candidate_mode(False)
+        cl._ADDITIVE_CFG_CACHE.clear()
+
+    def tearDown(self):
+        cl.CALIBRATION_DIR = self._orig_dir
+        cl.set_candidate_mode(False)
+        cl._ADDITIVE_CFG_CACHE.clear()
+
+    def _write(self, path, park_weight):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sport_key": SK, "expected_runs_additive":
+                       {"enabled": True, "run_env": {"park_weight": park_weight}}}, f)
+
+    def _park(self):
+        return (cl.load_expected_runs_additive(SK).get("run_env") or {}).get(
+            "park_weight")
+
+    def test_mode_off_reads_live_even_with_candidate(self):
+        self._write(cl.calibration_path(SK), 0.0)
+        self._write(cl.candidate_path(SK), 1.0)
+        self.assertEqual(self._park(), 0.0)               # serving = live
+
+    def test_mode_on_reads_candidate(self):
+        self._write(cl.calibration_path(SK), 0.0)
+        self._write(cl.candidate_path(SK), 1.0)
+        cl.set_candidate_mode(True)
+        self.assertEqual(self._park(), 1.0)               # backtest = candidate
+
+    def test_mode_on_no_candidate_falls_back_to_live(self):
+        self._write(cl.calibration_path(SK), 0.0)
+        cl.set_candidate_mode(True)                        # no candidate file
+        self.assertEqual(self._park(), 0.0)
+
+    def test_switching_modes_does_not_cross_serve_from_cache(self):
+        self._write(cl.calibration_path(SK), 0.0)
+        self._write(cl.candidate_path(SK), 1.0)
+        self.assertEqual(self._park(), 0.0)               # live (caches live block)
+        cl.set_candidate_mode(True)
+        self.assertEqual(self._park(), 1.0)               # path-keyed cache -> candidate
+        cl.set_candidate_mode(False)
+        self.assertEqual(self._park(), 0.0)               # back to live
+
+
 class CandidateStagingTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.mkdtemp()
