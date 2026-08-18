@@ -42,7 +42,7 @@ except Exception:
 try:
     for _gate_key in ("ODI_MLB_WAREHOUSE_HIST", "ODI_MLB_WAREHOUSE_TEAM",
                       "ODI_MLB_WAREHOUSE_CALIB", "ODI_MLB_ENFORCE_IDENTITY",
-                      "ODI_MLB_ADDITIVE_RUNS"):
+                      "ODI_MLB_ADDITIVE_RUNS", "ODI_MLB_WAREHOUSE_OFFENSE"):
         _gate_val = st.secrets.get(_gate_key)
         if _gate_val is not None:
             os.environ.setdefault(_gate_key, str(_gate_val))

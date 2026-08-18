@@ -233,6 +233,85 @@ def get_pitcher_expected_stats(season, min_bip=40):
     return out
 
 
+def _mlb_warehouse_offense_enabled():
+    """ODI_MLB_WAREHOUSE_OFFENSE: derive the expected-runs challenger's team OFFENSE
+    factors from the statcast_pitch warehouse instead of the live Savant HTTP endpoint.
+    OFF (default, unset) = byte-identical Savant path. Mirrors the other ODI_MLB_* env
+    gates; promoted from st.secrets at boot in app.py."""
+    return os.environ.get("ODI_MLB_WAREHOUSE_OFFENSE", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def _warehouse_team_factors(season, as_of, min_pa=40):
+    """Warehouse-native team OFFENSE inputs for the expected-runs challenger, derived
+    from statcast_pitch (leakage-safe: game_date in [season-01-01, as_of-1d]) instead of
+    the live Savant statcast_search/csv endpoint. Validated to reproduce Savant team
+    xwOBA to ~0.002, with NO network — so a backtest on a Savant-unreachable box still
+    fires the challenger + additive model. Same dict shape as get_expected_runs_team_
+    factors, but bullpen_xwoba is EMPTY (v1): _expected_staff falls back to starter-only
+    when a team's bullpen xwOBA is absent. Returns the dict, or None (empty / error /
+    SQL off) so the caller can fall back to Savant."""
+    try:
+        import savant_history as sh
+        import db_store
+        from sqlalchemy import select, func
+    except Exception:
+        return None
+    if not sh.enabled():
+        return None
+    try:
+        cutoff = _date.fromisoformat(str(as_of)[:10]) - timedelta(days=1)
+    except (TypeError, ValueError):
+        return None
+    if cutoff.year < int(season):
+        return None
+    season_start = f"{int(season)}-01-01"
+    sp = sh.statcast_pitch
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(sp.c.batting_team, sp.c.p_throws,
+                       func.avg(sp.c.xwoba), func.count(sp.c.xwoba)).where(
+                    (sp.c.xwoba.isnot(None))
+                    & (sp.c.batting_team.isnot(None))
+                    & (sp.c.p_throws.in_(("L", "R")))
+                    & (sp.c.game_date >= season_start)
+                    & (sp.c.game_date <= cutoff.isoformat()))
+                .group_by(sp.c.batting_team, sp.c.p_throws)).all()
+    except Exception:
+        return None
+    raw = {"L": {}, "R": {}}
+    for team, hand, avg, n in (rows or []):
+        if team and hand in ("L", "R") and avg is not None and n and n >= min_pa:
+            raw[hand][str(team)] = {"xwoba": float(avg), "pa": int(n)}
+    if not (raw["L"] or raw["R"]):
+        return None
+    # Normalize Savant team keys into the StatsAPI-abbr namespace the consumers look up
+    # by (SAME step + helper as the Savant path). A team-index hiccup just skips it.
+    try:
+        team_index = get_team_index(season)
+        statsapi_abbrs = {info.get("abbr") for info in (team_index or {}).values()
+                          if info.get("abbr")}
+    except (OSError, ValueError, requests.RequestException):
+        statsapi_abbrs = set()
+    if statsapi_abbrs:
+        raw = {hand: {_canonical_team_key(k, statsapi_abbrs): v
+                      for k, v in d.items()}
+               for hand, d in raw.items()}
+    offense_rows = [v for d in raw.values() for v in d.values()]
+    total_pa = sum(r["pa"] for r in offense_rows)
+    if not total_pa:
+        return None
+    league_xwoba = sum(r["xwoba"] * r["pa"] for r in offense_rows) / total_pa
+    return {
+        "league_xwoba": league_xwoba,
+        "league_bullpen_xwoba": None,      # v1: warehouse bullpen not derived yet
+        "offense_vs_hand": {hand: {t: r["xwoba"] for t, r in d.items()}
+                            for hand, d in raw.items()},
+        "bullpen_xwoba": {},               # empty -> _expected_staff uses starter-only
+    }
+
+
 def get_expected_runs_team_factors(season, as_of, min_pa=40):
     """Return leakage-safe live team inputs for the expected-runs model.
 
@@ -241,10 +320,27 @@ def get_expected_runs_team_factors(season, as_of, min_pa=40):
     bullpens. Savant's aggregate search endpoint produces those same averages
     in small team-level responses, avoiding a runtime pitch-level download.
     Only games before ``as_of`` are included.
+
+    When ODI_MLB_WAREHOUSE_OFFENSE is set, the OFFENSE factors are derived from the
+    statcast_pitch warehouse (no network; works on a Savant-unreachable box) and only
+    fall through to Savant when the warehouse is thin/unavailable. OFF = the original
+    Savant-only path, byte-identical.
     """
     cutoff = _date.fromisoformat(as_of) - timedelta(days=1)
     if cutoff.year < int(season):
         return None
+
+    if _mlb_warehouse_offense_enabled():
+        # Distinct cache key: warehouse and Savant numbers differ slightly, so never
+        # cross-serve. Fall through to Savant only when the warehouse can't answer.
+        wcache = f"wh_expected_runs_teams_v1_{season}_{cutoff.isoformat()}_{min_pa}"
+        wcached = _read_cache(wcache, max_age=24 * 3600)
+        if wcached is not None:
+            return wcached
+        wf = _warehouse_team_factors(season, as_of, min_pa)
+        if wf is not None:
+            _write_cache(wcache, wf)
+            return wf
 
     # v2: team keys are now normalized into the StatsAPI-abbreviation namespace
     # (see below); a stale v1 cache holds raw Savant keys, so bump to invalidate.
