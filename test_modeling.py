@@ -2335,23 +2335,35 @@ class VisualCrossingHistoricalTests(unittest.TestCase):
         def json(self):
             return self._payload
 
-    _PAYLOAD = {"days": [{"datetime": "2024-06-17", "hours": [
+    _DAILY = {"days": [{"datetime": "2024-06-17", "temp": 74, "humidity": 55,
+                        "pressure": 1015, "windspeed": 9, "winddir": 210}]}
+    _HOURLY = {"days": [{"datetime": "2024-06-17", "hours": [
         {"datetimeEpoch": 1000, "temp": 70, "humidity": 50, "pressure": 1015,
          "windspeed": 8, "winddir": 180},
         {"datetimeEpoch": 5000, "temp": 78, "humidity": 44, "pressure": 1013,
          "windspeed": 12, "winddir": 200}]}]}
 
-    def test_fetch_parses_days_hours(self):
+    def test_fetch_daily_default(self):
         with patch.dict(os.environ, {"WEATHER_API_KEY": "k"}), \
                 patch("weather_factors.requests.get",
-                      return_value=self._Resp(self._PAYLOAD)) as mock_get:
-            out = weather_factors.fetch_visualcrossing_range(
-                40.0, -75.0, "2024-06-17")
+                      return_value=self._Resp(self._DAILY)) as mock_get:
+            out = weather_factors.fetch_visualcrossing_range(40.0, -75.0, "2024-06-17")
         self.assertTrue(mock_get.called)
-        self.assertEqual(len(out["2024-06-17"]), 2)
+        w = out["2024-06-17"]                            # daily -> one dict per date
+        self.assertEqual((w["temp_f"], w["wind_mph"], w["pressure_mb"]),
+                         (74, 9, 1015))
+        self.assertEqual(mock_get.call_args.kwargs["params"]["include"], "days")
+
+    def test_fetch_hourly_when_requested(self):
+        with patch.dict(os.environ, {"WEATHER_API_KEY": "k"}), \
+                patch("weather_factors.requests.get",
+                      return_value=self._Resp(self._HOURLY)) as mock_get:
+            out = weather_factors.fetch_visualcrossing_range(
+                40.0, -75.0, "2024-06-17", hourly=True)
+        self.assertEqual(len(out["2024-06-17"]), 2)      # hourly -> list per date
         h0 = out["2024-06-17"][0]
         self.assertEqual((h0["epoch"], h0["temp_f"], h0["wind_mph"]), (1000, 70, 8))
-        self.assertEqual(h0["pressure_mb"], 1015)
+        self.assertEqual(mock_get.call_args.kwargs["params"]["include"], "hours")
 
     def test_fetch_without_key_is_empty_no_call(self):
         with patch.dict(os.environ, {}, clear=True), \
@@ -2372,6 +2384,34 @@ class VisualCrossingHistoricalTests(unittest.TestCase):
         self.assertEqual(weather_factors.pick_hour_by_epoch(hours, 1200)["temp_f"], 70)
         self.assertIsNone(weather_factors.pick_hour_by_epoch([], 1000))
         self.assertIsNone(weather_factors.pick_hour_by_epoch(hours, None))
+
+
+class WeatherRunEnvPhysicsTests(unittest.TestCase):
+    """Batch A weather run_env: run_env_from_weather is a BASELINE-RELATIVE, centered-
+    on-1.0 deviation (no double-count with the park factor's structural climate)."""
+
+    def test_at_baseline_is_neutral(self):
+        self.assertAlmostEqual(
+            weather_factors.run_env_from_weather(75, 5, 75, 5), 1.0)
+
+    def test_warmer_than_baseline_raises_runs(self):
+        c_temp = weather_factors.WEATHER_RUN_ENV_COEF[0]
+        self.assertAlmostEqual(
+            weather_factors.run_env_from_weather(85, 5, 75, 5), 1 + c_temp * 10)
+
+    def test_wind_out_over_baseline_raises_runs(self):
+        c_wind = weather_factors.WEATHER_RUN_ENV_COEF[1]
+        self.assertAlmostEqual(
+            weather_factors.run_env_from_weather(75, 10, 75, 5), 1 + c_wind * 5)
+
+    def test_colder_and_wind_in_lowers_runs(self):
+        self.assertLess(weather_factors.run_env_from_weather(60, -8, 75, 4), 1.0)
+
+    def test_missing_inputs_are_neutral(self):
+        self.assertAlmostEqual(
+            weather_factors.run_env_from_weather(None, None, 75, 5), 1.0)
+        self.assertAlmostEqual(
+            weather_factors.run_env_from_weather(85, 10, None, None), 1.0)
 
 
 class WeatherFetchTests(unittest.TestCase):

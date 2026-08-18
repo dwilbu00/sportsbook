@@ -122,13 +122,18 @@ def promote_weather_key_from_toml(path=None):
     return bool(_weather_api_key())
 
 
-def fetch_visualcrossing_range(lat, lon, start_date, end_date=None,
+def fetch_visualcrossing_range(lat, lon, start_date, end_date=None, hourly=False,
                                timeout=_VC_TIMEOUT):
-    """Historical hourly weather for [start_date, end_date] at lat/lon via the Visual
-    Crossing Timeline API (US units). Returns {date10: [hour_dict, ...]} where each
-    hour_dict = {epoch (UTC seconds), temp_f, humidity, pressure_mb, wind_mph,
-    wind_dir_deg}; a per-venue-season range is ONE networked call. {} on missing key /
-    coords / any network-parse error (fail-open → the backfill just skips that venue)."""
+    """Historical weather for [start_date, end_date] at lat/lon via the Visual Crossing
+    Timeline API (US units), ONE networked call for the whole range.
+
+    ``hourly=False`` (DEFAULT) -> {date10: day_dict} = the daily aggregate. This is ~1
+    record/day, well under Visual Crossing's per-query cost cap (a full-season HOURLY
+    range is ~4,300 records and is REJECTED by that cap). ``hourly=True`` -> {date10:
+    [hour_dict, ...]} for the eventual first-pitch-hour upgrade (pick_hour_by_epoch),
+    once a daily-weather grade justifies the ~24x record cost. Each dict = {temp_f,
+    humidity, pressure_mb, wind_mph, wind_dir_deg} (+ epoch for hourly). {} on missing
+    key / coords / any network-parse error (fail-open → the backfill skips that venue)."""
     key = _weather_api_key()
     if not key or lat is None or lon is None:
         return {}
@@ -137,26 +142,30 @@ def fetch_visualcrossing_range(lat, lon, start_date, end_date=None,
     url = "%s%s/%s" % (VISUAL_CROSSING_URL, loc, date_part)
     try:
         resp = requests.get(url, params={
-            "unitGroup": "us", "key": key, "include": "hours",
+            "unitGroup": "us", "key": key,
+            "include": "hours" if hourly else "days",
             "elements": _VC_ELEMENTS, "contentType": "json"},
             headers=_HTTP_HEADERS, timeout=timeout)
         resp.raise_for_status()
         days = resp.json().get("days", []) or []
     except Exception:
         return {}
+
+    def _rec(src):
+        return {"temp_f": src.get("temp"), "humidity": src.get("humidity"),
+                "pressure_mb": src.get("pressure"), "wind_mph": src.get("windspeed"),
+                "wind_dir_deg": src.get("winddir")}
+
     out = {}
     for d in days:
         date10 = str(d.get("datetime"))[:10]
-        hours = []
-        for h in d.get("hours", []) or []:
-            hours.append({
-                "epoch": h.get("datetimeEpoch"),
-                "temp_f": h.get("temp"), "humidity": h.get("humidity"),
-                "pressure_mb": h.get("pressure"), "wind_mph": h.get("windspeed"),
-                "wind_dir_deg": h.get("winddir"),
-            })
-        if date10:
-            out[date10] = hours
+        if not date10:
+            continue
+        if hourly:
+            out[date10] = [dict(_rec(h), epoch=h.get("datetimeEpoch"))
+                           for h in d.get("hours", []) or []]
+        else:
+            out[date10] = _rec(d)                # the day's aggregate conditions
     return out
 
 
@@ -194,6 +203,34 @@ def park_geo(team_name):
 def _neutral(dome=False):
     return {"temp_f": None, "wind_mph": None, "wind_dir_deg": None,
             "wind_out_mph": None, "dome": dome}
+
+
+# (per-degF, per-mph-out-to-CF) run-scoring sensitivities — reuse the props "runs"
+# weather coefficients (props._WEATHER_COEF["runs"]) so the two paths agree. Applied
+# BASELINE-RELATIVE for team run_env (deviation from the park's own seasonal average),
+# not absolute, so the park's structural climate (already in its park factor) isn't
+# double-counted. The overall strength is (re-)tuned by the weather_weight knob.
+WEATHER_RUN_ENV_COEF = (0.0015, 0.0060)
+
+
+def run_env_from_weather(temp_f, wind_out_mph, base_temp_f, base_wind_out_mph,
+                         coef=WEATHER_RUN_ENV_COEF):
+    """Centered-on-1.0 weather run-environment multiplier: the DEVIATION of this game's
+    temperature + out-to-CF wind from the PARK'S seasonal baseline. Warmer / more wind
+    blowing out -> >1.0 (more runs); colder / wind in -> <1.0. Each term contributes
+    only when both its value and baseline are present; all-missing -> exactly 1.0
+    (neutral). Baseline-relative by construction, so it does NOT double-count the park
+    factor's structural climate."""
+    c_temp, c_wind = coef
+    dev = 0.0
+    try:
+        if temp_f is not None and base_temp_f is not None:
+            dev += c_temp * (float(temp_f) - float(base_temp_f))
+        if wind_out_mph is not None and base_wind_out_mph is not None:
+            dev += c_wind * (float(wind_out_mph) - float(base_wind_out_mph))
+    except (TypeError, ValueError):
+        return 1.0
+    return 1.0 + dev
 
 
 def wind_out_component(wind_speed, wind_from_deg, cf_bearing):

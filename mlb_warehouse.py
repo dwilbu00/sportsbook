@@ -1746,21 +1746,23 @@ def build_weather(seasons, apply=False, force=False, verbose=True):
     for (vid, yr), ts in sorted(groups.items()):
         dates = sorted(t["date"] for t in ts)
         lat, lon = ts[0]["lat"], ts[0]["lon"]
-        day_hours = wf.fetch_visualcrossing_range(lat, lon, dates[0], dates[-1])
+        day_wx = wf.fetch_visualcrossing_range(lat, lon, dates[0], dates[-1])
+        if not day_wx and verbose:                    # surface a failed/empty fetch
+            print(f"    [weather] {vid} {yr}: fetch returned NO data for "
+                  f"{dates[0]}..{dates[-1]} (API error / cost cap / no key?).")
         rows = []
         for t in ts:
-            pick = wf.pick_hour_by_epoch(day_hours.get(t["date"]),
-                                         t["first_pitch_epoch"])
-            if not pick:
+            w = day_wx.get(t["date"])
+            if not w:
                 continue
             rows.append({
                 "venue_id": vid, "weather_date": t["date"],
-                "temp_f": pick.get("temp_f"), "humidity": pick.get("humidity"),
-                "pressure_mb": pick.get("pressure_mb"),
-                "wind_mph": pick.get("wind_mph"),
-                "wind_dir_deg": pick.get("wind_dir_deg"),
+                "temp_f": w.get("temp_f"), "humidity": w.get("humidity"),
+                "pressure_mb": w.get("pressure_mb"),
+                "wind_mph": w.get("wind_mph"),
+                "wind_dir_deg": w.get("wind_dir_deg"),
                 "first_pitch_utc": t.get("first_pitch_iso"),
-                "source": "visualcrossing", "fetched_at": now})
+                "source": "visualcrossing-daily", "fetched_at": now})
         if rows:
             with _WRITE_LOCK:
                 with db_store.get_engine().begin() as conn:
@@ -1775,6 +1777,67 @@ def build_weather(seasons, apply=False, force=False, verbose=True):
         print(f"  [weather] {written} weather_game rows upserted "
               f"({len(groups)} venue-season fetches).")
     return written
+
+
+def _weather_rows_with_windout():
+    """[(venue_id, weather_date, temp_f, wind_out_mph)] from weather_game joined to
+    mlb_venue for cf_bearing; wind_out via weather_factors.wind_out_component (the
+    out-to-CF projection). Shared by game_weather_map + weather_baseline_by_venue.
+    [] on SQL off/empty."""
+    if not enabled():
+        return []
+    import weather_factors as wf
+    wg = weather_game
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(wg.c.venue_id, wg.c.weather_date, wg.c.temp_f, wg.c.wind_mph,
+                       wg.c.wind_dir_deg, mlb_venue.c.cf_bearing)
+                .select_from(wg.join(mlb_venue,
+                             wg.c.venue_id == mlb_venue.c.venue_id,
+                             isouter=True))).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return []
+    out = []
+    for vid, d, temp, wmph, wdir, cf in rows:
+        out.append((str(vid), str(d), temp,
+                    wf.wind_out_component(wmph, wdir, cf)))
+    return out
+
+
+def game_weather_map(seasons=None):
+    """{(venue_id, weather_date): (temp_f, wind_out_mph)} from weather_game (+ venue
+    cf_bearing) — the OFFLINE per-game weather lookup for the weather run_env. Optional
+    `seasons` filters on the weather_date year. {} on SQL off/empty."""
+    yrs = None
+    if seasons:
+        try:
+            yrs = {str(int(s)) for s in seasons}
+        except (TypeError, ValueError):
+            yrs = None
+    out = {}
+    for vid, d, temp, wind_out in _weather_rows_with_windout():
+        if yrs and d[:4] not in yrs:
+            continue
+        out[(vid, d)] = (temp, wind_out)
+    return out
+
+
+def weather_baseline_by_venue():
+    """{venue_id: (avg_temp_f, avg_wind_out_mph)} over ALL weather_game rows — each
+    park's seasonal-average conditions, the baseline the weather run_env DEVIATES from
+    (so the park's structural climate is not double-counted with its park factor).
+    Per-venue means over hundreds of games; None for a component with no data.
+    {} on SQL off/empty."""
+    acc = {}                        # vid -> [temp_sum, temp_n, wind_sum, wind_n]
+    for vid, _d, temp, wind_out in _weather_rows_with_windout():
+        a = acc.setdefault(vid, [0.0, 0, 0.0, 0])
+        if temp is not None:
+            a[0] += float(temp); a[1] += 1
+        if wind_out is not None:
+            a[2] += float(wind_out); a[3] += 1
+    return {vid: (a[0] / a[1] if a[1] else None, a[2] / a[3] if a[3] else None)
+            for vid, a in acc.items()}
 
 
 def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,

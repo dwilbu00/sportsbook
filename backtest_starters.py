@@ -1986,7 +1986,7 @@ def test_additive_expected_runs(seasons, holdout_start=None,
                                 feature_sets=None,
                                 window_modes=("cumulative", "blend", "window"),
                                 rp_bullpen=False, bullpen_fatigue_weight=0.0,
-                                park_weight=0.0):
+                                park_weight=0.0, weather_weight=0.0):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
     model across FEATURE FAMILIES (v1/contact/fip/csw/gb/siera) x as-of WINDOW modes
     (cumulative / prior-season blend / trailing window), fit on a chronological train
@@ -2017,26 +2017,45 @@ def test_additive_expected_runs(seasons, holdout_start=None,
         print("!! pitcher_asof_daily is EMPTY — run `python pitcher_asof.py "
               "--build` first. Aborting additive bake-off.")
         return None
-    # Batch A PARK run_env: attach the ACTUAL venue_id per game (mlb_game
-    # (official_date, home_team_id) -> venue_id, so neutral-site games key their real
-    # park) and build the venue-keyed run_env_fn. INERT at park_weight=0 (run_env_fn
-    # stays None -> projector byte-identical).
+    # Batch A run_env: attach the ACTUAL venue_id per game (mlb_game (official_date,
+    # home_team_id) -> venue_id, so neutral-site games key their real park) and build
+    # the venue-keyed run_env_fn composing PARK x WEATHER. INERT when both weights are
+    # 0 (run_env_fn stays None -> projector byte-identical).
     run_env_fn = None
-    if park_weight:
+    if park_weight or weather_weight:
         import mlb_warehouse
+        import weather_factors as wf
         venue_idx = mlb_warehouse.game_venue_index(seasons)
         abbr_id = _abbr_to_team_id(seasons)
         for r in all_rows:
             tid = abbr_id.get(r.get("home_abbr"))
             r["venue_id"] = (venue_idx.get((str(r.get("date"))[:10], tid))
                              if tid else None)
-        park_runs = mlb_warehouse.venue_park_runs_map()
-        run_env_fn = _make_run_env_fn(
-            park_runs_of=lambda row: park_runs.get(row.get("venue_id"), 1.0),
-            park_weight=park_weight)
         n_res = sum(1 for r in all_rows if r.get("venue_id"))
-        print(f"  [park] run_env park_weight={park_weight}: {n_res}/{len(all_rows)} "
-              f"games venue-resolved, {len(park_runs)} venues in mlb_venue.")
+        park_runs_of = None
+        if park_weight:
+            park_runs = mlb_warehouse.venue_park_runs_map()
+            park_runs_of = lambda row: park_runs.get(row.get("venue_id"), 1.0)
+            print(f"  [park] park_weight={park_weight}: {n_res}/{len(all_rows)} "
+                  f"venue-resolved, {len(park_runs)} venues in mlb_venue.")
+        weather_of = None
+        if weather_weight:
+            gw = mlb_warehouse.game_weather_map(seasons)
+            base = mlb_warehouse.weather_baseline_by_venue()
+
+            def weather_of(row):
+                w = gw.get((row.get("venue_id"), str(row.get("date"))[:10]))
+                b = base.get(row.get("venue_id"))
+                if not w or not b:
+                    return 1.0
+                return wf.run_env_from_weather(w[0], w[1], b[0], b[1])
+            n_wx = sum(1 for r in all_rows
+                       if (r.get("venue_id"), str(r.get("date"))[:10]) in gw)
+            print(f"  [weather] weather_weight={weather_weight}: {n_wx}/{len(all_rows)}"
+                  f" games with weather, {len(base)} venue baselines.")
+        run_env_fn = _make_run_env_fn(
+            park_runs_of=park_runs_of, park_weight=park_weight,
+            weather_of=weather_of, weather_weight=weather_weight)
 
     all_rows.sort(key=lambda r: r["date"])
     if holdout_start is None:
@@ -2238,6 +2257,10 @@ if __name__ == "__main__":
                     help="with --additive-bakeoff, A/B the venue park run_env term "
                          "(Batch A) at this weight (0 = off; 1 = full mlb_venue park "
                          "runs factor). Needs `--build-venues` populated first.")
+    ap.add_argument("--weather-weight", type=float, default=0.0,
+                    help="with --additive-bakeoff, A/B the weather run_env term "
+                         "(Batch A, baseline-relative temp+wind) at this weight (0 = "
+                         "off). Needs `--build-weather ... --apply` populated first.")
     ap.add_argument("--additive-save", action="store_true",
                     help="Tier A #1d: fit the additive expected-runs model (v1/blend/"
                          "team-RP) on --season and STAGE it as the calibration "
@@ -2278,7 +2301,8 @@ if __name__ == "__main__":
                                     feature_sets=_fs, window_modes=_modes,
                                     rp_bullpen=args.rp_bullpen,
                                     bullpen_fatigue_weight=args.bullpen_fatigue_weight,
-                                    park_weight=args.park_weight)
+                                    park_weight=args.park_weight,
+                                    weather_weight=args.weather_weight)
     elif args.additive_save:
         save_additive_model(seasons,
                             bullpen_fatigue_weight=args.bullpen_fatigue_weight)

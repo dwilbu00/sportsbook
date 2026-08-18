@@ -335,6 +335,28 @@ class ResidentVenueTests(_Backend, unittest.TestCase):
             n = conn.execute(select(mlb_warehouse.weather_game)).fetchall()
         self.assertEqual(n, [])
 
+    def test_weather_run_env_maps(self):
+        from sqlalchemy import insert
+        with db_store.get_engine().begin() as conn:
+            conn.execute(insert(mlb_warehouse.mlb_venue),
+                         {"venue_id": "V", "cf_bearing": 0.0, "park_hits": 1.0})
+            conn.execute(insert(mlb_warehouse.weather_game), [
+                # wind FROM 180 (south) blows TO 0 (north) == cf_bearing 0 -> full out.
+                {"venue_id": "V", "weather_date": "2024-06-01", "temp_f": 80.0,
+                 "wind_mph": 10.0, "wind_dir_deg": 180.0},
+                {"venue_id": "V", "weather_date": "2024-06-02", "temp_f": 70.0,
+                 "wind_mph": 0.0, "wind_dir_deg": 0.0},
+            ])
+        gw = mlb_warehouse.game_weather_map([2024])
+        self.assertAlmostEqual(gw[("V", "2024-06-01")][0], 80.0)       # temp
+        self.assertAlmostEqual(gw[("V", "2024-06-01")][1], 10.0, places=1)  # wind_out
+        self.assertAlmostEqual(gw[("V", "2024-06-02")][1], 0.0, places=1)
+        base = mlb_warehouse.weather_baseline_by_venue()
+        self.assertAlmostEqual(base["V"][0], 75.0)                     # avg temp
+        self.assertAlmostEqual(base["V"][1], 5.0, places=1)           # avg wind_out
+        # A season filter excludes non-matching years.
+        self.assertEqual(mlb_warehouse.game_weather_map([2025]), {})
+
 
 # ─────────────────────────────────────────────────────────── pure parse / derive
 class ParseTests(unittest.TestCase):
