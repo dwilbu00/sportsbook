@@ -177,6 +177,75 @@ class BullpenGetterTests(unittest.TestCase):
         self.assertAlmostEqual(g("99", "2024-04-05"), 4.3)          # unknown -> league
 
 
+class BullpenFatigueTests(unittest.TestCase):
+    """Batch A #13: trailing-workload fatigue term on the shared make_bp_getter. INERT
+    at fatigue_weight=0 (byte-identical); a gassed pen prices worse when weighted."""
+
+    # 4 prior daily RP snapshots; cumulative ip strictly-before, era flat at league so
+    # the base ratio is 1.0 and the fatigue factor is isolated. All same season (2024)
+    # unless a per-row bucket is given so the cross-season guard is exercised too.
+    def _series(self, ips, buckets=None):
+        rows = [{"as_of_date": f"2024-04-0{i+1}", "era": 4.0, "ip": ip,
+                 "season_bucket": (buckets[i] if buckets else 2024)}
+                for i, ip in enumerate(ips)]
+        return {"10": rows}
+
+    def _getter(self, ips, weight, **kw):
+        return bs._make_bp_getter(self._series(ips), {"NYY": "10"}.get,
+                                  league_rp_era=4.0, league_bp=4.3,
+                                  fatigue_weight=weight, **kw)
+
+    def test_weight_zero_is_byte_identical_even_with_ip(self):
+        # ip present but weight 0 -> the pre-fatigue league-relative term exactly.
+        g = self._getter([5.0, 8.0, 11.0, 15.0], 0.0)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)   # ratio 1.0, no fatigue
+
+    def test_overworked_pen_prices_worse(self):
+        base = self._getter([5.0, 8.0, 11.0, 15.0], 0.0)("NYY", "2024-04-05")
+        heavy = self._getter([0.0, 3.0, 6.0, 100.0], 0.5)("NYY", "2024-04-05")
+        self.assertGreater(heavy, base)
+
+    def test_rested_pen_prices_better(self):
+        base = self._getter([5.0, 8.0, 11.0, 15.0], 0.0)("NYY", "2024-04-05")
+        light = self._getter([0.0, 1.0, 2.0, 3.0], 0.5)("NYY", "2024-04-05")
+        self.assertLess(light, base)
+
+    def test_exact_linear_region(self):
+        # window=3, baseline 3.0 -> expected 9.0 IP; trailing = 15-5 = 10 (rows[0..3]);
+        # excess = 10/9 - 1 = 0.111 (unclamped); factor = 1 + 0.5*excess.
+        g = self._getter([5.0, 8.0, 11.0, 15.0], 0.5, fatigue_baseline_ip=3.0)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"),
+                               4.3 * (1.0 + 0.5 * (10.0 / 9.0 - 1.0)))
+
+    def test_excess_is_clamped(self):
+        # trailing 100 over expected 9 -> excess clamped to +0.5 -> factor 1.25.
+        g = self._getter([0.0, 3.0, 6.0, 100.0], 0.5, fatigue_baseline_ip=3.0)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3 * 1.25)
+
+    def test_missing_ip_history_disables_fatigue(self):
+        # era-only rows (no ip) + weight>0 -> factor 1.0 (byte-identical fallback).
+        series = {"10": [{"as_of_date": f"2024-04-0{i+1}", "era": 4.0}
+                         for i in range(4)]}
+        g = bs._make_bp_getter(series, {"NYY": "10"}.get, 4.0, 4.3,
+                               fatigue_weight=0.5)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)
+
+    def test_insufficient_history_disables_fatigue(self):
+        # only 3 prior rows (need > window=3) -> no adjustment.
+        g = self._getter([5.0, 8.0, 11.0], 0.5)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)
+
+    def test_cross_season_boundary_disables_fatigue(self):
+        # ref (2024) vs back (2023) straddle the season reset: cumulative ip drops
+        # 480 -> 10, which WITHOUT the guard would clamp to max-rested (0.75x). The
+        # season_bucket mismatch must skip the adjustment -> factor 1.0.
+        series = self._series([480.0, 3.0, 6.0, 10.0],
+                              buckets=[2023, 2024, 2024, 2024])
+        g = bs._make_bp_getter(series, {"NYY": "10"}.get, 4.0, 4.3,
+                               fatigue_weight=0.5, fatigue_baseline_ip=3.0)
+        self.assertAlmostEqual(g("NYY", "2024-04-05"), 4.3)
+
+
 class AdditiveRunsExtractionTests(unittest.TestCase):
     """#1d: the pure helpers moved to additive_runs.py; backtest_starters aliases them
     so the OFFLINE bake-off and the LIVE path run the SAME code (fit==serve spine)."""

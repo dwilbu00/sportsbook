@@ -532,10 +532,17 @@ def load_rp_series(team_id, season):
         t = pitcher_asof_daily
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(
-                select(t.c.as_of_date, t.c.era).where(
+                select(t.c.as_of_date, t.c.era, t.c.ip, t.c.season_bucket).where(
                     (t.c.entity_id == str(team_id)) & (t.c.role == "RP")
                     & (t.c.season_bucket.in_(want)) & (t.c.era.isnot(None)))).all()
-        out = [{"as_of_date": str(d)[:10], "era": float(era)} for d, era in rows]
+        # ip = cumulative relief IP strictly-before (same curve as era); carried with
+        # season_bucket so the shared make_bp_getter can difference ip WITHIN a season
+        # for the trailing-workload fatigue term (Batch A #13) — cumulative ip resets
+        # per season. None-safe: a row with NULL ip just disables fatigue for it.
+        out = [{"as_of_date": str(d)[:10], "era": float(era),
+                "ip": (float(ip) if ip is not None else None),
+                "season_bucket": sb}
+               for d, era, ip, sb in rows]
         out.sort(key=lambda x: x["as_of_date"])
     except (OperationalError, ValueError, TypeError):
         return []

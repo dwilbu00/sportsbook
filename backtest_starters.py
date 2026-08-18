@@ -1912,14 +1912,20 @@ def _load_bullpen_asof_series(seasons):
         num = den = 0.0
         with db_store.get_engine().connect() as conn:
             rows = conn.execute(
-                select(t.c.entity_id, t.c.as_of_date, t.c.era, t.c.ip)
+                select(t.c.entity_id, t.c.as_of_date, t.c.era, t.c.ip,
+                       t.c.season_bucket)
                 .where((t.c.season_bucket.in_(sorted(want)))
                        & (t.c.role == "RP"))).all()
-        for eid, d, era, ip in rows:
+        for eid, d, era, ip, sb in rows:
             if era is None:
                 continue
+            # Carry ip + season_bucket per-row (cumulative relief IP strictly-before) so
+            # make_bp_getter can difference ip WITHIN a season for the trailing-workload
+            # fatigue term (Batch A #13); cumulative ip resets per season.
             by_tid.setdefault(str(eid), []).append(
-                {"as_of_date": str(d)[:10], "era": float(era)})
+                {"as_of_date": str(d)[:10], "era": float(era),
+                 "ip": (float(ip) if ip is not None else None),
+                 "season_bucket": sb})
             if ip:                                    # innings-weighted league mean
                 num += float(era) * float(ip)
                 den += float(ip)
@@ -1968,14 +1974,16 @@ def _abbr_to_team_id(seasons):
 def test_additive_expected_runs(seasons, holdout_start=None,
                                 feature_sets=None,
                                 window_modes=("cumulative", "blend", "window"),
-                                rp_bullpen=False):
+                                rp_bullpen=False, bullpen_fatigue_weight=0.0):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
-    model across FEATURE FAMILIES (v1 / contact / fip) x as-of WINDOW modes
+    model across FEATURE FAMILIES (v1 / contact / fip / csw) x as-of WINDOW modes
     (cumulative / prior-season blend / trailing window), fit on a chronological train
     split and graded by identical code on the holdout. rp_bullpen=True swaps the flat
     league bullpen term for the team's GS-based as-of RP aggregate (#1c-b, league-
-    relative). Reads pitcher_asof_daily. Families needing NULL columns (fip before the
-    #1c-a re-backfill) auto-skip with a note."""
+    relative). bullpen_fatigue_weight>0 layers the trailing-workload fatigue term on
+    that RP aggregate (Batch A #13; needs rp_bullpen). Reads pitcher_asof_daily.
+    Families needing NULL columns (fip before the #1c-a re-backfill) auto-skip with a
+    note."""
     feature_sets = feature_sets or _ADDITIVE_FEATURE_SETS
     all_rows = []
     for s in seasons:
@@ -2010,6 +2018,9 @@ def test_additive_expected_runs(seasons, holdout_start=None,
 
     # Optional GS-based RP bullpen term (league-relative so the earned/total scale
     # cancels). None -> flat league bullpen (v1 behavior).
+    if bullpen_fatigue_weight and not rp_bullpen:
+        print("  !! --bullpen-fatigue-weight has NO effect without --rp-bullpen "
+              "(the flat league bullpen has no per-team as-of workload). Ignoring.")
     bp_getter = None
     if rp_bullpen:
         bp_series, league_rp_era = _load_bullpen_asof_series(seasons)
@@ -2044,7 +2055,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
             if bp_getter:                        # bind league_bp now that it's known
                 _, bp_series, abbr_to_id, league_rp_era = bp_getter
                 bpg = _make_bp_getter(bp_series, abbr_to_id.get,   # resolve_id callable
-                                      league_rp_era, league_bp)
+                                      league_rp_era, league_bp,
+                                      fatigue_weight=bullpen_fatigue_weight)
             key = f"additive_{fs_name}_{mode}"
             results[key] = _variant_metrics_projfn(
                 train, holdout,
@@ -2052,6 +2064,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
             labels.append((f"B additive[{fs_name}/{mode}]", key))
 
     bp_tag = "team-RP" if bp_getter else "league-avg"
+    if bp_getter and bullpen_fatigue_weight:
+        bp_tag += f"+fatigue(w={bullpen_fatigue_weight})"
     print(f"\n=== Additive (xERA-lite) bake-off — train {len(train)} / holdout "
           f"{len(holdout)} — bullpen {bp_tag} ===")
     print(_bakeoff_row("A multiplicative", results["multiplicative"]))
@@ -2073,7 +2087,8 @@ def test_additive_expected_runs(seasons, holdout_start=None,
 
 
 def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
-                        mode="blend", blend_k=200.0, n_starts=10):
+                        mode="blend", blend_k=200.0, n_starts=10,
+                        bullpen_fatigue_weight=0.0):
     """Fit the additive expected-runs model on the FULL span and STAGE it as the
     calibration candidate block `expected_runs_additive` (Tier A #1d, commit 5).
     Default = the bake-off winner: v1 features (xwOBAcon+K9) + prior-season BLEND +
@@ -2110,7 +2125,9 @@ def save_additive_model(seasons, feature_keys=("xwobacon", "k9"),
         "model": xm,
         "blend": {"mode": mode, "blend_k": blend_k, "n_starts": n_starts},
         "bullpen": {"league_rp_era": league_rp_era,
-                    "league_bp": xm.get("league_rate9")},
+                    "league_bp": xm.get("league_rate9"),
+                    # Batch A #13; 0.0 -> inert (live make_bp_getter byte-identical).
+                    "fatigue_weight": bullpen_fatigue_weight},
     }
     _cl.set_candidate_mode(True)                    # candidate-ONLY, never live
     _cl.save_expected_runs_additive(
@@ -2170,11 +2187,15 @@ if __name__ == "__main__":
                          "(cumulative|blend|window).")
     ap.add_argument("--feature-sets", default=None,
                     help="comma list of additive feature families for "
-                         "--additive-bakeoff (v1|contact|fip). Default: all three.")
+                         "--additive-bakeoff (v1|contact|fip|csw). Default: all.")
     ap.add_argument("--rp-bullpen", action="store_true",
                     help="with --additive-bakeoff, use the GS-based team RP as-of "
                          "bullpen term (league-relative) instead of the flat league "
                          "average (needs the #1c-a re-backfill to populate GS).")
+    ap.add_argument("--bullpen-fatigue-weight", type=float, default=0.0,
+                    help="with --additive-bakeoff --rp-bullpen, A/B the trailing-"
+                         "workload bullpen fatigue term (Batch A #13) at this weight "
+                         "(0 = off/current behavior; try e.g. 0.3).")
     ap.add_argument("--additive-save", action="store_true",
                     help="Tier A #1d: fit the additive expected-runs model (v1/blend/"
                          "team-RP) on --season and STAGE it as the calibration "
@@ -2213,9 +2234,11 @@ if __name__ == "__main__":
                    if n.strip() in _ADDITIVE_FEATURE_SETS}
         test_additive_expected_runs(seasons, holdout_start=args.holdout_start,
                                     feature_sets=_fs, window_modes=_modes,
-                                    rp_bullpen=args.rp_bullpen)
+                                    rp_bullpen=args.rp_bullpen,
+                                    bullpen_fatigue_weight=args.bullpen_fatigue_weight)
     elif args.additive_save:
-        save_additive_model(seasons)
+        save_additive_model(seasons,
+                            bullpen_fatigue_weight=args.bullpen_fatigue_weight)
     elif args.test_runs:
         test_expected_runs_challenger(seasons)
     else:

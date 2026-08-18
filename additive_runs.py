@@ -102,7 +102,9 @@ def make_feat_getter(series, mode, feature_keys, n_starts=10, blend_k=200.0):
     return getter
 
 
-def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp):
+def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp,
+                   fatigue_weight=0.0, fatigue_window=3,
+                   fatigue_baseline_ip=3.3, fatigue_cap=0.5):
     """bp_getter(team_key, date) -> the team's as-of bullpen rate9 on the TOTAL-runs
     scale used by the additive label. Computed LEAGUE-RELATIVE:
         rate9 = league_bp * clamp(team_rp_era / league_rp_era, 0.5, 2.0)
@@ -112,7 +114,24 @@ def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp):
     ``resolve_id`` is a CALLABLE team_key -> team_id (the key `bp_series` is keyed by):
     the offline bake-off passes ``abbr_to_id.get`` (abbr -> MLBAM id); the live path
     passes an identity/str (team_id -> team_id). Generalizing the old abbr_to_id dict
-    to a callable is what lets both paths share this one function."""
+    to a callable is what lets both paths share this one function.
+
+    BULLPEN FATIGUE (Batch A #13, INERT at fatigue_weight=0): a recently over-worked
+    pen prices WORSE. trailing_ip = the cumulative RP ``ip`` snapshot at prev[-1] MINUS
+    the snapshot ``fatigue_window`` rows earlier. Both snapshots are strictly-before the
+    game date (the same leakage-safe curve the era ratio uses), so trailing_ip covers
+    the ``fatigue_window`` game-date intervals ENDING one game-date before the start
+    (it excludes the freshest outing, matching the era term's strictly-before lag). It
+    is compared to an expected ``fatigue_baseline_ip`` per game-date; the league-
+    relative rate9 is scaled by
+        1 + fatigue_weight * clamp(trailing_ip/(baseline*window) - 1, -cap, +cap).
+    The two snapshots must share a ``season_bucket``: cumulative relief ip resets each
+    season (built per-season), so a cross-season difference would read as maximally
+    rested — guarded (mirrors make_feat_getter's window-mode season check). fatigue_
+    weight=0, too little history, a cross-season boundary, or era-only rows missing
+    ``ip`` -> factor is exactly 1.0 -> byte-identical to the pre-fatigue term (fit ==
+    serve preserved).
+    """
     def getter(team_key, date):
         if not (bp_series and league_rp_era):
             return league_bp
@@ -128,7 +147,19 @@ def make_bp_getter(bp_series, resolve_id, league_rp_era, league_bp):
         if not prev:
             return league_bp
         ratio = max(0.5, min(2.0, prev[-1]["era"] / league_rp_era))
-        return league_bp * ratio
+        rate9 = league_bp * ratio
+        if fatigue_weight and fatigue_baseline_ip and len(prev) > fatigue_window:
+            ref, back = prev[-1], prev[-1 - fatigue_window]
+            ref_ip, back_ip = ref.get("ip"), back.get("ip")
+            # SAME season only — cumulative ip resets per season (see docstring).
+            same_season = ref.get("season_bucket") == back.get("season_bucket")
+            if ref_ip is not None and back_ip is not None and same_season:
+                expected = fatigue_baseline_ip * fatigue_window
+                if expected > 0:
+                    excess = max(-fatigue_cap, min(fatigue_cap,
+                                 (ref_ip - back_ip) / expected - 1.0))
+                    rate9 *= (1.0 + fatigue_weight * excess)
+        return rate9
     return getter
 
 

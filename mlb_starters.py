@@ -768,7 +768,12 @@ def live_additive_runs(sport_key, factors):
         if league_rp_era:
             rp_series = {str(htid): pitcher_asof.load_rp_series(htid, season),
                          str(atid): pitcher_asof.load_rp_series(atid, season)}
-            bp_getter = ar.make_bp_getter(rp_series, str, league_rp_era, league_bp)
+            # Bullpen fatigue (Batch A #13): sourced from the fitted config's bullpen
+            # block; absent -> 0.0 -> the pre-fatigue league-relative term (byte-
+            # identical). load_rp_series now carries the cumulative ip the getter needs.
+            bp_getter = ar.make_bp_getter(
+                rp_series, str, league_rp_era, league_bp,
+                fatigue_weight=float(bullpen.get("fatigue_weight") or 0.0))
         projector = ar.make_additive_projector(
             feat_getter, model, league_bp, feature_keys, bp_getter)
         # CROSSED mapping (see make_additive_projector): home_runs uses the away
