@@ -1754,11 +1754,21 @@ _ADDITIVE_FEATURES = ("xwobacon", "k9")   # v1 (owner-endorsed), available now
 #             csw-bearing additive config is fit + promoted (candidate staging) — live
 #             pricing reads the fitted config's feature_keys, never these lists, so this
 #             addition is byte-identical.
+#   gb      — contact + GB% (ground-ball rate): the SIERA ingredient that IS populated
+#             now (Batch A SIERA). Grades on current data; isolates the ground-ball
+#             marginal (grounders suppress XBH/HR) before the walk-rate unlock.
+#   siera   — fip + GB% = the full SIERA skill set (K%, BB%, GB% + contact) fed linearly
+#             into xERA-lite (true nonlinear SIERA interactions deferred). Like fip it
+#             needs k_pct/bb_pct, so it AUTO-SKIPS until the #1c-a BB/BF re-backfill +
+#             a pitcher_asof rebuild; then it grades.
 _ADDITIVE_FEATURE_SETS = {
     "v1": ("xwobacon", "k9"),
     "contact": ("xwobacon", "k9", "barrel_pct", "whiff_pct"),
     "fip": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "k_pct", "bb_pct"),
     "csw": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "csw_pct"),
+    "gb": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "gb_pct"),
+    "siera": ("xwobacon", "k9", "barrel_pct", "whiff_pct", "k_pct", "bb_pct",
+              "gb_pct"),
 }
 
 # Every feature any family may request — the series loader pulls all of these so a
@@ -1976,7 +1986,7 @@ def test_additive_expected_runs(seasons, holdout_start=None,
                                 window_modes=("cumulative", "blend", "window"),
                                 rp_bullpen=False, bullpen_fatigue_weight=0.0):
     """Bake-off: the multiplicative incumbent vs the additive Savant xERA-lite runs
-    model across FEATURE FAMILIES (v1 / contact / fip / csw) x as-of WINDOW modes
+    model across FEATURE FAMILIES (v1/contact/fip/csw/gb/siera) x as-of WINDOW modes
     (cumulative / prior-season blend / trailing window), fit on a chronological train
     split and graded by identical code on the holdout. rp_bullpen=True swaps the flat
     league bullpen term for the team's GS-based as-of RP aggregate (#1c-b, league-
@@ -2187,7 +2197,8 @@ if __name__ == "__main__":
                          "(cumulative|blend|window).")
     ap.add_argument("--feature-sets", default=None,
                     help="comma list of additive feature families for "
-                         "--additive-bakeoff (v1|contact|fip|csw). Default: all.")
+                         "--additive-bakeoff (v1|contact|fip|csw|gb|siera). "
+                         "Default: all (fip/siera auto-skip pre BB/BF re-backfill).")
     ap.add_argument("--rp-bullpen", action="store_true",
                     help="with --additive-bakeoff, use the GS-based team RP as-of "
                          "bullpen term (league-relative) instead of the flat league "

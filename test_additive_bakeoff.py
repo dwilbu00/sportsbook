@@ -78,6 +78,40 @@ class CswFeatureFamilyTests(unittest.TestCase):
         self.assertNotIn("csw_pct", f_with)
 
 
+class SieraFeatureFamilyTests(unittest.TestCase):
+    """Batch A SIERA — ground-ball rate + the SIERA skill set as additive families.
+    gb_pct is already loaded in both feature lists, so these are pure family additions."""
+
+    def test_gb_and_siera_registered(self):
+        self.assertIn("gb", bs._ADDITIVE_FEATURE_SETS)
+        self.assertIn("siera", bs._ADDITIVE_FEATURE_SETS)
+
+    def test_gb_is_marginal_over_contact(self):
+        extra = set(bs._ADDITIVE_FEATURE_SETS["gb"]) - set(
+            bs._ADDITIVE_FEATURE_SETS["contact"])
+        self.assertEqual(extra, {"gb_pct"})
+
+    def test_siera_is_marginal_over_fip(self):
+        extra = set(bs._ADDITIVE_FEATURE_SETS["siera"]) - set(
+            bs._ADDITIVE_FEATURE_SETS["fip"])
+        self.assertEqual(extra, {"gb_pct"})
+
+    def test_gb_grades_on_current_data(self):
+        # gb must NOT inherit the NULL-until-BB/BF-re-backfill columns, so it grades now.
+        self.assertNotIn("k_pct", bs._ADDITIVE_FEATURE_SETS["gb"])
+        self.assertNotIn("bb_pct", bs._ADDITIVE_FEATURE_SETS["gb"])
+
+    def test_siera_carries_the_walk_rate_skill_inputs(self):
+        # siera is the full K/BB/GB skill set -> intentionally gated on the re-backfill.
+        for k in ("k_pct", "bb_pct", "gb_pct"):
+            self.assertIn(k, bs._ADDITIVE_FEATURE_SETS["siera"])
+
+    def test_gb_pct_already_loadable_no_feature_list_change(self):
+        import pitcher_asof
+        self.assertIn("gb_pct", bs._ALL_ASOF_FEATURES)
+        self.assertIn("gb_pct", pitcher_asof._SERIES_FEATURES)
+
+
 class ExpIpTests(unittest.TestCase):
     def test_clamp_and_default(self):
         self.assertEqual(bs._exp_ip(6.0), 6.0)
