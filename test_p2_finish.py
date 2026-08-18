@@ -300,6 +300,40 @@ class WarehouseTeamOffenseTests(unittest.TestCase):
         self.assertIn("ZZZ", log)                         # unmapped warehouse key
         self.assertIn("SEA", log)                         # StatsAPI team, no warehouse data
 
+    def test_precompute_matches_live_warehouse_factors(self):
+        # The offline precompute must write, for a cutoff, EXACTLY what the live
+        # _warehouse_team_factors computes for the same as-of (shared _finalize_offense).
+        for _ in range(60):
+            self._pitch("NYY", "R", 0.340, date="2024-04-10")
+            self._pitch("SEA", "R", 0.300, date="2024-04-10")
+        with patch.object(mlb_starters, "get_team_index",
+                          return_value=_fake_index({"NYY", "SEA"})), \
+                patch.object(mlb_starters, "_write_cache") as wc:
+            n = mlb_starters.precompute_offense_cache([2024], min_pa=40, verbose=False)
+        self.assertGreater(n, 0)
+        writes = {c.args[0]: c.args[1] for c in wc.call_args_list}
+        key = "wh_expected_runs_teams_v1_2024_2024-04-10_40"
+        self.assertIn(key, writes)                        # cutoff = 04-10 present
+        with patch.object(mlb_starters, "get_team_index",
+                          return_value=_fake_index({"NYY", "SEA"})):
+            live = mlb_starters._warehouse_team_factors(2024, "2024-04-11")  # cutoff 04-10
+        # Equal to float precision (precompute sums in Python; live uses SQL AVG — they
+        # differ only at ~1e-15, far below any pricing sensitivity).
+        pre = writes[key]
+        self.assertEqual(set(pre["offense_vs_hand"]["R"]),
+                         set(live["offense_vs_hand"]["R"]))
+        self.assertAlmostEqual(pre["league_xwoba"], live["league_xwoba"], places=9)
+        for t in pre["offense_vs_hand"]["R"]:
+            self.assertAlmostEqual(pre["offense_vs_hand"]["R"][t],
+                                   live["offense_vs_hand"]["R"][t], places=9)
+        self.assertEqual(pre["bullpen_xwoba"], live["bullpen_xwoba"])
+        self.assertEqual(pre["league_bullpen_xwoba"], live["league_bullpen_xwoba"])
+
+    def test_precompute_sql_off_writes_nothing(self):
+        db_store.configure_engine(None)
+        self.assertEqual(
+            mlb_starters.precompute_offense_cache([2024], verbose=False), 0)
+
     # ── the env flag ──
     def test_flag_env_truth_table(self):
         for val, exp in [("1", True), ("true", True), ("on", True), ("YES", True),

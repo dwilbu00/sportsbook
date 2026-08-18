@@ -242,6 +242,139 @@ def _mlb_warehouse_offense_enabled():
         "1", "true", "on", "yes")
 
 
+def _finalize_offense(raw, statsapi_abbrs):
+    """{"L"/"R": {team: {"xwoba", "pa"}}} (already min_pa-filtered) -> the offense
+    factors dict (Savant->StatsAPI-abbr normalized, PA-weighted league_xwoba, empty
+    bullpen), or None if no team clears the bar. SHARED by the live warehouse path and
+    the offline precompute so both emit byte-identical output."""
+    d = {"L": raw.get("L") or {}, "R": raw.get("R") or {}}
+    if not (d["L"] or d["R"]):
+        return None
+    if statsapi_abbrs:
+        d = {hand: {_canonical_team_key(k, statsapi_abbrs): v for k, v in hd.items()}
+             for hand, hd in d.items()}
+    offense_rows = [v for hd in d.values() for v in hd.values()]
+    total_pa = sum(r["pa"] for r in offense_rows)
+    if not total_pa:
+        return None
+    league_xwoba = sum(r["xwoba"] * r["pa"] for r in offense_rows) / total_pa
+    return {
+        "league_xwoba": league_xwoba,
+        "league_bullpen_xwoba": None,      # v1: warehouse bullpen not derived yet
+        "offense_vs_hand": {hand: {t: r["xwoba"] for t, r in hd.items()}
+                            for hand, hd in d.items()},
+        "bullpen_xwoba": {},               # empty -> _expected_staff uses starter-only
+    }
+
+
+def _warn_offense_coverage(season, result, statsapi_abbrs):
+    """Fail-VISIBLE coverage warning (mirrors the Savant path): a warehouse team key
+    outside the StatsAPI namespace silently disables the challenger for that team.
+    Deduped per unique gap with a ("wh", ...) signature."""
+    offense_keys = {k for hd in result["offense_vs_hand"].values() for k in hd}
+    unmapped = sorted(offense_keys - statsapi_abbrs)
+    missing = sorted(statsapi_abbrs - offense_keys)
+    _sig = ("wh", int(season), tuple(unmapped), tuple(missing))
+    if (unmapped or missing) and _sig not in _COVERAGE_WARNED:
+        _COVERAGE_WARNED.add(_sig)
+        _warn(f"warehouse expected-runs team-key coverage gap for season {season}: "
+              f"warehouse keys outside the StatsAPI namespace={unmapped}; "
+              f"StatsAPI teams with no warehouse offense data={missing}. The "
+              f"ensemble challenger is disabled for these teams — extend "
+              f"_SAVANT_TO_STATSAPI_ABBR if 'unmapped' is a rename.")
+
+
+def precompute_offense_cache(seasons, min_pa=40, chunk_days=10, verbose=True):
+    """One-pass warehouse team-offense precompute for FAST backtests. Chunk-reads
+    statcast_pitch in small, timeout-safe date windows (a plain SELECT, NOT a growing
+    per-cutoff GROUP BY), maintains a running per-(team, hand) cumulative in memory, and
+    writes the wh_expected_runs_teams_v1_* cache file for EVERY cutoff date — so an odds
+    backtest with ODI_MLB_WAREHOUSE_OFFENSE=1 reads all team offense from disk with ZERO
+    per-cutoff SQL. Replaces the ~500 growing GROUP BY calls that time out on a remote /
+    throttled Azure SQL. Uses _finalize_offense so each snapshot is byte-identical to
+    what _warehouse_team_factors would compute live. Idempotent (overwrites). Returns
+    the number of cache files written. Run ONCE before the backtest."""
+    try:
+        import savant_history as sh
+        import db_store
+        from sqlalchemy import select
+    except Exception:
+        return 0
+    if not sh.enabled():
+        if verbose:
+            print("  [offense-precompute] SQL not configured — nothing to do.")
+        return 0
+    sp = sh.statcast_pitch
+    written = 0
+    for _season in seasons:
+        season = int(_season)
+        s0, s1 = _date(season, 1, 1), _date(season, 12, 31)
+        try:
+            team_index = get_team_index(season)
+            statsapi_abbrs = {info.get("abbr") for info in (team_index or {}).values()
+                              if info.get("abbr")}
+        except Exception:
+            statsapi_abbrs = set()
+        # 1) chunk-read the whole season into {date -> [(team, hand, xwoba)]}.
+        date_rows, chunks, failed = {}, 0, 0
+        d = s0
+        while d <= s1:
+            hi = min(d + timedelta(days=chunk_days), s1 + timedelta(days=1))
+            stmt = select(sp.c.game_date, sp.c.batting_team, sp.c.p_throws,
+                          sp.c.xwoba).where(
+                (sp.c.xwoba.isnot(None)) & (sp.c.batting_team.isnot(None))
+                & (sp.c.p_throws.in_(("L", "R")))
+                & (sp.c.game_date >= d.isoformat())
+                & (sp.c.game_date < hi.isoformat()))
+            rows = None
+            for _attempt in range(4):
+                try:
+                    with db_store.get_engine().connect() as conn:
+                        rows = conn.execute(stmt).all()
+                    break
+                except Exception:
+                    rows = None
+                    time.sleep(1.0)
+            chunks += 1
+            if rows is None:
+                failed += 1
+                if verbose:
+                    print(f"  [offense-precompute] {season}: chunk {d}..{hi} FAILED "
+                          f"after retries (cache will be incomplete).")
+            for gd, team, hand, xw in (rows or []):
+                date_rows.setdefault(str(gd)[:10], []).append(
+                    (str(team), hand, float(xw)))
+            d = hi
+        # 2) walk every calendar date, accumulate, snapshot -> cache[cutoff=date].
+        cum, cur, season_written = {}, s0, 0
+        while cur <= s1:
+            ds = cur.isoformat()
+            for team, hand, xw in date_rows.get(ds, []):
+                acc = cum.get((team, hand))
+                if acc is None:
+                    cum[(team, hand)] = [xw, 1]
+                else:
+                    acc[0] += xw
+                    acc[1] += 1
+            raw = {"L": {}, "R": {}}
+            for (team, hand), (ssum, n) in cum.items():
+                if hand in ("L", "R") and n >= min_pa:
+                    raw[hand][team] = {"xwoba": ssum / n, "pa": n}
+            out = _finalize_offense(raw, statsapi_abbrs)
+            if out is not None:
+                _write_cache(f"wh_expected_runs_teams_v1_{season}_{ds}_{min_pa}", out)
+                season_written += 1
+            cur += timedelta(days=1)
+        written += season_written
+        if verbose:
+            print(f"  [offense-precompute] {season}: {season_written} cache files "
+                  f"({chunks} chunk reads, {failed} failed).")
+    if verbose:
+        print(f"  [offense-precompute] DONE — {written} cache files written. Run the "
+              f"backtest now (ODI_MLB_WAREHOUSE_OFFENSE=1) — offense reads from disk.")
+    return written
+
+
 def _warehouse_team_factors(season, as_of, min_pa=40):
     """Warehouse-native team OFFENSE inputs for the expected-runs challenger, derived
     from statcast_pitch (leakage-safe: game_date in [season-01-01, as_of-1d]) instead of
@@ -290,47 +423,16 @@ def _warehouse_team_factors(season, as_of, min_pa=40):
     for team, hand, avg, n in (rows or []):
         if team and hand in ("L", "R") and avg is not None and n and n >= min_pa:
             raw[hand][str(team)] = {"xwoba": float(avg), "pa": int(n)}
-    if not (raw["L"] or raw["R"]):
-        return None
-    # Normalize Savant team keys into the StatsAPI-abbr namespace the consumers look up
-    # by (SAME step + helper as the Savant path). A team-index hiccup just skips it.
     try:
         team_index = get_team_index(season)
         statsapi_abbrs = {info.get("abbr") for info in (team_index or {}).values()
                           if info.get("abbr")}
     except (OSError, ValueError, requests.RequestException):
         statsapi_abbrs = set()
-    if statsapi_abbrs:
-        raw = {hand: {_canonical_team_key(k, statsapi_abbrs): v
-                      for k, v in d.items()}
-               for hand, d in raw.items()}
-        # Fail-VISIBLE coverage check (mirrors the Savant path): a warehouse team key
-        # outside the StatsAPI namespace silently disables the challenger for that team,
-        # so warn loudly instead. Distinct ("wh", ...) signature so it doesn't shadow
-        # the Savant warning. Offense-only (bullpen is intentionally empty in v1).
-        offense_keys = {k for d in raw.values() for k in d}
-        unmapped = sorted(offense_keys - statsapi_abbrs)
-        missing = sorted(statsapi_abbrs - offense_keys)
-        _sig = ("wh", int(season), tuple(unmapped), tuple(missing))
-        if (unmapped or missing) and _sig not in _COVERAGE_WARNED:
-            _COVERAGE_WARNED.add(_sig)
-            _warn(f"warehouse expected-runs team-key coverage gap for season {season}: "
-                  f"warehouse keys outside the StatsAPI namespace={unmapped}; "
-                  f"StatsAPI teams with no warehouse offense data={missing}. The "
-                  f"ensemble challenger is disabled for these teams — extend "
-                  f"_SAVANT_TO_STATSAPI_ABBR if 'unmapped' is a rename.")
-    offense_rows = [v for d in raw.values() for v in d.values()]
-    total_pa = sum(r["pa"] for r in offense_rows)
-    if not total_pa:
-        return None
-    league_xwoba = sum(r["xwoba"] * r["pa"] for r in offense_rows) / total_pa
-    return {
-        "league_xwoba": league_xwoba,
-        "league_bullpen_xwoba": None,      # v1: warehouse bullpen not derived yet
-        "offense_vs_hand": {hand: {t: r["xwoba"] for t, r in d.items()}
-                            for hand, d in raw.items()},
-        "bullpen_xwoba": {},               # empty -> _expected_staff uses starter-only
-    }
+    result = _finalize_offense(raw, statsapi_abbrs)   # shared with the precompute
+    if result is not None and statsapi_abbrs:
+        _warn_offense_coverage(season, result, statsapi_abbrs)
+    return result
 
 
 def get_expected_runs_team_factors(season, as_of, min_pa=40):
