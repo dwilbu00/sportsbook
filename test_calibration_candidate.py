@@ -216,6 +216,37 @@ class CandidateStagingTests(unittest.TestCase):
         # Discarding again is a no-op.
         self.assertFalse(cl.discard_candidate(SK))
 
+    # ── Tier A #1d: additive expected-runs block (candidate-staged) ────────
+    def test_additive_save_stages_candidate_preserves_blocks(self):
+        # save_expected_runs_additive stages to the CANDIDATE (not live) and preserves
+        # the other blocks; the serving loader reads LIVE until promote.
+        self._seed_live()                      # props (C/E) + prob_shrink block
+        model = {"enabled": True, "feature_keys": ["xwobacon", "k9"],
+                 "model": {"coef": [1.0, 2.0], "league_rate9": 4.3}}
+        cl.set_candidate_mode(True)
+        cl.save_expected_runs_additive(SK, model, meta={"seasons": [2024, 2025]})
+        cl.set_candidate_mode(False)
+        # Live untouched (no additive block yet); serving load reads live -> {}.
+        self.assertNotIn("expected_runs_additive", self._live())
+        self.assertEqual(cl.load_expected_runs_additive(SK), {})
+        # Candidate carries the additive block AND preserves props + prob_shrink.
+        cand = self._cand()
+        self.assertEqual(cand["expected_runs_additive"], model)
+        self.assertEqual(cand["props"]["batter_hits"]["method"], "C")
+        self.assertEqual(cand["prob_shrink"]["totals"], 0.5)
+        self.assertEqual(cand["meta"]["expected_runs_additive"]["seasons"],
+                         [2024, 2025])
+
+    def test_additive_promote_makes_it_live_and_preserves_props(self):
+        self._seed_live()
+        model = {"enabled": True, "feature_keys": ["xwobacon", "k9"]}
+        cl.set_candidate_mode(True)
+        cl.save_expected_runs_additive(SK, model)
+        cl.set_candidate_mode(False)
+        cl.promote_calibration(SK)
+        self.assertEqual(cl.load_expected_runs_additive(SK), model)
+        self.assertEqual(self._live()["props"]["batter_hits"]["method"], "C")
+
 
 def load_method(sport_key, prop):
     return (cl.load_calibration(sport_key).get(prop) or {}).get("method")

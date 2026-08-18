@@ -404,6 +404,40 @@ def save_starter_adjustment(sport_key, adj, meta=None):
         json.dump(blob, f, indent=2)
 
 
+def load_expected_runs_additive(sport_key):
+    """Load the additive expected-runs model config (Tier A #1d), or {} if none.
+    Read by mlb_starters.live_additive_runs on the flag-ON path; {} keeps the live
+    path on the multiplicative model (byte-identical)."""
+    if not sport_key:
+        return {}
+    return _load_blob(sport_key).get("expected_runs_additive", {})
+
+
+def save_expected_runs_additive(sport_key, model, meta=None):
+    """Persist the fitted additive expected-runs model (Tier A #1d), preserving every
+    other calibration block (props, expected_runs_challenger, starter_adjustment, ...).
+    Candidate-aware: under set_candidate_mode(True) this writes <sport>.candidate.json,
+    NOT live — the owner promotes via refit_calibration.py --promote."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_write_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["expected_runs_additive"] = model
+    if meta:
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            existing = blob["meta"].get("expected_runs_additive")
+            if isinstance(existing, dict):
+                existing.update(meta)
+                blob["meta"]["expected_runs_additive"] = existing
+            else:
+                blob["meta"]["expected_runs_additive"] = meta
+        else:
+            blob["meta"] = {"expected_runs_additive": meta}
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
 def load_lineup_adjustment(sport_key):
     """Load validated per-prop batting-order exposure adjustments."""
     if not sport_key:
