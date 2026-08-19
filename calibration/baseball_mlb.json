@@ -71988,7 +71988,8 @@
     "edge_floor": 0.01,
     "suppress": [
       "pitcher_outs",
-      "batter_strikeouts"
+      "batter_strikeouts",
+      "totals"
     ]
   },
   "expected_runs_additive": {

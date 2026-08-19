@@ -29,6 +29,7 @@ from pricing_common import (  # noqa: E402
     _shrink_factor,
     _apply_shrink,
     _blend_weight,
+    _market_suppressed,
     VENUE_MATCH_WEIGHTS,
     DEFAULT_VENUE_WEIGHTS,
     _venue_match_multiplier,
@@ -458,15 +459,15 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                     model_prob, sign * matchup_features["starter_edge"],
                     _starter_adjustment(sport_key, "moneyline"))
 
-        # Pythagorean blend (LIVE: DEFAULT_PYTHAG_WEIGHT=0.35 — see header note).
+        # Pythagorean blend (LIVE: DEFAULT_PYTHAG_WEIGHT=0.50 — see header note).
         # Pulls the model win prob toward the season run-differential estimate; a
         # mean-reverting transform, skipped when runs are absent (ESPN path).
         if DEFAULT_PYTHAG_WEIGHT > 0 and pythag_wp is not None:
             model_prob = ((1.0 - DEFAULT_PYTHAG_WEIGHT) * model_prob
                           + DEFAULT_PYTHAG_WEIGHT * pythag_wp)
 
-        # Calibrated overconfidence correction (LIVE: prob_shrink.moneyline=0.25
-        # pulls the prob 75% toward 0.5 — a revert-to-mean leash applied BEFORE
+        # Calibrated overconfidence correction (LIVE: prob_shrink.moneyline=0.35
+        # pulls the prob 65% toward 0.5 — a revert-to-mean leash applied BEFORE
         # edge/EV are scored), then optional model⇄market blend toward the
         # de-vigged closing line (blend_w=1.0 → blend OFF). See [[team-market-audit]].
         shrunk = _apply_shrink(model_prob, sport_key, "moneyline")
@@ -515,7 +516,8 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "best_price": best_offer["price"],
             "expected_roi_pct": (round(expected_roi * 100, 2)
                                   if expected_roi is not None else None),
-            "is_value": _prop_is_value(edge, threshold, expected_roi),
+            "is_value": (not _market_suppressed(sport_key, "moneyline"))
+                        and _prop_is_value(edge, threshold, expected_roi),
         }
         candidates.append(result)
 
@@ -712,8 +714,10 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                                     if under_roi is not None else None),
         "home_avg_scored": round(home_avg_scored, 2),
         "away_avg_scored": round(away_avg_scored, 2),
-        "is_over_value": diff > 0 and _prop_is_value(over_edge, threshold, over_roi),
-        "is_under_value": diff < 0 and _prop_is_value(under_edge, threshold, under_roi),
+        "is_over_value": (not _market_suppressed(sport_key, "totals"))
+                         and diff > 0 and _prop_is_value(over_edge, threshold, over_roi),
+        "is_under_value": (not _market_suppressed(sport_key, "totals"))
+                          and diff < 0 and _prop_is_value(under_edge, threshold, under_roi),
         "over_price": over_price,
         "under_price": under_price,
         # When a side has no consensus price, its over_implied/over_edge_pct are
@@ -857,7 +861,8 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             "edge_pct": round(edge * 100, 2),
             "expected_roi_pct": (round(roi * 100, 2)
                                   if roi is not None else None),
-            "is_value": _prop_is_value(edge, threshold, roi),
+            "is_value": (not _market_suppressed(sport_key, "spreads"))
+                        and _prop_is_value(edge, threshold, roi),
             "pred_game_margin": round(pred_margin, 2),
             "pred_game_std": round(pred_std, 2),
             "price": price,

@@ -15,6 +15,7 @@ from calibration_loader import (
     load_market_blend,
     load_prob_shrink,
     load_starter_adjustment,
+    load_value_gate,
 )
 from odds_client import american_to_decimal, devig_two_way
 
@@ -50,6 +51,24 @@ def et_local_date(commence_iso):
 _MARKET_BLEND_CACHE = {}
 _PROB_SHRINK_CACHE = {}
 _STARTER_ADJ_CACHE = {}
+_VALUE_GATE_CACHE = {}
+
+
+def _market_suppressed(sport_key, market):
+    """True if `market` is in the calibration value_gate ``suppress`` list — a
+    suppressed market (player prop OR team market) must NEVER be flagged as a
+    value bet or enter bet selection. Team markets ('moneyline'/'spreads'/
+    'totals') share the same suppress list as props; the names don't collide.
+    Fails OPEN (not suppressed) on any load error so a config miss can't silently
+    blank the whole card."""
+    if not sport_key or not market:
+        return False
+    if sport_key not in _VALUE_GATE_CACHE:
+        try:
+            _VALUE_GATE_CACHE[sport_key] = load_value_gate(sport_key) or {}
+        except Exception:
+            _VALUE_GATE_CACHE[sport_key] = {}
+    return market in (_VALUE_GATE_CACHE[sport_key].get("suppress") or [])
 
 
 def _decimal_to_american(decimal_odds):

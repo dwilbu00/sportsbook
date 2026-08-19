@@ -17,6 +17,7 @@ import espn_client
 import mlb_starters
 import odds_client
 import park_factors
+import pricing_common
 import props
 import recalibration
 import weather_factors
@@ -937,6 +938,57 @@ class AdditiveTotalsTests(unittest.TestCase):
             self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
+
+
+class TeamMarketSuppressTests(unittest.TestCase):
+    """value_gate.suppress must gate TEAM markets, not just props: a suppressed
+    market never flags a value bet, so it can't enter bet selection / the top-N
+    picker. Totals is the shipped case (loses at volume, badly overconfident);
+    the same guard covers moneyline/spreads. See _market_suppressed +
+    analyze_*_value."""
+
+    def setUp(self):
+        # _VALUE_GATE_CACHE is a module-level dict in pricing_common; snapshot
+        # and restore so seeding here never leaks into other tests.
+        self._orig = dict(pricing_common._VALUE_GATE_CACHE)
+
+    def tearDown(self):
+        pricing_common._VALUE_GATE_CACHE.clear()
+        pricing_common._VALUE_GATE_CACHE.update(self._orig)
+
+    def _seed(self, suppress):
+        pricing_common._VALUE_GATE_CACHE["baseball_mlb"] = {"suppress": suppress}
+
+    def test_market_suppressed_membership_and_fail_open(self):
+        self._seed(["totals", "pitcher_outs"])
+        self.assertTrue(pricing_common._market_suppressed("baseball_mlb", "totals"))
+        self.assertFalse(pricing_common._market_suppressed("baseball_mlb", "moneyline"))
+        self.assertFalse(pricing_common._market_suppressed("baseball_mlb", "spreads"))
+        # Fail OPEN on empty inputs — a config miss must never blank the card.
+        self.assertFalse(pricing_common._market_suppressed("", "totals"))
+        self.assertFalse(pricing_common._market_suppressed("baseball_mlb", ""))
+
+    def test_suppressed_totals_never_flags_value(self):
+        # Force the underlying value gate True so the ONLY thing that can zero the
+        # flag is the suppression guard; additive-on gives a clean over (diff>0).
+        def _over():
+            with patch("analysis._prop_is_value", return_value=True), \
+                    patch.object(mlb_starters, "_mlb_additive_totals_enabled",
+                                 return_value=True), \
+                    patch.object(mlb_starters, "live_additive_runs",
+                                 return_value=(7.25, 6.75)):  # 14.0 > 8.5 line
+                cands = analysis.analyze_totals_value(
+                    AdditiveTotalsTests._game_odds(),
+                    *AdditiveTotalsTests._team_stats(),
+                    sport_key="baseball_mlb",
+                    matchup_features=AdditiveTotalsTests._matchup_features())
+            return next(c for c in cands if c["type"] == "total_over")
+
+        self._seed([])                       # not suppressed -> flag CAN be True
+        self.assertTrue(_over()["is_over_value"])
+        self._seed(["totals"])               # suppressed -> forced False
+        self.assertFalse(_over()["is_over_value"])
+        self.assertFalse(_over()["is_under_value"])
 
 
 class AdditiveMoneylineTests(unittest.TestCase):
