@@ -1212,6 +1212,75 @@ def _matchup_features_for(home, away, date, sport_key):
     return None
 
 
+def _prewarm_matchup_features(pw_games, schedules, sport_key, use_warehouse,
+                             compute_fn=None):
+    """Build {(d10, home, away): features} for the live-engine grading loop, reusing
+    the feature_store cache so repeat backtests skip the slow prewarm.
+
+    Per-season cache version = count:max_date of the FULL warehouse schedule
+    (all_completed_games) → stable across --limit / season range (a partial run can't
+    poison it), and a season whose warehouse changed (2026 filling, a re-ingest) bumps
+    the version → automatic rebuild. None feature values (unresolved starters or a
+    transient build error) are NEVER cached, so they can't persistently degrade a
+    later run. Bypass with ODI_NO_FEATURE_CACHE=1; hard-reset via feature_store.clear().
+    fit==serve: caches the EXACT _matchup_features_for output grading would compute.
+    ``compute_fn`` is a test seam (defaults to _matchup_features_for)."""
+    import feature_store
+    from collections import defaultdict
+    compute = compute_fn or _matchup_features_for
+    prewarm = {}
+    pw = [g for g in pw_games
+          if g.get("date") and g.get("home_team") and g.get("away_team")]
+    if not pw:
+        return prewarm
+    use_cache = bool(use_warehouse and not os.environ.get("ODI_NO_FEATURE_CACHE"))
+    cache, ver, dirty = {}, {}, set()
+    if use_cache:
+        sg = defaultdict(list)
+        for g in all_completed_games(schedules):
+            if g.get("date"):
+                sg[int(str(g["date"])[:4])].append(g)
+        for s, gs in sg.items():
+            ver[s] = feature_store.season_version(gs)
+            cache[s] = feature_store.load(sport_key, s, ver[s]) or {}
+
+    def _one(g):
+        d10 = _et_date10(g["date"])
+        return ((d10, g["home_team"], g["away_team"]),
+                compute(g["home_team"], g["away_team"], d10, sport_key))
+
+    todo, hits = [], 0
+    for g in pw:
+        d10 = _et_date10(g["date"])
+        key = (d10, g["home_team"], g["away_team"])
+        s = int(d10[:4]) if d10[:4].isdigit() else None
+        if use_cache and s is not None and key in cache.get(s, {}):
+            prewarm[key] = cache[s][key]
+            hits += 1
+        else:
+            todo.append((g, s))
+    if todo:
+        print(f"  [prewarm] matchup features: {hits} cached, {len(todo)} to build "
+              f"(thread pool) ...")
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futs = {pool.submit(_one, g): s for g, s in todo}
+            for fut in as_completed(futs):
+                s = futs[fut]
+                try:
+                    k, v = fut.result()
+                    prewarm[k] = v
+                    if use_cache and s is not None and v is not None:
+                        cache.setdefault(s, {})[k] = v
+                        dirty.add(s)
+                except Exception:
+                    pass
+        for s in dirty:
+            feature_store.save(sport_key, s, ver[s], cache[s])
+    else:
+        print(f"  [prewarm] matchup features: all {hits} from cache.")
+    return prewarm
+
+
 def _shrink_prob(p, s):
     """Pull a probability toward 0.5 by factor s (s=1 unchanged, s=0 -> 0.5).
     Fixes overconfidence: a model 'p' becomes 0.5 + s*(p-0.5)."""
@@ -1358,24 +1427,8 @@ def _run_odds_backtest_impl(
     # consumes matchup features. (Reuses the build_schedules ThreadPool pattern.)
     prewarm_features = {}
     if engine == "live":
-        _pw = [g for g in all_games
-               if g.get("date") and g.get("home_team") and g.get("away_team")]
-
-        def _pw_one(g):
-            d10 = _et_date10(g["date"])
-            return ((d10, g["home_team"], g["away_team"]),
-                    _matchup_features_for(g["home_team"], g["away_team"],
-                                          d10, sport_key))
-        if _pw:
-            print(f"  [prewarm] matchup features for {len(_pw)} games "
-                  f"(thread pool) ...")
-            with ThreadPoolExecutor(max_workers=16) as _pool:
-                for _fut in as_completed([_pool.submit(_pw_one, g) for g in _pw]):
-                    try:
-                        _k, _v = _fut.result()
-                        prewarm_features[_k] = _v
-                    except Exception:
-                        pass
+        prewarm_features = _prewarm_matchup_features(
+            all_games, schedules, sport_key, use_warehouse)
 
     if engine == "live":
         print("\n[engine: live] grading the exact production analyzers "
