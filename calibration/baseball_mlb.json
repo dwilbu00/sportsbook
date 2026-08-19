@@ -71987,7 +71987,8 @@
     "ev_floor": 0.04,
     "edge_floor": 0.01,
     "suppress": [
-      "pitcher_outs"
+      "pitcher_outs",
+      "batter_strikeouts"
     ]
   },
   "expected_runs_additive": {
