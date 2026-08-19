@@ -548,11 +548,16 @@ def _secret(name):
 
 
 def promote_secrets_from_toml(path=None):
-    """Copy SQL_* keys from .streamlit/secrets.toml into os.environ (setdefault).
+    """Copy SQL_* keys AND ODI_MLB_* gate flags from .streamlit/secrets.toml into
+    os.environ (setdefault).
 
-    For CLI tools (backfill, offline refit) that run outside Streamlit. The
-    Streamlit app already promotes them at boot. Best-effort; returns True when
-    all four keys ended up in the environment."""
+    For CLI tools (backfill, offline refit, backtests) that run outside Streamlit.
+    The Streamlit app already promotes both at boot (app.py). Promoting the
+    ODI_MLB_* flags here means a CLI run honors the SAME secrets.toml flags the app
+    serves with — so an operator can set e.g. ODI_MLB_ADDITIVE_RUNS once in
+    secrets.toml instead of exporting it before every command. setdefault =>
+    an explicit shell env var still overrides per-run (e.g. for an A/B toggle).
+    Best-effort; returns True when all four SQL keys ended up in the environment."""
     path = path or os.path.join(SCRIPT_DIR, ".streamlit", "secrets.toml")
     try:
         import tomllib
@@ -561,6 +566,11 @@ def promote_secrets_from_toml(path=None):
         for key in (*_SECRET_KEYS, "SQL_DRIVER"):   # SQL_DRIVER optional (pyodbc opt-in)
             value = data.get(key)
             if value:
+                os.environ.setdefault(key, str(value).strip())
+        # ODI_MLB_* gate/feature flags (mirror app.py's boot promotion). A TOML
+        # boolean true -> "True", which the gate helpers read as on (.lower()).
+        for key, value in data.items():
+            if key.startswith("ODI_MLB_") and value is not None:
                 os.environ.setdefault(key, str(value).strip())
     except (ImportError, OSError, TypeError, ValueError):
         pass

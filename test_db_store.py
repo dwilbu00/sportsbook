@@ -8,6 +8,7 @@ override AND the recalibration in-memory caches so SQL never leaks into the othe
 hermetic storage tests (test_wagers, test_recalibration_durability, ...).
 """
 
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -1185,6 +1186,53 @@ class RefitPerformedTests(_SqliteBackend, unittest.TestCase):
         rows = {r["player"]: r for r in db_store.read_rows("prediction_log")}
         self.assertFalse(rows["C"]["refit_performed"])   # unresolved untouched
         self.assertTrue(rows["D"]["refit_performed"])    # already-flagged kept
+
+
+class PromoteSecretsTests(unittest.TestCase):
+    """promote_secrets_from_toml also promotes ODI_MLB_* gate flags (so a CLI run
+    honors the same secrets.toml flags the app serves with), setdefault-guarded."""
+
+    def setUp(self):
+        self._keys = ("ODI_MLB_ADDITIVE_RUNS", "ODI_MLB_ADDITIVE_TOTALS",
+                      "ODI_MLB_WAREHOUSE_OFFENSE", "ODI_MLB_DISABLED_FLAG")
+        self._saved = {k: os.environ.pop(k, None) for k in self._keys}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _write(self, body):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "secrets.toml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def test_promotes_odi_flags_bool_and_string(self):
+        p = self._write('ODI_MLB_ADDITIVE_RUNS = true\n'
+                        'ODI_MLB_ADDITIVE_TOTALS = "1"\n'
+                        'ODI_MLB_DISABLED_FLAG = false\n')
+        db_store.promote_secrets_from_toml(path=p)
+        # TOML true -> "True" (gate reads .lower() == "true" = on); string "1" as-is.
+        self.assertEqual(os.environ["ODI_MLB_ADDITIVE_RUNS"], "True")
+        self.assertEqual(os.environ["ODI_MLB_ADDITIVE_TOTALS"], "1")
+        # false is promoted as "False" (gate reads off) — mirrors app.py.
+        self.assertEqual(os.environ["ODI_MLB_DISABLED_FLAG"], "False")
+
+    def test_shell_env_overrides_secrets(self):
+        os.environ["ODI_MLB_ADDITIVE_RUNS"] = "0"   # operator per-run override
+        p = self._write('ODI_MLB_ADDITIVE_RUNS = true\n')
+        db_store.promote_secrets_from_toml(path=p)
+        self.assertEqual(os.environ["ODI_MLB_ADDITIVE_RUNS"], "0")  # setdefault no-op
+
+    def test_non_odi_keys_not_promoted(self):
+        p = self._write('SOME_OTHER_KEY = "x"\nODI_MLB_WAREHOUSE_OFFENSE = "1"\n')
+        db_store.promote_secrets_from_toml(path=p)
+        self.assertEqual(os.environ["ODI_MLB_WAREHOUSE_OFFENSE"], "1")
+        self.assertIsNone(os.environ.get("SOME_OTHER_KEY"))
 
 
 if __name__ == "__main__":
