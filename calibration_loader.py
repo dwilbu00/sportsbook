@@ -510,6 +510,59 @@ def save_expected_runs_challenger_shares(sport_key, shares, meta=None):
         json.dump(blob, f, indent=2)
 
 
+# Neutral challenger ensemble prior used by stage_team_market_reset: NOT empty,
+# because the spreads expected-runs projection needs valid shares present to fire
+# (analysis._mlb_expected_runs_projection reads shares["home_minus_1_5"]/["margin"]
+# and returns None on KeyError). --fit-shares overwrites these, and the raw cover
+# components it captures are independent of the share value, so 0.5/0.5 is safe.
+_NEUTRAL_CHALLENGER_SHARE = {"home_minus_1_5": 0.5, "margin": 0.5}
+
+
+def stage_team_market_reset(sport_key):
+    """STAGE a candidate with the TEAM-MARKET calibration blocks reset to a clean
+    slate, so a fresh team-market recalibration leaves no residue from prior builds.
+
+    NON-DESTRUCTIVE: writes ONLY the candidate (set_candidate_mode), seeded from live;
+    the live file the app serves is UNTOUCHED. Revert with refit_calibration.py
+    --discard; review with --diff.
+
+    RESET (the blocks the fresh RUN regenerates):
+      - prob_shrink -> {}  (the fit repopulates every graded market; an un-endorsed
+        market then serves at 1.0 = no shrink, the intended clean slate)
+      - market_blend -> removed  (the fit repopulates; --fit-shares pins spreads)
+      - expected_runs_challenger.final_2025_validation.ensemble_challenger_share
+        -> the NEUTRAL prior (strips any stale sibling e.g. a leftover moneyline share;
+        --fit-shares overwrites home_minus_1_5/margin)
+      - team-market meta entries cleared
+    PRESERVED: props, starter_adjustment, lineup_adjustment, value_gate, and the
+    challenger enabled/live_markets/model blocks (the projection needs them to fire).
+    expected_runs_additive is left alone — --additive-save fully overwrites it, so
+    clearing it here would only add an ordering footgun. Returns the candidate path."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    set_candidate_mode(True)                 # write path -> candidate; seed from live
+    blob = _load_write_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    blob["prob_shrink"] = {}
+    blob.pop("market_blend", None)
+    chal = blob.get("expected_runs_challenger")
+    if isinstance(chal, dict):
+        fv = chal.get("final_2025_validation")
+        if not isinstance(fv, dict):
+            fv = {}
+        fv["ensemble_challenger_share"] = dict(_NEUTRAL_CHALLENGER_SHARE)
+        chal["final_2025_validation"] = fv
+        blob["expected_runs_challenger"] = chal
+    meta = blob.get("meta")
+    if isinstance(meta, dict):
+        for k in ("prob_shrink", "prob_shrink_holdout", "market_blend",
+                  "expected_runs_challenger_share"):
+            meta.pop(k, None)
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+    return _write_path(sport_key)
+
+
 _ADDITIVE_CFG_CACHE = {}   # sport_key -> ((st_mtime_ns, st_size), block)
 
 

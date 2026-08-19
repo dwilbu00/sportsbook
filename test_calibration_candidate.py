@@ -344,5 +344,99 @@ def load_method(sport_key, prop):
     return (cl.load_calibration(sport_key).get(prop) or {}).get("method")
 
 
+class TeamMarketResetTests(unittest.TestCase):
+    """stage_team_market_reset stages a clean team-market slate in the CANDIDATE
+    (live untouched), clears exactly the blocks the fresh RUN regenerates, keeps
+    valid challenger shares so the spreads projection can still fire, and preserves
+    props + the auxiliary live levers."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._orig = cl.CALIBRATION_DIR
+        cl.CALIBRATION_DIR = self._dir
+        cl.set_candidate_mode(False)
+
+    def tearDown(self):
+        cl.CALIBRATION_DIR = self._orig
+        cl.set_candidate_mode(False)
+
+    def _live_blob(self):
+        return {
+            "sport_key": SK,
+            "props": {"batter_hits": {"method": "E"}},
+            "prob_shrink": {"moneyline": 0.25, "spreads": 0.6, "totals": 0.7},
+            "market_blend": {"moneyline": {"w": 0.5}},
+            "starter_adjustment": {"enabled": True, "moneyline": 0.35},
+            "lineup_adjustment": {"enabled": True, "props": {}},
+            "value_gate": {"ev_floor": 0.05, "edge_floor": 0.02},
+            "expected_runs_additive": {"enabled": True, "model": {"coef": [1]}},
+            "expected_runs_challenger": {
+                "enabled": True,
+                "live_markets": {"spreads": True},
+                "final_2025_validation": {
+                    "model": {"offense_weight": 0.5, "pitching_weight": 0.5},
+                    "ensemble_challenger_share": {
+                        "moneyline": 0.75, "home_minus_1_5": 0.7, "margin": 0.9}}},
+            "meta": {"prob_shrink": {"x": 1}, "prob_shrink_holdout": {"y": 2},
+                     "current_season": 2026},
+        }
+
+    def _write_live(self):
+        with open(cl.calibration_path(SK), "w", encoding="utf-8") as f:
+            json.dump(self._live_blob(), f)
+
+    def test_reset_clears_team_market_and_preserves_rest(self):
+        self._write_live()
+        path = cl.stage_team_market_reset(SK)
+        self.assertEqual(path, cl.candidate_path(SK))       # candidate, not live
+        with open(cl.candidate_path(SK), encoding="utf-8") as f:
+            cand = json.load(f)
+        # cleared
+        self.assertEqual(cand["prob_shrink"], {})
+        self.assertNotIn("market_blend", cand)
+        share = cand["expected_runs_challenger"]["final_2025_validation"][
+            "ensemble_challenger_share"]
+        self.assertEqual(share, {"home_minus_1_5": 0.5, "margin": 0.5})  # neutral
+        self.assertNotIn("moneyline", share)                # stale sibling stripped
+        self.assertNotIn("prob_shrink", cand["meta"])
+        self.assertNotIn("prob_shrink_holdout", cand["meta"])
+        # preserved
+        self.assertEqual(cand["props"], {"batter_hits": {"method": "E"}})
+        self.assertEqual(cand["starter_adjustment"], {"enabled": True,
+                                                      "moneyline": 0.35})
+        self.assertEqual(cand["lineup_adjustment"], {"enabled": True, "props": {}})
+        self.assertEqual(cand["value_gate"], {"ev_floor": 0.05, "edge_floor": 0.02})
+        chal = cand["expected_runs_challenger"]
+        self.assertTrue(chal["enabled"])
+        self.assertEqual(chal["live_markets"], {"spreads": True})
+        self.assertEqual(chal["final_2025_validation"]["model"],
+                         {"offense_weight": 0.5, "pitching_weight": 0.5})
+
+    def test_reset_leaves_live_untouched(self):
+        self._write_live()
+        cl.stage_team_market_reset(SK)
+        cl.set_candidate_mode(False)
+        with open(cl.calibration_path(SK), encoding="utf-8") as f:
+            live = json.load(f)
+        self.assertEqual(live["prob_shrink"],
+                         {"moneyline": 0.25, "spreads": 0.6, "totals": 0.7})
+        self.assertEqual(live["expected_runs_challenger"]["final_2025_validation"][
+            "ensemble_challenger_share"]["home_minus_1_5"], 0.7)
+
+    def test_reset_shares_stay_valid_for_projection(self):
+        # The neutral shares MUST be present + in [0,1] so the spreads expected-runs
+        # projection can fire (else --fit-shares captures nothing).
+        self._write_live()
+        cl.stage_team_market_reset(SK)
+        cl.set_serving_candidate(True)
+        try:
+            chal = cl.load_expected_runs_challenger(SK)
+            share = chal["final_2025_validation"]["ensemble_challenger_share"]
+            self.assertTrue(0.0 <= share["home_minus_1_5"] <= 1.0)
+            self.assertTrue(0.0 <= share["margin"] <= 1.0)
+        finally:
+            cl.set_serving_candidate(False)
+
+
 if __name__ == "__main__":
     unittest.main()
