@@ -4659,11 +4659,13 @@ def sizing_sweep(sport_key, espn_sport, espn_league, season_year=None,
     _row("eighth-Kelly", "kelly", frac=0.125)
     _row("quarter-Kelly", "kelly", frac=0.25)
     _row("half-Kelly", "kelly", frac=0.5)
-    _row("unc-Kelly z=0.5", "ukelly", z=0.5, frac=0.5)
-    _row("unc-Kelly z=1.0", "ukelly", z=1.0, frac=0.5)
+    for z in (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0):
+        _row(f"unc-Kelly z={z}", "ukelly", z=z, frac=0.5)
     print("\n  (Kelly fractions on the SAME bets show the growth/drawdown trade; "
-          "unc-Kelly (half) sizes off the win-prob interval low bound + abstains")
-    print("   when it spans break-even. Watch growth vs maxDD. Diagnostic only.)")
+          "unc-Kelly (half base) sizes off the win-prob interval low bound + "
+          "abstains when it spans")
+    print("   break-even. z=0.0 == half-Kelly (sanity); rising z = more "
+          "conservative / more abstains. Watch growth vs maxDD. Diagnostic only.)")
 
 
 def _warn_small_limit(limit):
