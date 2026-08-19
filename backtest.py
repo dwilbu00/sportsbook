@@ -4602,9 +4602,13 @@ def _bankroll_sim(bets, shrink=0.25, edge_gate=0.05, method="kelly",
         if stake <= 0.0:
             continue                          # abstained (uncertainty interval)
         dec = american_to_decimal(price)
+        br_before = bankroll
         profit = stake * (dec - 1.0) if won else -stake
         bankroll += profit
-        rets.append(profit / stake if stake else 0.0)
+        # Return on BANKROLL (not on stake) so Sharpe reflects the SIZING risk:
+        # flat's tiny constant fractions -> low vol; Kelly's bankroll-proportional
+        # stakes -> higher vol. (return-on-stake is stake-invariant = useless here.)
+        rets.append(profit / br_before if br_before > 0 else 0.0)
         if bankroll > peak:
             peak = bankroll
         dd = (peak - bankroll) / peak if peak > 0 else 0.0
