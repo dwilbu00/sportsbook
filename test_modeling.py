@@ -1,5 +1,6 @@
 """Focused regression tests for sportsbook model correctness boundaries."""
 
+import json
 import math
 import os
 import tempfile
@@ -2537,6 +2538,111 @@ class ServeModeGradingTests(unittest.TestCase):
             backtest._run_odds_backtest_impl(
                 "baseball_mlb", "baseball", "mlb", 10, 20, {},
                 serve_mode=True, engine="convolution")
+
+
+class LiveBlendWriteTests(unittest.TestCase):
+    """Gap C: fit + persist the model<->market blend on the LIVE model (not the
+    retired convolution engine), ON TOP of the fitted prob_shrink — so one raw
+    --write-calibration pass produces both corrections in serve order (shrink
+    then blend)."""
+
+    def _bucket(self, obs):
+        return {"blend": list(obs), "n": len(obs)}
+
+    def _results(self, ml_obs):
+        return {"live": {"moneyline": self._bucket(ml_obs),
+                         "spreads": self._bucket([]),
+                         "totals": self._bucket([])}}
+
+    def test_shrink_map_transforms_obs_before_fit(self):
+        import backtest
+        raw = [(0.90, 0.55, 1), (0.90, 0.55, 0), (0.10, 0.45, 0)]
+        results = self._results(raw)
+        captured = []
+
+        def fake_bbw(obs, step=0.05):
+            if not obs:
+                return None
+            captured.append(list(obs))
+            return (0.5, 0.10, 0.20, 0.15)
+
+        with patch("backtest._best_blend_weight", fake_bbw), \
+             patch("backtest.save_market_blend"):
+            backtest._write_blend_calibration(
+                "baseball_mlb", results, shrink_map={"moneyline": 0.5}, min_n=0)
+        self.assertEqual(len(captured), 1)  # only the non-empty market
+        expected = [(backtest._shrink_prob(pm, 0.5), mk, o) for pm, mk, o in raw]
+        for got, exp in zip(captured[0], expected):
+            self.assertAlmostEqual(got[0], exp[0])
+            self.assertAlmostEqual(got[1], exp[1])
+            self.assertEqual(got[2], exp[2])
+
+    def test_no_shrink_map_fits_raw(self):
+        import backtest
+        raw = [(0.90, 0.55, 1), (0.10, 0.45, 0)]
+        results = self._results(raw)
+        captured = []
+
+        def fake_bbw(obs, step=0.05):
+            if not obs:
+                return None
+            captured.append(list(obs))
+            return (0.5, 0.10, 0.20, 0.15)
+
+        with patch("backtest._best_blend_weight", fake_bbw), \
+             patch("backtest.save_market_blend"):
+            backtest._write_blend_calibration("baseball_mlb", results, min_n=0)
+        self.assertEqual([tuple(x) for x in captured[0]], raw)  # untransformed
+
+    def test_min_n_withholds_thin_sample(self):
+        import backtest
+        results = self._results([(0.90, 0.55, 1)] * 5)
+        with patch("backtest._best_blend_weight",
+                   lambda obs, step=0.05: (0.2, 0.10, 0.20, 0.15)), \
+             patch("backtest.save_market_blend") as save:
+            backtest._write_blend_calibration("baseball_mlb", results, min_n=1000)
+        self.assertFalse(save.called)  # thin -> nothing persisted
+
+    def test_min_n_persists_when_sample_sufficient(self):
+        import backtest
+        results = self._results([(0.90, 0.55, 1)] * 5)
+        with patch("backtest._best_blend_weight",
+                   lambda obs, step=0.05: (0.2, 0.10, 0.20, 0.15)), \
+             patch("backtest.save_market_blend") as save:
+            backtest._write_blend_calibration("baseball_mlb", results, min_n=1)
+        self.assertTrue(save.called)
+        blend = save.call_args[0][1]
+        self.assertEqual(blend["moneyline"]["w"], 0.2)
+        self.assertTrue(blend["moneyline"]["on_shrunk"] is False)
+
+    def test_chained_shrink_then_blend_writes_both_blocks(self):
+        import backtest
+        import calibration_loader as cl
+        orig_dir = cl.CALIBRATION_DIR
+        tmp = tempfile.mkdtemp()
+        cl.CALIBRATION_DIR = tmp
+        try:
+            # Model is a constant 0.85 (no discrimination); the market perfectly
+            # separates two subpopulations. Shrink calibrates the level; the blend
+            # then captures the discrimination the scalar shrink can't.
+            obs = ([(0.85, 0.80, 1)] * 120 + [(0.85, 0.80, 0)] * 30
+                   + [(0.85, 0.40, 1)] * 60 + [(0.85, 0.40, 0)] * 90)
+            results = self._results(obs)
+            fitted = backtest._write_shrink_calibration(
+                "baseball_mlb", results, min_shrink_n=1)
+            self.assertIn("moneyline", fitted)
+            self.assertLess(fitted["moneyline"], 1.0)
+            backtest._write_blend_calibration(
+                "baseball_mlb", results, shrink_map=fitted, min_n=1)
+            with open(cl.calibration_path("baseball_mlb"), encoding="utf-8") as f:
+                blob = json.load(f)
+            self.assertIn("moneyline", blob["prob_shrink"])
+            self.assertIn("moneyline", blob["market_blend"])
+            self.assertLess(blob["market_blend"]["moneyline"]["w"], 1.0)
+            self.assertTrue(blob["market_blend"]["moneyline"]["on_shrunk"])
+            self.assertTrue(blob["meta"]["market_blend"]["on_shrunk_probs"])
+        finally:
+            cl.CALIBRATION_DIR = orig_dir
 
 
 if __name__ == "__main__":

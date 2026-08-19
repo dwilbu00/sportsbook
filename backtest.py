@@ -982,7 +982,7 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None,
     variant = "live" if "live" in results else next(iter(results), None)
     if not variant:
         print("  [write-calibration] No variant to write.")
-        return
+        return {}
     extra_obs = extra_obs or {}
     shrink = {}
     holdout = {}
@@ -1017,7 +1017,7 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None,
               + ", ".join(f"{m} s={s} n={n}" for m, s, n in withheld))
     if not shrink and not holdout:
         print("  [write-calibration] No market graded; nothing written.")
-        return
+        return {}
     save_prob_shrink(sport_key, shrink, holdout=holdout, meta={
         "source": "odds backtest --engine live",
         "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1025,6 +1025,10 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None,
     print(f"\n  [write-calibration] Wrote prob_shrink to "
           f"calibration/{active_write_label(sport_key)}: shrink={shrink}, "
           f"holdout={holdout}")
+    # Return the persisted per-market factors so a chained blend fit (--fit-blend)
+    # can pull the model prob through the SAME shrink before fitting the blend
+    # weight — matching the serve order (_apply_shrink then blend).
+    return shrink
 
 
 def _inflate_samples(samples, weights, k):
@@ -1220,7 +1224,7 @@ def _run_odds_backtest_impl(
         engine="live", prob_shrink=1.0, source="auto",
         supplement_log=True, min_shrink_n=MIN_SHRINK_N,
         collect_obs=None, collect_dated=None, collect_lineup=None,
-        collect_components=None, serve_mode=False):
+        collect_components=None, serve_mode=False, fit_blend=False):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1551,8 +1555,16 @@ def _run_odds_backtest_impl(
             else:
                 extra_obs = ({m: supplement[m]["obs"] for m in MARKETS}
                              if supplement else None)
-                _write_shrink_calibration(sport_key, results, extra_obs=extra_obs,
-                                          min_shrink_n=min_shrink_n)
+                fitted_shrink = _write_shrink_calibration(
+                    sport_key, results, extra_obs=extra_obs,
+                    min_shrink_n=min_shrink_n)
+                # --fit-blend: also fit + persist the model⇄market blend on the LIVE
+                # model, ON TOP of the shrink just fitted (serve order = shrink then
+                # blend). One raw pass yields both corrections, correctly sequenced.
+                if fit_blend:
+                    _write_blend_calibration(
+                        sport_key, results, shrink_map=(fitted_shrink or {}),
+                        min_n=min_shrink_n)
         else:
             _write_blend_calibration(sport_key, results)
 
@@ -1658,9 +1670,19 @@ def _print_odds_results(results):
             f"Model calibration by confidence  (variant '{variant}')", named)
 
 
-def _write_blend_calibration(sport_key, results):
-    """Write the best blend weight per market (from the chosen variant) to
-    calibration/<sport>.json so the live analyzers consume it."""
+def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0):
+    """Write the best model⇄market blend weight per market (from the chosen
+    variant) to calibration/<sport>.json so the live analyzers consume it.
+
+    ``shrink_map`` (optional, live path): {market: shrink_factor}. When supplied,
+    the model prob in each blend obs is first pulled through that shrink before the
+    blend weight is fit — matching the serve order (_apply_shrink THEN blend), so
+    the fitted w is optimal ON TOP OF the shrink that's also in the file. Markets
+    absent from the map are treated as shrink=1.0 (no shrink). When None, the blend
+    is fit on the raw model prob (the convolution-engine path, unchanged).
+
+    ``min_n`` guards each weight: below this graded-obs count the weight is withheld
+    so a thin sample can't clobber an established blend (0 = no guard)."""
     from datetime import datetime, timezone
     # Prefer the production-like 'all' variant; else the first available.
     variant = "all" if "all" in results else next(iter(results), None)
@@ -1668,28 +1690,44 @@ def _write_blend_calibration(sport_key, results):
         print("  [write-calibration] No variants to write.")
         return
     blend = {}
+    withheld = []
     for market in MARKETS:
-        res = _best_blend_weight(results[variant][market]["blend"])
+        obs = results[variant][market]["blend"]
+        if shrink_map is not None:
+            s = shrink_map.get(market, 1.0)
+            obs = [(_shrink_prob(pm, s), mk, o) for pm, mk, o in obs]
+        res = _best_blend_weight(obs)
         if not res:
             continue
         best_w, best_brier, model_brier, market_brier = res
-        # Only persist a weight when blending actually helps over pure model.
-        if best_brier < model_brier - 1e-9:
-            blend[market] = {
-                "w": best_w,
-                "n": results[variant][market]["n"],
-                "blend_brier": round(best_brier, 5),
-                "model_brier": round(model_brier, 5),
-                "market_brier": round(market_brier, 5),
-            }
+        # Only persist a weight when blending actually helps over the (shrunk)
+        # model AND the sample is big enough to trust.
+        if best_brier < model_brier - 1e-9 and best_w < 1.0:
+            if len(obs) >= min_n:
+                blend[market] = {
+                    "w": best_w,
+                    "n": results[variant][market]["n"],
+                    "blend_brier": round(best_brier, 5),
+                    "model_brier": round(model_brier, 5),
+                    "market_brier": round(market_brier, 5),
+                    "on_shrunk": shrink_map is not None,
+                }
+            else:
+                withheld.append((market, best_w, len(obs)))
+    if withheld:
+        print(f"  [write-calibration] blend withheld (thin sample, need n>={min_n}; "
+              "existing weight kept): "
+              + ", ".join(f"{m} w={w} n={n}" for m, w, n in withheld))
     if not blend:
         print("  [write-calibration] No market beat the pure model; nothing written.")
         return
     save_market_blend(sport_key, blend, meta={
         "variant": variant,
+        "on_shrunk_probs": shrink_map is not None,
         "fit_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
-    print(f"\n  [write-calibration] Wrote blend weights (variant '{variant}') "
+    print(f"\n  [write-calibration] Wrote blend weights (variant '{variant}'"
+          f"{', on shrunk probs' if shrink_map is not None else ''}) "
           f"to calibration/{active_write_label(sport_key)}:")
     for market, cfg in blend.items():
         print(f"    {market:<10} w={cfg['w']:.2f}  (n={cfg['n']}, "
@@ -5107,6 +5145,13 @@ def main():
                         "0.5 = halve the edge). Fixes overconfidence; sweep and "
                         "watch the calibration table to find the value that "
                         "flattens it.")
+    p.add_argument("--fit-blend", action="store_true",
+                   help="(odds mode, live engine, with --write-calibration) After "
+                        "fitting prob_shrink on the raw model prob, ALSO fit + persist "
+                        "the model<->market blend weight per market — fit on the "
+                        "shrunk prob (serve order: shrink then blend), so one raw pass "
+                        "produces both corrections. Without this, only prob_shrink is "
+                        "written (current default).")
     p.add_argument("--serve-mode", action="store_true",
                    help="(odds mode, live engine) Grade the SERVED probabilities — "
                         "per-market prob_shrink + model<->market blend applied INSIDE "
@@ -5302,7 +5347,7 @@ def main():
                               engine=args.engine, prob_shrink=args.prob_shrink,
                               source=args.source, supplement_log=args.supplement_log,
                               min_shrink_n=args.min_shrink_n,
-                              serve_mode=args.serve_mode)
+                              serve_mode=args.serve_mode, fit_blend=args.fit_blend)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
