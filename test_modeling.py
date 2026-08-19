@@ -2888,5 +2888,60 @@ class BankrollSimTests(unittest.TestCase):
         self.assertGreater(kelly["growth_pct"], flat["growth_pct"])  # 5%/leg vs 1u
 
 
+class PortfolioSimTests(unittest.TestCase):
+    """Batch B1 top-N/day portfolio: per-day best-N-by-EV selection across eligible
+    markets, market policy (totals off, spreads high-conviction), per-day (not global)
+    cap. Rows: (date, home_side_prob, fair, price_home, price_away, home_won, n_eff)."""
+
+    ML = {"moneyline": {"enabled": True, "shrink": 0.25, "edge_gate": 0.05},
+          "spreads": {"enabled": False}, "totals": {"enabled": False}}
+    BOTH = {"moneyline": {"enabled": True, "shrink": 0.25, "edge_gate": 0.05},
+            "spreads": {"enabled": True, "shrink": 1.0, "edge_gate": 0.10},
+            "totals": {"enabled": False}}
+
+    # ML rows (shrink 0.25): hp 0.90/0.80/0.70 -> shrunk 0.60/0.575/0.55 @ +100 ->
+    # EV 0.20/0.15/0.10; A,B win, C loses.
+    A = ("2025-04-01", 0.90, 0.50, 100, -120, 1, 100)
+    B = ("2025-04-01", 0.80, 0.50, 100, -120, 1, 100)
+    C = ("2025-04-01", 0.70, 0.50, 100, -120, 0, 100)
+
+    def test_top_n_caps_per_day(self):
+        import backtest
+        bets = {"moneyline": [self.A, self.B, self.C], "spreads": [], "totals": []}
+        self.assertEqual(backtest._portfolio_sim(bets, None, self.ML)["n"], 3)
+        r2 = backtest._portfolio_sim(bets, 2, self.ML)
+        self.assertEqual(r2["n"], 2)              # top-2 by EV = A,B
+        self.assertEqual(r2["win"], 100.0)        # both won (C, the loser, dropped)
+
+    def test_ranks_by_ev_across_markets(self):
+        import backtest
+        # Spreads bet: served cover 0.62 @ +100 -> edge 0.12, EV 0.24 (tops A's 0.20),
+        # but it LOSES (home_covers=0). N=1 must pick it (highest EV) -> win 0%.
+        s_lose = ("2025-04-01", 0.62, 0.50, 100, -120, 0, 100)
+        bets = {"moneyline": [self.A, self.B, self.C], "spreads": [s_lose],
+                "totals": []}
+        r = backtest._portfolio_sim(bets, 1, self.BOTH)
+        self.assertEqual(r["n"], 1)
+        self.assertEqual(r["win"], 0.0)           # confirms the spread (top EV) chosen
+
+    def test_totals_excluded_and_spread_gate(self):
+        import backtest
+        weak_spread = ("2025-04-01", 0.54, 0.50, 100, -120, 1, 100)  # edge .04<.10
+        totals_bet = ("2025-04-01", 0.70, 0.50, 100, -120, 1, 100)   # totals off
+        bets = {"moneyline": [self.A], "spreads": [weak_spread],
+                "totals": [totals_bet]}
+        r = backtest._portfolio_sim(bets, None, self.BOTH)
+        self.assertEqual(r["n"], 1)               # only the ML bet A qualifies
+
+    def test_cap_is_per_day_not_global(self):
+        import backtest
+        day2 = [(("2025-04-02",) + row[1:]) for row in (self.A, self.B, self.C)]
+        bets = {"moneyline": [self.A, self.B, self.C] + day2, "spreads": [],
+                "totals": []}
+        r = backtest._portfolio_sim(bets, 2, self.ML)
+        self.assertEqual(r["n"], 4)               # 2/day x 2 days, not 2 global
+        self.assertAlmostEqual(r["avg_per_day"], 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1570,6 +1570,12 @@ def _run_odds_backtest_impl(
                     if collect_dated is not None:
                         collect_dated["spreads"].append(
                             (date_et, model_cover, fair_cover, home_covers))
+                    if collect_bets is not None:
+                        # Portfolio row (home-cover side = the served composite cover;
+                        # the sim gates edge>=10% for spreads, no extra shrink).
+                        collect_bets["spreads"].append((
+                            date_et, model_cover, fair_cover, price_h, price_a,
+                            home_covers, min(len(home_prior), len(away_prior))))
                     # RAW spread ensemble components (recency cover pre-shrink +
                     # additive/expected cover + the two point margins + de-vigged
                     # market cover + outcome) so the challenger share, spreads shrink
@@ -1596,6 +1602,12 @@ def _run_odds_backtest_impl(
                     if collect_dated is not None:
                         collect_dated["totals"].append(
                             (date_et, model_over, fair_over, over_hit))
+                    if collect_bets is not None:
+                        # Portfolio row (over side = served over-rate; totals abstained
+                        # by default policy, collected so the option can be toggled).
+                        collect_bets["totals"].append((
+                            date_et, model_over, fair_over, price_o, price_u,
+                            over_hit, min(len(home_prior), len(away_prior))))
             continue
 
         for variant_name, params in variants.items():
@@ -4721,6 +4733,121 @@ def sizing_sweep(sport_key, espn_sport, espn_league, season_year=None,
           "conservative / more abstains. Watch growth vs maxDD. Diagnostic only.)")
 
 
+# Real-world betting policy per market for the top-N portfolio test: which markets
+# are eligible, the shrink applied to the collected prob (moneyline is RAW -> shrink
+# 0.25; spreads/totals are the SERVED composite -> 1.0 = none), and the edge gate.
+# Moneyline = the replicated edge; spreads = high-conviction only (edge>=10%); totals
+# abstained (loses at volume). See the Batch-B triage.
+_PORTFOLIO_POLICY = {
+    "moneyline": {"enabled": True,  "shrink": 0.25, "edge_gate": 0.05},
+    "spreads":   {"enabled": True,  "shrink": 1.0,  "edge_gate": 0.10},
+    "totals":    {"enabled": False, "shrink": 1.0,  "edge_gate": 0.05},
+}
+
+
+def _portfolio_sim(bets_by_market, top_n, policy=None, b0=100.0):
+    """Real-world portfolio sim: each day, keep only the BEST ``top_n`` value bets
+    (ranked by EV) across the ELIGIBLE markets, flat-1u, chronological.
+
+    bets_by_market[market] = [(date, home_side_prob, fair, price_home, price_away,
+    home_won, n_eff)] (home side = home / home-cover / over). Per market: apply the
+    policy shrink, pick the value side (shrunk prob vs fair), gate on edge AND +EV.
+    top_n=None = no cap (all value bets — the current all-in ROI). Returns
+    {n, roi, win, growth_pct, max_dd_pct, avg_per_day}."""
+    from collections import defaultdict
+    policy = policy or _PORTFOLIO_POLICY
+    per_day = defaultdict(list)     # date -> [(ev, price, won)]
+    for market, rows in (bets_by_market or {}).items():
+        pol = policy.get(market)
+        if not pol or not pol.get("enabled"):
+            continue
+        s, gate = pol["shrink"], pol["edge_gate"]
+        for row in rows:
+            try:
+                date, hp, fair, ph, pa, hw, _neff = row
+            except (ValueError, TypeError):
+                continue
+            if hp is None or fair is None:
+                continue
+            p = _shrink_prob(hp, s)
+            if p >= fair:
+                sp, price, edge, won = p, ph, p - fair, (hw == 1)
+            else:
+                sp, price, edge, won = 1.0 - p, pa, fair - p, (hw == 0)
+            if price is None or edge < gate:
+                continue
+            ev = _expected_roi(sp, price)
+            if ev is None or ev <= 0.0:
+                continue
+            per_day[date].append((ev, price, won))
+    bankroll = peak = float(b0)
+    unit = float(b0) * 0.01
+    max_dd = pnl_u = 0.0
+    n = won_n = 0
+    for date in sorted(per_day):
+        day = sorted(per_day[date], key=lambda x: x[0], reverse=True)  # best EV first
+        if top_n is not None:
+            day = day[:top_n]
+        for ev, price, won in day:
+            dec = american_to_decimal(price)
+            profit = unit * (dec - 1.0) if won else -unit
+            bankroll += profit
+            pnl_u += (dec - 1.0) if won else -1.0
+            n += 1
+            won_n += 1 if won else 0
+            if bankroll > peak:
+                peak = bankroll
+            dd = (peak - bankroll) / peak if peak > 0 else 0.0
+            if dd > max_dd:
+                max_dd = dd
+    return {"n": n, "roi": (pnl_u / n * 100.0) if n else None,
+            "win": (won_n / n * 100.0) if n else None,
+            "growth_pct": (bankroll / float(b0) - 1.0) * 100.0,
+            "max_dd_pct": max_dd * 100.0,
+            "avg_per_day": (n / len(per_day)) if per_day else 0.0}
+
+
+def top_n_sweep(sport_key, espn_sport, espn_league, season_year=None,
+                limit=100000, store_label="", source="auto"):
+    """TOP-N/DAY portfolio test (Batch B1): the REAL-WORLD ROI — you only place the
+    best ~N wagers/day, not every value bet. Each day, rank the eligible value bets
+    (moneyline shrink 0.25 edge>=5%; spreads high-conviction edge>=10%; totals off)
+    by EV and keep the top N, flat-1u, chronological. Swept N=5/10/15/all, for the
+    full policy AND moneyline-only, so you can see whether tightening to your real
+    bet count helps and whether high-conviction spreads add to the portfolio.
+    Diagnostic only; nothing written."""
+    _warn_small_limit(limit)
+    bets = {m: [] for m in MARKETS}
+    run_odds_backtest(sport_key, espn_sport, espn_league, limit=limit, window=10,
+                      variants={"live": VARIANT_PRESETS.get("all", {})},
+                      season_year=season_year, threshold_pct=5.0,
+                      write_calibration=False, store_label=store_label,
+                      engine="live", prob_shrink=1.0, source=source,
+                      supplement_log=False, collect_bets=bets)
+    ml_only = {"moneyline": dict(_PORTFOLIO_POLICY["moneyline"]),
+               "spreads": {"enabled": False}, "totals": {"enabled": False}}
+    print("\n=== TOP-N/DAY portfolio (Batch B1) — best N value bets/day, EV-ranked, "
+          "flat-1u ===")
+    print("  ML shrink 0.25 edge>=5% + SPREADS edge>=10% (high-conviction); totals "
+          "off. b0=100u.")
+    for label, pol in (("ML + hi-conv spreads", _PORTFOLIO_POLICY),
+                       ("moneyline only", ml_only)):
+        print(f"\n  [{label}]")
+        print("    {:>5}{:>7}{:>9}{:>8}{:>10}{:>9}{:>9}".format(
+            "topN", "bets", "/day", "ROI%", "growth%", "maxDD%", "win%"))
+        for N in (5, 10, 15, None):
+            r = _portfolio_sim(bets, N, pol)
+            roi = f"{r['roi']:+.1f}" if r["roi"] is not None else "-"
+            win = f"{r['win']:.1f}" if r["win"] is not None else "-"
+            print("    {:>5}{:>7}{:>9.1f}{:>8}{:>+10.1f}{:>9.1f}{:>9}".format(
+                "all" if N is None else N, r["n"], r["avg_per_day"], roi,
+                r["growth_pct"], r["max_dd_pct"], win))
+    print("\n  ('/day' = avg bets placed per day; if it's below the cap, N doesn't "
+          "bind. Compare N=all (every value bet) vs N=10 (what you'd really place):")
+    print("   if ROI RISES as N tightens, your best bets are your good bets. "
+          "Diagnostic only — nothing written.)")
+
+
 def _warn_small_limit(limit):
     """These ROI sweeps need the full window; the global --limit default (200) caps
     to the last 200 games → ~100 bets/cell → noisy 'best cell' that jumps corners.
@@ -5393,6 +5520,13 @@ def main():
                         "probability-shrink x recommendation-gate and report "
                         "realized flat-1u ROI per combo (finds whether the live "
                         "shrink+edge gate over-suppress moneyline). No write.")
+    p.add_argument("--topn-sweep", action="store_true",
+                   help="(odds mode, Batch B1) TOP-N/DAY portfolio test: the real-"
+                        "world ROI — each day keep only the best N value bets "
+                        "(EV-ranked, moneyline edge>=5% + spreads high-conviction "
+                        "edge>=10%, totals off), flat-1u, swept N=5/10/15/all for the "
+                        "full policy AND moneyline-only. Shows if tightening to your "
+                        "real ~10 bets/day helps. No write.")
     p.add_argument("--sizing-sweep", action="store_true",
                    help="(odds mode, Batch B1) MONEYLINE bankroll sim: flat-1u vs "
                         "fractional-Kelly vs uncertainty-Kelly (size off the win-prob "
@@ -5663,6 +5797,10 @@ def main():
             sizing_sweep(sport_key, espn_sport, espn_league,
                          season_year=odds_seasons, limit=args.limit,
                          store_label=args.store_label, source=args.source)
+        elif args.topn_sweep:
+            top_n_sweep(sport_key, espn_sport, espn_league,
+                        season_year=odds_seasons, limit=args.limit,
+                        store_label=args.store_label, source=args.source)
         elif args.unleash_sweep:
             unleash_sweep(sport_key, espn_sport, espn_league,
                           season_year=odds_seasons, limit=args.limit,
