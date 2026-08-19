@@ -1485,18 +1485,14 @@ def _run_odds_backtest_impl(
                     collect_dated["moneyline"].append(
                         (date_et, mwin, fair_home, home_won))
                 if collect_bets is not None:
-                    # Per-bet row for the chronological bankroll sim, folded to the
-                    # model's FAVORED side (RAW pre-shrink prob so the sim can apply
-                    # its own shrink): (date, our_prob_raw, our_fair, our_price,
-                    # our_won, n_eff). n_eff = min prior-games behind the estimate,
-                    # the effective sample for the uncertainty interval.
-                    _home = mwin > 0.5
+                    # Per-game row for the chronological bankroll sim: RAW home prob
+                    # + BOTH prices + fair, so the sim selects the VALUE side (shrunk
+                    # prob vs fair) exactly like _team_gate_tally — the bet may be the
+                    # dog or a faded favorite, NOT necessarily the favored side.
+                    # (date, raw_home_p, fair_home, price_home, price_away, home_won,
+                    # n_eff=min prior-games = the interval's effective sample).
                     collect_bets["moneyline"].append((
-                        date_et,
-                        mwin if _home else 1.0 - mwin,
-                        fair_home if _home else 1.0 - fair_home,
-                        price_home if _home else price_away,
-                        home_won if _home else 1 - home_won,
+                        date_et, mwin, fair_home, price_home, price_away, home_won,
                         min(len(home_prior), len(away_prior))))
                 # #3 v2 (DIAGNOSTIC): bottom-up lineup-runs P(home win), graded
                 # head-to-head vs the recency model (mwin) + market (fair_home).
@@ -4566,37 +4562,43 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
 
 def _bankroll_sim(bets, shrink=0.25, edge_gate=0.05, method="kelly",
                   z=1.0, frac=0.5, cap=0.05, b0=100.0):
-    """Chronological bankroll simulation over per-bet rows
-    (date, prob_raw, fair, price, won, n_eff) — the model's favored side.
+    """Chronological bankroll simulation over per-game rows
+    (date, raw_home_p, fair_home, price_home, price_away, home_won, n_eff).
 
-    Applies ``shrink`` to the raw prob, then the value gate (edge = shrunk-fair >=
-    ``edge_gate`` AND +EV at the price), then stakes each PLACED bet:
+    Selects the VALUE side exactly like _team_gate_tally: shrink the home prob, back
+    home when shrunk>=fair_home else back away (the value side — may be the dog),
+    then the value gate (edge >= ``edge_gate`` AND +EV at the price), then stakes:
       'flat'   -> constant 1u (1% of b0), non-compounding (the incumbent baseline)
       'kelly'  -> fractional-Kelly of the CURRENT bankroll (compounding)
-      'ukelly' -> uncertainty-Kelly: size off prob_low = prob_interval_low(p,n_eff,z)
-    Returns {n_bets, growth_pct, max_dd_pct, sharpe}. Bankroll/drawdown are tracked
-    on the running equity; Sharpe is mean/stdev of per-bet return-on-stake."""
+      'ukelly' -> uncertainty-Kelly: size off prob_low = prob_interval_low(sp,n_eff,z)
+    Returns {n_bets, growth_pct, max_dd_pct, sharpe}. Drawdown is tracked on the
+    running equity; Sharpe is mean/stdev of per-bet return-on-stake."""
     import statistics
-    rows = sorted((b for b in bets if b and b[3] is not None
-                   and b[1] is not None and b[2] is not None), key=lambda r: r[0])
+    rows = sorted((b for b in bets if b and b[1] is not None and b[2] is not None),
+                  key=lambda r: r[0])
     bankroll = peak = float(b0)
     flat_unit = float(b0) * 0.01
     max_dd = 0.0
     rets = []
-    for _date, praw, fair, price, won, n_eff in rows:
-        p = _shrink_prob(praw, shrink)
-        if (p - fair) < edge_gate:
+    for _date, raw_home, fair_home, price_home, price_away, home_won, n_eff in rows:
+        p = _shrink_prob(raw_home, shrink)
+        if p >= fair_home:
+            sp, price, edge, won = p, price_home, p - fair_home, (home_won == 1)
+        else:
+            sp, price, edge, won = (1.0 - p, price_away, fair_home - p,
+                                    (home_won == 0))
+        if price is None or edge < edge_gate:
             continue
-        er = _expected_roi(p, price)
+        er = _expected_roi(sp, price)
         if er is None or er <= 0.0:
             continue                          # -EV at the price -> not a value bet
         if method == "flat":
             stake = flat_unit
         elif method == "kelly":
-            stake = kelly_stake(p, price, bankroll, frac, cap)
+            stake = kelly_stake(sp, price, bankroll, frac, cap)
         else:  # ukelly
             stake = kelly_stake_uncertain(
-                p, prob_interval_low(p, n_eff, z), price, bankroll, frac, cap)
+                sp, prob_interval_low(sp, n_eff, z), price, bankroll, frac, cap)
         if stake <= 0.0:
             continue                          # abstained (uncertainty interval)
         dec = american_to_decimal(price)

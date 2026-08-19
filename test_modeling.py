@@ -2830,36 +2830,47 @@ class SharesFitterTests(unittest.TestCase):
 
 
 class BankrollSimTests(unittest.TestCase):
-    """Batch B1: the chronological bankroll sim (_bankroll_sim) — equity path,
-    the value gate (edge + EV), and uncertainty-Kelly abstain. Rows are
-    (date, prob_raw, fair, price, won, n_eff), model's favored side. shrink=0 in
-    these tests so p == prob_raw (clean hand-math)."""
+    """Batch B1: the chronological bankroll sim (_bankroll_sim) — value-side
+    selection (matching _team_gate_tally), the value gate (edge + EV), and
+    uncertainty-Kelly abstain. Rows are (date, raw_home_p, fair_home, price_home,
+    price_away, home_won, n_eff). shrink=1.0 here so p == raw_home_p (s=1.0 = NO
+    shrink; s=0 would collapse to 0.5)."""
 
     def test_flat_growth_and_drawdown(self):
         import backtest
-        # b0=100, flat=1u. bet1 loses (-> 99, dd 1%), bet2 wins at +100 (-> 100).
-        bets = [("2025-04-01", 0.60, 0.50, 100, 0, 100),
-                ("2025-04-02", 0.60, 0.50, 100, 1, 100)]
+        # Back HOME (p 0.60 >= fair 0.50) @ +100. bet1 home loses (-> 99, dd 1%),
+        # bet2 home wins (-> 100).
+        bets = [("2025-04-01", 0.60, 0.50, 100, -120, 0, 100),
+                ("2025-04-02", 0.60, 0.50, 100, -120, 1, 100)]
         r = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="flat")
         self.assertEqual(r["n_bets"], 2)
         self.assertAlmostEqual(r["growth_pct"], 0.0, places=6)   # -1 then +1
         self.assertAlmostEqual(r["max_dd_pct"], 1.0, places=6)   # trough 99 vs peak 100
 
+    def test_value_side_is_the_away_dog_when_model_fades_home(self):
+        import backtest
+        # Model fades home (raw_home 0.40 < fair_home 0.50) -> back AWAY dog @ +130;
+        # away wins (home_won 0) -> our away bet wins. Confirms value-side selection.
+        bets = [("2025-04-01", 0.40, 0.50, -120, 130, 0, 100)]
+        r = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="flat")
+        self.assertEqual(r["n_bets"], 1)
+        self.assertGreater(r["growth_pct"], 0.0)   # +130 dog hit
+
     def test_gate_excludes_thin_edge_and_neg_ev(self):
         import backtest
         bets = [
-            ("2025-04-01", 0.52, 0.50, 100, 1, 100),   # edge 0.02 < 0.05 -> skip
-            ("2025-04-02", 0.60, 0.50, -200, 1, 100),  # edge 0.10 but EV<0 -> skip
-            ("2025-04-03", 0.60, 0.50, 100, 1, 100),   # edge 0.10 & +EV -> placed
+            ("2025-04-01", 0.52, 0.50, 100, -120, 1, 100),   # edge 0.02 < 0.05 skip
+            ("2025-04-02", 0.60, 0.50, -200, 150, 1, 100),   # edge 0.10 EV<0 skip
+            ("2025-04-03", 0.60, 0.50, 100, -120, 1, 100),   # edge 0.10 +EV placed
         ]
         r = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="flat")
         self.assertEqual(r["n_bets"], 1)
 
     def test_ukelly_abstains_thin_sample_that_kelly_takes(self):
         import backtest
-        # p=0.55, fair=0.48 (edge 0.07, +EV @ +100), but only n_eff=20 games:
+        # Back home p=0.55 >= fair 0.48 (edge 0.07, +EV @ +100), n_eff=20:
         # prob_low ~0.38 -> EV<0 -> uncertainty-Kelly abstains; plain Kelly bets it.
-        bets = [("2025-04-01", 0.55, 0.48, 100, 1, 20)]
+        bets = [("2025-04-01", 0.55, 0.48, 100, -120, 1, 20)]
         k = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="kelly")
         u = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05,
                                    method="ukelly", z=1.5)
@@ -2868,7 +2879,8 @@ class BankrollSimTests(unittest.TestCase):
 
     def test_kelly_compounds_more_than_flat_on_wins(self):
         import backtest
-        bets = [("2025-04-0%d" % i, 0.60, 0.50, 100, 1, 100) for i in range(1, 6)]
+        bets = [("2025-04-0%d" % i, 0.60, 0.50, 100, -120, 1, 100)
+                for i in range(1, 6)]
         flat = backtest._bankroll_sim(bets, shrink=1.0, method="flat")
         kelly = backtest._bankroll_sim(bets, shrink=1.0, method="kelly")
         self.assertEqual(flat["n_bets"], 5)
