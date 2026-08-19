@@ -2940,6 +2940,42 @@ class BankrollSimTests(unittest.TestCase):
         self.assertGreater(kelly["growth_pct"], flat["growth_pct"])  # 5%/leg vs 1u
 
 
+class RecencySweepGridTests(unittest.TestCase):
+    """STEP-1 recency sweep: _preset carries recent_n, _build_recency_sweep_grid
+    isolates the two recency axes (incumbent n20/none present), and the projection
+    contract holds — a length-N weight vector selects the NEWEST N (arrays are
+    most-recent-first) via _recency_weights/_weighted_* zip-truncation, which is what
+    the base_w cap in run_player_props_backtest relies on to model recent_n."""
+
+    def test_preset_carries_recent_n(self):
+        import backtest
+        self.assertIsNone(backtest._preset(half_life=None)["recent_n"])   # default = full
+        self.assertEqual(backtest._preset(half_life=5, recent_n=20)["recent_n"], 20)
+
+    def test_grid_isolates_axes_and_includes_incumbent(self):
+        import backtest
+        g = backtest._build_recency_sweep_grid([15, 20, None], [None, 7])
+        self.assertEqual(set(g), {"n15/none", "n15/hl7", "n20/none", "n20/hl7",
+                                  "full/none", "full/hl7"})
+        for cell in g.values():          # every other knob off -> axes isolated
+            self.assertEqual(cell["opp_defense_strength"], 0.0)
+            self.assertEqual(cell["shrink_k"], 0)
+            self.assertEqual(cell["def_adj"], 0.0)
+        self.assertIn("n20/none", backtest._build_recency_sweep_grid())   # incumbent cell
+
+    def test_recent_n_truncation_selects_newest(self):
+        # vals newest-first 10..1; recent_n=3 -> newest {10,9,8}: mean 9.0, and the
+        # method-A over-rate at line 8.5 -> 2/3 (10,9). Full history -> mean 5.5.
+        import stats
+        vals = list(range(10, 0, -1))
+        w_full = stats._recency_weights(len(vals), None)
+        w_n3 = stats._recency_weights(min(3, len(vals)), None)
+        self.assertAlmostEqual(stats._weighted_mean(vals, w_full), 5.5)
+        self.assertAlmostEqual(stats._weighted_mean(vals, w_n3), 9.0)
+        self.assertAlmostEqual(
+            stats._weighted_rate(vals, w_n3, lambda v: v > 8.5), 2 / 3)
+
+
 class PortfolioSimTests(unittest.TestCase):
     """Batch B1 top-N/day portfolio: per-day best-N-by-EV selection across eligible
     markets, market policy (totals off, spreads high-conviction), per-day (not global)

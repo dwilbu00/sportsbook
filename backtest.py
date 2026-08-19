@@ -2466,9 +2466,10 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             opp_defense_strength=0.0, use_minutes=False,
             pace_adj=0.0, def_adj=0.0,
             shrink_k=0.0, rest_adj=0.0, def_window=None,
-            park_strength=0.0, rest_strength=0.0):
+            park_strength=0.0, rest_strength=0.0, recent_n=None):
     return {
         "half_life": half_life,
+        "recent_n": recent_n,                # cap recency window to newest N prior games (None=full)
         "opp_strength": opp_strength,
         "venue_strength": venue_strength,
         "opp_defense_strength": opp_defense_strength,
@@ -2605,6 +2606,29 @@ def _build_props_sweep_grid():
                                 half_life=hl, opp_defense_strength=opp,
                                 def_adj=da, shrink_k=sk, venue_strength=vs,
                                 rest_strength=rs)
+    return variants
+
+
+def _build_recency_sweep_grid(recent_ns=None, half_lives=None):
+    """Joint recent_n × half_life grid for --recency-sweep (props, STEP 1).
+
+    Validates the two never-swept recency defaults TOGETHER: recent_n (the history
+    lookback window; live MLB=20, app.py) and half_life (recency decay; live props
+    decay is OFF / None). Every OTHER knob is held at baseline/off so the two
+    recency axes are ISOLATED — do NOT multiply this with the 576-cell
+    _build_props_sweep_grid. The incumbent cell is n20/none (recent_n=20 +
+    decay off); half_life None = equal weighting, recent_n None = full history.
+    Grade per-prop on OOS Brier (run with --calibrate); MAE/Hit% are diagnostics."""
+    if recent_ns is None:
+        recent_ns = [10, 15, 20, 25, 30, 40]
+    if half_lives is None:
+        half_lives = [None, 5, 7, 10, 15]
+    variants = {}
+    for rn in recent_ns:
+        for hl in half_lives:
+            rn_label = "full" if rn is None else f"n{rn}"
+            hl_label = "none" if hl is None else f"hl{hl}"
+            variants[f"{rn_label}/{hl_label}"] = _preset(half_life=hl, recent_n=rn)
     return variants
 
 
@@ -3293,7 +3317,18 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
 
                 for vname, params in variants.items():
                     hl = params.get("half_life")
-                    base_w = _recency_weights(len(prior_values), hl)
+                    # recent_n: cap the recency window to the newest N prior games
+                    # BEFORE decay, mirroring live serving (espn_client gamelog[:n]
+                    # then _recency_weights). prior_* arrays are most-recent-first and
+                    # every _weighted_* primitive zips values against weights, so a
+                    # length-N weight vector selects exactly the newest N games.
+                    # recent_n=None -> full history (byte-identical to pre-recency).
+                    # NB: only knobs that pair with `weights` honor the window;
+                    # shrink_k / use_minutes read full prior_values, so the recency
+                    # grid keeps those OFF (isolated axes). See _build_recency_sweep_grid.
+                    _rn = params.get("recent_n")
+                    _nw = min(_rn, len(prior_values)) if _rn else len(prior_values)
+                    base_w = _recency_weights(_nw, hl)
                     venue_s = params.get("venue_strength", 0.0)
                     def_s = params.get("opp_defense_strength", 0.0)
                     weights = []
@@ -5537,15 +5572,15 @@ def main():
     p.add_argument("--topn-sweep", action="store_true",
                    help="(odds mode, Batch B1) TOP-N/DAY portfolio test: the real-"
                         "world ROI — each day keep only the best N value bets "
-                        "(EV-ranked, moneyline edge>=5% + spreads high-conviction "
-                        "edge>=10%, totals off), flat-1u, swept N=5/10/15/all for the "
+                        "(EV-ranked, moneyline edge>=5%% + spreads high-conviction "
+                        "edge>=10%%, totals off), flat-1u, swept N=5/10/15/all for the "
                         "full policy AND moneyline-only. Shows if tightening to your "
                         "real ~10 bets/day helps. No write.")
     p.add_argument("--sizing-sweep", action="store_true",
                    help="(odds mode, Batch B1) MONEYLINE bankroll sim: flat-1u vs "
                         "fractional-Kelly vs uncertainty-Kelly (size off the win-prob "
                         "interval's low bound + abstain when it spans break-even) at "
-                        "the ROI-optimal config (shrink 0.25, edge>=5%). Reports "
+                        "the ROI-optimal config (shrink 0.25, edge>=5%%). Reports "
                         "growth / max-drawdown / Sharpe so risk-adjusted sizing is "
                         "visible (flat-1u ROI can't show it). No write.")
     p.add_argument("--unleash-sweep", action="store_true",
@@ -5600,6 +5635,17 @@ def main():
                         "slope + BSS + ROI-at-gate. INERT until set live. No write.")
     p.add_argument("--residual-weights", default=None,
                    help="(--pythag-residual-sweep) comma list, e.g. 0,0.1,0.2,0.3,0.5.")
+    p.add_argument("--recency-sweep", action="store_true",
+                   help="(--mode props) STEP-1 joint recent_n x half_life sweep to "
+                        "validate the never-swept lookback window + decay defaults. "
+                        "Isolated axes (all other knobs off); incumbent cell n20/none. "
+                        "Run with --calibrate to score per-prop OOS Brier. No write.")
+    p.add_argument("--recent-ns", default=None,
+                   help="(--recency-sweep) comma list of lookback windows, e.g. "
+                        "10,15,20,25,30,40 ('full'=entire history).")
+    p.add_argument("--half-lives", default=None,
+                   help="(--recency-sweep) comma list of decay half-lives, e.g. "
+                        "none,5,7,10,15 ('none'=decay off / equal weight).")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -5764,7 +5810,32 @@ def main():
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
 
-    if args.sweep:
+    if getattr(args, "recency_sweep", False):
+        if args.mode != "props":
+            print("--recency-sweep is only valid with --mode props.")
+            sys.exit(1)
+
+        def _parse_grid(raw, none_words):
+            if not raw:
+                return None
+            out = []
+            for tok in raw.split(","):
+                t = tok.strip()
+                if not t:
+                    continue
+                out.append(None if t.lower() in none_words else int(t))
+            return out or None
+
+        rns = _parse_grid(args.recent_ns, {"full", "none", "all"})
+        hls = _parse_grid(args.half_lives, {"none", "null", "off"})
+        variants = _build_recency_sweep_grid(rns, hls)
+        args.sweep = True   # reuse the sweep tabulator + code path
+        args.calibrate = True   # STEP-1 selects on OOS Brier, not just MAE
+        variant_names = list(variants.keys())
+        print(f"\n{'#'*60}")
+        print(f"#  RECENCY SWEEP: {len(variants)} recent_n x half_life combos "
+              f"(--calibrate forced for per-prop Brier)")
+    elif args.sweep:
         variants = (_build_props_sweep_grid() if args.mode == "props"
                     else _build_sweep_grid())
         variant_names = list(variants.keys())
