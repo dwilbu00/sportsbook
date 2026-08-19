@@ -2829,5 +2829,52 @@ class SharesFitterTests(unittest.TestCase):
         self.assertAlmostEqual(model_cover, 0.63)
 
 
+class BankrollSimTests(unittest.TestCase):
+    """Batch B1: the chronological bankroll sim (_bankroll_sim) — equity path,
+    the value gate (edge + EV), and uncertainty-Kelly abstain. Rows are
+    (date, prob_raw, fair, price, won, n_eff), model's favored side. shrink=0 in
+    these tests so p == prob_raw (clean hand-math)."""
+
+    def test_flat_growth_and_drawdown(self):
+        import backtest
+        # b0=100, flat=1u. bet1 loses (-> 99, dd 1%), bet2 wins at +100 (-> 100).
+        bets = [("2025-04-01", 0.60, 0.50, 100, 0, 100),
+                ("2025-04-02", 0.60, 0.50, 100, 1, 100)]
+        r = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="flat")
+        self.assertEqual(r["n_bets"], 2)
+        self.assertAlmostEqual(r["growth_pct"], 0.0, places=6)   # -1 then +1
+        self.assertAlmostEqual(r["max_dd_pct"], 1.0, places=6)   # trough 99 vs peak 100
+
+    def test_gate_excludes_thin_edge_and_neg_ev(self):
+        import backtest
+        bets = [
+            ("2025-04-01", 0.52, 0.50, 100, 1, 100),   # edge 0.02 < 0.05 -> skip
+            ("2025-04-02", 0.60, 0.50, -200, 1, 100),  # edge 0.10 but EV<0 -> skip
+            ("2025-04-03", 0.60, 0.50, 100, 1, 100),   # edge 0.10 & +EV -> placed
+        ]
+        r = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="flat")
+        self.assertEqual(r["n_bets"], 1)
+
+    def test_ukelly_abstains_thin_sample_that_kelly_takes(self):
+        import backtest
+        # p=0.55, fair=0.48 (edge 0.07, +EV @ +100), but only n_eff=20 games:
+        # prob_low ~0.38 -> EV<0 -> uncertainty-Kelly abstains; plain Kelly bets it.
+        bets = [("2025-04-01", 0.55, 0.48, 100, 1, 20)]
+        k = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05, method="kelly")
+        u = backtest._bankroll_sim(bets, shrink=1.0, edge_gate=0.05,
+                                   method="ukelly", z=1.5)
+        self.assertEqual(k["n_bets"], 1)
+        self.assertEqual(u["n_bets"], 0)   # abstained on uncertainty
+
+    def test_kelly_compounds_more_than_flat_on_wins(self):
+        import backtest
+        bets = [("2025-04-0%d" % i, 0.60, 0.50, 100, 1, 100) for i in range(1, 6)]
+        flat = backtest._bankroll_sim(bets, shrink=1.0, method="flat")
+        kelly = backtest._bankroll_sim(bets, shrink=1.0, method="kelly")
+        self.assertEqual(flat["n_bets"], 5)
+        self.assertEqual(kelly["n_bets"], 5)
+        self.assertGreater(kelly["growth_pct"], flat["growth_pct"])  # 5%/leg vs 1u
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,7 +59,9 @@ from odds_client import (
     american_to_implied_prob,
     devig_two_way,
 )
-from pricing_common import _resolve_team_defense
+from pricing_common import (_resolve_team_defense, kelly_stake,
+                            kelly_stake_uncertain, prob_interval_low,
+                            _expected_roi)
 import historical_odds as hist_store
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from calibration_loader import (
@@ -1245,7 +1247,7 @@ def _run_odds_backtest_impl(
         supplement_log=True, min_shrink_n=MIN_SHRINK_N,
         collect_obs=None, collect_dated=None, collect_lineup=None,
         collect_components=None, serve_mode=False, fit_blend=False,
-        fit_shares=False):
+        fit_shares=False, collect_bets=None):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1482,6 +1484,20 @@ def _run_odds_backtest_impl(
                 if collect_dated is not None:
                     collect_dated["moneyline"].append(
                         (date_et, mwin, fair_home, home_won))
+                if collect_bets is not None:
+                    # Per-bet row for the chronological bankroll sim, folded to the
+                    # model's FAVORED side (RAW pre-shrink prob so the sim can apply
+                    # its own shrink): (date, our_prob_raw, our_fair, our_price,
+                    # our_won, n_eff). n_eff = min prior-games behind the estimate,
+                    # the effective sample for the uncertainty interval.
+                    _home = mwin > 0.5
+                    collect_bets["moneyline"].append((
+                        date_et,
+                        mwin if _home else 1.0 - mwin,
+                        fair_home if _home else 1.0 - fair_home,
+                        price_home if _home else price_away,
+                        home_won if _home else 1 - home_won,
+                        min(len(home_prior), len(away_prior))))
                 # #3 v2 (DIAGNOSTIC): bottom-up lineup-runs P(home win), graded
                 # head-to-head vs the recency model (mwin) + market (fair_home).
                 if collect_lineup is not None:
@@ -4548,6 +4564,100 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
     _lineup_runs_diag(lineup)
 
 
+def _bankroll_sim(bets, shrink=0.25, edge_gate=0.05, method="kelly",
+                  z=1.0, frac=0.5, cap=0.05, b0=100.0):
+    """Chronological bankroll simulation over per-bet rows
+    (date, prob_raw, fair, price, won, n_eff) — the model's favored side.
+
+    Applies ``shrink`` to the raw prob, then the value gate (edge = shrunk-fair >=
+    ``edge_gate`` AND +EV at the price), then stakes each PLACED bet:
+      'flat'   -> constant 1u (1% of b0), non-compounding (the incumbent baseline)
+      'kelly'  -> fractional-Kelly of the CURRENT bankroll (compounding)
+      'ukelly' -> uncertainty-Kelly: size off prob_low = prob_interval_low(p,n_eff,z)
+    Returns {n_bets, growth_pct, max_dd_pct, sharpe}. Bankroll/drawdown are tracked
+    on the running equity; Sharpe is mean/stdev of per-bet return-on-stake."""
+    import statistics
+    rows = sorted((b for b in bets if b and b[3] is not None
+                   and b[1] is not None and b[2] is not None), key=lambda r: r[0])
+    bankroll = peak = float(b0)
+    flat_unit = float(b0) * 0.01
+    max_dd = 0.0
+    rets = []
+    for _date, praw, fair, price, won, n_eff in rows:
+        p = _shrink_prob(praw, shrink)
+        if (p - fair) < edge_gate:
+            continue
+        er = _expected_roi(p, price)
+        if er is None or er <= 0.0:
+            continue                          # -EV at the price -> not a value bet
+        if method == "flat":
+            stake = flat_unit
+        elif method == "kelly":
+            stake = kelly_stake(p, price, bankroll, frac, cap)
+        else:  # ukelly
+            stake = kelly_stake_uncertain(
+                p, prob_interval_low(p, n_eff, z), price, bankroll, frac, cap)
+        if stake <= 0.0:
+            continue                          # abstained (uncertainty interval)
+        dec = american_to_decimal(price)
+        profit = stake * (dec - 1.0) if won else -stake
+        bankroll += profit
+        rets.append(profit / stake if stake else 0.0)
+        if bankroll > peak:
+            peak = bankroll
+        dd = (peak - bankroll) / peak if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+    growth = (bankroll / float(b0) - 1.0) * 100.0
+    sharpe = (statistics.mean(rets) / statistics.pstdev(rets)
+              if len(rets) > 1 and statistics.pstdev(rets) > 0 else float("nan"))
+    return {"n_bets": len(rets), "growth_pct": growth,
+            "max_dd_pct": max_dd * 100.0, "sharpe": sharpe}
+
+
+def sizing_sweep(sport_key, espn_sport, espn_league, season_year=None,
+                 limit=100000, store_label="", source="auto",
+                 shrink=0.25, edge_gate=0.05):
+    """MONEYLINE bankroll sim (Batch B1): flat-1u vs fractional-Kelly vs
+    uncertainty-Kelly (size off the low bound of the win-prob interval + abstain
+    when it spans break-even) over the warehoused closing-line holdout, at the
+    ROI-optimal moneyline config (shrink 0.25, no blend, edge>=5%). Shows whether
+    uncertainty-aware sizing improves RISK-ADJUSTED returns (growth vs max
+    drawdown) — the thing flat-1u ROI can't reveal. Diagnostic only; nothing
+    written."""
+    _warn_small_limit(limit)
+    bets = {m: [] for m in MARKETS}
+    run_odds_backtest(sport_key, espn_sport, espn_league, limit=limit, window=10,
+                      variants={"live": VARIANT_PRESETS.get("all", {})},
+                      season_year=season_year, threshold_pct=5.0,
+                      write_calibration=False, store_label=store_label,
+                      engine="live", prob_shrink=1.0, source=source,
+                      supplement_log=False, collect_bets=bets)
+    ml = bets["moneyline"]
+    print(f"\n=== MONEYLINE bankroll sim (Batch B1) — shrink {shrink}, "
+          f"edge>={edge_gate*100:.0f}%, half-Kelly, cap 5%/leg ===")
+    print(f"  {len(ml)} graded moneyline games; chronological; b0=100u. "
+          "flat=1u/bet (incumbent).")
+    print("  {:<16}{:>7}{:>10}{:>9}{:>8}".format(
+        "sizing", "bets", "growth%", "maxDD%", "Sharpe"))
+    print("  " + "-" * 48)
+
+    def _row(label, m):
+        r = _bankroll_sim(ml, shrink=shrink, edge_gate=edge_gate, method=m["method"],
+                          z=m.get("z", 1.0))
+        sh = f"{r['sharpe']:.3f}" if r["sharpe"] == r["sharpe"] else "-"
+        print("  {:<16}{:>7}{:>+10.1f}{:>9.1f}{:>8}".format(
+            label, r["n_bets"], r["growth_pct"], r["max_dd_pct"], sh))
+
+    _row("flat-1u", {"method": "flat"})
+    _row("half-Kelly", {"method": "kelly"})
+    for z in (0.5, 1.0, 1.5):
+        _row(f"unc-Kelly z={z}", {"method": "ukelly", "z": z})
+    print("\n  (unc-Kelly z=0 == half-Kelly; higher z = more conservative / more "
+          "abstains. Watch growth vs maxDD — uncertainty-Kelly should trade a little")
+    print("   growth for a lower drawdown + higher Sharpe. Diagnostic only.)")
+
+
 def _warn_small_limit(limit):
     """These ROI sweeps need the full window; the global --limit default (200) caps
     to the last 200 games → ~100 bets/cell → noisy 'best cell' that jumps corners.
@@ -5220,6 +5330,13 @@ def main():
                         "probability-shrink x recommendation-gate and report "
                         "realized flat-1u ROI per combo (finds whether the live "
                         "shrink+edge gate over-suppress moneyline). No write.")
+    p.add_argument("--sizing-sweep", action="store_true",
+                   help="(odds mode, Batch B1) MONEYLINE bankroll sim: flat-1u vs "
+                        "fractional-Kelly vs uncertainty-Kelly (size off the win-prob "
+                        "interval's low bound + abstain when it spans break-even) at "
+                        "the ROI-optimal config (shrink 0.25, edge>=5%). Reports "
+                        "growth / max-drawdown / Sharpe so risk-adjusted sizing is "
+                        "visible (flat-1u ROI can't show it). No write.")
     p.add_argument("--unleash-sweep", action="store_true",
                    help="(odds mode) UNLEASH sweep: re-grade the LIVE pipeline with "
                         "each market-anchoring knob released one at a time "
@@ -5479,6 +5596,10 @@ def main():
             diagnose_team_gate(sport_key, espn_sport, espn_league,
                                season_year=odds_seasons, limit=args.limit,
                                store_label=args.store_label, source=args.source)
+        elif args.sizing_sweep:
+            sizing_sweep(sport_key, espn_sport, espn_league,
+                         season_year=odds_seasons, limit=args.limit,
+                         store_label=args.store_label, source=args.source)
         elif args.unleash_sweep:
             unleash_sweep(sport_key, espn_sport, espn_league,
                           season_year=odds_seasons, limit=args.limit,
