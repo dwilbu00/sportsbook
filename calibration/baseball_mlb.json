@@ -3,6 +3,7 @@
   "fit_timestamp": "2026-08-14T18:02:30.535264Z",
   "props": {
     "batter_hits": {
+      "recent_n": null,
       "method": "E",
       "half_life": null,
       "venue_strength": 0.0,
@@ -5671,8 +5672,9 @@
       ]
     },
     "pitcher_strikeouts": {
+      "recent_n": null,
       "method": "E",
-      "half_life": 5,
+      "half_life": null,
       "venue_strength": 0.25,
       "opp_defense_strength": 0.0,
       "output_def_strength": 0.0,
@@ -7063,6 +7065,7 @@
       }
     },
     "pitcher_earned_runs": {
+      "recent_n": 20,
       "method": "C",
       "half_life": null,
       "venue_strength": 0.0,
@@ -9190,6 +9193,7 @@
       }
     },
     "batter_strikeouts": {
+      "recent_n": null,
       "method": "A",
       "half_life": null,
       "venue_strength": 0.0,
