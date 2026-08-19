@@ -5966,6 +5966,23 @@ def main():
         # Player-props mode
         if args.players:
             players = [n.strip() for n in args.players.split(",") if n.strip()]
+        elif getattr(args, "recency_sweep", False) and args.sport == "mlb":
+            # STEP-1 decision-grade: the hand-picked DEFAULT_STARTERS is stable
+            # superstars, which are SURVIVORSHIP-BIASED toward longer windows (a
+            # stable-talent player always benefits from more history). Use the
+            # usage-representative refit pool (rookies / role-changers / part-timers
+            # included) so the recent_n/half_life pick generalizes to who we
+            # actually bet. Pass --players to override.
+            try:
+                from refit_calibration import _mlb_player_pool
+                players = [name for (_pid, _role, name)
+                          in _mlb_player_pool(args.season)]
+                print(f"#  (recency-sweep) representative MLB pool: "
+                      f"{len(players)} players (not the star DEFAULT_STARTERS)")
+            except Exception as e:
+                print(f"  [warn] representative pool unavailable ({e}); "
+                      f"falling back to DEFAULT_STARTERS.")
+                players = DEFAULT_STARTERS.get(args.sport, [])
         else:
             players = DEFAULT_STARTERS.get(args.sport, [])
             if not players:
