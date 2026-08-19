@@ -142,6 +142,59 @@ def kelly_stake(prob, american_price, bankroll, fraction=0.5, cap=0.05):
     return round(bankroll * f, 2)
 
 
+def prob_interval_low(prob, n_eff, z=1.0):
+    """Conservative LOWER bound of a win-probability estimate, via a normal (Wald)
+    interval sized by the effective sample count behind it:
+
+        prob_low = prob - z * sqrt(prob*(1-prob)/n_eff)     (clamped to [0, prob])
+
+    Larger ``n_eff`` -> tighter interval -> prob_low near prob; a thin sample (or a
+    mid-range prob) -> wider interval -> more conservative. ``z`` is the interval
+    half-width in SDs (1.0 ~ 1 SD). Fail-OPEN to the point estimate (returns
+    ``prob`` unchanged) when n_eff is missing/<=0 or prob is degenerate, so a caller
+    can apply it unconditionally and only ever get a <= prob result."""
+    import math
+    try:
+        p = float(prob)
+        n = float(n_eff)
+    except (TypeError, ValueError):
+        return prob
+    if not (0.0 < p < 1.0) or n <= 0.0:
+        return prob
+    low = p - float(z) * math.sqrt(p * (1.0 - p) / n)
+    return low if low > 0.0 else 0.0
+
+
+def kelly_fraction_uncertain(prob, prob_low, american_price, fraction=0.5, cap=0.05):
+    """Uncertainty-aware fractional Kelly: size off the LOWER bound of the win-prob
+    interval (``prob_low``) rather than the point estimate.
+
+    This attacks selection optimism directly (our named #1 forward>backtest cause):
+      * a shaky edge (wide interval -> low prob_low) is staked SMALL;
+      * an edge whose interval spans break-even (prob_low below the price's implied
+        prob) is ABSTAINED -- the existing kelly_fraction EV<=0 guard returns 0.0;
+      * since prob_low <= prob, it NEVER exceeds the point-estimate Kelly.
+    ``prob_low is None`` -> falls back to the point estimate (byte-identical to
+    kelly_fraction), so the whole path is opt-in per leg."""
+    if prob_low is None:
+        return kelly_fraction(prob, american_price, fraction, cap)
+    return kelly_fraction(prob_low, american_price, fraction, cap)
+
+
+def kelly_stake_uncertain(prob, prob_low, american_price, bankroll,
+                          fraction=0.5, cap=0.05):
+    """Dollar stake off the uncertainty-aware fractional Kelly (see
+    ``kelly_fraction_uncertain``). Fail-open to 0.0 exactly like ``kelly_stake``."""
+    try:
+        bankroll = float(bankroll)
+    except (TypeError, ValueError):
+        return 0.0
+    if bankroll <= 0.0:
+        return 0.0
+    f = kelly_fraction_uncertain(prob, prob_low, american_price, fraction, cap)
+    return round(bankroll * f, 2)
+
+
 def scale_to_slate_cap(stakes, bankroll, cap_fraction):
     """Proportionally scale a list of dollar stakes so their sum does not exceed
     ``cap_fraction * bankroll`` (a slate-total exposure cap).

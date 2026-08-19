@@ -15,7 +15,9 @@ import analysis
 import odds_client
 import wagers
 from odds_client import american_to_decimal, american_to_implied_prob
-from pricing_common import kelly_fraction, kelly_stake, scale_to_slate_cap
+from pricing_common import (kelly_fraction, kelly_stake, scale_to_slate_cap,
+                            prob_interval_low, kelly_fraction_uncertain,
+                            kelly_stake_uncertain)
 from recalibration import apply_platt
 
 
@@ -265,6 +267,55 @@ class KellySizingTests(unittest.TestCase):
         self.assertEqual(kelly_stake(0.60, 100, -500.0, 0.5, 0.05), 0.0)
         self.assertEqual(kelly_stake(0.40, 100, 1000.0, 0.5, 0.05), 0.0)
         self.assertEqual(kelly_stake(0.60, None, 1000.0, 0.5, 0.05), 0.0)
+
+    def test_prob_interval_low_shrinks_with_thin_sample(self):
+        # Wald interval: prob_low = p - z*sqrt(p(1-p)/n). Thinner n -> wider -> lower.
+        p = 0.60
+        wide = prob_interval_low(p, 25, z=1.0)    # se=sqrt(.24/25)=0.098 -> 0.502
+        tight = prob_interval_low(p, 400, z=1.0)   # se=sqrt(.24/400)=0.0245 -> 0.5755
+        self.assertAlmostEqual(wide, 0.60 - math.sqrt(0.24 / 25), places=6)
+        self.assertAlmostEqual(tight, 0.60 - math.sqrt(0.24 / 400), places=6)
+        self.assertLess(wide, tight)              # thin sample -> more conservative
+        self.assertLess(tight, p)                 # always <= point estimate
+
+    def test_prob_interval_low_fails_open(self):
+        # Missing/degenerate n_eff or prob -> return the point estimate unchanged.
+        self.assertEqual(prob_interval_low(0.60, 0), 0.60)
+        self.assertEqual(prob_interval_low(0.60, None), 0.60)
+        self.assertEqual(prob_interval_low(1.0, 100), 1.0)   # boundary, no raise
+        self.assertEqual(prob_interval_low(None, 100), None)
+
+    def test_uncertain_kelly_sizes_off_low_bound(self):
+        # p=0.60 @ +100 point-Kelly (half) = 0.10; using prob_low=0.55 -> 0.05.
+        self.assertAlmostEqual(
+            kelly_fraction_uncertain(0.60, 0.55, 100, 0.5, 1.0), 0.05, places=9)
+        # Never exceeds the point estimate (prob_low <= prob).
+        self.assertLessEqual(
+            kelly_fraction_uncertain(0.60, 0.55, 100, 0.5, 1.0),
+            kelly_fraction(0.60, 100, 0.5, 1.0))
+
+    def test_uncertain_kelly_abstains_when_interval_spans_breakeven(self):
+        # Point prob 0.55 @ +100 is +EV (would bet), but if the low bound is 0.50
+        # (break-even) or below, the interval spans break-even -> ABSTAIN (0.0).
+        self.assertGreater(kelly_fraction(0.55, 100, 0.5, 1.0), 0.0)
+        self.assertEqual(kelly_fraction_uncertain(0.55, 0.50, 100, 0.5, 1.0), 0.0)
+        self.assertEqual(kelly_fraction_uncertain(0.55, 0.48, 100, 0.5, 1.0), 0.0)
+
+    def test_uncertain_kelly_none_low_falls_back_to_point(self):
+        # prob_low=None -> byte-identical to the point-estimate kelly_fraction.
+        for p, a in ((0.55, 100), (0.62, -130), (0.40, 150)):
+            self.assertEqual(
+                kelly_fraction_uncertain(p, None, a, 0.5, 0.05),
+                kelly_fraction(p, a, 0.5, 0.05))
+
+    def test_uncertain_kelly_stake_dollars(self):
+        # bankroll 1000, prob_low 0.55 @ +100 half-Kelly frac 0.05 -> $50.
+        self.assertAlmostEqual(
+            kelly_stake_uncertain(0.60, 0.55, 100, 1000.0, 0.5, 1.0), 50.00, places=2)
+        self.assertEqual(
+            kelly_stake_uncertain(0.55, 0.50, 100, 1000.0, 0.5, 1.0), 0.0)  # abstain
+        self.assertEqual(
+            kelly_stake_uncertain(0.60, 0.55, 100, 0.0, 0.5, 1.0), 0.0)  # no bankroll
 
     def test_scale_to_slate_cap_scales_down_proportionally(self):
         # Sum 60 > cap 25 (25% of 100) -> scale by 25/60.
