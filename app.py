@@ -823,6 +823,7 @@ from espn_client import (
     mlb_warehouse_team_defense,
     mlb_warehouse_gate_status,
 )
+from props import prop_fetch_limit
 from analysis import (
     analyze_moneyline_value,
     analyze_spreads_value,
@@ -2320,9 +2321,15 @@ with st.sidebar:
 
     st.subheader("Analysis Settings")
     threshold = 5.0  # default value edge threshold for non-safe-mode analysis
-    # Recent-games window is hardcoded per sport. Per-prop calibration decides
-    # whether games inside the window are equally or exponentially weighted.
+    # Recent-games window for TEAM-market form is hardcoded per sport. Per-prop
+    # calibration decides whether games inside the window are equally or
+    # exponentially weighted.
     recent_n = sport.get("recent_n_default", 10)
+    # Player-prop history FETCH: a full-season superset (props.py slices per prop to
+    # its own recent_n; STEP-1 sweep found hits/K want the full season). Kept
+    # SEPARATE from the team-market recent_n above so a longer prop window never
+    # changes team-stat aggregation.
+    prop_fetch_n = prop_fetch_limit(sport["key"])
     safe_mode = st.toggle(
         "🎯 Alt lines (player props)",
         value=False,
@@ -2984,7 +2991,7 @@ if analyze_clicked and selected_game_labels:
                         prop_history_futures[key] = pool.submit(
                             get_player_stat_history,
                             sport["espn_sport"], sport["espn_league"],
-                            player_name, prop_key, recent_n,
+                            player_name, prop_key, prop_fetch_n,
                             team_ids=event_team_ids,
                             # MLB: the matchup teams narrow a namesake to its MLBAM
                             # id in the warehouse (Max Muncy / Luis Garcia Jr.) so it

@@ -2940,6 +2940,52 @@ class BankrollSimTests(unittest.TestCase):
         self.assertGreater(kelly["growth_pct"], flat["growth_pct"])  # 5%/leg vs 1u
 
 
+class PropRecentNWindowTests(unittest.TestCase):
+    """STEP-1 per-prop history window (recent_n): calibration slices the newest N
+    games BEFORE the projection; recent_n=null = full season (matches the sweep),
+    absent = per-sport default. Also the accessors + fetch superset."""
+
+    def test_accessors(self):
+        self.assertEqual(props._player_prop_recent_n("baseball_mlb"), 20)
+        self.assertEqual(props._player_prop_recent_n("basketball_nba"), 10)
+        self.assertEqual(props._player_prop_recent_n("americanfootball_nfl"), 8)
+        self.assertIsNone(props._player_prop_recent_n(None))       # unknown -> no cap
+        self.assertEqual(props.prop_fetch_limit("baseball_mlb"), 200)
+        self.assertEqual(props.prop_fetch_limit(None), 100)
+
+    @staticmethod
+    def _project(calib):
+        # 30 games, newest-first: newest 15 = 2.0, older 15 = 0.0.
+        n = 30
+        vals = [2.0] * 15 + [0.0] * 15
+        gdates = list(reversed([f"2026-06-{d:02d}" for d in range(1, n + 1)]))
+        hist = {"P": {"batter_hits": {"found": True, "values": vals,
+                      "opponents": ["Y"] * n, "home_aways": [False] * n,
+                      "game_dates": gdates}}}
+        pdata = {"props": {"batter_hits": {"P": {
+            "line": 0.5, "over_implied": 0.5, "under_implied": 0.5,
+            "over_price": -110, "under_price": -110,
+            "over_book": "DK", "under_book": "DK"}}},
+            "home_team": "X", "away_team": "Y"}
+        with patch("props.load_calibration", return_value=calib):
+            return props.analyze_player_props_value(
+                pdata, hist, threshold_pct=1.0, sport_key="baseball_mlb")[0]
+
+    def test_recent_n_slices_newest_games(self):
+        # null = full season -> all 30: (15*2 + 15*0)/30 = 1.0
+        self.assertAlmostEqual(
+            self._project({"batter_hits": {"recent_n": None}})["avg_stat"], 1.0, places=2)
+        # 20 -> newest 20: (15*2 + 5*0)/20 = 1.5
+        self.assertAlmostEqual(
+            self._project({"batter_hits": {"recent_n": 20}})["avg_stat"], 1.5, places=2)
+        # 10 -> newest 10 (all 2.0) = 2.0 (MLB streak floor is 8, so 10 survives)
+        self.assertAlmostEqual(
+            self._project({"batter_hits": {"recent_n": 10}})["avg_stat"], 2.0, places=2)
+        # absent -> MLB per-sport default 20 -> 1.5
+        self.assertAlmostEqual(
+            self._project({"batter_hits": {}})["avg_stat"], 1.5, places=2)
+
+
 class RecencySweepGridTests(unittest.TestCase):
     """STEP-1 recency sweep: _preset carries recent_n, _build_recency_sweep_grid
     isolates the two recency axes (incumbent n20/none present), and the projection

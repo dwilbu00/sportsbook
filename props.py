@@ -707,11 +707,59 @@ PLAYER_PROP_HALF_LIFE = {
 }
 DEFAULT_PLAYER_PROP_HALF_LIFE = None  # None = inherit from RECENCY_HALF_LIFE
 
+# Per-sport DEFAULT history LOOKBACK WINDOW for player-prop projections — the number
+# of most-recent prior games the projection is built from, applied BEFORE the
+# reliability filter (mirrors the recency sweep's newest-N slice). A per-prop
+# override lives in calibration[prop]["recent_n"] (read via _knob), where
+# recent_n=null means FULL season (no cap), exactly like the sweep's "full" cell.
+# These per-sport defaults reproduce the pre-sweep windows (MLB 20 / NBA 10 / NFL 8)
+# so a prop with no calibrated recent_n is byte-identical to the old behavior.
+# STEP-1 recency sweep (2026-08-19): MLB hits/batter-K/pitcher-K want FULL season,
+# pitcher_ER ~20 — set per-prop in the calibration file, not here.
+PLAYER_PROP_RECENT_N = {
+    "basketball_nba": 10,
+    "baseball_mlb": 20,
+    "americanfootball_nfl": 8,
+}
+# Unknown/None sport → NO window cap (all 3 real sports are configured above; this
+# default only hits tests that pass a history directly, or a not-yet-configured
+# sport, where truncating below a reliability streak floor would be wrong).
+DEFAULT_PLAYER_PROP_RECENT_N = None
+
+# Per-sport player-prop history FETCH cap — a superset sized to cover the largest
+# window any prop could slice to (a full season), so a full-season prop has its
+# games available while a shorter-window prop just slices down. Kept SEPARATE from
+# the team-market recent_n so lengthening a prop's window never touches team stats.
+PROP_FETCH_LIMIT = {
+    "baseball_mlb": 200,        # full MLB season + doubleheader/postseason headroom
+    "basketball_nba": 100,
+    "americanfootball_nfl": 25,
+}
+DEFAULT_PROP_FETCH_LIMIT = 100
+
 
 def _player_prop_defense_strength(sport_key):
     if sport_key is None:
         return DEFAULT_PLAYER_PROP_DEFENSE_STRENGTH
     return PLAYER_PROP_DEFENSE_STRENGTH.get(sport_key, DEFAULT_PLAYER_PROP_DEFENSE_STRENGTH)
+
+
+def _player_prop_recent_n(sport_key):
+    """Per-sport DEFAULT history window (games) for player-prop projections. A
+    per-prop calibration override (recent_n; null=full season) supersedes this via
+    _knob. Preserves the pre-sweep per-sport window when unset."""
+    if sport_key is None:
+        return DEFAULT_PLAYER_PROP_RECENT_N
+    return PLAYER_PROP_RECENT_N.get(sport_key, DEFAULT_PLAYER_PROP_RECENT_N)
+
+
+def prop_fetch_limit(sport_key):
+    """How many most-recent games to FETCH per player for props — a superset that
+    covers the largest window any prop slices to (a full season). Separate from the
+    team-market recent_n so a longer prop window never changes team-stat fetches."""
+    if sport_key is None:
+        return DEFAULT_PROP_FETCH_LIMIT
+    return PROP_FETCH_LIMIT.get(sport_key, DEFAULT_PROP_FETCH_LIMIT)
 
 
 def _player_prop_venue_strength(sport_key):
@@ -991,9 +1039,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         cfg = calibration.get(prop_key) if calibration else None
         if cfg and name in cfg:
             value = cfg[name]
-            # In calibration JSON, half_life=null explicitly means equal
-            # weighting. Other null knobs continue to mean "use the default."
-            if value is not None or name == "half_life":
+            # In calibration JSON, half_life=null explicitly means equal weighting
+            # and recent_n=null explicitly means the FULL season (no window cap) —
+            # so both must pass a null through rather than fall to the default. Other
+            # null knobs continue to mean "use the default."
+            if value is not None or name in ("half_life", "recent_n"):
                 return value
         return default
 
@@ -1007,6 +1057,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     default_weather_strength = _player_prop_weather_strength(sport_key)
     default_xstats_strength = _player_prop_xstats_strength(sport_key)
     default_rest_strength = _player_prop_rest_strength(sport_key)
+    default_recent_n = _player_prop_recent_n(sport_key)
 
     # Per-prop max strength across defaults + any calibrated overrides — used
     # only to decide whether league-average defense needs to be computed.
@@ -1121,6 +1172,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         weather_strength = _knob(prop_key, "weather_factor_strength", default_weather_strength)
         xstats_strength = _knob(prop_key, "xstats_strength", default_xstats_strength)
         rest_strength = _knob(prop_key, "rest_strength", default_rest_strength)
+        # History window: newest N prior games feeding the projection (calibration
+        # recent_n=null → full season; absent → per-sport default). STEP-1 sweep.
+        recent_n = _knob(prop_key, "recent_n", default_recent_n)
         prop_calib_cfg = calibration.get(prop_key) if calibration else None
 
         for player_name, odds_info in players.items():
@@ -1196,6 +1250,14 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     values, opponents, past_home_aways, minutes, game_dates,
                     plate_appearances, at_bats)
             ]
+            # STEP-1 recency window: keep the newest `recent_n` games BEFORE the
+            # reliability filter (recent_n falsy → full season, no cap). `synthetic`
+            # is most-recent-first (the fetch returns newest-first), so [:recent_n]
+            # is the newest N — matching the sweep and the live gamelog[:n]. Slicing
+            # PRE-filter (not post) keeps an unchanged-window prop byte-identical to
+            # the old behavior even when the filter later drops games.
+            if recent_n:
+                synthetic = synthetic[:recent_n]
             team_schedule = None
             if team_schedules and player_team_id:
                 team_schedule = team_schedules.get(str(player_team_id))
