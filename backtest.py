@@ -65,6 +65,7 @@ import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from calibration_loader import (
     save_market_blend,
     save_prob_shrink,
+    save_expected_runs_challenger_shares,
     save_calibration,
     load_calibration,
     apply_calibration_with_warmup,
@@ -963,7 +964,7 @@ MIN_SHRINK_N = 200  # min graded obs before a fitted shrink factor is persisted
 
 
 def _write_shrink_calibration(sport_key, results, extra_obs=None,
-                              min_shrink_n=MIN_SHRINK_N):
+                              min_shrink_n=MIN_SHRINK_N, skip_markets=()):
     """Fit and persist the Brier-optimal probability shrink per team market
     (from the 'live' variant) to calibration/<sport>.json.
 
@@ -988,6 +989,8 @@ def _write_shrink_calibration(sport_key, results, extra_obs=None,
     holdout = {}
     withheld = []
     for market in MARKETS:
+        if market in skip_markets:
+            continue
         blend = results[variant][market]["blend"]
         extra = [(p, None, o) for (p, o) in extra_obs.get(market, [])]
         combined = blend + extra
@@ -1109,13 +1112,18 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
     serve_mode=True: the SERVED fields (per-market prob_shrink + model<->market blend
     already applied inside the analyzers) — so a holdout grades EXACTLY what production
     would serve under the (staged) calibration. Includes the MLB starter adjustment
-    (matchup_features) + Pythagorean blend (home/away_season_runs)."""
+    (matchup_features) + Pythagorean blend (home/away_season_runs).
+
+    Also returns ``spread_comp``: the RAW spread ensemble components for the HOME side
+    when the expected-runs projection fired (recency cover pre-shrink, additive/expected
+    cover, and the two point margins) — so the challenger ensemble share can be fit
+    offline from clean inputs (see _write_shares_calibration). None otherwise."""
     stats_h = _live_stats(home_prior, home_season_runs)
     stats_a = _live_stats(away_prior, away_season_runs)
     ml_key = "blended_prob" if serve_mode else "model_prob"
     sp_key = "cover_rate" if serve_mode else "model_cover_rate"
     tot_key = "over_hit_rate" if serve_mode else "model_over_hit_rate"
-    home_win = home_cover = total_over = home_pythag = None
+    home_win = home_cover = total_over = home_pythag = spread_comp = None
     for c in analyze_moneyline_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                      matchup_features=matchup_features):
         if c["home_away"] == "HOME":
@@ -1128,11 +1136,23 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
                                    matchup_features=matchup_features):
         if c["home_away"] == "HOME":
             home_cover = (c["spread"], c[sp_key] / 100.0)
+            # Present only when the expected-runs ensemble fired (MLB, data complete).
+            if c.get("current_model_cover_rate") is not None \
+                    and c.get("expected_runs_cover_rate") is not None:
+                spread_comp = {
+                    "current_cover": c["current_model_cover_rate"] / 100.0,
+                    "expected_cover": c["expected_runs_cover_rate"] / 100.0,
+                    "current_margin": c.get("current_pred_game_margin"),
+                    "expected_margin": (c["expected_home_runs"] - c["expected_away_runs"]
+                                        if c.get("expected_home_runs") is not None
+                                        and c.get("expected_away_runs") is not None
+                                        else None),
+                }
     tot = analyze_totals_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                matchup_features=matchup_features)
     if tot:
         total_over = (tot[0]["line"], tot[0][tot_key] / 100.0)
-    return home_win, home_cover, total_over, home_pythag
+    return home_win, home_cover, total_over, home_pythag, spread_comp
 
 
 # Cache the MLB starter matchup-feature builder + per-season team index so the
@@ -1224,7 +1244,8 @@ def _run_odds_backtest_impl(
         engine="live", prob_shrink=1.0, source="auto",
         supplement_log=True, min_shrink_n=MIN_SHRINK_N,
         collect_obs=None, collect_dated=None, collect_lineup=None,
-        collect_components=None, serve_mode=False, fit_blend=False):
+        collect_components=None, serve_mode=False, fit_blend=False,
+        fit_shares=False):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1367,6 +1388,12 @@ def _run_odds_backtest_impl(
     # (event_key, market) pairs graded from the warehouse/store — the log
     # supplement skips these so a warehouse-graded event is never double-counted.
     graded_keys = set()
+    # --fit-shares: accumulate RAW spread ensemble components across this SAME live
+    # write pass so the challenger share + spreads shrink/blend can be fit offline in
+    # serve order (see _write_shares_calibration). None unless we're going to fit.
+    collect_shares = ({"spreads": []}
+                      if (write_calibration and engine == "live" and fit_shares)
+                      else None)
     # Date span of matched games — bounds the log supplement to the same window
     # this run graded (so a --season/--limit scoped fit stays coherent).
     graded_lo = graded_hi = None
@@ -1430,7 +1457,7 @@ def _run_odds_backtest_impl(
                        if use_warehouse else None)
             away_sr = (_asof_season_runs(away, schedules, espn_teams, date)
                        if use_warehouse else None)
-            mwin, mhc, mov, mpyth = _live_spread_total_probs(
+            mwin, mhc, mov, mpyth, mscomp = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features,
                 home_season_runs=home_sr, away_season_runs=away_sr,
@@ -1478,6 +1505,17 @@ def _run_odds_backtest_impl(
                     if collect_dated is not None:
                         collect_dated["spreads"].append(
                             (date_et, model_cover, fair_cover, home_covers))
+                    # RAW spread ensemble components (recency cover pre-shrink +
+                    # additive/expected cover + the two point margins + de-vigged
+                    # market cover + outcome) so the challenger share, spreads shrink
+                    # and spreads blend can be fit offline in serve order. Only when
+                    # the expected-runs ensemble fired (mscomp present).
+                    if collect_shares is not None and mscomp is not None:
+                        collect_shares["spreads"].append((
+                            mscomp["current_cover"], mscomp["expected_cover"],
+                            fair_cover, home_covers,
+                            mscomp["current_margin"], mscomp["expected_margin"],
+                            actual_margin))
             if tot and mov is not None:
                 line, fair_over, price_o, price_u = tot
                 model_line, model_over = mov
@@ -1555,15 +1593,26 @@ def _run_odds_backtest_impl(
             else:
                 extra_obs = ({m: supplement[m]["obs"] for m in MARKETS}
                              if supplement else None)
+                # --fit-shares OWNS the spreads market end-to-end (shrink+share+blend
+                # from raw components), so the generic shrink/blend fitters must skip
+                # it to avoid double-counting the analyzer's composite cover.
+                _skip = {"spreads"} if fit_shares else set()
                 fitted_shrink = _write_shrink_calibration(
                     sport_key, results, extra_obs=extra_obs,
-                    min_shrink_n=min_shrink_n)
+                    min_shrink_n=min_shrink_n, skip_markets=_skip)
                 # --fit-blend: also fit + persist the model⇄market blend on the LIVE
                 # model, ON TOP of the shrink just fitted (serve order = shrink then
                 # blend). One raw pass yields both corrections, correctly sequenced.
                 if fit_blend:
                     _write_blend_calibration(
                         sport_key, results, shrink_map=(fitted_shrink or {}),
+                        min_n=min_shrink_n, skip_markets=_skip)
+                # --fit-shares: fit the MLB spreads ensemble stack (challenger
+                # spread_share + spreads shrink + spreads blend) from the raw
+                # components captured this pass.
+                if fit_shares:
+                    _write_shares_calibration(
+                        sport_key, (collect_shares or {}).get("spreads", []),
                         min_n=min_shrink_n)
         else:
             _write_blend_calibration(sport_key, results)
@@ -1670,7 +1719,8 @@ def _print_odds_results(results):
             f"Model calibration by confidence  (variant '{variant}')", named)
 
 
-def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0):
+def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0,
+                             skip_markets=()):
     """Write the best model⇄market blend weight per market (from the chosen
     variant) to calibration/<sport>.json so the live analyzers consume it.
 
@@ -1692,6 +1742,8 @@ def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0):
     blend = {}
     withheld = []
     for market in MARKETS:
+        if market in skip_markets:
+            continue
         obs = results[variant][market]["blend"]
         if shrink_map is not None:
             s = shrink_map.get(market, 1.0)
@@ -1732,6 +1784,141 @@ def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0):
     for market, cfg in blend.items():
         print(f"    {market:<10} w={cfg['w']:.2f}  (n={cfg['n']}, "
               f"blendBrier={cfg['blend_brier']})")
+
+
+def _sweep_min(objective, step=0.05):
+    """Return (best_x, best_val) minimizing objective(x) over x in [0,1]."""
+    best_x, best_val = 0.0, float("inf")
+    x = 0.0
+    while x <= 1.0001:
+        v = objective(x)
+        if v < best_val:
+            best_val, best_x = v, x
+        x += step
+    return round(best_x, 2), best_val
+
+
+def _write_shares_calibration(sport_key, share_obs, min_n=MIN_SHRINK_N):
+    """Fit + persist the FULL MLB spreads ensemble stack for the ADDITIVE model,
+    from RAW components captured in the same live --write-calibration pass, in the
+    exact serve order (_apply_shrink -> challenger spread_share blend -> market
+    blend). This OWNS the spreads market (the generic shrink/blend fitters skip it
+    under --fit-shares) because the analyzer's composite model_cover_rate already
+    bakes shrink + share in, so a generic fit on it would double-count.
+
+    share_obs: [(current_cover, expected_cover, market_cover|None, covered,
+                 current_margin|None, expected_margin|None, actual_margin|None)]
+      current_cover  = recency P(home covers), PRE-shrink
+      expected_cover = additive/expected-runs P(home covers) (NegBin)
+      covered        = 1 if the home spread actually covered
+
+    Writes: prob_shrink[spreads]=s*, expected_runs_challenger share
+    {home_minus_1_5: sigma*, margin: m*}, and market_blend[spreads]=w*.
+    A single n<min_n gate withholds the WHOLE fit (keeps s*, sigma*, w* mutually
+    consistent). Returns True when it wrote, False otherwise."""
+    from datetime import datetime, timezone
+    obs = list(share_obs or [])
+    n = len(obs)
+    # max(1, min_n): a min_n of 0 must still block the empty case (the sweeps below
+    # divide by n / nm), so we never fit on zero obs.
+    if n < max(1, min_n):
+        print(f"  [write-calibration] spreads shares withheld (thin sample n={n}, "
+              f"need n>={max(1, min_n)}; challenger block kept).")
+        return False
+
+    covered = [o[3] for o in obs]
+    cc = [o[0] for o in obs]
+    ec = [o[1] for o in obs]
+
+    # 1) spreads shrink s* on the RAW recency cover (clean; not the composite).
+    sres = _best_shrink([(o[0], None, o[3]) for o in obs])
+    best_s, s_brier, s_raw = sres if sres else (1.0, None, None)
+    served_s = best_s if (best_s < 1.0 and s_brier is not None
+                          and s_brier < s_raw - 1e-9) else 1.0
+
+    # 2) spread_share sigma* on shrink(current_cover, served_s) blended -> expected.
+    shrunk_cc = [_shrink_prob(c, served_s) for c in cc]
+
+    def _share_brier(sig):
+        return sum((sc + sig * (e - sc) - o) ** 2
+                   for sc, e, o in zip(shrunk_cc, ec, covered)) / n
+    sigma, sigma_brier = _sweep_min(_share_brier)
+    model_cover = [sc + sigma * (e - sc) for sc, e in zip(shrunk_cc, ec)]
+
+    # 3) spreads market blend w* on the sigma-blended cover -> de-vigged market.
+    mkt = [(mc, o) for mc, o in ((o[2], o[3]) for o in obs) if mc is not None]
+    mc_model = [model_cover[i] for i, o in enumerate(obs) if o[2] is not None]
+    best_w, w_brier, w_model_brier = 1.0, None, None
+    if len(mkt) >= max(1, min_n):
+        nm = len(mkt)
+
+        def _blend_brier(w):
+            return sum((w * mcm + (1 - w) * mk[0] - mk[1]) ** 2
+                       for mcm, mk in zip(mc_model, mkt)) / nm
+        best_w, w_brier = _sweep_min(_blend_brier)
+        w_model_brier = sum((mcm - mk[1]) ** 2
+                            for mcm, mk in zip(mc_model, mkt)) / nm
+
+    # 4) margin_share m* — DISPLAY ONLY (pred_game_margin); fit to the actual margin.
+    marg = [(o[4], o[5], o[6]) for o in obs
+            if o[4] is not None and o[5] is not None and o[6] is not None]
+    if marg:
+        def _margin_sse(m):
+            return sum((cm + m * (em - cm) - am) ** 2 for cm, em, am in marg)
+        margin_share, _ = _sweep_min(_margin_sse)
+    else:
+        margin_share = sigma  # no margin data -> mirror the cover share
+
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # ── persist ──
+    # Persist served_s ALWAYS (even 1.0) so the served spreads shrink is exactly the
+    # one sigma* was fit on — a candidate seeded from live could otherwise carry an
+    # inherited spreads shrink and break fit==serve. s=1.0 is a serve no-op
+    # (_apply_shrink returns p unchanged), so this only pins the invariant.
+    save_prob_shrink(sport_key, {"spreads": round(served_s, 2)},
+                     holdout={"spreads": {
+                         "brier": round(s_brier if served_s < 1.0 else s_raw, 4),
+                         "raw_brier": round(s_raw, 4), "n": n}},
+                     meta={"source": "odds backtest --fit-shares",
+                           "fit_timestamp": ts})
+    save_expected_runs_challenger_shares(
+        sport_key,
+        {"home_minus_1_5": round(sigma, 2), "margin": round(margin_share, 2)},
+        meta={"source": "odds backtest --fit-shares", "n": n,
+              "shrink": round(served_s, 2), "share_brier": round(sigma_brier, 5),
+              "fit_timestamp": ts})
+    blend_helped = (w_brier is not None and best_w < 1.0
+                    and w_brier < w_model_brier - 1e-9)
+    if blend_helped:
+        save_market_blend(sport_key, {"spreads": {
+            "w": best_w, "n": len(mkt), "blend_brier": round(w_brier, 5),
+            "model_brier": round(w_model_brier, 5), "on_shrunk": True,
+            "on_shares": True}}, meta={"source": "odds backtest --fit-shares",
+                                       "fit_timestamp": ts})
+    else:
+        # Pin the NO-OP blend (w=1.0) whenever the fit declines a market pull —
+        # mirrors the unconditional served_s pin above. Otherwise a candidate
+        # seeded from live could carry an INHERITED spreads blend that sigma* was
+        # never fit against, breaking fit==serve (adversarial-review finding 1).
+        # w=1.0 => serve applies no market pull (blend_w<1.0 gate stays closed).
+        save_market_blend(sport_key, {"spreads": {
+            "w": 1.0, "n": len(mkt), "on_shrunk": True, "on_shares": True}},
+            meta={"source": "odds backtest --fit-shares", "fit_timestamp": ts})
+
+    print(f"\n  [write-calibration] Wrote SPREADS ensemble stack (n={n}) to "
+          f"calibration/{active_write_label(sport_key)}:")
+    print(f"    shrink   s={served_s:.2f}"
+          + (f"  (brier {s_brier:.4f} vs raw {s_raw:.4f})" if served_s < 1.0
+             else "  (no shrink helped)"))
+    print(f"    share    spread_share={sigma:.2f}  margin_share={margin_share:.2f}"
+          f"  (brier {sigma_brier:.4f})")
+    if blend_helped:
+        print(f"    blend    w={best_w:.2f}  (brier {w_brier:.4f} vs "
+              f"model {w_model_brier:.4f}, n={len(mkt)})")
+    else:
+        print("    blend    w=1.00 pinned (market blend did not beat the ensemble)")
+    return True
 
 
 def _player_stat_series(espn_sport, espn_league, name, prop_key):
@@ -5145,6 +5332,14 @@ def main():
                         "0.5 = halve the edge). Fixes overconfidence; sweep and "
                         "watch the calibration table to find the value that "
                         "flattens it.")
+    p.add_argument("--fit-shares", action="store_true",
+                   help="(odds mode, live engine, MLB, with --write-calibration) Fit "
+                        "the SPREADS ensemble stack end-to-end from raw components — "
+                        "challenger spread_share (recency<->additive cover), plus the "
+                        "spreads prob_shrink and market blend — in serve order. Owns "
+                        "the spreads market: the generic shrink/blend fitters skip it "
+                        "(their composite cover would double-count). Requires the "
+                        "additive expected-runs projection to fire (data complete).")
     p.add_argument("--fit-blend", action="store_true",
                    help="(odds mode, live engine, with --write-calibration) After "
                         "fitting prob_shrink on the raw model prob, ALSO fit + persist "
@@ -5201,6 +5396,11 @@ def main():
                     "prob). Fit on a raw pass, then validate with --serve-mode.")
         if args.engine != "live":
             p.error("--serve-mode requires --engine live.")
+    if getattr(args, "fit_shares", False) or getattr(args, "fit_blend", False):
+        if not args.write_calibration:
+            p.error("--fit-shares / --fit-blend only apply with --write-calibration.")
+        if args.engine != "live":
+            p.error("--fit-shares / --fit-blend require --engine live.")
 
     # EXPERIMENT hook: activate the lineup-offense margin shift for THIS backtest
     # run only (live stays inert until fit + wired). Set before any analyzer runs.
@@ -5347,7 +5547,8 @@ def main():
                               engine=args.engine, prob_shrink=args.prob_shrink,
                               source=args.source, supplement_log=args.supplement_log,
                               min_shrink_n=args.min_shrink_n,
-                              serve_mode=args.serve_mode, fit_blend=args.fit_blend)
+                              serve_mode=args.serve_mode, fit_blend=args.fit_blend,
+                              fit_shares=args.fit_shares)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,

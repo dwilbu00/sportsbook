@@ -399,12 +399,23 @@ def save_market_blend(sport_key, blend, meta=None):
     """
     Persist per-market blend weights into calibration/<sport>.json, preserving
     the existing 'props' calibration block.
+
+    The per-market weights are MERGED into any existing market_blend block (like
+    prob_shrink) so a partial fit — e.g. the spreads-only shares fitter writing
+    just the spreads blend, or a moneyline/totals run — updates only the markets
+    it fit and leaves the others intact instead of wiping them.
     """
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
     blob = _load_write_blob(sport_key)
     blob["sport_key"] = sport_key
     blob.setdefault("props", blob.get("props", {}))
-    blob["market_blend"] = blend
+    existing = blob.get("market_blend")
+    if isinstance(existing, dict):
+        merged = dict(existing)
+        merged.update(blend)
+        blob["market_blend"] = merged
+    else:
+        blob["market_blend"] = blend
     if meta:
         blob.setdefault("meta", {})
         if isinstance(blob["meta"], dict):
@@ -456,6 +467,45 @@ def save_starter_adjustment(sport_key, adj, meta=None):
                 blob["meta"]["starter_adjustment"] = meta
         else:
             blob["meta"] = {"starter_adjustment": meta}
+    with open(_write_path(sport_key), "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+
+
+def save_expected_runs_challenger_shares(sport_key, shares, meta=None):
+    """Update ONLY the challenger ensemble blend shares
+    (expected_runs_challenger.final_2025_validation.ensemble_challenger_share)
+    in calibration/<sport>.json, preserving the rest of the challenger block
+    (enabled / live_markets / the fallback multiplicative `model`) and every
+    other calibration block. ``shares`` = {"home_minus_1_5": <spread_share>,
+    "margin": <margin_share>}. Candidate-aware via _load_write_blob / _write_path."""
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    blob = _load_write_blob(sport_key)
+    blob["sport_key"] = sport_key
+    blob.setdefault("props", blob.get("props", {}))
+    chal = blob.get("expected_runs_challenger")
+    if not isinstance(chal, dict):
+        chal = {}
+    fv = chal.get("final_2025_validation")
+    if not isinstance(fv, dict):
+        fv = {}
+    # Per-key MERGE (like save_prob_shrink / save_market_blend): update only the
+    # shares we fit (home_minus_1_5 / margin) and preserve any sibling keys (e.g. a
+    # moneyline challenger share) instead of clobbering the whole sub-block.
+    existing_share = fv.get("ensemble_challenger_share")
+    if isinstance(existing_share, dict):
+        merged = dict(existing_share)
+        merged.update(shares)
+        fv["ensemble_challenger_share"] = merged
+    else:
+        fv["ensemble_challenger_share"] = shares
+    chal["final_2025_validation"] = fv
+    blob["expected_runs_challenger"] = chal
+    if meta:
+        blob.setdefault("meta", {})
+        if isinstance(blob["meta"], dict):
+            blob["meta"]["expected_runs_challenger_share"] = meta
+        else:
+            blob["meta"] = {"expected_runs_challenger_share": meta}
     with open(_write_path(sport_key), "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2)
 

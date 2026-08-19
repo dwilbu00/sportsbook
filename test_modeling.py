@@ -2499,7 +2499,7 @@ class ServeModeGradingTests(unittest.TestCase):
              patch("backtest.analyze_moneyline_value", lambda *a, **k: ml), \
              patch("backtest.analyze_spreads_value", lambda *a, **k: sp), \
              patch("backtest.analyze_totals_value", lambda *a, **k: tot):
-            hw, hc, ov, _ = backtest._live_spread_total_probs(
+            hw, hc, ov, _, _sc = backtest._live_spread_total_probs(
                 {}, [], [], 5.0, "baseball_mlb", serve_mode=False)
         self.assertAlmostEqual(hw, 0.70)
         self.assertAlmostEqual(hc[1], 0.65)
@@ -2512,7 +2512,7 @@ class ServeModeGradingTests(unittest.TestCase):
              patch("backtest.analyze_moneyline_value", lambda *a, **k: ml), \
              patch("backtest.analyze_spreads_value", lambda *a, **k: sp), \
              patch("backtest.analyze_totals_value", lambda *a, **k: tot):
-            hw, hc, ov, _ = backtest._live_spread_total_probs(
+            hw, hc, ov, _, _sc = backtest._live_spread_total_probs(
                 {}, [], [], 5.0, "baseball_mlb", serve_mode=True)
         self.assertAlmostEqual(hw, 0.58)
         self.assertAlmostEqual(hc[1], 0.55)
@@ -2643,6 +2643,190 @@ class LiveBlendWriteTests(unittest.TestCase):
             self.assertTrue(blob["meta"]["market_blend"]["on_shrunk_probs"])
         finally:
             cl.CALIBRATION_DIR = orig_dir
+
+
+class ChallengerShareSaveTests(unittest.TestCase):
+    """save_expected_runs_challenger_shares updates ONLY the ensemble blend shares
+    and preserves the rest of the challenger block + other calibration blocks."""
+
+    def setUp(self):
+        import calibration_loader as cl
+        self.cl = cl
+        self._dir = tempfile.mkdtemp()
+        self._orig = cl.CALIBRATION_DIR
+        cl.CALIBRATION_DIR = self._dir
+
+    def tearDown(self):
+        self.cl.CALIBRATION_DIR = self._orig
+
+    def test_preserves_model_and_live_markets(self):
+        cl = self.cl
+        path = cl.calibration_path("baseball_mlb")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sport_key": "baseball_mlb", "props": {"x": 1},
+                       "expected_runs_challenger": {
+                           "enabled": True,
+                           "live_markets": {"spreads": True},
+                           "final_2025_validation": {
+                               "model": {"offense_weight": 0.5},
+                               "ensemble_challenger_share": {
+                                   "home_minus_1_5": 0.3, "margin": 0.4}}}}, f)
+        cl.save_expected_runs_challenger_shares(
+            "baseball_mlb", {"home_minus_1_5": 0.7, "margin": 0.6})
+        with open(path, encoding="utf-8") as f:
+            blob = json.load(f)
+        chal = blob["expected_runs_challenger"]
+        self.assertTrue(chal["enabled"])
+        self.assertEqual(chal["live_markets"], {"spreads": True})
+        self.assertEqual(chal["final_2025_validation"]["model"],
+                         {"offense_weight": 0.5})
+        self.assertEqual(chal["final_2025_validation"]["ensemble_challenger_share"],
+                         {"home_minus_1_5": 0.7, "margin": 0.6})
+        self.assertEqual(blob["props"], {"x": 1})
+
+    def test_preserves_sibling_share_keys(self):
+        # A sibling key (e.g. a moneyline challenger share) must survive a
+        # spreads-only fit (per-key merge, not wholesale replace).
+        cl = self.cl
+        path = cl.calibration_path("baseball_mlb")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sport_key": "baseball_mlb", "expected_runs_challenger": {
+                "final_2025_validation": {"ensemble_challenger_share": {
+                    "moneyline": 0.75, "home_minus_1_5": 0.3, "margin": 0.4}}}}, f)
+        cl.save_expected_runs_challenger_shares(
+            "baseball_mlb", {"home_minus_1_5": 0.7, "margin": 0.6})
+        with open(path, encoding="utf-8") as f:
+            share = json.load(f)["expected_runs_challenger"][
+                "final_2025_validation"]["ensemble_challenger_share"]
+        self.assertEqual(share, {"moneyline": 0.75,
+                                 "home_minus_1_5": 0.7, "margin": 0.6})
+
+
+class GenericFitterSkipTests(unittest.TestCase):
+    """The generic shrink/blend fitters honor skip_markets (so --fit-shares can own
+    the spreads market without the generic fit double-counting its composite cover)."""
+
+    def _results(self, per_market):
+        return {"live": {m: {"blend": list(per_market.get(m, [])),
+                             "n": len(per_market.get(m, []))} for m in
+                         ("moneyline", "spreads", "totals")}}
+
+    def test_shrink_skips_spreads(self):
+        import backtest
+        # Overconfident obs in every market so shrink WOULD fire if not skipped.
+        obs = [(0.9, 0.5, 1)] * 100 + [(0.9, 0.5, 0)] * 100
+        results = self._results({"moneyline": obs, "spreads": obs, "totals": obs})
+        with patch("backtest.save_prob_shrink") as save:
+            backtest._write_shrink_calibration(
+                "baseball_mlb", results, min_shrink_n=1, skip_markets={"spreads"})
+        written = save.call_args[0][1]
+        self.assertIn("moneyline", written)
+        self.assertNotIn("spreads", written)
+
+    def test_blend_skips_spreads(self):
+        import backtest
+        # Overconfident model (0.9) covering only 55% while the market (0.55) is
+        # calibrated -> blending toward market helps -> weight WOULD be written if
+        # spreads were not skipped.
+        obs = [(0.9, 0.55, 1)] * 110 + [(0.9, 0.55, 0)] * 90
+        results = self._results({"moneyline": obs, "spreads": obs, "totals": obs})
+        with patch("backtest.save_market_blend") as save:
+            backtest._write_blend_calibration(
+                "baseball_mlb", results, min_n=1, skip_markets={"spreads"})
+        written = save.call_args[0][1]
+        self.assertIn("moneyline", written)
+        self.assertNotIn("spreads", written)
+
+
+class SharesFitterTests(unittest.TestCase):
+    """Gap E: the MLB spreads ensemble fitter recovers the Brier-optimal
+    challenger spread_share and writes the full stack (shrink/share/blend) in
+    serve order, from RAW components."""
+
+    def setUp(self):
+        import calibration_loader as cl
+        self.cl = cl
+        self._dir = tempfile.mkdtemp()
+        self._orig = cl.CALIBRATION_DIR
+        cl.CALIBRATION_DIR = self._dir
+
+    def tearDown(self):
+        self.cl.CALIBRATION_DIR = self._orig
+
+    def test_recovers_share_when_additive_perfect(self):
+        import backtest
+        cl = self.cl
+        # Recency cover uninformative (0.5); additive cover perfectly separates;
+        # display margin equals actual. Optimal share -> 1.0, margin_share -> 1.0,
+        # no shrink (0.5 is unshrinkable), no market blend (market uninformative).
+        obs = ([(0.5, 0.9, 0.5, 1, 0.0, 2.0, 2.0)] * 100
+               + [(0.5, 0.1, 0.5, 0, 0.0, -2.0, -2.0)] * 100)
+        wrote = backtest._write_shares_calibration("baseball_mlb", obs, min_n=1)
+        self.assertTrue(wrote)
+        with open(cl.calibration_path("baseball_mlb"), encoding="utf-8") as f:
+            blob = json.load(f)
+        share = blob["expected_runs_challenger"]["final_2025_validation"][
+            "ensemble_challenger_share"]
+        self.assertEqual(share["home_minus_1_5"], 1.0)
+        self.assertEqual(share["margin"], 1.0)
+        # 0.5 is unshrinkable -> served_s pinned to the no-op 1.0 (fit==serve).
+        self.assertEqual(blob["prob_shrink"]["spreads"], 1.0)
+        # Market uninformative -> blend pinned to the no-op w=1.0 (not omitted), so
+        # an inherited spreads blend can't survive and break fit==serve.
+        self.assertEqual(blob["market_blend"]["spreads"]["w"], 1.0)
+
+    def test_inherited_blend_pinned_to_noop(self):
+        import backtest
+        cl = self.cl
+        # A candidate seeded from live carries an inherited spreads blend w=0.6.
+        with open(cl.calibration_path("baseball_mlb"), "w", encoding="utf-8") as f:
+            json.dump({"sport_key": "baseball_mlb",
+                       "market_blend": {"spreads": {"w": 0.6},
+                                        "moneyline": {"w": 0.5}}}, f)
+        # Data where the market is uninformative -> blend does not beat the model.
+        obs = ([(0.5, 0.9, 0.5, 1, 0.0, 2.0, 2.0)] * 100
+               + [(0.5, 0.1, 0.5, 0, 0.0, -2.0, -2.0)] * 100)
+        backtest._write_shares_calibration("baseball_mlb", obs, min_n=1)
+        with open(cl.calibration_path("baseball_mlb"), encoding="utf-8") as f:
+            mb = json.load(f)["market_blend"]
+        self.assertEqual(mb["spreads"]["w"], 1.0)   # inherited 0.6 neutralized
+        self.assertEqual(mb["moneyline"]["w"], 0.5)  # sibling market untouched
+
+    def test_min_n_zero_does_not_crash_on_empty(self):
+        import backtest
+        # min_n=0 must NOT divide-by-zero on empty obs (max(1,min_n) guard).
+        self.assertFalse(
+            backtest._write_shares_calibration("baseball_mlb", [], min_n=0))
+
+    def test_shrink_fires_and_persists(self):
+        import backtest
+        cl = self.cl
+        # Overconfident recency cover (0.85, covers 60%); additive uninformative.
+        obs = ([(0.85, 0.5, None, 1, 0.0, 0.0, 0.0)] * 120
+               + [(0.85, 0.5, None, 0, 0.0, 0.0, 0.0)] * 80)
+        backtest._write_shares_calibration("baseball_mlb", obs, min_n=1)
+        with open(cl.calibration_path("baseball_mlb"), encoding="utf-8") as f:
+            blob = json.load(f)
+        self.assertIn("spreads", blob["prob_shrink"])
+        self.assertLess(blob["prob_shrink"]["spreads"], 1.0)
+
+    def test_thin_sample_withheld(self):
+        import backtest
+        cl = self.cl
+        obs = [(0.5, 0.9, 0.5, 1, 0.0, 2.0, 2.0)] * 3
+        wrote = backtest._write_shares_calibration("baseball_mlb", obs, min_n=1000)
+        self.assertFalse(wrote)
+        self.assertFalse(os.path.exists(cl.calibration_path("baseball_mlb")))
+
+    def test_fit_matches_serve_formula(self):
+        import backtest
+        # The fitter's cover formula must equal analysis serve order:
+        #   shrink(cc) -> +share*(ec-shrink(cc)).  Cross-check on a hand value.
+        cc, ec, s, sig = 0.80, 0.60, 0.50, 0.40
+        shrunk = backtest._shrink_prob(cc, s)           # 0.5 + 0.5*(0.8-0.5)=0.65
+        model_cover = shrunk + sig * (ec - shrunk)      # 0.65 + 0.4*(-0.05)=0.63
+        self.assertAlmostEqual(shrunk, 0.65)
+        self.assertAlmostEqual(model_cover, 0.63)
 
 
 if __name__ == "__main__":
