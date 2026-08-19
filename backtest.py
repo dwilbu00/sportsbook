@@ -1454,6 +1454,11 @@ def _run_odds_backtest_impl(
     graded_lo = graded_hi = None
 
     matched = 0
+    # Diagnostic: how many graded games read matchup features straight from the
+    # in-memory prewarm dict vs. fell back to a SERIAL _matchup_features_for
+    # recompute (a key miss). A non-trivial miss count is the one thing that makes
+    # the live grading phase genuinely slower than the prewarm implies.
+    _pw_hits = _pw_miss = 0
     for game in all_games:
         date = game.get("date")
         home, away = game.get("home_team"), game.get("away_team")
@@ -1502,9 +1507,13 @@ def _run_odds_backtest_impl(
                 entry.get("away_team"))
             ekeys = (gkey, ev_id) if ev_id else (gkey,)
             _mk = (date_et, home, away)
-            matchup_features = (prewarm_features[_mk] if _mk in prewarm_features
-                                else _matchup_features_for(home, away, date_et,
-                                                           sport_key))
+            if _mk in prewarm_features:
+                matchup_features = prewarm_features[_mk]
+                _pw_hits += 1
+            else:
+                matchup_features = _matchup_features_for(home, away, date_et,
+                                                         sport_key)
+                _pw_miss += 1
             # As-of season run-differential for the Pythagorean blend (MLB only;
             # DEFAULT_PYTHAG_WEIGHT). Zero extra queries — summed from the already-
             # loaded schedules through the day before this game (leakage-safe).
@@ -1652,6 +1661,11 @@ def _run_odds_backtest_impl(
 
     print(f"\nMatched {matched} games to stored closing lines "
           f"(threshold {threshold_pct:.1f}%).")
+    if engine == "live":
+        print(f"[grade] matchup features: {_pw_hits} from prewarm, "
+              f"{_pw_miss} recomputed serially"
+              + ("  <-- SERIAL FALLBACK (key miss) is slowing grading"
+                 if _pw_miss else ""))
     _print_odds_results(results)
 
     # Model-side holdout supplement from the durable prediction log (live only),
