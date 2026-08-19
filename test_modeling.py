@@ -2476,5 +2476,68 @@ class WeatherFetchTests(unittest.TestCase):
         self.assertFalse(w["dome"])
 
 
+class ServeModeGradingTests(unittest.TestCase):
+    """Gap A: the odds backtest's serve-mode grades the ALREADY-served probs
+    (per-market prob_shrink + model<->market blend applied inside the analyzers),
+    so a holdout grades exactly what production would serve. Raw mode (default)
+    keeps returning the pre-shrink/pre-blend model prob for the shrink FIT."""
+
+    def _fake_analyzers(self):
+        # Distinct raw vs served values so the field selection is unambiguous.
+        ml = [{"home_away": "HOME", "model_prob": 70.0, "blended_prob": 58.0,
+               "pythag_win_pct": None}]
+        sp = [{"home_away": "HOME", "spread": -1.5,
+               "model_cover_rate": 65.0, "cover_rate": 55.0}]
+        tot = [{"line": 8.5, "model_over_hit_rate": 62.0, "over_hit_rate": 53.0}]
+        return ml, sp, tot
+
+    def test_raw_mode_returns_pure_model_fields(self):
+        import backtest
+        ml, sp, tot = self._fake_analyzers()
+        with patch("backtest._live_stats", lambda *a, **k: {}), \
+             patch("backtest.analyze_moneyline_value", lambda *a, **k: ml), \
+             patch("backtest.analyze_spreads_value", lambda *a, **k: sp), \
+             patch("backtest.analyze_totals_value", lambda *a, **k: tot):
+            hw, hc, ov, _ = backtest._live_spread_total_probs(
+                {}, [], [], 5.0, "baseball_mlb", serve_mode=False)
+        self.assertAlmostEqual(hw, 0.70)
+        self.assertAlmostEqual(hc[1], 0.65)
+        self.assertAlmostEqual(ov[1], 0.62)
+
+    def test_serve_mode_returns_served_fields(self):
+        import backtest
+        ml, sp, tot = self._fake_analyzers()
+        with patch("backtest._live_stats", lambda *a, **k: {}), \
+             patch("backtest.analyze_moneyline_value", lambda *a, **k: ml), \
+             patch("backtest.analyze_spreads_value", lambda *a, **k: sp), \
+             patch("backtest.analyze_totals_value", lambda *a, **k: tot):
+            hw, hc, ov, _ = backtest._live_spread_total_probs(
+                {}, [], [], 5.0, "baseball_mlb", serve_mode=True)
+        self.assertAlmostEqual(hw, 0.58)
+        self.assertAlmostEqual(hc[1], 0.55)
+        self.assertAlmostEqual(ov[1], 0.53)
+
+    def test_serve_mode_rejects_calibration_fit(self):
+        import backtest
+        with self.assertRaises(ValueError):
+            backtest._run_odds_backtest_impl(
+                "baseball_mlb", "baseball", "mlb", 10, 20, {},
+                serve_mode=True, write_calibration=True)
+
+    def test_serve_mode_rejects_collect_obs(self):
+        import backtest
+        with self.assertRaises(ValueError):
+            backtest._run_odds_backtest_impl(
+                "baseball_mlb", "baseball", "mlb", 10, 20, {},
+                serve_mode=True, collect_obs={"moneyline": []})
+
+    def test_serve_mode_requires_live_engine(self):
+        import backtest
+        with self.assertRaises(ValueError):
+            backtest._run_odds_backtest_impl(
+                "baseball_mlb", "baseball", "mlb", 10, 20, {},
+                serve_mode=True, engine="convolution")
+
+
 if __name__ == "__main__":
     unittest.main()

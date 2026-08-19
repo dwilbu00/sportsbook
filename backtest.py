@@ -1096,20 +1096,26 @@ def _live_stats(prior_games, season_runs=None):
 
 def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport_key,
                              matchup_features=None, home_season_runs=None,
-                             away_season_runs=None):
-    """Run the ACTUAL live analyzers and return the PURE-model (pre-blend)
-    probabilities: (home_win_prob, (home_spread, P_home_cover),
-    (total_line, P_over)). This makes the backtest grade exactly what
-    production computes — including the MLB starter adjustment when
-    ``matchup_features`` is supplied and the Pythagorean blend when
-    ``home_season_runs`` / ``away_season_runs`` are supplied (MLB)."""
+                             away_season_runs=None, serve_mode=False):
+    """Run the ACTUAL live analyzers and return probabilities:
+    (home_win_prob, (home_spread, P_home_cover), (total_line, P_over)).
+
+    serve_mode=False (default): PURE-model (pre-shrink/pre-blend) fields — what the
+    shrink FIT needs and what the raw model + a single --prob-shrink grades.
+    serve_mode=True: the SERVED fields (per-market prob_shrink + model<->market blend
+    already applied inside the analyzers) — so a holdout grades EXACTLY what production
+    would serve under the (staged) calibration. Includes the MLB starter adjustment
+    (matchup_features) + Pythagorean blend (home/away_season_runs)."""
     stats_h = _live_stats(home_prior, home_season_runs)
     stats_a = _live_stats(away_prior, away_season_runs)
+    ml_key = "blended_prob" if serve_mode else "model_prob"
+    sp_key = "cover_rate" if serve_mode else "model_cover_rate"
+    tot_key = "over_hit_rate" if serve_mode else "model_over_hit_rate"
     home_win = home_cover = total_over = home_pythag = None
     for c in analyze_moneyline_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                      matchup_features=matchup_features):
         if c["home_away"] == "HOME":
-            home_win = c["model_prob"] / 100.0
+            home_win = c[ml_key] / 100.0
             # Raw home Pythagorean win prob (computed regardless of blend weight) —
             # captured so an A(recency) x B(pythag) sweep can recombine them offline.
             if c.get("pythag_win_pct") is not None:
@@ -1117,11 +1123,11 @@ def _live_spread_total_probs(entry, home_prior, away_prior, threshold_pct, sport
     for c in analyze_spreads_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                    matchup_features=matchup_features):
         if c["home_away"] == "HOME":
-            home_cover = (c["spread"], c["model_cover_rate"] / 100.0)
+            home_cover = (c["spread"], c[sp_key] / 100.0)
     tot = analyze_totals_value(entry, stats_h, stats_a, threshold_pct, sport_key,
                                matchup_features=matchup_features)
     if tot:
-        total_over = (tot[0]["line"], tot[0]["model_over_hit_rate"] / 100.0)
+        total_over = (tot[0]["line"], tot[0][tot_key] / 100.0)
     return home_win, home_cover, total_over, home_pythag
 
 
@@ -1214,7 +1220,7 @@ def _run_odds_backtest_impl(
         engine="live", prob_shrink=1.0, source="auto",
         supplement_log=True, min_shrink_n=MIN_SHRINK_N,
         collect_obs=None, collect_dated=None, collect_lineup=None,
-        collect_components=None):
+        collect_components=None, serve_mode=False):
     """
     Grade the model's moneyline / spread / total value flags against stored
     historical closing lines: realized ROI, model-vs-market Brier, and the
@@ -1232,6 +1238,21 @@ def _run_odds_backtest_impl(
     """
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
     threshold = threshold_pct / 100.0
+
+    if serve_mode:
+        # Serve-mode grades the ALREADY-served probs (per-market prob_shrink + blend
+        # applied inside the analyzers). It is a holdout-validation pass, mutually
+        # exclusive with FITTING: --write-calibration and raw-obs collection both
+        # need the pre-shrink/pre-blend model prob.
+        if write_calibration or collect_obs is not None:
+            raise ValueError(
+                "serve_mode cannot fit calibration: it grades the served "
+                "(shrunk+blended) probs, but --write-calibration / raw-obs "
+                "collection need the raw model prob. Fit on a raw pass, then "
+                "validate the staged file on a separate serve-mode pass.")
+        if engine != "live":
+            raise ValueError("serve_mode requires --engine live (it grades the "
+                             "production analyzers' served output).")
 
     store, source_used = _load_odds_store(sport_key, store_label, source)
     print(f"\n[odds source: {source_used}]")
@@ -1408,10 +1429,14 @@ def _run_odds_backtest_impl(
             mwin, mhc, mov, mpyth = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features,
-                home_season_runs=home_sr, away_season_runs=away_sr)
+                home_season_runs=home_sr, away_season_runs=away_sr,
+                serve_mode=serve_mode)
+            # serve-mode: analyzers already applied prob_shrink + blend, so grade the
+            # value as-is; raw-mode: apply the single sweepable prob_shrink scalar.
+            _gp = (lambda x: x) if serve_mode else (lambda x: _shrink_prob(x, prob_shrink))
             if ml and mwin is not None:
                 fair_home, price_home, price_away = ml
-                _grade(r["moneyline"], _shrink_prob(mwin, prob_shrink),
+                _grade(r["moneyline"], _gp(mwin),
                        fair_home, home_won, price_home, price_away, threshold)
                 graded_keys.update((t, "moneyline") for t in ekeys)
                 if collect_obs is not None:
@@ -1440,7 +1465,7 @@ def _run_odds_backtest_impl(
                 if (abs(model_spread - home_spread) < 1e-9
                         and abs(actual_margin + home_spread) > 1e-9):
                     home_covers = 1 if (actual_margin + home_spread) > 0 else 0
-                    _grade(r["spreads"], _shrink_prob(model_cover, prob_shrink),
+                    _grade(r["spreads"], _gp(model_cover),
                            fair_cover, home_covers, price_h, price_a, threshold)
                     graded_keys.update((t, "spreads") for t in ekeys)
                     if collect_obs is not None:
@@ -1455,7 +1480,7 @@ def _run_odds_backtest_impl(
                 if (abs(model_line - line) < 1e-9
                         and abs(actual_total - line) > 1e-9):
                     over_hit = 1 if actual_total > line else 0
-                    _grade(r["totals"], _shrink_prob(model_over, prob_shrink),
+                    _grade(r["totals"], _gp(model_over),
                            fair_over, over_hit, price_o, price_u, threshold)
                     graded_keys.update((t, "totals") for t in ekeys)
                     if collect_obs is not None:
@@ -5082,6 +5107,14 @@ def main():
                         "0.5 = halve the edge). Fixes overconfidence; sweep and "
                         "watch the calibration table to find the value that "
                         "flattens it.")
+    p.add_argument("--serve-mode", action="store_true",
+                   help="(odds mode, live engine) Grade the SERVED probabilities — "
+                        "per-market prob_shrink + model<->market blend applied INSIDE "
+                        "the analyzers — instead of the raw model prob. This is the "
+                        "holdout-VALIDATION pass: it grades exactly what production "
+                        "would serve under the live (or --staging candidate) "
+                        "calibration. Mutually exclusive with --write-calibration "
+                        "(fitting needs the raw prob).")
     p.add_argument("--cross-season", choices=["strict", "all"], default="strict",
                    help="(props mode) 'strict' (default) keeps only current-season "
                         "prior games per test observation; 'all' uses the full "
@@ -5115,6 +5148,14 @@ def main():
                         " sweep whether the lineup input helps, e.g. --lineup-weight"
                         " 3. Default None keeps the inert 0.0.")
     args = p.parse_args()
+
+    if getattr(args, "serve_mode", False):
+        if args.write_calibration:
+            p.error("--serve-mode grades the served (shrunk+blended) probs and "
+                    "cannot also --write-calibration (fitting needs the raw model "
+                    "prob). Fit on a raw pass, then validate with --serve-mode.")
+        if args.engine != "live":
+            p.error("--serve-mode requires --engine live.")
 
     # EXPERIMENT hook: activate the lineup-offense margin shift for THIS backtest
     # run only (live stays inert until fit + wired). Set before any analyzer runs.
@@ -5260,7 +5301,8 @@ def main():
                               variance_inflate=args.variance_inflate,
                               engine=args.engine, prob_shrink=args.prob_shrink,
                               source=args.source, supplement_log=args.supplement_log,
-                              min_shrink_n=args.min_shrink_n)
+                              min_shrink_n=args.min_shrink_n,
+                              serve_mode=args.serve_mode)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
