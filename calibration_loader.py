@@ -91,9 +91,47 @@ _CANDIDATE_MODE = False
 
 
 def set_candidate_mode(on):
-    """Enable/disable candidate-file staging for calibration writes (process-global)."""
+    """Enable/disable candidate-file staging for calibration WRITES (process-global).
+    Does NOT change serving reads — serving stays LIVE even mid-staging, so a refit
+    building a candidate never makes the app serve unpromoted values. To grade a STAGED
+    calibration in an offline backtest, use set_serving_candidate() (separate flag)."""
     global _CANDIDATE_MODE
     _CANDIDATE_MODE = bool(on)
+
+
+_SERVING_CANDIDATE = False
+
+
+def set_serving_candidate(on):
+    """Enable/disable candidate-aware SERVING reads (process-global) — OFFLINE backtest
+    ONLY, so it can grade a STAGED team-market calibration (additive / prob_shrink /
+    market_blend / challenger) on a holdout WITHOUT promoting. Kept SEPARATE from
+    set_candidate_mode (writes) so the invariant 'serving reads stay live mid-staging'
+    holds for the refit + the live app (which never enables this). Clears the serving
+    caches so a toggle never cross-serves a stale block."""
+    global _SERVING_CANDIDATE
+    _SERVING_CANDIDATE = bool(on)
+    _reset_serving_caches()
+
+
+def serving_candidate_active():
+    return _SERVING_CANDIDATE
+
+
+def _reset_serving_caches():
+    """Invalidate every process-level calibration serving cache (this module's additive
+    cache + pricing_common's shrink/blend caches + analysis's challenger cache) so a
+    candidate-mode toggle can't cross-serve a stale live/candidate block. Reaches
+    already-imported modules via sys.modules (no import cycle)."""
+    import sys
+    _ADDITIVE_CFG_CACHE.clear()
+    pc = sys.modules.get("pricing_common")
+    if pc is not None:
+        getattr(pc, "_PROB_SHRINK_CACHE", {}).clear()
+        getattr(pc, "_MARKET_BLEND_CACHE", {}).clear()
+    an = sys.modules.get("analysis")
+    if an is not None:
+        getattr(an, "_EXPECTED_RUNS_CACHE", {}).clear()
 
 
 def candidate_mode_active():
@@ -160,6 +198,24 @@ def _load_blob(sport_key):
     candidate never changes what the app serves.
     """
     return _read_json(calibration_path(sport_key)) or {}
+
+
+def _serving_path(sport_key):
+    """Path a SERVE/grade-time read resolves to: the staged candidate when candidate
+    mode is active AND one exists (so an OFFLINE backtest grades the staged team-market
+    calibration without promoting), else the live file. The live app never enables
+    candidate mode -> serving always reads live (byte-identical)."""
+    if _SERVING_CANDIDATE and has_candidate(sport_key):
+        return candidate_path(sport_key)
+    return calibration_path(sport_key)
+
+
+def _serving_blob(sport_key):
+    """The calibration blob a serve/grade-time reader should use — candidate-aware via
+    _serving_path. Every team-market serving reader (prob_shrink, market_blend,
+    expected_runs_challenger, starter_adjustment) goes through here so a candidate-staged
+    calibration can be graded on a holdout without promoting."""
+    return _read_json(_serving_path(sport_key)) or {}
 
 
 def _load_write_blob(sport_key):
@@ -336,7 +392,7 @@ def load_market_blend(sport_key):
     """
     if not sport_key:
         return {}
-    return _load_blob(sport_key).get("market_blend", {})
+    return _serving_blob(sport_key).get("market_blend", {})
 
 
 def save_market_blend(sport_key, blend, meta=None):
@@ -372,14 +428,14 @@ def load_starter_adjustment(sport_key):
     """
     if not sport_key:
         return {}
-    return _load_blob(sport_key).get("starter_adjustment", {})
+    return _serving_blob(sport_key).get("starter_adjustment", {})
 
 
 def load_expected_runs_challenger(sport_key):
     """Load the validated MLB expected-runs market configuration."""
     if not sport_key:
         return {}
-    return _load_blob(sport_key).get("expected_runs_challenger", {})
+    return _serving_blob(sport_key).get("expected_runs_challenger", {})
 
 
 def save_starter_adjustment(sport_key, adj, meta=None):
@@ -423,8 +479,7 @@ def load_expected_runs_additive(sport_key):
     switch never cross-serves, and any write (--promote / save) auto-invalidates."""
     if not sport_key:
         return {}
-    use_candidate = candidate_mode_active() and has_candidate(sport_key)
-    path = candidate_path(sport_key) if use_candidate else calibration_path(sport_key)
+    path = _serving_path(sport_key)
     try:
         st = os.stat(path)
         stat_key = (path, st.st_mtime_ns, st.st_size)
@@ -497,7 +552,7 @@ def load_prob_shrink(sport_key):
     """
     if not sport_key:
         return {}
-    return _load_blob(sport_key).get("prob_shrink", {})
+    return _serving_blob(sport_key).get("prob_shrink", {})
 
 
 def save_prob_shrink(sport_key, shrink, meta=None, holdout=None):

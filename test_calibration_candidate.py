@@ -25,21 +25,21 @@ SK = "baseball_mlb"
 
 
 class AdditiveCandidateReadTests(unittest.TestCase):
-    """load_expected_runs_additive is candidate-aware ONLY under candidate mode — so an
-    OFFLINE backtest can grade a staged additive config (park/fatigue run_env) without
-    promoting to live, while the live app (never in candidate mode) always reads live."""
+    """Candidate-aware SERVING reads (set_serving_candidate) — so an OFFLINE backtest can
+    grade a staged team-market calibration (additive / prob_shrink / market_blend /
+    challenger) on a holdout WITHOUT promoting. The live app never enables it (always
+    reads live), and it's SEPARATE from set_candidate_mode (writes) so a refit's serving
+    reads stay live mid-staging."""
 
     def setUp(self):
         self._dir = tempfile.mkdtemp()
         self._orig_dir = cl.CALIBRATION_DIR
         cl.CALIBRATION_DIR = self._dir
-        cl.set_candidate_mode(False)
-        cl._ADDITIVE_CFG_CACHE.clear()
+        cl.set_serving_candidate(False)
 
     def tearDown(self):
         cl.CALIBRATION_DIR = self._orig_dir
-        cl.set_candidate_mode(False)
-        cl._ADDITIVE_CFG_CACHE.clear()
+        cl.set_serving_candidate(False)
 
     def _write(self, path, park_weight):
         with open(path, "w", encoding="utf-8") as f:
@@ -50,30 +50,70 @@ class AdditiveCandidateReadTests(unittest.TestCase):
         return (cl.load_expected_runs_additive(SK).get("run_env") or {}).get(
             "park_weight")
 
-    def test_mode_off_reads_live_even_with_candidate(self):
+    def test_off_reads_live_even_with_candidate(self):
         self._write(cl.calibration_path(SK), 0.0)
         self._write(cl.candidate_path(SK), 1.0)
-        self.assertEqual(self._park(), 0.0)               # serving = live
+        self.assertEqual(self._park(), 0.0)               # serving = live (default)
 
-    def test_mode_on_reads_candidate(self):
+    def test_write_staging_alone_does_not_change_serving(self):
+        # set_candidate_mode (writes) must NOT flip serving to the candidate.
         self._write(cl.calibration_path(SK), 0.0)
         self._write(cl.candidate_path(SK), 1.0)
         cl.set_candidate_mode(True)
+        self.assertEqual(self._park(), 0.0)               # still live mid-staging
+        cl.set_candidate_mode(False)
+
+    def test_serving_candidate_reads_candidate(self):
+        self._write(cl.calibration_path(SK), 0.0)
+        self._write(cl.candidate_path(SK), 1.0)
+        cl.set_serving_candidate(True)
         self.assertEqual(self._park(), 1.0)               # backtest = candidate
 
-    def test_mode_on_no_candidate_falls_back_to_live(self):
+    def test_serving_candidate_no_candidate_falls_back_to_live(self):
         self._write(cl.calibration_path(SK), 0.0)
-        cl.set_candidate_mode(True)                        # no candidate file
+        cl.set_serving_candidate(True)                     # no candidate file
         self.assertEqual(self._park(), 0.0)
 
-    def test_switching_modes_does_not_cross_serve_from_cache(self):
+    def test_toggle_does_not_cross_serve_from_cache(self):
         self._write(cl.calibration_path(SK), 0.0)
         self._write(cl.candidate_path(SK), 1.0)
         self.assertEqual(self._park(), 0.0)               # live (caches live block)
-        cl.set_candidate_mode(True)
-        self.assertEqual(self._park(), 1.0)               # path-keyed cache -> candidate
-        cl.set_candidate_mode(False)
+        cl.set_serving_candidate(True)
+        self.assertEqual(self._park(), 1.0)               # cache cleared -> candidate
+        cl.set_serving_candidate(False)
         self.assertEqual(self._park(), 0.0)               # back to live
+
+    def _write_blob(self, path, blob):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(blob, sport_key=SK), f)
+
+    def test_team_readers_serving_candidate_aware(self):
+        # prob_shrink / market_blend / expected_runs_challenger all serve candidate-aware.
+        self._write_blob(cl.calibration_path(SK), {
+            "prob_shrink": {"totals": 0.6},
+            "market_blend": {"totals": {"w": 1.0}},
+            "expected_runs_challenger": {"enabled": False}})
+        self._write_blob(cl.candidate_path(SK), {
+            "prob_shrink": {"totals": 0.2},
+            "market_blend": {"totals": {"w": 0.2}},
+            "expected_runs_challenger": {"enabled": True}})
+        cl.set_serving_candidate(False)
+        self.assertEqual(cl.load_prob_shrink(SK)["totals"], 0.6)
+        self.assertEqual(cl.load_market_blend(SK)["totals"]["w"], 1.0)
+        self.assertFalse(cl.load_expected_runs_challenger(SK)["enabled"])
+        cl.set_serving_candidate(True)
+        self.assertEqual(cl.load_prob_shrink(SK)["totals"], 0.2)
+        self.assertEqual(cl.load_market_blend(SK)["totals"]["w"], 0.2)
+        self.assertTrue(cl.load_expected_runs_challenger(SK)["enabled"])
+
+    def test_set_serving_candidate_clears_pricing_cache(self):
+        import pricing_common as pc
+        self._write_blob(cl.calibration_path(SK), {"prob_shrink": {"totals": 0.6}})
+        self._write_blob(cl.candidate_path(SK), {"prob_shrink": {"totals": 0.2}})
+        cl.set_serving_candidate(False)
+        self.assertAlmostEqual(pc._shrink_factor(SK, "totals"), 0.6)   # caches live
+        cl.set_serving_candidate(True)                                 # clears the cache
+        self.assertAlmostEqual(pc._shrink_factor(SK, "totals"), 0.2)   # re-reads candidate
 
 
 class CandidateStagingTests(unittest.TestCase):

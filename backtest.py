@@ -69,6 +69,7 @@ from calibration_loader import (
     load_calibration,
     apply_calibration_with_warmup,
     set_candidate_mode,
+    set_serving_candidate,
     has_candidate,
     active_write_label,
     existing_candidate_notice,
@@ -5128,6 +5129,11 @@ def main():
     # occurs (it only affects the save_* helpers).
     staging = not args.live
     set_candidate_mode(staging)
+    # Also grade the STAGED team-market calibration (additive / prob_shrink / blend /
+    # challenger) when staging — so a candidate can be validated on a holdout without
+    # promoting. --live reads the live file. Separate from write-staging so the refit +
+    # live app (which never enable this) keep serving live mid-staging.
+    set_serving_candidate(staging)
     if staging and args.write_calibration:
         _notice = existing_candidate_notice(SPORT_MAP[args.sport][2])
         if _notice:
