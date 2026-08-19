@@ -4641,27 +4641,29 @@ def sizing_sweep(sport_key, espn_sport, espn_league, season_year=None,
                       supplement_log=False, collect_bets=bets)
     ml = bets["moneyline"]
     print(f"\n=== MONEYLINE bankroll sim (Batch B1) — shrink {shrink}, "
-          f"edge>={edge_gate*100:.0f}%, half-Kelly, cap 5%/leg ===")
-    print(f"  {len(ml)} graded moneyline games; chronological; b0=100u. "
+          f"edge>={edge_gate*100:.0f}%, cap 5%/leg ===")
+    print(f"  {len(ml)} graded moneyline games; VALUE side; chronological; b0=100u. "
           "flat=1u/bet (incumbent).")
     print("  {:<16}{:>7}{:>10}{:>9}{:>8}".format(
         "sizing", "bets", "growth%", "maxDD%", "Sharpe"))
     print("  " + "-" * 48)
 
-    def _row(label, m):
-        r = _bankroll_sim(ml, shrink=shrink, edge_gate=edge_gate, method=m["method"],
-                          z=m.get("z", 1.0))
+    def _row(label, method, z=1.0, frac=0.5):
+        r = _bankroll_sim(ml, shrink=shrink, edge_gate=edge_gate, method=method,
+                          z=z, frac=frac)
         sh = f"{r['sharpe']:.3f}" if r["sharpe"] == r["sharpe"] else "-"
         print("  {:<16}{:>7}{:>+10.1f}{:>9.1f}{:>8}".format(
             label, r["n_bets"], r["growth_pct"], r["max_dd_pct"], sh))
 
-    _row("flat-1u", {"method": "flat"})
-    _row("half-Kelly", {"method": "kelly"})
-    for z in (0.5, 1.0, 1.5):
-        _row(f"unc-Kelly z={z}", {"method": "ukelly", "z": z})
-    print("\n  (unc-Kelly z=0 == half-Kelly; higher z = more conservative / more "
-          "abstains. Watch growth vs maxDD — uncertainty-Kelly should trade a little")
-    print("   growth for a lower drawdown + higher Sharpe. Diagnostic only.)")
+    _row("flat-1u", "flat")
+    _row("eighth-Kelly", "kelly", frac=0.125)
+    _row("quarter-Kelly", "kelly", frac=0.25)
+    _row("half-Kelly", "kelly", frac=0.5)
+    _row("unc-Kelly z=0.5", "ukelly", z=0.5, frac=0.5)
+    _row("unc-Kelly z=1.0", "ukelly", z=1.0, frac=0.5)
+    print("\n  (Kelly fractions on the SAME bets show the growth/drawdown trade; "
+          "unc-Kelly (half) sizes off the win-prob interval low bound + abstains")
+    print("   when it spans break-even. Watch growth vs maxDD. Diagnostic only.)")
 
 
 def _warn_small_limit(limit):
