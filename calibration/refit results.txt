@@ -1,0 +1,71 @@
+=== Fitting POOLED calibration for baseball_mlb (seasons: 2024, 2025, 2026, 145 players) ===
+
+--- pool season 2024 ---
+  [skip] Drew Pomeranz: no warehouse gamelog
+  [skip] Anthony DeSclafani: no warehouse gamelog
+  [skip] Manny Banuelos: no warehouse gamelog
+  [skip] Luis Cessa: no warehouse gamelog
+  [skip] Kevin McGonigle: no warehouse gamelog
+  [skip] JJ Wetherholt: no warehouse gamelog
+  [skip] Sal Stewart: no warehouse gamelog
+  [skip] Robert Stock: no warehouse gamelog
+
+--- pool season 2025 ---
+  [skip] Johnny Cueto: no warehouse gamelog
+  [skip] Lance Lynn: no warehouse gamelog
+  [skip] Alex Cobb: no warehouse gamelog
+  [skip] Paolo Espino: no warehouse gamelog
+  [skip] Chase Anderson: no warehouse gamelog
+  [skip] Matt Moore: no warehouse gamelog
+  [skip] Julio Teheran: no warehouse gamelog
+  [skip] Gerrit Cole: no warehouse gamelog
+  [skip] Manny Banuelos: no warehouse gamelog
+  [skip] Luis Cessa: no warehouse gamelog
+  [skip] Kevin McGonigle: no warehouse gamelog
+  [skip] JJ Wetherholt: no warehouse gamelog
+  [skip] Burch Smith: no warehouse gamelog
+  [skip] Kent Emanuel: no warehouse gamelog
+  [skip] Marco Gonzales: no warehouse gamelog
+
+--- pool season 2026 ---
+  [skip] Jurickson Profar: no warehouse gamelog
+  [skip] Anthony Santander: no warehouse gamelog
+  [skip] Charlie Morton: no warehouse gamelog
+  [skip] Johnny Cueto: no warehouse gamelog
+  [skip] Lance Lynn: no warehouse gamelog
+  [skip] Clayton Kershaw: no warehouse gamelog
+  [skip] Wade Miley: no warehouse gamelog
+  [skip] Kyle Gibson: no warehouse gamelog
+  [skip] Alex Cobb: no warehouse gamelog
+  [skip] Paolo Espino: no warehouse gamelog
+  [skip] Chase Anderson: no warehouse gamelog
+  [skip] Yu Darvish: no warehouse gamelog
+  [skip] Ryan Brasier: no warehouse gamelog
+  [skip] Matt Moore: no warehouse gamelog
+  [skip] Julio Teheran: no warehouse gamelog
+  [skip] Tyler Anderson: no warehouse gamelog
+  [skip] Kyle Hendricks: no warehouse gamelog
+  [skip] Scott McGough: no warehouse gamelog
+  [skip] Cody Poteet: no warehouse gamelog
+  [skip] Rich Hill: no warehouse gamelog
+  [skip] Anthony DeSclafani: no warehouse gamelog
+  [skip] Manny Banuelos: no warehouse gamelog
+  [skip] José Ureña: no warehouse gamelog
+  [skip] Luis Cessa: no warehouse gamelog
+
+[batter_hits] method=E hl=5 opp=0.5 defadj=0.0 shrink=15 ven=0.0 [confirmed] brier=0.22 n=18177
+  [batter_total_bases] method=E hl=15 opp=0.0 defadj=0.5 shrink=15 ven=0.25 [confirmed] brier=0.2359 n=18177
+  [batter_rbis] method=C hl=None opp=0.0 defadj=0.5 shrink=15 ven=0.0 [confirmed] brier=0.2215 n=18177
+  [batter_strikeouts] method=A hl=None opp=0.0 defadj=0.0 shrink=0 ven=0.0 [baseline] brier=0.2437 n=18177
+  [pitcher_strikeouts] method=E hl=5 opp=0.0 defadj=0.0 shrink=5 ven=0.25 [confirmed] brier=0.2383 n=2271
+  [pitcher_outs] method=A hl=10 opp=0.0 defadj=0.0 shrink=0 ven=0.0 [confirmed] brier=0.2269 n=2271
+  [pitcher_earned_runs] method=A hl=None opp=0.0 defadj=0.0 shrink=0 ven=0.0 [baseline] brier=0.2242 n=2271
+
+
+=== candidate vs live: baseball_mlb ===
+  candidate fit: 2026-08-20T05:57:32.167700Z
+  live fit:      2026-08-14T18:02:30.535264Z
+  ~ METHOD changes (2) — review these:
+      batter_total_bases: A -> E (n 11174 -> 18177)
+      pitcher_earned_runs: C -> A (n 402 -> 2271)
+  ~ re-fit, method unchanged (5): batter_hits, batter_rbis, batter_strikeouts, pitcher_outs, pitcher_strikeouts
