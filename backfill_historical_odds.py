@@ -48,6 +48,9 @@ from odds_client import (
     get_historical_odds,
     get_historical_events,
     get_historical_event_odds,
+    is_historical_odds_cached,
+    is_historical_events_cached,
+    is_historical_event_cached,
     parse_game_odds,
     parse_player_props,
     get_remaining_credits,
@@ -275,6 +278,24 @@ def main():
             db_store.promote_secrets_from_toml()
         except Exception:
             pass
+        # spend-review #3: a paid --warehouse write silently falls back to LOCAL
+        # disk if the Azure SQL backend isn't actually enabled (partial/typo'd
+        # SQL_* secrets, import failure) — credits are spent but nothing lands in
+        # the warehouse the backfill exists to populate. Fail LOUD before spending.
+        try:
+            import warehouse as _wh
+            _backend = _wh.storage_backend()
+        except Exception:
+            _backend = "unavailable"
+        if _backend != "Azure SQL":
+            _msg = (f"--warehouse needs the Azure SQL backend, but it is "
+                    f"'{_backend}' (SQL_* secrets not enabled). A real run would "
+                    f"spend credits and write only to local disk. Fix the SQL "
+                    f"secrets before backfilling to the warehouse.")
+            if args.dry_run:
+                print(f"  [warn] {_msg}  (dry-run: no spend — continuing)")
+            else:
+                p.error(_msg)
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
 
@@ -345,6 +366,19 @@ def main():
     if args.snapshot_time:
         print(f"  Snapshot time: {args.snapshot_time}Z fixed per game date "
               f"(early/morning line).")
+        # spend-review #6: in the WAREHOUSE, early + close snapshots for the same
+        # game/kind bucket by captured_at HOUR (uq_odds_snapshot); a game tipping
+        # off in the --early-time's UTC hour collides with its own early snapshot
+        # → the second-written one is silently dropped (local labeled stores keep
+        # both). Warn + name the count so a colliding --early-time is caught.
+        if args.warehouse:
+            _eh = args.snapshot_time[:2]
+            _collide = sum(1 for g in sample if (g.get("date") or "")[11:13] == _eh)
+            if _collide:
+                print(f"  [warn] {_collide} game(s) tip off in the {_eh}:00Z hour "
+                      f"(= --early-time hour): their early+close warehouse snapshots "
+                      f"collide and one will be DROPPED (local stores keep both). "
+                      f"Choose an --early-time in an hour no game tips off.")
 
     store = store_mod.load_store(sport_key, args.label)
     store.update({"bookmaker": bookmaker})
@@ -375,6 +409,7 @@ def main():
     prop_games = []
     prop_floor_skipped = 0
     if n_prop:
+        req_markets_plan = [m.strip() for m in args.props.split(",") if m.strip()]
         for g in sample:
             # The Odds API has no historical props before PROPS_MIN_DATE — fetching
             # them would burn credits for guaranteed-empty returns. Gate props (NOT
@@ -383,8 +418,15 @@ def main():
                 prop_floor_skipped += 1
                 continue
             key = store_mod.game_key(g["date"], g["home_team"], g["away_team"])
-            done = existing.get(key, {}).get("props")
-            if done and all(m in done for m in args.props.split(",")):
+            # spend-review #4: dedup on the market SET we've FETCHED (recorded as
+            # props_markets_fetched), NOT on which keys the book posted — a
+            # requested-but-empty market is absent from stored props, so the old
+            # `all(m in props)` check re-queued (and re-charged) such a game every
+            # resume forever. Fall back to the parsed keys for pre-fix store entries.
+            g_entry = existing.get(key, {})
+            fetched = (g_entry.get("props_markets_fetched")
+                       or list((g_entry.get("props") or {}).keys()))
+            if fetched and all(m in fetched for m in req_markets_plan):
                 continue
             prop_games.append(g)
     if prop_floor_skipped:
@@ -440,15 +482,31 @@ def main():
         if spent + cost > args.max_credits:
             return False
         remaining = get_remaining_credits()
-        if remaining is not None and remaining - cost < args.reserve:
-            return False
+        if args.reserve > 0:
+            # spend-review #2: the balance is None until a paid call's response
+            # header populates it. Don't let None silently mean "reserve satisfied":
+            # allow the FIRST paid call (spent==0) to prime it (still capped by
+            # --max-credits), but if a paid call has already happened and the balance
+            # is STILL unknown (API omitted the header), fail closed rather than
+            # spend blind against the reserve.
+            if remaining is None:
+                if spent > 0:
+                    return False
+            elif remaining - cost < args.reserve:
+                return False
         return True
 
     try:
         # ── Phase 1: FEATURED (also harvests event IDs) ──
         feat_ts_list = sorted(feat_tasks.keys(), reverse=True)
         for i, ts in enumerate(feat_ts_list, 1):
-            if not _budget_ok(feat_cost):
+            # spend-review #5: a cached slate re-fetches for 0 credits, so charge
+            # only genuine fetches — else a resume re-counts cached snapshots and
+            # trips [stop] before reaching un-fetched dates (chunking impossible).
+            this_cost = 0 if is_historical_odds_cached(
+                sport_key, ts, regions=args.regions, markets=args.markets,
+                bookmakers=[bookmaker]) else feat_cost
+            if not _budget_ok(this_cost):
                 print("  [stop] Budget/reserve reached during featured phase.")
                 break
             try:
@@ -458,7 +516,7 @@ def main():
             except requests.exceptions.HTTPError as e:
                 print(f"  [warn] featured {ts}: HTTP error ({e}); skipping.")
                 continue
-            spent += feat_cost
+            spent += this_cost
             date_games = feat_tasks[ts]
             for api_game in (slate or []):
                 g = _find_sampled(api_game.get("home_team"),
@@ -498,20 +556,22 @@ def main():
         event_ids = {}  # game_key -> event_id
         if need_event_lookup:
             for d in id_dates:
-                if not _budget_ok(1):
-                    print("  [stop] Budget/reserve reached during ID lookup.")
-                    break
                 date_games = [g for g in prop_games if g["date"][:10] == d]
                 if args.snapshot_time:
                     ts = _snap_ts_for_date(d, args.snapshot_time)
                 else:
                     ts = min(g["date"] for g in date_games)
+                # Cache-aware charge (spend-review #5): a cached events lookup is free.
+                ev_cost = 0 if is_historical_events_cached(sport_key, ts) else 1
+                if not _budget_ok(ev_cost):
+                    print("  [stop] Budget/reserve reached during ID lookup.")
+                    break
                 try:
                     events, _ = get_historical_events(api_key, sport_key, date=ts)
                 except requests.exceptions.HTTPError as e:
                     print(f"  [warn] events {d}: HTTP error ({e}); skipping.")
                     continue
-                spent += 1
+                spent += ev_cost
                 for ev in events or []:
                     g = _find_sampled(ev.get("home_team"), ev.get("away_team"), date_games)
                     if g:
@@ -519,10 +579,8 @@ def main():
                         event_ids[key] = ev.get("id")
 
         # ── Phase 2: PROPS (per game) ──
+        req_markets = [m.strip() for m in args.props.split(",") if m.strip()]
         for i, g in enumerate(prop_games, 1):
-            if not _budget_ok(prop_cost):
-                print("  [stop] Budget/reserve reached during props phase.")
-                break
             key = store_mod.game_key(g["date"], g["home_team"], g["away_team"])
             entry = store["games"].get(key, {})
             eid = entry.get("event_id") or event_ids.get(key)
@@ -530,6 +588,15 @@ def main():
                 continue  # no event id harvested for this game
             prop_date = (_snap_ts_for_date(g["date"], args.snapshot_time)
                          if args.snapshot_time else g["date"])
+            # spend-review #4: charge only a genuine (uncached) fetch — a cached
+            # event re-reads for 0 credits, so counting it would trip [stop] on a
+            # resume and drop genuinely-new games (or falsely "re-pay" on a warm cache).
+            this_cost = 0 if is_historical_event_cached(
+                sport_key, eid, prop_date, regions=args.regions,
+                markets=args.props, bookmakers=[bookmaker]) else prop_cost
+            if not _budget_ok(this_cost):
+                print("  [stop] Budget/reserve reached during props phase.")
+                break
             try:
                 data, snap_ts = get_historical_event_odds(
                     api_key, sport_key, eid, date=prop_date,
@@ -539,7 +606,7 @@ def main():
                 continue
             if data is None:
                 continue
-            spent += prop_cost
+            spent += this_cost
             parsed = parse_player_props(data)
             entry.setdefault("commence_time", g["date"])
             entry.setdefault("home_team", data.get("home_team"))
@@ -547,6 +614,12 @@ def main():
             entry["event_id"] = eid
             entry["props_snapshot_timestamp"] = snap_ts
             entry["props"] = parsed.get("props", {})
+            # spend-review #4: record the market SET we actually FETCHED (not just
+            # the keys the book posted two-sided) so a resume dedups on it — a
+            # requested-but-empty market must count as done, else the game is
+            # re-queued (and re-charged) forever.
+            entry["props_markets_fetched"] = sorted(
+                set(entry.get("props_markets_fetched") or []) | set(req_markets))
             store["games"][key] = entry
             prop_stored += 1
             if args.warehouse:

@@ -516,6 +516,25 @@ def is_historical_event_cached(sport, event_id, date, regions="us",
     return os.path.exists(cache_path)
 
 
+def is_historical_odds_cached(sport, date, regions="us",
+                              markets="h2h,spreads,totals", bookmakers=None):
+    """True if this FEATURED historical-odds snapshot is already in the permanent
+    cache — a re-fetch returns instantly for 0 credits. Mirrors the cache key in
+    get_historical_odds so a budget-guarded caller can charge only genuine (uncached)
+    fetches instead of counting cache hits against the cap (spend-review #5)."""
+    date = _normalize_snapshot_date(date)
+    books_key = ",".join(sorted(bookmakers)) if bookmakers else ""
+    cache_path = _cache_key("hist_odds", sport, date, regions, markets, books_key)
+    return os.path.exists(cache_path)
+
+
+def is_historical_events_cached(sport, date):
+    """True if this historical-events lookup is already cached (free re-fetch)."""
+    date = _normalize_snapshot_date(date)
+    cache_path = _cache_key("hist_events", sport, date)
+    return os.path.exists(cache_path)
+
+
 def devig_two_way(implied_a, implied_b):
     """
     Remove the bookmaker margin (vig) from a two-outcome market by normalizing
