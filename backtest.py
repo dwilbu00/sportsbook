@@ -64,6 +64,8 @@ from pricing_common import (_resolve_team_defense, kelly_stake,
                             _expected_roi)
 import historical_odds as hist_store
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
+import park_factors     # PROP_PARK_KIND — weather/park apply to hits/ER only
+import weather_factors  # air_density / density_factor for the weather-density sweep
 from calibration_loader import (
     save_market_blend,
     save_prob_shrink,
@@ -2466,10 +2468,15 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             opp_defense_strength=0.0, use_minutes=False,
             pace_adj=0.0, def_adj=0.0,
             shrink_k=0.0, rest_adj=0.0, def_window=None,
-            park_strength=0.0, rest_strength=0.0, recent_n=None):
+            park_strength=0.0, rest_strength=0.0, recent_n=None,
+            weather_density_coef=0.0, weather_wind_coef=0.0, weather_strength=0.0):
     return {
         "half_life": half_life,
         "recent_n": recent_n,                # cap recency window to newest N prior games (None=full)
+        # Weather-density sweep axes (Phase B; 0 strength = off = byte-identical):
+        "weather_density_coef": weather_density_coef,
+        "weather_wind_coef": weather_wind_coef,
+        "weather_strength": weather_strength,
         "opp_strength": opp_strength,
         "venue_strength": venue_strength,
         "opp_defense_strength": opp_defense_strength,
@@ -2629,6 +2636,32 @@ def _build_recency_sweep_grid(recent_ns=None, half_lives=None):
             rn_label = "full" if rn is None else f"n{rn}"
             hl_label = "none" if hl is None else f"hl{hl}"
             variants[f"{rn_label}/{hl_label}"] = _preset(half_life=hl, recent_n=rn)
+    return variants
+
+
+def _build_weather_sweep_grid(density_coefs=None, wind_coefs=None, strengths=None):
+    """Joint density_coef × wind_coef × strength grid for --weather-sweep (props).
+
+    FITS the moist-air weather model (weather_factors.density_factor) rather than
+    hand-setting it: density_coef scales (baseline − air_density(temp,humidity,
+    pressure)), wind_coef scales out-to-CF wind, strength is the overall fraction.
+    Only batter_hits / pitcher_earned_runs move (park_factors.PROP_PARK_KIND); every
+    other prop is byte-identical across cells. Incumbent = the single 'wx_off' cell
+    (strength 0 → neutral regardless of coefs, so it is not looped — avoids degenerate
+    duplicates). Grade per-prop on OOS Brier (run with --calibrate)."""
+    if density_coefs is None:
+        density_coefs = [0.5, 1.0, 1.5, 2.0]      # density dev ~±0.05-0.10 kg/m³ → ±5-20%
+    if wind_coefs is None:
+        wind_coefs = [0.0, 0.003, 0.006]          # brackets the shipped _WEATHER_COEF
+    if strengths is None:
+        strengths = [0.5, 1.0]
+    variants = {"wx_off": _preset(half_life=None)}   # incumbent baseline (weather off)
+    for st in strengths:
+        for dc in density_coefs:
+            for wc in wind_coefs:
+                variants[f"dc{dc}/wc{wc}/s{st}"] = _preset(
+                    half_life=None, weather_density_coef=dc,
+                    weather_wind_coef=wc, weather_strength=st)
     return variants
 
 
@@ -3188,6 +3221,25 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             if pitcher_team_name:
                 print(f"Resolved park teams for {len(pitcher_team_name)} pitchers.")
 
+    # ── Weather-density map (Phase B) — {(home_team_id, date): (temp,humidity,
+    # pressure,wind_out,dome)}, built ONCE. The projection looks up each test game's
+    # HOME-park weather and applies weather_factors.density_factor at the swept coefs.
+    # Only when a variant turns weather on AND we're warehouse-native (MLB); inert
+    # otherwise. Weather is a pre-outcome game condition → no leakage.
+    weather_density_map, weather_name_to_id = {}, {}
+    needs_weather = any((p.get("weather_strength", 0.0) or 0.0) > 0
+                        for p in variants.values())
+    if needs_weather and use_warehouse:
+        import mlb_warehouse
+        _wx_seasons = ({int(season_year)} if season_year else
+                       {int(g["game_date"][:4]) for gl in player_data.values()
+                        for g in gl if g.get("game_date")})
+        weather_density_map = mlb_warehouse.game_weather_density_map(sorted(_wx_seasons))
+        # opponent arrives as a NAME in the gamelog; invert id→name to key the map.
+        weather_name_to_id = {v: str(k) for k, v
+                              in mlb_warehouse._team_name_map().items()}
+        print(f"Built weather-density map ({len(weather_density_map)} game-weather rows).")
+
     # results[variant][prop] = {errors, n, hits, decisive, safe[offset]={"hits":, "n":}}
     # When calibrate=True, also collect per-observation tuples for residual-
     # calibration analysis: (projected, synthetic_line, actual, empirical_over).
@@ -3417,6 +3469,30 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                         park_mult, _ = _park_factor_mult(
                             prop_key, past_parks, weights, upcoming_park, park_s)
                         projected *= park_mult
+
+                    # ── Weather-density projection multiplier (Phase B) ──
+                    # HOME park = player's team when home, else the upcoming opponent;
+                    # look up that (home_team_id, date) weather and scale the projection
+                    # by the moist-air density model at the swept coefs (mirrors park —
+                    # moves methods B/C/E via `projected`, not method A's line). Only
+                    # batter_hits / pitcher_earned_runs (PROP_PARK_KIND); dome / no data
+                    # -> neutral 1.0. NB: keyed on the gamelog's game_date[:10] (UTC), so
+                    # a late game whose UTC date leads its official play date simply
+                    # misses -> 1.0 (coverage caveat, never a wrong-day adjustment).
+                    wx_strength = params.get("weather_strength", 0.0) or 0.0
+                    if (wx_strength > 0 and weather_density_map
+                            and prop_key in park_factors.PROP_PARK_KIND):
+                        _home_id = (str(tid) if upcoming_is_home
+                                    else weather_name_to_id.get(upcoming_opp))
+                        _wx = (weather_density_map.get((_home_id, str(test_date)[:10]))
+                               if _home_id and test_date else None)
+                        if _wx:
+                            _t, _h, _p, _wo, _dome = _wx
+                            projected *= weather_factors.density_factor(
+                                _t, _h, _p, _wo,
+                                params.get("weather_density_coef", 0.0),
+                                params.get("weather_wind_coef", 0.0),
+                                wx_strength, dome=_dome)
 
                     # ── §2.6 candidate-feature multiplier (rest/days-off, …) ──
                     # ONE source shared with the runtime + real-line diagnostic
@@ -5646,6 +5722,17 @@ def main():
     p.add_argument("--half-lives", default=None,
                    help="(--recency-sweep) comma list of decay half-lives, e.g. "
                         "none,5,7,10,15 ('none'=decay off / equal weight).")
+    p.add_argument("--weather-sweep", action="store_true",
+                   help="(--mode props) FIT the moist-air weather model: a "
+                        "density_coef x wind_coef x strength sweep for batter_hits + "
+                        "pitcher_earned_runs. Incumbent cell wx_off. Run with "
+                        "--calibrate for per-prop OOS Brier. No write.")
+    p.add_argument("--density-coefs", default=None,
+                   help="(--weather-sweep) comma list, e.g. 0.5,1.0,1.5,2.0.")
+    p.add_argument("--wind-coefs", default=None,
+                   help="(--weather-sweep) comma list, e.g. 0,0.003,0.006.")
+    p.add_argument("--strengths", default=None,
+                   help="(--weather-sweep) comma list, e.g. 0.5,1.0.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
     p.add_argument("--season", type=int, default=None,
                    help="ESPN season year (e.g., 2025 = 2024-25 NBA season). Default: current.")
@@ -5835,6 +5922,24 @@ def main():
         print(f"\n{'#'*60}")
         print(f"#  RECENCY SWEEP: {len(variants)} recent_n x half_life combos "
               f"(--calibrate forced for per-prop Brier)")
+    elif getattr(args, "weather_sweep", False):
+        if args.mode != "props":
+            print("--weather-sweep is only valid with --mode props.")
+            sys.exit(1)
+
+        def _floats(raw):
+            return ([float(x) for x in raw.split(",") if x.strip()]
+                    if raw else None)
+
+        variants = _build_weather_sweep_grid(
+            _floats(args.density_coefs), _floats(args.wind_coefs),
+            _floats(args.strengths))
+        args.sweep = True        # reuse the sweep tabulator + code path
+        args.calibrate = True    # weather is selected on per-prop OOS Brier
+        variant_names = list(variants.keys())
+        print(f"\n{'#'*60}")
+        print(f"#  WEATHER SWEEP: {len(variants)} density x wind x strength combos "
+              f"(--calibrate forced for per-prop Brier)")
     elif args.sweep:
         variants = (_build_props_sweep_grid() if args.mode == "props"
                     else _build_sweep_grid())
@@ -5966,7 +6071,8 @@ def main():
         # Player-props mode
         if args.players:
             players = [n.strip() for n in args.players.split(",") if n.strip()]
-        elif getattr(args, "recency_sweep", False) and args.sport == "mlb":
+        elif ((getattr(args, "recency_sweep", False)
+               or getattr(args, "weather_sweep", False)) and args.sport == "mlb"):
             # STEP-1 decision-grade: the hand-picked DEFAULT_STARTERS is stable
             # superstars, which are SURVIVORSHIP-BIASED toward longer windows (a
             # stable-talent player always benefits from more history). Use the

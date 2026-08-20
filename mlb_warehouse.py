@@ -2017,6 +2017,48 @@ def game_weather_map(seasons=None):
     return out
 
 
+def game_weather_density_map(seasons):
+    """{(home_team_id, official_date): (temp_f, humidity, pressure_mb, wind_out_mph,
+    dome)} over `seasons` — the OFFLINE per-game weather lookup for the props
+    density sweep. Joins mlb_game (home_team_id, official_date, venue_id) → weather_game
+    (temp/humidity/pressure/raw wind) → mlb_venue (cf_bearing, roof), keyed on the
+    ACTUAL venue per game (neutral sites correct). wind_out is RECOMPUTED via
+    weather_factors.wind_out_component (weather_game stores only raw wind). dome = roof
+    is literally 'dome' (retractable is treated as open, matching get_game_weather).
+    {} on SQL off/empty. Weather is a pre-outcome game condition → no leakage."""
+    if not enabled():
+        return {}
+    try:
+        want = sorted({int(s) for s in seasons})
+    except (TypeError, ValueError):
+        return {}
+    import weather_factors as wf
+    g, wg, v = mlb_game, weather_game, mlb_venue
+    joined = (g.join(wg, and_(g.c.venue_id == wg.c.venue_id,
+                              g.c.official_date == wg.c.weather_date))
+               .join(v, g.c.venue_id == v.c.venue_id, isouter=True))
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(
+                select(g.c.home_team_id, g.c.official_date,
+                       wg.c.temp_f, wg.c.humidity, wg.c.pressure_mb,
+                       wg.c.wind_mph, wg.c.wind_dir_deg,
+                       v.c.cf_bearing, v.c.roof)
+                .select_from(joined)
+                .where(and_(g.c.season.in_(want),
+                            g.c.home_team_id.isnot(None),
+                            g.c.official_date.isnot(None)))).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    out = {}
+    for htid, od, temp, hum, pres, wmph, wdir, cf, roof in rows:
+        out[(str(htid), str(od)[:10])] = (
+            temp, hum, pres,
+            wf.wind_out_component(wmph, wdir, cf),
+            str(roof or "").lower() == "dome")
+    return out
+
+
 def weather_baseline_by_venue():
     """{venue_id: (avg_temp_f, avg_wind_out_mph)} over ALL weather_game rows — each
     park's seasonal-average conditions, the baseline the weather run_env DEVIATES from

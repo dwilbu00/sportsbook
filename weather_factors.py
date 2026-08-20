@@ -279,6 +279,39 @@ def air_density(temp_f, humidity_pct=None, pressure_mb=None):
     return (p_pa - vapor) / (287.05 * t_k) + vapor / (461.495 * t_k)
 
 
+# Weather multiplier clamp — identical to props.WEATHER_FACTOR_BOUNDS so both paths cap
+# the same way (kept here too so density_factor is self-contained/importable).
+WEATHER_DENSITY_BOUNDS = (0.88, 1.15)
+
+
+def density_factor(temp_f, humidity_pct, pressure_mb, wind_out_mph,
+                   density_coef, wind_coef, strength, dome=False):
+    """Baseline-relative moist-air-DENSITY projection multiplier for MLB hits/ER props.
+
+    raw = 1 + density_coef*(AIR_DENSITY_BASELINE - air_density(temp,humidity,pressure))
+            + wind_coef*wind_out_mph
+    mult = clamp(1 + strength*(raw - 1), 0.88..1.15)
+
+    Thin air (density < baseline: hot/dry/low-pressure) → >1.0 (ball carries → more
+    hits/runs); dense air → <1.0. dome, strength<=0, or no usable data → 1.0. Shared by
+    the offline weather sweep (backtest) and the live serving path (Phase C rewrite of
+    props._weather_factor_mult) so fit==serve. Coefficients + strength are FIT by the
+    sweep, not hand-set."""
+    if dome or not strength or strength <= 0:
+        return 1.0
+    dens = air_density(temp_f, humidity_pct, pressure_mb)
+    raw = 1.0
+    if dens is not None:
+        raw += density_coef * (AIR_DENSITY_BASELINE_KG_M3 - dens)
+    if wind_out_mph is not None:
+        try:
+            raw += wind_coef * float(wind_out_mph)
+        except (TypeError, ValueError):
+            pass
+    lo, hi = WEATHER_DENSITY_BOUNDS
+    return max(lo, min(hi, 1.0 + strength * (raw - 1.0)))
+
+
 def _cache_path(key):
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, digest + ".json")
