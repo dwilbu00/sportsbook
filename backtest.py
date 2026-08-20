@@ -2620,6 +2620,39 @@ def _build_props_sweep_grid():
     return variants
 
 
+def _build_focused_props_grid():
+    """A FOCUSED subset of _build_props_sweep_grid for FAST refits (opt-in).
+
+    Keeps FULL resolution on the axes that actually win for props — half_life ×
+    venue × shrink_k (32-cell cross) — and probes the axes that historically never
+    clear the P2.1 variant-confirmation gate for props (opp_defense, def_adj, rest)
+    only ONCE each against baseline. ~37 variants vs the full grid's 576, so ~15×
+    less CPU (crucially the per-variant NegBin method-E fit) and ~15× less peak RAM.
+
+    Built by SELECTING a subset of the full grid by name, so every variant's preset
+    and label is byte-identical to the full grid's — selections are directly
+    comparable and _is_baseline_variant / _parse_variant_name / _build_prop_cfg all
+    behave unchanged. The full grid stays the DEFAULT; this only runs under an
+    explicit --focused-grid, so a refit that needs to explore knob INTERACTIONS
+    (which this drops) can always use the full sweep. See _build_props_sweep_grid."""
+    full = _build_props_sweep_grid()
+    keep = set()
+    # Full cross of the prop-relevant axes (dead axes held off).
+    for hl in ("none", "hl5", "hl10", "hl15"):
+        for vs in ("ven0.0", "ven0.25"):
+            for sk in ("shrink0", "shrink5", "shrink10", "shrink15"):
+                keep.add(f"{hl}/opp0.0/defadj0.0/{sk}/{vs}/rest0.0")
+    # Single-axis probes for the team/feature axes that don't win props.
+    keep.update({
+        "none/opp0.5/defadj0.0/shrink0/ven0.0/rest0.0",
+        "none/opp1.0/defadj0.0/shrink0/ven0.0/rest0.0",
+        "none/opp0.0/defadj0.5/shrink0/ven0.0/rest0.0",
+        "none/opp0.0/defadj1.0/shrink0/ven0.0/rest0.0",
+        "none/opp0.0/defadj0.0/shrink0/ven0.0/rest1.0",
+    })
+    return {k: full[k] for k in keep if k in full}
+
+
 def _build_recency_sweep_grid(recent_ns=None, half_lives=None):
     """Joint recent_n × half_life grid for --recency-sweep (props, STEP 1).
 

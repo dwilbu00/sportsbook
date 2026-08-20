@@ -22,7 +22,8 @@ from datetime import datetime, timezone
 
 from backtest import (
     SPORT_MAP, DEFAULT_STARTERS, DEFAULT_PROPS, VARIANT_PRESETS,
-    _build_props_sweep_grid, _evaluate_calibration_methods,
+    _build_props_sweep_grid, _build_focused_props_grid,
+    _evaluate_calibration_methods,
     _score_calibration_methods, _team_defense_lookup,
     _mlb_warehouse_defense_lookup,
     run_player_props_backtest,
@@ -802,7 +803,8 @@ def _merge_props_results(acc, new):
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
-                nba_max_players=150, nba_min_games=15, seasons=None):
+                nba_max_players=150, nba_min_games=15, seasons=None,
+                focused_grid=False):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     # Resolve the set of seasons to POOL for the main fit. `--seasons` pools
     # several seasons' residuals into ONE fit (triples the thin pitcher-prop
@@ -841,7 +843,12 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         print(f"No default players/props for {sport}; please pass --players/--props.")
         sys.exit(1)
 
-    variants = _build_props_sweep_grid()
+    variants = (_build_focused_props_grid() if focused_grid
+                else _build_props_sweep_grid())
+    if focused_grid:
+        print(f"[focused-grid] {len(variants)} variants (vs full 576) — full "
+              f"resolution on half_life×venue×shrink, dead axes probed once. "
+              f"~15× faster/lighter; drops knob-interaction cells.")
 
     pooled = len(fit_seasons) > 1
     _season_lbl = (", ".join(str(s) for s in fit_seasons) if pooled
@@ -3253,6 +3260,12 @@ def main():
     p.add_argument("--prior-season", type=int, default=None,
                    help="Prior season year for warmup. Recommended. Ignored if "
                         "it is already one of --seasons (already pooled).")
+    p.add_argument("--focused-grid", action="store_true",
+                   help="Use the FOCUSED ~37-variant sweep grid instead of the full "
+                        "576 (full resolution on half_life×venue×shrink, dead axes "
+                        "probed once). ~15× faster + lighter — recommended for "
+                        "iterating on pooled multi-season refits; drops knob-"
+                        "interaction cells, so use the full grid for a final run.")
     p.add_argument("--players", default=None,
                    help="Comma-separated player names. Default: built-in starters.")
     p.add_argument("--props", default=None,
@@ -3532,7 +3545,7 @@ def main():
                 mlb_max_pitchers=args.mlb_max_pitchers,
                 nba_max_players=args.nba_max_players,
                 nba_min_games=args.nba_min_games,
-                seasons=seasons)
+                seasons=seasons, focused_grid=args.focused_grid)
     _report_staging(args.sport, staging)
 
 

@@ -3143,6 +3143,34 @@ class MethodESyntheticTests(unittest.TestCase):
         self.assertEqual(ms, 2.0)
 
 
+class FocusedGridTests(unittest.TestCase):
+    """STEP-2 perf: --focused-grid is a name-identical SUBSET of the full 576-cell
+    sweep (so selections stay comparable + the baseline gate still works), ~15×
+    smaller — cuts the per-variant NegBin method-E fit cost + peak RAM."""
+
+    def test_focused_is_comparable_subset_of_full(self):
+        import backtest
+        full = backtest._build_props_sweep_grid()
+        foc = backtest._build_focused_props_grid()
+        self.assertLess(len(foc), 50)                       # ~37, way under 576
+        self.assertGreater(len(full) / len(foc), 10)        # >=10x reduction
+        self.assertTrue(set(foc).issubset(set(full)))       # names are a subset
+        # presets pulled from the full grid -> byte-identical, so a focused winner
+        # is directly comparable to a full-grid winner.
+        self.assertTrue(all(foc[k] == full[k] for k in foc))
+        # the P2.1 variant-gate baseline (all-off) MUST be present.
+        self.assertIn("none/opp0.0/defadj0.0/shrink0/ven0.0/rest0.0", foc)
+
+    def test_focused_keeps_prop_relevant_axes(self):
+        import backtest
+        foc = set(backtest._build_focused_props_grid())
+        # full half_life x venue x shrink resolution retained
+        self.assertIn("hl15/opp0.0/defadj0.0/shrink0/ven0.25/rest0.0", foc)
+        self.assertIn("none/opp0.0/defadj0.0/shrink15/ven0.0/rest0.0", foc)
+        # dead axes probed at least once
+        self.assertIn("none/opp0.5/defadj0.0/shrink0/ven0.0/rest0.0", foc)
+
+
 class MultiSeasonPoolingTests(unittest.TestCase):
     """STEP-2 multi-season pooling: _merge_props_results pools per-season
     run_player_props_backtest results into one dict (concatenated calib_obs +
