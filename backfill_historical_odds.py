@@ -64,6 +64,39 @@ SPORT_MAP = {
     "nhl": ("hockey", "nhl", "icehockey_nhl"),
 }
 
+# The Odds API has NO historical player props before this date (all sports).
+# Featured/team markets predate it, so this floor gates PROPS only.
+PROPS_MIN_DATE = "2023-05-03"
+
+# Default UTC time for the --snapshot early "early-action" line (~9am ET).
+DEFAULT_EARLY_TIME = "13:00"
+
+# BROAD per-sport prop sets for the historical CORPUS backfill. Deliberately
+# SEPARATE from the live-served odds_client.PLAYER_PROPS_BY_SPORT: we capture
+# broadly now (one-time credit window) but only SERVE a prop once it's been
+# calibrated (capture broad, serve selective). Keys are Odds-API v4 market keys;
+# exotics (longest-*, first-TD, double-double) intentionally skipped.
+# ⚠ VERIFY these keys against the Odds API before a large spend (a wrong key
+# returns empty but still may cost a call) — a tiny 1-game probe per sport.
+BACKFILL_PROPS_BY_SPORT = {
+    "baseball_mlb": [
+        "batter_hits", "batter_total_bases", "batter_rbis", "batter_strikeouts",
+        "pitcher_strikeouts", "pitcher_outs", "pitcher_earned_runs",
+    ],
+    "americanfootball_nfl": [
+        "player_pass_yds", "player_pass_tds", "player_pass_completions",
+        "player_pass_attempts", "player_pass_interceptions", "player_rush_yds",
+        "player_rush_attempts", "player_receptions", "player_reception_yds",
+        "player_anytime_td",
+    ],
+    "basketball_nba": [
+        "player_points", "player_rebounds", "player_assists", "player_threes",
+        "player_steals", "player_blocks", "player_turnovers",
+        "player_points_rebounds_assists", "player_points_rebounds",
+        "player_points_assists",
+    ],
+}
+
 
 def load_config():
     with open(CONFIG_PATH, "r") as f:
@@ -118,6 +151,39 @@ def _snap_ts_for_date(date_iso, snapshot_time):
     return f"{date_iso[:10]}T{snapshot_time}:00Z"
 
 
+def _resolve_snapshot_mode(snapshot, snapshot_time, label, early_time,
+                           featured_cadence):
+    """Translate --snapshot into (featured_cadence, snapshot_time, label).
+
+    'early' = a fixed morning UTC line written to a labeled store (so it doesn't
+    overwrite the close); needs daily cadence for the fixed-clock snapshot.
+    'close' (default) = per-tip-off true closing line, unchanged. Explicit
+    --snapshot-time / --label passed by the user still win (only filled if unset)."""
+    if snapshot == "early":
+        featured_cadence = "daily"
+        snapshot_time = snapshot_time or early_time
+        label = label or "morning"
+    return featured_cadence, snapshot_time, label
+
+
+def _resolve_category(category, markets, props, sport_key):
+    """Translate --category into (markets, props). 'team' = featured only;
+    'props' = the broad per-sport corpus set (BACKFILL_PROPS_BY_SPORT) unless
+    --props was given. None = leave --markets/--props as passed. Raises
+    ValueError when 'props' is requested for a sport with no defined set."""
+    if category == "team":
+        props = ""
+    elif category == "props":
+        markets = ""
+        if not props:
+            broad = BACKFILL_PROPS_BY_SPORT.get(sport_key) or []
+            if not broad:
+                raise ValueError(
+                    f"--category props: no broad prop set defined for {sport_key}")
+            props = ",".join(broad)
+    return markets, props
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Backfill historical closing-line odds (budget-guarded)")
@@ -164,7 +230,28 @@ def main():
     p.add_argument("--warehouse", action="store_true",
                    help="Also archive each fetched snapshot to the durable odds "
                         "warehouse (roadmap 0.4). Free — reuses fetched payloads.")
+    p.add_argument("--category", choices=["team", "props"], default=None,
+                   help="Per-cell convenience for the multi-sport backfill: 'team' "
+                        "fetches featured (h2h/spreads/totals) only; 'props' fetches "
+                        "the broad per-sport BACKFILL_PROPS_BY_SPORT set (unless "
+                        "--props is given). Lets you run e.g. `--sport nba "
+                        "--category team` then `--sport nba --category props` "
+                        "independently.")
+    p.add_argument("--snapshot", choices=["close", "early"], default="close",
+                   help="'close' (default) = per-tip-off true closing line; "
+                        "'early' = a fixed morning UTC line (--early-time) written "
+                        "to a labeled store (default label 'morning') so it doesn't "
+                        "overwrite the close. Run once each to capture both.")
+    p.add_argument("--early-time", default=DEFAULT_EARLY_TIME,
+                   help=f"UTC HH:MM for --snapshot early (default {DEFAULT_EARLY_TIME} "
+                        "~9am ET). Ignored for --snapshot close.")
     args = p.parse_args()
+
+    # ── --snapshot convenience ── resolved BEFORE the snapshot-time validation
+    # so 'early' inherits --early-time and the daily-cadence requirement is met.
+    args.featured_cadence, args.snapshot_time, args.label = _resolve_snapshot_mode(
+        args.snapshot, args.snapshot_time, args.label,
+        args.early_time, args.featured_cadence)
 
     if args.snapshot_time is not None:
         try:
@@ -190,6 +277,15 @@ def main():
             pass
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
+
+    # ── --category convenience ── (needs sport_key; before the cost calc so
+    # n_feat/n_prop reflect it).
+    try:
+        args.markets, args.props = _resolve_category(
+            args.category, args.markets, args.props, sport_key)
+    except ValueError as e:
+        p.error(str(e))
+
     cfg = load_config()
     api_key = cfg["odds_api_key"]
     bookmaker = args.bookmaker or (cfg.get("bookmakers") or ["draftkings"])[0]
@@ -261,13 +357,23 @@ def main():
 
     # ── Plan PROP games (per game) ──────────────────────────────────────────
     prop_games = []
+    prop_floor_skipped = 0
     if n_prop:
         for g in sample:
+            # The Odds API has no historical props before PROPS_MIN_DATE — fetching
+            # them would burn credits for guaranteed-empty returns. Gate props (NOT
+            # featured/team, which predate the floor) here.
+            if ((g.get("date") or "")[:10]) < PROPS_MIN_DATE:
+                prop_floor_skipped += 1
+                continue
             key = store_mod.game_key(g["date"], g["home_team"], g["away_team"])
             done = existing.get(key, {}).get("props")
             if done and all(m in done for m in args.props.split(",")):
                 continue
             prop_games.append(g)
+    if prop_floor_skipped:
+        print(f"  [props-floor] skipped {prop_floor_skipped} game(s) before "
+              f"{PROPS_MIN_DATE} (Odds API has no historical props there).")
     # If props requested but no featured to harvest event IDs from, we'll need
     # the historical-events endpoint (1 credit per date).
     need_event_lookup = bool(n_prop) and not n_feat
