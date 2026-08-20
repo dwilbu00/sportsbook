@@ -50,6 +50,22 @@ class ResolveSnapshotModeTests(unittest.TestCase):
             ("daily", "09:30", "custom"))
 
 
+class PropLabelCoverageTests(unittest.TestCase):
+    """Spend-review #1 regression: an Odds-API prop key NOT in
+    odds_client.PROP_LABELS is silently dropped by parse_player_props at the
+    durable-write layer (paid credits -> zero stored lines). So every broad-corpus
+    backfill key MUST have a PROP_LABELS entry, and the CLI pre-flight guard must
+    reject any that don't."""
+
+    def test_every_backfill_prop_key_has_a_label(self):
+        from odds_client import PROP_LABELS
+        for sk, keys in bf.BACKFILL_PROPS_BY_SPORT.items():
+            for k in keys:
+                self.assertIn(k, PROP_LABELS,
+                              f"{k} ({sk}) not in PROP_LABELS -> would be silently "
+                              f"dropped at the durable-write layer")
+
+
 class PropsFloorTests(unittest.TestCase):
     def test_floor_is_the_vendor_props_start(self):
         self.assertEqual(bf.PROPS_MIN_DATE, "2023-05-03")

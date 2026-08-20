@@ -835,6 +835,26 @@ PROP_LABELS = {
     "pitcher_earned_runs": "Pitcher Earned Runs",
     "batter_total_bases": "Total Bases",
     "batter_rbis": "RBIs",
+    # NFL/NBA broad-corpus backfill markets (backfill_historical_odds
+    # BACKFILL_PROPS_BY_SPORT). Adding a key here ONLY lets parse_player_props
+    # EMIT lines for it when a payload contains it (i.e. the historical backfill
+    # requests it) — without it, capture_event_odds silently writes ZERO durable
+    # lines for that market. The LIVE-offered set is PLAYER_PROPS_BY_SPORT (still
+    # narrow), so this is inert for serving: capture broad, serve after calibration.
+    "player_pass_tds": "Passing TDs",
+    "player_pass_completions": "Pass Completions",
+    "player_pass_attempts": "Pass Attempts",
+    "player_pass_interceptions": "Interceptions",
+    "player_rush_attempts": "Rush Attempts",
+    "player_receptions": "Receptions",
+    "player_reception_yds": "Receiving Yards",
+    "player_threes": "Threes Made",
+    "player_steals": "Steals",
+    "player_blocks": "Blocks",
+    "player_turnovers": "Turnovers",
+    "player_points_rebounds_assists": "Pts+Reb+Ast",
+    "player_points_rebounds": "Pts+Reb",
+    "player_points_assists": "Pts+Ast",
 }
 
 

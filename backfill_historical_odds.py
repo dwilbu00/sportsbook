@@ -286,6 +286,22 @@ def main():
     except ValueError as e:
         p.error(str(e))
 
+    # Pre-flight (spend-review #1): every requested prop market MUST be in
+    # odds_client.PROP_LABELS, or parse_player_props silently drops it and
+    # capture_event_odds writes ZERO durable odds_line rows for it (paid credits →
+    # warehouse black hole, while the snapshot's markets column claims full
+    # coverage). Fail LOUD here — before any credit moves, dry-run included.
+    if args.props:
+        from odds_client import PROP_LABELS as _PROP_LABELS
+        uncovered = [m.strip() for m in args.props.split(",")
+                     if m.strip() and m.strip() not in _PROP_LABELS]
+        if uncovered:
+            p.error(
+                "these prop markets are not in odds_client.PROP_LABELS, so their "
+                "lines would be SILENTLY DROPPED at the durable-write layer (paid "
+                "credits, nothing stored). Add them to PROP_LABELS first: "
+                + ", ".join(uncovered))
+
     cfg = load_config()
     api_key = cfg["odds_api_key"]
     bookmaker = args.bookmaker or (cfg.get("bookmakers") or ["draftkings"])[0]
