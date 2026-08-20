@@ -349,6 +349,25 @@ def _mlb_player_pool(season, max_batters=40, max_pitchers=30):
         return []
 
 
+def _mlb_pool_union(seasons, max_batters=40, max_pitchers=30):
+    """Union the per-season MLB pools across `seasons`, deduped by (mlb_id, role).
+
+    A multi-season refit pools each season's top-N by volume; the UNION is what
+    lets a player active in only one of the pooled seasons still contribute his
+    games (and naturally widens the thin pitcher pool — the whole reason we pool).
+    Order is season-then-rank so the newest season's leaders sort first."""
+    pool, seen = [], set()
+    for sy in seasons:
+        for entry in _mlb_player_pool(sy, max_batters=max_batters,
+                                      max_pitchers=max_pitchers):
+            key = (entry[0], entry[1])       # (mlb_id, role) — identity
+            if key in seen:
+                continue
+            seen.add(key)
+            pool.append(entry)
+    return pool
+
+
 def _nba_player_pool(season, max_players=150, min_games=15):
     """Resolve a broad, usage-representative NBA calibration pool.
 
@@ -397,6 +416,19 @@ def _nba_player_pool(season, max_players=150, min_games=15):
             pass  # best effort; cached_athlete_id falls back to name search
         names.append(name)
     return names
+
+
+def _nba_pool_union(seasons, max_players=150, min_games=15):
+    """Union the per-season NBA pools across `seasons`, deduped by name."""
+    pool, seen = [], set()
+    for sy in seasons:
+        for name in _nba_player_pool(sy, max_players=max_players,
+                                     min_games=min_games):
+            if name in seen:
+                continue
+            seen.add(name)
+            pool.append(name)
+    return pool
 
 
 def _parse_variant_name(name):
@@ -705,24 +737,75 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
     return cfg
 
 
+def _merge_props_results(acc, new):
+    """Pool two ``run_player_props_backtest`` results dicts (same variant×prop
+    grid) into ``acc`` so a multi-season refit fits on the COMBINED calib_obs.
+
+    Sums the tally counters and concatenates ``calib_obs`` / ``errors``. Each
+    season's obs were projected strictly WITHIN that season (the backtest runs
+    per-season with ``cross_season='strict'``), so pooling adds sample without
+    introducing cross-season projection leakage — every residual still came from
+    a same-season prior slice. Winner selection (``_best_per_prop``) and the
+    residual fit (``_build_prop_cfg``) then run once over the pooled obs."""
+    for vname, by_prop in new.items():
+        acc_v = acc.setdefault(vname, {})
+        for prop_key, cell in by_prop.items():
+            a = acc_v.get(prop_key)
+            if a is None:
+                acc_v[prop_key] = cell
+                continue
+            a["errors"].extend(cell.get("errors") or [])
+            a["n"] += cell.get("n", 0)
+            a["hits"] += cell.get("hits", 0)
+            a["decisive"] += cell.get("decisive", 0)
+            if a.get("calib_obs") is not None and cell.get("calib_obs"):
+                a["calib_obs"].extend(cell["calib_obs"])
+            for off, tally in (cell.get("safe") or {}).items():
+                dst = a.setdefault("safe", {}).setdefault(
+                    off, {"hits": 0, "n": 0})
+                dst["hits"] += tally.get("hits", 0)
+                dst["n"] += tally.get("n", 0)
+            for q, tally in (cell.get("quantile") or {}).items():
+                dst = a.setdefault("quantile", {}).setdefault(
+                    q, {"hits": 0, "n": 0, "cushions": []})
+                dst["hits"] += tally.get("hits", 0)
+                dst["n"] += tally.get("n", 0)
+                dst["cushions"].extend(tally.get("cushions") or [])
+    return acc
+
+
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
-                nba_max_players=150, nba_min_games=15):
+                nba_max_players=150, nba_min_games=15, seasons=None):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
-    if sport in ("mlb", "nba") and season is None:
-        season = datetime.now(timezone.utc).year
+    # Resolve the set of seasons to POOL for the main fit. `--seasons` pools
+    # several seasons' residuals into ONE fit (triples the thin pitcher-prop
+    # sample + cures the earned_runs method C↔A instability); `--season` alone
+    # keeps the single-season fit (byte-identical to the pre-pooling path).
+    if seasons:
+        fit_seasons = sorted({int(s) for s in seasons})
+    elif season is not None:
+        fit_seasons = [int(season)]
+    elif sport in ("mlb", "nba"):
+        fit_seasons = [datetime.now(timezone.utc).year]
+    else:
+        fit_seasons = [None]
+    # The "current" season drives cfg["fit_season"], the warmup boundary, and
+    # meta — it is the newest of the pooled set.
+    season = max((s for s in fit_seasons if s is not None), default=None)
+
     if players is None and sport == "mlb":
-        players = _mlb_player_pool(
-            season, max_batters=mlb_max_batters,
+        players = _mlb_pool_union(
+            fit_seasons, max_batters=mlb_max_batters,
             max_pitchers=mlb_max_pitchers)
         if not players:
             print("No data-driven MLB player pool was available; aborting rather "
                   "than fitting all MLB props from the small static fallback.")
             sys.exit(1)
     if players is None and sport == "nba":
-        players = _nba_player_pool(
-            season, max_players=nba_max_players, min_games=nba_min_games)
+        players = _nba_pool_union(
+            fit_seasons, max_players=nba_max_players, min_games=nba_min_games)
         if not players:
             print("No data-driven NBA player pool was available; aborting rather "
                   "than fitting NBA props from the 18-star fallback.")
@@ -735,26 +818,50 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 
     variants = _build_props_sweep_grid()
 
-    print(f"\n=== Fitting CURRENT-season calibration for {sport_key} ===")
-    curr_results = run_player_props_backtest(
-        sport, espn_sport, espn_league, sport_key,
-        players=players, props=props,
-        games_per_player=games_per_player,
-        min_sample=5, variants=variants, sweep=True,
-        season_year=season, safe_mode=True,
-        cushion_sweep=False, safe_target=0.80,
-        quantile_mode=False, calibrate=True,
-        cross_season="strict",
-    )
+    pooled = len(fit_seasons) > 1
+    _season_lbl = (", ".join(str(s) for s in fit_seasons) if pooled
+                   else str(fit_seasons[0]))
+    print(f"\n=== Fitting {'POOLED ' if pooled else 'CURRENT-season '}"
+          f"calibration for {sport_key} (seasons: {_season_lbl}, "
+          f"{len(players)} players) ===")
+    # Run the sweep once per season and MERGE the per-season results so method
+    # selection + the residual fit see the COMBINED calib_obs. Each season runs
+    # strictly within-season (cross_season='strict'), so pooling never crosses a
+    # season boundary inside any one projection — it only widens the sample.
+    curr_results = None
+    for sy in fit_seasons:
+        if pooled:
+            print(f"\n--- pool season {sy} ---")
+        season_res = run_player_props_backtest(
+            sport, espn_sport, espn_league, sport_key,
+            players=players, props=props,
+            games_per_player=games_per_player,
+            min_sample=5, variants=variants, sweep=True,
+            season_year=sy, safe_mode=True,
+            cushion_sweep=False, safe_target=0.80,
+            quantile_mode=False, calibrate=True,
+            cross_season="strict",
+        )
+        if not season_res:
+            print(f"  [WARN] pool season {sy} produced no results; excluding it.")
+            continue
+        curr_results = (season_res if curr_results is None
+                        else _merge_props_results(curr_results, season_res))
     if not curr_results:
-        print("Current-season run produced no results; aborting.")
+        print("Calibration run produced no results; aborting.")
         sys.exit(2)
 
     curr_winners = _best_per_prop(curr_results, props)
 
     warmup_results = None
     warmup_winners = {}
-    if prior_season is not None:
+    if prior_season is not None and prior_season in fit_seasons:
+        # A season can't be both a pooled main-fit season AND the warmup prior:
+        # its games are already in curr_results, so a separate warmup block would
+        # double-count them (and blend the pool against itself). Skip it loudly.
+        print(f"\n[note] prior season {prior_season} is already in the pooled fit "
+              f"({_season_lbl}); skipping the redundant warmup block.")
+    elif prior_season is not None:
         print(f"\n=== Fitting WARMUP (prior season={prior_season}) calibration ===")
         warmup_results = run_player_props_backtest(
             sport, espn_sport, espn_league, sport_key,
@@ -809,6 +916,9 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 
     meta = {
         "current_season": season,
+        # The full pooled season set (a single-season fit lists just [season]);
+        # provenance for how much sample the shipped residuals were fit on.
+        "fit_seasons": fit_seasons,
         "warmup_season": prior_season,
         "games_per_player": games_per_player,
         "warmup_games": warmup_games,
@@ -3109,8 +3219,15 @@ def main():
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), required=True)
     p.add_argument("--season", type=int, default=None,
                    help="Current season year (ESPN convention). Default: current.")
+    p.add_argument("--seasons", default=None,
+                   help="Comma-separated seasons to POOL into one fit "
+                        "(e.g. 2024,2025,2026). Widens the player pool (union) "
+                        "and triples the thin pitcher-prop sample. Overrides "
+                        "--season for the synthetic base fit; each season is "
+                        "still projected strictly within-season.")
     p.add_argument("--prior-season", type=int, default=None,
-                   help="Prior season year for warmup. Recommended.")
+                   help="Prior season year for warmup. Recommended. Ignored if "
+                        "it is already one of --seasons (already pooled).")
     p.add_argument("--players", default=None,
                    help="Comma-separated player names. Default: built-in starters.")
     p.add_argument("--props", default=None,
@@ -3378,6 +3495,8 @@ def main():
 
     players = [n.strip() for n in args.players.split(",")] if args.players else None
     props = [pk.strip() for pk in args.props.split(",")] if args.props else None
+    seasons = ([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+               if args.seasons else None)
 
     refit_sport(args.sport, season=args.season, prior_season=args.prior_season,
                 players=players, props=props,
@@ -3387,7 +3506,8 @@ def main():
                 mlb_max_batters=args.mlb_max_batters,
                 mlb_max_pitchers=args.mlb_max_pitchers,
                 nba_max_players=args.nba_max_players,
-                nba_min_games=args.nba_min_games)
+                nba_min_games=args.nba_min_games,
+                seasons=seasons)
     _report_staging(args.sport, staging)
 
 

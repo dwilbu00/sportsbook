@@ -3044,6 +3044,82 @@ class RecencySweepGridTests(unittest.TestCase):
             stats._weighted_rate(vals, w_n3, lambda v: v > 8.5), 2 / 3)
 
 
+class MultiSeasonPoolingTests(unittest.TestCase):
+    """STEP-2 multi-season pooling: _merge_props_results pools per-season
+    run_player_props_backtest results into one dict (concatenated calib_obs +
+    summed tallies) so the residual fit sees the COMBINED sample, and the pool
+    unions dedupe players across seasons so a player active in only one season
+    still contributes (and the thin pitcher pool widens)."""
+
+    @staticmethod
+    def _cell(obs, n=0, hits=0, decisive=0, safe=None, quantile=None):
+        return {
+            "errors": [], "n": n, "hits": hits, "decisive": decisive,
+            "safe": safe or {}, "quantile": quantile or {},
+            "calib_obs": list(obs),
+        }
+
+    @staticmethod
+    def _obs(proj, actual, date):
+        # (x, projected, synthetic_line, actual, empirical_over, date) — the shape
+        # _fit_residuals (residual = actual-proj) and _chronological_folds (o[5])
+        # consume.
+        return (None, proj, proj, actual, 1 if actual > proj else 0, date)
+
+    def test_merge_concatenates_obs_and_sums_tallies(self):
+        import refit_calibration as rc
+        a = {"v": {"batter_hits": self._cell(
+            [self._obs(1.0, 2.0, "2024-04-01")], n=3, hits=2, decisive=3,
+            safe={0.5: {"hits": 1, "n": 2}})}}
+        b = {"v": {"batter_hits": self._cell(
+            [self._obs(1.0, 0.0, "2025-04-01")], n=4, hits=1, decisive=4,
+            safe={0.5: {"hits": 2, "n": 3}})}}
+        merged = rc._merge_props_results(a, b)
+        cell = merged["v"]["batter_hits"]
+        self.assertEqual(len(cell["calib_obs"]), 2)      # pooled obs
+        self.assertEqual(cell["n"], 7)
+        self.assertEqual(cell["hits"], 3)
+        self.assertEqual(cell["decisive"], 7)
+        self.assertEqual(cell["safe"][0.5], {"hits": 3, "n": 5})
+        # The residual fit now spans both seasons (residuals +1.0 and -1.0 -> mu 0).
+        fit = rc._fit_residuals(cell["calib_obs"])
+        self.assertEqual(fit["n_obs"], 2)
+        self.assertAlmostEqual(fit["residual_mu"], 0.0)
+
+    def test_merge_adds_missing_variant_or_prop(self):
+        import refit_calibration as rc
+        a = {"v1": {"batter_hits": self._cell([self._obs(1.0, 2.0, "2024-04-01")])}}
+        b = {"v2": {"pitcher_strikeouts":
+                    self._cell([self._obs(5.0, 6.0, "2024-04-01")])}}
+        merged = rc._merge_props_results(a, b)
+        self.assertIn("v1", merged)
+        self.assertIn("v2", merged)          # a variant absent from acc is added
+        self.assertIn("pitcher_strikeouts", merged["v2"])
+
+    def test_mlb_pool_union_dedupes_by_id_and_role(self):
+        import refit_calibration as rc
+        pools = {
+            2024: [("101", "batter", "A"), ("201", "pitcher", "P")],
+            2025: [("101", "batter", "A"),      # dup id+role -> dropped
+                   ("102", "batter", "B"),      # new
+                   ("201", "pitcher", "P")],    # dup -> dropped
+        }
+        with patch.object(rc, "_mlb_player_pool",
+                          side_effect=lambda sy, **kw: pools[sy]):
+            union = rc._mlb_pool_union([2024, 2025])
+        self.assertEqual(
+            union,
+            [("101", "batter", "A"), ("201", "pitcher", "P"),
+             ("102", "batter", "B")])
+
+    def test_nba_pool_union_dedupes_by_name(self):
+        import refit_calibration as rc
+        pools = {2024: ["A", "B"], 2025: ["B", "C"]}
+        with patch.object(rc, "_nba_player_pool",
+                          side_effect=lambda sy, **kw: pools[sy]):
+            self.assertEqual(rc._nba_pool_union([2024, 2025]), ["A", "B", "C"])
+
+
 class PortfolioSimTests(unittest.TestCase):
     """Batch B1 top-N/day portfolio: per-day best-N-by-EV selection across eligible
     markets, market policy (totals off, spreads high-conviction), per-day (not global)
