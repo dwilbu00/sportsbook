@@ -3470,15 +3470,17 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                             prop_key, past_parks, weights, upcoming_park, park_s)
                         projected *= park_mult
 
-                    # ── Weather-density projection multiplier (Phase B) ──
+                    # ── Weather-density multiplier (Phase B) ──
                     # HOME park = player's team when home, else the upcoming opponent;
-                    # look up that (home_team_id, date) weather and scale the projection
-                    # by the moist-air density model at the swept coefs (mirrors park —
-                    # moves methods B/C/E via `projected`, not method A's line). Only
-                    # batter_hits / pitcher_earned_runs (PROP_PARK_KIND); dome / no data
-                    # -> neutral 1.0. NB: keyed on the gamelog's game_date[:10] (UTC), so
-                    # a late game whose UTC date leads its official play date simply
-                    # misses -> 1.0 (coverage caveat, never a wrong-day adjustment).
+                    # look up that (home_team_id, date) weather and scale by the moist-air
+                    # density model at the swept coefs. Like live's combined_mult, wx_mult
+                    # is folded into BOTH `projected` (methods B/C/E, here) AND the method-A
+                    # effective line (calib_obs block below) so method-A props (batter_hits)
+                    # see weather too. Only batter_hits / pitcher_earned_runs
+                    # (PROP_PARK_KIND); dome / no data -> 1.0. NB: keyed on the gamelog's
+                    # game_date[:10] (UTC), so a late game whose UTC date leads its official
+                    # play date simply misses -> 1.0 (coverage caveat, never a wrong day).
+                    wx_mult = 1.0
                     wx_strength = params.get("weather_strength", 0.0) or 0.0
                     if (wx_strength > 0 and weather_density_map
                             and prop_key in park_factors.PROP_PARK_KIND):
@@ -3488,11 +3490,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                                if _home_id and test_date else None)
                         if _wx:
                             _t, _h, _p, _wo, _dome = _wx
-                            projected *= weather_factors.density_factor(
+                            wx_mult = weather_factors.density_factor(
                                 _t, _h, _p, _wo,
                                 params.get("weather_density_coef", 0.0),
                                 params.get("weather_wind_coef", 0.0),
                                 wx_strength, dome=_dome)
+                            projected *= wx_mult
 
                     # ── §2.6 candidate-feature multiplier (rest/days-off, …) ──
                     # ONE source shared with the runtime + real-line diagnostic
@@ -3548,8 +3551,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                             # the exact split production uses (effective_line for
                             # A, real line for B/C/E). feat_mult==1.0 → identical
                             # to production.
-                            line_eff = (synthetic_line / feat_mult
-                                        if feat_mult != 1.0 else synthetic_line)
+                            # Combined line shift = feat_mult × weather (matches live
+                            # combined_mult → effective_line), so method A sees weather
+                            # too, not just projected. Both are 1.0 when off → identical.
+                            _line_mult = feat_mult * wx_mult
+                            line_eff = (synthetic_line / _line_mult
+                                        if _line_mult != 1.0 else synthetic_line)
                             empirical_over = _weighted_rate(
                                 prior_values, weights, lambda v: v > line_eff)
                         else:
