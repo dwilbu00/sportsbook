@@ -40,3 +40,5 @@ experiment_registry.jsonl
 # Derived clean-odds backtest store (rebuilt by build_clean_odds_store.py from the
 # committed api20XX source stores + the warehouse; regenerable, so not committed).
 historical_odds/*__apiclean.json
+
+.feature_cache
