@@ -246,6 +246,39 @@ def wind_out_component(wind_speed, wind_from_deg, cf_bearing):
     return wind_speed * math.cos(math.radians(wind_to - cf_bearing))
 
 
+# Sea-level neutral baseline for the moist-air density term: 70°F, 50% RH, 1013.25 mb
+# (the same 70°F reference the temperature coefficient uses). Air density is INVERSE to
+# carry — denser air (cold / humid / high-pressure) suppresses batted-ball distance,
+# thinner air boosts it — so a projection factor keys off (baseline − density). NB: our
+# weather_game.pressure_mb is SEA-LEVEL-adjusted, so this term captures day-to-day
+# barometric + temperature/humidity variation but NOT altitude (Coors thin air stays in
+# the park factor, so no double-count).
+AIR_DENSITY_BASELINE_KG_M3 = 1.194
+
+
+def air_density(temp_f, humidity_pct=None, pressure_mb=None):
+    """Moist-air density (kg/m³) from temperature + relative humidity + pressure via the
+    Magnus saturation-vapor-pressure approximation and the moist-air ideal-gas law — the
+    physically-correct "how far the ball carries" combiner (ported from the parallel
+    app's ParkWeatherRoofBuilder). Uses the three variables weather_game already stores
+    but our current temp-only multiplier discards. Missing humidity → 50%, missing
+    pressure → sea-level 1013.25 mb, so it degrades gracefully to a temperature-driven
+    density. Returns None only when temperature itself is missing."""
+    if temp_f is None:
+        return None
+    try:
+        t_c = (float(temp_f) - 32.0) * 5.0 / 9.0
+        rh = (float(humidity_pct) / 100.0) if humidity_pct is not None else 0.5
+        p_pa = (float(pressure_mb) if pressure_mb is not None else 1013.25) * 100.0
+    except (TypeError, ValueError):
+        return None
+    rh = max(0.0, min(1.0, rh))
+    t_k = t_c + 273.15
+    sat = 610.94 * math.exp((17.625 * t_c) / (t_c + 243.04))   # sat. vapor pressure, Pa
+    vapor = rh * sat                                            # water-vapor partial pressure, Pa
+    return (p_pa - vapor) / (287.05 * t_k) + vapor / (461.495 * t_k)
+
+
 def _cache_path(key):
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, digest + ".json")

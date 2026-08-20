@@ -2313,6 +2313,26 @@ class WeatherFactorMultTests(unittest.TestCase):
         self.assertEqual(lo, props.WEATHER_FACTOR_BOUNDS[0])
 
 
+class AirDensityTests(unittest.TestCase):
+    """Moist-air density helper (weather_factors.air_density) for the weather feature:
+    the physics combiner (temp+humidity+pressure). Denser air (cold/humid/high-pressure)
+    suppresses batted-ball carry; thinner air boosts it; graceful on missing data."""
+
+    def test_baseline_and_monotonicity(self):
+        b = weather_factors.AIR_DENSITY_BASELINE_KG_M3
+        self.assertAlmostEqual(weather_factors.air_density(70, 50, 1013.25), b, places=3)
+        self.assertGreater(weather_factors.air_density(40, 90, 1030), b)   # cold+humid+high = denser
+        self.assertLess(weather_factors.air_density(95, 20, 1000), b)      # hot+dry+low = thinner
+        self.assertLess(weather_factors.air_density(95),
+                        weather_factors.air_density(50))                   # hotter -> thinner
+
+    def test_missing_inputs(self):
+        b = weather_factors.AIR_DENSITY_BASELINE_KG_M3
+        self.assertAlmostEqual(weather_factors.air_density(70), b, places=3)  # humidity/pressure default
+        self.assertIsNone(weather_factors.air_density(None))
+        self.assertIsNone(weather_factors.air_density("x", None, None))
+
+
 class WeatherFactorProjectionTests(unittest.TestCase):
     """P1.3: the weather nudge moves the projection through the runtime prop
     pipeline. Same offline harness as ParkFactorProjectionTests (sport_key=None +
