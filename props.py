@@ -326,18 +326,18 @@ PARK_FACTOR_BOUNDS = (0.85, 1.20)
 
 
 # ── Weather / wind adjustment (P1.3) ──
-# Strength of the pre-game weather nudge applied to the projection. Unlike park
-# factors this is an ABSOLUTE, baseline-relative adjustment (vs 70 F / no wind):
-# a player's ~15-game sample spans random weather, so its mean already reflects
-# typical conditions — no road-context delta or double-count. The per-game
-# forecast (temperature + out/in-to-CF wind) is fetched by the caller
-# (weather_factors.get_game_weather) and passed in; only props in
-# park_factors.PROP_PARK_KIND (batter_hits, pitcher_earned_runs) move. This
-# CANNOT be validated on the projection backtest (no historical weather stored),
-# so it ships ON at a CONSERVATIVE strength and is gated on CLV as forward data
-# accrues (like the sharp-book weights). 0.0 disables; per-prop override via
-# calibration JSON "weather_factor_strength".
-PLAYER_PROP_WEATHER_STRENGTH = {"baseball_mlb": 0.5}
+# Strength of the pre-game weather nudge applied to the projection (ABSOLUTE,
+# baseline-relative vs 70 F / no wind); only props in park_factors.PROP_PARK_KIND
+# (batter_hits, pitcher_earned_runs) move. VALIDATED 2026-08-19 via backtest.py
+# --weather-sweep over 3 seasons on an air-density model (temp+humidity+pressure,
+# the physically-correct combiner): weather HURTS batter_hits 3/3, and its ER
+# benefit sign-flipped across seasons + was coupled to the ER method choice (not
+# robust). So it now ships OFF for props (0.0) — beating the old hand-set 0.5,
+# which hurt batter_hits AND was a fit!=serve gap (the refit engine fits methods
+# with weather off). Air DENSITY is a run-ENVIRONMENT effect → its home is the
+# team-runs weather run_env (step 3), not props. 0.0 disables; per-prop override
+# via calibration JSON "weather_factor_strength".
+PLAYER_PROP_WEATHER_STRENGTH = {"baseball_mlb": 0.0}
 DEFAULT_PLAYER_PROP_WEATHER_STRENGTH = 0.0  # off for sports with no park geo
 # Bounds on the final weather multiplier (caps extreme temp/wind forecasts).
 WEATHER_FACTOR_BOUNDS = (0.88, 1.15)
