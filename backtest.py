@@ -4074,12 +4074,17 @@ def _print_combined_sweep_results(results, props, k_values, top_n=15, holdout=Tr
     print("=" * 110)
     print()
 
-    # Collect all rows
+    # Collect all rows. Show method E (NegBin) for count props so the sweep
+    # DISPLAY matches what _best_per_prop actually selects (both E-eligible) — else
+    # the tables silently omit E and read as "A wins" when E was never scored here.
+    from props import PROP_NEGBIN_ELIGIBLE
     by_prop_rows = {prop: [] for prop in props}
     for vname, by_prop in results.items():
         for prop_key in props:
             obs = by_prop[prop_key].get("calib_obs") or []
-            evals = _evaluate_calibration_methods(obs, k_values, holdout=holdout)
+            evals = _evaluate_calibration_methods(
+                obs, k_values, holdout=holdout,
+                negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE))
             for e in evals:
                 if e["brier"] is None:
                     continue
