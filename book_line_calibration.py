@@ -30,7 +30,8 @@ from analysis import (
     _norm_cdf, _half_life_for, _recency_weights, _weighted_rate,
     _weighted_std, _normal_inv_cdf, _weighted_quantile,
 )
-from stats import negbin_at_least, fit_negbin_dispersion  # §2.2 method "E"
+from stats import (  # §2.2 method "E"
+    negbin_at_least, fit_negbin_dispersion, fit_negbin_params)
 from backtest import (
     cached_gamelog, cached_athlete_id,
     SPORT_MAP, VARIANT_PRESETS, _empirical_cdf, _brier, _logloss, _hit_rate,
@@ -1148,18 +1149,11 @@ def _fit_negbin_real(rows):
     variance=mean+phi*mean^2 link). ``dispersion`` is fit by
     ``stats.fit_negbin_dispersion`` on the SCALED means. Leakage-safe: the caller
     fits on the train split (or all usable obs for the deployed params) and scores
-    on the held-out split, exactly like the B/C residual fit."""
-    usable = [r for r in rows if r.get("projected") and r["projected"] > 0]
-    if not usable:
-        return None
-    sp = sum(r["projected"] for r in usable)
-    if sp <= 0:
-        return None
-    sa = sum(r["actual"] for r in usable)
-    mean_scale = max(0.5, min(2.0, sa / sp))
-    disp = fit_negbin_dispersion(
-        [(mean_scale * r["projected"], r["actual"]) for r in usable])
-    return mean_scale, disp
+    on the held-out split, exactly like the B/C residual fit.
+
+    Thin adapter over the shared ``stats.fit_negbin_params`` (one fit impl for both
+    the real-line selector and the synthetic sweep — see that docstring)."""
+    return fit_negbin_params([(r.get("projected"), r.get("actual")) for r in rows])
 
 
 def _score_abc_real(train, test, negbin_eligible=False):

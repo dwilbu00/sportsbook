@@ -3044,6 +3044,105 @@ class RecencySweepGridTests(unittest.TestCase):
             stats._weighted_rate(vals, w_n3, lambda v: v > 8.5), 2 / 3)
 
 
+class MethodESyntheticTests(unittest.TestCase):
+    """STEP-2 Piece-1 (TB fix): method E (NegBin count model) is now a candidate in
+    the SYNTHETIC sweep, gated to count props (props.PROP_NEGBIN_ELIGIBLE), so a
+    count prop with no stored book lines can still select the count model. The fit
+    (mean_scale + dispersion) is the SAME shared fitter the real-line path uses and
+    the exact params props._negbin_over_rate serves (fit==serve)."""
+
+    @staticmethod
+    def _count_model_obs():
+        # 240 dated obs across three groups whose projection carries a MULTIPLICATIVE
+        # bias (proj = true_mean / 2) at DIFFERENT means. E's mean_scale (=Sum a/Sum
+        # proj = 2.0) corrects that at every mean; B/C's additive/pooled-residual
+        # correction is one shift and mis-prices across the heteroscedastic groups.
+        # actual cycles {mean-1, mean, mean+1} -> P(over mean-0.5) = 2/3 in each
+        # group and fold, so E wins the count structure out-of-sample. emp (method-A
+        # prob) is a miscalibrated constant 0.5.
+        groups = [(1.0, 2), (2.0, 4), (3.0, 6)]      # (projected, true_mean)
+        obs = []
+        for i in range(240):
+            proj, tm = groups[i % 3]
+            actual = tm + ((i // 3) % 3 - 1)         # tm-1, tm, tm+1
+            line = tm - 0.5
+            date = f"2025-{(i % 9) + 1:02d}-{(i // 9) % 27 + 1:02d}"
+            #    (name,          proj, line, actual, emp, date)
+            obs.append((f"p{i % 12}", proj, line, actual, 0.5, date))
+        return obs
+
+    def test_scorer_gates_E_on_eligibility(self):
+        import backtest
+        obs = self._count_model_obs()
+        fit, score = obs[:60], obs[60:]
+        with_e = {e["method"] for e in backtest._score_calibration_methods(
+            fit, score, (0,), negbin_eligible=True)}
+        without_e = {e["method"] for e in backtest._score_calibration_methods(
+            fit, score, (0,), negbin_eligible=False)}
+        self.assertIn("E", with_e)
+        self.assertNotIn("E", without_e)   # E omitted for a non-count prop
+
+    def test_best_per_prop_selects_E_only_for_eligible_prop(self):
+        # Wiring test: with the scorer controlled so E is the best confirmed method,
+        # _best_per_prop must SELECT E for an eligible count prop and CANNOT for an
+        # ineligible one (the scorer omits E when negbin_eligible=False — exactly how
+        # the real scorer gates it). Real E math is covered by the scorer/serve tests.
+        import refit_calibration as rc
+        obs = self._count_model_obs()          # 240 dated obs -> confirmation folds exist
+        results = {"none/defadj0.0/ven0.0": {  # a baseline variant -> variant gate skipped
+            "batter_total_bases": {"calib_obs": obs},   # eligible
+            "batter_strikeouts": {"calib_obs": obs},    # NOT eligible
+        }}
+
+        def fake(_obs, _k, holdout=False, negbin_eligible=False):
+            ms = [{"method": "A", "k": None, "brier": 0.25, "hit": 50.0},
+                  {"method": "C", "k": None, "brier": 0.23, "hit": 55.0}]
+            if negbin_eligible:
+                ms.append({"method": "E", "k": None, "brier": 0.20, "hit": 60.0})
+            return ms
+
+        def fake_score(_fit, _score, _k, negbin_eligible=False):
+            return fake(None, _k, negbin_eligible=negbin_eligible)
+
+        with patch.object(rc, "_evaluate_calibration_methods", side_effect=fake), \
+             patch.object(rc, "_score_calibration_methods", side_effect=fake_score):
+            winners = rc._best_per_prop(
+                results, ["batter_total_bases", "batter_strikeouts"])
+        self.assertEqual(winners["batter_total_bases"]["method"], "E")
+        self.assertEqual(winners["batter_strikeouts"]["method"], "C")  # E never offered
+
+    def test_build_prop_cfg_persists_negbin_params(self):
+        import refit_calibration as rc
+        obs = self._count_model_obs()
+        results = {"none/defadj0.0/ven0.0": {
+            "batter_total_bases": {"calib_obs": obs}}}
+        winner = {"variant": "none/defadj0.0/ven0.0", "method": "E",
+                  "brier": 0.19, "hit": 75.0, "baseline_brier": 0.25,
+                  "cv_brier": 0.19, "confirmed": True, "variant_confirmed": False}
+        cfg = rc._build_prop_cfg(winner, results, "batter_total_bases", 0)
+        self.assertEqual(cfg["method"], "E")
+        self.assertIn("mean_scale", cfg)
+        self.assertIn("dispersion", cfg)
+        self.assertGreater(cfg["mean_scale"], 0)
+        # serve-parity: the persisted params drive props._negbin_over_rate directly
+        import props
+        p = props._negbin_over_rate(1.5, cfg["mean_scale"], cfg["dispersion"], 0.5)
+        self.assertTrue(0.5 < p < 0.95)     # P(X>=1) for a mean~1.5 count
+
+    def test_fit_negbin_params_shared_with_real_line(self):
+        import stats
+        import book_line_calibration as blc
+        rows = [{"projected": 1.5, "actual": a}
+                for a in ([2] * 90 + [0] * 30)]
+        pairs = [(r["projected"], r["actual"]) for r in rows]
+        self.assertEqual(blc._fit_negbin_real(rows), stats.fit_negbin_params(pairs))
+        self.assertIsNone(stats.fit_negbin_params([]))
+        self.assertIsNone(stats.fit_negbin_params([(0, 1), (0, 2)]))
+        # mean_scale clamps to [0.5, 2.0]
+        ms, _ = stats.fit_negbin_params([(1.0, 9)] * 20)   # ratio 9 -> clamp 2.0
+        self.assertEqual(ms, 2.0)
+
+
 class MultiSeasonPoolingTests(unittest.TestCase):
     """STEP-2 multi-season pooling: _merge_props_results pools per-season
     run_player_props_backtest results into one dict (concatenated calib_obs +

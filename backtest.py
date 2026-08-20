@@ -59,6 +59,7 @@ from odds_client import (
     american_to_implied_prob,
     devig_two_way,
 )
+from stats import negbin_at_least, fit_negbin_params  # §2.2 method "E"
 from pricing_common import (_resolve_team_defense, kelly_stake,
                             kelly_stake_uncertain, prob_interval_low,
                             _expected_roi)
@@ -3907,12 +3908,14 @@ def _print_calibration_k_sweep(results, props, k_values=(0, 5, 10, 15, 20, 30, 6
             print()
 
 
-def _evaluate_calibration_methods(obs, k_values, holdout=False):
+def _evaluate_calibration_methods(obs, k_values, holdout=False,
+                                  negbin_eligible=False):
     """
     Evaluate calibration methods for one (variant, prop) observation list.
     Returns a list of dicts: {method, k, brier, hit}.
     Methods: A (empirical), B (pooled Gaussian), C (pooled ECDF),
-             B*@k, C*@k (per-player with shrinkage) for each k.
+             B*@k, C*@k (per-player with shrinkage) for each k, and
+             E (§2.2 Negative Binomial count model) when `negbin_eligible`.
 
     holdout=False: fit and score on the same `obs` (diagnostic / in-sample).
     holdout=True:  sort by game_date, fit on earliest 50%, score on latest 50%.
@@ -3932,16 +3935,23 @@ def _evaluate_calibration_methods(obs, k_values, holdout=False):
         fit_obs = obs
         score_obs = obs
 
-    return _score_calibration_methods(fit_obs, score_obs, k_values)
+    return _score_calibration_methods(fit_obs, score_obs, k_values,
+                                      negbin_eligible=negbin_eligible)
 
 
-def _score_calibration_methods(fit_obs, score_obs, k_values):
+def _score_calibration_methods(fit_obs, score_obs, k_values,
+                               negbin_eligible=False):
     """
     Fit calibration params on `fit_obs` and score them on `score_obs`.
 
     Returns a list of {method, k, brier, hit} for methods A (empirical),
     B (pooled Gaussian), C (pooled ECDF) and B*/C* (per-player shrinkage) at
-    each k. Both inputs use the calib_obs schema
+    each k. When `negbin_eligible` (a count prop the caller whitelisted via
+    props.PROP_NEGBIN_ELIGIBLE) also scores E (§2.2 Negative Binomial): the
+    same train-fit mean_scale + dispersion the real-line selector uses
+    (book_line_calibration._score_abc_real), so a count prop with NO stored book
+    lines (e.g. batter_total_bases) can still select the count model from the
+    synthetic sweep. Both inputs use the calib_obs schema
     (name, projected, line, actual, empirical_over, date). Splitting fit from
     score lets callers supply arbitrary chronological folds (e.g. the
     confirmation folds used by the calibration refit) without re-deriving the
@@ -3997,6 +4007,26 @@ def _score_calibration_methods(fit_obs, score_obs, k_values):
         pC.append(1.0 - _empirical_cdf(sorted_pool, line - corrected))
     results.append({"method": "C", "k": None,
                     "brier": _brier(pC, outcomes), "hit": _hit_rate(pC, outcomes)})
+
+    # E: §2.2 Negative Binomial count model — train-fit (mean_scale + dispersion),
+    # scored at each score row's line, ONLY for a whitelisted count prop. Mirrors
+    # book_line_calibration._score_abc_real's E branch verbatim (shared fit via
+    # stats.fit_negbin_params) so the synthetic sweep and the real-line selector
+    # can't drift. mean_scale/dispersion are line-invariant distributional params
+    # (like B/C residuals), so a fit at the synthetic season-avg line serves
+    # correctly at real book lines. fail-open: an unusable fit just omits E.
+    if negbin_eligible:
+        nb = fit_negbin_params([(proj, actual)
+                                for _, proj, _, actual, _, *_ in fit_obs])
+        if nb is not None:
+            mean_scale, disp = nb
+            pE = []
+            for _, proj, line, _, _ in rows:
+                mean = max(1e-9, mean_scale * proj)
+                pE.append(negbin_at_least(int(line) + 1, mean, disp))
+            results.append({"method": "E", "k": None,
+                            "brier": _brier(pE, outcomes),
+                            "hit": _hit_rate(pE, outcomes)})
 
     # B*, C* at each k
     for k in k_values:

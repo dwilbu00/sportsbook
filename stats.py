@@ -289,6 +289,32 @@ def fit_negbin_dispersion(pairs, cap=2.0):
         return 0.0
 
 
+def fit_negbin_params(pairs, scale_bounds=(0.5, 2.0)):
+    """Fit method-"E" params ``(mean_scale, dispersion)`` from
+    ``pairs = [(projected_i, actual_i)]``, or None when unusable.
+
+    ``mean_scale = sum(actual)/sum(projected)`` clamped to ``scale_bounds`` — the
+    MLE mean-scale for a proportional count mean and the multiplicative analog of
+    method B's additive ``residual_mu`` (multiplicative keeps the mean > 0 at low
+    counts). ``dispersion`` is then fit by ``fit_negbin_dispersion`` on the SCALED
+    means. One source of truth shared by the real-line selector
+    (``book_line_calibration._fit_negbin_real``) and the synthetic sweep
+    (``backtest._score_calibration_methods``) so the two can't drift; the caller is
+    responsible for leakage-safety (fit on train, score on the held-out split)."""
+    usable = [(float(p), float(a)) for p, a in pairs
+              if p is not None and a is not None and float(p) > 0]
+    if not usable:
+        return None
+    sp = sum(p for p, _ in usable)
+    if sp <= 0:
+        return None
+    sa = sum(a for _, a in usable)
+    lo, hi = scale_bounds
+    mean_scale = max(lo, min(hi, sa / sp))
+    disp = fit_negbin_dispersion([(mean_scale * p, a) for p, a in usable])
+    return mean_scale, disp
+
+
 def _normal_inv_cdf(p):
     """
     Inverse standard-normal CDF (probit). Acklam's rational approximation,

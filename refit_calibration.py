@@ -541,18 +541,20 @@ def _chronological_folds(obs, min_set_n=20):
     return folds
 
 
-def _method_brier_by_fold(obs, method):
-    """Out-of-sample Brier of `method` in each confirmation fold (A/B/C only)."""
+def _method_brier_by_fold(obs, method, negbin_eligible=False):
+    """Out-of-sample Brier of `method` in each confirmation fold (A/B/C, and E
+    when `negbin_eligible`)."""
     briers = []
     for fit_obs, score_obs in _chronological_folds(obs):
-        evals = _score_calibration_methods(fit_obs, score_obs, ())
+        evals = _score_calibration_methods(fit_obs, score_obs, (),
+                                           negbin_eligible=negbin_eligible)
         by_method = {e["method"]: e for e in evals
                      if e["k"] in (None, 0) and e["brier"] is not None}
         briers.append(by_method)
     return briers
 
 
-def _confirms_over_baseline(obs, method):
+def _confirms_over_baseline(obs, method, negbin_eligible=False):
     """A non-empirical method must beat method A out-of-sample in BOTH folds.
 
     This is the guard that defeats winner's-curse selection: noise that makes a
@@ -560,7 +562,7 @@ def _confirms_over_baseline(obs, method):
     independent later folds. Returns False when there isn't enough data to
     confirm (so the safe empirical baseline is used instead).
     """
-    folds = _method_brier_by_fold(obs, method)
+    folds = _method_brier_by_fold(obs, method, negbin_eligible=negbin_eligible)
     if not folds:
         return False
     for by_method in folds:
@@ -571,14 +573,14 @@ def _confirms_over_baseline(obs, method):
     return True
 
 
-def _cv_brier(obs, method):
+def _cv_brier(obs, method, negbin_eligible=False):
     """Mean out-of-sample Brier of `method` across the confirmation folds.
 
     Persisted as a less-biased estimate of the DEPLOYED calibration's quality
     than the single-split holdout Brier (which is the argmax-selected winner's
     optimistic number). Returns None when folds are unavailable.
     """
-    folds = _method_brier_by_fold(obs, method)
+    folds = _method_brier_by_fold(obs, method, negbin_eligible=negbin_eligible)
     briers = [by_method[method]["brier"]
               for by_method in folds if method in by_method]
     if not briers or len(briers) < len(folds):
@@ -604,7 +606,7 @@ def _baseline_variant_obs(results, prop_key):
     return []
 
 
-def _variant_confirms(cand_obs, base_obs, cand_method):
+def _variant_confirms(cand_obs, base_obs, cand_method, negbin_eligible=False):
     """P2.1: a non-baseline VARIANT (with its selected method) must beat the
     BASELINE variant (method A — knobs off, empirical) out-of-sample in BOTH
     chronological folds. Clones _confirms_over_baseline onto the knob axis: noise
@@ -618,7 +620,8 @@ def _variant_confirms(cand_obs, base_obs, cand_method):
     if not cand_folds or not base_folds or len(cand_folds) != len(base_folds):
         return False
     for (cf, cs), (bf, bs) in zip(cand_folds, base_folds):
-        ce = {e["method"]: e for e in _score_calibration_methods(cf, cs, ())
+        ce = {e["method"]: e for e in _score_calibration_methods(
+                  cf, cs, (), negbin_eligible=negbin_eligible)
               if e["k"] in (None, 0) and e["brier"] is not None}
         be = {e["method"]: e for e in _score_calibration_methods(bf, bs, ())
               if e["k"] in (None, 0) and e["brier"] is not None}
@@ -639,8 +642,14 @@ def _best_per_prop(results, props, k_values=(0,)):
         {prop_key: {"variant", "method", "brier", "hit",
                     "baseline_brier", "cv_brier", "confirmed"}}
     """
+    from props import PROP_NEGBIN_ELIGIBLE
     winners = {}
     for prop_key in props:
+        # §2.2: a whitelisted count prop admits method E (NegBin) as a candidate in
+        # the SYNTHETIC sweep too (not just the real-line path) — the fix that lets
+        # a count prop with NO stored book lines (e.g. batter_total_bases) select
+        # the count model. Non-count props are unaffected (E never scored).
+        negbin_eligible = prop_key in PROP_NEGBIN_ELIGIBLE
         base_obs = _baseline_variant_obs(results, prop_key)
         best = None
         for vname, by_prop in results.items():
@@ -648,15 +657,16 @@ def _best_per_prop(results, props, k_values=(0,)):
             if not obs:
                 continue
             is_baseline = _is_baseline_variant(vname)
-            evals = _evaluate_calibration_methods(obs, k_values, holdout=True)
+            evals = _evaluate_calibration_methods(
+                obs, k_values, holdout=True, negbin_eligible=negbin_eligible)
             by_method = {}
             for e in evals:
                 if e["brier"] is None or e["k"] not in (None, 0):
                     continue
-                # Only persist non-shrinkage methods (A, B, C) — per-player
-                # shrinkage variants (B*, C*) overfit out-of-sample per the
-                # NBA holdout sweep.
-                if e["method"] in ("A", "B", "C"):
+                # Persist non-shrinkage methods A, B, C (+ E for count props) —
+                # per-player shrinkage variants (B*, C*) overfit out-of-sample per
+                # the NBA holdout sweep.
+                if e["method"] in ("A", "B", "C", "E"):
                     by_method[e["method"]] = e
             baseline = by_method.get("A")
             for method, e in by_method.items():
@@ -665,7 +675,8 @@ def _best_per_prop(results, props, k_values=(0,)):
                     if (baseline is None
                             or baseline["brier"] - e["brier"] < MIN_CALIB_BRIER_GAIN):
                         continue
-                    if not _confirms_over_baseline(obs, method):
+                    if not _confirms_over_baseline(
+                            obs, method, negbin_eligible=negbin_eligible):
                         continue
                 # P2.1 variant gate: a non-baseline knob combo must ALSO beat the
                 # baseline variant out-of-sample in both folds — else it's likely a
@@ -673,7 +684,9 @@ def _best_per_prop(results, props, k_values=(0,)):
                 # Only active when the sweep actually contains the baseline cell
                 # (always true in the real grid; skipped in narrow unit fixtures).
                 if (base_obs and not is_baseline
-                        and not _variant_confirms(obs, base_obs, method)):
+                        and not _variant_confirms(
+                            obs, base_obs, method,
+                            negbin_eligible=negbin_eligible)):
                     continue
                 if best is None or e["brier"] < best["brier"]:
                     best = {
@@ -683,7 +696,8 @@ def _best_per_prop(results, props, k_values=(0,)):
                         "hit": e["hit"],
                         "baseline_brier": (round(baseline["brier"], 4)
                                            if baseline else None),
-                        "cv_brier": _cv_brier(obs, method),
+                        "cv_brier": _cv_brier(
+                            obs, method, negbin_eligible=negbin_eligible),
                         "confirmed": method != "A",
                         "variant_confirmed": not is_baseline,
                     }
@@ -698,6 +712,17 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
     parsed = _parse_variant_name(vname) or {}
     obs = results[vname][prop_key].get("calib_obs") or []
     fit = _fit_residuals(obs) or {}
+    # §2.2: method E ships the NegBin (mean_scale, dispersion) props.py serves
+    # (_negbin_over_rate), fit on the winning variant's obs via the SAME shared
+    # fitter the real-line path uses. Residual mu/sigma/ecdf stay in the cfg
+    # (harmless — E serving ignores them; keeps n_obs/provenance uniform).
+    if winner["method"] == "E":
+        import stats
+        nb = stats.fit_negbin_params(
+            [(o[1], o[3]) for o in obs])         # (projected, actual)
+        if nb is not None:
+            fit = dict(fit)
+            fit["mean_scale"], fit["dispersion"] = nb
     # P2.1b: shrinkage is now a swept knob (parsed from the winning label). The
     # CLI --shrinkage-k is only a fallback for legacy 3-part labels that carry no
     # shrink token — a candidate that won with shrink=0 keeps 0 (the gate chose
