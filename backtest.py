@@ -2468,11 +2468,14 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             opp_defense_strength=0.0, use_minutes=False,
             pace_adj=0.0, def_adj=0.0,
             shrink_k=0.0, rest_adj=0.0, def_window=None,
-            park_strength=0.0, rest_strength=0.0, recent_n=None,
+            park_strength=0.0, rest_strength=0.0, recent_n="__calib__",
             weather_density_coef=0.0, weather_wind_coef=0.0, weather_strength=0.0):
     return {
         "half_life": half_life,
-        "recent_n": recent_n,                # cap recency window to newest N prior games (None=full)
+        # recent_n: newest-N window BEFORE decay. "__calib__" (default) = resolve to the
+        # prop's LOCKED live window in run_player_props_backtest (fit==serve); an
+        # explicit int/None (recency sweep) overrides (None=full).
+        "recent_n": recent_n,
         # Weather-density sweep axes (Phase B; 0 strength = off = byte-identical):
         "weather_density_coef": weather_density_coef,
         "weather_wind_coef": weather_wind_coef,
@@ -3078,6 +3081,20 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               safe_target=0.80, quantile_mode=False,
                               calibrate=False, cross_season="strict"):
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
+    # STEP-2: resolve each prop's LOCKED live window so the refit fits methods at the
+    # SAME window production serves (fit==serve). A variant carrying the "__calib__"
+    # sentinel (the _preset default → normal refit / weather sweep) resolves to the
+    # prop's calibration recent_n (null=full=None; absent=per-sport default); the
+    # recency sweep passes an explicit recent_n and is untouched.
+    import props as _props_mod
+    _locked_props = (load_calibration(sport_key) or {}).get("props", {})
+    _default_locked_rn = _props_mod._player_prop_recent_n(sport_key)
+
+    def _locked_recent_n(pk):
+        cfg = _locked_props.get(pk)
+        if cfg and "recent_n" in cfg:
+            return cfg["recent_n"]        # None=full, int=window
+        return _default_locked_rn
     # P3/P4/P6: MLB sweep inputs (player gamelogs + team apparatus) come from the
     # StatsAPI warehouse; NBA/NFL stay on ESPN. (ESPN fully removed for MLB in P4.)
     use_warehouse = espn_sport == "baseball"
@@ -3379,6 +3396,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     # shrink_k / use_minutes read full prior_values, so the recency
                     # grid keeps those OFF (isolated axes). See _build_recency_sweep_grid.
                     _rn = params.get("recent_n")
+                    if _rn == "__calib__":       # normal refit -> the prop's LOCKED window
+                        _rn = _locked_recent_n(prop_key)
                     _nw = min(_rn, len(prior_values)) if _rn else len(prior_values)
                     base_w = _recency_weights(_nw, hl)
                     venue_s = params.get("venue_strength", 0.0)

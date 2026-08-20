@@ -3015,8 +3015,10 @@ class RecencySweepGridTests(unittest.TestCase):
 
     def test_preset_carries_recent_n(self):
         import backtest
-        self.assertIsNone(backtest._preset(half_life=None)["recent_n"])   # default = full
+        # default = "__calib__" sentinel (refit resolves to the prop's LOCKED window)
+        self.assertEqual(backtest._preset(half_life=None)["recent_n"], "__calib__")
         self.assertEqual(backtest._preset(half_life=5, recent_n=20)["recent_n"], 20)
+        self.assertIsNone(backtest._preset(half_life=5, recent_n=None)["recent_n"])  # explicit full
 
     def test_grid_isolates_axes_and_includes_incumbent(self):
         import backtest
