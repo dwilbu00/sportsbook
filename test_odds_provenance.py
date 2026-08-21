@@ -46,18 +46,32 @@ class OddsProvenanceTests(unittest.TestCase):
         self.assertEqual(s["A"], "live")
         self.assertEqual(s["B"], "backfill")
 
-    def test_retag_maps_null_rows_only(self):
+    def test_retag_maps_null_rows_and_leaves_tagged(self):
         self._legacy("L-seed", "seed")
         self._legacy("L-team", "team")
         self._legacy("sbr-L", "team")
-        self._legacy("L-tagged", "team", source="backfill")
+        self._legacy("L-live", "team", source="live")     # already tagged -> untouched
         with contextlib.redirect_stdout(io.StringIO()):
             op._retag(apply=True)
         s = self._sources()
         self.assertEqual(s["L-seed"], "seed")
         self.assertEqual(s["L-team"], "live")
         self.assertEqual(s["sbr-L"], "sbr")
-        self.assertEqual(s["L-tagged"], "backfill")   # already tagged -> untouched
+        self.assertEqual(s["L-live"], "live")             # non-null, non-backfill -> untouched
+
+    def test_retag_splits_backfill_by_timing(self):
+        # close: captured at commence (0h). early: captured 12h before (morning).
+        self._legacy("bf-close", "team", source="backfill")   # cap == commence (18Z)
+        with self.eng.begin() as c:
+            c.execute(insert(self.t).values(
+                sport="baseball_mlb", game_date="2024-06-02", event_id="bf-early",
+                kind="team", snapshot_hour="he", captured_at="2024-06-02T11:00:00Z",
+                commence_time="2024-06-02T23:00:00Z", source="backfill"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._retag(apply=True)
+        s = self._sources()
+        self.assertEqual(s["bf-close"], "backfill_close")
+        self.assertEqual(s["bf-early"], "backfill_early")
 
     def test_prune_seed_scoped_and_cascades(self):
         self._legacy("mlb-seed-24", "seed", gd="2024-06-01")

@@ -402,6 +402,49 @@ IF COL_LENGTH('dbo.odds_line', 'game_pk') IS NULL   -- P3: StatsAPI game (best-e
     ALTER TABLE dbo.odds_line ADD game_pk INT;
 GO
 
+-- Odds-coverage monitoring views (2026-08-21). v_odds_coverage: raw counts across
+-- every dimension (all sports). v_mlb_team_coverage_vs_eligible: MLB team-market
+-- completeness vs eligible completed games (MLB is the only sport with a warehouse
+-- game-fact table; NBA/NFL show absolute counts in v_odds_coverage only).
+CREATE OR ALTER VIEW dbo.v_odds_coverage AS
+SELECT
+    s.sport,
+    s.kind                          AS category,     -- team | props | seed | alt
+    s.source,                                        -- live | backfill_early/_close | seed | sbr
+    l.bet_type,                                      -- moneyline | spread | total | player_prop
+    l.prop_key,                                      -- NULL for team; market key for props
+    LEFT(s.game_date, 4)            AS season_year,
+    COUNT(DISTINCT CONCAT(s.event_id, '|', s.game_date)) AS games,
+    COUNT(DISTINCT s.id)            AS snapshots,
+    COUNT(l.id)                     AS lines
+FROM dbo.odds_snapshot s
+LEFT JOIN dbo.odds_line l ON l.snapshot_id = s.id
+GROUP BY s.sport, s.kind, s.source, l.bet_type, l.prop_key, LEFT(s.game_date, 4);
+GO
+CREATE OR ALTER VIEW dbo.v_mlb_team_coverage_vs_eligible AS
+WITH eligible AS (
+    SELECT LEFT(official_date, 4) AS season_year, COUNT(*) AS eligible_games
+    FROM dbo.mlb_game
+    WHERE game_type IN ('R','F','D','L','W')
+      AND status   IN ('Final','Completed Early','Game Over')
+    GROUP BY LEFT(official_date, 4)
+),
+covered AS (
+    SELECT LEFT(s.game_date, 4) AS season_year, l.bet_type,
+           COUNT(DISTINCT CONCAT(s.event_id, '|', s.game_date)) AS games_with_line
+    FROM dbo.odds_snapshot s
+    JOIN dbo.odds_line l ON l.snapshot_id = s.id
+    WHERE s.sport = 'baseball_mlb' AND l.bet_type IN ('moneyline','spread','total')
+    GROUP BY LEFT(s.game_date, 4), l.bet_type
+)
+SELECT e.season_year, bt.bet_type, e.eligible_games,
+       ISNULL(c.games_with_line, 0)                    AS games_with_line,
+       e.eligible_games - ISNULL(c.games_with_line, 0) AS gap
+FROM eligible e
+CROSS JOIN (VALUES ('moneyline'),('spread'),('total')) AS bt(bet_type)
+LEFT JOIN covered c ON c.season_year = e.season_year AND c.bet_type = bt.bet_type;
+GO
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Durable rolling ESPN gamelog store (Phase C). Replaces the ephemeral file
 -- cache (cache/backtest/*.json) so completed games survive Cloud restarts.

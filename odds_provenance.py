@@ -33,6 +33,29 @@ from datetime import datetime, timezone
 _SPORT_KEY = {"mlb": "baseball_mlb", "nfl": "americanfootball_nfl",
               "nba": "basketball_nba", "nhl": "icehockey_nhl"}
 
+# A legacy plain-'backfill' snapshot captured within this many hours of commence is
+# classified 'backfill_close'; captured earlier (the fixed morning snapshot) ->
+# 'backfill_early'. Reliable because the backfill captures close ~= commence and
+# early at a fixed morning clock time, cleanly separated. New captures are tagged
+# role-explicitly at write time, so this only reclassifies pre-refinement rows.
+CLOSE_WINDOW_HOURS = 4.0
+
+
+def _hours_before(commence, captured):
+    """Hours from captured_at to commence (positive = captured before), or None."""
+    try:
+        from datetime import datetime as _dt
+        com = _dt.fromisoformat(str(commence).replace("Z", "+00:00"))
+        cap = _dt.fromisoformat(str(captured).replace("Z", "+00:00"))
+        return (com - cap).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _chunks(seq, n=1000):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
 
 def _engine():
     import db_store
@@ -43,7 +66,9 @@ def _engine():
 
 
 def _retag(apply):
-    """Backfill source for NULL-source rows. Returns nothing; prints a plan."""
+    """(1) Backfill source for NULL-source rows (seed/sbr/live) and (2) split any
+    legacy plain-'backfill' rows into backfill_early/backfill_close by capture
+    timing. Idempotent. Prints a plan; writes only with --apply."""
     import db_store
     from sqlalchemy import select, func, update
     t = db_store.odds_snapshot
@@ -57,19 +82,37 @@ def _retag(apply):
                         .where(t.c.source.is_(None) & (t.c.kind != "seed")
                                & t.c.event_id.like("sbr-%"))).scalar()
         live = null_total - seed - sbr
-    print(f"\n=== retag: {null_total} rows have NULL source ===")
-    print(f"  -> 'seed': {seed}   -> 'sbr': {sbr}   -> 'live': {live}")
+        # Legacy rows tagged plain 'backfill' (pre role-explicit refinement) — split
+        # by timing. Unparseable timing stays plain 'backfill' (never mislabeled).
+        bf = c.execute(select(t.c.id, t.c.captured_at, t.c.commence_time)
+                       .where(t.c.source == "backfill")).all()
+    close_ids, early_ids = [], []
+    for rid, cap, com in bf:
+        h = _hours_before(com, cap)
+        if h is None:
+            continue
+        (close_ids if h <= CLOSE_WINDOW_HOURS else early_ids).append(rid)
+    print(f"\n=== retag ===")
+    print(f"  NULL source ({null_total}) -> seed={seed}, sbr={sbr}, live={live}")
+    print(f"  plain 'backfill' ({len(bf)}) -> close={len(close_ids)}, "
+          f"early={len(early_ids)}, unchanged={len(bf) - len(close_ids) - len(early_ids)}")
     if not apply:
         print("\n  dry-run only. Re-run with --apply to write.")
         return
     with eng.begin() as c:
-        # Order matters: tag seed + sbr first, then the remainder -> live.
+        # NULL rows: tag seed + sbr first, remainder -> live.
         c.execute(update(t).where(t.c.source.is_(None) & (t.c.kind == "seed"))
                   .values(source="seed"))
         c.execute(update(t).where(t.c.source.is_(None) & t.c.event_id.like("sbr-%"))
                   .values(source="sbr"))
         c.execute(update(t).where(t.c.source.is_(None)).values(source="live"))
-    print(f"  ✓ tagged {null_total} rows (seed={seed}, sbr={sbr}, live={live}).")
+        # Split legacy 'backfill' by role (batched for the SQL Server IN() limit).
+        for chunk in _chunks(close_ids):
+            c.execute(update(t).where(t.c.id.in_(chunk)).values(source="backfill_close"))
+        for chunk in _chunks(early_ids):
+            c.execute(update(t).where(t.c.id.in_(chunk)).values(source="backfill_early"))
+    print(f"  ✓ tagged NULL rows + reclassified {len(close_ids) + len(early_ids)} "
+          f"'backfill' rows (close={len(close_ids)}, early={len(early_ids)}).")
 
 
 def _prune_seed(sport_key, years, apply, yes):

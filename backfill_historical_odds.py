@@ -493,6 +493,11 @@ def main():
         print("  Nothing to fetch within budget. Done.")
         return
 
+    # Role-explicit provenance so a later gap-fill/verify sweep can tell which
+    # games are missing their EARLY vs their CLOSE line (close = per-tip-off;
+    # early = the fixed --early-time morning snapshot).
+    bf_source = "backfill_early" if args.snapshot == "early" else "backfill_close"
+
     spent = 0
     feat_stored = 0
     prop_stored = 0
@@ -563,7 +568,7 @@ def main():
                         warehouse.capture_event_odds(
                             sport_key, api_game.get("id"), args.regions,
                             args.markets, [bookmaker], api_game,
-                            captured_at=snap_ts, source="backfill")
+                            captured_at=snap_ts, source=bf_source)
                     except Exception:
                         pass
             if i % 25 == 0 or i == len(feat_ts_list):
@@ -646,7 +651,7 @@ def main():
                     import warehouse
                     warehouse.capture_event_odds(
                         sport_key, eid, args.regions, args.props,
-                        [bookmaker], data, captured_at=snap_ts, source="backfill")
+                        [bookmaker], data, captured_at=snap_ts, source=bf_source)
                 except Exception:
                     pass
             if i % 25 == 0 or i == len(prop_games):
