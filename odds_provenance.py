@@ -132,8 +132,9 @@ def _prune(sport_key, years, apply, yes, kind=None, source=None):
     ``source`` (at least one REQUIRED — never prune a whole sport unscoped).
     ``years`` is a list of year prefixes, or None = all years. Archives the full
     snapshot + line rows to a timestamped JSON first (reversible), THEN deletes.
-    Used for seed cleanup (kind='seed') and the clean-slate 2026 live-odds prune
-    (source='live', years=['2026'])."""
+    Used for seed cleanup (kind='seed'), the clean-slate 2026 live-odds prune
+    (source='live', years=['2026']), and pruning untagged legacy cruft
+    (source='null' -> matches source IS NULL)."""
     import db_store
     from sqlalchemy import select, func, or_, delete
     t, ln = db_store.odds_snapshot, db_store.odds_line
@@ -145,7 +146,11 @@ def _prune(sport_key, years, apply, yes, kind=None, source=None):
     if kind:
         scope = scope & (t.c.kind == kind)
     if source:
-        scope = scope & (t.c.source == source)
+        # 'null'/'none' targets the untagged (source IS NULL) legacy rows.
+        if str(source).strip().lower() in ("null", "none"):
+            scope = scope & t.c.source.is_(None)
+        else:
+            scope = scope & (t.c.source == source)
     if years:
         scope = scope & or_(*[t.c.game_date.like(f"{y}%") for y in years])
     # Subquery (not a materialized id list) so the line count/archive/delete never
@@ -228,7 +233,8 @@ def main():
     p.add_argument("--kind", default=None,
                    help="odds_snapshot.kind filter for --prune (e.g. seed, team, props).")
     p.add_argument("--source", default=None,
-                   help="odds_snapshot.source filter for --prune (e.g. live, backfill_close).")
+                   help="odds_snapshot.source filter for --prune (e.g. live, backfill_close; "
+                        "'null'/'none' = untagged legacy rows where source IS NULL).")
     p.add_argument("--sport", default=None,
                    help="Scope: an alias (mlb/nfl/nba/nhl), 'all', or an arbitrary raw "
                         "sport_key (e.g. soccer_epl) for odds beyond the 4 aliases. "

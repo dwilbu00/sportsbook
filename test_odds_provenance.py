@@ -176,6 +176,16 @@ class OddsProvenanceTests(unittest.TestCase):
         remaining = set(self._sources())
         self.assertEqual(remaining, {"bf25", "live25"})   # only 2026-live dropped
 
+    def test_prune_source_null_drops_only_untagged(self):
+        # clean-slate: prune the untagged (source IS NULL) legacy cruft, keep tagged.
+        self._legacy("cruft1", "props", gd="2025-06-01")               # source NULL
+        self._legacy("cruft2", "team", gd="2024-06-01")                # source NULL
+        self._legacy("tagged", "props", source="backfill_close", gd="2025-06-01")
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._prune("baseball_mlb", None, apply=True, yes=True, source="null")
+        remaining = set(self._sources())
+        self.assertEqual(remaining, {"tagged"})   # only NULL-source rows dropped
+
     def test_prune_without_filter_refuses(self):
         self._legacy("x", "team", gd="2026-06-01")
         with contextlib.redirect_stdout(io.StringIO()):
