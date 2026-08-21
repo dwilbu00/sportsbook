@@ -186,6 +186,19 @@ class OddsProvenanceTests(unittest.TestCase):
         remaining = set(self._sources())
         self.assertEqual(remaining, {"tagged"})   # only NULL-source rows dropped
 
+    def test_prune_by_ids_deletes_exactly_those_rows(self):
+        # surgical delete of specific corrupt/date-broken snapshots, regardless of
+        # sport/kind/source.
+        self._legacy("bad1", "props", gd="2023-12-25", sport="basketball_nba")
+        self._legacy("bad2", "props", gd="2025-05-28")
+        self._legacy("keep", "props", gd="2025-05-28")
+        with self.eng.connect() as c:
+            ids = dict(c.execute(select(self.t.c.event_id, self.t.c.id)).all())
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._prune(None, None, apply=True, yes=True,
+                      ids=[ids["bad1"], ids["bad2"]])
+        self.assertEqual(set(self._sources()), {"keep"})
+
     def test_prune_without_filter_refuses(self):
         self._legacy("x", "team", gd="2026-06-01")
         with contextlib.redirect_stdout(io.StringIO()):

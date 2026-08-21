@@ -127,32 +127,46 @@ def _retag(apply, sport_key=None, years=None, live_since=None, all_backfill=Fals
     print(f"  ok: tagged {tagged} row(s); left {n_amb} ambiguous row(s) NULL.")
 
 
-def _prune(sport_key, years, apply, yes, kind=None, source=None):
-    """Archive + delete odds_snapshot rows for a sport filtered by ``kind`` and/or
-    ``source`` (at least one REQUIRED — never prune a whole sport unscoped).
-    ``years`` is a list of year prefixes, or None = all years. Archives the full
-    snapshot + line rows to a timestamped JSON first (reversible), THEN deletes.
-    Used for seed cleanup (kind='seed'), the clean-slate 2026 live-odds prune
-    (source='live', years=['2026']), and pruning untagged legacy cruft
-    (source='null' -> matches source IS NULL)."""
+def _prune(sport_key, years, apply, yes, kind=None, source=None, ids=None):
+    """Archive + delete odds_snapshot rows, then delete. Two scoping modes:
+      - ``ids`` (a list of snapshot ids): delete EXACTLY those rows — surgical,
+        for removing specific corrupt/date-broken snapshots; sport/kind/source/
+        years are ignored (the ids are the scope).
+      - otherwise: filter by ``kind`` and/or ``source`` (at least one REQUIRED —
+        never prune a whole sport unscoped) within ``sport_key`` + ``years``
+        (list of year prefixes, or None = all years).
+    Archives the full snapshot + line rows to a timestamped JSON first (reversible),
+    THEN deletes. Covers seed cleanup (kind='seed'), the 2026 live prune
+    (source='live'), untagged cruft (source='null' -> source IS NULL), and
+    surgical id-deletes."""
     import db_store
     from sqlalchemy import select, func, or_, delete
     t, ln = db_store.odds_snapshot, db_store.odds_line
     eng = _engine()
-    if not (kind or source):
-        print("  refusing to prune without a --kind or --source filter (safety).")
-        sys.exit(3)
-    scope = (t.c.sport == sport_key)
-    if kind:
-        scope = scope & (t.c.kind == kind)
-    if source:
-        # 'null'/'none' targets the untagged (source IS NULL) legacy rows.
-        if str(source).strip().lower() in ("null", "none"):
-            scope = scope & t.c.source.is_(None)
-        else:
-            scope = scope & (t.c.source == source)
-    if years:
-        scope = scope & or_(*[t.c.game_date.like(f"{y}%") for y in years])
+    if ids:
+        scope = t.c.id.in_(ids)
+        desc = f"ids={','.join(str(i) for i in ids)}"
+        tag = "ids"
+    else:
+        if not (kind or source):
+            print("  refusing to prune without a --kind or --source filter (safety).")
+            sys.exit(3)
+        scope = (t.c.sport == sport_key)
+        if kind:
+            scope = scope & (t.c.kind == kind)
+        if source:
+            # 'null'/'none' targets the untagged (source IS NULL) legacy rows.
+            if str(source).strip().lower() in ("null", "none"):
+                scope = scope & t.c.source.is_(None)
+            else:
+                scope = scope & (t.c.source == source)
+        if years:
+            scope = scope & or_(*[t.c.game_date.like(f"{y}%") for y in years])
+        filt = " ".join(x for x in [f"kind='{kind}'" if kind else "",
+                                    f"source='{source}'" if source else ""] if x)
+        desc = (f"{sport_key} {filt} "
+                f"years={','.join(years) if years else 'ALL'}")
+        tag = "_".join(x for x in [kind or "", source or ""] if x) or "all"
     # Subquery (not a materialized id list) so the line count/archive/delete never
     # hit SQL Server's ~2100-param IN() limit on a large scope (e.g. 3k+ seed rows).
     snap_id_q = select(t.c.id).where(scope)
@@ -160,10 +174,7 @@ def _prune(sport_key, years, apply, yes, kind=None, source=None):
         n_snap = c.execute(select(func.count()).select_from(t).where(scope)).scalar()
         n_line = c.execute(select(func.count()).select_from(ln)
                            .where(ln.c.snapshot_id.in_(snap_id_q))).scalar()
-    filt = " ".join(x for x in [f"kind='{kind}'" if kind else "",
-                                f"source='{source}'" if source else ""] if x)
-    print(f"\n=== prune: {sport_key} {filt} "
-          f"years={','.join(years) if years else 'ALL'} ===")
+    print(f"\n=== prune: {desc} ===")
     print(f"  snapshots to delete: {n_snap}   odds_line rows to delete: {n_line}")
     if n_snap == 0:
         print("  nothing matches -- done.")
@@ -179,15 +190,14 @@ def _prune(sport_key, years, apply, yes, kind=None, source=None):
     arch_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "warehouse", "archive")
     os.makedirs(arch_dir, exist_ok=True)
-    tag = "_".join(x for x in [kind or "", source or ""] if x) or "all"
-    path = os.path.join(arch_dir, f"pruned_{tag}_{sport_key}_{ts}.json")
+    path = os.path.join(arch_dir, f"pruned_{tag}_{sport_key or 'byid'}_{ts}.json")
     with eng.connect() as c:
         snaps = [dict(r._mapping) for r in c.execute(select(t).where(scope)).all()]
         lines = [dict(r._mapping) for r in c.execute(
             select(ln).where(ln.c.snapshot_id.in_(snap_id_q))).all()]
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"sport": sport_key, "years": years, "kind": kind,
-                   "source": source, "archived_at": ts,
+                   "source": source, "ids": ids, "archived_at": ts,
                    "snapshots": snaps, "lines": lines}, f, indent=2, default=str)
     print(f"  archived {len(snaps)} snapshots + {len(lines)} lines -> {path}")
     # Delete lines first (explicit; not relying on FK cascade for portability),
@@ -229,7 +239,12 @@ def main():
     p.add_argument("--prune", action="store_true",
                    help="Archive + delete snapshots filtered by --kind and/or --source "
                         "(e.g. --prune --source live --years 2026 = drop the 2026 "
-                        "pre-relaunch live odds). At least one filter required.")
+                        "pre-relaunch live odds), or by explicit --ids. A filter or "
+                        "--ids is required.")
+    p.add_argument("--ids", default=None,
+                   help="Comma-separated odds_snapshot.id list for a SURGICAL --prune "
+                        "of exactly those rows (e.g. corrupt/date-broken snapshots). "
+                        "Ignores --sport/--kind/--source/--years.")
     p.add_argument("--kind", default=None,
                    help="odds_snapshot.kind filter for --prune (e.g. seed, team, props).")
     p.add_argument("--source", default=None,
@@ -266,7 +281,18 @@ def main():
         _retag(args.apply, sport_key=_resolve_sport(args.sport),
                years=_parse_years(args.years, default_all=True),
                live_since=args.live_since, all_backfill=args.all_backfill)
-    if args.prune_seed or args.prune:
+    if args.ids and not args.prune:
+        p.error("--ids is only valid with --prune (surgical id-delete).")
+    if args.prune and args.ids:
+        # Surgical id-delete: ids are the scope; --sport/--kind/--source/--years ignored.
+        try:
+            ids = [int(x) for x in args.ids.split(",") if x.strip()]
+        except ValueError:
+            p.error("--ids must be a comma-separated list of integer snapshot ids.")
+        if not ids:
+            p.error("--ids was empty.")
+        _prune(None, None, args.apply, args.yes, ids=ids)
+    elif args.prune_seed or args.prune:
         if args.sport in (None, "all"):
             p.error("--prune/--prune-seed requires a specific --sport "
                     "(an alias or raw sport_key), not 'all'.")
