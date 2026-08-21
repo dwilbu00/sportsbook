@@ -54,26 +54,31 @@ def _engine():
     return db_store.get_engine()
 
 
-def _classify(kind, event_id, game_date, live_since):
+def _classify(kind, event_id, game_date, live_since, all_backfill=False):
     """Provenance for one NULL-source row, or None if it must be left untagged.
     Positive rules first (seed by kind, sbr by id prefix); the live-vs-backfill
     split is a game_date season gate, NEVER classification-by-elimination — the
     pre-column population mixes real-time live captures with historical backfill
-    closes, so 'everything not seed/sbr = live' would mislabel the whole corpus."""
+    closes, so 'everything not seed/sbr = live' would mislabel the whole corpus.
+    ``all_backfill`` = the sport was never live-captured, so every non-seed/non-sbr
+    row is backfill_close (used for other sports with no real-time capture)."""
     if kind == "seed":
         return "seed"
     if (event_id or "").startswith("sbr-"):
         return "sbr"
+    if all_backfill:
+        return "backfill_close"
     if live_since is None:
         return None  # ambiguous without a boundary → leave NULL, never guess live
     return "live" if (game_date or "") >= live_since else "backfill_close"
 
 
-def _retag(apply, sport_key=None, years=None, live_since=None):
+def _retag(apply, sport_key=None, years=None, live_since=None, all_backfill=False):
     """Tag source for NULL-source odds_snapshot rows, scoped by sport/years, via
     _classify. Prints a sport×year×kind→target composition breakdown so the
     affected population is visible before any write. Idempotent; writes only with
-    --apply. Non-seed/non-sbr rows are left NULL unless --live-since is given."""
+    --apply. Non-seed/non-sbr rows are left NULL unless --live-since (date gate) or
+    --all-backfill (no live capture -> all backfill_close) is given."""
     import db_store
     from sqlalchemy import select, or_, update
     t = db_store.odds_snapshot
@@ -92,14 +97,15 @@ def _retag(apply, sport_key=None, years=None, live_since=None):
     buckets = {"seed": [], "sbr": [], "live": [], "backfill_close": [], None: []}
     comp = {}
     for rid, sport, gd, kind, eid in rows:
-        target = _classify(kind, eid, gd, live_since)
+        target = _classify(kind, eid, gd, live_since, all_backfill)
         buckets[target].append(rid)
         key = (sport, (gd or "")[:4], kind, target or "(left NULL)")
         comp[key] = comp.get(key, 0) + 1
 
     scope_desc = (f"sport={sport_key or 'ALL'}  "
                   f"years={','.join(years) if years else 'ALL'}  "
-                  f"live_since={live_since or '(unset)'}")
+                  + ("mode=all-backfill" if all_backfill
+                     else f"live_since={live_since or '(unset)'}"))
     print(f"\n=== retag ({scope_desc}) ===")
     print(f"  NULL-source rows in scope: {len(rows)}")
     for key in sorted(comp):
@@ -199,6 +205,15 @@ def _parse_years(years_arg, default_all):
     return [y.strip() for y in years_arg.split(",") if y.strip()]
 
 
+def _resolve_sport(sport_arg):
+    """Map --sport to a warehouse sport_key: a known alias (mlb->baseball_mlb),
+    'all'/None -> None (no filter), or an ARBITRARY raw sport_key passed through so
+    odds from sports beyond the 4 aliases (e.g. soccer_epl) can be targeted."""
+    if sport_arg in (None, "all"):
+        return None
+    return _SPORT_KEY.get(sport_arg, sport_arg)
+
+
 def main():
     p = argparse.ArgumentParser(description="Warehouse odds-provenance maintenance")
     p.add_argument("--retag", action="store_true",
@@ -215,9 +230,10 @@ def main():
     p.add_argument("--source", default=None,
                    help="odds_snapshot.source filter for --prune (e.g. live, backfill_close).")
     p.add_argument("--sport", default=None,
-                   choices=list(_SPORT_KEY.keys()) + ["all"],
-                   help="Scope. --retag: omit or 'all' = every sport. "
-                        "--prune/--prune-seed: REQUIRED (a specific sport, not 'all').")
+                   help="Scope: an alias (mlb/nfl/nba/nhl), 'all', or an arbitrary raw "
+                        "sport_key (e.g. soccer_epl) for odds beyond the 4 aliases. "
+                        "--retag: omit or 'all' = every sport. --prune/--prune-seed: "
+                        "REQUIRED (a specific sport, not 'all').")
     p.add_argument("--years", default=None,
                    help="Comma-separated seasons, or 'all'. --retag: omit = ALL years. "
                         "--prune/--prune-seed: omit = 2024,2025 (safe default).")
@@ -227,25 +243,31 @@ def main():
                         "'backfill_close'. Without it those rows are LEFT NULL (never "
                         "guessed as live). This is the season the app began real-time "
                         "capture (e.g. 2026-01-01 for MLB).")
+    p.add_argument("--all-backfill", action="store_true",
+                   help="--retag: the scope had NO real-time live capture, so tag every "
+                        "non-seed/non-sbr row 'backfill_close' (for other sports never "
+                        "captured live). Mutually exclusive with --live-since.")
     p.add_argument("--apply", action="store_true", help="Write (default is dry-run).")
     p.add_argument("--yes", action="store_true",
                    help="Required with --apply for the destructive --prune/--prune-seed.")
     args = p.parse_args()
     if not (args.retag or args.prune_seed or args.prune):
         p.error("choose --retag, --prune-seed, and/or --prune")
+    if args.live_since and args.all_backfill:
+        p.error("--live-since and --all-backfill are mutually exclusive "
+                "(one is a date gate, the other says 'no live capture at all').")
     if args.retag:
-        sport_key = None if args.sport in (None, "all") else _SPORT_KEY[args.sport]
-        _retag(args.apply, sport_key=sport_key,
+        _retag(args.apply, sport_key=_resolve_sport(args.sport),
                years=_parse_years(args.years, default_all=True),
-               live_since=args.live_since)
+               live_since=args.live_since, all_backfill=args.all_backfill)
     if args.prune_seed or args.prune:
         if args.sport in (None, "all"):
             p.error("--prune/--prune-seed requires a specific --sport "
-                    "(mlb/nfl/nba/nhl), not 'all'.")
+                    "(an alias or raw sport_key), not 'all'.")
         # --prune-seed = kind='seed'; --prune uses the explicit --kind/--source.
         kind = "seed" if args.prune_seed else args.kind
         source = None if args.prune_seed else args.source
-        _prune(_SPORT_KEY[args.sport],
+        _prune(_resolve_sport(args.sport),
                _parse_years(args.years, default_all=False),
                args.apply, args.yes, kind=kind, source=source)
 

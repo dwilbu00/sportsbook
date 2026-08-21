@@ -84,6 +84,32 @@ class OddsProvenanceTests(unittest.TestCase):
         self.assertEqual(s["hist25"], "backfill_close")
         self.assertEqual(s["live26"], "live")
 
+    def test_all_backfill_tags_every_ambiguous_row_without_live_since(self):
+        # a sport never live-captured: no date gate, everything non-seed/non-sbr
+        # becomes backfill_close (incl. rows dated 2026).
+        self._legacy("soc-seed", "seed", gd="2025-06-01", sport="soccer_epl")
+        self._legacy("soc-a", "team", gd="2024-06-01", sport="soccer_epl")
+        self._legacy("soc-b", "props", gd="2026-06-01", sport="soccer_epl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._retag(apply=True, sport_key="soccer_epl", all_backfill=True)
+        s = self._sources()
+        self.assertEqual(s["soc-seed"], "seed")
+        self.assertEqual(s["soc-a"], "backfill_close")
+        self.assertEqual(s["soc-b"], "backfill_close")   # 2026 too — no live gate
+
+    def test_classify_all_backfill_overrides_date(self):
+        self.assertEqual(
+            op._classify("team", "abc", "2026-06-01", None, all_backfill=True),
+            "backfill_close")
+        self.assertEqual(  # seed/sbr still win over all_backfill
+            op._classify("seed", "abc", "2026-06-01", None, all_backfill=True), "seed")
+
+    def test_resolve_sport_aliases_all_and_raw_key(self):
+        self.assertEqual(op._resolve_sport("mlb"), "baseball_mlb")
+        self.assertIsNone(op._resolve_sport("all"))
+        self.assertIsNone(op._resolve_sport(None))
+        self.assertEqual(op._resolve_sport("soccer_epl"), "soccer_epl")  # raw passthrough
+
     def test_retag_scoped_by_sport_and_years(self):
         self._legacy("mlb26", "team", gd="2026-06-01", sport="baseball_mlb")
         self._legacy("nba26", "team", gd="2026-06-01", sport="basketball_nba")
