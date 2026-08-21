@@ -272,9 +272,12 @@ def main():
         spent += game_cost
         if data is None:
             continue   # event expired at that timestamp
+        # This tool fetches per-game CLOSING lines → tag the role explicitly so
+        # coverage views / gap-fill treat it as a close (not a generic 'backfill'
+        # that would need later reclassification).
         warehouse.capture_event_odds(SPORT_KEY, eid, REGIONS,
                                      ",".join(n["missing"]), [BOOK_KEY], data,
-                                     captured_at=snap_ts, source="backfill")
+                                     captured_at=snap_ts, source="backfill_close")
         captured_games += 1
         captured_markets += len(n["missing"])
         if captured_games % 50 == 0:

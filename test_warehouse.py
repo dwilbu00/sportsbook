@@ -149,6 +149,9 @@ class SeedAndJoinTests(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         env = warehouse.read_snapshot(snaps[0]["name"])
         self.assertEqual(env["format"], "historical_odds_store")
+        # Self-tag: a seed reload must stamp source='seed' (not the 'live' default),
+        # so a later retag never has to fix it.
+        self.assertEqual(env["source"], "seed")
 
         # Closing line reads straight from the seeded (parsed) payload.
         close = warehouse.closing_line_for(

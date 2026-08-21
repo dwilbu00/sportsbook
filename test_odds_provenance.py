@@ -46,52 +46,62 @@ class OddsProvenanceTests(unittest.TestCase):
         self.assertEqual(s["A"], "live")
         self.assertEqual(s["B"], "backfill")
 
-    def test_retag_maps_null_rows_and_leaves_tagged(self):
-        self._legacy("L-seed", "seed")
-        self._legacy("L-team", "team")
-        self._legacy("sbr-L", "team")
-        self._legacy("L-live", "team", source="live")     # already tagged -> untouched
+    def test_classify_positive_rules_and_date_gate(self):
+        # seed by kind, sbr by id prefix — regardless of live_since
+        self.assertEqual(op._classify("seed", "x", "2024-01-01", None), "seed")
+        self.assertEqual(op._classify("team", "sbr-x", "2024-01-01", None), "sbr")
+        # ambiguous non-seed/non-sbr with NO boundary -> left untagged (never live)
+        self.assertIsNone(op._classify("team", "abc", "2024-01-01", None))
+        self.assertIsNone(op._classify("props", "abc", "2026-06-01", None))
+        # date gate: >= live_since -> live, earlier -> backfill_close
+        self.assertEqual(op._classify("team", "abc", "2026-06-01", "2026-01-01"), "live")
+        self.assertEqual(op._classify("team", "abc", "2025-06-01", "2026-01-01"),
+                         "backfill_close")
+
+    def test_retag_without_live_since_leaves_ambiguous_null(self):
+        self._legacy("L-seed", "seed", gd="2024-06-01")
+        self._legacy("L-team", "team", gd="2024-06-01")       # ambiguous, no boundary
+        self._legacy("sbr-L", "team", gd="2024-06-01")
+        self._legacy("L-live", "team", source="live", gd="2026-06-01")  # tagged -> untouched
         with contextlib.redirect_stdout(io.StringIO()):
-            op._retag(apply=True)
+            op._retag(apply=True)                              # no live_since
         s = self._sources()
         self.assertEqual(s["L-seed"], "seed")
-        self.assertEqual(s["L-team"], "live")
+        self.assertIsNone(s["L-team"])                        # left NULL, NOT 'live'
         self.assertEqual(s["sbr-L"], "sbr")
-        self.assertEqual(s["L-live"], "live")             # non-null, non-backfill -> untouched
+        self.assertEqual(s["L-live"], "live")
 
-    def test_retag_splits_backfill_by_timing(self):
-        # close: captured at commence (0h). early: captured 12h before (morning).
-        self._legacy("bf-close", "team", source="backfill")   # cap == commence (18Z)
-        with self.eng.begin() as c:
-            c.execute(insert(self.t).values(
-                sport="baseball_mlb", game_date="2024-06-02", event_id="bf-early",
-                kind="team", snapshot_hour="he", captured_at="2024-06-02T11:00:00Z",
-                commence_time="2024-06-02T23:00:00Z", source="backfill"))
+    def test_retag_with_live_since_splits_by_date(self):
+        self._legacy("seed24", "seed", gd="2024-06-01")
+        self._legacy("hist23", "team", gd="2023-06-01")       # < boundary -> backfill_close
+        self._legacy("hist25", "props", gd="2025-06-01")      # < boundary -> backfill_close
+        self._legacy("live26", "team", gd="2026-06-01")       # >= boundary -> live
         with contextlib.redirect_stdout(io.StringIO()):
-            op._retag(apply=True)
+            op._retag(apply=True, live_since="2026-01-01")
         s = self._sources()
-        self.assertEqual(s["bf-close"], "backfill_close")
-        self.assertEqual(s["bf-early"], "backfill_early")
+        self.assertEqual(s["seed24"], "seed")
+        self.assertEqual(s["hist23"], "backfill_close")
+        self.assertEqual(s["hist25"], "backfill_close")
+        self.assertEqual(s["live26"], "live")
 
-    def test_reclassify_by_clock_handles_duration_edge_cases(self):
-        # These are exactly the cases a 4-5h duration threshold gets wrong; the
-        # clock-time classifier gets both right.
-        with self.eng.begin() as c:
-            # stale close: captured 5h before an evening game (feed gap) -> close
-            c.execute(insert(self.t).values(
-                sport="baseball_mlb", game_date="2024-06-03", event_id="stale-close",
-                kind="team", snapshot_hour="hs", captured_at="2024-06-03T18:00:00Z",
-                commence_time="2024-06-03T23:00:00Z", source="backfill"))
-            # early-day game: 11Z early snapshot, 15Z first pitch (4h before) -> early
-            c.execute(insert(self.t).values(
-                sport="baseball_mlb", game_date="2024-06-03", event_id="day-early",
-                kind="team", snapshot_hour="hd", captured_at="2024-06-03T11:00:00Z",
-                commence_time="2024-06-03T15:00:00Z", source="backfill"))
+    def test_retag_scoped_by_sport_and_years(self):
+        self._legacy("mlb26", "team", gd="2026-06-01", sport="baseball_mlb")
+        self._legacy("nba26", "team", gd="2026-06-01", sport="basketball_nba")
+        self._legacy("mlb25", "team", gd="2025-06-01", sport="baseball_mlb")
         with contextlib.redirect_stdout(io.StringIO()):
-            op._retag(apply=True)
+            # only MLB, only 2026 -> just mlb26 is touched
+            op._retag(apply=True, sport_key="baseball_mlb", years=["2026"],
+                      live_since="2026-01-01")
         s = self._sources()
-        self.assertEqual(s["stale-close"], "backfill_close")
-        self.assertEqual(s["day-early"], "backfill_early")
+        self.assertEqual(s["mlb26"], "live")
+        self.assertIsNone(s["nba26"])      # out of sport scope
+        self.assertIsNone(s["mlb25"])      # out of year scope
+
+    def test_dry_run_writes_nothing(self):
+        self._legacy("d-team", "team", gd="2026-06-01")
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._retag(apply=False, live_since="2026-01-01")
+        self.assertIsNone(self._sources()["d-team"])
 
     def test_prune_seed_scoped_and_cascades(self):
         self._legacy("mlb-seed-24", "seed", gd="2024-06-01")

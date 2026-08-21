@@ -1111,6 +1111,7 @@ def seed_from_store(sport_key, label=""):
             "sport": sport_key,
             "event_id": event_id,
             "kind": "seed",
+            "source": "seed",
             "commence_time": commence,
             "home": entry.get("home_team"),
             "away": entry.get("away_team"),
@@ -1125,6 +1126,9 @@ def seed_from_store(sport_key, label=""):
                 "captured_at": captured_at, "commence_time": commence,
                 "home": entry.get("home_team"), "away": entry.get("away_team"),
                 "regions": None, "markets": "seed", "bookmakers": None,
+                # Self-tag so a post-source-column seed reload doesn't write NULL
+                # (which retag would then have to fix) or 'live' (capture default).
+                "source": "seed",
             }, lines)
             if _db.capture_odds_snapshot(_snap, _lines):
                 written += 1
