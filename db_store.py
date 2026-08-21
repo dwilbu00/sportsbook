@@ -371,6 +371,14 @@ odds_snapshot = Table(
     # SFBB cross-map enrichment (Phase 3, nullable/best-effort): canonical team codes.
     Column("home_code", String(16)),
     Column("away_code", String(16)),
+    # Provenance of the capture (nullable; retro-tagged for legacy rows):
+    #   'live'     = captured as a side-effect of a live analysis fetch
+    #   'backfill' = explicit historical-odds backfill (a chosen early/close snapshot)
+    #   'seed'     = bulk season seed (e.g. the ~18h-pre api-seed)
+    #   'sbr'      = defunct SBR ingest
+    # Does NOT affect reads (the reader still selects by captured_at nearest
+    # commence); lets backtests filter to a consistent source/snapshot.
+    Column("source", String(16)),
     UniqueConstraint("sport", "game_date", "event_id", "kind", "snapshot_hour",
                      name="uq_odds_snapshot"),   # write-once per hour bucket
     Index("ix_odds_snapshot_event", "sport", "game_date", "event_id"),
@@ -1227,6 +1235,9 @@ def capture_odds_snapshot(meta, lines):
                 "regions": _s(meta.get("regions")),
                 "markets": _s(meta.get("markets")),
                 "bookmakers": _s(meta.get("bookmakers")),
+                # Default to 'live' so an un-tagged caller (the live analysis fetch)
+                # records its provenance without any change at the call site.
+                "source": _s(meta.get("source") or "live"),
             })
             snapshot_id = result.inserted_primary_key[0]
             if lines:

@@ -344,6 +344,13 @@ GO
 IF COL_LENGTH('dbo.odds_snapshot', 'away_code') IS NULL
     ALTER TABLE dbo.odds_snapshot ADD away_code NVARCHAR(16);
 GO
+-- Capture provenance (2026-08-21): 'live' (live-analysis fetch) | 'backfill'
+-- (historical-odds backfill) | 'seed' (bulk season seed) | 'sbr' (defunct).
+-- Nullable; legacy rows retro-tagged via odds_provenance.py --retag. Does not
+-- affect reads; lets backtests filter to a consistent source/snapshot.
+IF COL_LENGTH('dbo.odds_snapshot', 'source') IS NULL
+    ALTER TABLE dbo.odds_snapshot ADD source NVARCHAR(16);
+GO
 
 ----------------------------------------------------------------------- odds_line
 -- One row per extracted line within a snapshot. price/implied reproduce

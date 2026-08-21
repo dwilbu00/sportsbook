@@ -336,7 +336,7 @@ def main():
     for i, c in enumerate(to_write, 1):
         warehouse.capture_event_odds(
             SPORT_KEY, c["event_id"], REGIONS, MARKETS, [BOOK_KEY],
-            c["payload"], captured_at=c["commence"])
+            c["payload"], captured_at=c["commence"], source="sbr")
         written += 1
         if i % 500 == 0:
             print(f"    {i}/{len(to_write)} ...")

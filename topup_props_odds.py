@@ -274,7 +274,7 @@ def main():
             continue   # event expired at that timestamp
         warehouse.capture_event_odds(SPORT_KEY, eid, REGIONS,
                                      ",".join(n["missing"]), [BOOK_KEY], data,
-                                     captured_at=snap_ts)
+                                     captured_at=snap_ts, source="backfill")
         captured_games += 1
         captured_markets += len(n["missing"])
         if captured_games % 50 == 0:

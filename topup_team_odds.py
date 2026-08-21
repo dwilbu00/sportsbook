@@ -289,7 +289,7 @@ def main():
                 continue
             warehouse.capture_event_odds(
                 SPORT_KEY, eid, REGIONS, MARKETS, [BOOK_KEY], api_game,
-                captured_at=snap_ts)
+                captured_at=snap_ts, source="backfill")
             n += 1
         captured += n
         if n == 0:

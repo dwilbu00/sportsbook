@@ -351,14 +351,17 @@ def _enrich_ids(sport, meta, lines):
 
 
 def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
-                       captured_at=None):
+                       captured_at=None, source="live"):
     """Archive one fetched event-odds payload. Best-effort; never raises.
 
     SQL backend: parse the payload into normalized snapshot + line rows
     (write-once). Local backend: eagerly write the immutable snapshot and
     queue a manifest entry for the next flush(). A no-op when the payload lacks an
     event id or a commence date. ``captured_at`` overrides the timestamp (used by
-    the historical backfill so past snapshots land under their true time)."""
+    the historical backfill so past snapshots land under their true time).
+    ``source`` is the provenance tag stored on the snapshot ('live' for the live
+    analysis fetch = default, 'backfill' for the historical backfill, 'seed'/'sbr'
+    for bulk imports) — it does not affect reads, only lets backtests filter."""
     try:
         if not event_id or not isinstance(payload, dict):
             return
@@ -375,7 +378,7 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
                 "captured_at": captured_at, "commence_time": commence,
                 "home": payload.get("home_team"), "away": payload.get("away_team"),
                 "regions": regions, "markets": markets,
-                "bookmakers": _books_str(bookmakers),
+                "bookmakers": _books_str(bookmakers), "source": source,
             }, _enumerate_lines(payload, "the-odds-api-v4-event-odds", kind))
             # Narrow DB-failure telemetry: a transient SQL error here silently
             # drops a durable odds snapshot. Surface it, then keep failing open
@@ -396,6 +399,7 @@ def capture_event_odds(sport, event_id, regions, markets, bookmakers, payload,
             "markets": markets,
             "bookmakers": bookmakers,
             "kind": kind,
+            "source": source,
             "commence_time": commence,
             "home": payload.get("home_team"),
             "away": payload.get("away_team"),

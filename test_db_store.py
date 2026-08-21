@@ -619,7 +619,7 @@ class SchemaParityTests(unittest.TestCase):
             {c.name for c in db_store.odds_snapshot.columns},
             {"id", "sport", "game_date", "event_id", "kind", "snapshot_hour",
              "captured_at", "commence_time", "home", "away", "regions",
-             "markets", "bookmakers", "home_code", "away_code"})
+             "markets", "bookmakers", "home_code", "away_code", "source"})
 
     def test_odds_line_columns(self):
         self.assertEqual(

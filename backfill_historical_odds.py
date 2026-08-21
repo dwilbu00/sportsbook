@@ -296,6 +296,25 @@ def main():
                 print(f"  [warn] {_msg}  (dry-run: no spend — continuing)")
             else:
                 p.error(_msg)
+        else:
+            # The snapshot insert now writes a `source` column; if the Azure ALTER
+            # (sql/schema.sql) hasn't been run, every capture would raise inside the
+            # best-effort handler and SILENTLY drop — paid credits, nothing stored.
+            # Verify the column exists before a real spend.
+            try:
+                from sqlalchemy import inspect as _sa_inspect
+                _cols = {c["name"] for c in _sa_inspect(
+                    db_store.get_engine()).get_columns("odds_snapshot")}
+            except Exception:
+                _cols = set()
+            if "source" not in _cols:
+                _m2 = ("odds_snapshot is missing the 'source' column — run the "
+                       "sql/schema.sql ALTER (COL_LENGTH ... ADD source) on Azure "
+                       "FIRST, or captures would silently drop.")
+                if args.dry_run:
+                    print(f"  [warn] {_m2}  (dry-run: no spend — continuing)")
+                else:
+                    p.error(_m2)
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
 
@@ -544,7 +563,7 @@ def main():
                         warehouse.capture_event_odds(
                             sport_key, api_game.get("id"), args.regions,
                             args.markets, [bookmaker], api_game,
-                            captured_at=snap_ts)
+                            captured_at=snap_ts, source="backfill")
                     except Exception:
                         pass
             if i % 25 == 0 or i == len(feat_ts_list):
@@ -627,7 +646,7 @@ def main():
                     import warehouse
                     warehouse.capture_event_odds(
                         sport_key, eid, args.regions, args.props,
-                        [bookmaker], data, captured_at=snap_ts)
+                        [bookmaker], data, captured_at=snap_ts, source="backfill")
                 except Exception:
                     pass
             if i % 25 == 0 or i == len(prop_games):
