@@ -73,6 +73,26 @@ class OddsProvenanceTests(unittest.TestCase):
         self.assertEqual(s["bf-close"], "backfill_close")
         self.assertEqual(s["bf-early"], "backfill_early")
 
+    def test_reclassify_by_clock_handles_duration_edge_cases(self):
+        # These are exactly the cases a 4-5h duration threshold gets wrong; the
+        # clock-time classifier gets both right.
+        with self.eng.begin() as c:
+            # stale close: captured 5h before an evening game (feed gap) -> close
+            c.execute(insert(self.t).values(
+                sport="baseball_mlb", game_date="2024-06-03", event_id="stale-close",
+                kind="team", snapshot_hour="hs", captured_at="2024-06-03T18:00:00Z",
+                commence_time="2024-06-03T23:00:00Z", source="backfill"))
+            # early-day game: 11Z early snapshot, 15Z first pitch (4h before) -> early
+            c.execute(insert(self.t).values(
+                sport="baseball_mlb", game_date="2024-06-03", event_id="day-early",
+                kind="team", snapshot_hour="hd", captured_at="2024-06-03T11:00:00Z",
+                commence_time="2024-06-03T15:00:00Z", source="backfill"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._retag(apply=True)
+        s = self._sources()
+        self.assertEqual(s["stale-close"], "backfill_close")
+        self.assertEqual(s["day-early"], "backfill_early")
+
     def test_prune_seed_scoped_and_cascades(self):
         self._legacy("mlb-seed-24", "seed", gd="2024-06-01")
         self._legacy("mlb-seed-25", "seed", gd="2025-06-01")

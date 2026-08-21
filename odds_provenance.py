@@ -33,21 +33,26 @@ from datetime import datetime, timezone
 _SPORT_KEY = {"mlb": "baseball_mlb", "nfl": "americanfootball_nfl",
               "nba": "basketball_nba", "nhl": "icehockey_nhl"}
 
-# A legacy plain-'backfill' snapshot captured within this many hours of commence is
-# classified 'backfill_close'; captured earlier (the fixed morning snapshot) ->
-# 'backfill_early'. Reliable because the backfill captures close ~= commence and
-# early at a fixed morning clock time, cleanly separated. New captures are tagged
-# role-explicitly at write time, so this only reclassifies pre-refinement rows.
-CLOSE_WINDOW_HOURS = 4.0
+# Legacy plain-'backfill' rows are split into early/close by the capture CLOCK
+# TIME, not a duration-before-commence: the backfill's EARLY snapshot is always
+# taken at the fixed --early-time (default 11:00Z) and no game's CLOSE is ever
+# captured near 11:00Z (all sports tip >=15:00Z; NFL London 13:30Z), so this is
+# exact regardless of commence — it avoids the duration-threshold ambiguity (a
+# stale close captured hours early vs a rare early-day game's early snapshot).
+# Must match backfill_historical_odds.DEFAULT_EARLY_TIME (11:00Z). New captures
+# are tagged role-explicitly at write, so this only reclassifies pre-refinement rows.
+EARLY_TIME_HOUR = 11         # UTC hour of the fixed early snapshot
+EARLY_WINDOW_HOURS = 1.5     # +/- window around it (covers at-or-before snapshots)
 
 
-def _hours_before(commence, captured):
-    """Hours from captured_at to commence (positive = captured before), or None."""
+def _capture_role(captured):
+    """'early' if captured_at is near the fixed early-time clock hour, 'close' if
+    clearly not, or None if unparseable (left as plain 'backfill')."""
     try:
         from datetime import datetime as _dt
-        com = _dt.fromisoformat(str(commence).replace("Z", "+00:00"))
         cap = _dt.fromisoformat(str(captured).replace("Z", "+00:00"))
-        return (com - cap).total_seconds() / 3600.0
+        hod = cap.hour + cap.minute / 60.0
+        return "early" if abs(hod - EARLY_TIME_HOUR) <= EARLY_WINDOW_HOURS else "close"
     except Exception:
         return None
 
@@ -83,15 +88,16 @@ def _retag(apply):
                                & t.c.event_id.like("sbr-%"))).scalar()
         live = null_total - seed - sbr
         # Legacy rows tagged plain 'backfill' (pre role-explicit refinement) — split
-        # by timing. Unparseable timing stays plain 'backfill' (never mislabeled).
-        bf = c.execute(select(t.c.id, t.c.captured_at, t.c.commence_time)
+        # by the capture CLOCK time (early snapshot ~= the fixed early-time; close
+        # ~= commence). Unparseable stays plain 'backfill' (never mislabeled).
+        bf = c.execute(select(t.c.id, t.c.captured_at)
                        .where(t.c.source == "backfill")).all()
     close_ids, early_ids = [], []
-    for rid, cap, com in bf:
-        h = _hours_before(com, cap)
-        if h is None:
+    for rid, cap in bf:
+        role = _capture_role(cap)
+        if role is None:
             continue
-        (close_ids if h <= CLOSE_WINDOW_HOURS else early_ids).append(rid)
+        (early_ids if role == "early" else close_ids).append(rid)
     print(f"\n=== retag ===")
     print(f"  NULL source ({null_total}) -> seed={seed}, sbr={sbr}, live={live}")
     print(f"  plain 'backfill' ({len(bf)}) -> close={len(close_ids)}, "
