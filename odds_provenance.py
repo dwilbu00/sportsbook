@@ -121,27 +121,41 @@ def _retag(apply, sport_key=None, years=None, live_since=None):
     print(f"  ok: tagged {tagged} row(s); left {n_amb} ambiguous row(s) NULL.")
 
 
-def _prune_seed(sport_key, years, apply, yes):
-    """Archive + delete kind='seed' snapshots for a sport. ``years`` is a list of
-    year prefixes to scope, or None/empty = ALL years' seed for the sport."""
+def _prune(sport_key, years, apply, yes, kind=None, source=None):
+    """Archive + delete odds_snapshot rows for a sport filtered by ``kind`` and/or
+    ``source`` (at least one REQUIRED — never prune a whole sport unscoped).
+    ``years`` is a list of year prefixes, or None = all years. Archives the full
+    snapshot + line rows to a timestamped JSON first (reversible), THEN deletes.
+    Used for seed cleanup (kind='seed') and the clean-slate 2026 live-odds prune
+    (source='live', years=['2026'])."""
     import db_store
     from sqlalchemy import select, func, or_, delete
     t, ln = db_store.odds_snapshot, db_store.odds_line
     eng = _engine()
-    scope = (t.c.sport == sport_key) & (t.c.kind == "seed")
+    if not (kind or source):
+        print("  refusing to prune without a --kind or --source filter (safety).")
+        sys.exit(3)
+    scope = (t.c.sport == sport_key)
+    if kind:
+        scope = scope & (t.c.kind == kind)
+    if source:
+        scope = scope & (t.c.source == source)
     if years:
         scope = scope & or_(*[t.c.game_date.like(f"{y}%") for y in years])
+    # Subquery (not a materialized id list) so the line count/archive/delete never
+    # hit SQL Server's ~2100-param IN() limit on a large scope (e.g. 3k+ seed rows).
+    snap_id_q = select(t.c.id).where(scope)
     with eng.connect() as c:
-        snap_ids = [r[0] for r in c.execute(select(t.c.id).where(scope)).all()]
-        n_snap = len(snap_ids)
-        n_line = (c.execute(select(func.count()).select_from(ln)
-                            .where(ln.c.snapshot_id.in_(snap_ids))).scalar()
-                  if snap_ids else 0)
-    print(f"\n=== prune-seed: {sport_key} kind='seed' "
+        n_snap = c.execute(select(func.count()).select_from(t).where(scope)).scalar()
+        n_line = c.execute(select(func.count()).select_from(ln)
+                           .where(ln.c.snapshot_id.in_(snap_id_q))).scalar()
+    filt = " ".join(x for x in [f"kind='{kind}'" if kind else "",
+                                f"source='{source}'" if source else ""] if x)
+    print(f"\n=== prune: {sport_key} {filt} "
           f"years={','.join(years) if years else 'ALL'} ===")
     print(f"  snapshots to delete: {n_snap}   odds_line rows to delete: {n_line}")
     if n_snap == 0:
-        print("  nothing matches — done.")
+        print("  nothing matches -- done.")
         return
     if not apply:
         print("\n  dry-run only. Re-run with --apply --yes to archive + delete.")
@@ -154,21 +168,23 @@ def _prune_seed(sport_key, years, apply, yes):
     arch_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "warehouse", "archive")
     os.makedirs(arch_dir, exist_ok=True)
-    path = os.path.join(arch_dir, f"pruned_seed_{sport_key}_{ts}.json")
+    tag = "_".join(x for x in [kind or "", source or ""] if x) or "all"
+    path = os.path.join(arch_dir, f"pruned_{tag}_{sport_key}_{ts}.json")
     with eng.connect() as c:
         snaps = [dict(r._mapping) for r in c.execute(select(t).where(scope)).all()]
         lines = [dict(r._mapping) for r in c.execute(
-            select(ln).where(ln.c.snapshot_id.in_(snap_ids))).all()]
+            select(ln).where(ln.c.snapshot_id.in_(snap_id_q))).all()]
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"sport": sport_key, "years": years, "archived_at": ts,
+        json.dump({"sport": sport_key, "years": years, "kind": kind,
+                   "source": source, "archived_at": ts,
                    "snapshots": snaps, "lines": lines}, f, indent=2, default=str)
     print(f"  archived {len(snaps)} snapshots + {len(lines)} lines -> {path}")
     # Delete lines first (explicit; not relying on FK cascade for portability),
     # then the snapshots.
     with eng.begin() as c:
-        c.execute(delete(ln).where(ln.c.snapshot_id.in_(snap_ids)))
+        c.execute(delete(ln).where(ln.c.snapshot_id.in_(snap_id_q)))
         c.execute(delete(t).where(scope))
-    print(f"  ✓ deleted {n_snap} seed snapshots + {n_line} lines. "
+    print(f"  ok: deleted {n_snap} snapshots + {n_line} lines. "
           f"(reversible from the archive above.)")
 
 
@@ -188,14 +204,23 @@ def main():
     p.add_argument("--retag", action="store_true",
                    help="Tag source for NULL-source rows (seed/sbr/live/backfill_close).")
     p.add_argument("--prune-seed", action="store_true",
-                   help="Archive + delete kind='seed' snapshots for a scope.")
+                   help="Archive + delete kind='seed' snapshots for a scope "
+                        "(sugar for --prune --kind seed).")
+    p.add_argument("--prune", action="store_true",
+                   help="Archive + delete snapshots filtered by --kind and/or --source "
+                        "(e.g. --prune --source live --years 2026 = drop the 2026 "
+                        "pre-relaunch live odds). At least one filter required.")
+    p.add_argument("--kind", default=None,
+                   help="odds_snapshot.kind filter for --prune (e.g. seed, team, props).")
+    p.add_argument("--source", default=None,
+                   help="odds_snapshot.source filter for --prune (e.g. live, backfill_close).")
     p.add_argument("--sport", default=None,
                    choices=list(_SPORT_KEY.keys()) + ["all"],
                    help="Scope. --retag: omit or 'all' = every sport. "
-                        "--prune-seed: REQUIRED (a specific sport, not 'all').")
+                        "--prune/--prune-seed: REQUIRED (a specific sport, not 'all').")
     p.add_argument("--years", default=None,
                    help="Comma-separated seasons, or 'all'. --retag: omit = ALL years. "
-                        "--prune-seed: omit = 2024,2025 (safe default).")
+                        "--prune/--prune-seed: omit = 2024,2025 (safe default).")
     p.add_argument("--live-since", default=None, metavar="YYYY-MM-DD",
                    help="Live-vs-backfill boundary for --retag: NULL non-seed/non-sbr "
                         "rows with game_date >= this -> 'live', earlier -> "
@@ -204,21 +229,25 @@ def main():
                         "capture (e.g. 2026-01-01 for MLB).")
     p.add_argument("--apply", action="store_true", help="Write (default is dry-run).")
     p.add_argument("--yes", action="store_true",
-                   help="Required with --apply for the destructive --prune-seed.")
+                   help="Required with --apply for the destructive --prune/--prune-seed.")
     args = p.parse_args()
-    if not (args.retag or args.prune_seed):
-        p.error("choose --retag and/or --prune-seed")
+    if not (args.retag or args.prune_seed or args.prune):
+        p.error("choose --retag, --prune-seed, and/or --prune")
     if args.retag:
         sport_key = None if args.sport in (None, "all") else _SPORT_KEY[args.sport]
         _retag(args.apply, sport_key=sport_key,
                years=_parse_years(args.years, default_all=True),
                live_since=args.live_since)
-    if args.prune_seed:
+    if args.prune_seed or args.prune:
         if args.sport in (None, "all"):
-            p.error("--prune-seed requires a specific --sport (mlb/nfl/nba/nhl), not 'all'.")
-        _prune_seed(_SPORT_KEY[args.sport],
-                    _parse_years(args.years, default_all=False),
-                    args.apply, args.yes)
+            p.error("--prune/--prune-seed requires a specific --sport "
+                    "(mlb/nfl/nba/nhl), not 'all'.")
+        # --prune-seed = kind='seed'; --prune uses the explicit --kind/--source.
+        kind = "seed" if args.prune_seed else args.kind
+        source = None if args.prune_seed else args.source
+        _prune(_SPORT_KEY[args.sport],
+               _parse_years(args.years, default_all=False),
+               args.apply, args.yes, kind=kind, source=source)
 
 
 if __name__ == "__main__":

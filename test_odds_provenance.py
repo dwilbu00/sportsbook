@@ -117,7 +117,7 @@ class OddsProvenanceTests(unittest.TestCase):
             c.execute(insert(db_store.odds_line).values(
                 snapshot_id=sid, bet_type="moneyline", selection="H", price=-120))
         with contextlib.redirect_stdout(io.StringIO()):
-            op._prune_seed("baseball_mlb", ["2024", "2025"], apply=True, yes=True)
+            op._prune("baseball_mlb", ["2024", "2025"], apply=True, yes=True, kind="seed")
         remaining = set(self._sources())
         self.assertEqual(
             remaining, {"mlb-seed-23", "mlb-team-24", "nba-seed-24"})
@@ -131,14 +131,31 @@ class OddsProvenanceTests(unittest.TestCase):
         self._legacy("t24", "team", gd="2024-06-01")
         self._legacy("nba-seed", "seed", gd="2024-06-01", sport="basketball_nba")
         with contextlib.redirect_stdout(io.StringIO()):
-            op._prune_seed("baseball_mlb", None, apply=True, yes=True)  # None = all years
+            op._prune("baseball_mlb", None, apply=True, yes=True, kind="seed")  # all years
         self.assertEqual(set(self._sources()), {"t24", "nba-seed"})
 
     def test_prune_dry_run_deletes_nothing(self):
         self._legacy("mlb-seed-24", "seed", gd="2024-06-01")
         with contextlib.redirect_stdout(io.StringIO()):
-            op._prune_seed("baseball_mlb", ["2024", "2025"], apply=False, yes=False)
+            op._prune("baseball_mlb", ["2024", "2025"], apply=False, yes=False, kind="seed")
         self.assertIn("mlb-seed-24", self._sources())   # still there
+
+    def test_prune_by_source_drops_2026_live_only(self):
+        # clean-slate: prune the thin 2026 pre-relaunch live odds, keep the corpus.
+        self._legacy("live26", "team", source="live", gd="2026-06-01")
+        self._legacy("bf25", "team", source="backfill_close", gd="2025-06-01")
+        self._legacy("live25", "team", source="live", gd="2025-06-01")  # out of year scope
+        with contextlib.redirect_stdout(io.StringIO()):
+            op._prune("baseball_mlb", ["2026"], apply=True, yes=True, source="live")
+        remaining = set(self._sources())
+        self.assertEqual(remaining, {"bf25", "live25"})   # only 2026-live dropped
+
+    def test_prune_without_filter_refuses(self):
+        self._legacy("x", "team", gd="2026-06-01")
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                op._prune("baseball_mlb", None, apply=True, yes=True)  # no kind/source
+        self.assertIn("x", self._sources())   # nothing deleted
 
 
 if __name__ == "__main__":
