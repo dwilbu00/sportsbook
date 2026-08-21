@@ -287,9 +287,11 @@ def main():
             eid = api_game.get("id")
             if not eid:
                 continue
+            # Per-date near-CLOSE lines → tag the role explicitly (not generic
+            # 'backfill') so coverage views / gap-fill read it as a close.
             warehouse.capture_event_odds(
                 SPORT_KEY, eid, REGIONS, MARKETS, [BOOK_KEY], api_game,
-                captured_at=snap_ts)
+                captured_at=snap_ts, source="backfill_close")
             n += 1
         captured += n
         if n == 0:

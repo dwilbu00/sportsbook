@@ -76,5 +76,82 @@ class PropsFloorTests(unittest.TestCase):
             self.assertGreaterEqual(len(bf.BACKFILL_PROPS_BY_SPORT[sk]), 7)
 
 
+class WarehouseGapFillTests(unittest.TestCase):
+    """--gap-fill warehouse-coverage diff: only games MISSING a landed snapshot
+    for the (kind, source) role should be planned for (re)fetch."""
+
+    def setUp(self):
+        import db_store
+        db_store.configure_engine("sqlite://")
+        db_store.create_all()
+        self.t = db_store.odds_snapshot
+        self.ln = db_store.odds_line
+        self.eng = db_store.get_engine()
+
+    def _snap(self, eid, gd, home, away, kind="team",
+              source="backfill_close", with_line=True):
+        from sqlalchemy import insert
+        with self.eng.begin() as c:
+            r = c.execute(insert(self.t).values(
+                sport="baseball_mlb", game_date=gd, event_id=eid, kind=kind,
+                snapshot_hour="h" + eid, captured_at=gd + "T23:00:00Z",
+                commence_time=gd + "T23:00:00Z", home=home, away=away, source=source))
+            sid = r.inserted_primary_key[0]
+            if with_line:
+                c.execute(insert(self.ln).values(
+                    snapshot_id=sid, bet_type="moneyline", selection=home, price=-120))
+        return sid
+
+    def test_covered_indexes_landed_snapshots(self):
+        self._snap("e1", "2024-06-01", "New York Yankees", "Boston Red Sox")
+        cov = bf._warehouse_covered("baseball_mlb", "team", "backfill_close",
+                                    ["2024-06-01"])
+        self.assertIn(("New York Yankees", "Boston Red Sox"), cov["2024-06-01"])
+
+    def test_lineless_snapshot_still_counts_as_covered(self):
+        # capture writes snapshot+lines atomically, so a lineless snapshot is a
+        # faithful 'fetched, book had nothing' record — NOT a load failure. It must
+        # count as covered so gap-fill doesn't perpetually re-attempt (and can't
+        # repair it anyway: write-once blocks re-landing lines into the bucket).
+        self._snap("e1", "2024-06-01", "Yankees", "Red Sox", with_line=False)
+        cov = bf._warehouse_covered("baseball_mlb", "team", "backfill_close",
+                                    ["2024-06-01"])
+        self.assertIn(("Yankees", "Red Sox"), cov["2024-06-01"])
+
+    def test_source_and_kind_are_scoped(self):
+        self._snap("e1", "2024-06-01", "Yankees", "Red Sox", source="backfill_early")
+        self._snap("e2", "2024-06-01", "Cubs", "Mets", kind="props")
+        # asking for team/backfill_close matches neither the early nor the props row
+        self.assertEqual(
+            bf._warehouse_covered("baseball_mlb", "team", "backfill_close",
+                                  ["2024-06-01"]), {})
+        self.assertIn(("Yankees", "Red Sox"),
+                      bf._warehouse_covered("baseball_mlb", "team", "backfill_early",
+                                            ["2024-06-01"])["2024-06-01"])
+
+    def test_date_range_scoped(self):
+        self._snap("e1", "2024-06-01", "Yankees", "Red Sox")
+        self._snap("e2", "2024-07-01", "Cubs", "Mets")
+        cov = bf._warehouse_covered("baseball_mlb", "team", "backfill_close",
+                                    ["2024-06-01"])
+        self.assertNotIn("2024-07-01", cov)
+
+    def test_is_covered_fuzzy_matches_espn_naming(self):
+        cov = {"2024-06-01": [("New York Yankees", "Boston Red Sox")]}
+        self.assertTrue(bf._is_covered(
+            {"date": "2024-06-01T23:05:00Z", "home_team": "Yankees",
+             "away_team": "Red Sox"}, cov))
+        self.assertFalse(bf._is_covered(  # wrong opponent
+            {"date": "2024-06-01T23:05:00Z", "home_team": "Yankees",
+             "away_team": "Orioles"}, cov))
+        self.assertFalse(bf._is_covered(  # right teams, wrong date
+            {"date": "2024-06-02T23:05:00Z", "home_team": "Yankees",
+             "away_team": "Red Sox"}, cov))
+
+    def test_no_dates_short_circuits_empty(self):
+        self.assertEqual(
+            bf._warehouse_covered("baseball_mlb", "team", "backfill_close", []), {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,11 @@ Examples
     python backfill_historical_odds.py --sport mlb --days 60 \
         --markets h2h --featured-cadence daily --max-credits 2000
 
+    # Repair sweep AFTER a big backfill — fetch only games missing their warehouse
+    # close-line (cached raw responses re-fetch for 0 credits):
+    python backfill_historical_odds.py --sport mlb --category team --snapshot close \
+        --gap-fill --warehouse --start 2024-03-01 --end 2024-10-01 --max-credits 5000 --dry-run
+
 Cost guide (1 US region):
     featured daily    = 10 x featured-markets per DAY
     featured commence = 10 x featured-markets per unique tip-off
@@ -144,6 +149,62 @@ def _find_sampled(api_home, api_away, date_games):
     return None
 
 
+def _warehouse_covered(sport_key, kind, source, dates):
+    """Gap-fill coverage index: {date10 -> [(home, away), ...]} for warehouse
+    odds_snapshot rows of this ``kind`` (team|props) AND ``source`` (e.g.
+    'backfill_close') that EXIST in ``dates`` (an iterable of 'YYYY-MM-DD').
+    Returns {} if SQL is unavailable so gap-fill degrades to a normal
+    (nothing-covered) plan rather than crashing.
+
+    Coverage is SNAPSHOT EXISTENCE, not line count, on purpose: capture writes the
+    snapshot + its lines in one transaction, so a lineless snapshot is a FAITHFUL
+    'fetched, book posted nothing for our markets' record (a line-write failure
+    would roll the snapshot back too), and write-once (uq_odds_snapshot) can't
+    re-land lines into an existing bucket anyway — so re-fetching an existing row
+    is pure waste. The real 'failed to load' case a repair sweep targets is a
+    MISSING snapshot (slate errored, process died, budget stop).
+
+    ⚠ matches on ``source`` EXACTLY: a game with only a 'live'/'seed' snapshot is
+    NOT counted as covered for a 'backfill_close' sweep — the point is verifying
+    the ROLE backfill landed. Run odds_provenance --retag first so legacy rows
+    carry a role source, else they won't count and would be (cheaply, cache) re-fetched."""
+    date_set = {(d or "")[:10] for d in dates}
+    if not date_set:
+        return {}
+    try:
+        import db_store
+        from sqlalchemy import select
+        t = db_store.odds_snapshot
+        eng = db_store.get_engine()
+    except Exception:
+        return {}
+    lo, hi = min(date_set), max(date_set)
+    covered = {}
+    try:
+        with eng.connect() as c:
+            q = (select(t.c.game_date, t.c.home, t.c.away)
+                 .where((t.c.sport == sport_key) & (t.c.kind == kind)
+                        & (t.c.source == source)
+                        & (t.c.game_date >= lo) & (t.c.game_date <= hi))
+                 .distinct())
+            for gd, home, away in c.execute(q).all():
+                d = (gd or "")[:10]
+                if d in date_set:
+                    covered.setdefault(d, []).append((home or "", away or ""))
+    except Exception:
+        return {}
+    return covered
+
+
+def _is_covered(g, covered_by_date):
+    """True if ESPN game ``g`` matches a warehouse-covered (home, away) on its
+    date (fuzzy name match, mirroring _find_sampled — Odds-API vs ESPN naming)."""
+    for home, away in covered_by_date.get((g.get("date") or "")[:10], ()):
+        if _names_match(g.get("home_team"), home) and _names_match(g.get("away_team"), away):
+            return True
+    return False
+
+
 def _count(csv):
     return len([x for x in (csv or "").split(",") if x.strip()])
 
@@ -248,7 +309,28 @@ def main():
     p.add_argument("--early-time", default=DEFAULT_EARLY_TIME,
                    help=f"UTC HH:MM for --snapshot early (default {DEFAULT_EARLY_TIME} "
                         "~9am ET). Ignored for --snapshot close.")
+    p.add_argument("--gap-fill", action="store_true",
+                   help="Repair/verify sweep: diff the planned games against WAREHOUSE "
+                        "coverage for this --category (kind) + --snapshot role, and fetch "
+                        "ONLY the games missing a landed snapshot for that role. Requires "
+                        "--warehouse + --category. Cached raw responses re-fetch for 0 "
+                        "credits, so this cheaply repairs records that failed to load. "
+                        "Run AFTER a big backfill (and after odds_provenance --retag).")
     args = p.parse_args()
+
+    if args.gap_fill:
+        if not args.warehouse:
+            p.error("--gap-fill requires --warehouse (it diffs against, and writes to, "
+                    "the warehouse).")
+        if not args.category:
+            p.error("--gap-fill requires --category {team,props} so the warehouse-coverage "
+                    "diff knows which snapshot kind to check.")
+
+    # Role-explicit provenance so a later gap-fill/verify sweep can tell which games
+    # are missing their EARLY vs their CLOSE line (close = per-tip-off; early = the
+    # fixed --early-time morning snapshot). Computed here (before planning) because
+    # --gap-fill diffs warehouse coverage on this exact source tag.
+    bf_source = "backfill_early" if args.snapshot == "early" else "backfill_close"
 
     # ── --snapshot convenience ── resolved BEFORE the snapshot-time validation
     # so 'early' inherits --early-time and the daily-cadence requirement is met.
@@ -296,6 +378,25 @@ def main():
                 print(f"  [warn] {_msg}  (dry-run: no spend — continuing)")
             else:
                 p.error(_msg)
+        else:
+            # The snapshot insert now writes a `source` column; if the Azure ALTER
+            # (sql/schema.sql) hasn't been run, every capture would raise inside the
+            # best-effort handler and SILENTLY drop — paid credits, nothing stored.
+            # Verify the column exists before a real spend.
+            try:
+                from sqlalchemy import inspect as _sa_inspect
+                _cols = {c["name"] for c in _sa_inspect(
+                    db_store.get_engine()).get_columns("odds_snapshot")}
+            except Exception:
+                _cols = set()
+            if "source" not in _cols:
+                _m2 = ("odds_snapshot is missing the 'source' column — run the "
+                       "sql/schema.sql ALTER (COL_LENGTH ... ADD source) on Azure "
+                       "FIRST, or captures would silently drop.")
+                if args.dry_run:
+                    print(f"  [warn] {_m2}  (dry-run: no spend — continuing)")
+                else:
+                    p.error(_m2)
 
     espn_sport, espn_league, sport_key = SPORT_MAP[args.sport]
 
@@ -360,6 +461,25 @@ def main():
     print(f"  {len(games)} completed games; sampling {len(sample)} "
           f"across {len(keep_dates)} dates ({span_desc}).\n")
 
+    # ── --gap-fill ── keep only games MISSING a landed warehouse snapshot for this
+    # category(kind)+role(source). Filtering `sample` here narrows BOTH the featured
+    # and prop plans below (a fully-covered date drops out of feat_tasks; covered
+    # games drop out of prop_games), and cache-aware charging makes re-fetching a
+    # game whose raw response is cached free — so this repairs failed-to-load records
+    # for ~0 credits. Covered games removed from the slate are simply not re-stored.
+    if args.gap_fill:
+        gap_kind = "team" if args.category == "team" else "props"
+        covered_by_date = _warehouse_covered(sport_key, gap_kind, bf_source, keep_dates)
+        n_cov = sum(len(v) for v in covered_by_date.values())
+        before = len(sample)
+        sample = [g for g in sample if not _is_covered(g, covered_by_date)]
+        print(f"  [gap-fill] warehouse has {n_cov} landed {gap_kind}/{bf_source} "
+              f"game(s) in range; {before - len(sample)} of the sampled games already "
+              f"covered -> planning fetch for the {len(sample)} still missing.\n")
+        if not sample:
+            print("  [gap-fill] nothing missing — coverage is complete. Done.")
+            return
+
     if args.label:
         print(f"  Store label: '{args.label}'  -> "
               f"{os.path.basename(store_mod.store_path(sport_key, args.label))}")
@@ -423,11 +543,16 @@ def main():
             # requested-but-empty market is absent from stored props, so the old
             # `all(m in props)` check re-queued (and re-charged) such a game every
             # resume forever. Fall back to the parsed keys for pre-fix store entries.
-            g_entry = existing.get(key, {})
-            fetched = (g_entry.get("props_markets_fetched")
-                       or list((g_entry.get("props") or {}).keys()))
-            if fetched and all(m in fetched for m in req_markets_plan):
-                continue
+            # In --gap-fill mode the WAREHOUSE is the authority (sample was already
+            # filtered to warehouse-missing games); skip the local-store dedup so a
+            # game present locally but missing from the warehouse is re-fetched to
+            # repair it (free if its raw response is cached).
+            if not args.gap_fill:
+                g_entry = existing.get(key, {})
+                fetched = (g_entry.get("props_markets_fetched")
+                           or list((g_entry.get("props") or {}).keys()))
+                if fetched and all(m in fetched for m in req_markets_plan):
+                    continue
             prop_games.append(g)
     if prop_floor_skipped:
         print(f"  [props-floor] skipped {prop_floor_skipped} game(s) before "
@@ -544,7 +669,7 @@ def main():
                         warehouse.capture_event_odds(
                             sport_key, api_game.get("id"), args.regions,
                             args.markets, [bookmaker], api_game,
-                            captured_at=snap_ts)
+                            captured_at=snap_ts, source=bf_source)
                     except Exception:
                         pass
             if i % 25 == 0 or i == len(feat_ts_list):
@@ -627,7 +752,7 @@ def main():
                     import warehouse
                     warehouse.capture_event_odds(
                         sport_key, eid, args.regions, args.props,
-                        [bookmaker], data, captured_at=snap_ts)
+                        [bookmaker], data, captured_at=snap_ts, source=bf_source)
                 except Exception:
                     pass
             if i % 25 == 0 or i == len(prop_games):

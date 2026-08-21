@@ -67,6 +67,23 @@ class LocalFallbackTests(unittest.TestCase):
         snaps = warehouse.list_snapshots("baseball_mlb", "2026-07-16")
         self.assertEqual(len(snaps), 1)  # one hour bucket -> one immutable blob
 
+    def test_source_defaults_live_and_can_override(self):
+        # provenance tag: unmarked callers (live analysis fetch) -> 'live';
+        # the backfill passes source='backfill'.
+        warehouse.capture_event_odds(
+            "baseball_mlb", "E1", "us", "h2h", None, _payload(),
+            captured_at="2026-07-16T14:00:00Z")
+        warehouse.capture_event_odds(
+            "baseball_mlb", "E2", "us", "h2h", None, _payload(event_id="E2"),
+            captured_at="2026-07-16T14:00:00Z", source="backfill")
+        warehouse.flush()
+        env = {}
+        for s in warehouse.list_snapshots("baseball_mlb", "2026-07-16"):
+            e = warehouse.read_snapshot(s["name"])
+            env[e["event_id"]] = e.get("source")
+        self.assertEqual(env["E1"], "live")
+        self.assertEqual(env["E2"], "backfill")
+
     def test_no_commence_is_skipped(self):
         warehouse.capture_event_odds(
             "baseball_mlb", "E1", "us", "h2h", None,
@@ -132,6 +149,9 @@ class SeedAndJoinTests(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         env = warehouse.read_snapshot(snaps[0]["name"])
         self.assertEqual(env["format"], "historical_odds_store")
+        # Self-tag: a seed reload must stamp source='seed' (not the 'live' default),
+        # so a later retag never has to fix it.
+        self.assertEqual(env["source"], "seed")
 
         # Closing line reads straight from the seeded (parsed) payload.
         close = warehouse.closing_line_for(
