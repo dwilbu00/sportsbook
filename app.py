@@ -883,6 +883,26 @@ def _cached_calibration_blobs(sport_keys):
     return blobs
 
 
+def _served_method_label(cfg):
+    """Display label for a prop's SERVED calibration method. A prop can carry a base
+    `method` PLUS a per-line-bucket `line_methods` override (e.g. batter_hits ships
+    base "C" but routes to "D" on every line bucket, since D is servable only via a
+    bucket, not as a pooled candidate). The base field alone is misleading, so show
+    what's actually served: the base when there's no override, the bucket method when
+    every bucket agrees, else "base / methods… (by line)"."""
+    base = cfg.get("method", "—")
+    buckets = cfg.get("line_methods") or []
+    if not buckets:
+        return base
+    # line_methods partitions ALL lines (the max_line:null bucket is the catch-all),
+    # so the base method is never actually served when buckets exist — report only
+    # what the buckets serve.
+    methods = sorted({b.get("method", base) for b in buckets})
+    if len(methods) == 1:
+        return methods[0] if methods[0] == base else f"{methods[0]} (per-line)"
+    return f"{' / '.join(methods)} (by line)"
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_prediction_summary():
     """Forward prediction-log summary (a full log read). Short TTL so the Model
@@ -1212,7 +1232,7 @@ def render_model_guide():
                         f"{cfg['fit_brier']:.4f}"
                         if cfg.get("fit_brier") is not None else "Not exported"
                     ),
-                    "Probability method": cfg.get("method", "—"),
+                    "Probability method": _served_method_label(cfg),
                     # Provenance of the Brier/accuracy numbers above: props re-fit
                     # on genuine book lines vs. still carrying the offline synthetic
                     # season-average sweep. The fallback labels pre-fit_basis
