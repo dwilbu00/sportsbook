@@ -1334,7 +1334,8 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
           f"other props/blocks preserved)")
 
 
-def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
+def diagnose_distributional(sport, store_label="", xstats_strength=0.5,
+                            seasons=None):
     """§2.4b-2 diagnostic (NO WRITE): score the distributional batter_hits model
     against the shipped method C on the SAME real-line chronological holdout.
 
@@ -1357,6 +1358,11 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
     print(f"\n=== §2.4b-2 distributional diagnostic: {sport_key} batter_hits ===")
     book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
         sport_key, ["batter_hits"], store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+        print(f"  [seasons] dist-diag scoped to {sorted(_yset)}")
     print(f"  {len(book_lines)} book lines ({n_store} backfill store + {n_pred} "
           f"prediction log)")
     if not book_lines:
@@ -3508,7 +3514,10 @@ def main():
 
     if args.dist_diag:
         diagnose_distributional(args.sport, store_label=args.store_label,
-                                xstats_strength=args.dist_xstats_strength)
+                                xstats_strength=args.dist_xstats_strength,
+                                seasons=([int(s.strip()) for s in
+                                          args.seasons.split(",") if s.strip()]
+                                         if args.seasons else None))
         return
 
     if args.negbin_diag:
