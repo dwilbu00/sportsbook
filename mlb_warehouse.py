@@ -1193,22 +1193,56 @@ def find_game_pk(official_date, home_team_id, away_team_id):
 
 
 # ───────────────────────────────────────── P3 resolver support (read + alias write)
+# The MLB team dim (30 rows) is effectively static within a serving session, yet
+# team_id_for_name / _team_name_map each fired a fresh SQL round-trip PER CALL —
+# hundreds per live analyze (once per player-prop, ~3x per team). Cache the dim
+# once per process (thread-safe; an empty/failed load is NOT cached, so it retries).
+# Tests reset via _TEAM_DIM.clear() in their backend setUp (fresh engine per test).
+_TEAM_DIM = {}          # {"d": {"by_id": {team_id: name}, "by_norm": {name_norm: [team_id,...]}}}
+_TEAM_DIM_LOCK = threading.Lock()
+
+
+def _team_dim():
+    """Team dim loaded ONCE per process: {"by_id": {team_id: name},
+    "by_norm": {name_norm: [team_id, ...]}}. Fail-open to empty (NOT cached, so a
+    transient error / not-yet-ingested dim retries on the next call)."""
+    d = _TEAM_DIM.get("d")
+    if d is not None:
+        return d
+    with _TEAM_DIM_LOCK:
+        d = _TEAM_DIM.get("d")
+        if d is not None:
+            return d
+        try:
+            with db_store.get_engine().connect() as conn:
+                rows = conn.execute(
+                    select(mlb_team.c.team_id, mlb_team.c.name,
+                           mlb_team.c.name_norm)).fetchall()
+        except (OperationalError, ValueError, TypeError):
+            return {"by_id": {}, "by_norm": {}}
+        if not rows:
+            return {"by_id": {}, "by_norm": {}}
+        by_id, by_norm = {}, {}
+        for tid, name, nn in rows:
+            by_id[tid] = name
+            by_norm.setdefault(nn, []).append(tid)
+        d = {"by_id": by_id, "by_norm": by_norm}
+        _TEAM_DIM["d"] = d
+        return d
+
+
 def team_id_for_name(name):
     """MLBAM team_id for a team display name (odds feed / any source), via the
     mlb_team dim's name_norm. Returns the single match, else None (unknown or
-    ambiguous). Fail-open."""
+    ambiguous). Fail-open. Served from the per-process _team_dim cache."""
     if not name or not enabled():
         return None
     try:
         nn = db_store.normalize_name(name)
-        engine = db_store.get_engine()
-        with engine.connect() as conn:
-            rows = conn.execute(
-                select(mlb_team.c.team_id).where(mlb_team.c.name_norm == nn)
-            ).fetchall()
-        return rows[0][0] if len(rows) == 1 else None
-    except (OperationalError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return None
+    ids = _team_dim()["by_norm"].get(nn, [])
+    return ids[0] if len(ids) == 1 else None
 
 
 def _parse_ts(v):
@@ -1453,16 +1487,11 @@ def _team_name_map():
     """{team_id (MLBAM): display name} from the team dim — for resolving a fact
     row's own/opponent team_id to the NAME the model's venue + opponent-defense
     lookups key on (the warehouse is MLBAM-keyed; those lookups are name-keyed).
-    Tiny (30 rows). Fail-open → {}."""
+    Tiny (30 rows). Fail-open → {}. Served from the per-process _team_dim cache
+    (a fresh copy per call so callers may mutate freely)."""
     if not enabled():
         return {}
-    try:
-        with db_store.get_engine().connect() as conn:
-            rows = conn.execute(
-                select(mlb_team.c.team_id, mlb_team.c.name)).fetchall()
-        return {r[0]: r[1] for r in rows}
-    except (OperationalError, ValueError, TypeError):
-        return {}
+    return dict(_team_dim()["by_id"])
 
 
 # ───────────────────────────────────────────────────── venue dimension (run_env)

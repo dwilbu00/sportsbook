@@ -146,10 +146,12 @@ class _Backend:
         db_store.configure_engine("sqlite://")
         mlb_warehouse.create_all()
         mlb_warehouse._TEAMS_ENSURED.clear()
+        mlb_warehouse._TEAM_DIM.clear()
 
     def tearDown(self):
         db_store.configure_engine(None)
         mlb_warehouse._TEAMS_ENSURED.clear()
+        mlb_warehouse._TEAM_DIM.clear()
 
 
 # ─────────────────────────────────────────────────────────────── schema parity
