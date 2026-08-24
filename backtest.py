@@ -697,7 +697,11 @@ MARKETS = ("moneyline", "spreads", "totals")
 
 def _empty_market_bucket():
     return {"n": 0, "model_brier": [], "market_brier": [], "correct": 0,
-            "bets": 0, "profit": 0.0, "blend": [], "prior_k": []}
+            "bets": 0, "profit": 0.0, "blend": [], "prior_k": [],
+            # (selected-side de-vigged MARKET prob, decimal_odds, won) per PLACED bet
+            # — lets us bucket realized ROI by MARKET CONFIDENCE (are the model's edges
+            # real only in the uncertain/near-pickem zone, or across all prices?).
+            "bets_detail": []}
 
 
 def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
@@ -711,9 +715,15 @@ def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
     if price_yes is not None and model_p - market_p >= threshold:
         bucket["bets"] += 1
         bucket["profit"] += (american_to_decimal(price_yes) - 1) if outcome else -1
+        # selected side = yes: its de-vigged market prob is market_p.
+        bucket["bets_detail"].append(
+            (market_p, american_to_decimal(price_yes), bool(outcome)))
     if price_no is not None and (1 - model_p) - (1 - market_p) >= threshold:
         bucket["bets"] += 1
         bucket["profit"] += (american_to_decimal(price_no) - 1) if not outcome else -1
+        # selected side = no: its de-vigged market prob is 1 - market_p.
+        bucket["bets_detail"].append(
+            (1.0 - market_p, american_to_decimal(price_no), not outcome))
 
 
 def _moneyline_market(entry):
@@ -2457,6 +2467,44 @@ def _print_props_odds_results(results, threshold_pct):
     _print_reliability(
         "Model calibration by confidence",
         [(prop, r["blend"]) for prop, r in results.items()])
+
+    _print_confidence_bands(results)
+
+
+_CONF_BANDS = [
+    ("dog <40%", 0.0, 0.40),
+    ("40-47.5%", 0.40, 0.475),
+    ("pickem 47.5-52.5%", 0.475, 0.525),
+    ("52.5-60%", 0.525, 0.60),
+    ("fav 60-70%", 0.60, 0.70),
+    ("heavy >=70%", 0.70, 1.01),
+]
+
+
+def _print_confidence_bands(results):
+    """Realized win%/ROI of PLACED bets bucketed by the SELECTED side's de-vigged
+    MARKET probability (= market confidence). Tests the hypothesis that the model's
+    edge, if any, lives in the UNCERTAIN middle (near-pickem, where the book is
+    laziest) and NOT on efficient extremes (heavy favorites) or the longshot trap.
+    Positive ROI concentrated in the pickem/mid bands = a price-zone to gate on."""
+    print("\n=== ROI by MARKET-confidence band (selected side's de-vigged market prob) ===")
+    print("  hypothesis: edge concentrates near PICKEM (book least sure); extremes are "
+          "efficient (favorites) or public traps (longshots).")
+    for prop, r in results.items():
+        detail = r.get("bets_detail") or []
+        if not detail:
+            continue
+        print(f"\n  {prop}:")
+        print(f"  {'band':<20} {'bets':>6} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for label, lo, hi in _CONF_BANDS:
+            band = [(dec, won) for mp, dec, won in detail if lo <= mp < hi]
+            if not band:
+                continue
+            n = len(band)
+            wins = sum(1 for _, won in band if won)
+            pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
+            print(f"  {label:<20} {n:>6} {100.0 * wins / n:>6.1f} "
+                  f"{100.0 * pl / n:>8.2f} {pl:>9.2f}")
 
 
 def _print_matchup_quantile_sweep_summary(results, safe_target=0.80):
