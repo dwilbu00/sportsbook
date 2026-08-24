@@ -2485,6 +2485,7 @@ def _print_props_odds_results(results, threshold_pct):
 
     _print_confidence_bands(results)
     _print_props_served_ev_staking(results)
+    _simulate_daily_topn(results)
 
 
 _CONF_BANDS = [
@@ -2568,29 +2569,106 @@ def _print_props_served_ev_staking(results):
             pl = sum((dec - 1.0) if w else -1.0 for _, dec, w, _ in sel)
             print(f"  {g * 100:>5.0f}%  {m:>7} {100.0 * wins / m:>6.1f} "
                   f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
-        sel = sorted([x for x in picks if x[3] >= 0.05], key=lambda x: x[0])
-        if len(sel) >= 25:
-            print(f"  staking @EV>=5% (n={len(sel)}, start 100u):")
-            for label, kf in (("flat-1u", None), ("1/8-Kelly", 0.125),
-                              ("1/4-Kelly", 0.25), ("1/2-Kelly", 0.5)):
-                bank, peak, maxdd = 100.0, 100.0, 0.0
-                for _d, dec, won, ev in sel:
-                    b = dec - 1.0
-                    if kf is None:
-                        stake = 1.0
-                    elif b > 0:
-                        stake = max(0.0, kf * (ev / b)) * bank
-                    else:
-                        stake = 0.0
-                    bank += (stake * b) if won else -stake
-                    peak = max(peak, bank)
-                    if peak > 0:
-                        maxdd = max(maxdd, (peak - bank) / peak)
-                    if bank <= 0:
-                        break
-                growth = (bank / 100.0 - 1.0) * 100.0
-                print(f"    {label:<10} final {bank:8.1f}u  growth {growth:+8.1f}%  "
-                      f"maxDD {maxdd * 100:5.1f}%")
+
+
+def _conf_bucket(p):
+    """5-point confidence bucket of the SELECTED side's prob on [0.5, 1.0)."""
+    return round(min(max(p, 0.5), 0.9989) * 20) / 20.0
+
+
+def _simulate_daily_topn(results, n_per_day=10, train_frac=0.6,
+                         kelly_fracs=(0.125, 0.25, 0.5), kelly_cap=0.10):
+    """REALISTIC daily portfolio sim — mirrors how the app is actually used
+    (bet_selector.select_top_bets): each day, take the top-N +EV props across ALL
+    markets and stake them on a chronological bankroll (flat + fractional Kelly).
+
+    Two selection/sizing modes, both simulated ONLY on the OOS test split:
+      RAW   — rank + size on the served (Platt) prob (what the app does today).
+      CALIB — rank + size on an OOS per-(prop, confidence-bucket) recalibrated prob:
+              fit each bucket's empirical win-rate on the TRAIN split, apply on TEST.
+              This is Doug's 'adjust by confidence bucket' — overconfident buckets get
+              their prob (=> EV => Kelly stake) marked down; well-calibrated ones keep
+              it. Buckets with too little train data are skipped (conservative).
+    Kelly fraction per bet = frac * (EV / net_odds), capped at kelly_cap of bankroll.
+    ⚠ Bets are sized independently (no same-day correlation haircut) — a real slate
+    of 10 correlated legs is riskier than this shows; treat Kelly growth as optimistic."""
+    from collections import defaultdict
+    pool = []   # (date10, prop, sel_prob, decimal_odds, won, served_ev)
+    for prop, r in results.items():
+        for d, p, _f, o, op, up in (r.get("ev_obs") or []):
+            if not d or op is None or up is None:
+                continue
+            do, du = american_to_decimal(op), american_to_decimal(up)
+            ev_o, ev_u = p * do - 1.0, (1.0 - p) * du - 1.0
+            if ev_o >= ev_u:
+                pool.append((d[:10], prop, p, do, o == 1, ev_o))
+            else:
+                pool.append((d[:10], prop, 1.0 - p, du, o == 0, ev_u))
+    if not pool:
+        return
+    dates = sorted({x[0] for x in pool})
+    if len(dates) < 20:
+        print("\n=== REALISTIC daily top-N portfolio: too few dates to split. ===")
+        return
+    cut = dates[int(len(dates) * train_frac)]
+    test_days = [d for d in dates if d >= cut]
+
+    # OOS calibration map: per-(prop, bucket) empirical win-rate on TRAIN (n>=50).
+    agg = defaultdict(lambda: [0, 0])
+    for d, prop, sp, _dec, won, _ev in pool:
+        if d >= cut:
+            continue
+        k = (prop, _conf_bucket(sp))
+        agg[k][0] += 1 if won else 0
+        agg[k][1] += 1
+    cmap = {k: w / nn for k, (w, nn) in agg.items() if nn >= 50}
+
+    print(f"\n=== REALISTIC daily top-{n_per_day} EV portfolio "
+          f"[OOS test {cut}..{dates[-1]}, {len(test_days)} days, start 100u] ===")
+    print("  each day: bet the top-N +EV props across ALL markets; chronological "
+          "bankroll.")
+    print("  RAW = served prob; CALIB = OOS per-(prop,confidence-bucket) recalibrated "
+          "prob (the bucket-adjust). Kelly capped at "
+          f"{int(kelly_cap * 100)}%/bet; legs sized independently (optimistic).")
+
+    test = [x for x in pool if x[0] >= cut]
+    for mode in ("RAW", "CALIB"):
+        byday = defaultdict(list)   # date -> [(ev_used, dec, won, prob_used)]
+        for d, prop, sp, dec, won, sev in test:
+            if mode == "RAW":
+                pu, evu = sp, sev
+            else:
+                cp = cmap.get((prop, _conf_bucket(sp)))
+                if cp is None:
+                    continue
+                pu, evu = cp, cp * dec - 1.0
+            byday[d].append((evu, dec, won, pu))
+        selected = []
+        for d in sorted(byday):
+            top = sorted([x for x in byday[d] if x[0] > 0], reverse=True)[:n_per_day]
+            selected.extend(top)
+        if not selected:
+            print(f"\n  [{mode}] no +EV bets selected.")
+            continue
+        n = len(selected)
+        wins = sum(1 for _, _, w, _ in selected if w)
+        pl_flat = sum((dec - 1.0) if w else -1.0 for _, dec, w, _ in selected)
+        print(f"\n  [{mode}] bets={n} ({n / max(1, len(test_days)):.1f}/day)  "
+              f"win%={100.0 * wins / n:.1f}  flat-1u ROI={100.0 * pl_flat / n:+.2f}%  "
+              f"P/L={pl_flat:+.1f}u")
+        for kf in kelly_fracs:
+            bank, peak, maxdd = 100.0, 100.0, 0.0
+            for evu, dec, won, _pu in selected:
+                b = dec - 1.0
+                frac = 0.0 if b <= 0 else min(kelly_cap, max(0.0, kf * (evu / b)))
+                stake = frac * bank
+                bank += (stake * b) if won else -stake
+                peak = max(peak, bank)
+                if peak > 0:
+                    maxdd = max(maxdd, (peak - bank) / peak)
+            growth = (bank / 100.0 - 1.0) * 100.0
+            print(f"    {kf:>5}-Kelly  final {bank:9.1f}u  growth {growth:+9.1f}%  "
+                  f"maxDD {maxdd * 100:5.1f}%")
 
 
 def _print_matchup_quantile_sweep_summary(results, safe_target=0.80):
