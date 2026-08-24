@@ -702,9 +702,10 @@ def _empty_market_bucket():
             # — lets us bucket realized ROI by MARKET CONFIDENCE (are the model's edges
             # real only in the uncertain/near-pickem zone, or across all prices?).
             "bets_detail": [],
-            # (date, served_prob, fair_over, outcome, over_price, under_price) per OBS
-            # — the SERVED (line-conditional Platt) prob, for the fit==serve EV-gate
-            # sweep + Kelly-staking diagnostics (props only; team uses its own lens).
+            # (date, served_prob, fair_over, outcome, over_price, under_price, n)
+            # per OBS — the SERVED (line-conditional Platt) prob + the bettor's prior
+            # game-count n, for the fit==serve EV-gate sweep, Kelly-staking, and the
+            # ROI-by-sample-size diagnostic (props only; team uses its own lens).
             "ev_obs": [],
             # (date, p_model[pre-Platt], line, outcome, over_price, under_price) per OBS
             # — feeds the --walk-forward sim (deep seed + online current-season Platt).
@@ -2666,7 +2667,8 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 results[prop]["prior_k"].append(
                     (p_final, fair_over, outcome, len(prior)))
                 results[prop]["ev_obs"].append(
-                    (d10, p_final, fair_over, outcome, over_price, under_price))
+                    (d10, p_final, fair_over, outcome, over_price, under_price,
+                     len(prior)))
                 results[prop]["wf_obs"].append(
                     (d10, p_model, line, outcome, over_price, under_price))
 
@@ -2741,6 +2743,7 @@ def _print_props_odds_results(results, threshold_pct):
 
     _print_confidence_bands(results)
     _print_props_served_ev_staking(results)
+    _print_props_ev_by_sample_size(results)
     _simulate_daily_topn(results)
 
 
@@ -2799,10 +2802,10 @@ def _print_props_served_ev_staking(results):
         if not obs:
             continue
         n = len(obs)
-        sb = sum((p - o) ** 2 for _, p, _, o, _, _ in obs) / n
-        mb = sum((f - o) ** 2 for _, _, f, o, _, _ in obs) / n
+        sb = sum((p - o) ** 2 for _, p, _, o, _, _, _ in obs) / n
+        mb = sum((f - o) ** 2 for _, _, f, o, _, _, _ in obs) / n
         picks = []   # (date, decimal_odds, won, ev) for the max-EV side
-        for _d, p, _f, o, op, up in obs:
+        for _d, p, _f, o, op, up, _n in obs:
             if op is None or up is None:
                 continue
             do, du = american_to_decimal(op), american_to_decimal(up)
@@ -2824,6 +2827,69 @@ def _print_props_served_ev_staking(results):
             wins = sum(1 for _, _, w, _ in sel if w)
             pl = sum((dec - 1.0) if w else -1.0 for _, dec, w, _ in sel)
             print(f"  {g * 100:>5.0f}%  {m:>7} {100.0 * wins / m:>6.1f} "
+                  f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+
+
+_N_BANDS = [
+    ("<10 gm", 0, 10),
+    ("10-19", 10, 20),
+    ("20-29", 20, 30),
+    ("30-44", 30, 45),
+    ("45+", 45, 10 ** 9),
+]
+# Cumulative min-n abstention gate: ROI if you only bet players with >= N prior games.
+_N_GATES = (0, 10, 15, 20, 25, 30)
+
+
+def _print_props_ev_by_sample_size(results, ev_gate=0.0):
+    """Realized win%/ROI of the served (Platt) +EV picks bucketed by the BETTOR's
+    prior game-count n — the axis we'd never sliced before.
+
+    Tests the abstention idea: are the losses concentrated in LOW-n players (whose
+    projection is dominated by the league prior via shrinkage_k, so it barely
+    deviates from the book) — in which case a hard min-n gate trims them — or is
+    ROI uniformly negative across n (the model just has no edge at any sample size)?
+    Also sweeps a CUMULATIVE min-n gate: ROI if you require >= N prior games, i.e.
+    'don't bet low-n batters' made explicit. Picks = the max-EV side at ev_gate,
+    matching what the app would actually place."""
+    print("\n=== ROI by BETTOR sample-size (prior game-count n) [served +EV picks] ===")
+    print("  hypothesis: low-n projections shrink to league (~the market line) and are")
+    print("  the losers; a min-n abstention gate should trim them. Uniform ROI across n")
+    print("  = no edge at any sample size (shrink vs. abstain is moot).")
+    for prop, r in results.items():
+        picks = []   # (n, decimal_odds, won) for the +EV max-EV side of each obs
+        for _d, p, _f, o, op, up, pn in (r.get("ev_obs") or []):
+            if op is None or up is None:
+                continue
+            do, du = american_to_decimal(op), american_to_decimal(up)
+            ev_o, ev_u = p * do - 1.0, (1.0 - p) * du - 1.0
+            if ev_o >= ev_u:
+                if ev_o >= ev_gate:
+                    picks.append((pn, do, o == 1))
+            elif ev_u >= ev_gate:
+                picks.append((pn, du, o == 0))
+        if not picks:
+            continue
+        print(f"\n  {prop} (EV gate {ev_gate * 100:.0f}%, n={len(picks)}):")
+        print(f"  {'n band':<10} {'bets':>6} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for label, lo, hi in _N_BANDS:
+            band = [(dec, won) for pn, dec, won in picks if lo <= pn < hi]
+            if not band:
+                continue
+            m = len(band)
+            wins = sum(1 for _, won in band if won)
+            pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
+            print(f"  {label:<10} {m:>6} {100.0 * wins / m:>6.1f} "
+                  f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+        print(f"  {'cum min-n':<10} {'bets':>6} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for gate in _N_GATES:
+            band = [(dec, won) for pn, dec, won in picks if pn >= gate]
+            if not band:
+                continue
+            m = len(band)
+            wins = sum(1 for _, won in band if won)
+            pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
+            print(f"  {'>=' + str(gate):<10} {m:>6} {100.0 * wins / m:>6.1f} "
                   f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
 
 
@@ -2851,7 +2917,7 @@ def _simulate_daily_topn(results, n_per_day=10, train_frac=0.6,
     from collections import defaultdict
     pool = []   # (date10, prop, sel_prob, decimal_odds, won, served_ev)
     for prop, r in results.items():
-        for d, p, _f, o, op, up in (r.get("ev_obs") or []):
+        for d, p, _f, o, op, up, _n in (r.get("ev_obs") or []):
             if not d or op is None or up is None:
                 continue
             do, du = american_to_decimal(op), american_to_decimal(up)
