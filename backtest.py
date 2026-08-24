@@ -2188,7 +2188,8 @@ def _write_market_prior_calibration(sport_key, results):
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
                             store_label="", write_calibration=False,
-                            source="auto", snapshot="close", seasons=None):
+                            source="auto", snapshot="close", seasons=None,
+                            xstats_override=None):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -2273,9 +2274,16 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     # ── Leakage-safe as-of xBA index for the batter_hits xBA blend (fit==serve with
     # the promoted C+xBA fit; mirrors the real-line refit). Built once over the obs
     # years; None => no blend. Only built when a served prop actually carries xstats.
+    # Effective xBA strength per prop: --xstats-strength overrides the calib value
+    # (only for props that ALREADY carry xstats, i.e. batter_hits) so we can A/B the
+    # xBA blend ON vs OFF against real odds without touching the calibration file.
+    def _eff_xs(p):
+        cx = (calibration.get(p) or {}).get("xstats_strength")
+        return xstats_override if (xstats_override is not None and cx) else cx
+
     xba_index = None
     if espn_sport == "baseball" and _obs_years and any(
-            (calibration.get(p) or {}).get("xstats_strength") for p in props):
+            (_eff_xs(p) or 0) > 0 for p in props):
         try:
             import savant_history as _sh
             import backtest_props as _bp
@@ -2387,8 +2395,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 # fit==serve: apply the promoted batter_hits xBA blend (leakage-safe
                 # as-of). No-op for any prop without a served xstats_strength.
                 proj = _props_xba_blend(
-                    proj, (calibration.get(prop) or {}).get("xstats_strength"),
-                    rid, d10, prior_ab, wts, xba_index)
+                    proj, _eff_xs(prop), rid, d10, prior_ab, wts, xba_index)
                 emp_over = _weighted_rate(prior, wts, lambda v, ln=line: v > ln)
                 p_model = _props_p_over(calibration.get(prop), proj, line,
                                         prior, wts, emp_over)
@@ -6332,6 +6339,11 @@ def main():
                         "nearest-pre-commence closing line = CLV reference) or "
                         "'early' (the backfill_early opening/pre-close line = the "
                         "bet-early ROI view that matches DK entry timing).")
+    p.add_argument("--xstats-strength", type=float, default=None,
+                   help="(props-odds mode) Override the xBA blend weight for xstats "
+                        "props (batter_hits) — 0 turns xBA OFF, 0.75 = the shipped "
+                        "value. Lets you A/B whether the xBA blend helps or HURTS vs "
+                        "real odds. Default None = use the calibration file's value.")
     p.add_argument("--supplement-log", dest="supplement_log",
                    action="store_true", default=True,
                    help="(odds mode, live engine) Fold resolved market_prediction_"
@@ -6483,7 +6495,8 @@ def main():
                                 write_calibration=args.write_calibration,
                                 source=args.source, snapshot=args.snapshot,
                                 seasons=(_parse_seasons(args.seasons)
-                                         if args.seasons else None))
+                                         if args.seasons else None),
+                                xstats_override=args.xstats_strength)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         if args.team_gate_sweep:
