@@ -2188,6 +2188,129 @@ def _write_market_prior_calibration(sport_key, results):
     print(f"  [write-calibration] Wrote market_prior_k for: {chosen}")
 
 
+def run_coherence_backtest(sport_key, espn_sport, espn_league, season_year=None,
+                           store_label="", source="auto", snapshot="close",
+                           limit=100000, train_frac=0.6):
+    """Cross-market COHERENCE probe — team triad (ML / run-line / total).
+
+    Tests whether the book's OWN run-line disagrees with what its moneyline + total
+    imply, and whether that outlier is exploitable — WITHOUT out-predicting DK. We
+    only use the book's other two markets as the 'truth':
+      1. de-vig each game -> favorite win prob (ML), total line, favorite RL-cover.
+      2. learn the book's TYPICAL favorite RL-cover as f(fav_win, total) on a TRAIN
+         split (empirical baseline — the book's own coherent relationship; no scoring
+         model, so a deviation is a genuine self-contradiction not our modeling error).
+      3. on the OOS TEST split, bet the games whose RL deviates most from that norm
+         (r>0 book overprices fav cover -> bet the +1.5 dog; r<0 -> bet the -1.5 fav),
+         graded vs the actual margin at the RAW RL price. ROI by |residual| bucket.
+    +ROI concentrating at larger |residual| = internal contradictions are exploitable;
+    flat/near-zero = DK prices the triad coherently (expected — it's the tight one)."""
+    store, source_used = _load_odds_store(sport_key, store_label, source, snapshot)
+    print(f"\n[odds source: {source_used} ({snapshot})]  "
+          f"=== COHERENCE: team triad (ML / run-line / total) ===")
+    if not store.get("games"):
+        print("  No team-market store for this sport/source.")
+        return
+    use_warehouse = espn_sport == "baseball"
+    seasons_list = (list(season_year)
+                    if isinstance(season_year, (list, tuple, set)) else [season_year])
+    if use_warehouse:
+        espn_teams, schedules = _warehouse_team_schedules(seasons_list)
+    else:
+        espn_teams = get_all_teams(espn_sport, espn_league)
+        schedules = {}
+        for sy in seasons_list:
+            for tid, gms in build_schedules(
+                    espn_sport, espn_league, espn_teams, season_year=sy).items():
+                schedules.setdefault(tid, []).extend(gms)
+    lookup, _unm = _build_odds_lookup(store, espn_teams)
+    all_games = all_completed_games(schedules)
+    if limit and limit < len(all_games):
+        all_games = all_games[-limit:]
+
+    # (date10, fav_win_prob, total, book_fav_cover, fav_price, dog_price, fav_covered)
+    obs = []
+    for game in all_games:
+        date, home, away = (game.get("date"), game.get("home_team"),
+                            game.get("away_team"))
+        if not (date and home and away):
+            continue
+        entry = _lookup_game_odds(lookup, _et_date10(date), home, away,
+                                  game_pk=game.get("game_pk"))
+        if not entry:
+            continue
+        ml, sp, tot = (_moneyline_market(entry), _spread_market(entry),
+                       _total_market(entry))
+        if not (ml and sp and tot):
+            continue
+        p_home = ml[0]
+        h_spread, fair_home_cover, sp_h_price, sp_a_price = sp
+        total_line = tot[0]
+        if h_spread is None or abs(abs(h_spread) - 1.5) > 1e-6:
+            continue  # only the standard ±1.5 run line
+        margin = game["home_score"] - game["away_score"]
+        if h_spread < 0:                      # home is the -1.5 favorite
+            fav_win, c_fav = p_home, fair_home_cover
+            fav_price, dog_price = sp_h_price, sp_a_price
+            fav_covered = 1 if margin >= 2 else 0
+        else:                                 # away is the -1.5 favorite
+            fav_win, c_fav = 1.0 - p_home, 1.0 - fair_home_cover
+            fav_price, dog_price = sp_a_price, sp_h_price
+            fav_covered = 1 if margin <= -2 else 0
+        if None in (fav_win, c_fav, total_line, fav_price, dog_price):
+            continue
+        obs.append((_et_date10(date), fav_win, total_line, c_fav,
+                    fav_price, dog_price, fav_covered))
+
+    if len(obs) < 200:
+        print(f"  only {len(obs)} usable triads — too few to test.")
+        return
+    obs.sort(key=lambda x: x[0])
+    dates = sorted({o[0] for o in obs})
+    cut = dates[int(len(dates) * train_frac)]
+    train = [o for o in obs if o[0] < cut]
+    test = [o for o in obs if o[0] >= cut]
+
+    def _wbin(p):
+        return round(min(max(p, 0.0), 1.0) * 20) / 20.0   # 5-point win-prob bin
+    def _tbin(t):
+        return round(t * 2) / 2.0                          # 0.5-run total bin
+
+    from collections import defaultdict
+    agg = defaultdict(lambda: [0.0, 0])
+    for _d, fw, T, c, _fp, _dp, _cov in train:
+        k = (_wbin(fw), _tbin(T))
+        agg[k][0] += c
+        agg[k][1] += 1
+    base = {k: s / n for k, (s, n) in agg.items() if n >= 20}
+    gbase = (sum(o[3] for o in train) / len(train)) if train else 0.5
+
+    graded = []   # (|resid|, decimal_odds, won)
+    for _d, fw, T, c, fp, dp, cov in test:
+        chat = base.get((_wbin(fw), _tbin(T)), gbase)
+        r = c - chat
+        if r >= 0:            # book overprices fav cover -> bet the +1.5 dog
+            graded.append((abs(r), american_to_decimal(dp), cov == 0))
+        else:                 # book underprices fav cover -> bet the -1.5 fav
+            graded.append((abs(r), american_to_decimal(fp), cov == 1))
+
+    print(f"  triads: {len(obs)} usable ({len(train)} train / {len(test)} test OOS, "
+          f"cut {cut}); baseline = book fav-cover ~ f(fav_win, total).")
+    print(f"  {'|resid|>=':>9} {'bets':>7} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+    for thr in (0.0, 0.02, 0.04, 0.06, 0.08, 0.10):
+        sel = [(dec, won) for r, dec, won in graded if r >= thr]
+        if not sel:
+            print(f"  {thr:>9.2f} {0:>7}")
+            continue
+        n = len(sel)
+        wins = sum(1 for _, w in sel if w)
+        pl = sum((dec - 1.0) if w else -1.0 for dec, w in sel)
+        print(f"  {thr:>9.2f} {n:>7} {100.0 * wins / n:>6.1f} "
+              f"{100.0 * pl / n:>8.2f} {pl:>9.2f}")
+    print("  +ROI growing with |resid| = the book's ML/RL/total contradictions are "
+          "exploitable; flat/negative = DK prices the triad coherently (as expected).")
+
+
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
                             store_label="", write_calibration=False,
@@ -6254,7 +6377,8 @@ def pythag_residual_sweep(sport_key, espn_sport, espn_league, season_year=None,
 
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
-    p.add_argument("--mode", choices=["matchup", "props", "odds", "props-odds"],
+    p.add_argument("--mode",
+                   choices=["matchup", "props", "odds", "props-odds", "coherence"],
                    default="matchup",
                    help="matchup = team-level projections; props = player-prop "
                         "projections; odds = grade team markets vs stored closing "
@@ -6719,6 +6843,13 @@ def main():
                               min_shrink_n=args.min_shrink_n,
                               serve_mode=args.serve_mode, fit_blend=args.fit_blend,
                               fit_shares=args.fit_shares)
+    elif args.mode == "coherence":
+        run_coherence_backtest(
+            sport_key, espn_sport, espn_league,
+            season_year=(_parse_seasons(args.seasons) if args.seasons
+                         else args.season),
+            store_label=args.store_label, source=args.source,
+            snapshot=args.snapshot, limit=args.limit)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
