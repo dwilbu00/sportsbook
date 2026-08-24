@@ -922,9 +922,19 @@ def _cached_pickrules_summaries():
 def load_config():
     # Cached: config.json + secrets + env are stable within a session, so this
     # avoids a file read + JSON parse on every rerun. save_api_key() clears it.
-    path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else CONFIG_EXAMPLE_PATH
-    with open(path, "r") as f:
-        config = json.load(f)
+    # Neither file is guaranteed in a hosted deploy (config.json is git-ignored;
+    # config.json.example may be absent) — the key comes from st.secrets there, so
+    # degrade to an empty config + setup screen instead of crashing at import.
+    path = (CONFIG_PATH if os.path.exists(CONFIG_PATH)
+            else CONFIG_EXAMPLE_PATH if os.path.exists(CONFIG_EXAMPLE_PATH)
+            else None)
+    config = {}
+    if path:
+        try:
+            with open(path, "r") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            config = {}
     # Prefer the deployment secret / env var over the local file so the key
     # never has to live on disk in a hosted environment.
     try:
@@ -947,9 +957,11 @@ def save_api_key(key):
     """
     if os.path.exists(CONFIG_PATH):
         config = load_config()
-    else:
+    elif os.path.exists(CONFIG_EXAMPLE_PATH):
         with open(CONFIG_EXAMPLE_PATH, "r") as f:
             config = json.load(f)
+    else:
+        config = {}
     config["odds_api_key"] = key
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
