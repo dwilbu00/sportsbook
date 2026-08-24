@@ -701,7 +701,11 @@ def _empty_market_bucket():
             # (selected-side de-vigged MARKET prob, decimal_odds, won) per PLACED bet
             # — lets us bucket realized ROI by MARKET CONFIDENCE (are the model's edges
             # real only in the uncertain/near-pickem zone, or across all prices?).
-            "bets_detail": []}
+            "bets_detail": [],
+            # (date, served_prob, fair_over, outcome, over_price, under_price) per OBS
+            # — the SERVED (line-conditional Platt) prob, for the fit==serve EV-gate
+            # sweep + Kelly-staking diagnostics (props only; team uses its own lens).
+            "ev_obs": []}
 
 
 def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
@@ -2231,6 +2235,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     # inflated by overconfidence Platt already removes. (Lazy import avoids any
     # import-order coupling; recalibration is otherwise unused here.)
     from recalibration import apply_platt, load_recalibration
+    import props as _props_recal   # for the LIVE line-conditional Platt resolver
     recal = load_recalibration(sport_key) or {}
     hl = half_life or _half_life_for(sport_key)
     results = {prop: _empty_market_bucket() for prop in props}
@@ -2396,14 +2401,21 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 # probability the app actually ships, plus the market fair prob,
                 # the outcome, and the sample size n. (_grade/blend above keep the
                 # pre-Platt prob to preserve existing backtest semantics.)
-                rc = recal.get(prop) or {}
+                # Served prob = the LIVE line-conditional Platt recal (fit==serve),
+                # so the served-EV + Kelly diagnostics below grade exactly what the app
+                # ships — not the raw pre-Platt prob. (The headline table above keeps
+                # the pre-Platt prob for backtest continuity.)
+                rcfg = _props_recal._resolve_recal_cfg(
+                    recal, prop, line, calibration.get(prop))
                 p_final = p_model
-                if rc.get("a") is not None:
-                    adj = apply_platt(p_model, rc.get("a"), rc.get("b"))
+                if rcfg and rcfg.get("a") is not None:
+                    adj = apply_platt(p_model, rcfg.get("a"), rcfg.get("b"))
                     if adj is not None:
                         p_final = max(0.0, min(1.0, adj))
                 results[prop]["prior_k"].append(
                     (p_final, fair_over, outcome, len(prior)))
+                results[prop]["ev_obs"].append(
+                    (d10, p_final, fair_over, outcome, over_price, under_price))
 
     # Diagnostics on coverage
     print("\nCoverage (why lines were dropped):")
@@ -2472,6 +2484,7 @@ def _print_props_odds_results(results, threshold_pct):
         [(prop, r["blend"]) for prop, r in results.items()])
 
     _print_confidence_bands(results)
+    _print_props_served_ev_staking(results)
 
 
 _CONF_BANDS = [
@@ -2508,6 +2521,76 @@ def _print_confidence_bands(results):
             pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
             print(f"  {label:<20} {n:>6} {100.0 * wins / n:>6.1f} "
                   f"{100.0 * pl / n:>8.2f} {pl:>9.2f}")
+
+
+_EV_GATES = (0.0, 0.02, 0.05, 0.08, 0.12)
+
+
+def _print_props_served_ev_staking(results):
+    """fit==serve diagnostics on the SERVED (line-conditional Platt) prob — what the
+    app actually ships (not the raw pre-Platt prob the headline table grades):
+      (1) served Brier vs market Brier (calibrated accuracy),
+      (2) an EV-gate sweep — side = max-EV, profit at the RAW price (vig included),
+      (3) flat vs fractional-Kelly staking on the EV>=5% bets (does Kelly help or
+          just amplify drawdown? — teams showed flat wins).
+    A positive ROI band with served Brier <= market = a real, capturable edge."""
+    print("\n=== SERVED-PROB (Platt) EV-gate sweep + staking [fit==serve] ===")
+    print("  graded on the LIVE served prob (line-conditional Platt); side = max-EV;")
+    print("  profit at the RAW price. This is what the app would actually bet.")
+    for prop, r in results.items():
+        obs = r.get("ev_obs") or []
+        if not obs:
+            continue
+        n = len(obs)
+        sb = sum((p - o) ** 2 for _, p, _, o, _, _ in obs) / n
+        mb = sum((f - o) ** 2 for _, _, f, o, _, _ in obs) / n
+        picks = []   # (date, decimal_odds, won, ev) for the max-EV side
+        for _d, p, _f, o, op, up in obs:
+            if op is None or up is None:
+                continue
+            do, du = american_to_decimal(op), american_to_decimal(up)
+            ev_o, ev_u = p * do - 1.0, (1.0 - p) * du - 1.0
+            if ev_o >= ev_u:
+                picks.append((_d, do, o == 1, ev_o))
+            else:
+                picks.append((_d, du, o == 0, ev_u))
+        flag = "served BEATS market" if sb < mb else "market still ahead"
+        print(f"\n  {prop}: served Brier {sb:.4f} vs market {mb:.4f}  "
+              f"({flag}; n={n})")
+        print(f"  {'EV gate':>7} {'bets':>7} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for g in _EV_GATES:
+            sel = [x for x in picks if x[3] >= g]
+            if not sel:
+                print(f"  {g * 100:>5.0f}%  {0:>7}")
+                continue
+            m = len(sel)
+            wins = sum(1 for _, _, w, _ in sel if w)
+            pl = sum((dec - 1.0) if w else -1.0 for _, dec, w, _ in sel)
+            print(f"  {g * 100:>5.0f}%  {m:>7} {100.0 * wins / m:>6.1f} "
+                  f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+        sel = sorted([x for x in picks if x[3] >= 0.05], key=lambda x: x[0])
+        if len(sel) >= 25:
+            print(f"  staking @EV>=5% (n={len(sel)}, start 100u):")
+            for label, kf in (("flat-1u", None), ("1/8-Kelly", 0.125),
+                              ("1/4-Kelly", 0.25), ("1/2-Kelly", 0.5)):
+                bank, peak, maxdd = 100.0, 100.0, 0.0
+                for _d, dec, won, ev in sel:
+                    b = dec - 1.0
+                    if kf is None:
+                        stake = 1.0
+                    elif b > 0:
+                        stake = max(0.0, kf * (ev / b)) * bank
+                    else:
+                        stake = 0.0
+                    bank += (stake * b) if won else -stake
+                    peak = max(peak, bank)
+                    if peak > 0:
+                        maxdd = max(maxdd, (peak - bank) / peak)
+                    if bank <= 0:
+                        break
+                growth = (bank / 100.0 - 1.0) * 100.0
+                print(f"    {label:<10} final {bank:8.1f}u  growth {growth:+8.1f}%  "
+                      f"maxDD {maxdd * 100:5.1f}%")
 
 
 def _print_matchup_quantile_sweep_summary(results, safe_target=0.80):
