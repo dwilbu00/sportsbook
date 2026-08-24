@@ -359,21 +359,30 @@ class PlayerStatSeriesTests(unittest.TestCase):
         gcg.assert_not_called()
         self.assertEqual(ser, [("2026-01-01", 20.0)])
 
-    def test_run_props_odds_calls_series(self):
-        # The wiring: run_props_odds_backtest resolves each odds-store player's series
-        # via _player_stat_series (which, for MLB, hits the warehouse).
-        store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z", "props": {
+    def test_run_props_odds_mlb_uses_season_aware_bulk_index(self):
+        # The MLB wiring: run_props_odds_backtest resolves each store player to an
+        # MLBAM id (resolve_mlbam_id) and serves a SEASON-AWARE gamelog from the
+        # multi-season bulk index (get_calib_gamelogs_bulk) — NOT the old
+        # current-season-only per-player path. The index is queried across the obs
+        # years PLUS the prior season (cross-season warmup).
+        store = {"games": {"g1": {"commence_time": "2024-07-01T00:00:00Z", "props": {
             "batter_hits": {"Guy": {"line": 0.5, "over_implied": 0.5,
                                     "under_implied": 0.5}}}}}, "bookmaker": "dk"}
-        spy = mock.Mock(return_value=[])
+        bulk = mock.Mock(return_value={})
         with mock.patch.object(backtest.hist_store, "load_store", return_value=store), \
              mock.patch.object(backtest, "load_calibration", return_value={}), \
-             mock.patch.object(backtest, "_player_stat_series", spy):
+             mock.patch("mlb_starters.resolve_mlbam_id",
+                        return_value=(592450, False)) as rz, \
+             mock.patch("mlb_warehouse.get_calib_gamelogs_bulk", bulk), \
+             mock.patch("mlb_warehouse._current_season", return_value=2024):
             backtest.run_props_odds_backtest(
-                "mlb", "baseball", "mlb", "baseball_mlb", props=["batter_hits"])
-        self.assertTrue(spy.called)
-        self.assertEqual(spy.call_args.args[:4],
-                         ("baseball", "mlb", "Guy", "batter_hits"))
+                "mlb", "baseball", "mlb", "baseball_mlb", props=["batter_hits"],
+                source="store")
+        self.assertTrue(rz.called)                 # resolved to an MLBAM id
+        self.assertTrue(bulk.called)               # served from the bulk index
+        seasons_queried = {c.args[1] for c in bulk.call_args_list}
+        self.assertIn(2024, seasons_queried)       # obs year
+        self.assertIn(2023, seasons_queried)       # cross-season warmup
 
 
 class LoadPropStoreTests(unittest.TestCase):

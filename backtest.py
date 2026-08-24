@@ -2106,6 +2106,30 @@ def _props_p_over(prop_cfg, proj, line, vals, wts, emp_over):
     return emp_over
 
 
+def _props_xba_blend(proj, xstats_strength, rid, game_d10, prior_ab, wts,
+                     xba_index):
+    """Blend the recency projection toward the batter's LEAKAGE-SAFE as-of xBA ×
+    recent AB/game — the fit==serve mirror of book_line_calibration.project_and_
+    empirical (batter_hits, method C+xBA). Uses a per-game as-of estimate (< this
+    game's date) so a past-dated obs never sees future contact data. Fails OPEN to
+    the plain projection (unknown id / no as-of xBA / no AB / any error)."""
+    s = xstats_strength or 0.0
+    if not (s > 0 and xba_index is not None and rid):
+        return proj
+    try:
+        xba = xba_index.asof_mean(str(rid), game_d10)   # min_bbe gated inside
+        ab_valid = [(ab, w) for ab, w in zip(prior_ab, wts) if ab and w > 0]
+        if xba is None or not ab_valid:
+            return proj
+        ab_pg = sum(ab * w for ab, w in ab_valid) / sum(w for _, w in ab_valid)
+        if ab_pg > 0:
+            s = max(0.0, min(1.0, s))
+            return (1.0 - s) * proj + s * (xba * ab_pg)
+    except Exception:
+        pass
+    return proj
+
+
 def _write_market_prior_calibration(sport_key, results):
     """Persist the Brier-optimal market-as-prior shrinkage k (P1.1a) per prop
     into calibration/<sport>.json as "market_prior_k".
@@ -2147,13 +2171,20 @@ def _write_market_prior_calibration(sport_key, results):
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
                             store_label="", write_calibration=False,
-                            source="auto", snapshot="close"):
+                            source="auto", snapshot="close", seasons=None):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
     book line we recompute the model's P(over) from the player's prior games,
     compare it to the de-vigged closing line, and measure ROI + model-vs-market
     Brier + the optimal model⇄market blend, per prop market.
+
+    fit==serve for MLB (P-fixes): (a) player logs come from a MULTI-SEASON warehouse
+    index (was current-season-only get_calib_gamelog → could only grade the live
+    season); (b) batter_hits applies the SAME leakage-safe xBA blend the promoted
+    C+xBA calibration was fit under (_props_xba_blend). ``seasons`` (list of ints)
+    filters the graded games to those years (per-season durability read); None =
+    all seasons pooled.
     """
     threshold = threshold_pct / 100.0
     # P3c/P4/P6: MLB player gamelogs come from the StatsAPI warehouse; NBA/NFL stay on
@@ -2193,13 +2224,102 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     series_cache = {}
     no_actual = {prop: 0 for prop in props}
     no_series = {prop: 0 for prop in props}
+    season_set = {str(s) for s in seasons} if seasons else None
+
+    # ── MLB: season-aware multi-season gamelog index (fixes the old current-season-
+    # only priors) — one bulk query per (role, season), every player from memory.
+    # Spans the obs years + the season before the earliest (cross-season warmup).
+    # Honors the --seasons filter so a per-season run loads only that year's data
+    # (its priors still reach back a season via the gamelog index's -1 span).
+    _obs_years = sorted({int(str(e.get("commence_time"))[:4])
+                         for e in games.values() if e.get("commence_time")
+                         and (season_set is None
+                              or str(e.get("commence_time"))[:4] in season_set)})
+    _gl_index = {}   # role -> {mlb_id(str): [gamelog dict, ...]} (all seasons merged)
+
+    def _gl_for_role(role):
+        if role not in _gl_index:
+            merged = {}
+            try:
+                import mlb_warehouse as _mw
+                if _obs_years:
+                    for _s in range(_obs_years[0] - 1, _obs_years[-1] + 1):
+                        for pid, logs in (
+                                _mw.get_calib_gamelogs_bulk(role, _s) or {}).items():
+                            merged.setdefault(pid, []).extend(logs)
+            except Exception:
+                merged = {}
+            _gl_index[role] = merged
+        return _gl_index[role]
+
+    # ── Leakage-safe as-of xBA index for the batter_hits xBA blend (fit==serve with
+    # the promoted C+xBA fit; mirrors the real-line refit). Built once over the obs
+    # years; None => no blend. Only built when a served prop actually carries xstats.
+    xba_index = None
+    if espn_sport == "baseball" and _obs_years and any(
+            (calibration.get(p) or {}).get("xstats_strength") for p in props):
+        try:
+            import savant_history as _sh
+            import backtest_props as _bp
+            _raw = []
+            for _y in _obs_years:
+                try:
+                    _raw.extend(_sh.load_days(f"{_y}-03-01", f"{_y}-11-30"))
+                except Exception:
+                    pass
+            if _raw:
+                xba_index = _bp.build_batter_xba_index(_raw)
+                print(f"  [xstats] built leakage-safe xBA index from {len(_raw):,} "
+                      f"pitches ({', '.join(str(y) for y in _obs_years)})")
+        except Exception:
+            xba_index = None
 
     def series(player, prop):
+        # NBA/NFL (ESPN) path — unchanged, current-season gamelog. (date, val).
         k = (player, prop)
         if k not in series_cache:
             series_cache[k] = _player_stat_series(
                 espn_sport, espn_league, player, prop)
         return series_cache[k]
+
+    _mlb_ser_cache = {}
+
+    def _mlb_series(player, prop):
+        """(rid, [(date, val, ab), ...]) from the multi-season index — season-aware
+        + carries AB per game for the xBA blend. rid is the resolved MLBAM id."""
+        k = (player, prop)
+        if k in _mlb_ser_cache:
+            return _mlb_ser_cache[k]
+        import mlb_starters
+        import mlb_warehouse
+        resolved = mlb_starters.resolve_mlbam_id(
+            player, mlb_warehouse._current_season(), prop_key=prop)
+        if not resolved:
+            _mlb_ser_cache[k] = (None, [])
+            return _mlb_ser_cache[k]
+        rid = str(resolved[0])
+        role = "pitcher" if str(prop).startswith("pitcher_") else "batter"
+        gl = _gl_for_role(role).get(rid) or []
+        if not (_role_matches_gamelog(prop, gl) and gl):
+            _mlb_ser_cache[k] = (rid, [])
+            return _mlb_ser_cache[k]
+        label = _stat_label_for(prop, gl)
+        if not label:
+            _mlb_ser_cache[k] = (rid, [])
+            return _mlb_ser_cache[k]
+        rows = []
+        for g in gl:
+            if g.get("completed") is False:
+                continue
+            d, v = g.get("game_date"), g.get(label)
+            if not d or v is None:
+                continue
+            if prop == "pitcher_outs":
+                v = ip_to_outs(v)
+            rows.append((d, float(v), g.get("AB")))
+        rows.sort(key=lambda x: x[0])
+        _mlb_ser_cache[k] = (rid, rows)
+        return _mlb_ser_cache[k]
 
     print(f"\n=== Props odds backtest: {sport_key} {props} ===")
     print(f"Stored games: {len(games)} (bookmaker: {store.get('bookmaker','?')})")
@@ -2209,6 +2329,8 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
         if not gdate:
             continue
         d10 = gdate[:10]
+        if season_set is not None and d10[:4] not in season_set:
+            continue
         eprops = entry.get("props") or {}
         for prop in props:
             market = eprops.get(prop) or {}
@@ -2220,17 +2342,23 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 under_price = info.get("under_price")
                 if line is None or over_imp is None or under_imp is None:
                     continue
-                ser = series(player, prop)
+                if espn_sport == "baseball":
+                    rid, ser = _mlb_series(player, prop)   # season-aware + AB
+                else:
+                    rid = None
+                    ser = [(d, v, None) for d, v in series(player, prop)]
                 if not ser:
                     no_series[prop] += 1
                     continue
                 actual = None
                 prior = []
-                for dt, val in ser:
+                prior_ab = []
+                for dt, val, ab in ser:
                     if dt[:10] == d10:
                         actual = val
                     elif dt < gdate:
                         prior.append(val)
+                        prior_ab.append(ab)
                 if actual is None or len(prior) < min_prior:
                     no_actual[prop] += 1
                     continue
@@ -2238,6 +2366,11 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                     continue  # push — refund
                 wts = _recency_weights(len(prior), hl)
                 proj = _weighted_mean(prior, wts)
+                # fit==serve: apply the promoted batter_hits xBA blend (leakage-safe
+                # as-of). No-op for any prop without a served xstats_strength.
+                proj = _props_xba_blend(
+                    proj, (calibration.get(prop) or {}).get("xstats_strength"),
+                    rid, d10, prior_ab, wts, xba_index)
                 emp_over = _weighted_rate(prior, wts, lambda v, ln=line: v > ln)
                 p_model = _props_p_over(calibration.get(prop), proj, line,
                                         prior, wts, emp_over)
@@ -6136,7 +6269,9 @@ def main():
                                 threshold_pct=args.threshold,
                                 store_label=args.store_label,
                                 write_calibration=args.write_calibration,
-                                source=args.source, snapshot=args.snapshot)
+                                source=args.source, snapshot=args.snapshot,
+                                seasons=(_parse_seasons(args.seasons)
+                                         if args.seasons else None))
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         if args.team_gate_sweep:
