@@ -1421,7 +1421,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
 
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
-                      max_retries=3):
+                      exclude_early=False, max_retries=3):
     """Bulk-read warehoused player-prop lines for a sport, joining each odds_line
     to its parent odds_snapshot.
 
@@ -1430,9 +1430,17 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
     Feeds the offline real-line calibration refit (warehouse.load_prop_lines)
     from the growing Azure warehouse instead of the local historical_odds JSON.
     Optional date filter: ``dates`` (explicit game_date list) OR
-    ``date_from``/``date_to`` (inclusive range). Ordered by (event_id,
-    captured_at) so the assembler can pick each event's closing snapshot. Retries
-    transient OperationalErrors like read_rows. Returns row dicts."""
+    ``date_from``/``date_to`` (inclusive range).
+
+    ``exclude_early`` drops 'backfill_early' snapshots — the closing-line refit read
+    only wants closes, so skipping the early half roughly halves the row volume.
+
+    ⚠ SCALE: the prop table is ~1.5M rows post-backfill, and a single unscoped read
+    with a server-side ORDER BY times out the Azure round-trip. So (a) NO order_by —
+    the assembler groups by event_id + picks the closing snapshot by captured_at
+    VALUE, never relying on row order — and (b) the caller (load_prop_lines) chunks
+    by season + passes exclude_early to keep each query small. Retries transient
+    OperationalErrors. Returns row dicts."""
     engine = get_engine()
     joined = odds_line.join(odds_snapshot,
                             odds_line.c.snapshot_id == odds_snapshot.c.id)
@@ -1450,6 +1458,10 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
         .where((odds_snapshot.c.sport == sport)
                & (odds_line.c.bet_type == "player_prop"))
     )
+    if exclude_early:
+        # keep closes (+ any untagged/legacy); drop the explicit early snapshots.
+        stmt = stmt.where(odds_snapshot.c.source.is_(None)
+                          | (odds_snapshot.c.source != "backfill_early"))
     if dates:
         stmt = stmt.where(odds_snapshot.c.game_date.in_(list(dates)))
     else:
@@ -1457,7 +1469,6 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
             stmt = stmt.where(odds_snapshot.c.game_date >= date_from)
         if date_to is not None:
             stmt = stmt.where(odds_snapshot.c.game_date <= date_to)
-    stmt = stmt.order_by(odds_snapshot.c.event_id, odds_snapshot.c.captured_at)
 
     last_exc = None
     for attempt in range(max_retries):

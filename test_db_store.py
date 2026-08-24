@@ -1093,6 +1093,46 @@ class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertEqual({r["direction"] for r in rows}, {"OVER", "UNDER"})
         self.assertTrue(all(r["player"] == "Kris Bryant" for r in rows))
 
+    def test_exclude_early_drops_early_snapshots(self):
+        # SCALE fix: the closing-line read drops 'backfill_early' snapshots.
+        m_close = self._meta("20240601T23Z", event_id="ec",
+                             game_date="2024-06-01", commence="2024-06-01T23:00:00Z")
+        m_close["source"] = "backfill_close"
+        m_close["captured_at"] = "2024-06-01T23:00:00Z"
+        m_early = self._meta("20240601T13Z", event_id="ee",
+                             game_date="2024-06-01", commence="2024-06-01T23:00:00Z")
+        m_early["source"] = "backfill_early"
+        m_early["captured_at"] = "2024-06-01T13:00:00Z"
+        db_store.capture_odds_snapshot(m_close, self._prop_lines(-110, -110))
+        db_store.capture_odds_snapshot(m_early, self._prop_lines(-120, 100))
+        self.assertEqual(
+            {r["event_id"] for r in db_store.player_prop_lines("baseball_mlb")},
+            {"ec", "ee"})                                        # both, no filter
+        self.assertEqual(
+            {r["event_id"] for r in
+             db_store.player_prop_lines("baseball_mlb", exclude_early=True)},
+            {"ec"})                                              # early dropped
+
+    def test_load_prop_lines_chunks_seasons_and_excludes_early(self):
+        import warehouse
+        # a 2024 close + early for one event: load_prop_lines chunks by season and
+        # excludes early -> returns the CLOSE only (proves the per-season read finds
+        # a prior season and the exclude_early filter is applied end-to-end).
+        m_close = self._meta("20240601T23Z", event_id="e24",
+                             game_date="2024-06-01", commence="2024-06-01T23:00:00Z")
+        m_close["source"] = "backfill_close"
+        m_close["captured_at"] = "2024-06-01T23:00:00Z"
+        m_early = self._meta("20240601T13Z", event_id="e24",
+                             game_date="2024-06-01", commence="2024-06-01T23:00:00Z")
+        m_early["source"] = "backfill_early"
+        m_early["captured_at"] = "2024-06-01T13:00:00Z"
+        db_store.capture_odds_snapshot(m_close, self._prop_lines(-110, -110))
+        db_store.capture_odds_snapshot(m_early, self._prop_lines(-200, 160))
+        out = warehouse.load_prop_lines("baseball_mlb")
+        self.assertEqual(len(out), 1)                            # one closing entry
+        self.assertEqual(out[0]["over_price"], -110)             # the CLOSE, not early
+        self.assertEqual(out[0]["game_date"], "2024-06-01")      # found via the 2024 chunk
+
     def test_reader_and_assembler_carry_player_mlb_id(self):
         import warehouse
         lines = self._prop_lines(-110, -110)

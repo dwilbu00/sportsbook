@@ -1019,7 +1019,19 @@ def load_prop_lines(sport_key, dates=None):
     if not _sql():
         return []
     try:
-        rows = _db.player_prop_lines(sport_key, dates=dates)
+        if dates:
+            rows = _db.player_prop_lines(sport_key, dates=dates, exclude_early=True)
+        else:
+            # SCALE: the full prop table is ~1.5M rows and a single unscoped read
+            # times out the Azure round-trip. Read the CLOSING set (exclude_early)
+            # ONE SEASON AT A TIME so each query stays small; concatenate. Empty
+            # years return fast (indexed sport+game_date scan finds nothing).
+            import datetime as _dt
+            rows = []
+            for _yr in range(2019, _dt.date.today().year + 2):
+                rows.extend(_db.player_prop_lines(
+                    sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
+                    exclude_early=True))
     except Exception as e:
         _ops.ops_event("database_failure", op="player_prop_lines",
                        sport=sport_key, error=type(e).__name__)
