@@ -633,10 +633,10 @@ class SelectLineMethodsTests(unittest.TestCase):
         return obs
 
     def _run(self, enriched, pooled="C"):
-        def _pe(o, params, sk, td=None, la=None):
+        def _pe(o, params, sk, td=None, la=None, defense_by_season=None):
             return o["_proj"], o["_emp"]
         def _pd(o, params, sk, td=None, la=None, xba_index=None,
-                quality_index=None, xstats_strength=0.0):
+                quality_index=None, xstats_strength=0.0, defense_by_season=None):
             return o["_pdist"]
         with patch.object(blc, "project_and_empirical", side_effect=_pe), \
              patch.object(blc, "project_distributional", side_effect=_pd):
@@ -688,11 +688,11 @@ class SelectLineMethodsTests(unittest.TestCase):
             "single_split": {"A": 0.25, "C": 0.24, "E": 0.10},
         }
 
-        def _pe(o, params, sk, td=None, la=None):
+        def _pe(o, params, sk, td=None, la=None, defense_by_season=None):
             return o["_proj"], o["_emp"]
 
         def _pd(o, params, sk, td=None, la=None, xba_index=None,
-                quality_index=None, xstats_strength=0.0):
+                quality_index=None, xstats_strength=0.0, defense_by_season=None):
             return o["_pdist"]
 
         with patch.object(blc, "project_and_empirical", side_effect=_pe), \

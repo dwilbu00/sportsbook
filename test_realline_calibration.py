@@ -180,7 +180,7 @@ class RefitSportRealLinesTests(unittest.TestCase):
         # build returns a per-prop marker list so the patched selector can key
         # off the prop; the actual projection math is not exercised here.
         def _build(enriched, params, sport_key, prop_key, td=None, la=None,
-                   xstats_strength=0.0, xba_index=None):
+                   xstats_strength=0.0, xba_index=None, defense_by_season=None):
             return [{"prop_key": prop_key}]
         def _select(rows, shrinkage_k=15, negbin_eligible=False,
                     roi_tiebreak=True):
@@ -566,6 +566,31 @@ class WarehouseHarvestTests(unittest.TestCase):
         out, n_primary, n_pred = self._harvest(wh, pred)
         self.assertEqual(len(out), 1)
         self.assertEqual(n_pred, 0)
+
+
+class SeasonDefenseTests(unittest.TestCase):
+    """opp_defense leakage guard: a multi-season refit selects each obs's OWN
+    season's pooled defense, so a prior-season obs never re-weights against a
+    later (future) season's defense."""
+
+    def test_obs_season_defense_selects_own_season(self):
+        dbs = {"2024": ({"OppA": 4.0}, 4.5), "2026": ({"OppA": 3.0}, 4.5)}
+        td, lg = blc._obs_season_defense(
+            {"game_date": "2024-06-01"}, None, None, dbs)
+        self.assertEqual(td, {"OppA": 4.0})          # 2024 obs -> 2024 defense
+        self.assertEqual(lg, 4.5)
+
+    def test_unknown_season_yields_empty_not_leak(self):
+        dbs = {"2026": ({"OppA": 3.0}, 4.5)}
+        td, lg = blc._obs_season_defense(
+            {"game_date": "2023-06-01"}, None, None, dbs)
+        self.assertEqual((td, lg), ({}, None))       # no map for 2023 -> no weight
+
+    def test_no_map_falls_back_to_single_lookup(self):
+        # non-baseball / single-season callers pass no map -> byte-identical old path
+        td, lg = blc._obs_season_defense(
+            {"game_date": "2024-06-01"}, {"X": 1.0}, 2.0, None)
+        self.assertEqual((td, lg), ({"X": 1.0}, 2.0))
 
 
 class JoinToActualsTests(unittest.TestCase):

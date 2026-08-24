@@ -185,7 +185,7 @@ def _partition_rows_by_bucket(rows):
 
 def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                          league_avg_def, pooled_method, xba_index, quality_index,
-                         roi_tiebreak=True):
+                         roi_tiebreak=True, defense_by_season=None):
     """Per-line-bucket method selection for a line-conditional prop, or None.
 
     Builds real-line rows carrying a leakage-safe distributional ``p_dist``,
@@ -204,13 +204,15 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
         if not isinstance(obs, dict) or obs.get("prop_key") != prop_key:
             continue
         projected, emp = blc.project_and_empirical(
-            obs, params, sport_key, team_defense, league_avg_def)
+            obs, params, sport_key, team_defense, league_avg_def,
+            defense_by_season=defense_by_season)
         if projected is None or emp is None:
             continue
         p_dist = blc.project_distributional(
             obs, params, sport_key, team_defense, league_avg_def,
             xba_index=xba_index, quality_index=quality_index,
-            xstats_strength=LINE_COND_XSTATS_STRENGTH)
+            xstats_strength=LINE_COND_XSTATS_STRENGTH,
+            defense_by_season=defense_by_season)
         if p_dist is None:
             continue
         rows.append({
@@ -1029,12 +1031,25 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         return
 
     # Weight-side opponent-defense lookup only if some prop's variant uses it.
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): the obs span multiple seasons, so build one
+    # pooled lookup per season and let the project fns self-select each obs's own
+    # season — a single all-season lookup would re-weight a 2024 obs against 2025/
+    # 2026 (future) defense. Mirrors the synthetic sweep, which is season-scoped.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in existing):
-        print("  Building team-defense lookup (a variant uses opp_defense)...")
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        _seasons = sorted({(o["game_date"] or "")[:4] for o in enriched
+                           if isinstance(o, dict) and o.get("game_date")})
+        print(f"  Building per-season team-defense lookups (a variant uses "
+              f"opp_defense; seasons: {', '.join(_seasons) or 'none'})...")
+        defense_by_season = {}
+        for _yr in _seasons:
+            try:
+                _avg, _, _lg = _defense_lookup(
+                    espn_sport, espn_league, season_year=int(_yr))
+                defense_by_season[_yr] = (_avg, _lg)
+            except Exception:
+                defense_by_season[_yr] = ({}, None)
 
     # ── P2.4a: leakage-safe as-of xBA index for the projection blend ──
     # Built once from the raw Statcast day cache spanning the obs seasons. Only
@@ -1118,8 +1133,9 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         prop_xstats = (xstats_strength if (xba_index is not None
                        and prop_key in PROP_XSTATS_KIND) else 0.0)
         rows = blc.build_real_line_obs(
-            enriched, params, sport_key, prop_key, team_defense, league_avg_def,
-            xstats_strength=prop_xstats, xba_index=xba_index)
+            enriched, params, sport_key, prop_key,
+            xstats_strength=prop_xstats, xba_index=xba_index,
+            defense_by_season=defense_by_season)
         sel = blc.select_method_at_real_lines(
             rows, negbin_eligible=(prop_key in PROP_NEGBIN_ELIGIBLE),
             roi_tiebreak=roi_tiebreak)
@@ -1150,9 +1166,9 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         line_methods = None
         if prop_key in LINE_CONDITIONAL_PROPS and need_lc:
             line_methods = _select_line_methods(
-                prop_key, enriched, params, sport_key, team_defense,
-                league_avg_def, sel["method"], xba_index, lc_quality_index,
-                roi_tiebreak=roi_tiebreak)
+                prop_key, enriched, params, sport_key, None,
+                None, sel["method"], xba_index, lc_quality_index,
+                roi_tiebreak=roi_tiebreak, defense_by_season=defense_by_season)
 
         # Normally only a genuine method FLIP is written (a same-method re-fit
         # would just churn the residuals onto a smaller real-line basis for no

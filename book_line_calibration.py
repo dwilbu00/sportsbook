@@ -750,9 +750,24 @@ def _center_estimate(values, weights, center="mean"):
     return sum(v * w for v, w in zip(values, weights)) / tw
 
 
+def _obs_season_defense(obs, team_defense, league_avg_def, defense_by_season):
+    """Per-season pooled opponent-defense for one obs. When ``defense_by_season``
+    (a {season-year-str: (team_defense, league_avg)} map) is supplied — the
+    multi-season real-line refit path — return the obs's OWN season's pooled
+    lookup so a prior-season obs never re-weights against another season's
+    (including FUTURE) defense. This mirrors the synthetic sweep, which builds a
+    per-season pooled lookup because it runs one season per backtest call. Falls
+    back to the single passed lookup (non-baseball / single-season callers), which
+    is byte-identical to the prior behavior."""
+    if defense_by_season:
+        return defense_by_season.get((obs.get("game_date") or "")[:4], ({}, None))
+    return team_defense, league_avg_def
+
+
 def project_and_empirical(obs, params, sport_key,
                           team_defense=None, league_avg_def=None,
-                          xstats_strength=0.0, xba_index=None):
+                          xstats_strength=0.0, xba_index=None,
+                          defense_by_season=None):
     """
     Mirrors backtest.run_player_props_backtest's per-obs projection logic,
     but takes the line from the book instead of synthetic.
@@ -801,6 +816,10 @@ def project_and_empirical(obs, params, sport_key,
     base_w = _recency_weights(len(prior_values), hl)
     venue_s = params.get("venue_strength", 0.0)
     def_s = params.get("opp_defense_strength", 0.0)
+    # Per-season pooled defense (leakage guard): a multi-season refit passes
+    # defense_by_season so this obs re-weights only against its OWN season.
+    team_defense, league_avg_def = _obs_season_defense(
+        obs, team_defense, league_avg_def, defense_by_season)
 
     weights = []
     for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
@@ -938,7 +957,7 @@ def project_distributional(obs, params, sport_key, team_defense=None,
                            quality_index=None, xstats_strength=0.0,
                            hardhit_coef=None, barrel_coef=None,
                            xba_window=None, xba_min_count=None,
-                           home_ab_delta=0.0):
+                           home_ab_delta=0.0, defense_by_season=None):
     """Distributional P(over) for a batter_hits obs at its REAL book line
     (§2.4b-2 method "D"), or None if not applicable / too thin.
 
@@ -964,6 +983,8 @@ def project_distributional(obs, params, sport_key, team_defense=None,
     base_w = _recency_weights(len(prior_games), params.get("half_life"))
     venue_s = params.get("venue_strength", 0.0)
     def_s = params.get("opp_defense_strength", 0.0)
+    team_defense, league_avg_def = _obs_season_defense(
+        obs, team_defense, league_avg_def, defense_by_season)
     weights = []
     for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
         w = bw * venue_mult(ph, upcoming_is_home, venue_s)
@@ -1125,7 +1146,8 @@ def evaluate_calibration(per_prop_obs, prop_key, label, shrinkage_k=15):
 
 def build_real_line_obs(enriched, params, sport_key, prop_key,
                         team_defense=None, league_avg_def=None,
-                        xstats_strength=0.0, xba_index=None):
+                        xstats_strength=0.0, xba_index=None,
+                        defense_by_season=None):
     """Project every joined observation for one prop at its REAL book line.
 
     Returns a list of row dicts {player, projected, line, actual,
@@ -1139,7 +1161,8 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
             continue
         projected, emp = project_and_empirical(
             obs, params, sport_key, team_defense, league_avg_def,
-            xstats_strength=xstats_strength, xba_index=xba_index)
+            xstats_strength=xstats_strength, xba_index=xba_index,
+            defense_by_season=defense_by_season)
         if projected is None:
             continue
         rows.append({
