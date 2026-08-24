@@ -3045,11 +3045,15 @@ if analyze_clicked and selected_game_labels:
 
     progress.progress(80, text="Analyzing odds against statistics history...")
 
-    # ── Phase 3: Run analysis (CPU-only, fast) ──
-    for event in selected_events:
+    # ── Phase 3: per-game data build + analysis, PARALLELIZED across games ──
+    def _analyze_one_event(event):
         eid = event["id"]
         home = event["home_team"]
         away = event["away_team"]
+        # Local result lists — the worker NEVER mutates the shared all_* lists or
+        # `warnings` (that would race across threads); it returns its candidates and
+        # the main thread merges them in slate order below.
+        ml, spreads, totals, props, warns = [], [], [], [], []
 
         # Phase 1–3 (MLB): probable-starter / opponent / bullpen matchup
         # features, built once per game and shared by team markets AND props.
@@ -3071,19 +3075,19 @@ if analyze_clicked and selected_game_labels:
                 matchup_features = mlb_starters.build_matchup_features(
                     home, away, game_date, int(game_date[:4]))
             except Exception as e:
-                warnings.append(f"Starter features unavailable for {away} @ {home}: {e}")
+                warns.append(f"Starter features unavailable for {away} @ {home}: {e}")
             try:
                 confirmed_lineup = mlb_starters.get_confirmed_lineup(
                     home, away, game_date)
             except Exception as e:
-                warnings.append(f"Lineup data unavailable for {away} @ {home}: {e}")
+                warns.append(f"Lineup data unavailable for {away} @ {home}: {e}")
             # §2.5A: announced probable starters (available days ahead) gate
             # pitcher props all day; confirmed_lineup gates batter props once
             # posted. Both feed mlb_starters.player_start_status below.
             try:
                 probable_starters = mlb_starters.get_probable_starters(game_date)
             except Exception as e:
-                warnings.append(f"Probable starters unavailable for {away} @ {home}: {e}")
+                warns.append(f"Probable starters unavailable for {away} @ {home}: {e}")
         elif sport["key"] == "americanfootball_nfl":
             # NFL EPA edge (net EPA/play, season-to-date) — feeds ML + spreads
             # via the same generic starter_edge margin hook. Degrades to None.
@@ -3096,7 +3100,7 @@ if analyze_clicked and selected_game_labels:
                 matchup_features = nfl_epa.build_matchup_features(
                     home, away, game_date, season, team_ratings=ratings)
             except Exception as e:
-                warnings.append(f"EPA features unavailable for {away} @ {home}: {e}")
+                warns.append(f"EPA features unavailable for {away} @ {home}: {e}")
 
         # Team market analysis
         if eid in odds_results:
@@ -3175,11 +3179,11 @@ if analyze_clicked and selected_game_labels:
                     return cands
 
                 if "h2h" in market_keys:
-                    all_ml.extend(_tag_event(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "h2h"))
+                    ml.extend(_tag_event(analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "h2h"))
                 if "spreads" in market_keys:
-                    all_spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "spreads"))
+                    spreads.extend(_tag_event(analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "spreads"))
                 if "totals" in market_keys:
-                    all_totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "totals"))
+                    totals.extend(_tag_event(analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport["key"], matchup_features=matchup_features), "totals"))
 
         # Player props analysis
         if eid in parsed_props:
@@ -3226,7 +3230,34 @@ if analyze_clicked and selected_game_labels:
                                                   probable_starters=probable_starters)
             for c in new_props:
                 c["event_id"] = eid
-            all_props.extend(new_props)
+            props.extend(new_props)
+
+        return {"ml": ml, "spreads": spreads, "totals": totals,
+                "props": props, "warns": warns}
+
+    # Build + analyze every game CONCURRENTLY (each game is independent; the heavy
+    # per-game cost is blocking Azure SQL / StatsAPI round-trips). Mirrors the
+    # backtest's 16-worker matchup-feature prewarm. Workers return their candidates;
+    # the main thread merges them in slate order — deterministic, no shared-list races.
+    _event_results = {}
+    with ThreadPoolExecutor(max_workers=16) as _pool:
+        _futs = {_pool.submit(_analyze_one_event, ev): ev["id"]
+                 for ev in selected_events}
+        for _f in as_completed(_futs):
+            _eid = _futs[_f]
+            try:
+                _event_results[_eid] = _f.result()
+            except Exception as e:
+                warnings.append(f"Analysis failed for event {_eid}: {e}")
+    for event in selected_events:
+        _r = _event_results.get(event["id"])
+        if not _r:
+            continue
+        all_ml.extend(_r["ml"])
+        all_spreads.extend(_r["spreads"])
+        all_totals.extend(_r["totals"])
+        all_props.extend(_r["props"])
+        warnings.extend(_r["warns"])
 
     # ── Safe-mode confidence filter for spreads / totals ──
     # Apply the alt-lines confidence (rounded to nearest 10%) to team-level
