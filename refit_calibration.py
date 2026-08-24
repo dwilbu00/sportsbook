@@ -50,6 +50,23 @@ def _defense_lookup(espn_sport, espn_league, season_year=None):
     return _team_defense_lookup(espn_sport, espn_league, season_year=season_year)
 
 
+def _defense_by_season(espn_sport, espn_league, enriched):
+    """Per-season pooled opponent-defense map {year-str: (avg_lookup, league_avg)}
+    for the obs seasons, so each obs re-weights against its OWN season only (no
+    cross-season/future leak). Mirrors the season-scoped synthetic sweep. {} if no
+    dated obs."""
+    seasons = sorted({(o.get("game_date") or "")[:4] for o in enriched
+                      if isinstance(o, dict) and o.get("game_date")})
+    out = {}
+    for yr in seasons:
+        try:
+            avg, _, lg = _defense_lookup(espn_sport, espn_league, season_year=int(yr))
+            out[yr] = (avg, lg)
+        except Exception:
+            out[yr] = ({}, None)
+    return out
+
+
 # A non-empirical method (B pooled-Gaussian / C pooled-ECDF) must beat the
 # empirical baseline (method A) by at least this much holdout Brier AND confirm
 # out-of-sample in two expanding chronological folds before it can be selected.
@@ -1042,14 +1059,7 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                            if isinstance(o, dict) and o.get("game_date")})
         print(f"  Building per-season team-defense lookups (a variant uses "
               f"opp_defense; seasons: {', '.join(_seasons) or 'none'})...")
-        defense_by_season = {}
-        for _yr in _seasons:
-            try:
-                _avg, _, _lg = _defense_lookup(
-                    espn_sport, espn_league, season_year=int(_yr))
-                defense_by_season[_yr] = (_avg, _lg)
-            except Exception:
-                defense_by_season[_yr] = ({}, None)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     # ── P2.4a: leakage-safe as-of xBA index for the projection blend ──
     # Built once from the raw Statcast day cache spanning the obs seasons. Only
@@ -1349,11 +1359,11 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
         print("  No batter_hits observations joined to actuals.")
         return
 
-    # Weight-side opp-defense lookup only if the shipped variant uses it.
-    team_defense, league_avg_def = {}, None
+    # Weight-side opp-defense lookup only if the shipped variant uses it. PER SEASON
+    # (leakage guard): each obs re-weights against its OWN season's pooled defense.
+    defense_by_season = None
     if (cfg.get("opp_defense_strength") or 0.0) > 0:
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     # Leakage-safe as-of xBA + contact-quality indices from the raw pitch cache.
     import savant_history as sh
@@ -1388,20 +1398,20 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
     rows = []
     for obs in enriched:
         projected, emp = blc.project_and_empirical(
-            obs, params, sport_key, team_defense, league_avg_def)
+            obs, params, sport_key, defense_by_season=defense_by_season)
         if projected is None or emp is None:
             continue
         base = blc.project_distributional(
-            obs, params, sport_key, team_defense, league_avg_def,
-            xstats_strength=0.0)
+            obs, params, sport_key, xstats_strength=0.0,
+            defense_by_season=defense_by_season)
         if base is None:             # no usable AB -> exclude from all variants
             continue
         pv = {}
         for name, kw in D_VARIANTS:
             strength = 0.0 if "empirical" in name else S
             p = blc.project_distributional(
-                obs, params, sport_key, team_defense, league_avg_def,
-                xstats_strength=strength, **kw)
+                obs, params, sport_key, xstats_strength=strength,
+                defense_by_season=defense_by_season, **kw)
             pv[name] = p if p is not None else base   # fall back to empirical
         rows.append({
             "obs": obs, "game_date": obs["game_date"], "line": obs["line"],
@@ -1481,8 +1491,8 @@ def diagnose_distributional(sport, store_label="", xstats_strength=0.5):
         se_all = se_05 = 0.0
         for r in test:
             p = blc.project_distributional(
-                r["obs"], params, sport_key, team_defense, league_avg_def,
-                xstats_strength=0.0, home_ab_delta=-d)
+                r["obs"], params, sport_key, xstats_strength=0.0,
+                home_ab_delta=-d, defense_by_season=defense_by_season)
             if p is None:
                 p = r["m"]["D dist: empirical"]
             e = (p - r["o"]) ** 2
@@ -1558,11 +1568,11 @@ def diagnose_negbin(sport, store_label=""):
 
     # Weight-side opponent-defense lookup only if some eligible prop's variant uses
     # it (mirrors refit_sport_real_lines' gating so the projection basis matches).
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     from props import PROP_XSTATS_KIND
     for prop_key in sorted(props_to_check):
@@ -1586,8 +1596,9 @@ def diagnose_negbin(sport, store_label=""):
         # the like-for-like basis for A/B/C/E (the xba_shipped caveat below flags
         # when the incumbent's live basis differs).
         rows = blc.build_real_line_obs(
-            enriched, params, sport_key, prop_key, team_defense, league_avg_def,
-            xstats_strength=0.0, xba_index=None)
+            enriched, params, sport_key, prop_key,
+            xstats_strength=0.0, xba_index=None,
+            defense_by_season=defense_by_season)
         sel = blc.select_method_at_real_lines(rows, negbin_eligible=True,
                                               roi_tiebreak=False)
         n_usable = len([r for r in rows if r["actual"] != r["line"]])
@@ -1682,11 +1693,11 @@ def diagnose_center(sport, prop_filter=None, store_label=""):
         print("  No observations joined to actuals; nothing to diagnose.")
         return
 
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     for prop_key in props_to_check:
         cfg = existing[prop_key]
@@ -1708,8 +1719,9 @@ def diagnose_center(sport, prop_filter=None, store_label=""):
         for center in ("mean", "median"):
             params = dict(base_params, center=center)
             rows = blc.build_real_line_obs(
-                enriched, params, sport_key, prop_key, team_defense,
-                league_avg_def, xstats_strength=0.0, xba_index=None)
+                enriched, params, sport_key, prop_key,
+                xstats_strength=0.0, xba_index=None,
+                defense_by_season=defense_by_season)
             sels[center] = (rows, blc.select_method_at_real_lines(
                 rows, negbin_eligible=elig, roi_tiebreak=False))
 
@@ -1819,7 +1831,8 @@ def _roi_sim_method(rows, prob_of, threshold):
 
 
 def _roi_build_rows(enriched, params, sport_key, prop_key,
-                    team_defense=None, league_avg_def=None):
+                    team_defense=None, league_avg_def=None,
+                    defense_by_season=None):
     """Per-prop rows for the ROI sim: the leakage-safe as-of point projection +
     method-A empirical over-rate (blc.project_and_empirical), BOTH american book
     prices, and the de-vigged consensus ``mkt_over`` + decimal payouts. A prop-
@@ -1835,7 +1848,8 @@ def _roi_build_rows(enriched, params, sport_key, prop_key,
         if obs.get("prop_key") != prop_key:
             continue
         projected, emp = blc.project_and_empirical(
-            obs, params, sport_key, team_defense, league_avg_def)
+            obs, params, sport_key, team_defense, league_avg_def,
+            defense_by_season=defense_by_season)
         if projected is None or emp is None:
             continue
         op = _cc_num_or_none(obs.get("over_price"))
@@ -1904,12 +1918,12 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
         return
 
     # Weight-side opp-defense lookup only if some prop's variant uses it (mirror
-    # diagnose_negbin so the projection basis matches the shipped fit).
-    team_defense, league_avg_def = {}, None
+    # diagnose_negbin so the projection basis matches the shipped fit). PER SEASON
+    # (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     # Leakage-safe as-of xBA index for method D, only if requested (mirror
     # diagnose_distributional). Default 0.0 keeps the diag free (no Statcast pull).
@@ -1941,7 +1955,7 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
             "use_minutes": cfg.get("use_minutes", False),
         }
         rows = _roi_build_rows(enriched, params, sport_key, prop_key,
-                               team_defense, league_avg_def)
+                               defense_by_season=defense_by_season)
         rows = [r for r in rows if r["actual"] != r["line"]]     # drop pushes
         if len(rows) < 40:
             print(f"\n  {prop_key}: only {len(rows)} usable obs (<40) — too thin.")
@@ -1970,8 +1984,9 @@ def diagnose_roi(sport, store_label="", threshold_pct=5.0, xstats_strength=0.0):
             }
             if prop_key == "batter_hits":
                 p_d = blc.project_distributional(
-                    r["obs"], params, sport_key, team_defense, league_avg_def,
-                    xstats_strength=xstats_strength, xba_index=xba_index)
+                    r["obs"], params, sport_key,
+                    xstats_strength=xstats_strength, xba_index=xba_index,
+                    defense_by_season=defense_by_season)
                 if p_d is not None:
                     m["D"] = p_d
             if nb is not None:
@@ -2097,10 +2112,11 @@ def diagnose_consensus(sport, store_label="", xstats_strength=0.5, threshold_pct
         print("  No observations joined to actuals; nothing to diagnose.")
         return
 
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     xba_index = None
     if xstats_strength > 0:
@@ -2135,7 +2151,7 @@ def diagnose_consensus(sport, store_label="", xstats_strength=0.5, threshold_pct
             "use_minutes": cfg.get("use_minutes", False),
         }
         rows = _roi_build_rows(enriched, params, sport_key, prop_key,
-                               team_defense, league_avg_def)
+                               defense_by_season=defense_by_season)
         rows = [r for r in rows if r["actual"] != r["line"]]
         if len(rows) < 40:
             print(f"\n  {prop_key}: only {len(rows)} usable obs (<40) — too thin.")
@@ -2160,8 +2176,9 @@ def diagnose_consensus(sport, store_label="", xstats_strength=0.5, threshold_pct
             }
             if prop_key == "batter_hits" and xba_index is not None:
                 p_d = blc.project_distributional(
-                    r["obs"], params, sport_key, team_defense, league_avg_def,
-                    xstats_strength=xstats_strength, xba_index=xba_index)
+                    r["obs"], params, sport_key,
+                    xstats_strength=xstats_strength, xba_index=xba_index,
+                    defense_by_season=defense_by_season)
                 if p_d is not None:
                     m["D"] = p_d
             if nb is not None:
@@ -2262,10 +2279,11 @@ def diagnose_gate(sport, store_label=""):
         print("  No observations joined to actuals; nothing to diagnose.")
         return
 
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     slate = []            # all props' TEST rows carrying r['p_ship']
     per_prop_rows = {}     # prop_key -> its TEST rows (for the per-prop breakdown)
@@ -2279,7 +2297,7 @@ def diagnose_gate(sport, store_label=""):
             "use_minutes": cfg.get("use_minutes", False),
         }
         rows = _roi_build_rows(enriched, params, sport_key, prop_key,
-                               team_defense, league_avg_def)
+                               defense_by_season=defense_by_season)
         rows = [r for r in rows if r["actual"] != r["line"]]
         if len(rows) < 40:
             continue
@@ -2362,7 +2380,8 @@ def diagnose_gate(sport, store_label=""):
 # feature is injected via params['features'] and threaded into the projection by
 # prop_features.strengths_from_params, so strength 0 == production bit-for-bit.
 def _roi_by_method(enriched, params, sport_key, prop_key, elig,
-                   team_defense, league_avg_def, threshold):
+                   team_defense, league_avg_def, threshold,
+                   defense_by_season=None):
     """Consensus-priced ROI per method (A/B/C/E) for one prop under ``params``.
 
     Mirrors diagnose_roi's fit + per-row-P(over) block (chronological 50/50
@@ -2373,7 +2392,8 @@ def _roi_by_method(enriched, params, sport_key, prop_key, elig,
     runs plain + free). Returns {} when too thin to price (<40 usable)."""
     import book_line_calibration as blc
     rows = _roi_build_rows(enriched, params, sport_key, prop_key,
-                           team_defense, league_avg_def)
+                           team_defense, league_avg_def,
+                           defense_by_season=defense_by_season)
     rows = [r for r in rows if r["actual"] != r["line"]]     # drop pushes
     if len(rows) < 40:
         return {}
@@ -2467,11 +2487,11 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label="",
         print("  No observations joined to actuals; nothing to diagnose.")
         return
 
-    team_defense, league_avg_def = {}, None
+    # PER SEASON (leakage guard): each obs re-weights against its OWN season.
+    defense_by_season = None
     if any((existing[pk].get("opp_defense_strength") or 0.0) > 0
            for pk in props_to_check):
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
 
     threshold = 0.05   # edge threshold for the ROI sim (matches diagnose_roi)
     for prop_key in props_to_check:
@@ -2498,14 +2518,15 @@ def diagnose_features(sport, feature=None, prop_filter=None, store_label="",
             for s in strengths:
                 params = dict(base_params, features={f["name"]: s})
                 rows = blc.build_real_line_obs(
-                    enriched, params, sport_key, prop_key, team_defense,
-                    league_avg_def, xstats_strength=0.0, xba_index=None)
+                    enriched, params, sport_key, prop_key,
+                    xstats_strength=0.0, xba_index=None,
+                    defense_by_season=defense_by_season)
                 rows_by_s[s] = rows        # stash for the per-line-bucket pass below
                 sels[s] = blc.select_method_at_real_lines(
                     rows, negbin_eligible=elig, roi_tiebreak=False)
                 rois[s] = _roi_by_method(enriched, params, sport_key, prop_key,
-                                         elig, team_defense, league_avg_def,
-                                         threshold)
+                                         elig, None, None, threshold,
+                                         defense_by_season=defense_by_season)
             # n_usable is strength-invariant (pushes = actual==raw line), so all
             # strengths return None together when too thin.
             if sels[off] is None:
@@ -2785,11 +2806,11 @@ def _cc_load_scored_rows(sport, store_label=""):
         print("  No batter_hits observations joined to actuals.")
         return sport_key, cfg, None
 
-    # Weight-side opp-defense lookup only if the shipped variant uses it.
-    team_defense, league_avg_def = {}, None
+    # Weight-side opp-defense lookup only if the shipped variant uses it. PER SEASON
+    # (leakage guard): each obs re-weights against its OWN season's pooled defense.
+    defense_by_season = None
     if (cfg.get("opp_defense_strength") or 0.0) > 0:
-        team_defense, _, league_avg_def = _defense_lookup(
-            espn_sport, espn_league)
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
     params = {
         "half_life": cfg.get("half_life"),
         "venue_strength": cfg.get("venue_strength", 0.0),
@@ -2800,7 +2821,7 @@ def _cc_load_scored_rows(sport, store_label=""):
     rows = []
     for obs in enriched:
         projected, emp = blc.project_and_empirical(
-            obs, params, sport_key, team_defense, league_avg_def)
+            obs, params, sport_key, defense_by_season=defense_by_season)
         if projected is None or emp is None:
             continue
         op = _cc_num_or_none(obs.get("over_price"))
