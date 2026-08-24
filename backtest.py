@@ -1849,6 +1849,9 @@ def _print_odds_results(results):
         named = [(market, results[variant][market]["blend"]) for market in MARKETS]
         _print_reliability(
             f"Model calibration by confidence  (variant '{variant}')", named)
+        # ROI by market-confidence band (un-shrunk headline gate) — the team analog
+        # of the props test: is the edge in the uncertain middle vs efficient extremes?
+        _print_confidence_bands(results[variant])
 
 
 def _write_blend_calibration(sport_key, results, shrink_map=None, min_n=0,
