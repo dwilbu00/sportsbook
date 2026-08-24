@@ -2188,6 +2188,124 @@ def _write_market_prior_calibration(sport_key, results):
     print(f"  [write-calibration] Wrote market_prior_k for: {chosen}")
 
 
+def run_prop_lag_backtest(sport, espn_sport, espn_league, sport_key,
+                          props=("batter_hits", "batter_total_bases"),
+                          stale_thr=0.03, min_prior=5):
+    """SLOW-PROP-LAG coherence probe. When the GAME total moves early->close (the game
+    state shifts) but a batter's prop did NOT follow (|Δprop| small = STALE), bet the
+    prop toward the total's move — at the CLOSE price. Within-player DELTAS control for
+    batter quality (movements, not levels). Realizable at close (both snapshots seen).
+    Reports ROI bucketed by game-move size |Δtotal| for STALE props vs a MOVED-prop
+    control: edge = stale props +ROI at big |Δtotal| while moved props aren't."""
+    import warehouse as _wh
+    import mlb_starters
+    import mlb_warehouse
+    pe = _wh.load_prop_market_store(sport_key, snapshot="early").get("games", {})
+    pc = _wh.load_prop_market_store(sport_key, snapshot="close").get("games", {})
+    te = _wh.load_team_market_store(sport_key, snapshot="early").get("games", {})
+    tc = _wh.load_team_market_store(sport_key, snapshot="close").get("games", {})
+    print("\n=== SLOW-PROP-LAG: game-total move (early->close) vs stale batter props ===")
+    if not (pe and pc and te and tc):
+        print("  need early+close for BOTH props and team markets.")
+        return
+
+    def _tot(entry):
+        t = _total_market(entry)
+        return t[0] if t else None
+    dtotal = {}
+    for gk in set(te) & set(tc):
+        et, ct = _tot(te[gk]), _tot(tc[gk])
+        if et is not None and ct is not None:
+            dtotal[gk] = ct - et
+
+    yrs = sorted({str(g.get("commence_time"))[:4] for g in pc.values()
+                  if g.get("commence_time")})
+    gl_index = {}
+    for y in yrs:
+        try:
+            for pid, logs in (mlb_warehouse.get_calib_gamelogs_bulk(
+                    "batter", int(y)) or {}).items():
+                gl_index.setdefault(pid, []).extend(logs)
+        except Exception:
+            pass
+    _rid = {}
+
+    def _actual(player, prop, d10):
+        if player not in _rid:
+            r = mlb_starters.resolve_mlbam_id(
+                player, mlb_warehouse._current_season(), prop_key=prop)
+            _rid[player] = str(r[0]) if r else ""
+        rid = _rid[player]
+        gl = gl_index.get(rid) or []
+        if not (rid and gl):
+            return None
+        label = _stat_label_for(prop, gl)
+        if not label:
+            return None
+        for g in gl:
+            gd = g.get("game_date")
+            if (gd and gd[:10] == d10 and g.get(label) is not None
+                    and g.get("completed") is not False):
+                return float(g[label])
+        return None
+
+    obs = []   # (Δtotal, Δprop, over_dec, under_dec, over_outcome)
+    for gk, gce in pc.items():
+        if gk not in pe or gk not in dtotal:
+            continue
+        dtot = dtotal[gk]
+        d10 = str(gce.get("commence_time"))[:10]
+        em = pe[gk].get("props") or {}
+        for prop in props:
+            cm = (gce.get("props") or {}).get(prop) or {}
+            pem = em.get(prop) or {}
+            for player, ci in cm.items():
+                ei = pem.get(player)
+                if not ei:
+                    continue
+                if (ci.get("over_implied") is None or ci.get("under_implied") is None
+                        or ei.get("over_implied") is None
+                        or ei.get("under_implied") is None
+                        or ci.get("line") is None or ci.get("over_price") is None
+                        or ci.get("under_price") is None):
+                    continue
+                co = devig_two_way(ci["over_implied"], ci["under_implied"])[0]
+                eo = devig_two_way(ei["over_implied"], ei["under_implied"])[0]
+                actual = _actual(player, prop, d10)
+                if actual is None or abs(actual - ci["line"]) < 1e-9:
+                    continue
+                obs.append((dtot, co - eo,
+                            american_to_decimal(ci["over_price"]),
+                            american_to_decimal(ci["under_price"]),
+                            1 if actual > ci["line"] else 0))
+
+    if len(obs) < 200:
+        print(f"  only {len(obs)} paired early/close prop obs — too few.")
+        return
+    print(f"  {len(obs)} paired obs; STALE = |Δprop|<={stale_thr}. Bet toward the total "
+          "move (total up -> over) at the close price.")
+    print(f"  {'|Δtotal|>=':>9} {'group':>6} {'bets':>6} {'win%':>6} {'ROI%':>8} "
+          f"{'P/L(u)':>9}")
+    for thr in (0.5, 1.0, 1.5):
+        for grp, cond in (("stale", lambda dp: abs(dp) <= stale_thr),
+                          ("moved", lambda dp: abs(dp) > stale_thr)):
+            sel = []
+            for dtot, dprop, do, du, o in obs:
+                if abs(dtot) < thr or dtot == 0 or not cond(dprop):
+                    continue
+                sel.append((do, o == 1) if dtot > 0 else (du, o == 0))
+            if not sel:
+                print(f"  {thr:>9.1f} {grp:>6} {0:>6}")
+                continue
+            n = len(sel)
+            wins = sum(1 for _, w in sel if w)
+            pl = sum((dec - 1.0) if w else -1.0 for dec, w in sel)
+            print(f"  {thr:>9.1f} {grp:>6} {n:>6} {100.0 * wins / n:>6.1f} "
+                  f"{100.0 * pl / n:>8.2f} {pl:>9.2f}")
+    print("  edge = STALE props +ROI at big |Δtotal| while MOVED props aren't "
+          "(the lag is real + exploitable). Both flat/negative = no lag edge.")
+
+
 def run_coherence_backtest(sport_key, espn_sport, espn_league, season_year=None,
                            store_label="", source="auto", snapshot="close",
                            limit=100000, train_frac=0.6):
@@ -6378,7 +6496,8 @@ def pythag_residual_sweep(sport_key, espn_sport, espn_league, season_year=None,
 def main():
     p = argparse.ArgumentParser(description="Backtest the sportsbook projection model")
     p.add_argument("--mode",
-                   choices=["matchup", "props", "odds", "props-odds", "coherence"],
+                   choices=["matchup", "props", "odds", "props-odds", "coherence",
+                            "prop-lag"],
                    default="matchup",
                    help="matchup = team-level projections; props = player-prop "
                         "projections; odds = grade team markets vs stored closing "
@@ -6850,6 +6969,11 @@ def main():
                          else args.season),
             store_label=args.store_label, source=args.source,
             snapshot=args.snapshot, limit=args.limit)
+    elif args.mode == "prop-lag":
+        _props = ([x.strip() for x in args.props.split(",") if x.strip()]
+                  if args.props else ("batter_hits", "batter_total_bases"))
+        run_prop_lag_backtest(args.sport, espn_sport, espn_league, sport_key,
+                              props=_props, min_prior=args.min_sample)
     elif args.mode == "matchup":
         run_backtest(sport_key, espn_sport, espn_league,
                      limit=args.limit, window=args.window, variants=variants,
