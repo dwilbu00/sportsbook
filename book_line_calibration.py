@@ -280,7 +280,11 @@ def harvest_real_line_book_lines(sport_key, target_props, label=""):
         except Exception:
             use_warehouse = False
     if use_warehouse:
-        primary = [r for r in warehouse.load_prop_lines(sport_key)
+        # Pass the target props so the warehouse read filters in SQL (a single-prop
+        # diagnostic then transfers ~1/7 the rows). The Python filter stays as a
+        # belt-and-suspenders on the assembled output.
+        primary = [r for r in warehouse.load_prop_lines(
+                       sport_key, prop_keys=(list(target) or None))
                    if r.get("prop_key") in target]
     else:
         primary = harvest_book_lines_from_store(sport_key, target_props, label)

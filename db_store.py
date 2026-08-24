@@ -1421,7 +1421,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
 
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
-                      exclude_early=False, max_retries=3):
+                      exclude_early=False, prop_keys=None, max_retries=3):
     """Bulk-read warehoused player-prop lines for a sport, joining each odds_line
     to its parent odds_snapshot.
 
@@ -1462,6 +1462,10 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
         # keep closes (+ any untagged/legacy); drop the explicit early snapshots.
         stmt = stmt.where(odds_snapshot.c.source.is_(None)
                           | (odds_snapshot.c.source != "backfill_early"))
+    if prop_keys:
+        # filter to the requested prop markets IN SQL so a single-prop caller
+        # doesn't transfer/materialize all seven props' lines.
+        stmt = stmt.where(odds_line.c.prop_key.in_(list(prop_keys)))
     if dates:
         stmt = stmt.where(odds_snapshot.c.game_date.in_(list(dates)))
     else:

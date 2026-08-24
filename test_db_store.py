@@ -1113,6 +1113,20 @@ class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
              db_store.player_prop_lines("baseball_mlb", exclude_early=True)},
             {"ec"})                                              # early dropped
 
+    def test_prop_keys_filters_in_sql(self):
+        # two props in one snapshot; the prop_keys filter returns only the asked-for
+        # one (so a single-prop read doesn't transfer every prop's lines).
+        lines = (self._prop_lines(-110, -110, prop_key="batter_hits")
+                 + self._prop_lines(-105, -115, prop_key="batter_rbis"))
+        db_store.capture_odds_snapshot(self._meta("20260722T18Z"), lines)
+        self.assertEqual(
+            {r["prop_key"] for r in db_store.player_prop_lines("baseball_mlb")},
+            {"batter_hits", "batter_rbis"})
+        self.assertEqual(
+            {r["prop_key"] for r in db_store.player_prop_lines(
+                "baseball_mlb", prop_keys=["batter_hits"])},
+            {"batter_hits"})
+
     def test_load_prop_lines_chunks_seasons_and_excludes_early(self):
         import warehouse
         # a 2024 close + early for one event: load_prop_lines chunks by season and

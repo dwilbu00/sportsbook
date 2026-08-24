@@ -1004,7 +1004,7 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     } for (player, prop_key), e in combined.items()]
 
 
-def load_prop_lines(sport_key, dates=None):
+def load_prop_lines(sport_key, dates=None, prop_keys=None):
     """Assemble player-prop closing-line rows from the SQL warehouse for the
     offline real-line calibration refit.
 
@@ -1014,43 +1014,51 @@ def load_prop_lines(sport_key, dates=None):
      player, prop_key, line, over_price, under_price} — one CLOSING line per
     (event, player, prop_key). ``game_date`` is the US-Eastern calendar date
     (UTC at rest, ET on read; see pricing_common.et_local_date). SQL-only and
-    best-effort: returns [] when SQL is off or on any error."""
+    best-effort: returns [] when SQL is off or on any error.
+
+    ``prop_keys`` (optional) filters the read to those prop markets IN SQL so a
+    single-prop caller (e.g. the distributional diagnostic) doesn't transfer all
+    seven props' lines.
+
+    SCALE: the full prop table is ~1.5M rows; a single unscoped read times out the
+    Azure round-trip AND materializes multiple GB. So this reads the CLOSING set
+    (exclude_early) ONE SEASON AT A TIME and ASSEMBLES each season immediately —
+    peak memory is one season's raw rows, not the whole table."""
     _ensure_durable("read the player-prop warehouse")
     if not _sql():
-        return []
-    try:
-        if dates:
-            rows = _db.player_prop_lines(sport_key, dates=dates, exclude_early=True)
-        else:
-            # SCALE: the full prop table is ~1.5M rows and a single unscoped read
-            # times out the Azure round-trip. Read the CLOSING set (exclude_early)
-            # ONE SEASON AT A TIME so each query stays small; concatenate. Empty
-            # years return fast (indexed sport+game_date scan finds nothing).
-            import datetime as _dt
-            rows = []
-            for _yr in range(2019, _dt.date.today().year + 2):
-                rows.extend(_db.player_prop_lines(
-                    sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
-                    exclude_early=True))
-    except Exception as e:
-        _ops.ops_event("database_failure", op="player_prop_lines",
-                       sport=sport_key, error=type(e).__name__)
-        return []
-    if not rows:
         return []
     try:
         from pricing_common import et_local_date
     except Exception:
         def et_local_date(c):
             return (str(c)[:10] if c else None)
-    by_event = {}
-    for r in rows:
-        by_event.setdefault(r.get("event_id"), []).append(r)
+
     out = []
-    for event_id, ev_rows in by_event.items():
-        for row in _assemble_prop_entries(event_id, ev_rows, sport_key):
-            row["game_date"] = et_local_date(row.get("commence_time"))
-            out.append(row)
+
+    def _assemble(rows):
+        by_event = {}
+        for r in rows:
+            by_event.setdefault(r.get("event_id"), []).append(r)
+        for event_id, ev_rows in by_event.items():
+            for row in _assemble_prop_entries(event_id, ev_rows, sport_key):
+                row["game_date"] = et_local_date(row.get("commence_time"))
+                out.append(row)
+
+    try:
+        if dates:
+            _assemble(_db.player_prop_lines(
+                sport_key, dates=dates, exclude_early=True, prop_keys=prop_keys))
+        else:
+            # Empty years return fast (indexed sport+game_date scan finds nothing).
+            import datetime as _dt
+            for _yr in range(2019, _dt.date.today().year + 2):
+                _assemble(_db.player_prop_lines(
+                    sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
+                    exclude_early=True, prop_keys=prop_keys))
+    except Exception as e:
+        _ops.ops_event("database_failure", op="player_prop_lines",
+                       sport=sport_key, error=type(e).__name__)
+        return []
     return out
 
 
