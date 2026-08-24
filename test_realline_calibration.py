@@ -599,6 +599,34 @@ class JoinToActualsTests(unittest.TestCase):
         self.assertEqual(out[0]["stat_label"], "H")
         self.assertGreaterEqual(len(out[0]["prior_games"]), 10)
 
+    def test_join_grades_each_obs_against_its_own_season(self):
+        # THE fix: a player with book lines in multiple seasons is graded against
+        # EACH season's gamelog (previously the join was current-season-only and
+        # silently dropped every prior-season book line). One fetch per season;
+        # each obs graded off its own season's actuals.
+        logs = {
+            2024: self._gamelog([(f"2024-07-{d:02d}", 1) for d in range(12, 24)]
+                                + [("2024-07-24", 2)]),
+            2025: self._gamelog([(f"2025-07-{d:02d}", 1) for d in range(12, 24)]
+                                + [("2025-07-24", 3)]),
+        }
+        seasons_seen = []
+
+        def fake(mlb_id, role, season=None, **kw):
+            seasons_seen.append(season)
+            return logs.get(season, [])
+
+        rows = [self._book_row(gd="2024-07-24"), self._book_row(gd="2025-07-24")]
+        with patch("mlb_warehouse.get_calib_gamelog", side_effect=fake):
+            out = blc.join_book_lines_to_actuals(rows, "baseball", "mlb")
+        self.assertEqual(sorted(seasons_seen), [2024, 2025])   # per-season fetch
+        self.assertEqual(sorted(o["actual"] for o in out), [2.0, 3.0])  # both graded
+        # each obs's prior_games are drawn only from its OWN season (no leakage)
+        for o in out:
+            yr = o["game_date"][:4]
+            self.assertTrue(all(g["game_date"].startswith(yr)
+                                for g in o["prior_games"]))
+
     def test_join_skips_doubleheader_date(self):
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
                            + [("2026-07-24", 2), ("2026-07-24", 0)])
@@ -1032,14 +1060,15 @@ class CalibWarehouseCutoverTests(unittest.TestCase):
 
     def test_flag_on_uses_warehouse(self):
         wh, esp = self._run("1")
-        wh.assert_called_once_with("592450", "batter")
+        # season-aware join: the fetch carries the obs's season (game_date year).
+        wh.assert_called_once_with("592450", "batter", season=2024)
         esp.assert_not_called()
 
     def test_baseball_warehouse_only_ignores_flag(self):
         # P6 cutover: MLB calibration is warehouse-only regardless of the (now
         # retired) flag — it never falls open to ESPN.
         wh, esp = self._run("")           # flag OFF
-        wh.assert_called_once_with("592450", "batter")
+        wh.assert_called_once_with("592450", "batter", season=2024)
         esp.assert_not_called()
 
 

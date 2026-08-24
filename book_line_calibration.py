@@ -359,50 +359,162 @@ def _calib_role(rows):
     return "pitcher" if pitcher > (len(rows) - pitcher) else "batter"
 
 
+def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
+                           counters):
+    """Grade one player-SEASON gamelog (ESPN cached_gamelog shape) against its
+    book-line ``rows``, appending matched obs to ``enriched`` and accumulating
+    ``counters['no_game']``. Extracted so the MLB warehouse path can grade each
+    obs against ITS OWN season's gamelog while the non-baseball path keeps its
+    single-gamelog behavior."""
+    gamelog = sorted(gamelog, key=lambda g: g.get("game_date") or "", reverse=True)
+
+    # Build a date → game-index lookup. A date carrying MORE THAN ONE gamelog
+    # entry is a doubleheader: first-wins would mis-bind a book line to the wrong
+    # game's box score, so track those dates and skip them in the match below
+    # (belt-and-suspenders; true doubleheaders are already dropped upstream in
+    # harvest_real_line_book_lines).
+    date_idx = {}
+    date_counts = {}
+    for i, g in enumerate(gamelog):
+        if g.get("completed") is False:
+            continue             # in-progress/partial game: not a gradeable box score
+        d = (g.get("game_date") or "")[:10]
+        if not d:
+            continue
+        date_counts[d] = date_counts.get(d, 0) + 1
+        if d not in date_idx:
+            date_idx[d] = i
+    dup_dates = {d for d, c in date_counts.items() if c > 1}
+
+    for row in rows:
+        # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: an ESPN gamelog's
+        # 'RBI' is uncalibrated and it has no 'TB', so NEVER fit these off an
+        # ESPN-sourced gamelog. (from_warehouse is False only on a non-baseball /
+        # ESPN log; the MLB path is always warehouse post-P6.)
+        if (not from_warehouse and espn_sport == "baseball"
+                and row["prop_key"] in WAREHOUSE_ONLY_PROPS):
+            counters["no_game"] += 1
+            continue
+        # Never grade a pitcher prop off a batter's gamelog (or vice-versa): the
+        # "K"/"SO" strikeout labels collide across MLB roles. A role mismatch
+        # drops just this row; non-MLB props (role None) always pass.
+        if not _role_matches_gamelog(row["prop_key"], gamelog):
+            counters["no_game"] += 1
+            continue
+        stat_label = _stat_label_for(row["prop_key"], gamelog)
+        if not stat_label:
+            continue
+        # game_date is UTC-ish on both sides, so date-only match is usually
+        # accurate. Also try ±1 day for timezone slippage (stays within the
+        # season's gamelog — MLB seasons don't cross a calendar-year boundary).
+        d = row["game_date"]
+        matched_d = d if d in date_idx else None
+        if matched_d is None:
+            from datetime import date as _date, timedelta
+            try:
+                d0 = _date.fromisoformat(d)
+                for delta in (-1, 1):
+                    alt = (d0 + timedelta(days=delta)).isoformat()
+                    if alt in date_idx:
+                        matched_d = alt
+                        break
+            except ValueError:
+                pass
+        if matched_d is None:
+            counters["no_game"] += 1
+            continue
+        if matched_d in dup_dates:       # doubleheader → can't attribute cleanly
+            counters["no_game"] += 1
+            continue
+
+        idx = date_idx[matched_d]
+        test_game = gamelog[idx]
+        actual = test_game.get(stat_label)
+        if actual is None:
+            counters["no_game"] += 1
+            continue
+        if stat_label == "IP":           # pitcher_outs: IP notation -> outs
+            actual = ip_to_outs(actual)
+        min_played = test_game.get("MIN", 0.0) or 0.0
+        if min_played and min_played < 10.0:
+            counters["no_game"] += 1
+            continue
+
+        # Strictly-earlier games in THIS season (gamelog is most-recent-first, so
+        # idx+1: are the prior games) → the as-of feature window. No future/other-
+        # season leakage: only the obs's own season, only games before it.
+        prior_games = gamelog[idx + 1:]
+        if len(prior_games) < 10:
+            counters["no_game"] += 1
+            continue
+
+        enriched.append({
+            **row,
+            "stat_label": stat_label,
+            "actual": float(actual),
+            "test_game": test_game,
+            "prior_games": prior_games,
+        })
+
+
 def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
-    For each book line, resolve the player's athlete_id, pull their gamelog,
-    locate the game on `game_date`, and attach `actual` + `prior_games`.
-    Returns a list of enriched dicts (skipping unjoinable rows).
+    For each book line, resolve the player, pull their gamelog, locate the game on
+    `game_date`, and attach `actual` + `prior_games`. Returns enriched dicts
+    (skipping unjoinable rows).
+
+    MLB (warehouse) path grades each obs against ITS OWN season's gamelog
+    (get_calib_gamelog per season = game_date year), so book lines from ALL
+    backfilled seasons — not just the current one — enter the fit. The join was
+    previously current-season-only, silently dropping every prior-season real
+    book line. Leakage-safe: each obs uses only its own season's actuals +
+    within-season prior_games. NBA/NFL keep the ESPN name→aid→single-gamelog path.
+
+    P6 MLB cutover — WAREHOUSE-ONLY (no ESPN for baseball): a valid MLBAM id is
+    sufficient; a warehouse miss / missing MLBAM id drops the row (never falls
+    open to ESPN).
     """
     # Group by canonical id (falling back to name) so spelling variants of one
-    # player pool into a single gamelog fetch.
+    # player pool together.
     by_player = defaultdict(list)
     for row in book_lines:
         by_player[row.get("player_mlb_id") or row["player"]].append(row)
 
     enriched = []
+    counters = {"no_game": 0}
     skipped_no_player = 0
-    skipped_no_game = 0
 
     for _, rows in by_player.items():
         player = rows[0].get("player")
         mlb_id = rows[0].get("player_mlb_id")
-        # Prefer the book line's authoritative MLBAM id → ESPN athlete_id (name-
-        # independent; handles accents/namesakes), falling back to the name-based
-        # cache lookup for un-enriched / unmapped / non-baseball rows.
-        # P6 MLB calibration cutover — WAREHOUSE-ONLY (no ESPN for baseball):
-        # grade MLB book lines off the StatsAPI facts (get_calib_gamelog); a valid
-        # MLBAM id is sufficient (the facts don't need an ESPN athlete_id), so a row
-        # is NO LONGER dropped for a missing ESPN aid — the old cached_athlete_id
-        # precondition was an ungated ESPN coupling that silently omitted valid-MLBAM
-        # rows from the fit. A warehouse miss / missing MLBAM id drops the row (it
-        # never falls open to ESPN). ODI_MLB_WAREHOUSE_CALIB is now unconditional for
-        # MLB (proven on). NBA/NFL/NHL keep the unchanged ESPN name→aid→gamelog path.
-        gamelog = None
-        from_warehouse = False
         if espn_sport == "baseball":
-            if mlb_id:
+            if not mlb_id:
+                skipped_no_player += len(rows)
+                continue
+            role = _calib_role(rows)
+            # Grade each obs against its OWN season's gamelog (season = game_date
+            # year; MLB season == calendar year). One fetch per (player, season).
+            rows_by_season = defaultdict(list)
+            for r in rows:
+                rows_by_season[(r.get("game_date") or "")[:4]].append(r)
+            for yr, srows in rows_by_season.items():
+                try:
+                    season = int(yr)
+                except (TypeError, ValueError):
+                    skipped_no_player += len(srows)
+                    continue
+                gamelog = None
                 try:
                     import mlb_warehouse
                     gamelog = mlb_warehouse.get_calib_gamelog(
-                        mlb_id, _calib_role(rows)) or None
-                    from_warehouse = gamelog is not None
+                        mlb_id, role, season=season) or None
                 except Exception:
                     gamelog = None
-            if not gamelog:
-                skipped_no_player += len(rows)
-                continue
+                if not gamelog:
+                    skipped_no_player += len(srows)
+                    continue
+                _match_rows_to_gamelog(gamelog, srows, True, espn_sport,
+                                       enriched, counters)
         else:
             aid = cached_athlete_id(espn_sport, espn_league, player)
             if not aid:
@@ -414,104 +526,12 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
             if not gamelog:
                 skipped_no_player += len(rows)
                 continue
-        gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
-
-        # Build a date → game-index lookup. A date carrying MORE THAN ONE gamelog
-        # entry is a doubleheader: first-wins would mis-bind a book line to the
-        # wrong game's box score, so track those dates and skip them in the match
-        # below (belt-and-suspenders; true doubleheaders are already dropped
-        # upstream in harvest_real_line_book_lines).
-        date_idx = {}
-        date_counts = {}
-        for i, g in enumerate(gamelog):
-            if g.get("completed") is False:
-                continue             # in-progress/partial game: not a gradeable box score
-            d = (g.get("game_date") or "")[:10]
-            if not d:
-                continue
-            date_counts[d] = date_counts.get(d, 0) + 1
-            if d not in date_idx:
-                date_idx[d] = i
-        dup_dates = {d for d, c in date_counts.items() if c > 1}
-
-        for row in rows:
-            # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: an ESPN gamelog's
-            # 'RBI' is uncalibrated and it has no 'TB', so NEVER fit these off an
-            # ESPN-sourced gamelog — only the warehouse get_calib_gamelog may serve
-            # them into the calibration corpus. Mirrors espn_client.WAREHOUSE_ONLY_PROPS
-            # + the history/grading guards; MLB-gated so other sports are unaffected.
-            # (from_warehouse is False when the warehouse missed and we fell open to
-            # the ESPN cached_gamelog above.)
-            if (not from_warehouse and espn_sport == "baseball"
-                    and row["prop_key"] in WAREHOUSE_ONLY_PROPS):
-                skipped_no_game += 1
-                continue
-            # Never grade a pitcher prop off a batter's gamelog (or vice-versa):
-            # the "K"/"SO" strikeout labels collide across MLB roles, so
-            # _stat_label_for would bind the wrong role's log (mirrors
-            # backtest._role_matches_gamelog on the main sweep and the
-            # recalibration ESPN-grading guard). A role mismatch drops just this
-            # row; non-MLB props (role None) always pass. Hardening — 0 known
-            # instances given id-based resolution, but cheap insurance against a
-            # namesake / id-map slip pooling a cross-role game into the fit.
-            if not _role_matches_gamelog(row["prop_key"], gamelog):
-                skipped_no_game += 1
-                continue
-            stat_label = _stat_label_for(row["prop_key"], gamelog)
-            if not stat_label:
-                continue
-            # ESPN game_date is UTC-ish; the book commence_time is also UTC,
-            # so date-only match is usually accurate. Also try ±1 day in case
-            # of timezone slippage.
-            d = row["game_date"]
-            matched_d = d if d in date_idx else None
-            if matched_d is None:
-                from datetime import date as _date, timedelta
-                try:
-                    d0 = _date.fromisoformat(d)
-                    for delta in (-1, 1):
-                        alt = (d0 + timedelta(days=delta)).isoformat()
-                        if alt in date_idx:
-                            matched_d = alt
-                            break
-                except ValueError:
-                    pass
-            if matched_d is None:
-                skipped_no_game += 1
-                continue
-            if matched_d in dup_dates:   # doubleheader → can't attribute cleanly
-                skipped_no_game += 1
-                continue
-
-            idx = date_idx[matched_d]
-            test_game = gamelog[idx]
-            actual = test_game.get(stat_label)
-            if actual is None:
-                skipped_no_game += 1
-                continue
-            if stat_label == "IP":       # pitcher_outs: IP notation -> outs
-                actual = ip_to_outs(actual)
-            min_played = test_game.get("MIN", 0.0) or 0.0
-            if min_played and min_played < 10.0:
-                skipped_no_game += 1
-                continue
-
-            prior_games = gamelog[idx + 1:]
-            if len(prior_games) < 10:
-                skipped_no_game += 1
-                continue
-
-            enriched.append({
-                **row,
-                "stat_label": stat_label,
-                "actual": float(actual),
-                "test_game": test_game,
-                "prior_games": prior_games,
-            })
+            _match_rows_to_gamelog(gamelog, rows, False, espn_sport,
+                                   enriched, counters)
 
     print(f"  Matched {len(enriched):,} book lines to actual results "
           f"(one per player-prop-game); dropped {skipped_no_player:,} "
-          f"(player not found) and {skipped_no_game:,} (no matching game/stat).")
+          f"(player not found) and {counters['no_game']:,} (no matching game/stat).")
     _attach_gamecontext(enriched, espn_sport)
     _attach_platoon(enriched, espn_sport)
     return enriched
