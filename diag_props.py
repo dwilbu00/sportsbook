@@ -1,54 +1,35 @@
-"""Throwaway diagnostic: why does warehouse.load_prop_lines('baseball_mlb')
-return 0 when odds_line clearly holds 1.5M MLB prop lines? Run from the deploy
-dir:  python diag_props.py   (safe to delete afterward)."""
-import traceback
+"""Check the FIXED, chunked player-prop read (warehouse.load_prop_lines).
+Run from the deploy dir:  python diag_props.py   (safe to delete afterward).
+
+NOTE: this deliberately does NOT call db_store.player_prop_lines('baseball_mlb')
+with no args — that's the OLD unchunked full-table read (~1.5M rows) that hangs.
+The refit uses load_prop_lines, which reads one season at a time."""
+import time
+import inspect
 
 import db_store
 import warehouse
-from sqlalchemy import text
 
 db_store.promote_secrets_from_toml()
-print("db_store.enabled():", db_store.enabled())
-try:
-    print("warehouse._sql() :", warehouse._sql())
-except Exception as e:
-    print("warehouse._sql() : ERROR", type(e).__name__, e)
-try:
-    print("storage_backend  :", warehouse.storage_backend())
-except Exception as e:
-    print("storage_backend  : ERROR", type(e).__name__, e)
+print("SQL enabled:", db_store.enabled())
 
-eng = db_store.get_engine()
-print("engine url       :", str(eng.url))
+# Is the scale fix present on THIS machine? (exclude_early is new in commit 802814e)
+has_fix = "exclude_early" in inspect.signature(
+    db_store.player_prop_lines).parameters
+print("scale fix present (exclude_early param):", has_fix)
+if not has_fix:
+    print("  -> This machine does NOT have the fix. Pull the latest code "
+          "(through commit 802814e) here, then re-run.")
 
-sql = ("SELECT COUNT(*) FROM odds_line ol "
-       "JOIN odds_snapshot os ON ol.snapshot_id = os.id "
-       "WHERE os.sport = 'baseball_mlb' AND ol.bet_type = 'player_prop'")
-try:
-    with eng.connect() as c:
-        n = c.execute(text(sql)).scalar()
-    print("prop lines via THIS engine:", n)
-except Exception:
-    print("direct count raised:")
-    traceback.print_exc()
-
-print("--- db_store.player_prop_lines('baseball_mlb') ---")
-try:
-    rows = db_store.player_prop_lines("baseball_mlb")
-    print("player_prop_lines rows:", len(rows))
-    if rows:
-        r = rows[0]
-        print("sample:", {k: r.get(k) for k in
-              ("event_id", "player", "prop_key", "point", "direction",
-               "commence_time", "snapshot_id", "captured_at")})
-except Exception:
-    traceback.print_exc()
-
-print("--- warehouse.load_prop_lines('baseball_mlb') ---")
-try:
-    lp = warehouse.load_prop_lines("baseball_mlb")
-    print("load_prop_lines rows:", len(lp))
-    if lp:
-        print("sample:", lp[0])
-except Exception:
-    traceback.print_exc()
+t0 = time.time()
+rows = warehouse.load_prop_lines("baseball_mlb", prop_keys=["batter_hits"])
+dt = time.time() - t0
+print(f"load_prop_lines(batter_hits) rows: {len(rows):,}  in {dt:.1f}s")
+if rows:
+    r = rows[0]
+    print("sample:", {k: r.get(k) for k in
+          ("game_date", "player", "prop_key", "line",
+           "over_price", "under_price")})
+    from collections import Counter
+    print("by year:", Counter((str(r.get("game_date"))[:4] for r in rows))
+          .most_common())
