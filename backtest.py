@@ -702,10 +702,11 @@ def _empty_market_bucket():
             # — lets us bucket realized ROI by MARKET CONFIDENCE (are the model's edges
             # real only in the uncertain/near-pickem zone, or across all prices?).
             "bets_detail": [],
-            # (date, served_prob, fair_over, outcome, over_price, under_price, n)
+            # (date, served_prob, fair_over, outcome, over_price, under_price, n, cv)
             # per OBS — the SERVED (line-conditional Platt) prob + the bettor's prior
-            # game-count n, for the fit==serve EV-gate sweep, Kelly-staking, and the
-            # ROI-by-sample-size diagnostic (props only; team uses its own lens).
+            # game-count n + recency-weighted CV (per-player outcome volatility), for
+            # the fit==serve EV-gate sweep, Kelly-staking, and the ROI-by-sample-size
+            # / ROI-by-variance diagnostics (props only; team uses its own lens).
             "ev_obs": [],
             # (date, p_model[pre-Platt], line, outcome, over_price, under_price) per OBS
             # — feeds the --walk-forward sim (deep seed + online current-season Platt).
@@ -2636,11 +2637,19 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 if abs(actual - line) < 1e-9:
                     continue  # push — refund
                 wts = _recency_weights(len(prior), hl)
-                proj = _weighted_mean(prior, wts)
+                raw_mean = _weighted_mean(prior, wts)
+                # Leakage-safe per-player OUTCOME volatility: recency-weighted CV
+                # (sigma/mean) of the prior game-to-game stat — a 'how consistent is
+                # this player' certainty signal, distinct from sample-size (n)
+                # uncertainty. Computed on the RAW mean (pre-xBA-blend) so it reflects
+                # realized game-to-game spread, not the projection.
+                _sw = sum(wts) or 1.0
+                _var = sum(w * (v - raw_mean) ** 2 for v, w in zip(prior, wts)) / _sw
+                cv = (_var ** 0.5 / raw_mean) if raw_mean > 1e-9 else 0.0
                 # fit==serve: apply the promoted batter_hits xBA blend (leakage-safe
                 # as-of). No-op for any prop without a served xstats_strength.
                 proj = _props_xba_blend(
-                    proj, _eff_xs(prop), rid, d10, prior_ab, wts, xba_index)
+                    raw_mean, _eff_xs(prop), rid, d10, prior_ab, wts, xba_index)
                 emp_over = _weighted_rate(prior, wts, lambda v, ln=line: v > ln)
                 p_model = _props_p_over(calibration.get(prop), proj, line,
                                         prior, wts, emp_over)
@@ -2668,7 +2677,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                     (p_final, fair_over, outcome, len(prior)))
                 results[prop]["ev_obs"].append(
                     (d10, p_final, fair_over, outcome, over_price, under_price,
-                     len(prior)))
+                     len(prior), cv))
                 results[prop]["wf_obs"].append(
                     (d10, p_model, line, outcome, over_price, under_price))
 
@@ -2744,6 +2753,7 @@ def _print_props_odds_results(results, threshold_pct):
     _print_confidence_bands(results)
     _print_props_served_ev_staking(results)
     _print_props_ev_by_sample_size(results)
+    _print_props_ev_by_variance(results)
     _simulate_daily_topn(results)
 
 
@@ -2802,10 +2812,10 @@ def _print_props_served_ev_staking(results):
         if not obs:
             continue
         n = len(obs)
-        sb = sum((p - o) ** 2 for _, p, _, o, _, _, _ in obs) / n
-        mb = sum((f - o) ** 2 for _, _, f, o, _, _, _ in obs) / n
+        sb = sum((p - o) ** 2 for _, p, _, o, *_ in obs) / n
+        mb = sum((f - o) ** 2 for _, _, f, o, *_ in obs) / n
         picks = []   # (date, decimal_odds, won, ev) for the max-EV side
-        for _d, p, _f, o, op, up, _n in obs:
+        for _d, p, _f, o, op, up, *_ in obs:
             if op is None or up is None:
                 continue
             do, du = american_to_decimal(op), american_to_decimal(up)
@@ -2858,7 +2868,7 @@ def _print_props_ev_by_sample_size(results, ev_gate=0.0):
     print("  = no edge at any sample size (shrink vs. abstain is moot).")
     for prop, r in results.items():
         picks = []   # (n, decimal_odds, won) for the +EV max-EV side of each obs
-        for _d, p, _f, o, op, up, pn in (r.get("ev_obs") or []):
+        for _d, p, _f, o, op, up, pn, *_ in (r.get("ev_obs") or []):
             if op is None or up is None:
                 continue
             do, du = american_to_decimal(op), american_to_decimal(up)
@@ -2893,6 +2903,71 @@ def _print_props_ev_by_sample_size(results, ev_gate=0.0):
                   f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
 
 
+_CV_BANDS = [
+    ("steady <0.6", 0.0, 0.6),
+    ("0.6-0.8", 0.6, 0.8),
+    ("0.8-1.0", 0.8, 1.0),
+    ("1.0-1.3", 1.0, 1.3),
+    ("volatile 1.3+", 1.3, 10 ** 9),
+]
+# Cumulative max-CV gate: ROI if you only bet players calmer than a CV ceiling.
+_CV_GATES = (10 ** 9, 1.3, 1.0, 0.8, 0.6)
+
+
+def _print_props_ev_by_variance(results, ev_gate=0.0):
+    """Realized win%/ROI of the served (Platt) +EV picks bucketed by the player's
+    OUTCOME volatility — recency-weighted CV (sigma/mean) of his prior games.
+
+    This is the OTHER uncertainty axis (distinct from sample-size n): even with a
+    reliable mean estimate, a boom/bust hitter's game outcome is dominated by
+    variance, so a mean-based edge is least trustworthy there. Tests whether ROI
+    concentrates on STEADY (low-CV) players — in which case a max-CV abstention gate
+    trims the volatile ones — vs. uniform loss (the book already prices volatility,
+    so variance carries no selection signal). Also sweeps a cumulative max-CV gate:
+    ROI if you only bet players below a CV ceiling. Picks = the max-EV side at
+    ev_gate, matching what the app would place."""
+    print("\n=== ROI by PLAYER volatility (recency-weighted CV) [served +EV picks] ===")
+    print("  hypothesis: mean-based edges are most trustworthy on STEADY (low-CV)")
+    print("  players; volatile players are variance-dominated noise. Uniform ROI across")
+    print("  CV = the book already prices volatility (no selection signal here).")
+    for prop, r in results.items():
+        picks = []   # (cv, decimal_odds, won) for the +EV max-EV side of each obs
+        for _d, p, _f, o, op, up, _pn, pcv in (r.get("ev_obs") or []):
+            if op is None or up is None:
+                continue
+            do, du = american_to_decimal(op), american_to_decimal(up)
+            ev_o, ev_u = p * do - 1.0, (1.0 - p) * du - 1.0
+            if ev_o >= ev_u:
+                if ev_o >= ev_gate:
+                    picks.append((pcv, do, o == 1))
+            elif ev_u >= ev_gate:
+                picks.append((pcv, du, o == 0))
+        if not picks:
+            continue
+        print(f"\n  {prop} (EV gate {ev_gate * 100:.0f}%, n={len(picks)}):")
+        print(f"  {'CV band':<14} {'bets':>6} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for label, lo, hi in _CV_BANDS:
+            band = [(dec, won) for pcv, dec, won in picks if lo <= pcv < hi]
+            if not band:
+                continue
+            m = len(band)
+            wins = sum(1 for _, won in band if won)
+            pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
+            print(f"  {label:<14} {m:>6} {100.0 * wins / m:>6.1f} "
+                  f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+        print(f"  {'cum max-CV':<14} {'bets':>6} {'win%':>6} {'ROI%':>8} {'P/L(u)':>9}")
+        for gate in _CV_GATES:
+            band = [(dec, won) for pcv, dec, won in picks if pcv <= gate]
+            if not band:
+                continue
+            m = len(band)
+            wins = sum(1 for _, won in band if won)
+            pl = sum((dec - 1.0) if won else -1.0 for dec, won in band)
+            lbl = "all" if gate >= 10 ** 8 else f"<={gate:g}"
+            print(f"  {lbl:<14} {m:>6} {100.0 * wins / m:>6.1f} "
+                  f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+
+
 def _conf_bucket(p):
     """5-point confidence bucket of the SELECTED side's prob on [0.5, 1.0)."""
     return round(min(max(p, 0.5), 0.9989) * 20) / 20.0
@@ -2917,7 +2992,7 @@ def _simulate_daily_topn(results, n_per_day=10, train_frac=0.6,
     from collections import defaultdict
     pool = []   # (date10, prop, sel_prob, decimal_odds, won, served_ev)
     for prop, r in results.items():
-        for d, p, _f, o, op, up, _n in (r.get("ev_obs") or []):
+        for d, p, _f, o, op, up, *_ in (r.get("ev_obs") or []):
             if not d or op is None or up is None:
                 continue
             do, du = american_to_decimal(op), american_to_decimal(up)
