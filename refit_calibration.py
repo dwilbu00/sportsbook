@@ -987,7 +987,8 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
 def refit_sport_real_lines(sport, store_label="", warmup_games=10,
                            shrinkage_k_default=0, xstats_strength=0.0,
                            dry_run=False, roi_tiebreak=True,
-                           min_override_obs=MIN_REAL_LINE_OVERRIDE_OBS):
+                           min_override_obs=MIN_REAL_LINE_OVERRIDE_OBS,
+                           seasons=None):
     """Re-select each prop's calibration METHOD at REAL book lines (roadmap 0.3).
 
     The synthetic-line sweep (`refit_sport`) chooses each prop's A/B/C method by
@@ -1026,6 +1027,15 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
           f"{sport_key} ===")
     book_lines, n_primary, n_pred = blc.harvest_real_line_book_lines(
         sport_key, target_props, store_label)
+    # Season scope (e.g. exclude the 2023 pitch-clock-transition regime): keep only
+    # book lines whose US-Eastern game_date year is in `seasons`. Applied BEFORE the
+    # actuals join so a dropped season never enters the method/residual fit.
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+        print(f"  [seasons] real-line fit scoped to {sorted(_yset)} — "
+              f"{len(book_lines):,} book lines after the season filter")
     # Primary source label mirrors harvest's choice (Azure warehouse when SQL is
     # on and no --store-label is forced, else the local backfill store).
     primary_src = "backfill store"
@@ -3564,7 +3574,10 @@ def main():
                                xstats_strength=args.xstats_strength,
                                dry_run=args.dry_run,
                                roi_tiebreak=not args.no_roi_tiebreak,
-                               min_override_obs=args.min_override_obs)
+                               min_override_obs=args.min_override_obs,
+                               seasons=([int(s.strip()) for s in
+                                         args.seasons.split(",") if s.strip()]
+                                        if args.seasons else None))
         _report_staging(args.sport, staging, wrote=not args.dry_run)
         return
 
