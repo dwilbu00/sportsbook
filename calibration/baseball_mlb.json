@@ -129573,8 +129573,8 @@
     "warmup_games": 10,
     "n_players": 102,
     "prob_shrink": {
-      "source": "odds backtest --engine live",
-      "fit_timestamp": "2026-08-18T02:57:27.027689Z"
+      "source": "odds backtest --fit-shares",
+      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
     },
     "starter_adjustment": {
       "team_markets": {
@@ -129886,25 +129886,23 @@
     },
     "prob_shrink_holdout": {
       "moneyline": {
-        "brier": 0.2472,
-        "raw_brier": 0.2565,
-        "n": 6468,
-        "n_warehouse": 6457,
-        "n_log": 11
+        "brier": 0.2468,
+        "raw_brier": 0.2472,
+        "n": 4864,
+        "n_warehouse": 4864,
+        "n_log": 0
       },
       "spreads": {
-        "brier": 0.243,
-        "raw_brier": 0.2456,
-        "n": 4809,
-        "n_warehouse": 4771,
-        "n_log": 38
+        "brier": 0.2494,
+        "raw_brier": 0.2787,
+        "n": 4477
       },
       "totals": {
-        "brier": 0.249,
-        "raw_brier": 0.271,
-        "n": 5986,
-        "n_warehouse": 5941,
-        "n_log": 45
+        "brier": 0.25,
+        "raw_brier": 0.264,
+        "n": 4655,
+        "n_warehouse": 4655,
+        "n_log": 0
       }
     },
     "warmup_present": false,
@@ -129923,12 +129921,23 @@
     "fit_seasons": [
       2024,
       2025
-    ]
+    ],
+    "market_blend": {
+      "source": "odds backtest --fit-shares",
+      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
+    },
+    "expected_runs_challenger_share": {
+      "source": "odds backtest --fit-shares",
+      "n": 4477,
+      "shrink": 0.1,
+      "share_brier": 0.24154,
+      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
+    }
   },
   "prob_shrink": {
-    "spreads": 0.6,
-    "totals": 0.15,
-    "moneyline": 0.35
+    "spreads": 0.1,
+    "totals": 0.05,
+    "moneyline": 0.75
   },
   "starter_adjustment": {
     "enabled": true,
@@ -130062,7 +130071,7 @@
       },
       "ensemble_challenger_share": {
         "moneyline": 0.75,
-        "home_minus_1_5": 0.7,
+        "home_minus_1_5": 0.5,
         "margin": 0.9
       },
       "candidate_summary": [
@@ -130164,6 +130173,32 @@
     "bullpen": {
       "league_rp_era": 4.369649923574748,
       "league_bp": 4.408462238398545
+    }
+  },
+  "market_blend": {
+    "moneyline": {
+      "w": 0.0,
+      "n": 4864,
+      "blend_brier": 0.24121,
+      "model_brier": 0.24684,
+      "market_brier": 0.24121,
+      "on_shrunk": true
+    },
+    "totals": {
+      "w": 0.5,
+      "n": 4655,
+      "blend_brier": 0.24994,
+      "model_brier": 0.25,
+      "market_brier": 0.25001,
+      "on_shrunk": true
+    },
+    "spreads": {
+      "w": 0.0,
+      "n": 4477,
+      "blend_brier": 0.23834,
+      "model_brier": 0.24154,
+      "on_shrunk": true,
+      "on_shares": true
     }
   }
 }
