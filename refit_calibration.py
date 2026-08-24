@@ -111,11 +111,13 @@ ROI_TIEBREAK_MIN_ROI_GAIN = 0.02   # ROI winner must beat the Brier leader's ROI
 ROI_TIEBREAK_THRESHOLD = 0.05      # edge threshold for the sim (matches diagnose_roi's default / live gate)
 
 # ── Data-gated line-conditional method selection (§2.4b-2 follow-up) ──
-# The best calibration method is line-dependent (diagnostic: C wins at line 0.5,
-# D dist:+xBA at >=1.5). refit_sport_real_lines picks the method PER LINE BUCKET
-# for these props, but a bucket adopts its own method only when it has enough obs
-# AND clears the confirmation gate AND beats the pooled method on that bucket —
-# else it inherits the pooled method. Ships inert until a bucket earns it.
+# The best calibration method can be line-dependent (which method wins in which
+# line bucket is data-driven and regime-dependent — e.g. D dist:+xBA has won the
+# line<=0.5 bucket on 2024-2025). refit_sport_real_lines picks the method PER
+# LINE BUCKET for these props, but a bucket adopts its own method only when it
+# has enough obs AND clears the confirmation gate AND beats the pooled method on
+# that bucket — else it inherits the pooled method. Ships inert until a bucket
+# earns it.
 LINE_CONDITIONAL_PROPS = {"batter_hits"}
 LINE_BUCKETS = [0.5, None]          # ascending max_line; None = open-ended top
 # Per-bucket floor before a bucket can flip. Comfortably above the 2-fold
@@ -125,7 +127,10 @@ LINE_BUCKETS = [0.5, None]          # ascending max_line; None = open-ended top
 # safeguard: a bucket only flips if its winner beats empirical in BOTH folds AND
 # beats the pooled method on the bucket by >= MIN_CALIB_BRIER_GAIN.
 MIN_BUCKET_OBS = 100
-LINE_COND_XSTATS_STRENGTH = 0.5    # xBA weight used when scoring method D
+LINE_COND_XSTATS_STRENGTH = 0.5    # default xBA weight for method-D bucket
+                                   # scoring/serving; used only when the caller
+                                   # passes no --xstats-strength (>0 overrides it,
+                                   # so the pooled + D-bucket xBA weights agree)
 
 
 def _lc_bucket_counts(enriched, prop_key):
@@ -202,7 +207,8 @@ def _partition_rows_by_bucket(rows):
 
 def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                          league_avg_def, pooled_method, xba_index, quality_index,
-                         roi_tiebreak=True, defense_by_season=None):
+                         roi_tiebreak=True, defense_by_season=None,
+                         xstats_strength=LINE_COND_XSTATS_STRENGTH):
     """Per-line-bucket method selection for a line-conditional prop, or None.
 
     Builds real-line rows carrying a leakage-safe distributional ``p_dist``,
@@ -212,7 +218,14 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
     winner differs from the pooled method, AND it beats the pooled method on the
     bucket's single holdout by >= MIN_CALIB_BRIER_GAIN. Otherwise the bucket
     inherits the pooled method (no residuals stored). Returns a ``line_methods``
-    list only when at least one bucket adopts its own method, else None (inert)."""
+    list only when at least one bucket adopts its own method, else None (inert).
+
+    ``xstats_strength`` is the xBA blend weight used both to SCORE and to SERVE
+    method D in a bucket. The caller threads the operator's per-prop
+    --xstats-strength here so the D bucket agrees with the pooled path (the D
+    bucket carries the MAJORITY of a prop's volume — a mismatch would silently
+    serve a different xBA weight than the pooled method was fit under). Falls back
+    to ``LINE_COND_XSTATS_STRENGTH`` when the caller passes no strength."""
     import book_line_calibration as blc
     from props import _DIST_HARDHIT_COEF, _DIST_BARREL_COEF, PROP_NEGBIN_ELIGIBLE
 
@@ -228,7 +241,7 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
         p_dist = blc.project_distributional(
             obs, params, sport_key, team_defense, league_avg_def,
             xba_index=xba_index, quality_index=quality_index,
-            xstats_strength=LINE_COND_XSTATS_STRENGTH,
+            xstats_strength=xstats_strength,
             defense_by_season=defense_by_season)
         if p_dist is None:
             continue
@@ -276,7 +289,7 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                     "cv_brier": sel_b["cv_brier"], "confirmed": True,
                 }
                 if sel_b["method"] == "D":
-                    entry.update({"xstats_strength": LINE_COND_XSTATS_STRENGTH,
+                    entry.update({"xstats_strength": xstats_strength,
                                   "dist_hardhit_coef": _DIST_HARDHIT_COEF,
                                   "dist_barrel_coef": _DIST_BARREL_COEF})
                 elif sel_b["method"] == "E":
@@ -1185,10 +1198,15 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
         # a bucket only flips when it genuinely beats pooling on that bucket.
         line_methods = None
         if prop_key in LINE_CONDITIONAL_PROPS and need_lc:
+            # Thread the operator's per-prop xBA weight so the D bucket serves the
+            # SAME strength as the pooled path (prop_xstats>0 → --xstats-strength;
+            # 0 → keep the LINE_COND_XSTATS_STRENGTH default for a bare re-fit).
+            lc_xstats = prop_xstats if prop_xstats > 0 else LINE_COND_XSTATS_STRENGTH
             line_methods = _select_line_methods(
                 prop_key, enriched, params, sport_key, None,
                 None, sel["method"], xba_index, lc_quality_index,
-                roi_tiebreak=roi_tiebreak, defense_by_season=defense_by_season)
+                roi_tiebreak=roi_tiebreak, defense_by_season=defense_by_season,
+                xstats_strength=lc_xstats)
 
         # Normally only a genuine method FLIP is written (a same-method re-fit
         # would just churn the residuals onto a smaller real-line basis for no
