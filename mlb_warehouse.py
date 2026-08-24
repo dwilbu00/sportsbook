@@ -2257,6 +2257,7 @@ def get_calib_gamelogs_bulk(role, season):
     reader sorts). role ∈ {'pitcher','batter'}. Fail-open -> {}."""
     if not enabled():
         return {}
+    season = season if season is not None else _current_season()
     table, stats = ((mlb_pitcher_game, _PITCHER_GAME_STATS) if role == "pitcher"
                     else (mlb_batter_game, _BATTER_GAME_STATS))
     by_ath = _game_log_bulk(table, stats, season,

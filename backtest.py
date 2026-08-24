@@ -2860,12 +2860,30 @@ def _iter_pool_players(players):
 def fetch_player_data(espn_sport, espn_league, players, season_year=None):
     """Resolve each player → (athlete_id, gamelog). Returns {name: gamelog_list}.
 
-    For MLB (P3/P4/P6) each player's per-game log comes from the StatsAPI warehouse
-    (mlb_warehouse.get_calib_gamelog by the pool's authoritative MLBAM id + role) — no
-    name→ESPN-id round trip, no ESPN gamelog fetch. A bare-name --players override is
-    resolved to its MLBAM id via the game-context-free resolver. NBA/NFL use the ESPN
-    path. (ESPN was fully removed for MLB in P4.)"""
+    For MLB (P3/P4/P6) each player's per-game log comes from the StatsAPI warehouse.
+    The whole season's logs are pulled ONCE per role (mlb_warehouse.get_calib_gamelogs_
+    bulk) and every player is served from that in-memory index by his authoritative
+    MLBAM id — no per-player round trip (thousands on a deep multi-season sweep), no
+    name→ESPN-id hop, no ESPN gamelog fetch. A bare-name --players override is resolved
+    to its MLBAM id via the game-context-free resolver. NBA/NFL use the ESPN path.
+    (ESPN was fully removed for MLB in P4.)"""
     data = {}
+    _bulk_by_role = {}
+
+    def _bulk_for(role):
+        # Lazily pull the WHOLE season's gamelogs for a role once (one query), then
+        # serve every player from memory. Normalize to the two fact tables exactly as
+        # get_calib_gamelog does (role == "pitcher" → pitcher, else batter).
+        norm = "pitcher" if role == "pitcher" else "batter"
+        if norm not in _bulk_by_role:
+            try:
+                import mlb_warehouse as _mw
+                _bulk_by_role[norm] = (
+                    _mw.get_calib_gamelogs_bulk(norm, season_year) or {})
+            except Exception:
+                _bulk_by_role[norm] = {}
+        return _bulk_by_role[norm]
+
     for mlb_id, role, name in _iter_pool_players(players):
         if not name:
             continue
@@ -2874,7 +2892,7 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
             rid, rrole = mlb_id, role
             if not rid:
                 # A bare-name --players override under the flag: resolve the
-                # authoritative MLBAM id + role (get_calib_gamelog needs the role to
+                # authoritative MLBAM id + role (the bulk index is keyed by role to
                 # pick the batter vs pitcher fact table).
                 import mlb_starters
                 resolved = mlb_starters.resolve_mlbam_id(
@@ -2882,11 +2900,12 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
                 if resolved:
                     rid = resolved[0]
                     rrole = "pitcher" if resolved[1] else "batter"
-            gamelog = (mlb_warehouse.get_calib_gamelog(
-                str(rid), rrole, season=season_year) if rid else [])
+            gamelog = _bulk_for(rrole).get(str(rid)) if rid else None
             if not gamelog:
                 print(f"  [skip] {name}: no warehouse gamelog")
                 continue
+            # Own copy: the bulk index shares one list per id, and we sort in place.
+            gamelog = list(gamelog)
             gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
             # The pool dedups by MLBAM id and can carry two DISTINCT players who share
             # a fullName (e.g. Will Smith the catcher + the pitcher). data is keyed by

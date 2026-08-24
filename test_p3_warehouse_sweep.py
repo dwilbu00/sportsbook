@@ -2,8 +2,9 @@
 StatsAPI warehouse (ESPN fully removed for MLB in P4; NBA/NFL stay on ESPN).
 
 These lock the re-keyed seams WITHOUT touching a DB or ESPN:
-  * fetch_player_data / _player_stat_series → mlb_warehouse.get_calib_gamelog (by
-    MLBAM id+role) for MLB; ESPN for NBA/NFL
+  * fetch_player_data → mlb_warehouse.get_calib_gamelogs_bulk (ONE query per
+    season+role, served by MLBAM id) for MLB; _player_stat_series →
+    mlb_warehouse.get_calib_gamelog (single player by MLBAM id+role); ESPN for NBA/NFL
   * _warehouse_team_schedules mirrors get_all_teams + build_schedules (canonical names)
   * _mlb_warehouse_defense_lookup keys on the CANONICAL name the player rows carry
     (opponent-name match by construction)
@@ -31,34 +32,36 @@ class FetchPlayerDataTests(unittest.TestCase):
                 "is_home": True, "opponent": "Boston Red Sox", "team_id": "147",
                 "completed": True}]
 
-    def test_mlb_uses_get_calib_gamelog_not_espn(self):
-        gcg = mock.Mock(return_value=list(self._WH_LOG))
+    def test_mlb_uses_bulk_gamelog_not_espn(self):
+        # One bulk pull per (role, season), served by MLBAM id — no per-player round
+        # trip, no ESPN hop.
+        gcg = mock.Mock(return_value={"592450": list(self._WH_LOG)})
         with mock.patch.object(backtest, "cached_athlete_id") as caid, \
              mock.patch.object(backtest, "cached_gamelog") as cgl, \
-             mock.patch("mlb_warehouse.get_calib_gamelog", gcg):
+             mock.patch("mlb_warehouse.get_calib_gamelogs_bulk", gcg):
             data = backtest.fetch_player_data(
                 "baseball", "mlb", [("592450", "batter", "Aaron Judge")],
                 season_year=2026)
         self.assertIn("Aaron Judge", data)
         self.assertEqual(data["Aaron Judge"][0]["H"], 2.0)
-        gcg.assert_called_once_with("592450", "batter", season=2026)
+        gcg.assert_called_once_with("batter", 2026)
         caid.assert_not_called()          # ESPN id lookup bypassed
         cgl.assert_not_called()           # ESPN gamelog bypassed
 
     def test_bare_name_resolved_via_resolver(self):
-        gcg = mock.Mock(return_value=list(self._WH_LOG))
+        gcg = mock.Mock(return_value={"605483": list(self._WH_LOG)})
         with mock.patch("mlb_starters.resolve_mlbam_id",
                         return_value=(605483, True)) as rz, \
-             mock.patch("mlb_warehouse.get_calib_gamelog", gcg), \
+             mock.patch("mlb_warehouse.get_calib_gamelogs_bulk", gcg), \
              mock.patch("mlb_warehouse._current_season", return_value=2026):
             data = backtest.fetch_player_data(
                 "baseball", "mlb", ["Some Pitcher"])
         rz.assert_called_once()
-        gcg.assert_called_once_with("605483", "pitcher", season=None)
+        gcg.assert_called_once_with("pitcher", None)   # season default happens inside
         self.assertIn("Some Pitcher", data)
 
     def test_warehouse_miss_skips_player(self):
-        with mock.patch("mlb_warehouse.get_calib_gamelog", return_value=[]):
+        with mock.patch("mlb_warehouse.get_calib_gamelogs_bulk", return_value={}):
             data = backtest.fetch_player_data(
                 "baseball", "mlb", [("1", "batter", "Ghost")], season_year=2026)
         self.assertEqual(data, {})
@@ -68,7 +71,7 @@ class FetchPlayerDataTests(unittest.TestCase):
                                return_value="e1") as caid, \
              mock.patch.object(backtest, "cached_gamelog",
                                return_value=[{"PTS": 20.0, "game_date": "2026-01-01"}]), \
-             mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
+             mock.patch("mlb_warehouse.get_calib_gamelogs_bulk") as gcg:
             backtest.fetch_player_data("basketball", "nba", ["Star"])
         caid.assert_called_once()          # ESPN path
         gcg.assert_not_called()
@@ -76,13 +79,15 @@ class FetchPlayerDataTests(unittest.TestCase):
     def test_same_name_namesakes_both_survive(self):
         # Two distinct MLBAM ids sharing a fullName each keep their own gamelog
         # (name collision disambiguated by id) instead of the second overwriting the
-        # first — the id-dedup pool's stated intent, true downstream.
-        def _gcg(rid, role, season=None):
+        # first — the id-dedup pool's stated intent, true downstream. The bulk index is
+        # keyed by id, so each namesake resolves independently across the two role pulls.
+        def _bulk(role, season=None):
             label = "K" if role == "pitcher" else "H"
-            return [{label: 1.0, "game_date": "2026-07-20T18:00Z",
-                     "is_home": True, "opponent": "X", "team_id": "1",
-                     "completed": True}]
-        with mock.patch("mlb_warehouse.get_calib_gamelog", side_effect=_gcg):
+            ids = {"pitcher": "592858", "batter": "669257"}
+            return {ids[role]: [{label: 1.0, "game_date": "2026-07-20T18:00Z",
+                                 "is_home": True, "opponent": "X", "team_id": "1",
+                                 "completed": True}]}
+        with mock.patch("mlb_warehouse.get_calib_gamelogs_bulk", side_effect=_bulk):
             data = backtest.fetch_player_data(
                 "baseball", "mlb",
                 [("669257", "batter", "Will Smith"),
