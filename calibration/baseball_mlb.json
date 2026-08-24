@@ -163393,7 +163393,6 @@
     "edge_floor": 0.01,
     "suppress": [
       "pitcher_outs",
-      "batter_strikeouts",
       "totals"
     ]
   },
