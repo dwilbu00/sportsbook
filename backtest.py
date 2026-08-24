@@ -705,7 +705,10 @@ def _empty_market_bucket():
             # (date, served_prob, fair_over, outcome, over_price, under_price) per OBS
             # — the SERVED (line-conditional Platt) prob, for the fit==serve EV-gate
             # sweep + Kelly-staking diagnostics (props only; team uses its own lens).
-            "ev_obs": []}
+            "ev_obs": [],
+            # (date, p_model[pre-Platt], line, outcome, over_price, under_price) per OBS
+            # — feeds the --walk-forward sim (deep seed + online current-season Platt).
+            "wf_obs": []}
 
 
 def _grade(bucket, model_p, market_p, outcome, price_yes, price_no, threshold):
@@ -2189,7 +2192,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
                             store_label="", write_calibration=False,
                             source="auto", snapshot="close", seasons=None,
-                            xstats_override=None):
+                            xstats_override=None, walk_forward=False):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -2423,6 +2426,8 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                     (p_final, fair_over, outcome, len(prior)))
                 results[prop]["ev_obs"].append(
                     (d10, p_final, fair_over, outcome, over_price, under_price))
+                results[prop]["wf_obs"].append(
+                    (d10, p_model, line, outcome, over_price, under_price))
 
     # Diagnostics on coverage
     print("\nCoverage (why lines were dropped):")
@@ -2432,6 +2437,9 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
               f"no_actual/min_prior={no_actual[prop]:>5}")
 
     _print_props_odds_results(results, threshold_pct)
+
+    if walk_forward:
+        _simulate_walk_forward(results, recal, calibration)
 
     if write_calibration:
         print("\n[write-calibration] Persisting market-as-prior k (P1.1a)...")
@@ -2676,6 +2684,126 @@ def _simulate_daily_topn(results, n_per_day=10, train_frac=0.6,
             growth = (bank / 100.0 - 1.0) * 100.0
             print(f"    {kf:>5}-Kelly  final {bank:9.1f}u  growth {growth:+9.1f}%  "
                   f"maxDD {maxdd * 100:5.1f}%")
+
+
+def _topn_flat(rows, n_per_day):
+    """rows: [(date, prob, decimal_odds, won)]. Each day take the top-N +EV, flat-1u.
+    Returns (bets, win%, ROI%)."""
+    from collections import defaultdict
+    byday = defaultdict(list)
+    for d, p, dec, won in rows:
+        ev = p * dec - 1.0
+        if ev > 0:
+            byday[d].append((ev, dec, won))
+    sel = []
+    for d in byday:
+        sel.extend(sorted(byday[d], reverse=True)[:n_per_day])
+    if not sel:
+        return 0, 0.0, 0.0
+    m = len(sel)
+    wins = sum(1 for _, _, w in sel if w)
+    pl = sum((dec - 1.0) if w else -1.0 for _, dec, w in sel)
+    return m, 100.0 * wins / m, 100.0 * pl / m
+
+
+def _simulate_walk_forward(results, recal, calibration, seed_trust=1.0,
+                           min_loop=50, refit_days=7, max_fit_obs=8000,
+                           n_per_day=10):
+    """WALK-FORWARD test of the deep-seed + online-CURRENT-SEASON-Platt architecture
+    (Doug's proposal): step through obs chronologically; per (prop, line-bucket) refit a
+    loop Platt on the current-season resolved obs SO FAR (reset each season) and blend it
+    with the committed 4-season SEED via w = n_loop/(n_loop + trust*n_seed) — cold-start
+    leans on the seed (prior), fills in -> current takes over. Compares STATIC (seed only)
+    vs WALK-FORWARD served Brier + daily top-N ROI. Leakage-safe: a day's obs join the
+    accumulator only AFTER that day is graded. Answers: does within-season adaptation help
+    beyond the static pooled fit? (Opt-in via --walk-forward; it re-fits Platt repeatedly.)"""
+    import props as _pm
+    from recalibration import fit_platt, apply_platt
+    from collections import defaultdict
+
+    def _bkey(prop, line):
+        cfg = calibration.get(prop) or {}
+        if cfg.get("line_methods"):
+            try:
+                return (prop, _pm._resolve_line_bucket(cfg, line)[0])
+            except Exception:
+                return (prop, None)
+        return (prop, None)
+
+    def _seed(prop, line):
+        cfg = _pm._resolve_recal_cfg(recal, prop, line, calibration.get(prop))
+        if cfg and cfg.get("a") is not None:
+            return cfg.get("a"), cfg.get("b"), (cfg.get("n_fit") or 500)
+        return None, None, 500
+
+    byday = defaultdict(list)
+    for prop, r in results.items():
+        for d, pm, line, o, op, up in (r.get("wf_obs") or []):
+            if not d or pm is None or op is None or up is None:
+                continue
+            byday[d[:10]].append((prop, line, pm, o,
+                                  american_to_decimal(op), american_to_decimal(up)))
+    if sum(len(v) for v in byday.values()) < 500:
+        print("\n=== WALK-FORWARD (online current-season Platt): too few obs. ===")
+        return
+    days = sorted(byday)
+
+    acc = defaultdict(list)      # (prop,bkey) -> [(p_model, outcome)] current season
+    loop_fit, last_fit = {}, {}
+    cur_season = None
+    st_rows, wf_rows = [], []
+    sB = defaultdict(lambda: [0.0, 0])
+    wB = defaultdict(lambda: [0.0, 0])
+    mB = defaultdict(lambda: [0.0, 0])
+
+    for di, day in enumerate(days):
+        if day[:4] != cur_season:
+            acc.clear(); loop_fit.clear(); last_fit.clear(); cur_season = day[:4]
+        for prop, line, pm, o, do, du in byday[day]:
+            k = _bkey(prop, line)
+            a_s, b_s, n_seed = _seed(prop, line)
+            ps = pm if a_s is None else apply_platt(pm, a_s, b_s)
+            ps = min(max(ps if ps is not None else pm, 0.0), 1.0)
+            lf = loop_fit.get(k)
+            pw = ps
+            if lf:
+                pl = apply_platt(pm, lf[0], lf[1])
+                if pl is not None:
+                    w = lf[2] / (lf[2] + seed_trust * n_seed)
+                    pw = (1.0 - w) * ps + w * min(max(pl, 0.0), 1.0)
+            fair_o, _ = devig_two_way(1.0 / do, 1.0 / du)
+            sB[prop][0] += (ps - o) ** 2; sB[prop][1] += 1
+            wB[prop][0] += (pw - o) ** 2; wB[prop][1] += 1
+            mB[prop][0] += (fair_o - o) ** 2; mB[prop][1] += 1
+            for probv, rows in ((ps, st_rows), (pw, wf_rows)):
+                if probv * do - 1.0 >= (1.0 - probv) * du - 1.0:
+                    rows.append((day, probv, do, o == 1))
+                else:
+                    rows.append((day, 1.0 - probv, du, o == 0))
+        for k, obs in acc.items():
+            if len(obs) >= min_loop and di - last_fit.get(k, -10 ** 9) >= refit_days:
+                fit = fit_platt([p for p, _ in obs[-max_fit_obs:]],
+                                [oo for _, oo in obs[-max_fit_obs:]], max_iter=50)
+                if fit is not None:
+                    loop_fit[k] = (fit[0], fit[1], len(obs))
+                    last_fit[k] = di
+        for prop, line, pm, o, _do, _du in byday[day]:
+            acc[_bkey(prop, line)].append((pm, o))
+
+    print(f"\n=== WALK-FORWARD: deep seed + online CURRENT-SEASON Platt "
+          f"(trust={seed_trust}, refit/{refit_days}d, reset each season) ===")
+    print("  STATIC = seed only; WF = seed + online current-season blend. "
+          "WF Brier<static & WF ROI>static => within-season adaptation helps.")
+    print(f"  {'prop':<20} {'staticBrier':>11} {'wfBrier':>9} {'mktBrier':>9}")
+    for prop in results:
+        if sB[prop][1] == 0:
+            continue
+        print(f"  {prop:<20} {sB[prop][0] / sB[prop][1]:>11.4f} "
+              f"{wB[prop][0] / wB[prop][1]:>9.4f} {mB[prop][0] / mB[prop][1]:>9.4f}")
+    sm, sw, sr = _topn_flat(st_rows, n_per_day)
+    wm, ww, wr = _topn_flat(wf_rows, n_per_day)
+    print(f"\n  daily top-{n_per_day} flat ROI:  STATIC {sr:+.2f}% ({sm} bets, "
+          f"{sw:.1f}% win)   WALK-FWD {wr:+.2f}% ({wm} bets, {ww:.1f}% win)")
 
 
 def _print_matchup_quantile_sweep_summary(results, safe_target=0.80):
@@ -6344,6 +6472,13 @@ def main():
                         "props (batter_hits) — 0 turns xBA OFF, 0.75 = the shipped "
                         "value. Lets you A/B whether the xBA blend helps or HURTS vs "
                         "real odds. Default None = use the calibration file's value.")
+    p.add_argument("--walk-forward", action="store_true",
+                   help="(props-odds mode) Simulate the deep-seed + online CURRENT-"
+                        "SEASON Platt architecture: per (prop,bucket) refit a loop Platt "
+                        "on current-season obs so far (reset each season), blend with the "
+                        "4-season seed, grade forward. Compares STATIC vs WALK-FORWARD "
+                        "Brier + daily top-N ROI (tests whether within-season adaptation "
+                        "helps). Slower — re-fits Platt repeatedly.")
     p.add_argument("--supplement-log", dest="supplement_log",
                    action="store_true", default=True,
                    help="(odds mode, live engine) Fold resolved market_prediction_"
@@ -6496,7 +6631,8 @@ def main():
                                 source=args.source, snapshot=args.snapshot,
                                 seasons=(_parse_seasons(args.seasons)
                                          if args.seasons else None),
-                                xstats_override=args.xstats_strength)
+                                xstats_override=args.xstats_strength,
+                                walk_forward=args.walk_forward)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         if args.team_gate_sweep:
