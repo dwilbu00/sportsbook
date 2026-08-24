@@ -864,7 +864,8 @@ def _assemble_team_entry(event_id, rows):
 SBR_EVENT_PREFIX = "sbr-"   # synthetic id prefix stamped by ingest_sbr_odds.py
 
 
-def load_team_market_store(sport_key, dates=None, include_sbr=False):
+def load_team_market_store(sport_key, dates=None, include_sbr=False,
+                           snapshot="close"):
     """Assemble a historical_odds-shaped store from the SQL warehouse's captured
     team-market lines, for the team-market backtest.
 
@@ -902,7 +903,11 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False):
     if not _sql():
         return empty
     try:
-        rows = _db.team_market_lines(sport_key, dates=dates)
+        # 'close' (default) keeps every snapshot → the assembler picks the
+        # nearest-pre-commence (close), byte-identical to before; 'early' reads only
+        # the backfill_early (opening / pre-close) snapshots — the bet-early view.
+        rows = _db.team_market_lines(sport_key, dates=dates,
+                                     only_early=(snapshot == "early"))
     except Exception as e:
         _ops.ops_event("database_failure", op="team_market_lines",
                        sport=sport_key, error=type(e).__name__)
@@ -1004,9 +1009,14 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     } for (player, prop_key), e in combined.items()]
 
 
-def load_prop_lines(sport_key, dates=None, prop_keys=None):
-    """Assemble player-prop closing-line rows from the SQL warehouse for the
-    offline real-line calibration refit.
+def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
+    """Assemble player-prop line rows from the SQL warehouse for the offline
+    real-line calibration refit + the props-odds backtest.
+
+    ``snapshot``: 'close' (default) reads the closing set (drops backfill_early,
+    then the assembler picks the nearest-pre-commence snapshot) — byte-identical to
+    the prior closing-only behavior. 'early' reads ONLY the backfill_early
+    (opening / pre-close) snapshots — the bet-early ROI view (you bet early at DK).
 
     Returns the shape book_line_calibration.harvest_book_lines_from_store emits,
     plus ``event_id``/``commence_time``:
@@ -1033,6 +1043,11 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None):
         def et_local_date(c):
             return (str(c)[:10] if c else None)
 
+    # 'close' drops early + the assembler picks the nearest-pre-commence snapshot;
+    # 'early' reads only the backfill_early snapshots (assembler picks the one early
+    # snapshot per event). Mutually exclusive db filters.
+    _excl_early = snapshot != "early"
+    _only_early = snapshot == "early"
     out = []
 
     def _assemble(rows):
@@ -1047,19 +1062,72 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None):
     try:
         if dates:
             _assemble(_db.player_prop_lines(
-                sport_key, dates=dates, exclude_early=True, prop_keys=prop_keys))
+                sport_key, dates=dates, exclude_early=_excl_early,
+                only_early=_only_early, prop_keys=prop_keys))
         else:
             # Empty years return fast (indexed sport+game_date scan finds nothing).
             import datetime as _dt
             for _yr in range(2019, _dt.date.today().year + 2):
                 _assemble(_db.player_prop_lines(
                     sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
-                    exclude_early=True, prop_keys=prop_keys))
+                    exclude_early=_excl_early, only_early=_only_early,
+                    prop_keys=prop_keys))
     except Exception as e:
         _ops.ops_event("database_failure", op="player_prop_lines",
                        sport=sport_key, error=type(e).__name__)
         return []
     return out
+
+
+def load_prop_market_store(sport_key, dates=None, snapshot="close"):
+    """Assemble a historical_odds-shaped store of PLAYER-PROP lines from the SQL
+    warehouse, for the props-odds backtest (run_props_odds_backtest --source
+    warehouse). The prop sibling of load_team_market_store.
+
+    Returns the EXACT shape historical_odds.load_store produces so
+    run_props_odds_backtest consumes it unchanged:
+        {'sport_key','bookmaker','games': {game_key: {commence_time, home_team,
+         away_team, props: {prop_key: {player: {line, over_implied, under_implied,
+         over_price, under_price}}}}}}
+    over_implied/under_implied are the RAW (vig-in) implied probs derived from the
+    American prices — the grader (run_props_odds_backtest) de-vigs them itself, same
+    as the JSON store. ``snapshot`` selects 'close' (default) or 'early' lines.
+    SQL-only, best-effort: an empty store on any error / no rows."""
+    empty = {"sport_key": sport_key, "games": {},
+             "bookmaker": f"warehouse props ({snapshot})"}
+    try:
+        rows = load_prop_lines(sport_key, dates=dates, snapshot=snapshot)
+    except Exception:
+        return empty
+    if not rows:
+        return empty
+    try:
+        import historical_odds as store_mod
+        from odds_client import american_to_implied_prob
+    except Exception:
+        return empty
+
+    games = {}
+    for r in rows:
+        line, player, prop_key = r.get("line"), r.get("player"), r.get("prop_key")
+        if line is None or not player or not prop_key:
+            continue
+        gkey = store_mod.game_key(r.get("commence_time"),
+                                  r.get("home_team"), r.get("away_team"))
+        g = games.setdefault(gkey, {
+            "commence_time": r.get("commence_time"),
+            "home_team": r.get("home_team"), "away_team": r.get("away_team"),
+            "props": {}})
+        op, up = r.get("over_price"), r.get("under_price")
+        g["props"].setdefault(prop_key, {})[player] = {
+            "line": line, "over_price": op, "under_price": up,
+            "over_implied": (american_to_implied_prob(op)
+                             if op is not None else None),
+            "under_implied": (american_to_implied_prob(up)
+                              if up is not None else None),
+        }
+    return {"sport_key": sport_key,
+            "bookmaker": f"warehouse props (DK, {snapshot})", "games": games}
 
 
 def doubleheader_event_ids(rows):

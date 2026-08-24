@@ -829,14 +829,15 @@ def _best_shrink(obs, step=0.05):
     return round(best_s, 2), best_brier, raw_brier
 
 
-def _load_odds_store(sport_key, store_label, source):
+def _load_odds_store(sport_key, store_label, source, snapshot="close"):
     """Return ``(store, source_used)`` for the team-market backtest.
 
     ``source``: 'auto' (default) uses the SQL odds warehouse when it's enabled,
     no --store-label was given, and it holds team-market games — else the local
     historical_odds JSON; 'warehouse' forces the warehouse; 'store' forces the
     local JSON. The warehouse store is assembled to the EXACT historical_odds
-    shape so the downstream grading path is identical."""
+    shape so the downstream grading path is identical. ``snapshot`` ('close' |
+    'early') selects the warehoused snapshot set (ignored for the local JSON)."""
     def _local():
         return hist_store.load_store(sport_key, store_label), "store"
 
@@ -845,12 +846,39 @@ def _load_odds_store(sport_key, store_label, source):
     if source in ("auto", "warehouse"):
         try:
             import warehouse
-            wh = warehouse.load_team_market_store(sport_key)
+            wh = warehouse.load_team_market_store(sport_key, snapshot=snapshot)
         except Exception:
             wh = None
         if source == "warehouse":
             return (wh or {"sport_key": sport_key, "games": {}}), "warehouse"
         # auto: warehouse only when it has games and no explicit local label.
+        if wh and wh.get("games") and not store_label:
+            return wh, "warehouse"
+        return _local()
+    return _local()
+
+
+def _load_prop_store(sport_key, store_label, source, snapshot="close"):
+    """Return ``(store, source_used)`` for the PLAYER-PROPS odds backtest — the prop
+    sibling of _load_odds_store. 'warehouse' assembles the historical_odds shape
+    from the SQL warehouse (warehouse.load_prop_market_store) at the chosen
+    ``snapshot`` ('close' | 'early'); 'store' forces the local historical_odds JSON;
+    'auto' prefers the warehouse when it has games and no --store-label was given.
+    Note the local JSON stores have historically held TEAM markets only (no props),
+    so the warehouse is the real props source."""
+    def _local():
+        return hist_store.load_store(sport_key, store_label), "store"
+
+    if source == "store":
+        return _local()
+    if source in ("auto", "warehouse"):
+        try:
+            import warehouse
+            wh = warehouse.load_prop_market_store(sport_key, snapshot=snapshot)
+        except Exception:
+            wh = None
+        if source == "warehouse":
+            return (wh or {"sport_key": sport_key, "games": {}}), "warehouse"
         if wh and wh.get("games") and not store_label:
             return wh, "warehouse"
         return _local()
@@ -1315,7 +1343,7 @@ def _run_odds_backtest_impl(
         sport_key, espn_sport, espn_league, limit, window, variants,
         min_sample=5, season_year=None, threshold_pct=5.0,
         write_calibration=False, store_label="", variance_inflate=1.0,
-        engine="live", prob_shrink=1.0, source="auto",
+        engine="live", prob_shrink=1.0, source="auto", snapshot="close",
         supplement_log=True, min_shrink_n=MIN_SHRINK_N,
         collect_obs=None, collect_dated=None, collect_lineup=None,
         collect_components=None, serve_mode=False, fit_blend=False,
@@ -1353,8 +1381,8 @@ def _run_odds_backtest_impl(
             raise ValueError("serve_mode requires --engine live (it grades the "
                              "production analyzers' served output).")
 
-    store, source_used = _load_odds_store(sport_key, store_label, source)
-    print(f"\n[odds source: {source_used}]")
+    store, source_used = _load_odds_store(sport_key, store_label, source, snapshot)
+    print(f"\n[odds source: {source_used} ({snapshot})]")
     if not store.get("games"):
         if source_used == "warehouse":
             print(f"\nNo warehoused team-market lines for {sport_key} yet. The "
@@ -2118,7 +2146,8 @@ def _write_market_prior_calibration(sport_key, results):
 
 def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                             min_prior=5, half_life=None, threshold_pct=5.0,
-                            store_label="", write_calibration=False):
+                            store_label="", write_calibration=False,
+                            source="auto", snapshot="close"):
     """
     Grade the model's player-prop value flags against stored historical closing
     lines (from backfill_historical_odds.py --props ...). For each captured
@@ -2132,14 +2161,21 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     use_warehouse = espn_sport == "baseball"
     if use_warehouse:
         print("=== props-odds player logs: StatsAPI warehouse (ESPN bypassed) ===")
-    store = hist_store.load_store(sport_key, store_label)
+    store, source_used = _load_prop_store(sport_key, store_label, source, snapshot)
+    print(f"\n[odds source: {source_used} ({snapshot})]")
     games = store.get("games", {})
     if not games:
         cli = _SPORT_KEY_TO_CLI.get(sport_key, sport_key)
         lbl = f" --label {store_label}" if store_label else ""
-        print(f"\nNo historical odds stored for {sport_key}"
-              f"{f' (label={store_label})' if store_label else ''}. Run "
-              f"backfill_historical_odds.py --sport {cli} --props {','.join(props)}{lbl} ...")
+        if source_used == "warehouse":
+            print(f"\nNo warehoused player-prop lines for {sport_key} at "
+                  f"snapshot={snapshot}. Backfill props with "
+                  f"backfill_historical_odds.py --sport {cli} --props ...")
+        else:
+            print(f"\nNo historical odds stored for {sport_key}"
+                  f"{f' (label={store_label})' if store_label else ''}. Run "
+                  f"backfill_historical_odds.py --sport {cli} "
+                  f"--props {','.join(props)}{lbl} ...")
         return
     if store_label:
         print(f"\n[store-label: {store_label}] grading ROI at the "
@@ -4796,7 +4832,8 @@ def _prob_metrics_panel(obs):
 
 
 def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
-                       limit=100000, store_label="", source="auto"):
+                       limit=100000, store_label="", source="auto",
+                       snapshot="close"):
     """Team-market GATE + SHRINK lens (NO WRITE): grade ML/spread/total over the
     warehoused closing-line holdout, collect each obs's RAW (pre-shrink) model
     prob + market prob + outcome + prices, then sweep probability-shrink x
@@ -4816,6 +4853,7 @@ def diagnose_team_gate(sport_key, espn_sport, espn_league, season_year=None,
                       season_year=season_year, threshold_pct=5.0,
                       write_calibration=False, store_label=store_label,
                       engine="live", prob_shrink=1.0, source=source,
+                      snapshot=snapshot,
                       supplement_log=False, collect_obs=obs, collect_dated=dated,
                       collect_lineup=lineup)
 
@@ -5935,12 +5973,20 @@ def main():
                         "ESPN gamelog regardless of season boundary.")
     p.add_argument("--source", choices=["auto", "warehouse", "store"],
                    default="auto",
-                   help="(odds mode) Closing-line source: 'auto' (default) uses "
+                   help="(odds / props-odds mode) Odds source: 'auto' (default) uses "
                         "the Azure odds warehouse when it's configured and has "
-                        "team-market games, else the local historical_odds JSON; "
+                        "games, else the local historical_odds JSON; "
                         "'warehouse' forces the warehouse; 'store' forces the "
                         "local JSON. Under 'auto', a --store-label forces the "
-                        "local JSON (the warehouse has no label concept).")
+                        "local JSON (the warehouse has no label concept). NOTE the "
+                        "local JSON has historically held TEAM markets only, so "
+                        "props-odds needs --source warehouse.")
+    p.add_argument("--snapshot", choices=["close", "early"], default="close",
+                   help="(odds / props-odds mode, --source warehouse) Which "
+                        "warehoused snapshot to grade: 'close' (default, the "
+                        "nearest-pre-commence closing line = CLV reference) or "
+                        "'early' (the backfill_early opening/pre-close line = the "
+                        "bet-early ROI view that matches DK entry timing).")
     p.add_argument("--supplement-log", dest="supplement_log",
                    action="store_true", default=True,
                    help="(odds mode, live engine) Fold resolved market_prediction_"
@@ -6089,13 +6135,15 @@ def main():
                                 props=props, min_prior=args.min_sample,
                                 threshold_pct=args.threshold,
                                 store_label=args.store_label,
-                                write_calibration=args.write_calibration)
+                                write_calibration=args.write_calibration,
+                                source=args.source, snapshot=args.snapshot)
     elif args.mode == "odds":
         odds_seasons = _parse_seasons(args.seasons) if args.seasons else args.season
         if args.team_gate_sweep:
             diagnose_team_gate(sport_key, espn_sport, espn_league,
                                season_year=odds_seasons, limit=args.limit,
-                               store_label=args.store_label, source=args.source)
+                               store_label=args.store_label, source=args.source,
+                               snapshot=args.snapshot)
         elif args.sizing_sweep:
             sizing_sweep(sport_key, espn_sport, espn_league,
                          season_year=odds_seasons, limit=args.limit,
@@ -6170,7 +6218,8 @@ def main():
                               store_label=args.store_label,
                               variance_inflate=args.variance_inflate,
                               engine=args.engine, prob_shrink=args.prob_shrink,
-                              source=args.source, supplement_log=args.supplement_log,
+                              source=args.source, snapshot=args.snapshot,
+                              supplement_log=args.supplement_log,
                               min_shrink_n=args.min_shrink_n,
                               serve_mode=args.serve_mode, fit_blend=args.fit_blend,
                               fit_shares=args.fit_shares)

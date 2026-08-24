@@ -187,5 +187,87 @@ class KindClassificationTests(unittest.TestCase):
             warehouse._hour_bucket("2026-07-16T14:23:01Z"), "20260716T14Z")
 
 
+class PropMarketStoreTests(unittest.TestCase):
+    """load_prop_lines snapshot->db-filter mapping + load_prop_market_store
+    assembling the historical_odds shape (for run_props_odds_backtest --source
+    warehouse), with de-vig-ready implied probs from the American prices."""
+
+    _ROWS = [
+        {"event_id": "E1", "commence_time": "2025-07-01T18:00:00Z",
+         "home_team": "Atlanta Braves", "away_team": "Los Angeles Angels",
+         "game_date": "2025-07-01", "player": "Alex Verdugo",
+         "prop_key": "batter_hits", "line": 0.5,
+         "over_price": -170, "under_price": 125},
+        {"event_id": "E1", "commence_time": "2025-07-01T18:00:00Z",
+         "home_team": "Atlanta Braves", "away_team": "Los Angeles Angels",
+         "game_date": "2025-07-01", "player": "Austin Riley",
+         "prop_key": "batter_total_bases", "line": 1.5,
+         "over_price": 120, "under_price": -140},
+    ]
+
+    def _capture_prop_filters(self, snapshot):
+        seen = {}
+
+        def _fake(sport, dates=None, date_from=None, date_to=None,
+                  exclude_early=False, only_early=False, prop_keys=None,
+                  max_retries=3):
+            seen["exclude_early"] = exclude_early
+            seen["only_early"] = only_early
+            return []
+
+        with patch.object(warehouse, "_sql", return_value=True), \
+             patch.object(warehouse, "_ensure_durable"), \
+             patch.object(warehouse._db, "player_prop_lines", _fake):
+            warehouse.load_prop_lines("baseball_mlb", dates=["2025-07-01"],
+                                      snapshot=snapshot)
+        return seen
+
+    def test_close_excludes_early(self):
+        seen = self._capture_prop_filters("close")
+        self.assertTrue(seen["exclude_early"])   # default = closing set
+        self.assertFalse(seen["only_early"])
+
+    def test_early_reads_only_early(self):
+        seen = self._capture_prop_filters("early")
+        self.assertFalse(seen["exclude_early"])
+        self.assertTrue(seen["only_early"])       # opening/pre-close set
+
+    def test_store_shape_and_implied(self):
+        with patch.object(warehouse, "load_prop_lines",
+                          return_value=list(self._ROWS)):
+            store = warehouse.load_prop_market_store("baseball_mlb",
+                                                     dates=["2025-07-01"])
+        games = store["games"]
+        self.assertEqual(len(games), 1)          # one event -> one game_key
+        entry = next(iter(games.values()))
+        self.assertEqual(entry["home_team"], "Atlanta Braves")
+        self.assertEqual(entry["commence_time"], "2025-07-01T18:00:00Z")
+        props = entry["props"]
+        self.assertEqual(set(props), {"batter_hits", "batter_total_bases"})
+        vh = props["batter_hits"]["Alex Verdugo"]
+        self.assertEqual(vh["line"], 0.5)
+        self.assertEqual(vh["over_price"], -170)
+        # RAW implied (vig in): -170 -> 170/270; +125 -> 100/225. The grader de-vigs.
+        self.assertAlmostEqual(vh["over_implied"], 170 / 270, places=6)
+        self.assertAlmostEqual(vh["under_implied"], 100 / 225, places=6)
+
+    def test_store_threads_snapshot_to_reader(self):
+        seen = {}
+
+        def _fake(sport_key, dates=None, snapshot="close"):
+            seen["snapshot"] = snapshot
+            return []
+
+        with patch.object(warehouse, "load_prop_lines", _fake):
+            warehouse.load_prop_market_store("baseball_mlb", snapshot="early")
+        self.assertEqual(seen["snapshot"], "early")
+
+    def test_store_empty_on_no_rows(self):
+        with patch.object(warehouse, "load_prop_lines", return_value=[]):
+            store = warehouse.load_prop_market_store("baseball_mlb")
+        self.assertEqual(store["games"], {})
+        self.assertEqual(store["sport_key"], "baseball_mlb")
+
+
 if __name__ == "__main__":
     unittest.main()

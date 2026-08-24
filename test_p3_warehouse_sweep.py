@@ -376,5 +376,52 @@ class PlayerStatSeriesTests(unittest.TestCase):
                          ("baseball", "mlb", "Guy", "batter_hits"))
 
 
+class LoadPropStoreTests(unittest.TestCase):
+    """backtest._load_prop_store: props-odds source routing (warehouse vs the local
+    historical_odds JSON) + snapshot threading. Prop sibling of _load_odds_store."""
+
+    def test_warehouse_source_uses_prop_market_store(self):
+        wh = {"sport_key": "baseball_mlb", "games": {"g1": {"props": {}}}}
+        with mock.patch("warehouse.load_prop_market_store", return_value=wh) as m, \
+             mock.patch("backtest.hist_store.load_store") as loc:
+            store, used = backtest._load_prop_store(
+                "baseball_mlb", "", "warehouse", "early")
+        self.assertEqual(used, "warehouse")
+        self.assertIs(store, wh)
+        m.assert_called_once_with("baseball_mlb", snapshot="early")   # snapshot threaded
+        loc.assert_not_called()
+
+    def test_store_source_forces_local_json(self):
+        loc_store = {"sport_key": "baseball_mlb", "games": {"g": {}}}
+        with mock.patch("warehouse.load_prop_market_store") as m, \
+             mock.patch("backtest.hist_store.load_store",
+                        return_value=loc_store) as loc:
+            store, used = backtest._load_prop_store(
+                "baseball_mlb", "", "store", "close")
+        self.assertEqual(used, "store")
+        m.assert_not_called()
+        loc.assert_called_once()
+
+    def test_auto_prefers_warehouse_when_it_has_games(self):
+        wh = {"sport_key": "baseball_mlb", "games": {"g1": {}}}
+        with mock.patch("warehouse.load_prop_market_store", return_value=wh), \
+             mock.patch("backtest.hist_store.load_store") as loc:
+            _store, used = backtest._load_prop_store(
+                "baseball_mlb", "", "auto", "close")
+        self.assertEqual(used, "warehouse")
+        loc.assert_not_called()
+
+    def test_auto_falls_back_to_local_when_warehouse_empty(self):
+        wh = {"sport_key": "baseball_mlb", "games": {}}
+        loc_store = {"sport_key": "baseball_mlb", "games": {"g": {}}}
+        with mock.patch("warehouse.load_prop_market_store", return_value=wh), \
+             mock.patch("backtest.hist_store.load_store",
+                        return_value=loc_store) as loc:
+            _store, used = backtest._load_prop_store(
+                "baseball_mlb", "", "auto", "close")
+        self.assertEqual(used, "store")
+        loc.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
