@@ -42,4 +42,4 @@ experiment_registry.jsonl
 historical_odds/*__apiclean.json
 
 .feature_cache
-historical_odds/baseball_mlb.json
+historical_odds/*.json
