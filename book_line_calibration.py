@@ -488,6 +488,23 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     counters = {"no_game": 0}
     skipped_no_player = 0
 
+    # MLB: pre-load each (role, season) gamelog set in ONE bulk query and look up
+    # per player in memory — avoids one round-trip per (player, season) (thousands
+    # on a multi-season corpus; the join was otherwise network-bound at ~0% CPU).
+    # Lazily filled as (role, season) pairs are encountered. Fail-open -> {}.
+    _bulk_cache = {}
+
+    def _bulk_gamelogs(role, season):
+        key = (role, season)
+        if key not in _bulk_cache:
+            try:
+                import mlb_warehouse
+                _bulk_cache[key] = (
+                    mlb_warehouse.get_calib_gamelogs_bulk(role, season) or {})
+            except Exception:
+                _bulk_cache[key] = {}
+        return _bulk_cache[key]
+
     for _, rows in by_player.items():
         player = rows[0].get("player")
         mlb_id = rows[0].get("player_mlb_id")
@@ -497,7 +514,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
                 continue
             role = _calib_role(rows)
             # Grade each obs against its OWN season's gamelog (season = game_date
-            # year; MLB season == calendar year). One fetch per (player, season).
+            # year; MLB season == calendar year), looked up from the per-season
+            # bulk index (one query per role×season, not per player).
             rows_by_season = defaultdict(list)
             for r in rows:
                 rows_by_season[(r.get("game_date") or "")[:4]].append(r)
@@ -507,13 +525,7 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
                 except (TypeError, ValueError):
                     skipped_no_player += len(srows)
                     continue
-                gamelog = None
-                try:
-                    import mlb_warehouse
-                    gamelog = mlb_warehouse.get_calib_gamelog(
-                        mlb_id, role, season=season) or None
-                except Exception:
-                    gamelog = None
+                gamelog = _bulk_gamelogs(role, season).get(str(mlb_id))
                 if not gamelog:
                     skipped_no_player += len(srows)
                     continue

@@ -2207,6 +2207,75 @@ def get_calib_gamelog(mlb_player_id, role, season=None):
     return out
 
 
+def _game_log_bulk(table, stat_cols, season, exclude_game_types=None):
+    """Bulk _game_log: ONE query returns EVERY athlete's per-game rows for a season,
+    grouped {athlete_id(str): [rec, ...]} in the same row shape as _game_log. The
+    logs are UNORDERED (the caller sorts each). For offline bulk consumers (the
+    calibration join) that would otherwise issue one query per athlete. Fail-open ->
+    {}. No leakage-safe as_of slice here: the calibration reader takes the whole
+    season and does its own strictly-earlier prior_games slice per obs."""
+    if not enabled() or season is None:
+        return {}
+    g = mlb_game
+    joined = table.join(g, table.c.game_pk == g.c.game_pk)
+    cols = [table.c.athlete_id, table.c.game_pk, table.c.team_id,
+            table.c.season_bucket, g.c.game_date, g.c.official_date, g.c.season,
+            g.c.home_team_id, g.c.away_team_id] + [table.c[c] for c in stat_cols]
+    stmt = (select(*cols).select_from(joined)
+            .where(table.c.season_bucket == int(season)))
+    if exclude_game_types:
+        stmt = stmt.where(g.c.game_type.notin_(tuple(exclude_game_types)))
+    # No ORDER BY — the reader sorts each athlete's log most-recent-first itself, so
+    # a server-side sort of the whole season would be pure cost.
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    out = {}
+    for r in rows:
+        m = r._mapping
+        team_id = m["team_id"]
+        is_home = team_id == m["home_team_id"]
+        rec = {"athlete_id": m["athlete_id"], "game_pk": m["game_pk"],
+               "team_id": team_id, "is_home": is_home,
+               "opponent_team_id": m["away_team_id"] if is_home else m["home_team_id"],
+               "game_date": m["game_date"], "official_date": m["official_date"],
+               "season": m["season"]}
+        for c in stat_cols:
+            rec[c] = m[c]
+        out.setdefault(str(m["athlete_id"]), []).append(rec)
+    return out
+
+
+def get_calib_gamelogs_bulk(role, season):
+    """Bulk get_calib_gamelog: {mlb_player_id(str): [game dict, ...]} for ALL players
+    in ``season``, each dict in the ESPN cached_gamelog SHAPE the calibration/backtest
+    readers consume (adds opponent NAME + completed=True). ONE query per (role,
+    season) instead of one per player — the calibration join pre-loads these to
+    avoid thousands of round-trips on a multi-season corpus. Logs are UNORDERED (the
+    reader sorts). role ∈ {'pitcher','batter'}. Fail-open -> {}."""
+    if not enabled():
+        return {}
+    table, stats = ((mlb_pitcher_game, _PITCHER_GAME_STATS) if role == "pitcher"
+                    else (mlb_batter_game, _BATTER_GAME_STATS))
+    by_ath = _game_log_bulk(table, stats, season,
+                            exclude_game_types=_NON_REGULAR_GAME_TYPES)
+    if not by_ath:
+        return {}
+    names = _team_name_map()
+    out = {}
+    for aid, rows in by_ath.items():
+        logs = []
+        for r in rows:
+            gg = dict(r)
+            gg["opponent"] = names.get(r.get("opponent_team_id"))
+            gg["completed"] = True
+            logs.append(gg)
+        out[aid] = logs
+    return out
+
+
 # ── P4 team-market model inputs: recent form / standings / team defense ───────
 # StatsAPI-native team readers for the team markets. recent_games come from
 # mlb_game (per-game scores — no better source); win%/record + team defense come

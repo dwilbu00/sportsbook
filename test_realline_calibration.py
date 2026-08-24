@@ -610,9 +610,12 @@ class JoinToActualsTests(unittest.TestCase):
 
     def _join(self, book_rows, gamelog):
         # MLB calibration is warehouse-only now (no ESPN): source the per-game log
-        # from get_calib_gamelog. The join LOGIC under test (idx binding /
-        # prior_games / doubleheader guard / role gate) is source-independent.
-        with patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog):
+        # from the bulk fetch (one dict {mlb_id: gamelog} per role×season). The join
+        # LOGIC under test (idx binding / prior_games / doubleheader guard / role
+        # gate) is source-independent.
+        ids = {str(r.get("player_mlb_id")) for r in book_rows if r.get("player_mlb_id")}
+        bulk = {i: gamelog for i in ids}
+        with patch("mlb_warehouse.get_calib_gamelogs_bulk", return_value=bulk):
             return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
 
     def test_join_attaches_actual_and_prior_games(self):
@@ -637,12 +640,12 @@ class JoinToActualsTests(unittest.TestCase):
         }
         seasons_seen = []
 
-        def fake(mlb_id, role, season=None, **kw):
+        def fake_bulk(role, season):
             seasons_seen.append(season)
-            return logs.get(season, [])
+            return {"123": logs[season]} if season in logs else {}
 
         rows = [self._book_row(gd="2024-07-24"), self._book_row(gd="2025-07-24")]
-        with patch("mlb_warehouse.get_calib_gamelog", side_effect=fake):
+        with patch("mlb_warehouse.get_calib_gamelogs_bulk", side_effect=fake_bulk):
             out = blc.join_book_lines_to_actuals(rows, "baseball", "mlb")
         self.assertEqual(sorted(seasons_seen), [2024, 2025])   # per-season fetch
         self.assertEqual(sorted(o["actual"] for o in out), [2.0, 3.0])  # both graded
@@ -692,7 +695,8 @@ class JoinToActualsTests(unittest.TestCase):
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 25)])
         row = self._book_row()
         row["player_mlb_id"] = None
-        with patch("mlb_warehouse.get_calib_gamelog", return_value=gl) as wh:
+        with patch("mlb_warehouse.get_calib_gamelogs_bulk",
+                   return_value={"123": gl}) as wh:
             out = blc.join_book_lines_to_actuals([row], "baseball", "mlb")
         self.assertEqual(out, [])
         wh.assert_not_called()
@@ -802,20 +806,16 @@ class JoinIdBridgeTests(_Backend, unittest.TestCase):
         # the warehouse gamelog directly — no ESPN name-cache / gamelog touched.
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(13, 24)]
                            + [("2026-07-24", 2)])
-        seen = {}
-
-        def fake_calib(mlb_id, role, **kw):
-            seen["mlb_id"] = mlb_id
-            return gl
-
+        # The bulk fetch returns ALL players for the role×season; the join picks
+        # this player out by his MLBAM id — no ESPN name-cache / gamelog touched.
         with patch("book_line_calibration.cached_athlete_id") as m_name, \
              patch("book_line_calibration.cached_gamelog") as m_espn, \
-             patch("mlb_warehouse.get_calib_gamelog", side_effect=fake_calib):
+             patch("mlb_warehouse.get_calib_gamelogs_bulk",
+                   return_value={"608070": gl}):
             out = blc.join_book_lines_to_actuals(
                 [self._row("Totally Wrong Spelling")], "baseball", "mlb")
         self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["actual"], 2.0)
-        self.assertEqual(seen["mlb_id"], "608070")   # resolved by MLBAM id
+        self.assertEqual(out[0]["actual"], 2.0)       # resolved by MLBAM id
         m_name.assert_not_called()                    # no ESPN name search
         m_espn.assert_not_called()                    # no ESPN gamelog
 
@@ -826,17 +826,17 @@ class JoinIdBridgeTests(_Backend, unittest.TestCase):
                            + [("2026-07-24", 2)])
         calls = []
 
-        def fake_calib(mlb_id, role, **kw):
-            calls.append(mlb_id)
-            return gl
+        def fake_bulk(role, season):
+            calls.append((role, season))
+            return {"608070": gl}
 
         rows = [self._row("Jose Ramirez", line=0.5),
                 self._row("José Ramírez", line=1.5)]
         with patch("book_line_calibration.cached_athlete_id") as m_name, \
              patch("book_line_calibration.cached_gamelog") as m_espn, \
-             patch("mlb_warehouse.get_calib_gamelog", side_effect=fake_calib):
+             patch("mlb_warehouse.get_calib_gamelogs_bulk", side_effect=fake_bulk):
             out = blc.join_book_lines_to_actuals(rows, "baseball", "mlb")
-        self.assertEqual(len(calls), 1)               # pooled: ONE fetch
+        self.assertEqual(len(calls), 1)               # pooled: ONE bulk fetch
         m_name.assert_not_called()
         m_espn.assert_not_called()
         self.assertEqual(sorted(r["line"] for r in out), [0.5, 1.5])
@@ -846,7 +846,7 @@ class JoinIdBridgeTests(_Backend, unittest.TestCase):
         # falls back to the ESPN name cache.
         with patch("book_line_calibration.cached_athlete_id") as m_name, \
              patch("book_line_calibration.cached_gamelog") as m_espn, \
-             patch("mlb_warehouse.get_calib_gamelog", return_value=[]):
+             patch("mlb_warehouse.get_calib_gamelogs_bulk", return_value={}):
             out = blc.join_book_lines_to_actuals(
                 [self._row("A. Batter", mlb_id="000404")], "baseball", "mlb")
         self.assertEqual(out, [])
@@ -1078,22 +1078,23 @@ class CalibWarehouseCutoverTests(unittest.TestCase):
         with patch.dict(os.environ, {blc._MLB_WAREHOUSE_CALIB_ENV: flag}), \
              patch.object(blc, "cached_athlete_id", return_value="e1"), \
              patch("player_id_map.espn_id_for_mlb_id", return_value=None), \
-             patch("mlb_warehouse.get_calib_gamelog", return_value=wh_log) as wh, \
+             patch("mlb_warehouse.get_calib_gamelogs_bulk",
+                   return_value={"592450": wh_log}) as wh, \
              patch.object(blc, "cached_gamelog", return_value=[]) as esp:
             blc.join_book_lines_to_actuals([self._book_line()], "baseball", "mlb")
         return wh, esp
 
     def test_flag_on_uses_warehouse(self):
         wh, esp = self._run("1")
-        # season-aware join: the fetch carries the obs's season (game_date year).
-        wh.assert_called_once_with("592450", "batter", season=2024)
+        # season-aware bulk join: the fetch carries the obs's role + season (year).
+        wh.assert_called_once_with("batter", 2024)
         esp.assert_not_called()
 
     def test_baseball_warehouse_only_ignores_flag(self):
         # P6 cutover: MLB calibration is warehouse-only regardless of the (now
         # retired) flag — it never falls open to ESPN.
         wh, esp = self._run("")           # flag OFF
-        wh.assert_called_once_with("592450", "batter", season=2024)
+        wh.assert_called_once_with("batter", 2024)
         esp.assert_not_called()
 
 
