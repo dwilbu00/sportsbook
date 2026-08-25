@@ -17,7 +17,10 @@ import requests
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-CACHE_MAX_AGE = 3600  # 1 hour in seconds
+CACHE_MAX_AGE = 300  # 5 minutes — short TTL for FRESH live lines (lines move
+# intraday); was 3600 (1h) to conserve the old tiny credit cap. With the 20K/mo
+# budget a single user's few-per-day analyses refetch cheaply. Historical snapshots
+# are cached permanently (separate path) and are unaffected.
 # When credits are exhausted we may fall back to expired cache for interactive
 # analysis, but only up to this age. Beyond it, pricing bets against the stale
 # line is worse than failing, so we surface the error instead.
