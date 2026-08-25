@@ -732,6 +732,22 @@ def load_value_gate(sport_key):
         out["suppress"] = [supp]
     elif isinstance(supp, (list, tuple, set)):
         out["suppress"] = [str(s) for s in supp]
+    # R5 selectivity config (optional): time_bands = [[max_hours, mult], ...]
+    # (ascending by max_hours); longshot_surcharge = [min_american_price, mult].
+    # Malformed entries are dropped → the caller falls back to its module defaults.
+    def _num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+    tb = gate.get("time_bands")
+    if isinstance(tb, (list, tuple)):
+        bands = [(float(r[0]), float(r[1])) for r in tb
+                 if isinstance(r, (list, tuple)) and len(r) == 2
+                 and _num(r[0]) and _num(r[1])]
+        if bands:
+            out["time_bands"] = bands
+    ls = gate.get("longshot_surcharge")
+    if (isinstance(ls, (list, tuple)) and len(ls) == 2
+            and _num(ls[0]) and _num(ls[1])):
+        out["longshot_surcharge"] = (float(ls[0]), float(ls[1]))
     return out
 
 

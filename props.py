@@ -9,6 +9,7 @@ analysis re-exports these names for backward compatibility.
 """
 
 import os
+from datetime import datetime, timezone
 
 from calibration_loader import (
     apply_calibration_with_warmup,
@@ -942,9 +943,42 @@ def _player_prop_half_life(sport_key):
 # DK-only line with no independent market check.
 _DK_SELFDEVIG_EDGE_MULT = 2.0
 
+# ── R5 selectivity: demand MORE edge/EV the EARLIER a bet is placed (early lines
+# are noise that reverts toward the sharp close) and on LONGSHOT plus-money legs
+# (favorite-longshot bias + thin fair-prob estimates). These multipliers scale the
+# value-gate floors. Tunable per sport via value_gate ("time_bands",
+# "longshot_surcharge"); the module defaults below apply when a sport hasn't tuned
+# them. STARTING values — backtest-tune once the multi-book/close data lands.
+# hours_to_pitch=None (missing commence) or empty config → 1.0 (no scaling;
+# byte-identical to the pre-R5 gate).
+_DEFAULT_GATE_TIME_BANDS = [(2.0, 1.0), (6.0, 1.5), (1e9, 2.0)]   # (max_hours, mult)
+_DEFAULT_GATE_LONGSHOT = (150.0, 1.5)   # American price >= +150 → mult
+
+
+def _gate_floor_mult(hours_to_pitch, price, time_bands, longshot):
+    """Combined value-gate floor multiplier (R5): escalate the required edge/EV the
+    earlier the bet (early edges revert) and on longshot plus-money legs. Returns
+    1.0 when inputs/config are absent (pre-R5 behavior). ``time_bands`` = ascending
+    [(max_hours, mult), ...]; ``longshot`` = (min_american_price, mult)."""
+    mult = 1.0
+    if hours_to_pitch is not None and time_bands:
+        for max_h, m in time_bands:
+            if hours_to_pitch <= max_h:
+                mult *= m
+                break
+    if price is not None and longshot:
+        try:
+            if float(price) >= float(longshot[0]):   # plus-money longshot
+                mult *= float(longshot[1])
+        except (TypeError, ValueError, IndexError):
+            pass
+    return mult
+
 
 def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
-                        suppress, legacy_threshold, dk_alone):
+                        suppress, legacy_threshold, dk_alone,
+                        hours_to_pitch=None, price=None,
+                        time_bands=None, longshot=None):
     """Recommendation-gate decision for one prop side (pure + unit-testable).
 
     Two gate shapes, selected by whether a calibrated ``ev_floor`` is present:
@@ -967,17 +1001,19 @@ def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
     """
     if prop_key in (suppress or ()):
         return False
+    r5 = _gate_floor_mult(hours_to_pitch, price, time_bands, longshot)
     if ev_floor is not None:
-        ev = ev_floor
-        floor = (edge_floor or 0.0)
+        ev = ev_floor * r5
+        floor = (edge_floor or 0.0) * r5
         if dk_alone:
             ev *= _DK_SELFDEVIG_EDGE_MULT
             floor *= _DK_SELFDEVIG_EDGE_MULT
         return (expected_roi is not None
                 and expected_roi >= ev
                 and edge >= floor)
-    eff_threshold = (legacy_threshold * _DK_SELFDEVIG_EDGE_MULT if dk_alone
-                     else legacy_threshold)
+    eff_threshold = legacy_threshold * r5
+    if dk_alone:
+        eff_threshold *= _DK_SELFDEVIG_EDGE_MULT
     return _prop_is_value(edge, eff_threshold, expected_roi)
 
 
@@ -1034,6 +1070,21 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     # US-Eastern local date (a late US game's UTC date is one day ahead), so the
     # outcome resolver buckets the prediction under its official game date.
     log_game_date = et_local_date(commence_iso) if commence_iso else None
+
+    # R5 selectivity inputs (computed once per game): hours until first pitch (the
+    # gate demands more edge/EV early, since early edges revert toward the sharp
+    # close) + the value_gate's time-band / longshot config, falling back to the
+    # module defaults when a sport hasn't tuned them.
+    gate_time_bands = value_gate.get("time_bands", _DEFAULT_GATE_TIME_BANDS)
+    gate_longshot = value_gate.get("longshot_surcharge", _DEFAULT_GATE_LONGSHOT)
+    hours_to_pitch = None
+    if commence_iso:
+        try:
+            _ct = datetime.fromisoformat(str(commence_iso).replace("Z", "+00:00"))
+            hours_to_pitch = (
+                _ct - datetime.now(timezone.utc)).total_seconds() / 3600.0
+        except (TypeError, ValueError):
+            hours_to_pitch = None
 
     def _knob(prop_key, name, default):
         cfg = calibration.get(prop_key) if calibration else None
@@ -1876,7 +1927,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         == "dk_selfdevig_fallback")
             is_value = _prop_gate_is_value(
                 edge, expected_roi, prop_key, gate_ev_floor, gate_edge_floor,
-                gate_suppress, threshold, dk_alone)
+                gate_suppress, threshold, dk_alone,
+                hours_to_pitch=hours_to_pitch, price=best_price,
+                time_bands=gate_time_bands, longshot=gate_longshot)
 
             # §2.4b-2 direction split: demote losing UNDER picks on cheap lines
             # (batter_hits under 0.5 wins only ~43% OOS) from recommendations.

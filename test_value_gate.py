@@ -11,7 +11,8 @@ import tempfile
 import unittest
 
 import calibration_loader as cl
-from props import _prop_gate_is_value, _DK_SELFDEVIG_EDGE_MULT
+from props import (_prop_gate_is_value, _DK_SELFDEVIG_EDGE_MULT, _gate_floor_mult,
+                   _DEFAULT_GATE_TIME_BANDS, _DEFAULT_GATE_LONGSHOT)
 
 
 class PropGateDecisionTests(unittest.TestCase):
@@ -84,6 +85,47 @@ class PropGateDecisionTests(unittest.TestCase):
         self.assertEqual(_DK_SELFDEVIG_EDGE_MULT, 2.0)
 
 
+class R5SelectivityTests(unittest.TestCase):
+    """R5: the gate scales its edge/EV floors UP the earlier the bet (early edges
+    revert) and on longshot plus-money legs. hours_to_pitch/price None or no config
+    → multiplier 1.0 (pre-R5 behavior)."""
+
+    def test_mult_no_inputs_is_one(self):
+        self.assertEqual(_gate_floor_mult(None, None, None, None), 1.0)
+        self.assertEqual(_gate_floor_mult(None, None, _DEFAULT_GATE_TIME_BANDS,
+                                          _DEFAULT_GATE_LONGSHOT), 1.0)
+
+    def test_mult_time_bands(self):
+        tb = _DEFAULT_GATE_TIME_BANDS   # [(2,1.0),(6,1.5),(inf,2.0)]
+        self.assertEqual(_gate_floor_mult(1.0, None, tb, None), 1.0)   # <2h
+        self.assertEqual(_gate_floor_mult(4.0, None, tb, None), 1.5)   # 2-6h
+        self.assertEqual(_gate_floor_mult(9.0, None, tb, None), 2.0)   # >6h (early)
+
+    def test_mult_longshot_surcharge(self):
+        ls = _DEFAULT_GATE_LONGSHOT   # (150, 1.5)
+        self.assertEqual(_gate_floor_mult(None, 200, None, ls), 1.5)   # +200 longshot
+        self.assertEqual(_gate_floor_mult(None, -150, None, ls), 1.0)  # favorite
+        self.assertEqual(_gate_floor_mult(None, 120, None, ls), 1.0)   # +120 < +150
+
+    def test_mult_stacks_early_and_longshot(self):
+        self.assertEqual(_gate_floor_mult(9.0, 200, _DEFAULT_GATE_TIME_BANDS,
+                                          _DEFAULT_GATE_LONGSHOT), 3.0)  # 2.0 * 1.5
+
+    def test_gate_early_demands_more_edge(self):
+        base = dict(prop_key="batter_hits", ev_floor=0.04, edge_floor=0.01,
+                    suppress=(), legacy_threshold=0.05, dk_alone=False,
+                    time_bands=_DEFAULT_GATE_TIME_BANDS, longshot=None)
+        # <2h: mult 1.0 → 1% edge / 4% EV floors → a 1.5%-edge, 5%-EV bet passes.
+        self.assertTrue(_prop_gate_is_value(0.015, 0.05, hours_to_pitch=1.0, **base))
+        # 9h out: floors x2 → 2% edge floor rejects the same 1.5%-edge bet.
+        self.assertFalse(_prop_gate_is_value(0.015, 0.05, hours_to_pitch=9.0, **base))
+
+    def test_gate_backward_compatible_when_unscaled(self):
+        # No R5 inputs → identical to the pre-R5 decision.
+        self.assertTrue(_prop_gate_is_value(
+            0.02, 0.05, "batter_hits", 0.04, 0.01, (), 0.05, False))
+
+
 class ValueGateIOTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.mkdtemp()
@@ -133,6 +175,17 @@ class ValueGateIOTests(unittest.TestCase):
         self.assertEqual(blob["props"]["batter_hits"]["method"], "E")
         self.assertEqual(blob["prob_shrink"], {"moneyline": 0.25})
         self.assertEqual(blob["value_gate"], {"ev_floor": 0.04})
+
+    def test_load_parses_r5_config(self):
+        import json
+        cl.save_value_gate("baseball_mlb", {"ev_floor": 0.04})
+        blob = json.load(open(cl.calibration_path("baseball_mlb")))
+        blob["value_gate"]["time_bands"] = [[2, 1.0], [6, 1.5], ["bad", 2]]
+        blob["value_gate"]["longshot_surcharge"] = [150, 1.5]
+        json.dump(blob, open(cl.calibration_path("baseball_mlb"), "w"))
+        gate = cl.load_value_gate("baseball_mlb")
+        self.assertEqual(gate["time_bands"], [(2.0, 1.0), (6.0, 1.5)])  # bad row dropped
+        self.assertEqual(gate["longshot_surcharge"], (150.0, 1.5))
 
 
 if __name__ == "__main__":
