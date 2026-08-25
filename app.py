@@ -490,6 +490,7 @@ def _selected_kelly_rows(ar, valid_keys=None):
     ``_submit_selected_picks``."""
     import wagers
     import bankroll as bankroll_mod
+    import bet_selector
     bankroll = bankroll_mod.current_balance()  # durable ledger balance, not a widget
     fraction = _kelly_float("kelly_fraction")
     cap_pct = _kelly_float("kelly_cap_pct")
@@ -497,7 +498,7 @@ def _selected_kelly_rows(ar, valid_keys=None):
     events = ar.get("events", {})
     sport_key = ar.get("sport_key")
     placed_at = datetime.now(timezone.utc).isoformat()
-    built = []  # (selection_key, row)
+    built = []  # (selection_key, row, corr_leg)
     seq = 0
     for sel_key, bet_type, side, candidate in _iter_wager_candidates(ar):
         if not st.session_state.get(sel_key, False):
@@ -521,16 +522,24 @@ def _selected_kelly_rows(ar, valid_keys=None):
         except Exception:
             row = None
         if row:
-            built.append((sel_key, row))
+            built.append((sel_key, row,
+                          bet_selector._leg(bet_type, side, candidate)))
             seq += 1
+    # R6 correlation haircut: shrink each leg's Kelly stake by its positive-
+    # correlation load with the rest of the slate (same-game / same-pitcher legs
+    # don't diversify, so independent sizing overbets the cluster) BEFORE the
+    # slate-total cap. Both size off the one frozen bankroll snapshot read above.
+    haircut = bet_selector.correlation_haircut(
+        [r.get("stake") for _k, r, _lg in built],
+        [lg for _k, _r, lg in built], sport_key)
     # Slate-total exposure cap: scale the whole batch down proportionally so the
     # sum of stakes never exceeds slate_pct% of bankroll.
     scaled = pricing_common.scale_to_slate_cap(
-        [r.get("stake") for _k, r in built], bankroll, slate_pct / 100.0)
-    for (_sel_key, row), stake in zip(built, scaled):
+        haircut, bankroll, slate_pct / 100.0)
+    for (_sel_key, row, _lg), stake in zip(built, scaled):
         row["stake"] = stake
-    rows = [row for _k, row in built]
-    stake_by_key = {sel_key: row.get("stake") for sel_key, row in built}
+    rows = [row for _k, row, _lg in built]
+    stake_by_key = {sel_key: row.get("stake") for sel_key, row, _lg in built}
     return rows, stake_by_key
 
 

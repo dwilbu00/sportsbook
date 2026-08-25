@@ -136,6 +136,44 @@ def _leg(bet_type, side, cand):
     }
 
 
+def correlation_haircut(stakes, legs, sport_key):
+    """R6 (honest Kelly): shrink each leg's stake by its POSITIVE-correlation load
+    with the rest of the slate so positively-correlated legs (same game / same
+    pitcher / shared game conditions) aren't overbet when sized independently.
+
+        stake_i *= 1 / (1 + sum_{j!=i} max(rho_ij, 0))
+
+    with rho from parlay._pair_correlation (0.0 cross-game). Fully independent legs
+    are unchanged; a cluster of n positively-correlated legs collapses toward one
+    leg's total exposure (n perfectly-correlated → 1/n each). Sizing correlated legs
+    off a frozen bankroll without this overbets the cluster (an all-+EV slate can
+    still lose). ``legs`` are _leg()-shape dicts aligned 1:1 with ``stakes``; a None
+    leg or falsy stake passes through untouched. Returns a NEW list. Never raises."""
+    n = len(stakes)
+    if n <= 1:
+        return list(stakes)
+    out = []
+    for i in range(n):
+        s = stakes[i]
+        leg_i = legs[i] if i < len(legs) else None
+        if not s or leg_i is None:
+            out.append(s)
+            continue
+        load = 0.0
+        for j in range(n):
+            leg_j = legs[j] if j < len(legs) else None
+            if j == i or leg_j is None:
+                continue
+            try:
+                rho = parlay._pair_correlation(leg_i, leg_j, sport_key)
+            except Exception:
+                rho = 0.0
+            if rho > 0:
+                load += rho
+        out.append(s / (1.0 + load))
+    return out
+
+
 # ── MLB slate rules (L3) ───────────────────────────────────────────────────
 
 def _is_batter_hits_over(rec):

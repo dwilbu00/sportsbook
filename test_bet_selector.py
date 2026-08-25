@@ -260,5 +260,58 @@ class EarnedRunsStrikeoutsConflictTests(unittest.TestCase):
             sorted(bet_selector.select_top_bets(pool, MLB, 5, "ev")), ["er", "k"])
 
 
+class CorrelationHaircutTests(unittest.TestCase):
+    """R6: correlation_haircut shrinks each stake by its positive-correlation load
+    (1/(1+sum max(rho,0))); independent legs unchanged, negative-corr not haircut."""
+
+    def _legs(self, entries):
+        return [bet_selector._leg(bt, side, cand)
+                for _k, bt, side, cand in entries]
+
+    def test_independent_legs_unchanged(self):
+        legs = self._legs([
+            _prop("a", "g1", "NYY", "batter_hits", "OVER", 5.0),
+            _prop("b", "g2", "BOS", "batter_hits", "OVER", 5.0)])   # different games
+        self.assertEqual(
+            bet_selector.correlation_haircut([10.0, 10.0], legs, "baseball_mlb"),
+            [10.0, 10.0])
+
+    def test_same_game_generic_shrink(self):
+        legs = self._legs([
+            _prop("a", "g1", "NYY", "batter_hits", "OVER", 5.0, player="A"),
+            _prop("b", "g1", "NYY", "batter_hits", "OVER", 5.0, player="B")])
+        out = bet_selector.correlation_haircut([10.0, 10.0], legs, "baseball_mlb")
+        self.assertAlmostEqual(out[0], 10.0 / 1.05, places=6)   # generic +0.05
+        self.assertAlmostEqual(out[1], 10.0 / 1.05, places=6)
+
+    def test_negative_correlation_not_haircut(self):
+        # Same-pitcher ER-over vs K-over = -0.35 → no positive load → unchanged.
+        legs = self._legs([
+            _prop("a", "g1", "NYY", "pitcher_earned_runs", "OVER", 5.0, player="Ace"),
+            _prop("b", "g1", "NYY", "pitcher_strikeouts", "OVER", 5.0, player="Ace")])
+        self.assertEqual(
+            bet_selector.correlation_haircut([10.0, 10.0], legs, "baseball_mlb"),
+            [10.0, 10.0])
+
+    def test_cluster_of_three_collapses(self):
+        legs = self._legs([
+            _prop(k, "g1", "NYY", "batter_hits", "OVER", 5.0, player=k)
+            for k in ("a", "b", "c")])                 # each loaded 2*0.05 = 0.10
+        out = bet_selector.correlation_haircut([9.0, 9.0, 9.0], legs, "baseball_mlb")
+        for v in out:
+            self.assertAlmostEqual(v, 9.0 / 1.10, places=6)
+
+    def test_falsy_and_single_pass_through(self):
+        legs = self._legs([
+            _prop("a", "g1", "NYY", "batter_hits", "OVER", 5.0),
+            _prop("b", "g1", "NYY", "batter_hits", "OVER", 5.0)])
+        self.assertEqual(
+            bet_selector.correlation_haircut([0.0, None], legs, "baseball_mlb"),
+            [0.0, None])
+        self.assertEqual(
+            bet_selector.correlation_haircut([10.0], [legs[0]], "baseball_mlb"),
+            [10.0])
+
+
 if __name__ == "__main__":
     unittest.main()
