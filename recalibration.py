@@ -2552,7 +2552,26 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key,
         # Offline bootstrap: write the local file only (committed to git and
         # shipped as the Cloud baseline). The production SQL store is populated by
         # the online refit loop, not by local seed runs.
-        save_recalibration(sport_key, per_prop_params,
+        #
+        # MERGE onto the existing committed props (new fits win on key collision).
+        # A seed fits every eligible prop at once, but a prop whose Platt can't beat
+        # raw on the folds this run (e.g. a well-calibrated batter_hits under D+xBA)
+        # produces NO fit — and save_recalibration replaces props wholesale, so a
+        # bare overwrite would DROP that prop's already-validated fit. Merging keeps
+        # untouched fits intact so an incremental/partial seed is non-destructive.
+        # (For a true clean slate, delete the file first.)
+        existing = {}
+        try:
+            with open(recalibration_path(sport_key), "r", encoding="utf-8") as f:
+                existing = (json.load(f).get("props") or {})
+        except Exception:
+            existing = {}
+        preserved = sorted(k for k in existing if k not in per_prop_params)
+        merged = {**existing, **per_prop_params}
+        if preserved:
+            print(f"[seed] preserved {len(preserved)} existing fit(s) not re-fit this "
+                  f"run (kept intact, not dropped): {preserved}")
+        save_recalibration(sport_key, merged,
                            meta={"source": "book_line_cache_seed"},
                            to_blob=False)
         _LOAD_CACHE.pop(sport_key, None)
