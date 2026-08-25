@@ -115,6 +115,42 @@ class AdditiveCandidateReadTests(unittest.TestCase):
         cl.set_serving_candidate(True)                                 # clears the cache
         self.assertAlmostEqual(pc._shrink_factor(SK, "totals"), 0.2)   # re-reads candidate
 
+    # ── PROPS (load_calibration) candidate-awareness ──────────────────────────
+    # Regression guard: load_calibration (the PROPS method-selection reader) must
+    # honor serving-candidate too, else a staged --seasons props refit silently
+    # grades on LIVE (the C->E flip that read identical-to-live and tripped the
+    # holdout-validation sanity check). Mirrors the team-reader invariants above.
+    def _write_props(self, path, method):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sport_key": SK,
+                       "props": {"pitcher_earned_runs": {"method": method}}}, f)
+
+    def _method(self):
+        return (cl.load_calibration(SK).get("pitcher_earned_runs") or {}).get("method")
+
+    def test_props_off_reads_live_even_with_candidate(self):
+        self._write_props(cl.calibration_path(SK), "C")
+        self._write_props(cl.candidate_path(SK), "E")
+        self.assertEqual(self._method(), "C")             # serving = live (default)
+
+    def test_props_write_staging_alone_does_not_change_serving(self):
+        self._write_props(cl.calibration_path(SK), "C")
+        self._write_props(cl.candidate_path(SK), "E")
+        cl.set_candidate_mode(True)
+        self.assertEqual(self._method(), "C")             # still live mid-staging
+        cl.set_candidate_mode(False)
+
+    def test_props_serving_candidate_reads_candidate(self):
+        self._write_props(cl.calibration_path(SK), "C")
+        self._write_props(cl.candidate_path(SK), "E")
+        cl.set_serving_candidate(True)
+        self.assertEqual(self._method(), "E")             # backtest = candidate
+
+    def test_props_serving_candidate_no_candidate_falls_back_to_live(self):
+        self._write_props(cl.calibration_path(SK), "C")
+        cl.set_serving_candidate(True)                     # no candidate file
+        self.assertEqual(self._method(), "C")
+
 
 class CandidateStagingTests(unittest.TestCase):
     def setUp(self):

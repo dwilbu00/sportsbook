@@ -167,8 +167,15 @@ def load_calibration(sport_key):
     Load calibration for a sport. Returns a dict of {prop_key: prop_cfg} or
     an empty dict if no calibration file exists for this sport.
     Failures are silent — analyzers fall back to defaults.
+
+    Candidate-aware via _serving_path (the SAME offline-only mechanism the team-market
+    readers use through _serving_blob): the live app never enables serving-candidate mode,
+    so _SERVING_CANDIDATE stays False and this reads the LIVE file byte-identically. An
+    offline backtest that calls set_serving_candidate(True) grades a STAGED candidate's
+    PROPS on a holdout without promoting. Props were previously left on the live file, so a
+    staged --seasons refit couldn't be graded through the props path — this closes that gap.
     """
-    path = calibration_path(sport_key)
+    path = _serving_path(sport_key)
     if not os.path.exists(path):
         return {}
     try:
