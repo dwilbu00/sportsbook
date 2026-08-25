@@ -2345,12 +2345,19 @@ def maybe_auto_refit(sport_key):
 # Bootstrap from existing book-line cache
 # ──────────────────────────────────────────────────────────────────────────────
 
-def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_props):
+def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key,
+                              target_props, seasons=None):
     """
     Use existing odds-cache snapshots + ESPN gamelogs to fit Platt with the
     *current production* analysis pipeline (no need for new predictions to
     accumulate first). Calls book_line_calibration's machinery to produce
     (raw_prob, outcome) pairs, then fits Platt per prop.
+
+    ``seasons`` (list of ints, e.g. [2024, 2025, 2026]) scopes the fit to those
+    game-date years and EXCLUDES all others — critical for MLB, where the 2023
+    pitch-clock regime differs materially and must be kept out of the fit (the
+    warehouse now holds a 2023-onward backfill). None = all years (prints the
+    per-year counts either way so an unscoped run is never silent).
 
     Returns dict {prop_key: (a, b, n_fit)} actually fit & saved.
     """
@@ -2383,9 +2390,37 @@ def seed_from_book_line_cache(sport, espn_sport, espn_league, sport_key, target_
         book_lines = harvest_book_lines(sport_key, target_props)
     if not book_lines:
         return {}
+
+    # Season scoping + visibility. For MLB the game_date YEAR == season (no
+    # cross-year boundary), so a year filter cleanly drops unwanted regimes
+    # (2023 pitch-clock). Print per-year line counts BEFORE and AFTER the filter
+    # so every seed run shows exactly what it's fitting on (answers "is it finding
+    # enough / is 2023 leaking in").
+    from collections import Counter
+
+    def _yr(row):
+        s = str(row.get("game_date") or "")
+        return s[:4] if len(s) >= 4 else "?"
+
+    pre = Counter(_yr(r) for r in book_lines)
+    print(f"[seed] book-line years (pre-filter): "
+          f"{dict(sorted(pre.items()))}")
+    if seasons:
+        keep = {str(int(s)) for s in seasons}
+        book_lines = [r for r in book_lines if _yr(r) in keep]
+        print(f"[seed] season filter {sorted(keep)} -> {len(book_lines)} book lines "
+              f"(excluded {dict(sorted((y, n) for y, n in pre.items() if y not in keep))})")
+        if not book_lines:
+            print("[seed] no book lines in the requested seasons.")
+            return {}
+
     enriched = join_book_lines_to_actuals(book_lines, espn_sport, espn_league)
     if not enriched:
         return {}
+    ematch = Counter(_yr(o) for o in enriched)
+    print(f"[seed] matched {len(enriched)}/{len(book_lines)} book lines to actuals "
+          f"({len(book_lines) - len(enriched)} dropped: DNP / missing fact / id gap); "
+          f"matched years: {dict(sorted(ematch.items()))}")
 
     cal = _load_cal(sport_key) or {}
 
@@ -2542,9 +2577,17 @@ def _main_cli():
                    help="Resolve pending outcomes and refit Platt from the "
                         "prediction log.")
     p.add_argument("--sport", choices=list(SPORT_MAP.keys()), default="nba")
+    p.add_argument("--seasons", default=None,
+                   help="(--seed) Comma-separated game-date years to fit on, e.g. "
+                        "'2024,2025,2026'. EXCLUDES all other years — use this to "
+                        "keep the MLB 2023 pitch-clock regime out of the Platt fit "
+                        "(the warehouse now holds a 2023-onward backfill). Omit = "
+                        "all years (the per-year counts still print).")
     p.add_argument("--show", action="store_true",
                    help="Print current recalibration params for the sport.")
     args = p.parse_args()
+    seasons = ([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+               if args.seasons else None)
 
     # Target the durable SQL backend when the SQL_* secrets are
     # configured (mirrors the app's boot promotion + refit_calibration.main;
@@ -2563,9 +2606,11 @@ def _main_cli():
     target_props = PROPS_BY_SPORT.get(args.sport, [])
 
     if args.seed:
-        print(f"Seeding Platt fit for {sport_key} from cached book lines...")
+        _slbl = ",".join(str(s) for s in seasons) if seasons else "ALL"
+        print(f"Seeding Platt fit for {sport_key} from cached book lines "
+              f"(seasons={_slbl})...")
         fits = seed_from_book_line_cache(args.sport, espn_sport, espn_league,
-                                         sport_key, target_props)
+                                         sport_key, target_props, seasons=seasons)
         if not fits:
             print("  Nothing fit — not enough cached lines + outcomes.")
         else:
