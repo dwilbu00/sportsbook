@@ -6,6 +6,7 @@ Includes file-based caching to avoid redundant API calls.
 
 import hashlib
 import json
+import math
 import os
 import random
 import statistics
@@ -540,20 +541,49 @@ def is_historical_events_cached(sport, date):
 
 def devig_two_way(implied_a, implied_b):
     """
-    Remove the bookmaker margin (vig) from a two-outcome market by normalizing
-    the raw implied probabilities so they sum to 1.
+    Remove the bookmaker margin (vig) from a two-outcome market and return the
+    fair (vig-free) probabilities, via Clarke's POWER method: solve for the
+    exponent k with ``implied_a**k + implied_b**k == 1`` (Newton from k0=1; the
+    raw implied probs sum to >1, so k>1), then ``fair_i = implied_i**k`` normalized.
+
+    WHY POWER, NOT MULTIPLICATIVE: Clarke, Kovalchik & Ingram (2017) find the power
+    method the most accurate margin-removal across datasets. The old multiplicative
+    normalization (implied_i / sum) systematically INFLATES longshot fair probs and
+    deflates favorites, so every underdog/plus-money "edge" was computed against a
+    biased-high baseline — a mechanical source of phantom value bets. Power removes
+    proportionally more vig from the favorite, deflating the longshot's fair prob.
+    Degrades to multiplicative on any degenerate/non-converging input.
 
     The live american_to_implied_prob() keeps the vig in, so raw two-sided
     probabilities sum to >1 and any edge computed against them is biased low.
-    Use this to turn closing-line prices into a true market probability.
 
     Returns:
         tuple: (fair_prob_a, fair_prob_b). Returns (0.5, 0.5) on degenerate input.
     """
     total = implied_a + implied_b
-    if total <= 0:
+    if not (total > 0) or not math.isfinite(total):
         return 0.5, 0.5
-    return implied_a / total, implied_b / total
+    a = min(max(float(implied_a), 1e-12), 1.0 - 1e-12)
+    b = min(max(float(implied_b), 1e-12), 1.0 - 1e-12)
+    la, lb = math.log(a), math.log(b)
+    k = 1.0
+    for _ in range(50):
+        ak, bk = a ** k, b ** k
+        f = ak + bk - 1.0
+        fp = ak * la + bk * lb            # d/dk (a**k + b**k)
+        if abs(fp) < 1e-15:
+            break
+        step = f / fp
+        k -= step
+        if not math.isfinite(k) or k <= 0:  # left the valid region → fall back
+            return implied_a / total, implied_b / total
+        if abs(step) < 1e-12:
+            break
+    ak, bk = a ** k, b ** k
+    tot = ak + bk
+    if not (tot > 0) or not math.isfinite(tot):
+        return implied_a / total, implied_b / total
+    return ak / tot, bk / tot
 
 
 def get_remaining_credits():

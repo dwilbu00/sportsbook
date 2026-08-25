@@ -127,7 +127,13 @@ class DevigFairBaselineTests(unittest.TestCase):
         over = american_to_implied_prob(-200)          # 0.6667
         under = american_to_implied_prob(150)          # 0.40
         fair = analysis._devig_fair(over, under)
-        self.assertAlmostEqual(fair, over / (over + under), places=9)
+        # Clarke POWER-method devig: the favorite's fair prob sits ABOVE the naive
+        # multiplicative split (power deflates longshots / inflates favorites).
+        mult = over / (over + under)          # old multiplicative value (~0.625)
+        self.assertGreater(fair, 0.5)         # favorite
+        self.assertLess(fair, over)           # vig removed
+        self.assertGreater(fair, mult)        # power > multiplicative for the favorite
+        self.assertAlmostEqual(fair, 0.6379, places=3)   # power value, -200/+150
 
     def test_one_sided_market_falls_back_to_raw(self):
         raw = american_to_implied_prob(-110)

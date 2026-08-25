@@ -1879,9 +1879,13 @@ class SharpWeightedConsensusTests(unittest.TestCase):
             self._book("Pinnacle", 200, -250),     # fair_over ~0.318
         ])
         info = parse_player_props(game)["props"]["batter_hits"]["P"]
-        # Weighted (Pinnacle x3): (0.5+0.5+3*0.3182)/5 ≈ 0.391, vs plain mean
-        # ≈ 0.439. Consensus is pulled toward the sharp book.
-        self.assertAlmostEqual(info["over_implied"], 0.3909, places=3)
+        # Pinnacle weighted x3 pulls the consensus toward the sharp book, below the
+        # plain mean (~0.439). Method-agnostic: recompute the sharp fair via the live
+        # devig so this pins the WEIGHTING behavior, not a devig-method constant.
+        from odds_client import american_to_implied_prob as _imp, devig_two_way as _dv
+        pin_over = _dv(_imp(200), _imp(-250))[0]
+        expected = (0.5 + 0.5 + 3 * pin_over) / 5
+        self.assertAlmostEqual(info["over_implied"], expected, places=3)
         self.assertLess(info["over_implied"], 0.439)
 
     def test_stale_book_dropped(self):
@@ -1896,10 +1900,14 @@ class SharpWeightedConsensusTests(unittest.TestCase):
     def test_no_sharp_no_timestamp_matches_plain_mean(self):
         game = self._game([
             self._book("Book A", -110, -110),     # fair_over 0.5000
-            self._book("Book B", 100, -120),      # fair_over ~0.4783
+            self._book("Book B", 100, -120),      # power fair_over ~0.477
         ])
         info = parse_player_props(game)["props"]["batter_hits"]["P"]
-        self.assertAlmostEqual(info["over_implied"], (0.5 + 0.4783) / 2, places=3)
+        # Method-agnostic: recompute each book's fair over via the live devig, so
+        # this pins the CONSENSUS==plain-mean property, not a devig-method constant.
+        from odds_client import american_to_implied_prob as _imp, devig_two_way as _dv
+        b_over = _dv(_imp(100), _imp(-120))[0]
+        self.assertAlmostEqual(info["over_implied"], (0.5 + b_over) / 2, places=3)
 
 
 class MarketPriorShrinkageTests(unittest.TestCase):

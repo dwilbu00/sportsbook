@@ -156,11 +156,13 @@ class RoiBuildRowsTests(unittest.TestCase):
         self.assertEqual(r["game_date"], "2026-07-01")
 
     def test_asymmetric_prices_devig(self):
-        # -140 over / +120 under: fair over prob > 0.5. Raw implieds 0.5833 / 0.4545
-        # sum 1.0379; de-vigged over = 0.5833/1.0379 ~ 0.562.
+        # -140 over / +120 under: raw implieds 0.5833 / 0.4545 (favorite over).
+        # Clarke POWER devig gives fair over ~0.5656, ABOVE the naive multiplicative
+        # 0.5833/1.03788 ~ 0.562 (power inflates the favorite / deflates the dog).
         rows = self._build([_bobs("batter_hits", -140, 120)])
         self.assertGreater(rows[0]["mkt_over"], 0.5)
-        self.assertAlmostEqual(rows[0]["mkt_over"], 0.5833 / 1.03788, places=3)
+        self.assertGreater(rows[0]["mkt_over"], 0.5833 / 1.03788)   # power > multiplicative
+        self.assertAlmostEqual(rows[0]["mkt_over"], 0.5656, places=3)
 
     def test_unpriced_row_kept_with_none_market(self):
         rows = self._build([_bobs("batter_hits", None, None)])
