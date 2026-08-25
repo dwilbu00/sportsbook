@@ -119,7 +119,13 @@ ROI_TIEBREAK_THRESHOLD = 0.05      # edge threshold for the sim (matches diagnos
 # that bucket — else it inherits the pooled method. Ships inert until a bucket
 # earns it.
 LINE_CONDITIONAL_PROPS = {"batter_hits"}
-LINE_BUCKETS = [0.5, None]          # ascending max_line; None = open-ended top
+LINE_BUCKETS = [0.5, 1.5, None]     # ascending max_line; None = open-ended top.
+# Buckets: <=0.5 ("gets one"), (0.5,1.5] ("2+"), >1.5. The 1.5 split was added so
+# RBI/TB (and any prop) can adopt a distinct method at the common 1.5 line instead
+# of lumping it with 2.5/3.5 in one top bucket. Global, but the per-bucket adopt
+# guard (n>=MIN_BUCKET_OBS + gate-confirmed winner beats pooled by
+# MIN_CALIB_BRIER_GAIN) means a prop only gets the finer split where it actually
+# helps -- an unhelpful bucket just inherits the pooled method (inert).
 # Per-bucket floor before a bucket can flip. Comfortably above the 2-fold
 # confirmation gate's own minimum (~60 obs to form the two expanding folds) for a
 # more robust confirmation, but below the whole-prop obs count so a higher-line

@@ -338,10 +338,11 @@ class DiagnoseFeaturesEndToEndTests(unittest.TestCase):
 # ── per-line-bucket lens (Track 2): partition helpers + diagnose_features pass ──
 class PartitionHelperTests(unittest.TestCase):
     def test_line_bucket_key(self):
-        # LINE_BUCKETS = [0.5, None]: line <= 0.5 -> 'le_0.5', else 'top'.
+        # LINE_BUCKETS = [0.5, 1.5, None]: <=0.5 -> 'le_0.5', (0.5,1.5] -> 'le_1.5',
+        # else 'top'.
         self.assertEqual(rc._line_bucket_key(0.0), "le_0.5")
         self.assertEqual(rc._line_bucket_key(0.5), "le_0.5")
-        self.assertEqual(rc._line_bucket_key(1.5), "top")
+        self.assertEqual(rc._line_bucket_key(1.5), "le_1.5")
         self.assertEqual(rc._line_bucket_key(2.5), "top")
         self.assertIsNone(rc._line_bucket_key(None))
         self.assertIsNone(rc._line_bucket_key("x"))
@@ -350,9 +351,11 @@ class PartitionHelperTests(unittest.TestCase):
         rows = [{"line": 1.5}, {"line": 0.5}, {"line": 0.5},
                 {"line": 2.5}, {"line": None}]
         parts = rc._partition_rows_by_bucket(rows)
-        self.assertEqual(list(parts.keys()), ["le_0.5", "top"])   # canonical order
+        self.assertEqual(list(parts.keys()),
+                         ["le_0.5", "le_1.5", "top"])             # canonical order
         self.assertEqual(len(parts["le_0.5"]), 2)
-        self.assertEqual(len(parts["top"]), 2)                    # 1.5+2.5; None gone
+        self.assertEqual(len(parts["le_1.5"]), 1)                 # the 1.5 line
+        self.assertEqual(len(parts["top"]), 1)                    # 2.5; None gone
 
     def test_keys_match_props_resolver(self):
         # The diagnostic helper must derive the SAME bucket key as the runtime
@@ -360,9 +363,11 @@ class PartitionHelperTests(unittest.TestCase):
         # this invariant is pinned by a test instead).
         from props import _resolve_line_bucket
         cfg = {"line_methods": [{"max_line": 0.5, "method": "C"},
+                                {"max_line": 1.5, "method": "E"},
                                 {"max_line": None, "method": "D"}]}
         self.assertEqual(_resolve_line_bucket(cfg, 0.5)[0], rc._line_bucket_key(0.5))
         self.assertEqual(_resolve_line_bucket(cfg, 1.5)[0], rc._line_bucket_key(1.5))
+        self.assertEqual(_resolve_line_bucket(cfg, 2.5)[0], rc._line_bucket_key(2.5))
 
 
 def _killer_build(enriched, params, *a, **k):
@@ -383,7 +388,7 @@ def _killer_select(rows, **k):
     on = s > 0.0
     if lines == {0.5}:                       # le_0.5 bucket: feature inert
         ss = {"A": 0.2000}
-    elif lines == {1.5}:                     # top bucket: feature helps a lot
+    elif lines == {1.5}:                     # le_1.5 bucket: feature helps a lot
         ss = {"A": 0.2900 if on else 0.3000}
     else:                                    # pooled (mixed): sub-gate +0.0010
         ss = {"A": 0.2110 if on else 0.2120}
@@ -428,8 +433,8 @@ class PerBucketFeatureDiagTests(unittest.TestCase):
         # ... the saturated bucket is inert (both buckets clear MIN_BUCKET_OBS=100)
         self.assertIn("bucket le_0.5 (incumbent=A, usable n=700)", out)
         self.assertIn("+0.0000  no", out)
-        # ... but the top bucket clears the SAME 0.002 gate the pooled number can't.
-        self.assertIn("bucket top (incumbent=A, usable n=100)", out)
+        # ... but the le_1.5 bucket clears the SAME 0.002 gate the pooled number can't.
+        self.assertIn("bucket le_1.5 (incumbent=A, usable n=100)", out)
         self.assertIn("+0.0100  YES", out)
         # A diagnostic writes nothing.
         self.assertIn("nothing written", out)
@@ -439,8 +444,8 @@ class PerBucketFeatureDiagTests(unittest.TestCase):
         out, save_mock = self._run(
             {"batter_hits": {"method": "A", "half_life": None}},
             _thin_build, _thin_select)
-        # top bucket below the floor -> one-line skip, no sub-table.
-        self.assertIn("bucket top: n=10 < 100 floor - skipped (thin).", out)
+        # le_1.5 bucket below the floor -> one-line skip, no sub-table.
+        self.assertIn("bucket le_1.5: n=10 < 100 floor - skipped (thin).", out)
         self.assertNotIn("bucket top (incumbent=", out)
         # the deep bucket still prints.
         self.assertIn("bucket le_0.5 (incumbent=", out)
