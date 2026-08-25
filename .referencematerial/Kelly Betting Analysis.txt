@@ -1,0 +1,478 @@
+See discussions, stats, and author profiles for this publication at: https://www.researchgate.net/publication/284372316
+
+
+
+An Adaptive Kelly Betting Strategy for Finite Repeated Games
+
+Conference Paper · August 2015
+DOI: 10.1007/978-3-319-23207-2_5
+
+
+
+
+CITATIONS                                                                                              READS
+
+5                                                                                                      1,219
+
+
+4 authors, including:
+
+            Mu-En Wu                                                                                              Hui-Huang Tsai
+            National Taipei University of Technology                                                              National United University
+            26 PUBLICATIONS   96 CITATIONS                                                                        4 PUBLICATIONS   5 CITATIONS   
+
+                SEE PROFILE                                                                                          SEE PROFILE
+
+
+
+            Chi-Yao Weng
+            National Tsing Hua University
+            67 PUBLICATIONS   1,081 CITATIONS   
+
+                SEE PROFILE
+
+
+
+
+ All content following this page was uploaded by Hui-Huang Tsai on 23 June 2016.
+
+ The user has requested enhancement of the downloaded file.
+    An Adaptive Kelly Betting Strategy for Finite Repeated
+                           Games
+
+           Mu-En Wu1, Hui-Huang Tsai2, Raylin Tso3, and Chi-Yao Weng4
+
+            1Department    of Mathematics, Soochow University, Taipei, Taiwan. 1
+                                   mnasia1@gmail.com1
+            2Department   of Finance, National United University, Miaoli, Taiwan2
+                                   hhtsai@nuu.edu.tw2
+      3Department   of Computer Science, National Chengchi University, Taipei, Taiwan3
+                                raylin@cs.nccu.edu.tw3
+      4Department   of Computer Science, National Tsinghua University, Hsinchu, Taiwan4
+                                chiyao.weng@gmail.com4
+
+
+
+       Abstract. Kelly criterion is the optimal bidding strategy when considering a se-
+       ries of gambles with the wining probability 𝑝 and the odds 𝑏. One of the ar-
+       guments is Kelly criterion is optimal in theory rather than in practice. In this
+       paper we show the results of using Kelly criterion in a gamble of bidding T
+       steps. At the end of T steps, there are 𝑊 times of winning and 𝐿 times of los-
+       ing. i.e. 𝑇 = 𝑊 + 𝐿. Consequently, the best strategy for these bidding steps is
+       using the probability 𝑊 ⁄𝑇 instead of using 𝑝 in Kelly Criterion. However,
+       we do not know the number of 𝑊, to put it better the information of 𝑝, before
+       placing the bet. We first derive the relation of profits between using p and W/T
+       as the winning probability in the Kelly formula, respectively. Then we use the
+       proportion of winning and bidding numbers before time step t, denoted as 𝑝𝑡 , as
+       the winning probability used in the Kelly criterion at time step 𝑡. Even we do
+       not know the winning probability of 𝑝 in a gamble, we can use this method to
+       achieve the profit near the optimal profit when using 𝑝 in the Kelly betting.
+
+       Keywords: Kelly Criterion, KL-divergence, winning probability, odds, learning
+       theory
+
+
+
+1      Introduction
+
+Kelly criterion, proposed by John Larry Kelly, Jr. [5] at 1956, has been applied in the
+solution of searching communication optimization and further in those of many as-
+pects, such as the well-known BlackJack [2], Texas hold'em Poker (Hold'em or
+Holdem in short) and money management of trading financial instruments, including
+stocks, futures, options and currencies.
+   Kelly criterion could be regarded as the optimization process of wagering ratio in
+the long term. Given a set of winning probability and odds, if the gamble could repeat
+unlimited times, the balance will grows at the fastest speed with the wagering ratio
+computed by Kelly criterion. However, in the real gamble, we cannot play again and
+again infinitely, so the interesting question we want to ask here is shown as follows:
+    Facing the limited times of gambles, is betting by Kelly criterion still our best solu-
+tion?
+    Additionally, the condition of Kelly formula applies to is the fixed winning proba-
+bility and odds, but that of the real gamble or trade is totally different. Ralph Vince
+[6], [7], [8] provided the coping strategy: the optimal 𝑓 concept. It optimizes the
+wagering ratio depending on different odds and then let Kelly formula turn into a
+special case of this concept. Further, Vince proposed the Leverage Space Model [5]
+for the staking system similar to Kelly formula in multiple independent gambles,
+which can optimize the wagering ratio and then to enhance the gambler’s profit sig-
+nificantly. Gary. Gottlieb [3] also considered repeated games for Kelly betting. How-
+ever, he considered an infinite sequence of wagers, which may not practical in real
+life.
+    Due to the fact that the situation Kelly formula assumes is a long term of profit
+maximization process, but the gambles and trades cannot be repeated infinitely, this
+study tries to investigate the gap between the theory and the reality. We adopt the
+concept of online learning to computes the relation between the profit from Kelly
+formula and that from hindsight after 𝑇 games each. The hindsight here means that
+after 𝑇 times of bidding steps, if the wining times is 𝑊, then we can replace the
+original winning probability of 𝑝 in Kelly formula with 𝑊 ⁄𝑇. By our derivation, the
+relation of profits between wagering by Kelly formula and by hindsight can be de-
+scribed by Kullback-Leibler divergence (short for KL divergence in short) [7]. In
+other words, if the winning probability used in Kelly formula matches that computed
+from the winning times within 𝑇 round of bidding steps, then the profits from these
+two staking strategies will be almost the same as 𝑇 goes to infinity. The more dif-
+ferent between the winning times within 𝑇 round of bidding steps and the given
+probability 𝑝, the more between profits of these two strategies.
+    The second achievement in this study shows that under the condition with un-
+known winning probability, we adopt the already known number of wining rounds
+divided by the number of bidding numbers as the winning probability needed in Kelly
+formula to wager, and then the following profit profile of this strategy compared to
+that of adopting real probability, i.e. hindsight, can be described by KL divergence.
+    The remainder of this paper is shown in the following: In Section II, we give pre-
+liminaries, include Kelly criterion and KL divergences. In Section III, the relation
+between traditional Kelly criterion and hindsight is described. Section IV analyze the
+variant of Kelly criterion in the case of unknown winning probability. Finally, we
+conclude in Section V.
+2       Preliminaries
+
+2.1     Kelly Criterion
+
+Considering a gamble with the winning probability 𝑝 and odds 𝑏. Let a gambler with
+the initial capital being A0 , the 𝑡-th step capital being A𝑡 , and the wager ratio of 𝑓,
+where 0 < 𝑓 < 100%, the Kelly formula can be derived as follows:
+
+    If the gambler wins the (𝑡 − 1)-th round, then A𝑡 = A𝑡−1 (1 + 𝑏𝑓).
+
+   If the gambler loses the (𝑡 − 1)-th round, then A𝑡 = A𝑡−1 (1 − 𝑓).
+   Since the gambler plays T rounds and has the winning probability of p, we can ex-
+pect that he/she will win 𝑇 × 𝑝 rounds and lose 𝑇 × (1 − 𝑝) rounds. Then in theo-
+ry, the value of A 𝑇 should be:
+
+                          A 𝑇 = A0 (1 + 𝑏𝑓)𝑇𝑝 (1 − 𝑓)𝑇(1−𝑝)
+
+   By the above equation, we can optimize A 𝑇 to find the solution of 𝑓. Differentiate
+the above equation, we can find the optimal 𝑓 value as following:
+
+                                        𝑝(1 + 𝑏) − 1
+                                   𝑓=
+                                             𝑏
+   However, the numbers of winning and losing should depend on binomial distribu-
+tion during the process of the real T rounds. For example, among 100 time of gambles
+with the winning probability 50%, it is not just composed of 50 time of wins and 50
+time of loses. According to the binomial theorem, there will be the probability of
+𝐶𝑘100 50%𝑘 × 50%100−𝑘 to win 𝑘 times and to lose 100 − 𝑘 times. There is a little
+difference between theory and practice.
+   Hence, the issue we want to investigate in this paper is described in the following:
+Within a sequence of 𝑇-time gambles, there are 𝑊 times of wins and 𝐿 times of
+losses, what is the relation between the wagering profit from Kelly formula with the
+winning probability 𝑝 and that with the hindsight probability 𝑊 ⁄𝑇?
+
+
+2.2     KL Divergence
+
+   In this paper, we use KL divergence [4] to describe the difference of Kelly profits
+between theoretical expectation and practice. KL divergence measures the distance
+between its two input distributions [1]. It is a non-symmetric measure. Assuming
+                                                                                   𝑝
+that 𝑃 and 𝑄 are two discrete distributions, we will have KL(𝑃||𝑄) = ∑𝑛𝑖=1 𝑝𝑖 ln 𝑖.
+                                                                                      𝑞𝑖
+Note that KL(𝑃||𝑄) = 0 as 𝑃 = 𝑄.
+3      On the Relation of Kelly Criterion on Theory and Practice
+
+First, let us define the so-called Hindsight here. During the 𝑇-time steps in a gamble,
+even knowing the winning probability 𝑝, we can only compute the probability of win-
+ning 𝑊 times within 𝑇 time steps of the gamble, where 𝑊 could be 1, 2, …, 𝑇,
+etc. In fact 𝑊 is a random variable and will be found after the end of 𝑇-time real
+gambles. No one can know it in advance. Therefore, should we know it in advance,
+we can substitute 𝑊 ⁄𝑇 into the probability in Kelly formula, so as to use this wager
+ratio:
+
+                                              𝑊
+                                                (1+𝑏)−1
+                                              𝑇
+                                       𝑓∗ =
+                                                  𝑏
+
+Such kind of result will be better than that of the traditional Kelly formula’s wager
+ratio:
+                                              𝑝(1+𝑏)−1
+                                        𝑓=
+                                                  𝑏
+   This is why we call the use of 𝑓 ∗ in Kelly formula for wagering propositionally as
+“Hindsight”. Next, supposing that using 𝑓 and 𝑓 ∗ as the wager ratios to play 𝑇
+times and the following results are E 𝑇 (𝑓) and E 𝑇 (𝑓 ∗ ) respectively, we describe the
+relationship between E 𝑇 (𝑓) and E 𝑇 (𝑓 ∗ ) in the next theorem:
+
+Theorem 1. Consider a gamble with the winning rate of 𝑝 and the odds of 𝑏, if we
+wager 𝑓 ratio of money by the Kelly rule, i.e., 𝑓 = (𝑝(1 + 𝑏) − 1)⁄𝑏, and continue
+𝑇 time steps. We denote the expected payoff E 𝑇 (𝑓). Further, if there are 𝑊 times of
+wining and 𝐿 times of losing (i.e. 𝑇 = 𝑊 + 𝐿) during the 𝑇 time steps, the best
+hindsight is to wager 𝑓 ∗ ratio of his money each time steps and get the payoff
+E 𝑇 (𝑓 ∗ ), where 𝑓 ∗ equals (𝑝(1 + 𝑏) − 1). Then we have the following equation:
+
+                                1       E (𝑓∗ )          𝑊
+                                𝑇
+                                    × ln E𝑇 (𝑓) = KL ( 𝑇 ||𝑝)
+                                          𝑇
+
+
+
+   Before the proof of Theorem 1, we observe that the KL divergence of W/T and p
+are positive related to the ration of E 𝑇 (𝑓 ∗ ) and E 𝑇 (𝑓). As W/T approaches the win-
+ning rate p sufficiently, E 𝑇 (𝑓)will converge to E 𝑇 (𝑓 ∗ ) significantly. This means that
+although the winning rate p in the Kelly rule works well, the best hindsight is to adopt
+the alternative winning rate, that is 𝑊 ⁄𝑇. One thing deserves to mention is that the
+difference of profit/loss (P/L) between these two betting methods will depends on the
+KL Divergence between 𝑊 ⁄𝑇 and 𝑝.
+
+The Proof of Theorem 1.
+    Within a 𝑇-time gambles, we denote the number of winnings as 𝑊 and the one
+of losings as 𝐿. It is trivial to say that 𝑇 = W + 𝐿. On one hand, according to Kelly
+                                            𝑝(1+𝑏)−1
+criterion, we may set the optimal 𝑓 =                , and then wager by it. The prof-
+                                                𝑏
+it/loss, E 𝑇 (𝑓), after 𝑇-time of gambles can be computed as follows:
+
+                                 E 𝑇 (𝑓) = (1 + 𝑏𝑓)𝑊 × (1 − 𝑓)𝐿
+                                                 𝑊                                        𝐿
+                                       𝑃(1+𝑏)−1                         𝑃(1+𝑏)−1
+                           = (1 + 𝑏        𝑏
+                                                )            × (1 −         𝑏
+                                                                                )
+
+                                                     𝑊                            𝐿
+                                                              1+𝑏
+                                = (𝑝(1 + 𝑏)) × (               𝑏
+                                                                  (1    − 𝑝))
+
+                                                     𝑊                            𝐿
+                                                              1+𝑏
+                                = (𝑝(1 + 𝑏)) × (               𝑏
+                                                                  (1    − 𝑝))
+
+   On the other hand, because the 𝑇-time of gambles are composed of 𝑊-time of
+winnings and 𝐿-time of losings, the best staking strategy is to set the winning proba-
+bility as 𝑊 ⁄𝑇. Before the end of the 𝑇 rounds of a gamble, no one will be able to
+make sure absolutely about the number of 𝑊. Therefore this is why we call the stak-
+ing strategy, which uses the W/T as the winning probability, as a hindsight. We want
+                                                                              𝑝(1+𝑏)−1
+to compute the profit and loss from the hindsight and the traditional 𝑓 =
+                                                                                  𝑏
+throughout the gambles each. We hope to prove that the difference between the prof-
+its of wagering with Kelly formula and with hindsight will be not significant. The
+derivation we did is as follows:
+                                                                                          𝑊
+                                                                                            (1+𝑏)−1
+   Replacing 𝑝 with 𝑊 ⁄𝑇 in Kelly formula, we have 𝑓 ∗ =                                  𝑇
+                                                                                                  . Hence, using
+                                                                                              𝑏
+ ∗
+𝑓 to play 𝑇 times will have the profit and loss like:
+
+                               E 𝑇 (𝑓 ∗ ) = (1 + 𝑏𝑓 ∗ )𝑊 × (1 − 𝑓 ∗ )𝐿
+                                       𝑊                 𝑊              𝑊         𝐿
+                                           (1+𝑏)−1                        (1+𝑏)−1
+                           = (1 + 𝑏 𝑇         𝑏
+                                                      ) × (1 −          𝑇
+                                                                             𝑏
+                                                                                      )
+                                                  𝑊                                   𝐿
+                                  𝑊                          1+𝑏              𝑊
+                               = ( 𝑇 (1 + 𝑏)) × (             𝑏
+                                                                   × (1 − 𝑇 ))
+
+  Consequence, the ratio of the profits when bidding with 𝑓 and 𝑓 ∗ is
+                                              𝑊                    𝐿
+                                   𝑊
+                                     (1+𝑏)) ×(
+                                                    1+𝑏       𝑊            𝑊𝑊      𝑊 𝐿
+                        E𝑇 (𝑓∗ ) ( 𝑇           𝑏
+                                                 ×(1− 𝑇 ))
+                                                                           𝑇 ×(1− 𝑇 )
+                                =                                      =
+                        E𝑇 (𝑓)             𝑊 1+𝑏
+                                                         𝐿                 (𝑝)𝑊 ×(1−𝑝)𝐿
+                                   (𝑝(1+𝑏))    ×(        ×(1−𝑝))
+                                                    𝑏
+
+
+  We take the loge function and divide by T to get
+                           ∗               𝑊                           (1−𝑊⁄𝑇)𝐿
+             1
+             𝑇
+                 × lnEE𝑇(𝑓(𝑓)) = 𝑊
+                                 𝑇
+                                   ln 𝑊𝑝⁄𝑊
+                                         𝑇
+                                           + (1 − 𝑊
+                                                  𝑇
+                                                    ) ln                (1−𝑝)𝐿
+                                                                                      = KL(𝑊
+                                                                                           𝑇
+                                                                                             ||𝑝),
+                       𝑇
+
+
+which proves the Theorem 1.
+   The aforementioned theorem proves that given a fixed winning probability, even
+after 𝑇 round of simulations we cannot make sure of the numbers of winnings and
+losings in reality. But by the Law of Larger Number, 𝑊 ⁄𝑇 will approach 𝑝. There-
+fore, as the number of playing is enough, we can see that the difference between prof-
+its from 𝑝 and from the hindsight will not significant. However, when the gap be-
+tween 𝑊 ⁄𝑇 and 𝑝 is large enough, the difference between them will be significant
+afterwards. The ratio of their profit is just the same as the KL divergence of 𝑊 ⁄𝑇
+and 𝑝.
+
+
+4        Learning from Probability before Time Step 𝒕
+
+   We extend the results of Section III to the general case. Consider a gamble with the
+unknown win rate and the odds of 𝑏. If we adopt the happened winning percentage as
+the winning probability and b as the odds, then we want to study the relation between
+profits of this new method and that of the hindsight. The process we deduce is as fol-
+lows.
+   Supposing the winning times before every time step 𝑡 being 𝑊𝑡−1 , we can assign
+
+                                                 𝑊𝑡−1
+                                          𝑝𝑡 =
+                                                 𝑡−1
+
+We use 𝑝𝑡 as the winning probability at the time step 𝑡. Consequently, we take 𝑝𝑡
+into Kelly formula and then calculate the bidding fraction 𝑓𝑡 at time step 𝑡. That is,
+                               𝑝𝑡 (1 + 𝑏) − 1 𝑊𝑡−1
+                                                𝑡−1 (1 + 𝑏) − 1
+                        𝑓𝑡 =                 =
+                                      𝑏                𝑏
+   Assume that the win/loss profile of this 𝑇 rounds is r1, r2 , r3,…rT，where
+ri={win, lose}. Therefore, the profit after 𝑇 rounds is
+
+     Profit 𝑇 = (1 + 𝐵1 𝑓1 ) × (1 + 𝐵2 𝑓2 ) × … × (1 + 𝐵𝑇−1 𝑓𝑇−1 ) × (1 + 𝐵𝑇 𝑓𝑇 ),
+
+where 𝐵𝑖 = 𝑏 if 𝑟𝑖 is win, and 𝐵𝑖 = −1 if 𝑟𝑖 is lose.
+   Without loss of generality, we rearrange the sequence of r1, r2 , r3,…rT. Those
+winning rounds are located at the front and those losing ones are moved to behind
+them in the same turn in each group. For example, if the sequence of win-lose is
+                     (𝑤1 , 𝑙1 , 𝑤2 , 𝑤3 , 𝑤4 , 𝑙2 , … 𝑙𝐿−2 , 𝑤𝑊 , 𝑤𝐿−1 , 𝑙𝐿 )
+Rearrange the order of this sequence to
+                    (𝑤1 , 𝑤2 , 𝑤3 , … , 𝑤𝑊−1 , 𝑤𝑊 , 𝑙1 , 𝑙2 , … , 𝑙𝐿−2 , 𝑙𝐿−3 )
+We have
+
+Profit 𝑇 = (1 + 𝑏𝑓𝑤1 ) × (1 + 𝑏𝑓𝑤2 ) × … × (1 + 𝑏𝑓𝑤𝑊 ) ×× (1 − 𝑓𝑙1) )(1 − 𝑓𝑙2 ) × …
+                 × (1 − 𝑓𝑙𝐿 )
+
+Hence,
+                  Profit 𝑇 = (∏𝑊                    𝐿
+                               𝑖=1 (1 + 𝑏𝑓𝑤𝑖 )) × (∏𝑘=1 (1 − 𝑓𝑙𝑘 ))
+
+
+                                   𝑝𝑊𝑖 (1+𝑏)−1                      𝑝𝑙 (1+𝑏)−1
+              = (∏𝑊
+                  𝑖=1 (1 + 𝑏           𝑏
+                                               )) × (∏𝐿𝑘=1 (1 −         𝑘
+                                                                            𝑏
+                                                                                   ))
+
+                                                             1+𝑏
+                 = (∏𝑊                      𝐿
+                     𝑖=1 (𝑝𝑊𝑖 (1 + 𝑏))) × (∏𝑘=1 (             𝑏
+                                                                 ) (1   − 𝑝𝑙𝑘 ))
+
+                           (1+𝑏)𝑇
+                       =            (∏𝑊             𝐿
+                                      𝑖=1 𝑝𝑊𝑖 ) × (∏𝑘=1 (1 − 𝑝𝑙𝑘 ))
+                              𝑏𝐿
+
+Thus,
+                                                  𝑊                         𝐿
+                  E 𝑇 (𝑓 ∗ )   (𝑊𝑇
+                                   (1 + 𝑏)) × (1+𝑏𝑏
+                                                    (1 − 𝑊
+                                                         𝑇
+                                                           ))
+                             =
+                  Profit 𝑇 (∏𝑊                      𝐿
+                               𝑖=1(1 + 𝑏𝑓𝑤𝑖 )) × (∏𝑘=1(1 − 𝑓𝑙𝑘 ))
+
+            (1 + 𝑏)𝑇 𝑊 𝑊                 𝐿                      𝑊           𝐿
+                 𝐿    ( 𝑇 ) × (1 − 𝑊   )                   (𝑊 ) × (1 − 𝑊  )
+    =          𝑏                     𝑇
+                                                   =        𝑇           𝑇
+      (1 + 𝑏)𝑇 𝑊                 𝐿                   (∏𝑊             𝐿
+                                                       𝑖=1 𝑝𝑤𝑖 ) × (∏𝑘=1(1 − 𝑝𝑙𝑘 ))
+               (∏     𝑝
+                   𝑖=1 𝑤𝑖 ) × (∏    (1  −  𝑝𝑙𝑘 ) )
+         𝑏𝐿                      𝑘=1
+
+
+Lemma2.     There exist a value 𝑝𝑊𝐿 satisfying
+
+         𝑝𝑊𝐿 = (∏𝑊             𝑇−𝑊                  𝑊
+                 𝑖=1 𝑝𝑤𝑖 ) × (∏𝑘=1 (1 − 𝑝𝑙𝑘 )) = 𝑝𝑊𝐿 × (1 − 𝑝𝑊𝐿 )
+                                                                 𝑇−𝑊
+                                                                     .
+
+Proof of Lemma 2. The Lemma is trivial since 𝑝𝑊𝐿 is just the solution of the poly-
+nomial with single variable.
+
+   We call 𝑝𝑊𝐿 the geometric mean of probability. After taking the loge and dividing
+by T, we have
+                                                      𝑊                 𝐿
+                      1 E 𝑇 (𝑓 ∗ ) 1   (𝑊
+                                        𝑇
+                                          ) × ((1 − 𝑊
+                                                    𝑇
+                                                      ))
+                       ln         = ln
+                      𝑇 Profit T 𝑇 (𝑝𝑊𝐿 )𝑊 × (1 − 𝑝𝑊𝐿 )𝐿
+
+                      𝑊    𝑊 ⁄𝑇            𝑊     1−𝑊⁄𝑇            𝑊
+                    = 𝑇 ln𝑝        + (1 − 𝑇 ) ln1−𝑝        = KL ( 𝑇 ||𝑝𝑊𝐿 )
+                              𝑊𝐿                      𝑊𝐿
+
+
+
+   The above-mentioned result shows that wagering according to the sequential win-
+ning percentage, the final profit will depend on the KL divergence of geometric mean
+of probability and the real winning percentage.
+   One thing deserves mention is that as the number of T increases, 𝑝𝑊𝐿 will ap-
+proach p. In other words, as the rounds of gambles increase, the happened winning
+percentage will present the unknown winning probability of this gamble. However, if
+we wager following the ratio computed from the winning percentage happened which
+                         used as the winning probability in Kelly formula, so long as the time we play is
+                         enough, i.e. T is large enough, and its profit will tend towards that of hindsight.
+
+                         5      Conclusion and the Future Work
+
+                         This study first derives that when using Kelly formula, the relation between the real
+                         profit and loss and the expected one can be described by KL divergence, and then
+                         deduces the same result of KL divergence for describing the close relation between
+                         the profits from hindsight and from our adaptive winning probability, which is the
+                         winning percentage of the past events under the condition of unknown winning prob-
+                         ability in real world in advance, combining the given odds to wager by Kelly formula
+                         in the long term. Applying this kind of technique, we hope to use the happened events
+                         under the situation with unknown winning probability and odds as the learning sam-
+                         ple to predict the possible probability and odds needed for wagering by Kelly formu-
+                         la. Therefore, the study in this paper can be used in stock market prediction, money
+                         management and the development of trading strategy.
+
+
+                         Acknowledgments. The work of Mu-En Wu has been supported by the Ministry
+                         of Science and Technology, Taiwan, R.O.C., under Grant MOST 103-2218-E-031
+                         -001. The work of Raylin Tso has been supported by the Ministry of Science and
+                         Technology, Taiwan, R.O.C., under Grant MOST 103-2221-E-004-009.
+
+
+                         Reference
+                          1. Jen-Hou Chou, Chi-Jen Lu, and Mu-En Wu, "Making Profit in a Prediction Market," In
+                             Proceedings of the 18th Annual International Computing and Combinatorics Conference
+                             (COCOON 2012), Springer, Lecture Notes in Computer Science, 7434, pp. 556-567, Aug.
+                             20-22, 2012.
+                          2. Edward O. Thorp, "The Kelly Criterion in Blackjack, Sports Betting, and the stock mar-
+                             ket," Handbook of Asset and Liability Management, Vol. 1, Edited by S.A. Zenios and W.
+                             Ziemba, 2006.
+                          3. Gary. Gottlieb, "An optimal betting strategy for repeated games," Journal of Applied
+                             Probability (1985): 787-795.
+                          4. http://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence
+                          5. John L. Kelly, "A new interpretation of information rate," Bell System Technical Journal
+                             35 (4): 917–926.
+                          6. Ralph. Vince, Portfolio Management Formulas, New York, John Willey & Sons, 1990.
+                          7. Ralph. Vince, The mathematics of money management: risk analysis techniques for trad-
+                             ers. Vol. 18. John Wiley & Sons, 1992.
+                          8. Ralph. Vince, The new money management: a framework for asset allocation. Vol. 47.
+                             John Wiley & Sons, 1995.
+                          9. Ralph. Vince, The leverage space trading model: reconciling portfolio management strate-
+                             gies and economic theory. Vol. 425. John Wiley and Sons, 2009.
+
+
+
+
+View publication stats
+

@@ -1,0 +1,349 @@
+American Journal of Sports Science
+2017; 5(6): 45-49
+http://www.sciencepublishinggroup.com/j/ajss
+doi: 10.11648/j.ajss.20170506.12
+ISSN: 2330-8559 (Print); ISSN: 2330-8540 (Online)
+
+
+
+Adjusting Bookmaker’s Odds to Allow for Overround
+Stephen Clarke1, *, Stephanie Kovalchik2, 3, Martin Ingram4
+1
+    Department of Mathematics, Swinburne University of Technology, Melbourne, Australia
+2
+    Tennis Australia, Melbourne Park, Melbourne, Australia
+3
+    Institute of Sport Exercise and Active Living, Victoria University, Footscray, Australia
+4
+    Division of Machine Learning, Silverpond, Melbourne, Australia
+
+Email address:
+sandkclarke@hotmail.com (S. Clarke)
+*
+    Corresponding author
+
+To cite this article:
+Stephen Clarke, Stephanie Kovalchik, Martin Ingram. Adjusting Bookmaker’s Odds to Allow for Overround. American Journal of Sports
+Science. Vol. 5, No. 6, 2017, pp. 45-49. doi: 10.11648/j.ajss.20170506.12
+
+Received: September 9, 2017; Accepted: October 12, 2017; Published: December 25, 2017
+
+
+
+Abstract: Several methods have been proposed to adjust bookmakers’ implied probabilities, including an additive model, a
+normalization model, and an iterative method proposed by Shin. These approaches have one or more defects: the additive
+model can give negative adjusted probabilities, normalization does not account for favorite long-shot bias, and both the
+normalization and Shin approaches can produce bookmaker probabilities greater than 1 when applied in reverse. Moreover, it
+is shown that the Shin and additive methods are equivalent for races with two competitors. Vovk and Zhadanov (2009) and
+Clarke (2016) suggested a power method, where the implied probabilities are raised to a fixed power, which never produces
+bookmaker or fair probabilities outside the 0-1 range and allows for the favorite long-shot bias. This paper describes and
+applies the methods to three large bookmaker datasets, each in a different sport, and shows that the power method universally
+outperforms the multiplicative method and outperforms or is comparable to the Shin method.
+Keywords: Adjusting Forecasts, Betting, Sports Forecasting, Probability Forecasting
+
+
+                                                                             obtain the actual probability expectations of bookmakers.
+1. Introduction                                                                 While the need to remove the overround to estimate fair or
+   Bookmaker odds have a useful role for sports performance                  true probabilities pi is the most common situation in sport
+research and commercial applications. Bookmaker odds have                    research, Clarke [5] gives an example of the reverse process.
+been repeatedly shown to provide improved expectations                       This previous study considered the commercial application of
+about outcomes in sport [1-2], which can be used by                          a major betting agency, in which a mathematical model
+practitioners to set more realistic expectations before and                  produced fair probabilities for the number of runs in the next
+after competitive events. Efficiency in bookmaker odds is                    over of cricket. With only a small window while players
+fundamental to the success of sports betting firms, an                       changed ends to set odds and take bets, a mathematical
+industry that continues to grow and have an influence on all                 formula was needed to convert the true probabilities to
+professional sports [3].                                                     bookmaker odds with the required overround. In a second
+   Sports researchers and professionals can get the most use                 application the same process was used to set odds for the
+out of bookmaker odds if they have an accurate method to                     point score in the next game of tennis. With the expansion of
+convert odds into event probabilities [4]. The probabilities πi              sports betting, many bookmakers or exchanges now use
+implied by bookmakers odds, or prices, invariably sum to                     mathematical models plus an adjustment for overround to
+more than 1. The total π of the implied probabilities is known               determine initial prices. As the event nears, further
+as the booksum, and the excess π-1 the overround. The                        adjustments are then made due to the weight of money on
+overround determines the expected return to punters, which                   placed bets.
+is 1/π in the long run. Due to the overround, the implied                       The present paper discusses and compares four methods
+probabilities from bookmaker odds require an adjustment to                   for removing (or incorporating) overround. For simplicity
+                                         American Journal of Sports Science 2017; 5(6): 45-49                                         46
+
+
+
+racing terminology is used, but the analysis applies to any
+                                                                                                           (       )
+experiment (race, match, contest, etc.) with n outcomes on
+which betting takes place. Section 2 describes four                                                                                   (5)
+adjustment methods of distributing the overround: additive,                                 =
+                                                                                                               (       )
+normalization, Shin and the power method. Section 3
+compares the performance of each method on various data              where
+sets, and is followed by the conclusion.
+                                                                                                ∑ !"               (       )
+2. Adjustment Methods                                                                                                                 (6)
+                                                                                            =
+   Four methods of adjustment for overround have been used
+in the literature. In the following subsections each method is
+                                                                        To create bookmakers odds from fair odds requires using
+described and its distinguishing features summarized.
+                                                                     (4) and (6) and iterating on z to produce the required
+2.1. The Additive Method                                             overround. To adjust bookmaker’s odds to produce fair odds
+                                                                     requires using iteration on (5) and (6).
+   Better described as the additive method, additive uses an            This method helps to protect against the favorite longshot
+additive model where the overround is split evenly between           bias, and has been shown to produce better predictive true
+the n outcomes. Thus, the true probability for the ith               probabilities than normalization [9-10]. However, it is shown
+outcome, pi, is                                                      in the Appendix that in the case of two outcomes the Shin
+                                                                     method is equivalent to the simple additive method, and as
+        =       − ( − 1)/ and        =    + ( − 1)/          (1)
+                                                                     such can adjust outsiders too much. While (5) implies it can
+   Although used by Viney et al. and others [4], the additive        never produce negative true probabilities, (4) can produce
+method is rarely used in the literature, as the changes              bookmaker’s probabilities greater than 1 for hot favorites.
+between the implied and adjusted probabilities for outsiders
+                                                                     2.4. The Power Method
+can be quite dramatic. Not infrequently, the additive method
+can produce negative probabilities for rank outsiders. In fact,        A natural extension of the additive method used in the
+this will occur whenever the ratio of the overround and              additive approach (where probabilities are adjusted by a
+implied probability is greater than the number of competitors,       constant addition), and the multiplicative method used in
+( − 1)/ > . The reverse process can also produce                     normalization (where probabilities are adjusted by a constant
+bookmaker probabilities greater than 1 for hot favorites.            multiplier), is to raise the probabilities to a constant power.
+                                                                     Clarke [11] gives details of this method, used in a
+2.2. The Multiplicative Method
+                                                                     commercial application described in [5]. It was also
+  The multiplicative or normalization method allocates the           described in Vovk and Zhdanov [12] and attributed to Victor
+overround proportionally. So that,                                   Khutsishvili. The power approach proposed by these authors
+                                                                     can be written as,
+                      =    / or      =      .                (2)                                                                "
+                                                                                                       #                        ( )
+                                                                                                =          or           =       $     (7)
+  Because of its simplicity, this is the most commonly used
+method. While seemingly appropriate for totalisator data, an            The logic behind this method stems from the idea that
+automated betting system that allocates the same proportion          bookmaker probabilities derived from fair probabilities for
+of the pool for all horses, it fails to account for the favorite     joint events should satisfy the usual multiplicative law for
+longshot bias, where it is well known that long-shots tend to        independent events. In practical terms, this condition implies
+be overbet while favorites are underbet. Thus a greater              that the return to a punter from investing his winnings on
+proportion of overround needs to be removed/added to                 subsequent events is the same as a single investment on the
+longshots than favorites. It also suffers from sometimes             joint event. When the n competitors are all equally likely, the
+                                                                                                         &'(( )
+producing probabilities greater than 1 for favorites in the          value for k is calculated as, % =          . However, in most
+                                                                                                                       &'(( )
+conversion from fair to bookmaker’s probabilities.                                                                          )
+                                                                     cases iteration on k is necessary to ensure ∑ = 1, or the
+2.3. The Shin Method                                                 required booksum.
+                                                                        A clear advantage of the power method is that it can never
+  Shin [6-7] proposed a correction method based on an                produce probabilities outside the [0, 1] range. Similarly, it
+assumed fraction z of knowledgeable punters. As given in             can be applied directly to prices, as the fair and adjusted
+[8], this results in                                                 prices follow the same power law with the same k as the true
+                                                                     and implied probabilities. The power method also ensures a
+            =       + (1 − )     ∑              + (1 − )     (4)     greater change to outsider probabilities than favorites.
+                                                                     However, when compared to Shin it adjusts favorites and
+or                                                                   longshots more but middle-of-the-range priced horses less.
+47                                 Stephen Clarke et al.: Adjusting Bookmaker’s Odds to Allow for Overround
+
+
+
+3. Methods                                                                        Three measures of performance were evaluated. The first
+                                                                               was the distribution in the adjusted win probability assigned
+   The operational characteristics of each method are shown                    to the winning competitor. The higher the mean and the
+with several illustrative examples. Analyses are then                          lower the variance in this probability, the better the predictive
+presented on the actual predictive performance of each                         performance of the adjustment method. We also report the
+method on large-scale sports datasets for 3 different sports.                  logloss, which is a loss measure that is closely connected to
+   Historical bookmaker odds were gathered for 3 different                     the Kelly betting criterion [13]. This measure is unique in
+sporting events: tennis, greyhound racing, and horse racing.                   that it penalizes inaccurate predictions that are made with
+These datasets were chosen to represent a range of                             higher confidence. For the non-binary events, a binary
+competitor numbers and overround characteristics. The ATP                      classifier was created that assigned one category to the
+dataset included nearly 15,000 men’s singles matches from                      winner and all other competitors to the losing category. Using
+2000 to the present. Bookmaker prices for this dataset were                    the same binary classifier, we also evaluated the root-mean
+the average betting odds reported by Oddsportal. The                           squared error, or Brier score, for each method. As with the
+greyhound data comprised tote data (from over 27,000 races)                    logloss, a lower square-error indicates a superior prediction
+at 2,206 meetings in New Zealand between 1/8/2011 and                          method.
+18/8/2016. The final dataset was gallop data that consisted of
+closing prices from the Victorian Tote on Australian
+thoroughbred races in the first half of 2008. Together, these                  4. Results
+datasets range from 2 to 12 competitor events and have                         4.1. Operational Characteristics
+average overrounds ranging between 6% and 27% (Table 1).
+                                                                                 Tables 2 and 3 show an example of transforming
+     Table 1. Description of Datasets used in Performance Evaluation.          probabilities in both directions using the four adjustment
+                        Average Number of          Average Overround           methods. These tables clearly show the shortcomings of the
+Dataset       Events
+                        Competitors                (95% Interval)              additive method, and the varying degree to which the Shin
+ATP           14,925    2                          6.1 (4.7 – 7.0)             and Power method adjust favorites and longshots. Later we
+Gallop        4,663     12                         27.2 (9.0 – 78.2)
+                                                                               compare the efficacy of the predictive power of the
+Greyhound     20,206    8                          19.5 (11.1 – 22.2)
+                                                                               probabilities produced by these two methods.
+                                Table 2. Comparison of 4 Methods of Adjusting 1.25 Booksum to Produce Fair Probabilities.
+
+                                        Calculated True Probabilities                             Calculated Fair Prices
+ Prices and their Implied probs
+                                        Add.          Mult.          Shin          Power          Add.          Mult.           Shin          Power
+ $1.15               0.870              0.828         0.696          0.769         0.825          $1.21         $1.44           $1.30         $1.21
+ $5.00               0.200              0.158         0.160          0.148         0.110          $6.31         $6.25           $6.78         $9.12
+ $10.00              0.100              0.058         0.080          0.059         0.042          $17.12        $12.50          $16.94        $23.63
+ $20.00              0.050              0.008         0.040          0.020         0.016          $118.97       $24.99          $49.84        $61.23
+ $50.00              0.020              -0.022        0.016          0.004         0.005          -$46.31       $62.48          $264.78       $215.54
+ $100.00             0.010              -0.032        0.008          0.001         0.002          -$31.65       $124.96         $1,026.96     $558.47
+ Total               1.250              1.000         1.000          1.000         1.000
+
+  Again Table 3 shows the possibility of both the multiplicative and Shin method producing probabilities greater than 1 for
+short priced favorites. Since probabilities in [0, 1] remain in [0, 1] when raised to any positive power, the power method
+always produces realistic transformations.
+
+                                Table 3. Comparison of 4 Methods of Adjusting true Probabilities to Produce a 1.25 Booksum.
+
+                                    Adjusted Probabilities                                     Boookmaker Prices
+ True Probs       Fair Prices
+                                    Add.         Mult.            Shin           Power         Add.        Mult.              Shin          Power
+ 0.01              $100.00          0.052        0.013            0.033          0.040         $19.35      $80.00             $30.74        $24.93
+ 0.015             $66.67           0.057        0.019            0.041          0.053         $17.65      $53.33             $24.44        $18.78
+ 0.02              $50.00           0.062        0.025            0.048          0.065         $16.22      $40.00             $20.64        $15.36
+ 0.025             $40.00           0.067        0.031            0.055          0.076         $15.00      $32.00             $18.02        $13.15
+ 0.03              $33.33           0.072        0.038            0.062          0.086         $13.95      $26.67             $16.08        $11.57
+ 0.9               $1.11            0.942        1.125            1.010          0.929         $1.06       $0.89              $0.99         $1.08
+ 1                                  1.250        1.250            1.250          1.250
+
+   The findings indicate that the power method has some
+advantage over the other three methods in that it never                        4.2. Predictive Performance
+produces improper probabilities. The Appendix shows that the                     The results for the ATP data, with only two outcomes,
+additive and Shin method are equivalent for two-competitor                     confirmed in the Appendix, in that the additive and Shin
+races. The following subsection explores the predictive power                  methods always had the same result. In all three measures the
+of the probabilities produced by the various methods.                          Clarke power method achieved the best or equal best result,
+                                             American Journal of Sports Science 2017; 5(6): 45-49                                               48
+
+
+
+with the multiplicative method the worst (Table 4). For the                   measure, with Shin being the second worst on all measures.
+gallop data, the additive model was superior, followed by                     The additive method proved the best on the probability
+Shin. The multiplicative model was the worst performing on                    assigned to winner and RMSE, but only third on log loss.
+all measures. Results for the greyhound data were more                        The power method was either first or second on each
+variable. The multiplicative model was again the worst                        measure.
+performer on two measures, but second on the log loss
+                                  Table 4. Performance Comparison of Alternative Methods of Removing Overround.
+
+ Performance Measure                                     ATP                                Gallop                          Greyhound
+ Prob. Assigned to Winner, Mean (95% Interval)
+ Power                                                   62.8 (18.1 - 97.3)                 19.2 (1.5 – 47.4)               24.8 (3.3 – 67.5)
+ Additive                                                62.4 (19.2 – 95.6)                 20.4 (0.8 – 48.7)               25.6 (2.3 – 68.8)
+ Multiplicative                                          61.7 (21.1 – 93.4)                 18.2 (2.4 – 44.6)               23.5 (4.0 – 59.4)
+ Shin                                                    62.4 (19.2 – 95.6)                 19.2 (1.6 – 46.7)               24.6 (3.1 – 64.4)
+ LogLoss
+ Power                                                   0.548                              1.971                           1.686
+ Additive                                                0.548                              1.968                           1.696
+ Multiplicative                                          0.550                              1.994                           1.692
+ Shin                                                    0.548                              1.968                           1.696
+ RMSE
+ Power                                                   74.39                              79.14                           155.28
+ Additive                                                74.41                              78.12                           154.14
+ Multiplicative                                          74.50                              79.75                           156.90
+ Shin                                                    74.41                              79.03                           155.42
+
+  Clearly the additive method has performed surprisingly                      mathematical model. To the authors’ knowledge, at least two
+well, but as pointed out earlier it does have some problems in                Australian companies currently use the power method to
+producing probabilities outside the range [0, 1]. The                         transform bookmakers’ prices as a means to obtain an
+multiplicative generally does very poorly. The power method                   estimate of market knowledge about specific competitive
+outperforms the multiplicative method on all data sets on                     events (personal communication).
+each measure. Similarly it universally outperforms or equals                     There are multiple adjustment methods available to sports
+Shin, with the exception of the RMSE measure on the                           researchers and professionals for translating bookmaker odds
+Greyhound data.                                                               into true event expectations. Considerations of performance,
+                                                                              ease-of-implementation, and commercial record make the
+5. Conclusions                                                                power adjustment method a strong competitor among
+                                                                              approaches for correcting for overround.
+   This is the first paper to give a complete description of the
+most popular methods for adjustment of bookmaker odds and                     Acknowledgements
+provide the most comprehensive comparison of their
+performance with actual sporting data. While simple to                          We thank Anthony Bedford of Xtrade for supplying the
+apply, the additive method can produce negative                               gallop and greyhound data.
+probabilities, and the multiplicative or normalization method
+performed badly on all predictive performance measures. On
+the data sets analysed, the power method generally                            Appendix: Equivalence of Shin and the
+performed better than the Shin approach. It also performed                    Additive Method for 2 Outcomes
+better than all other methods on the ATP dataset, which is the
+only dataset obtained from bookmakers.                                           Many events on which betting takes place have only two
+   Given the comparability in performance between the Shin                    outcomes, usually win or loss. Betting on the line (whether a
+and power method, ease-of-implementation will be a critical                   score will exceed or not exceed a given value), or laying
+consideration for practitioners and industry. Both the Shin                   (betting on an event not occurring) can reduce events with
+and the power method require iteration. As with Shin, the                     multiple outcomes to one with only two outcomes. Strumbelj
+power method has an underlying logical basis for its                          [8] notes that in this special case, equation (5) above has a
+derivation. However, as a natural extension of the additive                   tractable solution. While this may be of interest in calculating
+and multiplicative transformation the power method is                         the proportion of knowledgeable punters, it is not necessary
+conceptually simpler and generally easier to implement than                   to calculate z to find pi, as we show here that for n = 2 the
+Shin.                                                                         Shin probabilities are given by the additive method.
+   Past commercial applications also indicate an industry                     Specifically,
+preference for the power method. Clarke [5] has used the                                                 (      )                    (   )
+                                                                                            =        −          , and   =      −
+power method successfully in a commercial application to
+incorporate overround into probabilities estimated from a
+49                               Stephen Clarke et al.: Adjusting Bookmaker’s Odds to Allow for Overround
+
+
+
+   Proof: For n = 2, we have π1 and π2 are bookmaker prices                                                (+ − )
+                                                                                                      =                      2(1 − )                (A2)
+that sum to π and pi are Shin adjusted prices that sum to 1.
+   To simplify let
+                                                                                 So + = + 2(1 − )
+                   + =         + 4(1 − )         -
+                                                                      (A1)       From (A2),
+
+     So from equation (6)                                                                                 (/"       /"       ) (/       /       )
+                                                                                                  -   =                      -
+                                                                                                                (        )          (       )
+
+                                                                                 So,
+                                                                             (+ − + ) − 2 ( + − + )
+                                             (       −   )(       +   )=
+                                                                                   4(1 − )
+
+                  ={      + 4(1 − )      "
+                                             −       − 4(1 − )        − 2 ( + 2(1 − )          − − 2(1 − ) )}/4(1 − )
+
+                                         = {4 (1 − )(         "
+                                                                  −   )− 4 (1 − ) (     −    )}/4(1 − )
+
+     So,                                                                       [4]   M. Viney A. Bedford, and E. Kondo, “Incorporating over-
+                                                                                     round into in-play Markov Chain models in tennis”. 15th
+             −    ={ (    −     )− ( (       −       )}/( 1 − )                      International Conference on Gambling & Risk-Taking, Las
+                                                                                     Vegas, USA, 2013.
+     Since =   +  and + = 1.
+                                                                               [5]   S. R. Clarke, “Successful applications of statistical modeling
+     Then, ( − ) = ( − )
+                                                                                     to betting markets”. In IMA Sport 2007: First International
+                                               (1 +     − )1
+   Solving using + = 1 gives               =                    2,
+                                                                                     conference on Mathematics in Sport. D. Percy, P Scarf & C
+       (1 +      − )1                                                                Robinson, Eds., The Institute of Mathematics and its
+    =                    2                                                           Applications: Salford, United Kingdom, 2007, pp. 35-43.
+                                        ( + − 1)1
+or alternatively that          =     −                   2,     =              [6]   H. S. Shin, “Prices of State Contingent Claims with Insider
+       ( + − 1)1                                                                     traders, and the Favorite-Longshot Bias”. The Economic
+    −                   2                                                            Journal, 1992, 102, pp. 426-435.
+as required
+                                                                               [7]   H. S. Shin, “Measuring the Incidence of Insider Trading in a
+   Alternatively, there is similar proof using (4)                                   Market for State-Contingent Claims”. The Economic Journal,
+   Again for simplicity let 2 =          + (1 − )                                    1993, 103(420), pp. 1141-1153.
+   Then      −     =2 (2 +2 )− 2 (2 +2 )
+                                                                               [8]   E. J. Strumbelj, "On Determining Probability Forecasts from
+                   =2 -2                                                             Betting Odds." International Journal of Forecasting, 2014,
+                   = z( - )+(1-z) ( - )                                              30(4), pp. 934-943.
+                   = ( - )(z +1-z) since + =1
+                   =( - )=(2 -1)=(1-2 )                                        [9]   M. Cain, D. Law, and D. Peel, “The favorite-longshot bias,
+                                                                                     bookmaker margins and insider trading in a variety of betting
+   But     +      =                                                                  markets”. Bulletin of Economic Research, 2003, 55, pp. 263–
+                              ( − 1)1               ( − 1)1                          273.
+   Solving gives       = +             2,     = -             2 as
+required.                                                                      [10] M. A. Smith, D. Paton, and L. V. Williams, “Do bookmakers
+   Note it is easily seen that this can result in π‘s greater than                  possess superior skills to bettors in predicting outcomes?”
+1.                                                                                  Journal of Economic Behavior & Organization, 2009, 71, 539
+                                                                                    – 549.
+
+                                                                               [11] S. R. Clarke, “Adjusting true odds to allow for vigorish”. In
+References                                                                          Proceedings of the 13th Australasian Conference on
+                                                                                    Mathematics and Computers in Sport. R. Stefani and A.
+[1]    C. Leitner, A. Zeileis, and K. Hornik, "Forecasting sports                   Shembri, Eds., 2016: Melbourne, pp. 111-115.
+       tournaments by ratings of (prob) abilities: A comparison for
+       the EURO 2008." International Journal of Forecasting 26, no.            [12] V. Vovk, and F. Zhdanov, “Prediction with Expert Advice for
+       3, 2010, pp. 471-481.                                                        the Brier Game”. Journal of Machine Learning Research,
+                                                                                    2009, 10, pp. 2445-2471.
+[2]    S. Kovalchik, "Searching for the GOAT of tennis win
+       prediction." Journal of Quantitative Analysis in Sports 12, no.         [13] L. H. Yuan, A. Liu, A., Yeh, A. et al. “A mixture-of-modelers
+       3, 2016, pp. 127-138.                                                        approach to forecasting NCAA tournament outcomes”.
+                                                                                    Journal of Quantitative Analysis in Sports, 2015, 11(1), pp.
+[3]    L. Robinson, "The business of sport" in Sport & Society: A                   13-27.
+       Student Introduction, Houlihan, B. Eds. London: SAGE, 2003,
+       pp. 165-183.
+

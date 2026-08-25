@@ -1,0 +1,719 @@
+  STRATEGY IN
+VALUE BETTING
+    A GUIDE TO RISK CONTROL, PROFIT
+MAXIMIZATION AND AVOIDING BETTING
+                        LIMITATIONS
+                                                                                     Preface   2
+
+
+
+
+                                    PREFACE
+In Trademate, we are passionate about finding the edge, and are always on the lookout for
+new ways to improve. Now, we have created this eBook to share our enthusiasm for the
+concept of value betting and the mindset behind it.
+
+
+The goal is that after reading this, you will have a better understanding on how to maximize
+your profits, tune risks to your preference and avoid limitation from bookmakers. Much of
+the content in this book is about understanding the different factors in value betting and
+how one can manipulate them to set up a strategy that suits your personal preference.
+
+
+The advices and strategies in this book is based on our conversations with professional bet-
+tors, industry insiders, simulations and own experience.
+
+
+This is the third in this series of four eBooks covering betting from the basic concepts to
+strategies and how to make a living out of it.
+
+
+I hope you find it interesting.
+
+
+      	-Marius, CEO of Trademate Sports.
+                                                           Content    3
+
+
+
+                             CONTENT
+
+          4
+                                                 7
+ Presets for Soft Books
+A breakdown of the factors
+  affecting edge and risk
+                                              Bet Sizing
+
+
+        11
+  Reducing Variance in
+                                   Explaining how Kelly's Crite-
+                                   rion work and how to use it
+
+
+
+     Sports Betting
+
+
+
+                                              13
+            Odds
+   Duration Untill Game
+        Edge Percent
+Multiple Lines on One Game
+                                            Hedging Bets
+
+
+        17
+                                       A strategy to reduce risk in
+                                              sports betting
+
+
+Why Bookmakers Limit
+
+
+
+                                              18
+  Winning Players
+ An overview of why value
+    bettors get limited
+
+
+
+
+        20
+                                          How Bookmakers
+                                           Profile Players
+                                   The different aspects looked
+How to Avoid Limitation             at to find winning players
+ Tips to make your account
+   stand less out from the
+       square bettors
+                                 The Presets Used for Soft Books Betting on TradingEurope   4
+
+
+
+
+1	 The Presets Used for Soft Books 		
+	 Betting on TradingEurope
+From time to time someone asks me if I’m willing to share which presets I’m using,
+which I am. I have gone through them on previous episodes of TradingEurope and I
+do make some smaller changes every now and then. So I figured I’d just write a post
+where I go through my presets and explain more about them.
+
+
+GENERAL STRATEGY
+I mainly trade during the weekends and view this as a good way to generate a second-
+ary income. I never risk more than I’m comfortable with losing both in terms of overall
+bankroll and as my maximum stake size. In the days of Edgebet I tried the high volume
+all leagues approach and within my 1100 trades found myself limited on 5 of the high-
+est volume bookies. When Trademate was launched it included better filtering options
+so I decided to change my strategy and rather focus on quality over quantity and take
+a long-term perspective. Don’t get me wrong just as anyone I want to maximize my
+profits, but since the soft books limit winning players I believe that the best way for me
+to maximize my lifetime value is to be more selective of which edges I get in on. There-
+fore 95% of my trades will be on recommended leagues. The exceptions being when I
+try to clear a bonus.
+
+
+This approach is not for everyone and we have customers who have been getting
+higher profits than me in a shorter time period, by following more of a high volume all
+leagues approach. However, I believe that my lifetime earnings from the softs will be
+higher and only time will tell whether that will actually be the case. So my way is not
+the only way. I would say that it is best for people to use their own judgment and find
+a balance between risk and reward that they are comfortable with.
+                                  The Presets Used for Soft Books Betting on TradingEurope   5
+
+
+
+ALL BOOKIES PRESET
+To the right you can see my main preset. Here I
+include all of the bookies that I’m using and all
+sports besides tennis.
+
+
+SPORTS
+The main reason that I stay away from Tennis
+is that sometimes players retire after a few sets
+in a tennis game if they have a more important
+game a few days later. This makes it unpredict-
+able. Not being a teamsport also makes the
+games more unpredictable.
+
+
+ODDSRANGE
+I stick to odds from 1-4. There are two main
+reasons for why I do this. First, the variance is   This image shows a preset from the
+higher the higher you go in odds range. Second, Trademate Sports tool illustrating my
+Trademate is currently slightly overvaluing edg- preferences
+es in the higher odds ranges, so I want to have
+higher edges and a margin of safety of a couple of percentage points to move in on
+trades here.
+
+
+EDGE
+I have set my minimum edge at 2%, because more marginal edges than that are not
+going to be worth my time. At times I have used 1% here, but these days when I do
+the majority of my trading on the weekends and there are plenty of edges to choose
+from I want to focus on getting in on the better edges.
+                                  The Presets Used for Soft Books Betting on TradingEurope   6
+
+
+
+HOURS BEFORE KICK-OFF
+I take edges as early as 7 hours before kick-off on the softs. The timing is an aspect
+that is much more important on the sharps, than on the softs, so I’m comfortable with
+going early here. Also, not doing so would make me to miss out on a lot of good edg-
+es because the bookmakers sharpen up the last hours. The downside is that you risk
+losing the edge because a lot can happen before gamestart. As long as one is beating
+the closing odds, taking early edges is fine.
+
+
+RECOMMENDED LEAGUES
+I use recommended leagues only here. From my experience my accounts last longer
+before I get limited when I stick to recommended leagues, as it is a lot less suspicious
+for me as a Norwegian to play on e.g. the English Championship than Chinese Basket-
+ball.
+
+
+AFTER TRADE PLACED
+I stick to one trade per game. By having more trades on one game one can increase
+turnover, but it comes at the cost of a large increase in variance, which is not worth it
+in my opinion. The one exception I do make is if there is let’s say an over/under edge
+on Bookie A and a 1x2 edge on Norsk Tipping the Norwegian government bookie.
+Then I’ll place both trades at times.
+                                    How Bet Sizing Impacts Your Game, a Technical Analysis   7
+
+
+
+
+2	 How Bet Sizing Impacts Your Game, 	
+	 a Technical Analysis
+Bet sizing plays an extremely important role in any profitable betting strategy, and in
+this article I’m gonna try to give some insight into exactly how important it is.
+
+
+In the sports betting community, there are mainly two general staking strategies bet-
+tors use. A flat stake, and a proportional stake. With a flat bet size, you either put the
+same wager on every single game, or you put the same wager on games that have the
+same odds and edge. Flat bet sizing is fairly easy to use, but it’s hard to select a proper
+size. A size too big will increase the chance of going broke, while a size too low will not
+yield big enough profits.
+
+
+A proportional strategy is where you place a certain percentage of your current bank-
+roll on each bet. Kelly’s Criterion is a formula that maximizes the growth rate of your
+bankroll. The formula for the Kelly’s Criterion is
+                                         P* G -1
+                                             G-1
+where P is the probability of success and G is the odds you’re given. Let’s take an ex-
+ample. If you were to bet on a coinflip - in a fair world you’d get an odds of 2. If you
+                                                         2.1
+were to get odds of 2.1, you would’ve had an edge of      2
+                                                               = 0.05 = 5% and Kelly would
+suggest
+
+                             0.5 * 2.1 - 1
+                                             = 0.04545
+                               2.1 - 1
+
+This means you should bet 4.545% of your current bankroll. Let’s take the scenario
+where this is ran 2 times with a starting bankroll of $100, you win one and lose one.
+                                     How Bet Sizing Impacts Your Game, a Technical Analysis   8
+
+
+
+  1.	 You bet 0.04545 * 100 = 4.545 and lose, now you’ve got $100 - $4.545 =
+     $95.455 left.
+  2.	 You bet 0.04545 * 95.455 = 4.338 and win, now you’ve got $95.455 + $4.338	*
+     	(2.1 - 1) = $100.227 left. (4.338 * 1.1 is the net return of the bet.)
+
+
+The interesting thing, is that the order of the bets does not matter. You would’ve end-
+ed up with $100.227 if you’d won the first one and lost the second one.
+
+
+Now over to a practical scenario. The example written over is not exactly represen-
+tative for the common bettor, because it assumes that you know the outcome of the
+previous bet before placing the next one. In the sports betting world, one would usu-
+ally have between 5-50 open bets at the time. This obviously affects the bet sizing. If
+you were to place 10 bets in a row with similar odds and edge, the bet sizing would
+decrease as your current bankroll decreases with each bet. If every single bet were
+with the odds of 2.1 and edge of 5%, you would expect to win 50% of the bets. This
+gives you the possibility of losing all your biggest bets and winning all your smallest
+bets - hence ending up in the negatives after placing nothing but profitable bets. It’s
+worth noting that the other way around could occur, you could win all your biggest
+bets hence flipping a huge profit.
+
+
+Here is a distribution of all possible combinations of bets with odds of 2.1 and edge of
+5%, giving a win rate of 50%. There are 20 open bets, and it randomly picks 10 win-
+ners and 10 losers, so it’s running perfectly every time - and only a matter of how the
+wins and loses are distributed. The x-axis shows the bankroll after the bets are settled
+relative to the starting bankroll, and the y-axis shows the number of occurences (out of
+the 184756 possible combinations). It follows the Kelly bet sizing, so the bet size de-
+creases for each bet as it’s always placing 4.545% of its current bankroll.
+                                      How Bet Sizing Impacts Your Game, a Technical Analysis   9
+
+
+
+The blue shows the results for 100% of Kelly, the orange for placing 50% of Kelly, and
+the green for placing 30% of Kelly.
+
+
+
+
+As we can see from the plot, the 100% of Kelly (blue line) yields the highest possible
+return, and the highest average (~1.03). However the spread is huge. One could end
+up with everything from 88% to 117% of your starting bankroll. As you decrease the
+fraction of Kelly to 50% and 30%, the spread gets a lot smaller. The probability of end-
+ing up in profit skyrockets, where as the average return gets lowered ever so slightly.
+It’s very important to note that by betting a lower fraction of Kelly, you risk less mon-
+ey. By betting 100% of Kelly, you risk ~60% of your bankroll to grow it to an average of
+104%. By betting 50% of Kelly, you risk ~37% of your bankroll to grow it to an average
+of 102%. By betting 30% of Kelly, you risk only ~24% to grow your bankroll to an aver-
+age of 101%.
+                                   How Bet Sizing Impacts Your Game, a Technical Analysis   10
+
+
+
+
+ Kelly                                           30%              50%             100%
+
+ Turnover                                        0.240            0.369           0.606
+
+ EV                                              1.012            1.018           1.030
+
+ Best case                                       1.030            1.063           1.176
+
+ Worst case                                      0.995            0.974           0.885
+
+ Probability of profit                           ~1.0             0.941           0.778
+
+ Probability of EV or better                      0.5              0.5              0.5
+
+ Standard deviation                              0.005            0.012           0.039
+
+
+There is no doubt that following full Kelly is the strategy that would maximize the
+growth of your bankroll. Many people will tell you to bet less than the Kelly formula
+tells you to. Two reasons are generally given for this.
+
+
+  1.	 The edge may change. If you place a bet 10 hours before kick off, the odds can
+      swing both in and out of your favor. By placing a fraction of Kelly, let’s say 50%
+      you have more rooms for error if the edge slightly decrease. If it increases, you
+      can simply place more money on that bet.
+  2.	 The Kelly formula leads to extreme volatility, the probability of being badly down
+      for an unacceptable long strech may occur.
+
+
+Additionally, placing a lower fraction of Kelly would generally decrease your bet size,
+making the probability of getting limited by the bookmakers smaller.
+
+
+Do not bet more than Kelly suggests, so if you chose to go high risk (100% of Kelly),
+do not over-bet. That will actually decrease the growth of your bankroll - as the full
+Kelly value is a maximizer.
+                                                How to Reduce Variance in Sports Betting   11
+
+
+
+
+3	 How to Reduce Variance in Sports 		
+	 Betting
+This section briefly goes into the different parameters that ultimately decides your
+variance. For the bettors out there that do not enjoy larger swings in your bankroll and
+deviance from your expected value, this section also discusses what actions you can
+take in order to minimize those fluctuations.
+
+
+When placing trades - there are 4 main parameters that impacts your variance;
+  1.	 Odds
+  2.	 Time until the game starts
+  3.	 The edge percent
+  4.	 Whether you place bets that are dependant of each other
+
+
+ODDS
+This is the most obvious one. The higher the odds you place on, the more swings you
+will see in your bankroll. The reason is quite simple; if you bet only on odds of 11 with
+an edge of 10%, you can expect the bet to be a winner one out of every 10 games,
+and you’ll get paid back 11 times your wager. In theory, you’d then lose 9 bets in a row
+then win one and win back more than you lost in the previous 9 bets.
+
+
+TIME UNTIL THE GAME STARTS
+The time until the game starts is quite important. The reason is, if you place a bet a
+full day before game start with an edge of 3% - new information may occur that could
+swing the bet out of your favour. To be extreme, there is a chance that all the key play-
+ers of your team might miss their flight, making your team lose the game. There is also
+a chance that the bet gets stronger, as the same thing could happen to the opposing
+team.
+                                                 How to Reduce Variance in Sports Betting    12
+
+
+
+The only thing that can be said for sure is that this will increase your variance, as the
+lines and the information are not settled yet.
+
+
+THE EDGE
+If you place on marginal edges (1-2%), chances are they can swing back if you place it a
+far from game time. The reason is that even the smallest piece of information may shift
+the market out of your favour. When you find higher edges, there is always a reason
+the market shifts so drastically - and the probability that it would shift back is higher.
+Most of the players in our community apply a rule of thumb that the longer it is until
+game time, the higher the edge threshold is. For instance, if it’s less than 2 hours until
+game time, One would place on their full range. If it’s 2-6 hours, then one would only
+place on 5%+ edges. If it’s more than 6 hours, then one might place on 8%+ edges.
+
+
+MULTIPLE LINES ON SAME GAME
+If you place multiple bets on the same game with dependant lines, you’ll see huge
+swings. If you place bets on +0.25 Home, +0.5 Home, +0.75 Home, +1 Home as well
+as Home to win and you follow our bet sizing - you’ll have a lot of money that the
+home team is going to win. Keep in mind that if you place on many lines on the same
+game you need to scale down the bet size. One could argue that decreasing the bet
+size and placing on multiple lines could decrease variance, for instance if there’s an
+edge on Over 1.5 and Over 2.5 goals, you place half the bet size on both of them.
+                                 Hedging bets: a Strategy for Reducing Risks When Trading Sports             13
+
+
+
+
+4	 Hedging bets: a Strategy for
+	 Reducing Risks When Trading Sports
+KEY TAKEAWAYS
+  •	 Hedging sports bets can enable you to reduce your risk, but it will also reduce
+     your potential ROI. Therefore it is a tradeoff between risk and reward that you as
+     a trader have to make.
+  •	 Be aware of potential pitfalls such as bookmakers voiding your bets as they can
+     leave you exposed with high risk and no upside.
+
+
+            “A hedge is an investment to reduce the risk of adverse price
+            movements in an asset.” - Investopedia
+
+
+
+
+                                        Russian Premier League: Ural vs. Rostov
+
+
+AN EXAMPLE OF HEDGING A SPORTS BET IN RUSSIAN PREMIER LEAGUE
+As a sports trader you can reduce your risk by hedging a trade you have placed. For
+instance on November 30th, 2016, Ural played Rostov in the Russian Premier League.
+The opening odds for the game offered by an Asian bookmaker is included in the table
+below. Rostov both being higher placed in the League and being a team that beat Bay-
+ern Munich at 15 in odds in the Champions League the week before was the favorite
+to win the game.
+         Opening odds at an Asian bookmaker    Ural win                 Draw             Rostov win
+         November 28th, 13:12                                    3.35             2.98                2.53
+                             Hedging bets: a Strategy for Reducing Risks When Trading Sports   14
+
+
+
+Soft bookmakers typically place their odds lower than the odds offered by the sharp
+bookmakers, because they have a lower payout rate. 2,5 hours before kick-off, Novem-
+ber 30th, the Norwegian bookmaker Norsk Tipping (NT) offered the game at 2.95 for a
+Ural win. However at this point in time the odds at Pinnacle had dropped to 2.17 (re-
+moving their 2,5% vig, the true odds would be 2.26) resulting in a 30.5 % edge [ ((2.95
+/ 2.26) -1) *100% ]. Next, Norsk Tipping most likely noticing a large amount of money
+placed on a Ural win adjusted their odds to 2.6 resulting in the odds below.
+
+           Opening odds at Norsk Tipping   Ural win         Draw         Rostov win
+           November 30th, 12:41                       2.6          2.7                2.45
+
+
+
+However, this was still a 15% edge versus the Asian bookmaker. I placed the bet at 2.6
+on NT with a stake of 850 NOK or approximately 100 USD. If Ural wins I would get a
+return of 260 USD and a profit of 160 USD (Stake returned - Initial stake). After I had
+placed my initial bet, I kept monitoring the odds at the Asian bookmaker, which kept
+dropping. With such a large edge I now had the opportunity to hedge my bet to com-
+pletely eliminate any potential losses if Ural failed to win, while making a smaller profit
+if they win. This was achieved by placing a bet on Rostov to win on the Asian Handicap
+line of +0.5 at Pinnacle at 1.96 in odds about 20 minutes after taking my initial posi-
+tion. Meaning that if the match ended in a draw, Rostov would have a 0.5 goal handi-
+cap, the result being a Rostov win. By hedging on the Asian bookmaker I would have a
+return on investment of 11,7% given a Ural win [ 1 / (1/2.6 + 1/1.96) ]. While breaking
+even on any other outcome (a draw or a Rostov win), so basically I was freerolling the
+game without any risk of potential losses. An important point to note is that hedging
+differs from arbitrage, because the bets take place at different points in time. This
+enabled me to get a much higher ROI while taking positions on both sides than what I
+would have achieved through arbitrage at the time I placed my initial bet.
+                                 Hedging bets: a Strategy for Reducing Risks When Trading Sports                      15
+
+
+
+     Norsk Tipping - 1x2                         Initial stake   Odds on Ural win               Return    Profits
+                                                     $100.00                             2.6 $260.00        $160.00
+     Asian bookmaker - Asian Handicap +0.5       Hedge stake Odds on AHC +0.5 Rostov Return               Profits
+                                                     $104.20                            1.96 $204.23        $100.03
+
+                           Profits if home win      $160 - Hedge stake              $60.00
+                           Profits if draw / away $100.032 - Initial stake              $0.32
+
+
+
+
+NEW INFORMATION IN THE FORM OF LINEUP CHANGES MADE THE ODDS
+DROP
+The odds at the Asian bookmaker kept on dropping all the way until kick-off as new
+information became known to the market. Most likely due to Rostov resting several key
+players.
+
+
+When the match started Ural had become the favorite and Rostov the underdog. The
+Asian bookmaker offered the following odds:
+
+              Closing odds at the Asian bookmaker       Ural win          Draw           Rostov Win
+              November 30th, 15:00 - Kickoff time                  1.71          3.53              6.25
+
+
+
+The vig-free closing odds offered by the Asian bookmaker at a Ural win would be 1.76
+[ 1.71 / 0.973 ]. The closing edge versus my initial trade at 2.6 would have been a
+47,7% edge [ ((2.6 / 1.76) -1) * 100%) ]. It is also worth to note that I would have had
+better odds on my hedge trade if I had placed it closer to kick-off.
+
+
+THE PROS AND CONS OF HEDGING A SPORTS TRADE
+The game ended with Ural winning 1-0, giving me a profit of $60. However, if I had
+simply stuck with my initial trade of a Ural win at 2.6 in odds without hedging I would
+have made a profit of $160. This highlights the pros and cons of hedging sports. The
+advantage of hedging was that I managed to eliminate my risk on the game. However,
+the disadvantage was that I reduced my potential ROI.
+                          Hedging bets: a Strategy for Reducing Risks When Trading Sports   16
+
+
+
+Now, because of Norsk Tipping’s specific rules, the Ural - Rostov game was not offered
+as a single, meaning that it had to be matched with another game to form an accu-
+mulator. I ended up combining it with another team scoring 2 goals or less in another
+game at 1.01 in odds. They ended up scoring 2 goals, so it was a close call, that ended
+with the trade being good. However this also meant that in reality my hedge trade
+was not completely risk free. If the 1.01 game had not gone in, I would have ended up
+losing the $100 I placed through the Asian bookmaker. Also, bookmakers often reserve
+the right to void bets where the odds is wrongly set. This could potentially have left
+me with a huge -EV trade. So if you are going to hedge your trades, make sure you are
+familiar with your bookmakers rules and practices.
+
+
+LESSONS LEARNED FROM HEDGING A SPORTS BET
+What did I learn from this experience? One can only make decisions with the informa-
+tion one has available at that point in time. I could not know whether the market would
+continue dropping in odds on a Ural win after I placed my initial trade or whether it
+would swing the other way. Therefore I made the decision to hedge my trade and
+freeroll the game for a guaranteed profit if Ural ended up winning. In hindsight, I would
+have made the same decision if the trade had been a single on NT. However if I come
+across trades in the future where there are hedging opportunities, but the game is not
+offered as a single I would rather run the risk with the potential upside of a larger re-
+turn on investment.
+
+
+KEY TAKEAWAY
+To sum it up hedging a sports bet can enable you to reduce your risk, but it will also
+reduce your potential ROI. Therefore it is a tradeoff between risk and reward that you
+as a trader have to make. In addition, you should be aware of potential pitfalls such as
+bookmakers voiding your bets as they can leave you exposed.
+                                                         Why Bookmakers Limit Players   17
+
+
+
+
+5	 Why Bookmakers Limit Players
+The corporate bookmakers overall aim is to make profits, since that’s what the owners
+and shareholders are looking for, and nothing else. They’re a business, not a charity
+after all. As an industry insider said:
+
+
+“I’ll be honest with you, there’s a culture of always trying to be unfair with the custom-
+er, and there doesn’t have to be. In other words, trying to deceive the customer, the
+very guys who pay our wages. As a punter myself it annoys me, because I know other
+bookmakers are doing it to me. The difference is, I understand it.”
+
+
+Sports betting is an expensive service for the online betting companies compared to
+games and casinos, or FOBT’s (Fixed Odds Betting Terminals) that are guaranteed to
+provide profits. The soft bookmakers do therefore have high margins on sports betting,
+and if someone consistantly earns money from sports betting they have no problems
+with limiting the players to prevent the company from losing money.
+
+
+Most betting companies deny limiting winning players. When P3, one of Norway’s
+largest radio channels interviewed a spokesperson from a major Nordic bookmaker he
+claimed that stake limitations are common though denying limiting winning players:
+
+
+“Like most other companies in the industry, staking limits are applied to games, es-
+pecially to prevent syndicate and insider betting. The claims that we generally limit
+winning players are completely wrong and we do not experience many inquiries about
+this.”
+
+
+With little means to distinguish syndicate or inside bettors from sharp ones, the reality
+is that winning players eventually get limited. The question then is,
+                             how can one avoid being limited?
+                                                       How Bookmakers Profile Players    18
+
+
+
+
+6	 How Bookmakers Profile Players
+All soft bookmakers profile players whether they say so or not. It is done both for mar-
+keting purposes as well as detecting sharp bettors beating the bookmaker. The aspect
+of not gaining attention has therefore become an important aspect of value betting.
+
+
+Not all risk teams are the same, but industry insider Matthew Trenhaile, pointed out
+things that will most likely be looked at:
+  •	 Does the account make money? Sounds ridiculous to highlight this but it is the
+      one thing that you can’t hide no matter whose account you use to place the bet.
+  •	 Is the account price sensitive and did the account place a bet via a price sensitive
+      medium such as a price comparison site? Sharp bettors are price sensitive.
+  •	 Was the bet placed well in advance of the start of the event? Anything prior to
+      the day of the event in particular can raise questions.
+  •	 Is the price an arbitrage price at the time of the bet? Pretty easy this one.
+  •	 Did the price shorten significantly after the bet was placed and before the start
+      of the event? The closing price is more accurate than the opening price after all.
+  •	 Did the client place only one bet rather than a variety of bets? Contentious this
+      one but bookmakers like to see you place multiple bets on the same match as if
+      you need as much action as possible. This is as long the bets are different types
+      and not the same bet type with different lines, doing so would just appear like
+      one’s exploiting the bookmakers mistakes.
+  •	 Do you withdraw your money? Never let money out the door.
+  •	 Do you use an E-Wallet when other more direct methods are possible? People
+      who need to move money fast are sharp or arbitrage traders. Or possibly money
+      launderers, which can get your account flagged just as fast whether you are one
+      or not.
+  •	 Do you use the online casino? If not then why not.
+                                                        How Bookmakers Profile Players     19
+
+
+
+  •	 Do you bet on niche markets that are not directly highlighted by the marketing
+     team?
+  •	 Do you bet in large size? Betting is supposed to be a small stakes social exercise
+     isn’t it?
+  •	 Do you bet on mobile platforms? If yes then that is good news. If not how come
+     your IP keeps changing when you login? Are you using a dongle or a VPN to con-
+     fuse our kindly risk team?
+  •	 Are you a woman? They do not conventionally bet on sports unless they have
+     followed an arbitrage e-book or are a bowler account or at least that is the com-
+     mon assumption.
+  •	 Are you betting in a size not commonly associated with your demographic? Re-
+     search of professions and financial standing is becoming more commonplace
+     now. Originally they just wanted to find the rich lawyers, accountants, doctors
+     who are worth offering client entertainment to but now if you find a student
+     betting £1,000 pound a game that is note worthy as well.
+  •	 IESnare? Just Google it I guess. There are probably other cookie trackers that are
+     not as well publicised.
+  •	 Bet at the same time as several other punters, excluding just before an event
+     starts. Was it arbitrage? Was it a tipster?
+  •	 Try never to bet on a fixed match or one that is perceived as possibly fixed inten-
+     tionally or unintentionally.
+  •	 Do not work in the betting or tipster industry, be connected with the betting or
+     tipping industry, friends on Facebook with people in betting or follow people on
+     Twitter from the betting or tipping industry.
+
+
+While reading this, you may have noticed that many of these points are hard to avoid
+if your goal is profits. There are still some precautions one take to reduce the risk of
+being limited. Therefore the next chapter is all about this.
+                                                            How to Avoid Being Limited     20
+
+
+
+
+7	 How to Avoid Being Limited
+FOLLOW OUR RECOMMENDED LEAGUES
+Trademate has a filter called recommended leagues. By selecting this, you’ll only
+get edgebets from the leagues with the highest betting limits. This includes Premier
+League, Primera Divisione, NBA, NFL and many more. These leagues are the ones that
+most people bet on - so it’s easy to hide in the mass of all the non-profitable betters.
+Betting on a diverse range of national minor league sports does indeed look very suspi-
+cious.
+
+
+BET WHOLE AMOUNTS
+Arbitrage betting is very usual in sports betting - so bookmakers look out for betsizing
+out of the ordinary. Instead of placing the exact recommended Kelly amount of $162,
+bet $160.
+
+
+NEVER CASH OUT BEFORE YOU HAVE TO
+Never cashout from a bookmaker before you’re limited. Bookmakers are paying fees
+whenever you cash out, so that’s an easy way for them to do a second look at your
+account. So you’ve tripled your bankroll in the past 3 weeks? Let’s take a closer look...
+
+
+DON’T PUSH THE MAX LIMITS
+Let’s say you try to place a bet of $250 on a game. The bookmaker may tell you that
+you can only place $238 on the particular bet. Instead of putting the $238, bet 60-
+70% of the max stake, in this case $150. Some bookmakers even give you the oppor-
+tunity to automatically put the max limit of $238 and send the remaining $12 for man-
+ual clearance. Never do that. Add in some accumulators with a lower betsize. This will
+make you look more of a “fun bettor” and its something bookmakers appreciate. Lower
+your betsize for these as the variance is higher.
+                                                           How to Avoid Being Limited     21
+
+
+
+ONE BET PER GAME
+Bookmakers place betting limits for a reason. The reason is usually that they’re not re-
+ally sure if their odds in a particular game is any good. If someone comes in and places
+bets on Over 198.5, Over 199.5, Over 200.5 and Over 201.5 - it’s pretty clear that
+they’re trying to get value. Bookmakers don’t like that. Also - placing more than one
+bet on a game has a great impact on your variance.
+
+
+MAKE YOUR FIRST DEPOSIT SMALL
+Try to look like a hobby sportsbetter. Depositing $10,000 in a brand new account is an
+obvious way to tell bookmakers that you’re trying to beat them.
+
+
+WANNA BE REALLY CLEVER? THROW IN AN ACCUMULATOR ONCE IN A WHILE
+Bookmakers makes most of their money from accumulators. Their margins increases for
+each bet in the accumulator. The variance is bigger, but matching different edges still
+give a positive expected value. By doing this, you look more like a non-profitable player
+to the bookmakers.
+
+
+BETTING FROM NETWORKS WHERE OTHERS HAVE BEEN LIMITED
+Even if you just log onto your account in a home network where another player have
+been limited, you risk becoming limited. We do not know yet whether this could in-
+clude all betting companies owned by the same firm. Which means that if your friend
+was limited on Betsafe, you have to stay away from Betsafe, and maybe also Betsson
+and Nordicbet while you’re on his home network since all three bookmakers are owned
+by Betsson. A virtually private network (VPN) could solve this issue.
+                                                            How to Avoid Being Limited   22
+
+
+
+NOTHING LASTS FOREVER
+Unfortunately, by continously placing profitable bets and beating the bookmakers -
+chances are they will limit you eventually. After all - they are losing money on you.
+However, by following these steps we are confident that your accounts will last longer,
+thus making more money from each and every bookmaker. Good luck and happy bet-
+ting!
+                               CREDITS
+      This eBook is written by Trademate Sports for educational purposes.
+All rights of the content and the right to distribute this ebook lies with TM Sports
+                                 Technologies AS.
+
+
+         If you have any questions, please do not hesitate to contact us.
+ This ebook is the third in a series of four ebooks about the topic of betting and
+               value betting, each book with increasing complexity.
+
+
+                           CONTACT INFORMATION
+                              Tradematesports.com
+                          marius@tradematesports.com
+
+
+                        FOLLOW US ON SOCIAL MEDIA
+
