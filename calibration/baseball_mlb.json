@@ -130144,7 +130144,10 @@
     "suppress": [
       "pitcher_outs",
       "totals"
-    ]
+    ],
+    "cv_floor": {
+      "pitcher_earned_runs": 1.3
+    }
   },
   "expected_runs_additive": {
     "enabled": true,
