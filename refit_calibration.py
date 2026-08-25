@@ -2852,6 +2852,17 @@ def _cc_load_scored_rows(sport, store_label=""):
         "use_minutes": False,
     }
 
+    # Method-D reconstruction: when a batter_hits line-bucket ships as D, build the
+    # as-of xBA index once + stamp each obs's distributional prob (p_dist) so
+    # _rc_run_bucket can recalibrate D like A/C. None (off) when no D bucket ships.
+    _lm = cfg.get("line_methods") or []
+    _d_buckets = [b for b in _lm if b.get("method") == "D"]
+    _default_m = cfg.get("method", "A")
+    _uses_d = bool(_d_buckets) or _default_m == "D"
+    xba_index = _diag_build_xba_index(enriched) if _uses_d else None
+    d_xstats = (_d_buckets[0].get("xstats_strength", 0.75) if _d_buckets
+                else cfg.get("xstats_strength", 0.75))
+
     rows = []
     for obs in enriched:
         projected, emp = blc.project_and_empirical(
@@ -2866,18 +2877,57 @@ def _cc_load_scored_rows(sport, store_label=""):
                                      american_to_implied_prob(up))[0]
             over_dec = american_to_decimal(op)
             under_dec = american_to_decimal(up)
-        rows.append({
+        rowd = {
             "game_date": obs["game_date"], "line": obs["line"],
             "actual": obs["actual"], "projected": projected,
             "empirical_over": max(0.0, min(1.0, emp)),
             "mkt_over": mkt_over, "over_dec": over_dec, "under_dec": under_dec,
-        })
+        }
+        if xba_index is not None and _rc_method_for_line(
+                obs["line"], _lm, _default_m) == "D":
+            try:
+                rowd["p_dist"] = blc.project_distributional(
+                    obs, params, sport_key, xba_index=xba_index,
+                    xstats_strength=d_xstats, defense_by_season=defense_by_season)
+            except Exception:
+                rowd["p_dist"] = None
+        rows.append(rowd)
 
     rows = [r for r in rows if r["actual"] != r["line"]]   # drop pushes
     rows.sort(key=lambda r: r["game_date"])
     for r in rows:
         r["o"] = 1 if r["actual"] > r["line"] else 0
     return sport_key, cfg, rows
+
+
+def _diag_build_xba_index(enriched):
+    """Leakage-safe as-of xBA index for reconstructing method-D probs in
+    --recalibrate (mirrors the --real-lines build). Fail-open -> None when no
+    Statcast days are cached for the obs seasons (D rows then drop out)."""
+    try:
+        import savant_history as sh
+        import backtest_props
+    except Exception:
+        return None
+    years = sorted({str(o["game_date"])[:4] for o in enriched
+                    if isinstance(o, dict) and o.get("game_date")})
+    raw = []
+    for y in years:
+        try:
+            raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+        except Exception:
+            pass
+    if not raw:
+        print("  [xstats] no Statcast days cached — method-D buckets can't be "
+              "reconstructed; they show as skipped.")
+        return None
+    try:
+        idx = backtest_props.build_batter_xba_index(raw)
+        print(f"  [xstats] built leakage-safe xBA index from {len(raw):,} pitches "
+              f"({', '.join(years)}) to reconstruct method-D probs.")
+        return idx
+    except Exception:
+        return None
 
 
 def diagnose_conditional_calibration(sport, store_label="", min_cell_n=50):
@@ -3146,6 +3196,20 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
                 resid, r["line"] - (r["projected"] + mu))
         print(f"     split: pool={len(pool)} (residual ECDF, mu={mu:+.3f})  "
               f"train={len(train)}  test={len(test)} (3-way)")
+    elif method == "D":
+        drows = [r for r in brows if r.get("p_dist") is not None]
+        if len(drows) < 120:
+            print(f"     too thin (n={len(drows)} rows with a reconstructed "
+                  f"distributional prob < 120); skipped — D needs as-of AB + a "
+                  f"cached xBA index (run the Statcast bulk backfill if 0).")
+            return
+        split = len(drows) // 2
+        train, test = drows[:split], drows[split:]
+        for r in train + test:
+            r["p_raw"] = r["p_dist"]
+        print(f"     split: train={len(train)}  test={len(test)} (2-way, method-D "
+              f"distributional prob w/ as-of xBA; {n - len(drows)} row(s) dropped "
+              f"for missing AB/xBA)")
     else:
         print(f"     method {method} unsupported for recalibration; skipped.")
         return
