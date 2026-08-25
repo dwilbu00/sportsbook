@@ -398,6 +398,13 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
             date_idx[d] = i
     dup_dates = {d for d, c in date_counts.items() if c > 1}
 
+    # ``no_game`` stays the running total dropped at the match stage; the named
+    # sub-reason counters break down WHY, so a low join yield can be diagnosed
+    # (early-season <10-prior warm-up vs DNP/date-miss vs a real facts gap).
+    def _drop(reason):
+        counters["no_game"] += 1
+        counters[reason] = counters.get(reason, 0) + 1
+
     for row in rows:
         # batter_total_bases / batter_rbis are WAREHOUSE-ONLY: an ESPN gamelog's
         # 'RBI' is uncalibrated and it has no 'TB', so NEVER fit these off an
@@ -405,16 +412,17 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
         # ESPN log; the MLB path is always warehouse post-P6.)
         if (not from_warehouse and espn_sport == "baseball"
                 and row["prop_key"] in WAREHOUSE_ONLY_PROPS):
-            counters["no_game"] += 1
+            _drop("warehouse_only_off_espn")
             continue
         # Never grade a pitcher prop off a batter's gamelog (or vice-versa): the
         # "K"/"SO" strikeout labels collide across MLB roles. A role mismatch
         # drops just this row; non-MLB props (role None) always pass.
         if not _role_matches_gamelog(row["prop_key"], gamelog):
-            counters["no_game"] += 1
+            _drop("role_mismatch")
             continue
         stat_label = _stat_label_for(row["prop_key"], gamelog)
         if not stat_label:
+            _drop("no_stat_label")
             continue
         # game_date is UTC-ish on both sides, so date-only match is usually
         # accurate. Also try ±1 day for timezone slippage (stays within the
@@ -433,23 +441,23 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
             except ValueError:
                 pass
         if matched_d is None:
-            counters["no_game"] += 1
+            _drop("date_no_match")       # player didn't play that date (DNP) / date slip
             continue
         if matched_d in dup_dates:       # doubleheader → can't attribute cleanly
-            counters["no_game"] += 1
+            _drop("doubleheader")
             continue
 
         idx = date_idx[matched_d]
         test_game = gamelog[idx]
         actual = test_game.get(stat_label)
         if actual is None:
-            counters["no_game"] += 1
+            _drop("actual_none")         # game found but the stat is NULL (facts gap)
             continue
         if stat_label == "IP":           # pitcher_outs: IP notation -> outs
             actual = ip_to_outs(actual)
         min_played = test_game.get("MIN", 0.0) or 0.0
         if min_played and min_played < 10.0:
-            counters["no_game"] += 1
+            _drop("low_min")
             continue
 
         # Strictly-earlier games in THIS season (gamelog is most-recent-first, so
@@ -457,7 +465,7 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
         # season leakage: only the obs's own season, only games before it.
         prior_games = gamelog[idx + 1:]
         if len(prior_games) < 10:
-            counters["no_game"] += 1
+            _drop("prior_lt10")          # early-season: <10 in-season priors (hits pitchers hardest)
             continue
 
         enriched.append({
@@ -493,7 +501,9 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
         by_player[row.get("player_mlb_id") or row["player"]].append(row)
 
     enriched = []
-    counters = {"no_game": 0}
+    counters = {"no_game": 0, "prior_lt10": 0, "date_no_match": 0, "actual_none": 0,
+                "doubleheader": 0, "role_mismatch": 0, "no_stat_label": 0,
+                "low_min": 0, "warehouse_only_off_espn": 0}
     skipped_no_player = 0
 
     # MLB: pre-load each (role, season) gamelog set in ONE bulk query and look up
@@ -556,6 +566,11 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     print(f"  Matched {len(enriched):,} book lines to actual results "
           f"(one per player-prop-game); dropped {skipped_no_player:,} "
           f"(player not found) and {counters['no_game']:,} (no matching game/stat).")
+    _reasons = {k: v for k, v in counters.items() if k != "no_game" and v}
+    if _reasons:
+        _brk = ", ".join(f"{k}={v:,}" for k, v in
+                         sorted(_reasons.items(), key=lambda kv: -kv[1]))
+        print(f"    no-match breakdown: {_brk}")
     _attach_gamecontext(enriched, espn_sport)
     _attach_platoon(enriched, espn_sport)
     return enriched
