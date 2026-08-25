@@ -3110,6 +3110,11 @@ def _rc_method_for_line(line, line_methods, default_method):
     return default_method
 
 
+_RC_ISOTONIC_MIN_TRAIN = 1000   # min train rows before isotonic is a WINNER
+#                                 candidate; below it a non-parametric step map is
+#                                 noise-fit (sklearn rule of thumb ~1000) -> Platt.
+
+
 def _rc_run_bucket(name, method, brows, blc, min_cell_n):
     """Fit + OOS-evaluate a recal map on one shipped line-bucket. Method A raw p
     is the as-of empirical over-rate (2-way chronological split); method C raw p
@@ -3179,7 +3184,14 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
     # noise). A Platt fit with a<=0 is disqualified — a monotone-DECREASING map
     # inverts the probability ordering, which is always noise-fitting on a thin
     # slice, never a legitimate recalibration.
-    cands = [("raw", m_raw, _raw), ("isotonic", m_is, _is)]
+    # R4b(i): isotonic is a WINNER candidate only with enough train rows — below
+    # _RC_ISOTONIC_MIN_TRAIN a step map is noise-fit, so fall back to Platt/raw.
+    cands = [("raw", m_raw, _raw)]
+    if len(train) >= _RC_ISOTONIC_MIN_TRAIN:
+        cands.append(("isotonic", m_is, _is))
+    else:
+        print(f"     isotonic held out as a winner (train={len(train)} < "
+              f"{_RC_ISOTONIC_MIN_TRAIN}: too thin to trust a step map)")
     if a > 0.0:
         cands.append(("platt", m_pl, _pl))
     win_lbl, win_m, win_get = min(cands, key=lambda t: t[1]["logloss"])
@@ -3191,6 +3203,24 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
     print(f"     winner (OOS log-loss): {win_lbl} — improves raw "
           f"({m_raw['logloss']:.4f} -> {win_m['logloss']:.4f}, "
           f"ECE {m_raw['ece']:.4f} -> {win_m['ece']:.4f})")
+
+    # R4b(ii) market-BSS gate: beating RAW makes a map calibration-honest, but it is
+    # only SELECTION-worthy if it ALSO beats the de-vigged MARKET's Brier on the
+    # priced rows (BSS > 0). A map that beats raw but not the market improves our
+    # numbers without adding anything the market doesn't already price -- it must
+    # NOT be allowed to change bet selection (the no-edge trap).
+    priced = [r for r in test if r.get("mkt_over") is not None]
+    if priced:
+        mkt_brier = sum((r["mkt_over"] - r["o"]) ** 2 for r in priced) / len(priced)
+        win_brier = sum((win_get(r) - r["o"]) ** 2 for r in priced) / len(priced)
+        bss = (1.0 - win_brier / mkt_brier) if mkt_brier > 0 else None
+        verdict = ("SELECTION-worthy (beats the market)" if win_brier < mkt_brier
+                   else "calibration-only -- does NOT beat the market; must not "
+                        "alter bet selection")
+        print("     vs de-vigged MARKET (priced n={}): map brier {:.4f} vs market "
+              "{:.4f}{} -> {}".format(
+                  len(priced), win_brier, mkt_brier,
+                  ", BSS {:+.4f}".format(bss) if bss is not None else "", verdict))
 
     for r in test:
         r["p_before"] = _raw(r)
