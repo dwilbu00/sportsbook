@@ -50,7 +50,15 @@ ODDS_CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 
 PROPS_BY_SPORT = {
     "nba":  ["player_points", "player_rebounds", "player_assists"],
-    "mlb":  ["pitcher_strikeouts", "batter_hits"],
+    # MLB: Platt-recal eligibility. batter_hits + pitcher_strikeouts were the
+    # originals; TB/RBI/batter_strikeouts added 2026-08-25 (R4 across-the-board) —
+    # they were served RAW (overconfident) with no Platt fit. Seeding is fail-safe
+    # (a fit that can't beat raw on both CV folds is never persisted → identity
+    # passthrough). pitcher_earned_runs is deliberately WITHHELD: its raw-served
+    # high-CV +ROI lead is under validation (Thread B) and Platt would change the
+    # served prob mid-measurement — add it back only after that edge is characterized.
+    "mlb":  ["pitcher_strikeouts", "batter_hits",
+             "batter_total_bases", "batter_rbis", "batter_strikeouts"],
     "nfl":  ["player_pass_yds", "player_rush_yds"],
 }
 
