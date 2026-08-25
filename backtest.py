@@ -2754,6 +2754,7 @@ def _print_props_odds_results(results, threshold_pct):
     _print_props_served_ev_staking(results)
     _print_props_ev_by_sample_size(results)
     _print_props_ev_by_variance(results)
+    _print_props_cv_ev_matrix(results)
     _simulate_daily_topn(results)
 
 
@@ -2966,6 +2967,59 @@ def _print_props_ev_by_variance(results, ev_gate=0.0):
             lbl = "all" if gate >= 10 ** 8 else f"<={gate:g}"
             print(f"  {lbl:<14} {m:>6} {100.0 * wins / m:>6.1f} "
                   f"{100.0 * pl / m:>8.2f} {pl:>9.2f}")
+
+
+# Deployable-gate lens for the validated earned_runs high-CV variance edge: a
+# CUMULATIVE CV-FLOOR (bet only pitchers with recency-weighted CV >= floor — the
+# edge is in HIGH CV, so this is a min-gate, not the max-gate _CV_GATES above)
+# crossed with the live EV floor. The validated grid is at EV>=0; production also
+# applies value_gate.ev_floor (0.04), so this confirms whether CV>=1.3 survives
+# being stacked with the 4% EV gate BEFORE the serving gate is wired in.
+_CV_FLOORS = (0.0, 1.0, 1.3)
+_CVEV_GATES = (0.0, 0.02, 0.04, 0.05, 0.08)
+
+
+def _print_props_cv_ev_matrix(results):
+    """CV-floor x EV-floor ROI matrix on the served (+EV, max-EV side) picks — the
+    deployable-gate lens. Rows require the pitcher's recency-weighted CV >= floor
+    (edge = HIGH CV); columns require the selected side's EV >= gate (production's
+    value_gate.ev_floor = 0.04). Each cell = ROI% / n. '-' = no bets in that cell.
+    The decision cell for the earned_runs edge is [CV>=1.3, EV>=4%]: if it stays
+    solidly +ROI with usable volume, the CV>=1.3 gate survives the live EV floor.
+
+    NOTE: gates on EV only (value_gate's edge_floor=0.01 rarely binds); side and EV
+    are computed exactly as _print_props_served_ev_staking, so this is fit==serve."""
+    print("\n=== CV-floor x EV-floor ROI matrix [served +EV picks; deployable-gate lens] ===")
+    print("  rows require CV >= floor (edge = HIGH CV); cols require side EV >= gate")
+    print("  (production value_gate.ev_floor = 0.04). cell = ROI%/n. '-' = no bets.")
+    for prop, r in results.items():
+        picks = []   # (cv, ev, decimal_odds, won) for the max-EV side of each obs
+        for _d, p, _f, o, op, up, _pn, pcv in (r.get("ev_obs") or []):
+            if op is None or up is None:
+                continue
+            do, du = american_to_decimal(op), american_to_decimal(up)
+            ev_o, ev_u = p * do - 1.0, (1.0 - p) * du - 1.0
+            if ev_o >= ev_u:
+                picks.append((pcv, ev_o, do, o == 1))
+            else:
+                picks.append((pcv, ev_u, du, o == 0))
+        if not picks:
+            continue
+        print(f"\n  {prop}:")
+        print("  " + f"{'CV floor':<9}"
+              + "".join(f"{'EV>=' + f'{g * 100:.0f}%':>14}" for g in _CVEV_GATES))
+        for cvf in _CV_FLOORS:
+            row = "  " + f"{'>=' + f'{cvf:g}':<9}"
+            for g in _CVEV_GATES:
+                sel = [(dec, won) for pcv, ev, dec, won in picks
+                       if pcv >= cvf and ev >= g]
+                if not sel:
+                    row += f"{'-':>14}"
+                    continue
+                m = len(sel)
+                pl = sum((dec - 1.0) if won else -1.0 for dec, won in sel)
+                row += f"{f'{100.0 * pl / m:+.1f}%/{m}':>14}"
+            print(row)
 
 
 def _conf_bucket(p):
