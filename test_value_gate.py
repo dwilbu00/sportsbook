@@ -12,7 +12,9 @@ import unittest
 
 import calibration_loader as cl
 from props import (_prop_gate_is_value, _DK_SELFDEVIG_EDGE_MULT, _gate_floor_mult,
-                   _DEFAULT_GATE_TIME_BANDS, _DEFAULT_GATE_LONGSHOT)
+                   _DEFAULT_GATE_TIME_BANDS, _DEFAULT_GATE_LONGSHOT,
+                   _recency_weighted_cv, _CV_MIN_PRIOR)
+from stats import _recency_weights, _weighted_mean
 
 
 class PropGateDecisionTests(unittest.TestCase):
@@ -186,6 +188,55 @@ class ValueGateIOTests(unittest.TestCase):
         gate = cl.load_value_gate("baseball_mlb")
         self.assertEqual(gate["time_bands"], [(2.0, 1.0), (6.0, 1.5)])  # bad row dropped
         self.assertEqual(gate["longshot_surcharge"], (150.0, 1.5))
+
+    def test_load_parses_cv_floor(self):
+        import json
+        cl.save_value_gate("baseball_mlb", {"ev_floor": 0.04})
+        blob = json.load(open(cl.calibration_path("baseball_mlb")))
+        # good numeric floor kept; non-numeric entry dropped (fail safe → not CV-gated)
+        blob["value_gate"]["cv_floor"] = {"pitcher_earned_runs": 1.3, "bad": "x"}
+        json.dump(blob, open(cl.calibration_path("baseball_mlb"), "w"))
+        gate = cl.load_value_gate("baseball_mlb")
+        self.assertEqual(gate["cv_floor"], {"pitcher_earned_runs": 1.3})
+
+    def test_cv_floor_absent_is_inert(self):
+        cl.save_value_gate("baseball_mlb", {"ev_floor": 0.04})
+        self.assertNotIn("cv_floor", cl.load_value_gate("baseball_mlb"))
+
+
+class RecencyWeightedCVTests(unittest.TestCase):
+    """props._recency_weighted_cv must reproduce backtest.py's inline volatility
+    formula EXACTLY (the lens the earned_runs CV>=1.3 edge was validated on) and
+    fail CLOSED (None) on inputs where a high-CV floor can't be confirmed."""
+
+    @staticmethod
+    def _backtest_cv(prior, hl):
+        # mirror of backtest.py:2639-2648
+        wts = _recency_weights(len(prior), hl)
+        raw_mean = _weighted_mean(prior, wts)
+        sw = sum(wts) or 1.0
+        var = sum(w * (v - raw_mean) ** 2 for v, w in zip(prior, wts)) / sw
+        return (var ** 0.5 / raw_mean) if raw_mean > 1e-9 else 0.0
+
+    def test_matches_backtest_formula(self):
+        for hl in (None, 7, 15):
+            for series in ([3, 0, 5, 2, 8, 1, 4, 6, 0, 7],
+                           [4, 4, 4, 4, 4],
+                           [2.5, 3.1, 0.0, 9.0, 1.0, 2.0]):
+                got = _recency_weighted_cv(series, hl)
+                self.assertIsNotNone(got)
+                self.assertAlmostEqual(got, self._backtest_cv(series, hl), places=12)
+
+    def test_fails_closed_on_short_or_degenerate(self):
+        self.assertIsNone(_recency_weighted_cv([1, 2, 3, 4], None))   # < _CV_MIN_PRIOR
+        self.assertIsNone(_recency_weighted_cv([], None))
+        self.assertIsNone(_recency_weighted_cv(None, None))
+        self.assertIsNone(_recency_weighted_cv([0, 0, 0, 0, 0, 0], None))  # zero mean
+
+    def test_min_prior_boundary(self):
+        self.assertEqual(_CV_MIN_PRIOR, 5)
+        self.assertIsNone(_recency_weighted_cv([1, 2, 3, 4], None))       # 4 < 5
+        self.assertIsNotNone(_recency_weighted_cv([1, 2, 3, 4, 5], None))  # 5 ok
 
 
 if __name__ == "__main__":

@@ -755,6 +755,16 @@ def load_value_gate(sport_key):
     if (isinstance(ls, (list, tuple)) and len(ls) == 2
             and _num(ls[0]) and _num(ls[1])):
         out["longshot_surcharge"] = (float(ls[0]), float(ls[1]))
+    # Prop-conditional recency-weighted-CV floor {prop_key: min_cv}: recommend the
+    # prop only when the player's outcome volatility clears the floor (validated for
+    # pitcher_earned_runs — the market underprices high-variance starters). Drop
+    # non-numeric entries so a misconfigured floor fails SAFE (that prop just isn't
+    # CV-gated) rather than raising at the gate comparison.
+    cvf = gate.get("cv_floor")
+    if isinstance(cvf, dict):
+        parsed = {str(k): float(v) for k, v in cvf.items() if _num(v)}
+        if parsed:
+            out["cv_floor"] = parsed
     return out
 
 

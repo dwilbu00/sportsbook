@@ -975,6 +975,29 @@ def _gate_floor_mult(hours_to_pitch, price, time_bands, longshot):
     return mult
 
 
+_CV_MIN_PRIOR = 5   # min prior games for a meaningful CV (matches the backtest grade floor)
+
+
+def _recency_weighted_cv(series, half_life):
+    """Recency-weighted coefficient of variation (sigma/mean) of a prior-game stat
+    series, computed EXACTLY as backtest.py's volatility diagnostic (the lens the
+    earned_runs high-CV edge was validated on): PURE recency weights (no defense/
+    venue adjustment) over the FULL fetched series. This is why callers must pass
+    history["values"] (the untouched series) and the pure ``half_life`` — NOT the
+    recent_n-capped / reliability-filtered ``values`` nor the defense-adjusted
+    ``weights`` rebuilt downstream, or the live CV would drift off the backtested
+    threshold. Returns None when the series is too short (< _CV_MIN_PRIOR) or the
+    mean is ~0, so a CV-floor gate fails CLOSED (can't confirm high volatility → not
+    recommended) rather than open."""
+    if not series or len(series) < _CV_MIN_PRIOR:
+        return None
+    w = _recency_weights(len(series), half_life)
+    mean = _weighted_mean(series, w)
+    if mean <= 1e-9:
+        return None
+    return _weighted_std(series, w, mean=mean) / mean
+
+
 def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
                         suppress, legacy_threshold, dk_alone,
                         hours_to_pitch=None, price=None,
@@ -1056,6 +1079,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
     gate_ev_floor = value_gate.get("ev_floor")
     gate_edge_floor = value_gate.get("edge_floor", 0.0) or 0.0
     gate_suppress = set(value_gate.get("suppress") or [])
+    # Prop-conditional recency-weighted-CV floor {prop_key: min_cv}: only recommend
+    # this prop when the player's outcome volatility clears the floor. Validated for
+    # pitcher_earned_runs (the market underprices high-variance starters); empty by
+    # default → no-op, serving byte-identical. See _recency_weighted_cv.
+    gate_cv_floor = value_gate.get("cv_floor") or {}
 
     # Self-updating Platt recalibration: on first call per process per sport,
     # resolve any past-game predictions to outcomes and refit Platt params
@@ -1930,6 +1958,20 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 gate_suppress, threshold, dk_alone,
                 hours_to_pitch=hours_to_pitch, price=best_price,
                 time_bands=gate_time_bands, longshot=gate_longshot)
+
+            # CV-floor gate (validated earned_runs variance edge): for a prop with a
+            # configured recency-weighted-CV floor, only recommend when the pitcher's
+            # outcome volatility clears it — the edge lives on HIGH-CV (boom/bust)
+            # starters whose fat-tailed earned-runs the market underprices. CV is the
+            # PURE-recency CV of the FULL fetched series (history["values"]), matching
+            # the backtest diagnostic the threshold was tuned on — NOT the recent_n-
+            # capped / defense-adjusted `values`/`weights` used for the projection.
+            # Fails CLOSED (short history / below floor → not value). Inert unless a
+            # cv_floor is configured for this prop → serving byte-identical by default.
+            if is_value and prop_key in gate_cv_floor:
+                _pcv = _recency_weighted_cv(history.get("values") or [], half_life)
+                if _pcv is None or _pcv < gate_cv_floor[prop_key]:
+                    is_value = False
 
             # §2.4b-2 direction split: demote losing UNDER picks on cheap lines
             # (batter_hits under 0.5 wins only ~43% OOS) from recommendations.
