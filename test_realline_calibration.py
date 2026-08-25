@@ -656,9 +656,31 @@ class JoinToActualsTests(unittest.TestCase):
                                 for g in o["prior_games"]))
 
     def test_join_skips_doubleheader_date(self):
+        # No game_pk on the line (or the gamelog) -> falls back to the date match ->
+        # the DH date is unattributable -> dropped. The residual same-timestamp case.
         gl = self._gamelog([(f"2026-07-{d:02d}", 1) for d in range(12, 24)]
                            + [("2026-07-24", 2), ("2026-07-24", 0)])
         self.assertEqual(self._join([self._book_row()], gl), [])
+
+    def test_join_attributes_doubleheader_via_game_pk(self):
+        # DH-SAFE recovery: two games on one date with DISTINCT game_pks + split
+        # first-pitch times; a book line carrying each game_pk binds to the EXACT
+        # game instead of the whole date dropping. Also checks the as-of prior window
+        # stays leakage-correct (g1 does NOT see g2, which is later same day).
+        gl = ([{"game_date": f"2026-07-{d:02d}T23:00:00Z", "H": 1,
+                "game_pk": 1000 + d} for d in range(12, 24)]
+              + [{"game_date": "2026-07-24T17:05:00Z", "H": 2, "game_pk": 7001},   # g1 (afternoon)
+                 {"game_date": "2026-07-24T23:10:00Z", "H": 3, "game_pk": 7002}])  # g2 (evening)
+        r1 = self._book_row(gd="2026-07-24"); r1["game_pk"] = 7001
+        r2 = self._book_row(gd="2026-07-24"); r2["game_pk"] = 7002
+        out = self._join([r1, r2], gl)
+        self.assertEqual(len(out), 2)                     # BOTH recovered, neither dropped
+        by_pk = {o["game_pk"]: o for o in out}
+        self.assertEqual(by_pk[7001]["actual"], 2.0)      # g1 line -> g1 box score
+        self.assertEqual(by_pk[7002]["actual"], 3.0)      # g2 line -> g2 box score
+        # leakage guard: g1's prior window excludes g2 (later same day); g2 sees g1
+        self.assertNotIn(7002, {g.get("game_pk") for g in by_pk[7001]["prior_games"]})
+        self.assertIn(7001, {g.get("game_pk") for g in by_pk[7002]["prior_games"]})
 
     def _pitcher_gamelog(self, dates_k):
         # Pitcher rows carry IP (the pitcher discriminator) plus K/SO.

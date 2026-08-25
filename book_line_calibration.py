@@ -387,9 +387,13 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
     # harvest_real_line_book_lines).
     date_idx = {}
     date_counts = {}
+    pk_idx = {}                  # game_pk -> index: DH-safe exact-game match
     for i, g in enumerate(gamelog):
         if g.get("completed") is False:
             continue             # in-progress/partial game: not a gradeable box score
+        gp = g.get("game_pk")
+        if gp is not None and gp not in pk_idx:
+            pk_idx[gp] = i       # unique per (athlete, game_pk); first-wins is exact
         d = (g.get("game_date") or "")[:10]
         if not d:
             continue
@@ -424,30 +428,42 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
         if not stat_label:
             _drop("no_stat_label")
             continue
-        # game_date is UTC-ish on both sides, so date-only match is usually
-        # accurate. Also try ±1 day for timezone slippage (stays within the
-        # season's gamelog — MLB seasons don't cross a calendar-year boundary).
-        d = row["game_date"]
-        matched_d = d if d in date_idx else None
-        if matched_d is None:
-            from datetime import date as _date, timedelta
-            try:
-                d0 = _date.fromisoformat(d)
-                for delta in (-1, 1):
-                    alt = (d0 + timedelta(days=delta)).isoformat()
-                    if alt in date_idx:
-                        matched_d = alt
-                        break
-            except ValueError:
-                pass
-        if matched_d is None:
-            _drop("date_no_match")       # player didn't play that date (DNP) / date slip
-            continue
-        if matched_d in dup_dates:       # doubleheader → can't attribute cleanly
-            _drop("doubleheader")
-            continue
+        # DH-SAFE match: if the book line carries a game_pk present in this gamelog,
+        # bind to the EXACT game — this attributes a split-doubleheader line to the
+        # right box score instead of dropping the whole date. odds_line.game_pk is
+        # ~99.9% populated for MLB props (stamped at capture via find_game_pk_by_
+        # commence). Fall back to the date match when game_pk is absent (the ~0.1%
+        # legacy/unresolvable rows) or not in this log; a true same-timestamp DH
+        # with no game_pk still drops via dup_dates below.
+        idx = None
+        row_pk = row.get("game_pk")
+        if row_pk is not None and row_pk in pk_idx:
+            idx = pk_idx[row_pk]
+        if idx is None:
+            # game_date is UTC-ish on both sides, so date-only match is usually
+            # accurate. Also try ±1 day for timezone slippage (stays within the
+            # season's gamelog — MLB seasons don't cross a calendar-year boundary).
+            d = row["game_date"]
+            matched_d = d if d in date_idx else None
+            if matched_d is None:
+                from datetime import date as _date, timedelta
+                try:
+                    d0 = _date.fromisoformat(d)
+                    for delta in (-1, 1):
+                        alt = (d0 + timedelta(days=delta)).isoformat()
+                        if alt in date_idx:
+                            matched_d = alt
+                            break
+                except ValueError:
+                    pass
+            if matched_d is None:
+                _drop("date_no_match")   # player didn't play that date (DNP) / date slip
+                continue
+            if matched_d in dup_dates:   # same-timestamp DH, no game_pk → unattributable
+                _drop("doubleheader")
+                continue
+            idx = date_idx[matched_d]
 
-        idx = date_idx[matched_d]
         test_game = gamelog[idx]
         actual = test_game.get(stat_label)
         if actual is None:

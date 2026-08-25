@@ -983,7 +983,7 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     closing_sid = min(
         by_snap, key=lambda sid: _closing_sort_key(target, snap_captured.get(sid)))
 
-    combined = {}   # (player, prop_key) -> {line, over_price, under_price, mlb_id}
+    combined = {}   # (player, prop_key) -> {line, over_price, under_price, mlb_id, game_pk}
     for r in by_snap[closing_sid]:
         player, prop_key = r.get("player"), r.get("prop_key")
         point = r.get("point")
@@ -991,9 +991,12 @@ def _assemble_prop_entries(event_id, rows, sport_key):
             continue
         e = combined.setdefault((player, prop_key),
                                 {"line": point, "over_price": None,
-                                 "under_price": None, "player_mlb_id": None})
+                                 "under_price": None, "player_mlb_id": None,
+                                 "game_pk": None})
         if e.get("player_mlb_id") is None:
             e["player_mlb_id"] = r.get("player_mlb_id")   # first non-None wins
+        if e.get("game_pk") is None:
+            e["game_pk"] = r.get("game_pk")   # per-event; DH-safe join key downstream
         direction = (r.get("direction") or "").upper()
         if direction == "OVER":
             e["over_price"] = r.get("price")
@@ -1006,6 +1009,7 @@ def _assemble_prop_entries(event_id, rows, sport_key):
         "player": player, "player_mlb_id": e.get("player_mlb_id"),
         "prop_key": prop_key, "line": e["line"],
         "over_price": e["over_price"], "under_price": e["under_price"],
+        "game_pk": e.get("game_pk"),
     } for (player, prop_key), e in combined.items()]
 
 

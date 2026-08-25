@@ -1459,6 +1459,7 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
             odds_line.c.selection, odds_line.c.player, odds_line.c.prop_key,
             odds_line.c.direction, odds_line.c.point, odds_line.c.price,
             odds_line.c.implied_prob, odds_line.c.player_mlb_id,
+            odds_line.c.game_pk,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
@@ -1505,6 +1506,7 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                 "point": r._mapping["point"],
                 "price": r._mapping["price"],
                 "implied_prob": r._mapping["implied_prob"],
+                "game_pk": r._mapping["game_pk"],   # DH-safe calibration join key
             } for r in rows]
         except OperationalError as exc:  # transient (cold resume / lock / timeout)
             last_exc = exc
