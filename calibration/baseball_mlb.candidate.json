@@ -1,6 +1,6 @@
 {
   "sport_key": "baseball_mlb",
-  "fit_timestamp": "2026-08-26T01:55:15.011366Z",
+  "fit_timestamp": "2026-08-26T02:25:22.029349Z",
   "props": {
     "batter_hits": {
       "method": "C",
@@ -178637,9 +178637,7 @@
     },
     "real_line_refit": {
       "props": [
-        "batter_hits",
-        "batter_strikeouts",
-        "pitcher_strikeouts"
+        "batter_hits"
       ],
       "store_label": "default"
     },
