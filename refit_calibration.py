@@ -118,7 +118,13 @@ ROI_TIEBREAK_THRESHOLD = 0.05      # edge threshold for the sim (matches diagnos
 # has enough obs AND clears the confirmation gate AND beats the pooled method on
 # that bucket — else it inherits the pooled method. Ships inert until a bucket
 # earns it.
-LINE_CONDITIONAL_PROPS = {"batter_hits"}
+# TB/RBI included alongside hits (owner ask): the 1.5 split lets the "2+" bucket
+# adopt its own method vs the ">1.5" bucket instead of one lumped top bucket. The
+# machinery is prop-generic (select_method_at_real_lines tries A/B/C/D/E per
+# bucket; the serve side reads line_methods off any cfg) — method D just won't win
+# for TB/RBI (no xBA lift), so those buckets adopt C/E or inherit pooled. Safe by
+# the adopt guard: inert unless a bucket genuinely beats pooled OOS.
+LINE_CONDITIONAL_PROPS = {"batter_hits", "batter_total_bases", "batter_rbis"}
 LINE_BUCKETS = [0.5, 1.5, None]     # ascending max_line; None = open-ended top.
 # Buckets: <=0.5 ("gets one"), (0.5,1.5] ("2+"), >1.5. The 1.5 split was added so
 # RBI/TB (and any prop) can adopt a distinct method at the common 1.5 line instead
