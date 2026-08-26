@@ -288,24 +288,42 @@ def main():
     # ── Phase 1b: event-ID lookups when featured is skipped (props-only) ─────
     if n_prop and not n_feat:
         id_dates = sorted({g["_snap_ts"] for g in prop_games})
-        print(f"\n=== Phase 1b: event-ID lookups — {len(id_dates)} dates ===")
-        for ts in id_dates:
+        print(f"\n=== Phase 1b: event-ID lookups — {len(id_dates)} dates "
+              f"({args.workers} workers) ===")
+
+        def _fetch_events(ts):
+            # Reserve 1 cr per UNCACHED lookup under the lock (cached = free).
             if not is_historical_events_cached(sport_key, ts):
                 with lock:
                     if spent["cr"] + 1 > args.max_credits:
-                        print("  [stop] budget reached during ID lookup.")
-                        break
+                        return ts, None            # budget: skip, no fetch/spend
                     spent["cr"] += 1
             try:
                 events, _ = get_historical_events(api_key, sport_key, date=ts)
+                return ts, (events or [])
             except Exception as e:
-                print(f"  [warn] events {ts}: {e}")
-                continue
-            date_games = [g for g in prop_games if g["_snap_ts"] == ts]
-            for ev in events or []:
-                g = _find_sampled(ev.get("home_team"), ev.get("away_team"), date_games)
-                if g and ev.get("id"):
-                    event_ids[_gkey(g)] = ev["id"]
+                return ts, e
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(_fetch_events, ts): ts for ts in id_dates}
+            for fut in as_completed(futs):
+                ts, res = fut.result()
+                done += 1
+                if res is None:                    # budget-skipped
+                    continue
+                if isinstance(res, Exception):
+                    print(f"  [warn] events {ts}: {res}")
+                    continue
+                # event_ids written only here (main thread) -> no lock needed.
+                date_games = [g for g in prop_games if g["_snap_ts"] == ts]
+                for ev in res:
+                    g = _find_sampled(ev.get("home_team"), ev.get("away_team"), date_games)
+                    if g and ev.get("id"):
+                        event_ids[_gkey(g)] = ev["id"]
+                if done % 50 == 0 or done == len(id_dates):
+                    print(f"  [events {done}/{len(id_dates)}] ~{spent['cr']} cr, "
+                          f"{len(event_ids)} ids")
 
     # ── Phase 2: PROPS (parallel, per game) ──────────────────────────────────
     def _fetch_props(g):
