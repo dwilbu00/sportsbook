@@ -39,3 +39,4 @@ historical_odds/*__apiclean.json
 
 .feature_cache
 historical_odds/*.json
+cache.zip
