@@ -102,22 +102,35 @@ class KindAndSourceTests(unittest.TestCase):
             wh._kind_for_markets(",".join(sorted(img._game_market_keys(_prop_game())))),
             "props")
 
-    def test_classify_snapshot(self):
+    def test_classify_snapshot_props(self):
         EARLY, WIN = 12, 30
-        # ts ~5 min before first pitch -> that game's close
+        # props: the 12Z file is the morning open
         self.assertEqual(
-            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", EARLY, WIN),
-            "multibook_close")
-        # ts at the fixed early hour, hours before -> morning open
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", EARLY, WIN),
+            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
             "multibook_open")
-        # ts is an intraday pre-close (5pm for a 10pm game), not the early hour -> skip
+        # props: any non-early snapshot IS the close pass — even a few min before...
+        self.assertEqual(
+            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
+            "multibook_close")
+        # ...OR hours before (a sharp book whose market stopped updating early) — still kept
+        self.assertEqual(
+            img._classify_snapshot("2024-05-19T18:00:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
+            "multibook_close")
+
+    def test_classify_snapshot_team(self):
+        EARLY, WIN = 12, 30
+        # team: 12Z open, near-commence close, intraday (whole-slate) dropped
+        self.assertEqual(
+            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN),
+            "multibook_open")
+        self.assertEqual(
+            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN),
+            "multibook_close")
         self.assertIsNone(
-            img._classify_snapshot("2024-05-19T17:00:00Z", "2024-05-19T22:00:00Z", EARLY, WIN))
+            img._classify_snapshot("2024-05-19T17:00:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN))
         # unparseable ts -> skip (never silently mislabeled)
         self.assertIsNone(
-            img._classify_snapshot(None, "2024-05-19T22:00:00Z", EARLY, WIN))
+            img._classify_snapshot(None, "2024-05-19T22:00:00Z", "props", EARLY, WIN))
 
 
 class IterCacheGamesTests(unittest.TestCase):

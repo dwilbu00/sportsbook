@@ -118,20 +118,35 @@ def _per_book_lines(game, kind):
     return out
 
 
-def _classify_snapshot(snapshot_ts, commence, early_hour, close_window_min):
-    """'multibook_close' when the snapshot ts is within close_window_min of first
-    pitch (this game's true close), 'multibook_open' when the ts is at the fixed
-    early-pull hour (the morning line), else None to SKIP — an intraday pre-close
-    snapshot that landed in another game's whole-slate close-pass file."""
+def _classify_snapshot(snapshot_ts, commence, kind, early_hour, close_window_min):
+    """'multibook_open' (ts at the fixed early-pull hour), 'multibook_close', or
+    None to SKIP (intraday).
+
+    The two market types are structured differently in the pull, so they classify
+    differently:
+
+    - PROPS come from the per-EVENT endpoint (event-odds) — exactly two files per
+      event: the 12Z early pull and the commence close pull. So ANY non-early prop
+      snapshot IS its close, with NO window. This is the fix for Doug's catch: a
+      window would drop a close whose last pre-pitch snapshot is >window min before
+      first pitch (e.g. a sharp book like Pinnacle that stops updating a market
+      earlier than the soft books) — those must be KEPT as the close.
+
+    - TEAM markets come from the whole-SLATE featured endpoint, so one game recurs
+      across many close-pass files (each fetched at a different game's commence).
+      Only the snapshot near THIS game's own commence is its close; the earlier
+      appearances are intraday and dropped."""
     import warehouse as wh
     sdt = wh._parse_utc(snapshot_ts)
-    cdt = wh._parse_utc(commence)
-    if not sdt or not cdt:
+    if not sdt:
         return None
-    if abs((cdt - sdt).total_seconds()) <= close_window_min * 60:
-        return "multibook_close"
     if sdt.hour == early_hour:
         return "multibook_open"
+    if kind == "props":
+        return "multibook_close"          # per-event: the non-early file is the close
+    cdt = wh._parse_utc(commence)          # team: only the near-commence snapshot is close
+    if cdt and abs((cdt - sdt).total_seconds()) <= close_window_min * 60:
+        return "multibook_close"
     return None
 
 
@@ -260,7 +275,7 @@ def main():
         # Classify BEFORE the expensive parse/enrich so intraday snapshots (a game
         # seen pre-close in another game's whole-slate close-pass file) are dropped
         # cheaply — we keep only each game's true close + its morning open.
-        source = _classify_snapshot(ts, commence, args.early_hour, args.close_window_min)
+        source = _classify_snapshot(ts, commence, kind, args.early_hour, args.close_window_min)
         if source is None:
             intraday_skipped += 1
             continue
