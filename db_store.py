@@ -1253,7 +1253,7 @@ def capture_odds_snapshot(meta, lines):
             })
             snapshot_id = result.inserted_primary_key[0]
             if lines:
-                conn.execute(insert(odds_line), [{
+                _rows = [{
                     "snapshot_id": snapshot_id,
                     "bet_type": _s(ln.get("bet_type")),
                     "selection": _s(ln.get("selection")),
@@ -1269,7 +1269,16 @@ def capture_odds_snapshot(meta, lines):
                     # per-book grain (multibook); absent on legacy callers -> NULL
                     "bookmaker": _s(ln.get("bookmaker")),
                     "region": _s(ln.get("region")),
-                } for ln in lines])
+                } for ln in lines]
+                # Multi-row INSERT (VALUES tuples), NOT executemany: pymssql's
+                # executemany is a round-trip PER ROW, brutal for a per-book snapshot's
+                # hundreds of lines. One .values([...]) statement is a single round-trip
+                # per chunk — the reason the multibook ingest is viable without pyodbc.
+                # Chunk to stay under SQL Server's 2100-parameter cap (14 cols x 100 =
+                # 1400). Harmless on every backend (a live snapshot's few lines = 1 chunk).
+                _CHUNK = 100
+                for _off in range(0, len(_rows), _CHUNK):
+                    conn.execute(insert(odds_line).values(_rows[_off:_off + _CHUNK]))
         return True
     except IntegrityError:
         return False  # snapshot already captured this hour (write-once)
