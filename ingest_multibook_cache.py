@@ -48,10 +48,14 @@ _PROP_PREFIXES = ("batter_", "pitcher_", "player_")
 _DEFAULT_EARLY_HOUR = 12          # UTC hour of the early pull (audit: 12:00Z cluster)
 
 
-def _iter_cache_games(cache_dir, sport):
+def _iter_cache_games(cache_dir, sport, seasons=None):
     """Yield (game_dict, snapshot_ts, path) for the target sport, handling the
     double-nested historical wrapper {cached_at, data:{data, timestamp}} and the
-    single-nested live wrapper {cached_at, data}."""
+    single-nested live wrapper {cached_at, data}.
+
+    ``seasons`` (a set of 4-char year strings, e.g. {"2024","2025","2026"}) filters
+    by the game's commence YEAR — a guard so a stray old-season cache file can never
+    re-introduce a purged season (2023). None = no filter."""
     for path in sorted(glob.glob(os.path.join(cache_dir, "*.json"))):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -70,8 +74,11 @@ def _iter_cache_games(cache_dir, sport):
         else:
             games = []
         for g in games:
-            if isinstance(g, dict) and g.get("sport_key") == sport:
-                yield g, ts, path
+            if not (isinstance(g, dict) and g.get("sport_key") == sport):
+                continue
+            if seasons and str(g.get("commence_time") or "")[:4] not in seasons:
+                continue
+            yield g, ts, path
 
 
 def _game_market_keys(game):
@@ -115,7 +122,7 @@ def _per_book_lines(game, kind):
     return out
 
 
-def _scan_snapshots(cache_dir, sport, early_hour, progress_every=5000):
+def _scan_snapshots(cache_dir, sport, early_hour, seasons=None, progress_every=5000):
     """PASS 1 (cheap metadata scan — no per-book parse, no enrich): choose, per
     (event_id, kind), the OPEN snapshot (the one at early_hour) and the CLOSE
     snapshot (the one whose ts is NEAREST that game's commence, among the non-early
@@ -132,7 +139,7 @@ def _scan_snapshots(cache_dir, sport, early_hour, progress_every=5000):
     open_hour = {}
     best_close = {}       # (event,kind) -> (delta_seconds, snapshot_hour)
     scanned = 0
-    for game, ts, _ in _iter_cache_games(cache_dir, sport):
+    for game, ts, _ in _iter_cache_games(cache_dir, sport, seasons):
         commence = game.get("commence_time")
         if not commence:
             continue
@@ -243,8 +250,14 @@ def main():
                         "fast player_mlb_id coverage comes back materially lower.")
     p.add_argument("--early-hour", type=int, default=_DEFAULT_EARLY_HOUR,
                    help=f"UTC hour of the early/open pull (default {_DEFAULT_EARLY_HOUR}).")
+    p.add_argument("--seasons", default=None,
+                   help="Comma-separated commence YEARS to ingest (e.g. "
+                        "'2024,2025,2026'). Guards against re-ingesting a purged "
+                        "season (2023) if a stray cache file is present. Default: all.")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args()
+    seasons = ({s.strip() for s in args.seasons.split(",") if s.strip()}
+               if args.seasons else None)
 
     try:
         from cli_encoding import configure_stdio
@@ -273,6 +286,7 @@ def main():
     # PASS 1: choose, per (event, kind), the open (12Z) + the nearest-commence close.
     print("  Pass 1: choosing open + nearest-commence close per event (metadata scan)...")
     chosen, scan_stats = _scan_snapshots(args.cache_dir, args.sport, args.early_hour,
+                                         seasons=seasons,
                                          progress_every=max(1, args.progress_every) * 10)
     print(f"  events(x kind): both open+close={scan_stats['n_both']:,}  "
           f"open-only={scan_stats['n_open_only']:,}  close-only={scan_stats['n_close_only']:,}  "
@@ -297,7 +311,7 @@ def main():
 
     # PASS 2: ingest ONLY each event's chosen open + close snapshots.
     print("  Pass 2: ingesting the chosen snapshots...")
-    for game, ts, _path in _iter_cache_games(args.cache_dir, args.sport):
+    for game, ts, _path in _iter_cache_games(args.cache_dir, args.sport, seasons):
         commence = game.get("commence_time")
         if not commence:
             continue

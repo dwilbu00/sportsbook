@@ -156,6 +156,19 @@ class IterCacheGamesTests(unittest.TestCase):
         self.assertEqual(ts_by_id["evt_team_1"], "2024-05-19T22:00:00Z")
         self.assertIsNone(ts_by_id["evt_prop_1"])
 
+    def test_seasons_filter_excludes_purged_year(self):
+        g2023 = _team_game()
+        g2023["id"] = "evt_2023"
+        g2023["commence_time"] = "2023-05-19T22:00:00Z"
+        g2024 = _team_game()  # id evt_team_1, commence 2024-05-19
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.json"), "w") as f:
+                json.dump({"cached_at": 1.0,
+                           "data": {"timestamp": "2024-05-19T22:00:00Z",
+                                    "data": [g2023, g2024]}}, f)
+            got = list(img._iter_cache_games(d, "baseball_mlb", {"2024", "2025", "2026"}))
+        self.assertEqual({g["id"] for g, _ts, _p in got}, {"evt_team_1"})  # 2023 dropped
+
 
 if __name__ == "__main__":
     unittest.main()
