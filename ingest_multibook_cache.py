@@ -158,20 +158,23 @@ def _scan_snapshots(cache_dir, sport, early_hour, progress_every=5000):
         if progress_every and scanned % progress_every == 0:
             print(f"    ...pass 1 scanned {scanned:,} snapshots")
 
-    chosen, close_delta = {}, Counter()
+    chosen, close_delta, close_delta_by_kind = {}, Counter(), {}
     for k in set(open_hour) | set(best_close):
         chosen[k] = {"open": open_hour.get(k),
                      "close": best_close[k][1] if k in best_close else None}
-    for delta, _h in best_close.values():
+    for (_ev, knd), (delta, _h) in best_close.items():
         dm = delta / 60
-        close_delta["0-5m" if dm <= 5 else "5-15m" if dm <= 15
-                    else "15-30m" if dm <= 30 else ">30m"] += 1
+        b = ("0-5m" if dm <= 5 else "5-15m" if dm <= 15
+             else "15-30m" if dm <= 30 else ">30m")
+        close_delta[b] += 1
+        close_delta_by_kind.setdefault(knd, Counter())[b] += 1
     stats = {
         "scanned": scanned,
         "n_both": sum(1 for v in chosen.values() if v["open"] and v["close"]),
         "n_open_only": sum(1 for v in chosen.values() if v["open"] and not v["close"]),
         "n_close_only": sum(1 for v in chosen.values() if v["close"] and not v["open"]),
         "close_delta": close_delta,
+        "close_delta_by_kind": close_delta_by_kind,
     }
     return chosen, stats
 
@@ -387,8 +390,10 @@ def main():
     # >30m tail = markets a book stopped updating early, still the best close we have).
     if close_delta:
         order = ["0-5m", "5-15m", "15-30m", ">30m"]
-        print(f"  CLOSE |ts-commence| (nearest per event): "
-              f"{{{', '.join(f'{b}: {close_delta[b]}' for b in order if close_delta[b])}}}")
+        _fmt = lambda cd: "{" + ", ".join(f"{b}: {cd[b]}" for b in order if cd[b]) + "}"
+        print(f"  CLOSE |ts-commence| (nearest per event): {_fmt(close_delta)}")
+        for knd, cd in sorted(scan_stats.get("close_delta_by_kind", {}).items()):
+            print(f"    {knd:<6} {_fmt(cd)}")
     if dates:
         yr = Counter(d[:4] for d in dates)
         print(f"  snapshot date range: {min(dates)} .. {max(dates)}   by year: {dict(sorted(yr.items()))}")
