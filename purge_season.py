@@ -43,9 +43,21 @@ def _specs(season):
     y = int(season)
     lo, hi = f"{y}-01-01", f"{y}-12-31"
     return [
-        # odds — snapshot cascades odds_line (ON DELETE CASCADE)
+        # odds — DELETE THE CHILD LINES EXPLICITLY FIRST (via the parent's indexed
+        # id set), THEN the snapshots. We do NOT lean on ON DELETE CASCADE here: a
+        # single DELETE TOP(50000) on odds_snapshot cascades to millions of odds_line
+        # rows in ONE transaction and blows Azure's 60s pymssql query timeout
+        # (DB-Lib 20003 "connection timed out"). Child-first keeps every batch a
+        # plain indexed delete (ix_odds_line_snapshot / ix_odds_snapshot_event) that
+        # finishes well under the timeout. The subquery re-resolves the 2023 snapshot
+        # ids each batch — cheap on the index — and by the time we reach the snapshot
+        # delete its children are already gone, so the cascade is a no-op.
+        ("odds_line",
+         f"snapshot_id IN (SELECT id FROM odds_snapshot WHERE sport = 'baseball_mlb' "
+         f"AND game_date >= '{lo}' AND game_date <= '{hi}')",
+         "bulk", "child lines first (explicit — avoids the cascade timeout)"),
         ("odds_snapshot", f"sport = 'baseball_mlb' AND game_date >= '{lo}' AND game_date <= '{hi}'",
-         "bulk", "cascades odds_line"),
+         "bulk", "snapshot parents (children already deleted → cascade no-op)"),
         # game facts BEFORE mlb_game (RESTRICT FK)
         ("mlb_batter_game", f"season_bucket = {y}", "bulk", "child of mlb_game"),
         ("mlb_pitcher_game", f"season_bucket = {y}", "bulk", "child of mlb_game"),
@@ -77,6 +89,10 @@ def main():
                    help="ALSO purge weather_game (only PAID-restorable).")
     p.add_argument("--purge-standings", action="store_true",
                    help="ALSO purge mlb_team_standings (as-of snapshots not cleanly restorable).")
+    p.add_argument("--batch", type=int, default=20000,
+                   help="Rows per DELETE TOP() chunk. Each chunk must finish inside "
+                        "Azure's ~60s pymssql query timeout; lower it (e.g. 5000) if a "
+                        "table still times out. Default 20000.")
     args = p.parse_args()
 
     try:
@@ -136,10 +152,14 @@ def main():
         sys.exit(1)
 
     print(f"\n  Executing {len(to_delete)} delete(s) in FK-safe order...")
-    # Chunked deletes: a single 820k-row statcast_pitch DELETE would bloat the Azure
-    # SQL transaction log + risk lock escalation/timeout. DELETE TOP(BATCH) in a loop
-    # keeps each transaction small; re-runnable (a resumed run just deletes what's left).
-    BATCH = 50000
+    # Chunked deletes: a single huge DELETE bloats the Azure SQL transaction log +
+    # risks lock escalation, and — critically — must finish inside pymssql's ~60s
+    # query timeout (a 50k-snapshot cascade to odds_line exceeded it: DB-Lib 20003
+    # "connection timed out"). DELETE TOP(BATCH) in a loop keeps each transaction
+    # small + re-runnable (a resumed run just deletes what's left); odds_line is
+    # deleted child-first (see _specs) so no batch carries a cascade. Lower --batch
+    # if any single table still times out.
+    BATCH = args.batch
     done = 0
     for table, where, n in to_delete:
         try:
