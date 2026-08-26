@@ -238,6 +238,8 @@ def main():
     prop_gpk = 0
     prop_mlbid = 0
     intraday_skipped = 0
+    open_hours = Counter()    # ts-hour of OPEN snapshots (confidence: expect ~all early_hour)
+    close_delta = Counter()   # |ts - commence| bucket of CLOSE snapshots (expect ~all 0-5m)
     written = skipped = errors = 0
     dates = []
     seen = set()          # (event_id, kind, snapshot_hour) — de-dupe within this run
@@ -293,6 +295,14 @@ def main():
         snaps_by_kind[kind] += 1
         source_ct[source] += 1
         dates.append(meta["game_date"])
+        # Confidence diagnostics for the close/open call (see the report).
+        _sdt, _cdt = wh._parse_utc(ts), wh._parse_utc(commence)
+        if source == "multibook_open" and _sdt:
+            open_hours[_sdt.hour] += 1
+        elif source == "multibook_close" and _sdt and _cdt:
+            _dm = abs((_cdt - _sdt).total_seconds()) / 60
+            close_delta["0-5m" if _dm <= 5 else "5-15m" if _dm <= 15
+                        else "15-30m" if _dm <= 30 else ">30m"] += 1
         for ln in lines:
             lines_total += 1
             books_ct[ln.get("bookmaker")] += 1
@@ -330,6 +340,14 @@ def main():
     print(f"  source split: multibook_close={source_ct.get('multibook_close', 0):,}  "
           f"multibook_open={source_ct.get('multibook_open', 0):,}")
     print(f"  intraday snapshots skipped (kept in cache): {intraday_skipped:,}")
+    # Confidence check on the close/open call:
+    if open_hours:
+        print(f"  OPEN ts-hour (confidence: expect ~all {args.early_hour:02d}Z): "
+              f"{dict(sorted(open_hours.items()))}")
+    if close_delta:
+        order = ["0-5m", "5-15m", "15-30m", ">30m"]
+        print(f"  CLOSE |ts-commence| (confidence: expect ~all 0-5m): "
+              f"{{{', '.join(f'{b}: {close_delta[b]}' for b in order if close_delta[b])}}}")
     if dates:
         yr = Counter(d[:4] for d in dates)
         print(f"  snapshot date range: {min(dates)} .. {max(dates)}   by year: {dict(sorted(yr.items()))}")
