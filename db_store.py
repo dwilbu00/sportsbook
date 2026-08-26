@@ -40,7 +40,7 @@ import unicodedata
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
     MetaData, PrimaryKeyConstraint, String, Table, UniqueConstraint, and_,
-    bindparam, create_engine, delete, event, func, insert, select, update,
+    bindparam, create_engine, delete, event, func, insert, select, true, update,
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -1253,7 +1253,7 @@ def capture_odds_snapshot(meta, lines):
             })
             snapshot_id = result.inserted_primary_key[0]
             if lines:
-                conn.execute(insert(odds_line), [{
+                _rows = [{
                     "snapshot_id": snapshot_id,
                     "bet_type": _s(ln.get("bet_type")),
                     "selection": _s(ln.get("selection")),
@@ -1269,7 +1269,22 @@ def capture_odds_snapshot(meta, lines):
                     # per-book grain (multibook); absent on legacy callers -> NULL
                     "bookmaker": _s(ln.get("bookmaker")),
                     "region": _s(ln.get("region")),
-                } for ln in lines])
+                } for ln in lines]
+                # Bulk line insert. Driver-aware for the multibook ingest's hundreds
+                # of rows/snapshot:
+                #  - pyodbc: executemany + fast_executemany (set on the engine)
+                #    array-binds the whole batch in one native call — fastest.
+                #  - pymssql/sqlite: no array bind, and per-row executemany is a
+                #    round-trip PER ROW — so use a multi-row INSERT ... VALUES (one
+                #    round-trip per ~100-row chunk, under SQL Server's 2100-param cap).
+                # Both write identical rows; this is why the ingest is fast on either
+                # driver (and needs no ODBC install on the pymssql box).
+                if engine.dialect.driver == "pyodbc":
+                    conn.execute(insert(odds_line), _rows)
+                else:
+                    _CHUNK = 100
+                    for _off in range(0, len(_rows), _CHUNK):
+                        conn.execute(insert(odds_line).values(_rows[_off:_off + _CHUNK]))
         return True
     except IntegrityError:
         return False  # snapshot already captured this hour (write-once)
@@ -1288,9 +1303,23 @@ def odds_snapshots_for_event(sport, game_date, event_id):
     return [{"id": r[0], "captured_at": r[1], "kind": r[2]} for r in rows]
 
 
+def _bookmaker_pred(bookmaker):
+    """odds_line per-book (multibook) filter. 'draftkings' (the default) ALSO matches
+    legacy untagged (NULL) rows — pre-migration odds were DK-sourced/consensus, so
+    NULL reads as DK (this is why NBA/NFL need no backfill, and the live flush's
+    untagged rows still surface). A specific OTHER book (e.g. 'pinnacle', the R2
+    sharp read) matches STRICTLY. None = no filter (all books)."""
+    if bookmaker is None:
+        return true()
+    col = odds_line.c.bookmaker
+    if bookmaker == "draftkings":
+        return (col == "draftkings") | (col.is_(None))
+    return col == bookmaker
+
+
 def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
                      player=None, prop_key=None, direction=None,
-                     player_mlb_id=None, team_code=None):
+                     player_mlb_id=None, team_code=None, bookmaker="draftkings"):
     """The stored line for a descriptor within one snapshot, or None.
 
     Reproduces _extract_line's matching: props key on (prop_key, player,
@@ -1300,8 +1329,13 @@ def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
     When a canonical id is supplied (``player_mlb_id`` for props, ``team_code``
     for moneyline/spread) the identity prefers the id — matching enriched rows by
     id (fixing accents/namesakes) while un-enriched historical rows (id IS NULL)
-    still match by name. A None id degrades to the exact name-only behavior."""
+    still match by name. A None id degrades to the exact name-only behavior.
+
+    ``bookmaker`` (multibook per-book grain): restrict to one book's rows. Default
+    'draftkings' reproduces the pre-per-book behavior (also matches legacy untagged
+    NULL rows); None = all books; 'pinnacle' = the R2 sharp read."""
     table = odds_line
+    _bk = _bookmaker_pred(bookmaker)
     bt = (bet_type or "").lower()
     with get_engine().connect() as conn:
         if bt == "player_prop":
@@ -1317,7 +1351,8 @@ def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
                     & (table.c.bet_type == "player_prop")
                     & (table.c.prop_key == prop_key)
                     & ident
-                    & (table.c.direction == ((direction or "OVER").upper())))
+                    & (table.c.direction == ((direction or "OVER").upper()))
+                    & _bk)
             ).first()
             return {"price": row[0], "implied_prob": row[1]} if row else None
 
@@ -1332,7 +1367,7 @@ def odds_line_lookup(snapshot_id, bet_type, selection=None, point=None,
         else:
             ident = (table.c.selection == sel)
         base = ((table.c.snapshot_id == snapshot_id)
-                & (table.c.bet_type == norm) & ident)
+                & (table.c.bet_type == norm) & ident & _bk)
         if point is not None:
             row = conn.execute(
                 select(table.c.price, table.c.implied_prob).where(
@@ -1367,7 +1402,7 @@ def list_odds_snapshots(sport, game_date):
 
 
 def team_market_lines(sport, dates=None, date_from=None, date_to=None,
-                      only_early=False, max_retries=3):
+                      only_early=False, bookmaker="draftkings", max_retries=3):
     """Bulk-read warehoused team-market lines (moneyline/spread/total) for a
     sport, joining each odds_line to its parent odds_snapshot.
 
@@ -1396,6 +1431,8 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
         .where((odds_snapshot.c.sport == sport)
                & odds_line.c.bet_type.in_(("moneyline", "spread", "total")))
     )
+    # DK-parity (multibook per-book grain); 'draftkings' also matches legacy NULL.
+    stmt = stmt.where(_bookmaker_pred(bookmaker))
     if only_early:
         # the EARLY-snapshot set ONLY (opening / pre-close lines) — the bet-early ROI
         # view; default (unset) keeps every snapshot and the assembler picks the
@@ -1442,7 +1479,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                       exclude_early=False, only_early=False, prop_keys=None,
-                      max_retries=3):
+                      bookmaker="draftkings", max_retries=3):
     """Bulk-read warehoused player-prop lines for a sport, joining each odds_line
     to its parent odds_snapshot.
 
@@ -1480,6 +1517,8 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
         .where((odds_snapshot.c.sport == sport)
                & (odds_line.c.bet_type == "player_prop"))
     )
+    # DK-parity (multibook per-book grain); 'draftkings' also matches legacy NULL.
+    stmt = stmt.where(_bookmaker_pred(bookmaker))
     if exclude_early:
         # keep closes (+ any untagged/legacy); drop the explicit early snapshots.
         stmt = stmt.where(odds_snapshot.c.source.is_(None)
