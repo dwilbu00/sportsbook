@@ -102,35 +102,34 @@ class KindAndSourceTests(unittest.TestCase):
             wh._kind_for_markets(",".join(sorted(img._game_market_keys(_prop_game())))),
             "props")
 
-    def test_classify_snapshot_props(self):
-        EARLY, WIN = 12, 30
-        # props: the 12Z file is the morning open
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
-            "multibook_open")
-        # props: any non-early snapshot IS the close pass — even a few min before...
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
-            "multibook_close")
-        # ...OR hours before (a sharp book whose market stopped updating early) — still kept
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T18:00:00Z", "2024-05-19T22:00:00Z", "props", EARLY, WIN),
-            "multibook_close")
+    def _write(self, d, name, ts, game):
+        with open(os.path.join(d, name), "w") as f:
+            json.dump({"cached_at": 1.0, "data": {"timestamp": ts, "data": [game]}}, f)
 
-    def test_classify_snapshot_team(self):
-        EARLY, WIN = 12, 30
-        # team: 12Z open, near-commence close, intraday (whole-slate) dropped
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN),
-            "multibook_open")
-        self.assertEqual(
-            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN),
-            "multibook_close")
-        self.assertIsNone(
-            img._classify_snapshot("2024-05-19T17:00:00Z", "2024-05-19T22:00:00Z", "team", EARLY, WIN))
-        # unparseable ts -> skip (never silently mislabeled)
-        self.assertIsNone(
-            img._classify_snapshot(None, "2024-05-19T22:00:00Z", "props", EARLY, WIN))
+    def test_scan_picks_open_and_nearest_close(self):
+        # One event seen 3x: 12Z (open), 21:55 (nearest commence 22:00 -> close),
+        # 17:00 (intraday, further from commence -> neither). _scan_snapshots must
+        # choose 12Z open + 21:55 close, and mark the event as having both.
+        g = _team_game()  # id evt_team_1, commence 2024-05-19T22:00:00Z
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, "a_open.json", "2024-05-19T12:00:00Z", g)
+            self._write(d, "b_close.json", "2024-05-19T21:55:00Z", g)
+            self._write(d, "c_mid.json", "2024-05-19T17:00:00Z", g)
+            chosen, stats = img._scan_snapshots(d, "baseball_mlb", 12, progress_every=0)
+        key = ("evt_team_1", "team")
+        self.assertEqual(chosen[key]["open"], wh._hour_bucket("2024-05-19T12:00:00Z"))
+        self.assertEqual(chosen[key]["close"], wh._hour_bucket("2024-05-19T21:55:00Z"))
+        self.assertNotEqual(chosen[key]["close"], wh._hour_bucket("2024-05-19T17:00:00Z"))
+        self.assertEqual((stats["n_both"], stats["n_open_only"], stats["n_close_only"]), (1, 0, 0))
+
+    def test_scan_completeness_open_only(self):
+        # An event with ONLY an early snapshot -> open-only (no close invented).
+        g = _prop_game()  # id evt_prop_1
+        with tempfile.TemporaryDirectory() as d:
+            self._write(d, "o.json", "2024-05-19T12:00:00Z", g)
+            chosen, stats = img._scan_snapshots(d, "baseball_mlb", 12, progress_every=0)
+        self.assertEqual((stats["n_both"], stats["n_open_only"], stats["n_close_only"]), (0, 1, 0))
+        self.assertIsNone(chosen[("evt_prop_1", "props")]["close"])
 
 
 class IterCacheGamesTests(unittest.TestCase):

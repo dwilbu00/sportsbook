@@ -40,15 +40,12 @@ from collections import Counter
 # props are keyed by these market prefixes in the Odds API payload
 _PROP_PREFIXES = ("batter_", "pitcher_", "player_")
 # The pull ran two passes: CLOSE (snapshot ts = each game's commence) and EARLY
-# (snapshot ts = a fixed morning time, ~12:00Z per the cache audit). BUT the
-# historical featured endpoint returns the WHOLE SLATE at each ts — so a close-pass
-# fetch at game A's first pitch also contains the later games at their as-of-then
-# (intraday) prices. We keep only each game's TRUE close (ts within a window of its
-# OWN commence) and its morning open (ts at the fixed early hour); the intraday
-# pre-close snapshots from other games' close-pass files are dropped (the raw cache
-# retains them for a future line-movement ingest if we ever want it).
+# (snapshot ts = a fixed morning time, ~12:00Z per the cache audit). The historical
+# featured endpoint returns the WHOLE SLATE at each ts, so a game recurs across many
+# files; _scan_snapshots picks, per event, the OPEN (the early-hour snapshot) and the
+# CLOSE (the snapshot NEAREST that game's commence), dropping the rest as intraday
+# (the raw cache retains them for a future line-movement ingest if we ever want it).
 _DEFAULT_EARLY_HOUR = 12          # UTC hour of the early pull (audit: 12:00Z cluster)
-_DEFAULT_CLOSE_WINDOW_MIN = 30    # |snapshot ts - commence| <= this => that game's close
 
 
 def _iter_cache_games(cache_dir, sport):
@@ -118,36 +115,65 @@ def _per_book_lines(game, kind):
     return out
 
 
-def _classify_snapshot(snapshot_ts, commence, kind, early_hour, close_window_min):
-    """'multibook_open' (ts at the fixed early-pull hour), 'multibook_close', or
-    None to SKIP (intraday).
+def _scan_snapshots(cache_dir, sport, early_hour, progress_every=5000):
+    """PASS 1 (cheap metadata scan — no per-book parse, no enrich): choose, per
+    (event_id, kind), the OPEN snapshot (the one at early_hour) and the CLOSE
+    snapshot (the one whose ts is NEAREST that game's commence, among the non-early
+    snapshots). This is the robust close rule — nearest-to-commence per event — so
+    it needs no window and never drops a real close, whether the last pre-pitch
+    snapshot is 2 min or 2 h before first pitch (a sharp book that stopped updating
+    early). It also collapses the whole-slate team redundancy: a game recurs across
+    many featured files, and only its nearest-commence appearance is kept.
 
-    The two market types are structured differently in the pull, so they classify
-    differently:
-
-    - PROPS come from the per-EVENT endpoint (event-odds) — exactly two files per
-      event: the 12Z early pull and the commence close pull. So ANY non-early prop
-      snapshot IS its close, with NO window. This is the fix for Doug's catch: a
-      window would drop a close whose last pre-pitch snapshot is >window min before
-      first pitch (e.g. a sharp book like Pinnacle that stops updating a market
-      earlier than the soft books) — those must be KEPT as the close.
-
-    - TEAM markets come from the whole-SLATE featured endpoint, so one game recurs
-      across many close-pass files (each fetched at a different game's commence).
-      Only the snapshot near THIS game's own commence is its close; the earlier
-      appearances are intraday and dropped."""
+    Returns (chosen, stats):
+      chosen[(event_id, kind)] = {"open": <hour|None>, "close": <hour|None>}
+      stats = {scanned, n_both, n_open_only, n_close_only, close_delta(Counter)}"""
     import warehouse as wh
-    sdt = wh._parse_utc(snapshot_ts)
-    if not sdt:
-        return None
-    if sdt.hour == early_hour:
-        return "multibook_open"
-    if kind == "props":
-        return "multibook_close"          # per-event: the non-early file is the close
-    cdt = wh._parse_utc(commence)          # team: only the near-commence snapshot is close
-    if cdt and abs((cdt - sdt).total_seconds()) <= close_window_min * 60:
-        return "multibook_close"
-    return None
+    open_hour = {}
+    best_close = {}       # (event,kind) -> (delta_seconds, snapshot_hour)
+    scanned = 0
+    for game, ts, _ in _iter_cache_games(cache_dir, sport):
+        commence = game.get("commence_time")
+        if not commence:
+            continue
+        mkeys = _game_market_keys(game)
+        if not mkeys:
+            continue
+        kind = wh._kind_for_markets(",".join(sorted(mkeys)))
+        if kind == "alt":
+            continue
+        sdt = wh._parse_utc(ts)
+        if not sdt:
+            continue
+        hour = wh._hour_bucket(ts or commence)
+        k = (game.get("id"), kind)
+        if sdt.hour == early_hour:
+            open_hour[k] = hour
+        else:
+            cdt = wh._parse_utc(commence)
+            delta = abs((cdt - sdt).total_seconds()) if cdt else float("inf")
+            if k not in best_close or delta < best_close[k][0]:
+                best_close[k] = (delta, hour)
+        scanned += 1
+        if progress_every and scanned % progress_every == 0:
+            print(f"    ...pass 1 scanned {scanned:,} snapshots")
+
+    chosen, close_delta = {}, Counter()
+    for k in set(open_hour) | set(best_close):
+        chosen[k] = {"open": open_hour.get(k),
+                     "close": best_close[k][1] if k in best_close else None}
+    for delta, _h in best_close.values():
+        dm = delta / 60
+        close_delta["0-5m" if dm <= 5 else "5-15m" if dm <= 15
+                    else "15-30m" if dm <= 30 else ">30m"] += 1
+    stats = {
+        "scanned": scanned,
+        "n_both": sum(1 for v in chosen.values() if v["open"] and v["close"]),
+        "n_open_only": sum(1 for v in chosen.values() if v["open"] and not v["close"]),
+        "n_close_only": sum(1 for v in chosen.values() if v["close"] and not v["open"]),
+        "close_delta": close_delta,
+    }
+    return chosen, stats
 
 
 def _enrich_lines_fast(sport, meta, lines, gpk_cache, id_cache):
@@ -214,9 +240,6 @@ def main():
                         "fast player_mlb_id coverage comes back materially lower.")
     p.add_argument("--early-hour", type=int, default=_DEFAULT_EARLY_HOUR,
                    help=f"UTC hour of the early/open pull (default {_DEFAULT_EARLY_HOUR}).")
-    p.add_argument("--close-window-min", type=int, default=_DEFAULT_CLOSE_WINDOW_MIN,
-                   help=f"|snapshot ts - commence| <= this many minutes counts as that "
-                        f"game's close (default {_DEFAULT_CLOSE_WINDOW_MIN}).")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args()
 
@@ -244,6 +267,14 @@ def main():
     mode = "APPLY (writing)" if args.apply else "DRY-RUN (no writes)"
     print(f"\n{'='*70}\n  Multibook ingest — {args.cache_dir} -> warehouse  [{mode}]\n{'='*70}")
 
+    # PASS 1: choose, per (event, kind), the open (12Z) + the nearest-commence close.
+    print("  Pass 1: choosing open + nearest-commence close per event (metadata scan)...")
+    chosen, scan_stats = _scan_snapshots(args.cache_dir, args.sport, args.early_hour,
+                                         progress_every=max(1, args.progress_every) * 10)
+    print(f"  events(x kind): both open+close={scan_stats['n_both']:,}  "
+          f"open-only={scan_stats['n_open_only']:,}  close-only={scan_stats['n_close_only']:,}  "
+          f"(from {scan_stats['scanned']:,} snapshots)")
+
     snaps_by_kind = Counter()
     source_ct = Counter()
     books_ct = Counter()
@@ -253,8 +284,7 @@ def main():
     prop_gpk = 0
     prop_mlbid = 0
     intraday_skipped = 0
-    open_hours = Counter()    # ts-hour of OPEN snapshots (confidence: expect ~all early_hour)
-    close_delta = Counter()   # |ts - commence| bucket of CLOSE snapshots (expect ~all 0-5m)
+    close_delta = scan_stats["close_delta"]   # |ts-commence| of the CHOSEN (nearest) closes
     written = skipped = errors = 0
     dates = []
     seen = set()          # (event_id, kind, snapshot_hour) — de-dupe within this run
@@ -262,6 +292,8 @@ def main():
     id_cache = {}         # (name, home, away) -> player_mlb_id (recurs ~26x/snapshot)
     n = 0
 
+    # PASS 2: ingest ONLY each event's chosen open + close snapshots.
+    print("  Pass 2: ingesting the chosen snapshots...")
     for game, ts, _path in _iter_cache_games(args.cache_dir, args.sport):
         commence = game.get("commence_time")
         if not commence:
@@ -272,14 +304,17 @@ def main():
         kind = wh._kind_for_markets(",".join(sorted(mkeys)))
         if kind == "alt":
             continue                                     # alternates weren't pulled
-        # Classify BEFORE the expensive parse/enrich so intraday snapshots (a game
-        # seen pre-close in another game's whole-slate close-pass file) are dropped
-        # cheaply — we keep only each game's true close + its morning open.
-        source = _classify_snapshot(ts, commence, kind, args.early_hour, args.close_window_min)
-        if source is None:
-            intraday_skipped += 1
-            continue
         snapshot_hour = wh._hour_bucket(ts or commence)
+        ch = chosen.get((game.get("id"), kind))
+        if not ch:
+            continue
+        if snapshot_hour == ch["close"]:
+            source = "multibook_close"
+        elif snapshot_hour == ch["open"]:
+            source = "multibook_open"
+        else:
+            intraday_skipped += 1                        # not the chosen open/close
+            continue
         key = (game.get("id"), kind, snapshot_hour)
         if key in seen:
             continue
@@ -310,14 +345,6 @@ def main():
         snaps_by_kind[kind] += 1
         source_ct[source] += 1
         dates.append(meta["game_date"])
-        # Confidence diagnostics for the close/open call (see the report).
-        _sdt, _cdt = wh._parse_utc(ts), wh._parse_utc(commence)
-        if source == "multibook_open" and _sdt:
-            open_hours[_sdt.hour] += 1
-        elif source == "multibook_close" and _sdt and _cdt:
-            _dm = abs((_cdt - _sdt).total_seconds()) / 60
-            close_delta["0-5m" if _dm <= 5 else "5-15m" if _dm <= 15
-                        else "15-30m" if _dm <= 30 else ">30m"] += 1
         for ln in lines:
             lines_total += 1
             books_ct[ln.get("bookmaker")] += 1
@@ -354,14 +381,13 @@ def main():
           f"props={snaps_by_kind.get('props', 0):,})")
     print(f"  source split: multibook_close={source_ct.get('multibook_close', 0):,}  "
           f"multibook_open={source_ct.get('multibook_open', 0):,}")
-    print(f"  intraday snapshots skipped (kept in cache): {intraday_skipped:,}")
-    # Confidence check on the close/open call:
-    if open_hours:
-        print(f"  OPEN ts-hour (confidence: expect ~all {args.early_hour:02d}Z): "
-              f"{dict(sorted(open_hours.items()))}")
+    print(f"  intraday snapshots skipped (not the chosen open/close): {intraday_skipped:,}")
+    # Confidence check: the CHOSEN close is the nearest snapshot to commence per
+    # event, so this shows how close the closes actually are (expect ~all 0-15m; a
+    # >30m tail = markets a book stopped updating early, still the best close we have).
     if close_delta:
         order = ["0-5m", "5-15m", "15-30m", ">30m"]
-        print(f"  CLOSE |ts-commence| (confidence: expect ~all 0-5m): "
+        print(f"  CLOSE |ts-commence| (nearest per event): "
               f"{{{', '.join(f'{b}: {close_delta[b]}' for b in order if close_delta[b])}}}")
     if dates:
         yr = Counter(d[:4] for d in dates)
