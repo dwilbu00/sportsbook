@@ -79,6 +79,9 @@ def main():
     focus_team_events = set()             # focus events carrying a team market
     focus_prop_events = set()             # focus events carrying a prop market
     focus_prop_markets = Counter()        # prop market key -> occurrences (focus)
+    focus_f5_markets = Counter()          # F5 (1st-5-innings) market key -> occurrences
+    focus_f5_events = set()               # focus events carrying an F5 market
+    focus_f5_books = Counter()            # book -> F5 occurrences (which books post F5)
     focus_books_by_event = defaultdict(set)   # event_id -> {book keys} (focus, for the DK+Pinnacle join)
     focus_dates = []                      # commence_time date strings (focus)
     focus_snap_hours = Counter()          # snapshot-ts hour bucket (focus) -> close/early split
@@ -114,7 +117,11 @@ def main():
                     focus_books_by_event[eid].add(key)
                     for m in markets:
                         mk = m.get("key") or ""
-                        if _is_prop_market(mk):
+                        if "1st_5" in mk:                    # F5 period markets
+                            focus_f5_markets[mk] += 1
+                            focus_f5_events.add(eid)
+                            focus_f5_books[key] += 1
+                        elif _is_prop_market(mk):
                             focus_prop_markets[mk] += 1
                             focus_prop_events.add(eid)
                         elif mk in ("h2h", "spreads", "totals"):
@@ -172,6 +179,20 @@ def main():
             print(f"    {k:<24} {n:>10,}")
     else:
         print(f"\n  Prop markets present ({args.sport}): NONE")
+
+    if focus_f5_markets:
+        print(f"\n  F5 (first-5-innings) markets present ({args.sport}):")
+        for k, n in focus_f5_markets.most_common():
+            print(f"    {k:<24} {n:>10,}")
+        print(f"  F5 events: {len(focus_f5_events):,}")
+        both_f5 = sum(1 for ev in focus_f5_events
+                      if {"draftkings", "pinnacle"} <= focus_books_by_event.get(ev, set()))
+        print(f"  F5 events with BOTH draftkings + pinnacle: {both_f5:,}")
+        print(f"  F5 books (which books post F5):")
+        for k, n in focus_f5_books.most_common():
+            tag = "  <-- SHARP REF" if k == "pinnacle" else (
+                "  <-- DK (we bet here)" if k == "draftkings" else "")
+            print(f"    {k:<16} {n:>8,}{tag}")
 
     if focus_snap_hours:
         print(f"\n  Snapshot-ts UTC hour histogram ({args.sport}) "
