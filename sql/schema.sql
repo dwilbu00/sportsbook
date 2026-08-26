@@ -370,6 +370,8 @@ CREATE TABLE dbo.odds_line (
     direction    NVARCHAR(8),
     price        INT,
     implied_prob FLOAT,
+    bookmaker    NVARCHAR(64),                     -- per-book grain (multibook migration)
+    region       NVARCHAR(16),                     -- us|eu (Pinnacle = eu)
     CONSTRAINT fk_odds_line_snapshot
         FOREIGN KEY (snapshot_id) REFERENCES dbo.odds_snapshot (id)
         ON DELETE CASCADE
@@ -400,6 +402,26 @@ IF COL_LENGTH('dbo.odds_line', 'team_code') IS NULL
 GO
 IF COL_LENGTH('dbo.odds_line', 'game_pk') IS NULL   -- P3: StatsAPI game (best-effort)
     ALTER TABLE dbo.odds_line ADD game_pk INT;
+GO
+-- Per-book grain (multibook migration, 2026-08-25): one odds_line row per
+-- (bookmaker, point) within a snapshot, so a single snapshot holds every book's
+-- price (incl. Pinnacle for the R2 sharp reference) instead of one collapsed row.
+-- Nullable; legacy DK-only rows (NBA/NFL backfill) are retro-set to 'draftkings'
+-- by the migration so the DK readers can filter bookmaker='draftkings' for strict
+-- parity. region = us|eu (Pinnacle = eu). RUN THIS ALTER BEFORE deploying the
+-- bookmaker-aware capture_odds_snapshot / ingester.
+IF COL_LENGTH('dbo.odds_line', 'bookmaker') IS NULL
+    ALTER TABLE dbo.odds_line ADD bookmaker NVARCHAR(64);
+GO
+IF COL_LENGTH('dbo.odds_line', 'region') IS NULL
+    ALTER TABLE dbo.odds_line ADD region NVARCHAR(16);
+GO
+-- Snapshot-scoped bookmaker filtering (DK-parity readers + R2 sharp reads) now
+-- that a snapshot holds ~40 books' rows rather than one collapsed row.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_odds_line_snapshot_book'
+                 AND object_id = OBJECT_ID('dbo.odds_line'))
+CREATE INDEX ix_odds_line_snapshot_book ON dbo.odds_line (snapshot_id, bookmaker);
 GO
 
 -- Odds-coverage monitoring views (2026-08-21). v_odds_coverage: raw counts across

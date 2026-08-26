@@ -411,7 +411,15 @@ odds_line = Table(
     Column("player_mlb_id", String(32)),
     Column("team_code", String(16)),
     Column("game_pk", Integer),                        # P3: StatsAPI game (best-effort)
+    # Per-book grain (multibook migration): one row per (bookmaker, point) within a
+    # snapshot. NULL on legacy DK-only rows (retro-set to 'draftkings'); the DK
+    # readers filter bookmaker='draftkings'. region = us|eu (Pinnacle = eu).
+    Column("bookmaker", String(64)),
+    Column("region", String(16)),
     Index("ix_odds_line_snapshot", "snapshot_id"),
+    # Snapshot-scoped bookmaker filtering (the DK-parity readers + the R2 sharp
+    # reads) now that a snapshot holds ~40 books' rows, not one collapsed row.
+    Index("ix_odds_line_snapshot_book", "snapshot_id", "bookmaker"),
 )
 
 
@@ -1207,7 +1215,11 @@ def save_recal(sport_key, cfg):
 
 _ODDS_LINE_COLS = ("bet_type", "selection", "point", "player", "prop_key",
                    "direction", "price", "implied_prob",
-                   "player_mlb_id", "team_code", "game_pk")
+                   "player_mlb_id", "team_code", "game_pk",
+                   # per-book grain (multibook migration): one line row per
+                   # (bookmaker, point); NULL on legacy DK-only rows (retro-set
+                   # to 'draftkings'). region = us|eu (Pinnacle = eu).
+                   "bookmaker", "region")
 
 
 def capture_odds_snapshot(meta, lines):
@@ -1254,6 +1266,9 @@ def capture_odds_snapshot(meta, lines):
                     "player_mlb_id": _s(ln.get("player_mlb_id")),
                     "team_code": _s(ln.get("team_code")),
                     "game_pk": _i(ln.get("game_pk")),
+                    # per-book grain (multibook); absent on legacy callers -> NULL
+                    "bookmaker": _s(ln.get("bookmaker")),
+                    "region": _s(ln.get("region")),
                 } for ln in lines])
         return True
     except IntegrityError:
