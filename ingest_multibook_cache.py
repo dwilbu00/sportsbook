@@ -39,11 +39,16 @@ from collections import Counter
 
 # props are keyed by these market prefixes in the Odds API payload
 _PROP_PREFIXES = ("batter_", "pitcher_", "player_")
-# snapshot taken >= this many hours before first pitch => the EARLY (open) pull;
-# nearer than that => the CLOSE pull. The early pull used a fixed morning time
-# (~12:00Z), the close pull used per-game commence, so a 3h margin separates them
-# for every realistic MLB start time.
-_OPEN_MIN_HOURS_BEFORE = 3.0
+# The pull ran two passes: CLOSE (snapshot ts = each game's commence) and EARLY
+# (snapshot ts = a fixed morning time, ~12:00Z per the cache audit). BUT the
+# historical featured endpoint returns the WHOLE SLATE at each ts — so a close-pass
+# fetch at game A's first pitch also contains the later games at their as-of-then
+# (intraday) prices. We keep only each game's TRUE close (ts within a window of its
+# OWN commence) and its morning open (ts at the fixed early hour); the intraday
+# pre-close snapshots from other games' close-pass files are dropped (the raw cache
+# retains them for a future line-movement ingest if we ever want it).
+_DEFAULT_EARLY_HOUR = 12          # UTC hour of the early pull (audit: 12:00Z cluster)
+_DEFAULT_CLOSE_WINDOW_MIN = 30    # |snapshot ts - commence| <= this => that game's close
 
 
 def _iter_cache_games(cache_dir, sport):
@@ -113,15 +118,63 @@ def _per_book_lines(game, kind):
     return out
 
 
-def _source_for(snapshot_ts, commence):
-    """multibook_open (early) when the snapshot predates first pitch by >= the
-    margin, else multibook_close."""
+def _classify_snapshot(snapshot_ts, commence, early_hour, close_window_min):
+    """'multibook_close' when the snapshot ts is within close_window_min of first
+    pitch (this game's true close), 'multibook_open' when the ts is at the fixed
+    early-pull hour (the morning line), else None to SKIP — an intraday pre-close
+    snapshot that landed in another game's whole-slate close-pass file."""
     import warehouse as wh
     sdt = wh._parse_utc(snapshot_ts)
     cdt = wh._parse_utc(commence)
-    if sdt and cdt and (cdt - sdt).total_seconds() >= _OPEN_MIN_HOURS_BEFORE * 3600:
+    if not sdt or not cdt:
+        return None
+    if abs((cdt - sdt).total_seconds()) <= close_window_min * 60:
+        return "multibook_close"
+    if sdt.hour == early_hour:
         return "multibook_open"
-    return "multibook_close"
+    return None
+
+
+def _enrich_lines_fast(sport, meta, lines, gpk_cache):
+    """Fast id/game_pk stamping for a snapshot's lines (MLB only), the bulk-ingest
+    counterpart to warehouse._enrich_ids.
+
+    The heavy per-snapshot cost in _enrich_ids is (a) find_game_pk_by_commence per
+    snapshot and (b) the game-context entity_resolver PER PROP PLAYER. But every
+    line of one event (team + props, close + open) shares ONE game, and the odds
+    feed's player ids come from the same SFBB cross-map the rest of the system uses.
+    So: resolve game_pk ONCE per event (memoized in gpk_cache, DH-safe via commence)
+    and take player_mlb_id / team_code straight from the in-memory SFBB map. Fail-open
+    (a miss leaves the field None -> name-based join, exactly as before)."""
+    try:
+        if not (sport or "").startswith("baseball"):
+            return meta, lines
+        import player_id_map
+        import mlb_warehouse
+        home, away = meta.get("home"), meta.get("away")
+        meta["home_code"] = player_id_map.team_code_for_name(home)
+        meta["away_code"] = player_id_map.team_code_for_name(away)
+        eid = meta.get("event_id")
+        if eid in gpk_cache:
+            gpk = gpk_cache[eid]
+        else:
+            hid = mlb_warehouse.team_id_for_name_tolerant(home) if home else None
+            aid = mlb_warehouse.team_id_for_name_tolerant(away) if away else None
+            commence = meta.get("commence_time")
+            gpk = (mlb_warehouse.find_game_pk_by_commence(hid, aid, commence)
+                   if hid and aid and commence else None)
+            gpk_cache[eid] = gpk
+        teams = (home, away)
+        for ln in lines:
+            if (ln.get("bet_type") or "") == "player_prop":
+                ln["player_mlb_id"] = player_id_map.mlb_id_for_name(
+                    ln.get("player"), teams=teams)
+            else:
+                ln["team_code"] = player_id_map.team_code_for_name(ln.get("selection"))
+            ln["game_pk"] = gpk
+    except Exception:
+        pass
+    return meta, lines
 
 
 def main():
@@ -134,7 +187,16 @@ def main():
     p.add_argument("--no-enrich", action="store_true",
                    help="Skip player_mlb_id/game_pk resolution — a FAST structural "
                         "preview (books, source split, line counts, dates) without "
-                        "the slow per-snapshot entity/game_pk lookups. Dry-run only.")
+                        "the id/game_pk lookups. Dry-run only.")
+    p.add_argument("--full-enrich", action="store_true",
+                   help="Use the thorough warehouse._enrich_ids (game-context entity "
+                        "resolver) instead of the fast SFBB path — slower; only if the "
+                        "fast player_mlb_id coverage comes back materially lower.")
+    p.add_argument("--early-hour", type=int, default=_DEFAULT_EARLY_HOUR,
+                   help=f"UTC hour of the early/open pull (default {_DEFAULT_EARLY_HOUR}).")
+    p.add_argument("--close-window-min", type=int, default=_DEFAULT_CLOSE_WINDOW_MIN,
+                   help=f"|snapshot ts - commence| <= this many minutes counts as that "
+                        f"game's close (default {_DEFAULT_CLOSE_WINDOW_MIN}).")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args()
 
@@ -169,9 +231,12 @@ def main():
     gpk_lines = 0
     prop_lines = 0
     prop_gpk = 0
+    prop_mlbid = 0
+    intraday_skipped = 0
     written = skipped = errors = 0
     dates = []
     seen = set()          # (event_id, kind, snapshot_hour) — de-dupe within this run
+    gpk_cache = {}        # event_id -> game_pk (resolve once per game, DH-safe)
     n = 0
 
     for game, ts, _path in _iter_cache_games(args.cache_dir, args.sport):
@@ -184,6 +249,13 @@ def main():
         kind = wh._kind_for_markets(",".join(sorted(mkeys)))
         if kind == "alt":
             continue                                     # alternates weren't pulled
+        # Classify BEFORE the expensive parse/enrich so intraday snapshots (a game
+        # seen pre-close in another game's whole-slate close-pass file) are dropped
+        # cheaply — we keep only each game's true close + its morning open.
+        source = _classify_snapshot(ts, commence, args.early_hour, args.close_window_min)
+        if source is None:
+            intraday_skipped += 1
+            continue
         snapshot_hour = wh._hour_bucket(ts or commence)
         key = (game.get("id"), kind, snapshot_hour)
         if key in seen:
@@ -193,7 +265,6 @@ def main():
         lines = _per_book_lines(game, kind)
         if not lines:
             continue
-        source = _source_for(ts, commence)
         meta = {
             "sport": args.sport, "game_date": commence[:10],
             "event_id": game.get("id"), "kind": kind,
@@ -203,11 +274,15 @@ def main():
             "regions": "us,eu", "markets": ",".join(sorted(mkeys)),
             "bookmakers": "multibook", "source": source,
         }
-        # Stamp player_mlb_id + DH-safe game_pk + team codes (same resolver the
-        # backfill used). Runs in dry-run too so the coverage % is real — unless
-        # --no-enrich (fast structural preview: skip the slow per-snapshot lookups).
-        if not args.no_enrich:
+        # Stamp player_mlb_id + DH-safe game_pk + team codes. Fast path (default):
+        # game_pk once per event (cached) + in-memory SFBB ids. --full-enrich uses
+        # the thorough game-context resolver. --no-enrich skips it (preview only).
+        if args.no_enrich:
+            pass
+        elif args.full_enrich:
             meta, lines = wh._enrich_ids(args.sport, meta, lines)
+        else:
+            meta, lines = _enrich_lines_fast(args.sport, meta, lines, gpk_cache)
 
         snaps_by_kind[kind] += 1
         source_ct[source] += 1
@@ -218,6 +293,8 @@ def main():
             is_prop = (ln.get("bet_type") == "player_prop")
             if is_prop:
                 prop_lines += 1
+                if ln.get("player_mlb_id"):
+                    prop_mlbid += 1
             if ln.get("game_pk"):
                 gpk_lines += 1
                 if is_prop:
@@ -246,17 +323,22 @@ def main():
           f"props={snaps_by_kind.get('props', 0):,})")
     print(f"  source split: multibook_close={source_ct.get('multibook_close', 0):,}  "
           f"multibook_open={source_ct.get('multibook_open', 0):,}")
+    print(f"  intraday snapshots skipped (kept in cache): {intraday_skipped:,}")
     if dates:
         yr = Counter(d[:4] for d in dates)
         print(f"  snapshot date range: {min(dates)} .. {max(dates)}   by year: {dict(sorted(yr.items()))}")
     print(f"  odds_line rows: {lines_total:,}   (prop lines: {prop_lines:,})")
     if args.no_enrich:
-        print(f"  game_pk coverage: (skipped — --no-enrich; drop it for a real % on a small --limit)")
+        print(f"  game_pk / mlb_id coverage: (skipped — --no-enrich; drop it for a real % on a small --limit)")
     elif lines_total:
         print(f"  game_pk coverage: {gpk_lines:,}/{lines_total:,} lines "
               f"({100*gpk_lines/lines_total:.1f}%)"
               + (f"   props: {prop_gpk:,}/{prop_lines:,} "
                  f"({100*prop_gpk/prop_lines:.1f}%)" if prop_lines else ""))
+        if prop_lines:
+            print(f"  player_mlb_id coverage (props): {prop_mlbid:,}/{prop_lines:,} "
+                  f"({100*prop_mlbid/prop_lines:.1f}%)"
+                  + ("" if args.full_enrich else "  [fast SFBB path — use --full-enrich if low]"))
     print(f"\n  Bookmakers written (occurrences):")
     for k, v in books_ct.most_common():
         tag = "  <-- SHARP REF" if k == "pinnacle" else ""

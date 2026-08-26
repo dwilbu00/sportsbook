@@ -102,17 +102,22 @@ class KindAndSourceTests(unittest.TestCase):
             wh._kind_for_markets(",".join(sorted(img._game_market_keys(_prop_game())))),
             "props")
 
-    def test_source_close_vs_open(self):
-        # snapshot ~5 min before first pitch -> close
+    def test_classify_snapshot(self):
+        EARLY, WIN = 12, 30
+        # ts ~5 min before first pitch -> that game's close
         self.assertEqual(
-            img._source_for("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z"),
+            img._classify_snapshot("2024-05-19T21:55:00Z", "2024-05-19T22:00:00Z", EARLY, WIN),
             "multibook_close")
-        # snapshot 10h before (the fixed morning pull) -> open
+        # ts at the fixed early hour, hours before -> morning open
         self.assertEqual(
-            img._source_for("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z"),
+            img._classify_snapshot("2024-05-19T12:00:00Z", "2024-05-19T22:00:00Z", EARLY, WIN),
             "multibook_open")
-        # missing ts -> defaults to close (never mislabels a real early as open)
-        self.assertEqual(img._source_for(None, "2024-05-19T22:00:00Z"), "multibook_close")
+        # ts is an intraday pre-close (5pm for a 10pm game), not the early hour -> skip
+        self.assertIsNone(
+            img._classify_snapshot("2024-05-19T17:00:00Z", "2024-05-19T22:00:00Z", EARLY, WIN))
+        # unparseable ts -> skip (never silently mislabeled)
+        self.assertIsNone(
+            img._classify_snapshot(None, "2024-05-19T22:00:00Z", EARLY, WIN))
 
 
 class IterCacheGamesTests(unittest.TestCase):
