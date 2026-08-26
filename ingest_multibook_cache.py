@@ -131,6 +131,10 @@ def main():
     p.add_argument("--apply", action="store_true", help="Write to the warehouse (default = dry-run).")
     p.add_argument("--yes", action="store_true", help="Required with --apply.")
     p.add_argument("--limit", type=int, default=0, help="Process at most N snapshots (0 = all; use for a fast dry-run sample).")
+    p.add_argument("--no-enrich", action="store_true",
+                   help="Skip player_mlb_id/game_pk resolution — a FAST structural "
+                        "preview (books, source split, line counts, dates) without "
+                        "the slow per-snapshot entity/game_pk lookups. Dry-run only.")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args()
 
@@ -143,6 +147,10 @@ def main():
     import warehouse as wh
     import db_store
     db_store.promote_secrets_from_toml()
+    if args.no_enrich and args.apply:
+        print("--no-enrich is a preview-only mode (writes need the ids/game_pk). "
+              "Drop --no-enrich for --apply.")
+        sys.exit(1)
     if args.apply:
         if not args.yes:
             print("--apply requires --yes (double-confirm). Nothing written.")
@@ -196,8 +204,10 @@ def main():
             "bookmakers": "multibook", "source": source,
         }
         # Stamp player_mlb_id + DH-safe game_pk + team codes (same resolver the
-        # backfill used). Runs in dry-run too so the coverage % is real.
-        meta, lines = wh._enrich_ids(args.sport, meta, lines)
+        # backfill used). Runs in dry-run too so the coverage % is real — unless
+        # --no-enrich (fast structural preview: skip the slow per-snapshot lookups).
+        if not args.no_enrich:
+            meta, lines = wh._enrich_ids(args.sport, meta, lines)
 
         snaps_by_kind[kind] += 1
         source_ct[source] += 1
@@ -240,7 +250,9 @@ def main():
         yr = Counter(d[:4] for d in dates)
         print(f"  snapshot date range: {min(dates)} .. {max(dates)}   by year: {dict(sorted(yr.items()))}")
     print(f"  odds_line rows: {lines_total:,}   (prop lines: {prop_lines:,})")
-    if lines_total:
+    if args.no_enrich:
+        print(f"  game_pk coverage: (skipped — --no-enrich; drop it for a real % on a small --limit)")
+    elif lines_total:
         print(f"  game_pk coverage: {gpk_lines:,}/{lines_total:,} lines "
               f"({100*gpk_lines/lines_total:.1f}%)"
               + (f"   props: {prop_gpk:,}/{prop_lines:,} "
