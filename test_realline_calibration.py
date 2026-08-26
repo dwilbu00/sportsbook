@@ -1070,6 +1070,49 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
         _args, kwargs = spy.call_args
         self.assertIs(kwargs.get("roi_tiebreak"), True)
 
+    def test_non_d_prop_builds_rows_without_p_dist(self):
+        # Regression (TB/RBI bucketing): project_distributional is batter_hits-only,
+        # so it returns None for every non-D prop. _select_line_methods must NOT drop
+        # those rows — D just isn't a candidate — else a non-D prop builds zero rows
+        # and can never adopt a per-line-bucket method (the reason the deep-recal
+        # re-run kept TB/RBI pooled before this fix).
+        obs = [{"prop_key": "batter_rbis", "player": f"P{i}", "line": 1.0,
+                "actual": 1.0, "game_date": _day(i),
+                "over_price": -110, "under_price": -110} for i in range(120)]
+        spy = MagicMock(return_value=None)
+        with patch.object(blc, "project_and_empirical", return_value=(1.0, 0.6)), \
+                patch.object(blc, "project_distributional", return_value=None), \
+                patch.object(blc, "select_method_at_real_lines", spy):
+            refit_calibration._select_line_methods(
+                "batter_rbis", obs, params={}, sport_key="baseball_mlb",
+                team_defense={}, league_avg_def={}, pooled_method="A",
+                xba_index=None, quality_index=None)
+        # The (0.5,1.5] bucket (n=120 >= MIN_BUCKET_OBS) reached the selector, and
+        # every forwarded row carries p_dist=None so D stays out of contention.
+        self.assertTrue(spy.called)
+        bucket_rows = spy.call_args[0][0]
+        self.assertEqual(len(bucket_rows), 120)
+        self.assertTrue(all(r.get("p_dist") is None for r in bucket_rows))
+
+    def test_d_prop_still_drops_p_distless_rows(self):
+        # The hits (D-eligible) path is unchanged: a p_dist-less row can't be scored
+        # for D and would knock D out of the bucket (has_d = all(p_dist)), so it is
+        # still dropped. With every row p_dist-less, no bucket forms and the selector
+        # is never reached (line_methods stays None) — preserving the hits behavior.
+        obs = [{"prop_key": "batter_hits", "player": f"P{i}", "line": 1.0,
+                "actual": 1.0, "game_date": _day(i),
+                "over_price": -110, "under_price": -110} for i in range(120)]
+        spy = MagicMock(return_value=None)
+        with patch.object(blc, "project_and_empirical", return_value=(1.0, 0.6)), \
+                patch.object(blc, "project_distributional", return_value=None), \
+                patch.object(blc, "select_method_at_real_lines", spy):
+            result = refit_calibration._select_line_methods(
+                "batter_hits", obs, params={}, sport_key="baseball_mlb",
+                team_defense={}, league_avg_def={}, pooled_method="A",
+                xba_index=None, quality_index=None)
+        self.assertFalse(spy.called)     # all rows dropped → no bucket reached
+        self.assertIsNone(result)
+
 
 class CalibWarehouseCutoverTests(unittest.TestCase):
     """P4 calibration cutover: join_book_lines_to_actuals grades off the warehouse

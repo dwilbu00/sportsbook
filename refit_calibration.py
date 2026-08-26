@@ -239,7 +239,8 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
     serve a different xBA weight than the pooled method was fit under). Falls back
     to ``LINE_COND_XSTATS_STRENGTH`` when the caller passes no strength."""
     import book_line_calibration as blc
-    from props import _DIST_HARDHIT_COEF, _DIST_BARREL_COEF, PROP_NEGBIN_ELIGIBLE
+    from props import (_DIST_HARDHIT_COEF, _DIST_BARREL_COEF,
+                       PROP_NEGBIN_ELIGIBLE, PROP_XSTATS_KIND)
 
     rows = []
     for obs in enriched:
@@ -255,7 +256,16 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
             xba_index=xba_index, quality_index=quality_index,
             xstats_strength=xstats_strength,
             defense_by_season=defense_by_season)
-        if p_dist is None:
+        # Method D (contact-quality distributional) is batter_hits-only, so
+        # project_distributional returns None for every non-D prop (TB/RBI, the
+        # pitcher props). Only DROP a p_dist-less row for a D-ELIGIBLE prop: there
+        # a missing p_dist can't be scored for D and the bucket's D-candidacy needs
+        # EVERY row to carry one (has_d = all(p_dist)), so keeping it would silently
+        # knock D out of a hits bucket. For a non-D prop, KEEP the row (p_dist=None)
+        # so A/B/C/E are still scored per bucket — D simply won't be a candidate.
+        # Without this, _select_line_methods built zero rows for TB/RBI and they
+        # could never bucket (the real reason the re-run kept them pooled).
+        if p_dist is None and prop_key in PROP_XSTATS_KIND:
             continue
         rows.append({
             "player": obs["player"], "projected": projected, "line": obs["line"],
