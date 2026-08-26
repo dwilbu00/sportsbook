@@ -1,36 +1,70 @@
 {
   "sport_key": "baseball_mlb",
-  "fit_timestamp": "2026-07-30T17:34:28.021880+00:00",
+  "fit_timestamp": "2026-08-26T02:52:36.288785+00:00",
   "props": {
-    "batter_hits@le_0.5": {
-      "a": 0.37526,
-      "b": 0.19425,
-      "n_fit": 2144,
-      "n_validation": 889,
+    "batter_strikeouts": {
+      "a": 0.68627,
+      "b": -0.06587,
+      "n_fit": 17547,
+      "n_validation": 7036,
       "n_validation_folds": 2,
-      "holdout_start": "2026-07-26",
-      "holdout_raw_brier": 0.245348,
-      "holdout_calibrated_brier": 0.242147,
-      "holdout_raw_log_loss": 0.684341,
-      "holdout_calibrated_log_loss": 0.677324,
+      "holdout_start": "2024-08-03",
+      "holdout_raw_brier": 0.237067,
+      "holdout_calibrated_brier": 0.235841,
+      "holdout_raw_log_loss": 0.668102,
+      "holdout_calibrated_log_loss": 0.664471,
       "holdout_metric_scope": "fold_cross_validation",
       "deploy_fit_scope": "all_observations",
       "validation_folds": [
         {
-          "holdout_start": "2026-07-26",
-          "n_validation": 389,
-          "raw_brier": 0.23928310655356608,
-          "calibrated_brier": 0.23863966514986445,
-          "raw_log_loss": 0.671232772890307,
-          "calibrated_log_loss": 0.6701625805174698
+          "holdout_start": "2024-08-03",
+          "n_validation": 3290,
+          "raw_brier": 0.23970507517587544,
+          "calibrated_brier": 0.23730844574128063,
+          "raw_log_loss": 0.673311809416162,
+          "calibrated_log_loss": 0.6673682904767925
         },
         {
-          "holdout_start": "2026-07-28",
-          "n_validation": 500,
-          "raw_brier": 0.25006734034186234,
-          "calibrated_brier": 0.24487522259607813,
-          "raw_log_loss": 0.6945398126438761,
-          "calibrated_log_loss": 0.682896236428689
+          "holdout_start": "2024-08-25",
+          "n_validation": 3746,
+          "raw_brier": 0.23475054613469123,
+          "calibrated_brier": 0.23455226431323556,
+          "raw_log_loss": 0.6635267163130859,
+          "calibrated_log_loss": 0.6619269889852385
+        }
+      ],
+      "validated": true,
+      "source": "book_line_cache_seed"
+    },
+    "batter_total_bases": {
+      "a": 0.29946,
+      "b": -0.07471,
+      "n_fit": 53138,
+      "n_validation": 21266,
+      "n_validation_folds": 2,
+      "holdout_start": "2025-05-23",
+      "holdout_raw_brier": 0.250793,
+      "holdout_calibrated_brier": 0.24548,
+      "holdout_raw_log_loss": 0.699811,
+      "holdout_calibrated_log_loss": 0.684508,
+      "holdout_metric_scope": "fold_cross_validation",
+      "deploy_fit_scope": "all_observations",
+      "validation_folds": [
+        {
+          "holdout_start": "2025-05-23",
+          "n_validation": 10556,
+          "raw_brier": 0.2492913782807039,
+          "calibrated_brier": 0.24550987343367145,
+          "raw_log_loss": 0.6937076908594287,
+          "calibrated_log_loss": 0.6841115745014621
+        },
+        {
+          "holdout_start": "2025-09-14",
+          "n_validation": 10710,
+          "raw_brier": 0.2522732848225678,
+          "calibrated_brier": 0.24545073977456694,
+          "raw_log_loss": 0.7058270014357514,
+          "calibrated_log_loss": 0.6848994097951159
         }
       ],
       "validated": true,
