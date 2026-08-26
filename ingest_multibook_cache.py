@@ -135,7 +135,7 @@ def _classify_snapshot(snapshot_ts, commence, early_hour, close_window_min):
     return None
 
 
-def _enrich_lines_fast(sport, meta, lines, gpk_cache):
+def _enrich_lines_fast(sport, meta, lines, gpk_cache, id_cache):
     """Fast id/game_pk stamping for a snapshot's lines (MLB only), the bulk-ingest
     counterpart to warehouse._enrich_ids.
 
@@ -143,9 +143,11 @@ def _enrich_lines_fast(sport, meta, lines, gpk_cache):
     snapshot and (b) the game-context entity_resolver PER PROP PLAYER. But every
     line of one event (team + props, close + open) shares ONE game, and the odds
     feed's player ids come from the same SFBB cross-map the rest of the system uses.
-    So: resolve game_pk ONCE per event (memoized in gpk_cache, DH-safe via commence)
-    and take player_mlb_id / team_code straight from the in-memory SFBB map. Fail-open
-    (a miss leaves the field None -> name-based join, exactly as before)."""
+    So: resolve game_pk ONCE per event (memoized in gpk_cache, DH-safe via commence),
+    memoize player_mlb_id per (name, teams) in id_cache — a player recurs ~26x in one
+    snapshot (books x over/under) and again in the close+open snapshots — and take
+    ids straight from the in-memory SFBB map. Fail-open (a miss leaves the field
+    None -> name-based join, exactly as before)."""
     try:
         if not (sport or "").startswith("baseball"):
             return meta, lines
@@ -167,8 +169,11 @@ def _enrich_lines_fast(sport, meta, lines, gpk_cache):
         teams = (home, away)
         for ln in lines:
             if (ln.get("bet_type") or "") == "player_prop":
-                ln["player_mlb_id"] = player_id_map.mlb_id_for_name(
-                    ln.get("player"), teams=teams)
+                nm = ln.get("player")
+                ck = (nm, home, away)
+                if ck not in id_cache:
+                    id_cache[ck] = player_id_map.mlb_id_for_name(nm, teams=teams)
+                ln["player_mlb_id"] = id_cache[ck]
             else:
                 ln["team_code"] = player_id_map.team_code_for_name(ln.get("selection"))
             ln["game_pk"] = gpk
@@ -237,6 +242,7 @@ def main():
     dates = []
     seen = set()          # (event_id, kind, snapshot_hour) — de-dupe within this run
     gpk_cache = {}        # event_id -> game_pk (resolve once per game, DH-safe)
+    id_cache = {}         # (name, home, away) -> player_mlb_id (recurs ~26x/snapshot)
     n = 0
 
     for game, ts, _path in _iter_cache_games(args.cache_dir, args.sport):
@@ -282,7 +288,7 @@ def main():
         elif args.full_enrich:
             meta, lines = wh._enrich_ids(args.sport, meta, lines)
         else:
-            meta, lines = _enrich_lines_fast(args.sport, meta, lines, gpk_cache)
+            meta, lines = _enrich_lines_fast(args.sport, meta, lines, gpk_cache, id_cache)
 
         snaps_by_kind[kind] += 1
         source_ct[source] += 1
