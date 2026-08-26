@@ -1204,6 +1204,69 @@ class PlayerPropLinesSqlTests(_SqliteBackend, unittest.TestCase):
         self.assertEqual(warehouse.doubleheader_event_ids(consec), set())
 
 
+class PerBookFilterTests(_SqliteBackend, unittest.TestCase):
+    """Multibook per-book grain: the readers filter to one bookmaker. Default
+    'draftkings' = DK parity (NOT best-across-books); None = all books; 'pinnacle'
+    = the R2 sharp read."""
+
+    def _meta(self, kind, markets):
+        return {"sport": "baseball_mlb", "game_date": "2026-07-22",
+                "event_id": "e1", "kind": kind, "snapshot_hour": "20260722T23Z",
+                "captured_at": "2026-07-22T23:00:00Z",
+                "commence_time": "2026-07-22T23:00:00Z",
+                "home": "Rockies", "away": "Astros",
+                "regions": "us,eu", "markets": markets, "bookmakers": "multibook"}
+
+    def _prop_lines_per_book(self):
+        rows = []
+        for book, op, up in (("draftkings", -110, -110), ("pinnacle", -105, -105),
+                             ("fanduel", 120, -140)):
+            for direction, price in (("OVER", op), ("UNDER", up)):
+                rows.append({"bet_type": "player_prop", "selection": "Kris Bryant",
+                             "player": "Kris Bryant", "prop_key": "batter_hits",
+                             "direction": direction, "point": 0.5, "price": price,
+                             "implied_prob": 0.5, "bookmaker": book})
+        return rows
+
+    def _team_lines_per_book(self):
+        return [{"bet_type": "moneyline", "selection": "Rockies", "price": price,
+                 "implied_prob": 0.45, "team_code": "COL", "bookmaker": book}
+                for book, price in (("draftkings", 120), ("pinnacle", 115),
+                                    ("fanduel", 130))]
+
+    def test_prop_reader_defaults_to_draftkings(self):
+        db_store.capture_odds_snapshot(self._meta("props", "batter_hits"),
+                                       self._prop_lines_per_book())
+        self.assertEqual({r["price"] for r in db_store.player_prop_lines("baseball_mlb")},
+                         {-110})                                   # DK only (both sides -110)
+        self.assertEqual(len(db_store.player_prop_lines("baseball_mlb", bookmaker=None)),
+                         6)                                        # all 3 books x 2 sides
+        self.assertEqual({r["price"] for r in
+                          db_store.player_prop_lines("baseball_mlb", bookmaker="pinnacle")},
+                         {-105})                                   # sharp read
+
+    def test_team_reader_defaults_to_draftkings(self):
+        db_store.capture_odds_snapshot(self._meta("team", "h2h"),
+                                       self._team_lines_per_book())
+        self.assertEqual([r["price"] for r in db_store.team_market_lines("baseball_mlb")],
+                         [120])                                    # DK, NOT best-across (130)
+        self.assertEqual(len(db_store.team_market_lines("baseball_mlb", bookmaker=None)), 3)
+        self.assertEqual([r["price"] for r in
+                          db_store.team_market_lines("baseball_mlb", bookmaker="pinnacle")],
+                         [115])
+
+    def test_odds_line_lookup_per_book(self):
+        db_store.capture_odds_snapshot(self._meta("team", "h2h"),
+                                       self._team_lines_per_book())
+        sid = db_store.team_market_lines("baseball_mlb", bookmaker=None)[0]["snapshot_id"]
+        # default (DK) returns DK's 120, NOT the best price (130) it would pick unfiltered
+        self.assertEqual(db_store.odds_line_lookup(
+            sid, "moneyline", selection="Rockies", team_code="COL")["price"], 120)
+        self.assertEqual(db_store.odds_line_lookup(
+            sid, "moneyline", selection="Rockies", team_code="COL",
+            bookmaker="pinnacle")["price"], 115)
+
+
 class RefitPerformedTests(_SqliteBackend, unittest.TestCase):
     """refit_performed flag + count_rows + recalibration count/mark helpers that
     power the app's 'time to refit' banner."""
