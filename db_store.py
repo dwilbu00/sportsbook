@@ -1270,15 +1270,21 @@ def capture_odds_snapshot(meta, lines):
                     "bookmaker": _s(ln.get("bookmaker")),
                     "region": _s(ln.get("region")),
                 } for ln in lines]
-                # Multi-row INSERT (VALUES tuples), NOT executemany: pymssql's
-                # executemany is a round-trip PER ROW, brutal for a per-book snapshot's
-                # hundreds of lines. One .values([...]) statement is a single round-trip
-                # per chunk — the reason the multibook ingest is viable without pyodbc.
-                # Chunk to stay under SQL Server's 2100-parameter cap (14 cols x 100 =
-                # 1400). Harmless on every backend (a live snapshot's few lines = 1 chunk).
-                _CHUNK = 100
-                for _off in range(0, len(_rows), _CHUNK):
-                    conn.execute(insert(odds_line).values(_rows[_off:_off + _CHUNK]))
+                # Bulk line insert. Driver-aware for the multibook ingest's hundreds
+                # of rows/snapshot:
+                #  - pyodbc: executemany + fast_executemany (set on the engine)
+                #    array-binds the whole batch in one native call — fastest.
+                #  - pymssql/sqlite: no array bind, and per-row executemany is a
+                #    round-trip PER ROW — so use a multi-row INSERT ... VALUES (one
+                #    round-trip per ~100-row chunk, under SQL Server's 2100-param cap).
+                # Both write identical rows; this is why the ingest is fast on either
+                # driver (and needs no ODBC install on the pymssql box).
+                if engine.dialect.driver == "pyodbc":
+                    conn.execute(insert(odds_line), _rows)
+                else:
+                    _CHUNK = 100
+                    for _off in range(0, len(_rows), _CHUNK):
+                        conn.execute(insert(odds_line).values(_rows[_off:_off + _CHUNK]))
         return True
     except IntegrityError:
         return False  # snapshot already captured this hour (write-once)
