@@ -94,6 +94,16 @@ class GateTests(unittest.TestCase):
         self.assertIn("not positive", reason)
 
 
+class DistBucketTests(unittest.TestCase):
+    def test_line_gap_buckets(self):
+        self.assertEqual(bt.dist_bucket(0.0), "<=0.5")
+        self.assertEqual(bt.dist_bucket(0.5), "<=0.5")
+        self.assertEqual(bt.dist_bucket(1.0), "(0.5,1.0]")
+        self.assertEqual(bt.dist_bucket(1.5), "(1.0,1.5]")
+        self.assertEqual(bt.dist_bucket(2.0), ">1.5")
+        self.assertEqual(bt.dist_bucket(None), "n/a")
+
+
 class BHTests(unittest.TestCase):
     def test_bh_selects_expected(self):
         pvals = [0.001, 0.5, 0.9, 0.02]

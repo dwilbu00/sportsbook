@@ -32,10 +32,20 @@ from datetime import datetime, timezone
 PropLeg = namedtuple("PropLeg",
                      "event_id game_date commence_time captured_at snapshot_id "
                      "game_pk player player_mlb_id prop_key dk_point "
-                     "dk_over_price dk_under_price pinnacle_offers")
+                     "dk_over_price dk_under_price pinnacle_offers ref_prop")
+PropLeg.__new__.__defaults__ = (None,)      # ref_prop defaults to same-prop pricing
 
 _DK = "draftkings"
 _PIN = "pinnacle"
+
+# Cross-market sharp-reference synonyms: {DK prop: (Pinnacle prop, {valid DK points})}.
+# batter_hits Over/Under 0.5 == batter_total_bases Over/Under 0.5 EXACTLY — a batter
+# accrues a total base ONLY via a hit and any hit gives >=1 TB, so TB>=1 <=> H>=1.
+# ONLY the 0.5 line maps: at 1.5, P(TB>=2) != P(H>=2) (a double is 2 TB from one hit).
+# Pinnacle books ZERO batter_hits but books TB densely (incl. at 0.5), so this makes
+# TB the sharp reference for DK's largest prop, hits 0.5. Grading still uses the DK
+# market's own actual (H) — the synonym is a PRICING reference only.
+_SYNONYM = {"batter_hits": ("batter_total_bases", frozenset({0.5}))}
 
 
 def _parse_ts(s):
@@ -62,49 +72,62 @@ def _player_key(row):
     return ("nm", name)
 
 
+def _pin_offers(pin_by_point):
+    """Per-point two-sided Pinnacle offers list from {point: {side: price}}."""
+    return [{"point": pt, "over_price": s.get("OVER"), "under_price": s.get("UNDER")}
+            for pt, s in pin_by_point.items()]
+
+
 def _assemble_from_snapshot(snap_rows, stats):
     """Build PropLeg records from the rows of ONE (event, close) snapshot that
-    carries both books. Groups on (player, prop_key); Pinnacle keeps its per-point
-    two-sided offers; DK yields one leg per posted point (usually one). Drops+counts
-    legs missing a two-sided Pinnacle price or any DK price."""
-    grp = defaultdict(lambda: {"dk": defaultdict(dict), "pin": defaultdict(dict),
-                               "meta": None})
+    carries both books. Groups by PLAYER (so a DK prop can reference a DIFFERENT
+    Pinnacle prop via _SYNONYM — hits priced off TB), then per prop: Pinnacle keeps
+    its per-point two-sided offers, DK yields one leg per posted point. Drops+counts
+    legs with no two-sided Pinnacle reference or an out-of-range synonym line."""
+    players = defaultdict(lambda: {
+        "dk": defaultdict(lambda: defaultdict(dict)),   # prop -> point -> {side: price}
+        "pin": defaultdict(lambda: defaultdict(dict)),
+        "meta": None})
     for r in snap_rows:
-        key = (_player_key(r), r.get("prop_key"))
-        g = grp[key]
+        pl = players[_player_key(r)]
         # Prefer a meta row that carries the MLBAM id + game_pk for grading.
-        if g["meta"] is None or (r.get("player_mlb_id") and not g["meta"].get("player_mlb_id")):
-            g["meta"] = r
-        side = (r.get("direction") or "").upper()
+        if pl["meta"] is None or (r.get("player_mlb_id") and not pl["meta"].get("player_mlb_id")):
+            pl["meta"] = r
+        prop, side = r.get("prop_key"), (r.get("direction") or "").upper()
         pt, price = r.get("point"), r.get("price")
-        if pt is None or price is None or side not in ("OVER", "UNDER"):
+        if not prop or pt is None or price is None or side not in ("OVER", "UNDER"):
             continue
-        target = g["dk"] if r.get("book") == _DK else g["pin"]
-        target[pt][side] = price
+        book = "dk" if r.get("book") == _DK else "pin"
+        pl[book][prop][pt][side] = price
 
     out = []
-    for (_pkey, prop_key), g in grp.items():
-        meta = g["meta"]
-        pin_offers = [{"point": pt, "over_price": s.get("OVER"),
-                       "under_price": s.get("UNDER")} for pt, s in g["pin"].items()]
-        if not any(o["over_price"] is not None and o["under_price"] is not None
-                   for o in pin_offers):
-            stats["leg_dropped_no_pinnacle_twosided"] += 1
-            continue
-        if not g["dk"]:
-            stats["leg_dropped_no_dk_price"] += 1
-            continue
-        for pt, sides in g["dk"].items():
-            out.append(PropLeg(
-                event_id=meta.get("event_id"), game_date=meta.get("game_date"),
-                commence_time=meta.get("commence_time"),
-                captured_at=meta.get("captured_at"),
-                snapshot_id=meta.get("snapshot_id"), game_pk=meta.get("game_pk"),
-                player=meta.get("player"), player_mlb_id=meta.get("player_mlb_id"),
-                prop_key=prop_key, dk_point=pt,
-                dk_over_price=sides.get("OVER"), dk_under_price=sides.get("UNDER"),
-                pinnacle_offers=pin_offers))
-            stats["leg_built"] += 1
+    for _pkey, pl in players.items():
+        meta = pl["meta"]
+        for dk_prop, dk_by_point in pl["dk"].items():
+            # Sharp reference: same prop by default, or a cross-market synonym
+            # (hits -> TB) restricted to the lines where the identity holds.
+            ref_prop, valid_pts = _SYNONYM.get(dk_prop, (dk_prop, None))
+            pin_offers = _pin_offers(pl["pin"].get(ref_prop, {}))
+            has_two_sided = any(o["over_price"] is not None
+                                and o["under_price"] is not None for o in pin_offers)
+            for dk_pt, sides in dk_by_point.items():
+                if valid_pts is not None and dk_pt not in valid_pts:
+                    stats["leg_dropped_synonym_bad_point"] += 1
+                    continue                      # e.g. hits 1.5 has no TB identity
+                if not has_two_sided:
+                    stats["leg_dropped_no_pinnacle_twosided"] += 1
+                    continue
+                out.append(PropLeg(
+                    event_id=meta.get("event_id"), game_date=meta.get("game_date"),
+                    commence_time=meta.get("commence_time"),
+                    captured_at=meta.get("captured_at"),
+                    snapshot_id=meta.get("snapshot_id"), game_pk=meta.get("game_pk"),
+                    player=meta.get("player"), player_mlb_id=meta.get("player_mlb_id"),
+                    prop_key=dk_prop, dk_point=dk_pt,
+                    dk_over_price=sides.get("OVER"), dk_under_price=sides.get("UNDER"),
+                    pinnacle_offers=pin_offers,
+                    ref_prop=(ref_prop if ref_prop != dk_prop else None)))
+                stats["leg_built"] += 1
     return out
 
 

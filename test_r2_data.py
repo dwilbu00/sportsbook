@@ -5,7 +5,7 @@ import unittest
 import r2_data as d
 
 
-def _row(book, sid, cap, com, prop="batter_hits", side="OVER", pt=0.5, price=-110,
+def _row(book, sid, cap, com, prop="pitcher_earned_runs", side="OVER", pt=0.5, price=-110,
          player="Gunnar Henderson", mlbid="683002", eid="E1", gpk=700):
     return {"book": book, "snapshot_id": sid, "captured_at": cap,
             "commence_time": com, "event_id": eid, "player": player,
@@ -99,6 +99,53 @@ class OfferAssemblyTests(unittest.TestCase):
         self.assertEqual(len(legs), 1)
         self.assertIsNotNone(legs[0].dk_over_price)
         self.assertTrue(legs[0].pinnacle_offers)
+
+
+class SynonymTests(unittest.TestCase):
+    """DK batter_hits priced off Pinnacle batter_total_bases (TB>=1 <=> H>=1)."""
+
+    def _rows(self, dk_hits_point, pin_tb_points):
+        # DK posts hits at dk_hits_point; Pinnacle posts TB at the given points.
+        rows = _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM,
+                          prop="batter_hits", pt=dk_hits_point)
+        for pt in pin_tb_points:
+            rows += _two_sided("pinnacle", 1, "2024-06-26T23:05:00Z", COM,
+                               prop="batter_total_bases", pt=pt)
+        return rows
+
+    def test_hits_0p5_priced_off_pinnacle_tb_0p5(self):
+        legs, _ = d.select_prop_legs(self._rows(0.5, [0.5, 1.5]))
+        hits = [lg for lg in legs if lg.prop_key == "batter_hits"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].dk_point, 0.5)
+        self.assertEqual(hits[0].ref_prop, "batter_total_bases")   # synonym-priced
+        pts = sorted(o["point"] for o in hits[0].pinnacle_offers)
+        self.assertEqual(pts, [0.5, 1.5])          # Pinnacle TB offers, not hits
+
+    def test_hits_1p5_dropped_no_tb_identity(self):
+        # hits 1.5 has NO TB identity (P(TB>=2) != P(H>=2)) -> no synonym leg.
+        legs, stats = d.select_prop_legs(self._rows(1.5, [0.5, 1.5]))
+        hits = [lg for lg in legs if lg.prop_key == "batter_hits"]
+        self.assertEqual(hits, [])
+        self.assertEqual(stats["leg_dropped_synonym_bad_point"], 1)
+
+    def test_hits_priced_even_when_pinnacle_only_posts_tb_1p5(self):
+        # Only TB 1.5 posted -> projector back-solves P(TB>=1) at the 0.5 target.
+        legs, _ = d.select_prop_legs(self._rows(0.5, [1.5]))
+        hits = [lg for lg in legs if lg.prop_key == "batter_hits"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual([o["point"] for o in hits[0].pinnacle_offers], [1.5])
+
+    def test_same_prop_tb_still_priced_directly(self):
+        # A DK TB leg still uses Pinnacle TB directly (ref_prop None = same prop).
+        rows = _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM,
+                          prop="batter_total_bases", pt=1.5)
+        rows += _two_sided("pinnacle", 1, "2024-06-26T23:05:00Z", COM,
+                           prop="batter_total_bases", pt=1.5)
+        legs, _ = d.select_prop_legs(rows)
+        tb = [lg for lg in legs if lg.prop_key == "batter_total_bases"]
+        self.assertEqual(len(tb), 1)
+        self.assertIsNone(tb[0].ref_prop)
 
 
 class OutcomeValueTests(unittest.TestCase):
