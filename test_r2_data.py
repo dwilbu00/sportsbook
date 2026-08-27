@@ -148,6 +148,40 @@ class SynonymTests(unittest.TestCase):
         self.assertIsNone(tb[0].ref_prop)
 
 
+class TeamMLTests(unittest.TestCase):
+    def _ml_row(self, book, sid, cap, com, selection, price, home="NYM", away="NYY",
+                eid="G1", gpk=555):
+        return {"book": book, "snapshot_id": sid, "captured_at": cap,
+                "commence_time": com, "event_id": eid, "home": home, "away": away,
+                "bet_type": "moneyline", "selection": selection, "point": None,
+                "price": price, "game_pk": gpk, "game_date": com[:10]}
+
+    def test_pairs_home_away_per_book_at_close(self):
+        com = "2024-06-26T23:10:00Z"
+        rows = [
+            self._ml_row("draftkings", 2, "2024-06-26T23:00:00Z", com, "NYM", +105),
+            self._ml_row("draftkings", 2, "2024-06-26T23:00:00Z", com, "NYY", -125),
+            self._ml_row("pinnacle", 2, "2024-06-26T23:00:00Z", com, "NYM", +108),
+            self._ml_row("pinnacle", 2, "2024-06-26T23:00:00Z", com, "NYY", -120),
+        ]
+        legs, stats = d.select_team_ml_legs(rows)
+        self.assertEqual(len(legs), 1)
+        lg = legs[0]
+        self.assertEqual((lg.dk_home, lg.dk_away), (105, -125))
+        self.assertEqual((lg.pin_home, lg.pin_away), (108, -120))
+
+    def test_incomplete_moneyline_dropped(self):
+        com = "2024-06-26T23:10:00Z"
+        rows = [  # DK missing the away side
+            self._ml_row("draftkings", 2, "2024-06-26T23:00:00Z", com, "NYM", +105),
+            self._ml_row("pinnacle", 2, "2024-06-26T23:00:00Z", com, "NYM", +108),
+            self._ml_row("pinnacle", 2, "2024-06-26T23:00:00Z", com, "NYY", -120),
+        ]
+        legs, stats = d.select_team_ml_legs(rows)
+        self.assertEqual(legs, [])
+        self.assertEqual(stats["legs_dropped_incomplete_moneyline"], 1)
+
+
 class OutcomeValueTests(unittest.TestCase):
     def test_game_pk_exact_hit_and_miss(self):
         idx = {"batter": {("683002", 700): {"H": 2.0, "SO": 1.0}}}

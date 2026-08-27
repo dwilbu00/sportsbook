@@ -166,6 +166,29 @@ class SideSplitTests(unittest.TestCase):
         self.assertIn("UNDER positive", v)
 
 
+class TeamSharpnessTests(unittest.TestCase):
+    def test_team_sharpness_rows_grade_home_win(self):
+        import r2_data
+        legs = {"2024": [r2_data.TeamMLLeg(
+            event_id="G1", game_date="2024-06-26", commence_time="x", snapshot_id=2,
+            game_pk=555, home="NYM", away="NYY",
+            dk_home=+105, dk_away=-125, pin_home=+108, pin_away=-120)]}
+        finals = {555: 1.0}   # home (NYM) won
+        rows = bt.team_sharpness_rows(legs, finals, label="moneyline_team")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["over"], 1.0)
+        self.assertEqual(rows[0]["prop_key"], "moneyline_team")
+        self.assertTrue(0 < rows[0]["dk_fair"] < 1 and 0 < rows[0]["pin_fair"] < 1)
+
+    def test_missing_final_dropped(self):
+        import r2_data
+        legs = {"2024": [r2_data.TeamMLLeg(
+            event_id="G1", game_date="x", commence_time="x", snapshot_id=2,
+            game_pk=999, home="NYM", away="NYY",
+            dk_home=+105, dk_away=-125, pin_home=+108, pin_away=-120)]}
+        self.assertEqual(bt.team_sharpness_rows(legs, {555: 1.0}), [])   # 999 not in finals
+
+
 class ReportSmokeTests(unittest.TestCase):
     def test_build_report_runs(self):
         rows = ([{"season": "2024", "prop_key": "pitcher_earned_runs", "side": "OVER",

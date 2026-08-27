@@ -235,6 +235,103 @@ def build_outcome_index(seasons, prop_keys):
     return idx
 
 
+# ── Team moneyline (for the sharpness GATE: is Pinnacle sharper on game lines?) ──
+
+TeamMLLeg = namedtuple("TeamMLLeg",
+                       "event_id game_date commence_time snapshot_id game_pk "
+                       "home away dk_home dk_away pin_home pin_away")
+
+
+def select_team_ml_legs(rows):
+    """PURE: from combined DK+Pinnacle moneyline rows (row['book'] tagged), pick each
+    event's close snapshot (latest captured<=commence with BOTH books) and extract
+    both books' home/away prices. Same temporal + same-snapshot guards as props."""
+    stats = Counter()
+    by_event = defaultdict(list)
+    for r in rows:
+        by_event[r.get("event_id")].append(r)
+    legs = []
+    for _eid, ev_rows in by_event.items():
+        snaps = {}
+        for r in ev_rows:
+            cap = _parse_ts(r.get("captured_at"))
+            com = _parse_ts(r.get("commence_time"))
+            if cap is None or com is None or cap > com:
+                continue
+            s = snaps.setdefault(r.get("snapshot_id"),
+                                 {"cap": cap, "books": set(), "rows": []})
+            s["books"].add(r.get("book"))
+            s["rows"].append(r)
+        both = [(s["cap"], sid, s) for sid, s in snaps.items()
+                if {_DK, _PIN} <= s["books"]]
+        if not both:
+            stats["events_dropped_no_both_book_close"] += 1
+            continue
+        both.sort(key=lambda x: x[0])
+        _cap, _sid, close = both[-1]
+        meta = close["rows"][0]
+        home, away = meta.get("home"), meta.get("away")
+        px = {_DK: {}, _PIN: {}}
+        for r in close["rows"]:
+            px.setdefault(r.get("book"), {})[r.get("selection")] = r.get("price")
+        dk, pin = px.get(_DK, {}), px.get(_PIN, {})
+        vals = (dk.get(home), dk.get(away), pin.get(home), pin.get(away))
+        if any(v is None for v in vals):
+            stats["legs_dropped_incomplete_moneyline"] += 1
+            continue
+        legs.append(TeamMLLeg(
+            event_id=meta.get("event_id"), game_date=meta.get("game_date"),
+            commence_time=meta.get("commence_time"),
+            snapshot_id=meta.get("snapshot_id"), game_pk=meta.get("game_pk"),
+            home=home, away=away, dk_home=vals[0], dk_away=vals[1],
+            pin_home=vals[2], pin_away=vals[3]))
+        stats["legs_built"] += 1
+    return legs, stats
+
+
+def load_team_ml_legs(sport, seasons, kind="team"):
+    """Fetch + pair DK/Pinnacle MONEYLINE legs per season (bulk reads). ``kind``
+    selects the snapshot kind: 'team' = full-game moneyline, 'first_five' = the F5
+    moneyline (the SP-matchup R2 shot). CRITICAL: full-game and F5 moneyline share
+    bet_type='moneyline' and are distinguished ONLY by snapshot kind, so we MUST
+    filter on kind or the two would be mixed. Returns (legs_by_season, stats_by)."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    by_season, stats_by = {}, {}
+    for s in seasons:
+        rows = []
+        for book in (_DK, _PIN):
+            fetched = db_store.team_market_lines(
+                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
+            for r in fetched:
+                if r.get("bet_type") == "moneyline" and r.get("kind") == kind:
+                    r["book"] = book
+                    rows.append(r)
+        legs, stats = select_team_ml_legs(rows)
+        by_season[s], stats_by[s] = legs, stats
+    return by_season, stats_by
+
+
+def build_team_finals_index(seasons=None):
+    """{game_pk(int): home_won 1.0/0.0} for all FINAL games (non-tie), from mlb_game.
+    ~one query; ties dropped (MLB has none in regulation, but guard anyway)."""
+    import mlb_warehouse as wh
+    import db_store
+    from sqlalchemy import select as _select
+    g = wh.mlb_game
+    idx = {}
+    with db_store.get_engine().connect() as conn:
+        rows = conn.execute(
+            _select(g.c.game_pk, g.c.home_score, g.c.away_score)
+            .where(g.c.home_score.isnot(None) & g.c.away_score.isnot(None))
+        ).fetchall()
+    for gpk, hs, as_ in rows:
+        if hs == as_:
+            continue
+        idx[int(gpk)] = 1.0 if hs > as_ else 0.0
+    return idx
+
+
 def outcome_value(idx, prop_key, player_mlb_id, game_pk):
     """Realized stat for (player, game) via game_pk-exact lookup, or None (DNP / not
     ingested / unmapped). NEVER coalesces a miss to 0 (that would grade a scratch as

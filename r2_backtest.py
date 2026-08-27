@@ -350,6 +350,29 @@ def build_sharpness_report(rows, min_n=100):
     return {"text": text}
 
 
+def team_sharpness_rows(legs_by_season, finals_idx, label="moneyline_team"):
+    """Rows (in build_sharpness_report's shape) for the MONEYLINE sharpness gate:
+    DK's vs Pinnacle's devigged fair P(home win) vs the realized home win, from
+    paired same-snapshot moneyline legs. `over` = home won. Works for full-game
+    (kind=team) or F5 (kind=first_five) legs identically."""
+    from r2_sharp import fair_two_way
+    rows = []
+    for season, legs in legs_by_season.items():
+        for lg in legs:
+            if lg.game_pk is None:
+                continue
+            hw = finals_idx.get(int(lg.game_pk))
+            if hw is None:
+                continue
+            dk_h, _ = fair_two_way(lg.dk_home, lg.dk_away)
+            pin_h, _ = fair_two_way(lg.pin_home, lg.pin_away)
+            if dk_h is None or pin_h is None:
+                continue
+            rows.append({"season": str(season), "prop_key": label,
+                         "dk_fair": dk_h, "pin_fair": pin_h, "over": hw})
+    return rows
+
+
 # ── Significance helpers ──────────────────────────────────────────────────────
 
 def dist_bucket(distance):
@@ -524,6 +547,28 @@ def load_or_fetch(sport, seasons, prop_keys, refresh=False):
     return blob, path
 
 
+def _ml_cache_path(sport, seasons, kind):
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    tag = f"ml_{kind}_{sport}_{'-'.join(map(str, seasons))}"
+    return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
+
+
+def load_or_fetch_ml(sport, seasons, kind, refresh=False):
+    """Fetch + pair DK/Pinnacle moneyline legs (kind='team' or 'first_five') + the
+    finals index (or load cache). Feeds the sharpness GATE."""
+    path = _ml_cache_path(sport, seasons, kind)
+    if not refresh and os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f), path
+    legs_by_season, stats = r2_data.load_team_ml_legs(sport, seasons, kind=kind)
+    finals_idx = r2_data.build_team_finals_index(seasons)
+    blob = {"legs_by_season": legs_by_season, "finals_idx": finals_idx,
+            "stats": {s: dict(c) for s, c in stats.items()}}
+    with open(path, "wb") as f:
+        pickle.dump(blob, f)
+    return blob, path
+
+
 def main():
     ap = argparse.ArgumentParser(description="R2 DK-vs-sharp closing-line backtest.")
     ap.add_argument("--sport", default="baseball_mlb")
@@ -546,6 +591,11 @@ def main():
     ap.add_argument("--side-split", action="store_true",
                     help="Diagnostic: realized ROI by side (fade test) — is DK "
                          "directionally mispriced? Unconditional, cache-only.")
+    ap.add_argument("--ml-sharpness", action="store_true",
+                    help="GATE: is Pinnacle sharper than DK on MONEYLINE? (Brier/"
+                         "log-loss, model-free). --ml-kind selects team vs first_five.")
+    ap.add_argument("--ml-kind", default="team", choices=("team", "first_five"),
+                    help="Moneyline snapshot kind for --ml-sharpness (default team).")
     args = ap.parse_args()
 
     try:
@@ -556,6 +606,19 @@ def main():
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     prop_keys = [p.strip() for p in args.props.split(",") if p.strip()]
+
+    # GATE: moneyline sharpness (team or F5) — its own data/cache path.
+    if args.ml_sharpness:
+        mlblob, mlpath = load_or_fetch_ml(args.sport, seasons, args.ml_kind,
+                                          refresh=args.refresh)
+        n = sum(len(v) for v in mlblob["legs_by_season"].values())
+        print(f"  data: {n:,} paired {args.ml_kind} moneyline legs "
+              f"(DK+Pinnacle)  (cache: {mlpath})")
+        build_sharpness_report(
+            team_sharpness_rows(mlblob["legs_by_season"], mlblob["finals_idx"],
+                                label=f"moneyline_{args.ml_kind}"),
+            min_n=args.min_n)
+        return
 
     blob, path = load_or_fetch(args.sport, seasons, prop_keys, refresh=args.refresh)
     print(f"  data: {sum(len(v) for v in blob['legs_by_season'].values()):,} paired "
