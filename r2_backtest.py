@@ -135,6 +135,221 @@ def grade_legs(legs_by_season, outcome_idx, haircut, ev_floor,
     return rows, cov
 
 
+# ── Side-split diagnostic (is DK directionally mispriced? the "fade" test) ────
+
+def side_split_rows(legs_by_season, outcome_idx, default_dispersion=0.0,
+                    haircut=0.0, resolve_fn=None):
+    """UNCONDITIONAL realized ROI of flat-betting each side of every leg — NO EV
+    floor, NO fair-selection (so no winner's curse), and the fair/projector is not
+    used to decide anything (we only tag same_line vs projected). This isolates
+    DK's own directional calibration: if DK OVERs systematically lose while UNDERs
+    win (replicating across seasons), that's a real fade edge. Returns graded rows
+    (both sides of each gradeable leg)."""
+    rows = []
+    for season, legs in legs_by_season.items():
+        for lg in legs:
+            edges = r2_edge.prop_leg_edges(
+                lg.dk_point, lg.dk_over_price, lg.dk_under_price,
+                lg.pinnacle_offers, default_dispersion=default_dispersion)
+            if not edges:
+                continue
+            pid = lg.player_mlb_id
+            if pid is None and resolve_fn is not None:
+                try:
+                    pid = resolve_fn(lg.player, int(str(lg.game_date)[:4]), lg.prop_key)
+                except (TypeError, ValueError):
+                    pid = None
+            if pid is None or lg.game_pk is None:
+                continue
+            actual = r2_data.outcome_value(outcome_idx, lg.prop_key, pid, lg.game_pk)
+            if actual is None:
+                continue
+            for e in edges:
+                result = r2_grade.grade_over_under(actual, e.point, e.side)
+                if result is None:
+                    continue
+                rows.append({
+                    "season": str(season), "prop_key": lg.prop_key, "side": e.side,
+                    "arm": "projected" if e.projected else "same_line",
+                    "result": result,
+                    "profit": profit_haircut(e.dk_price, result, haircut),
+                })
+    return rows
+
+
+def build_side_split_report(rows, min_n=100):
+    """Per (prop, side) realized ROI — same-line (clean) then all legs (power) —
+    with a per-prop fade verdict. Raw DK prices (haircut 0): an efficient two-sided
+    market shows BOTH sides ~-half-hold; a fade = one side systematically positive /
+    much-less-negative than the other, replicating each season."""
+    out = []
+    p = out.append
+    p("=" * 74)
+    p("  R2 side-split — is DK directionally mispriced? (raw prices, no EV floor)")
+    p("=" * 74)
+
+    def _section(title, subset):
+        p(f"\n  {title}:")
+        props = sorted({r["prop_key"] for r in subset})
+        for prop in props:
+            pr = [r for r in subset if r["prop_key"] == prop]
+            line = []
+            per_side = {}
+            for side in ("OVER", "UNDER"):
+                sm = r2_grade.summarize([r for r in pr if r["side"] == side])
+                per_side[side] = sm
+                line.append(f"{side} n={sm.decided:,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+            p(f"    {prop:<22} " + "   ".join(line))
+            # per-season, both sides, to check replication of any gap
+            seasons = sorted({r["season"] for r in pr})
+            for s in seasons:
+                cells = []
+                for side in ("OVER", "UNDER"):
+                    sm = r2_grade.summarize(
+                        [r for r in pr if r["side"] == side and r["season"] == s])
+                    tag = "" if sm.decided >= min_n else "*"
+                    cells.append(f"{side} {sm.roi:+.1%}(n{sm.decided}{tag})")
+                p(f"        {s}: " + "  ".join(cells))
+            # fade verdict: one side positive every judged season, other negative
+            verdict = _fade_verdict(pr, min_n)
+            if verdict:
+                p(f"      -> {verdict}")
+
+    _section("SAME-LINE only (model-free, cleanest)",
+             [r for r in rows if r["arm"] == "same_line"])
+    _section("ALL legs (same-line + projected; higher power, DK-calibration test)",
+             rows)
+    p("\n  (* = season n below min_n; ROI is realized at DK's raw price, hold not removed)")
+    p("=" * 74)
+    text = "\n".join(out)
+    print(text)
+    return {"text": text}
+
+
+def _fade_verdict(prop_rows, min_n):
+    """A per-prop fade call: does ONE side clear ROI>0 in EVERY judged season while
+    the other is negative? Returns a short string or None."""
+    seasons = sorted({r["season"] for r in prop_rows})
+    judged = {}
+    for side in ("OVER", "UNDER"):
+        per = {}
+        for s in seasons:
+            sm = r2_grade.summarize([r for r in prop_rows
+                                     if r["side"] == side and r["season"] == s])
+            if sm.decided >= min_n:
+                per[s] = sm.roi
+        judged[side] = per
+    for win, lose in (("UNDER", "OVER"), ("OVER", "UNDER")):
+        w, l = judged[win], judged[lose]
+        if len(w) >= 2 and all(v > 0 for v in w.values()) and \
+           l and all(v < 0 for v in l.values()):
+            return (f"FADE signal: {win} positive every judged season, "
+                    f"{lose} negative — possible DK {lose.lower()} bias")
+    return None
+
+
+# ── Sharpness test: is Pinnacle actually sharper than DK? (R2's premise) ──────
+
+def sharpness_rows(legs_by_season, outcome_idx, default_dispersion=0.0, resolve_fn=None):
+    """Model-FREE head-to-head: on SAME-LINE legs (both books post the same point,
+    so their devigged probs price the identical over/under event), record DK's fair
+    P(over), Pinnacle's fair P(over), and the realized over (0/1). Lets us score each
+    book's closing prices against outcomes (Brier/log-loss) — the direct test of
+    whether Pinnacle is sharper, with NO model and NO EV selection."""
+    from r2_sharp import fair_two_way, fair_prob_at_line
+    rows = []
+    for season, legs in legs_by_season.items():
+        for lg in legs:
+            sf = fair_prob_at_line(lg.pinnacle_offers, lg.dk_point, default_dispersion)
+            if sf.prob is None or sf.projected:      # same-line only (apples-to-apples)
+                continue
+            dk_fair, _ = fair_two_way(lg.dk_over_price, lg.dk_under_price)
+            if dk_fair is None:
+                continue
+            pid = lg.player_mlb_id
+            if pid is None and resolve_fn is not None:
+                try:
+                    pid = resolve_fn(lg.player, int(str(lg.game_date)[:4]), lg.prop_key)
+                except (TypeError, ValueError):
+                    pid = None
+            if pid is None or lg.game_pk is None:
+                continue
+            actual = r2_data.outcome_value(outcome_idx, lg.prop_key, pid, lg.game_pk)
+            if actual is None or actual == lg.dk_point:   # None=DNP; ==point=push
+                continue
+            rows.append({"season": str(season), "prop_key": lg.prop_key,
+                         "dk_fair": dk_fair, "pin_fair": sf.prob,
+                         "over": 1.0 if actual > lg.dk_point else 0.0})
+    return rows
+
+
+def _brier_logloss(rows, prob_key):
+    """(mean Brier, mean log-loss) of a book's fair probs vs the realized over."""
+    n = len(rows)
+    if not n:
+        return None, None
+    brier = sum((r[prob_key] - r["over"]) ** 2 for r in rows) / n
+    ll = 0.0
+    for r in rows:
+        p = min(max(r[prob_key], 1e-12), 1.0 - 1e-12)
+        ll += -(r["over"] * math.log(p) + (1 - r["over"]) * math.log(1 - p))
+    return brier, ll / n
+
+
+def _paired_brier_t(rows):
+    """Paired t on per-leg (DK_brier - Pin_brier): mean>0 & t>2 => Pinnacle sharper
+    (lower Brier). Returns (mean_diff, t)."""
+    d = [(r["dk_fair"] - r["over"]) ** 2 - (r["pin_fair"] - r["over"]) ** 2 for r in rows]
+    n = len(d)
+    if n < 2:
+        return (0.0, 0.0)
+    mean = sum(d) / n
+    var = sum((x - mean) ** 2 for x in d) / (n - 1)
+    se = math.sqrt(var / n)
+    return mean, (mean / se if se > 0 else 0.0)
+
+
+def build_sharpness_report(rows, min_n=100):
+    """Per-prop + pooled Brier/log-loss for DK vs Pinnacle, with a paired t on the
+    Brier difference. The definitive 'is Pinnacle sharper?' read."""
+    out = []
+    p = out.append
+    p("=" * 74)
+    p("  R2 sharpness — DK vs Pinnacle closing-line accuracy (same-line, model-free)")
+    p("=" * 74)
+
+    def _line(label, subset):
+        db, dll = _brier_logloss(subset, "dk_fair")
+        pb, pll = _brier_logloss(subset, "pin_fair")
+        if db is None:
+            p(f"  {label:<24} (no same-line legs)")
+            return
+        md, t = _paired_brier_t(subset)
+        if md > 0 and t >= 2:
+            verdict = f"PINNACLE sharper (t={t:+.2f})"
+        elif md < 0 and t <= -2:
+            verdict = f"DK sharper (t={t:+.2f})"
+        else:
+            verdict = f"tie (t={t:+.2f})"
+        tag = "" if len(subset) >= min_n else "  *thin"
+        p(f"  {label:<24} n={len(subset):>5,}  Brier DK={db:.4f} Pin={pb:.4f}  "
+          f"logloss DK={dll:.4f} Pin={pll:.4f}  -> {verdict}{tag}")
+
+    _line("ALL same-line", rows)
+    p("")
+    for prop in sorted({r["prop_key"] for r in rows}):
+        pr = [r for r in rows if r["prop_key"] == prop]
+        _line(prop, pr)
+        for s in sorted({r["season"] for r in pr}):
+            _line(f"  {prop[:16]} {s}", [r for r in pr if r["season"] == s])
+    p("\n  Lower Brier/log-loss = sharper. Paired t>+2 => Pinnacle significantly "
+      "sharper; this VALIDATES (or refutes) R2's use of Pinnacle as the yardstick.")
+    p("=" * 74)
+    text = "\n".join(out)
+    print(text)
+    return {"text": text}
+
+
 # ── Significance helpers ──────────────────────────────────────────────────────
 
 def dist_bucket(distance):
@@ -325,6 +540,12 @@ def main():
     ap.add_argument("--min-seasons", type=int, default=2)
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true", help="Re-fetch (ignore cache).")
+    ap.add_argument("--sharpness", action="store_true",
+                    help="Diagnostic: is Pinnacle sharper than DK? (model-free "
+                         "closing-line Brier/log-loss on same-line legs). Cache-only.")
+    ap.add_argument("--side-split", action="store_true",
+                    help="Diagnostic: realized ROI by side (fade test) — is DK "
+                         "directionally mispriced? Unconditional, cache-only.")
     args = ap.parse_args()
 
     try:
@@ -357,6 +578,21 @@ def main():
         resolve_fn = mlb_starters.resolve_mlbam_id
     except Exception:
         resolve_fn = None
+
+    # Diagnostics (cache-only; answer premise/direction questions, not the verdict).
+    if args.sharpness:
+        build_sharpness_report(
+            sharpness_rows(blob["legs_by_season"], blob["outcome_idx"],
+                           default_dispersion=args.dispersion, resolve_fn=resolve_fn),
+            min_n=args.min_n)
+    if args.side_split:
+        build_side_split_report(
+            side_split_rows(blob["legs_by_season"], blob["outcome_idx"],
+                            default_dispersion=args.dispersion, haircut=0.0,
+                            resolve_fn=resolve_fn),
+            min_n=args.min_n)
+    if args.sharpness or args.side_split:
+        return
 
     rows, cov = grade_legs(blob["legs_by_season"], blob["outcome_idx"],
                            haircut=args.haircut, ev_floor=args.ev_floor,

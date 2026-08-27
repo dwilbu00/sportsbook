@@ -113,6 +113,59 @@ class BHTests(unittest.TestCase):
         self.assertEqual(bt.benjamini_hochberg([0.9, 0.8, 0.7], alpha=0.05), set())
 
 
+class SharpnessTests(unittest.TestCase):
+    def test_brier_paired_t_detects_sharper_book(self):
+        # Pinnacle probs track the outcome (with per-leg confidence variation so the
+        # Brier gap has real variance); DK is flat 0.5 -> Pinnacle sharper.
+        rows = []
+        for i in range(200):
+            over = 1.0 if i % 2 == 0 else 0.0
+            conf = 0.85 if i % 4 < 2 else 0.70    # two confidence tiers -> variance
+            rows.append({"dk_fair": 0.5, "over": over,
+                         "pin_fair": conf if over else (1 - conf)})
+        md, t = bt._paired_brier_t(rows)
+        self.assertGreater(md, 0)        # DK_brier - Pin_brier > 0
+        self.assertGreater(t, 2)         # significantly: Pinnacle sharper
+        db, _ = bt._brier_logloss(rows, "dk_fair")
+        pb, _ = bt._brier_logloss(rows, "pin_fair")
+        self.assertGreater(db, pb)       # DK worse (higher) Brier
+
+    def test_sharpness_rows_same_line_only(self):
+        # A same-line leg (Pinnacle posts DK's exact point) yields a row; a projected
+        # one (different point) does not.
+        same = _leg(prop="pitcher_earned_runs", dk_point=2.5,
+                    pin_over=-110, pin_under=-110)  # pinnacle offer at 2.5
+        idx = {"pitcher": {("683002", 700): {"ER": 3.0}}}   # over 2.5
+        rows = bt.sharpness_rows({"2024": [same]}, idx)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["over"], 1.0)
+
+
+class SideSplitTests(unittest.TestCase):
+    def test_fade_detected_when_unders_win_overs_lose(self):
+        # Build legs where the UNDER always wins (actual below the line) across 2
+        # seasons -> _fade_verdict flags a DK-over bias.
+        legs = {}
+        idx_all = {}
+        legs_list_by_season = {}
+        for si, season in enumerate(("2024", "2025")):
+            legs_s = []
+            for i in range(150):
+                gpk = 1000 * (si + 1) + i
+                legs_s.append(_leg(prop="batter_total_bases", dk_point=1.5,
+                                   dk_over=-110, dk_under=-110,
+                                   pin_over=-110, pin_under=-110,
+                                   mlbid=str(gpk), gpk=gpk, season=season))
+                idx_all[(str(gpk), gpk)] = {"TB": 0.0}    # actual 0 -> UNDER 1.5 wins
+            legs[season] = legs_s
+        idx = {"batter": idx_all}
+        rows = bt.side_split_rows(legs, idx, haircut=0.0)
+        pr = [r for r in rows if r["prop_key"] == "batter_total_bases"]
+        v = bt._fade_verdict(pr, min_n=100)
+        self.assertIsNotNone(v)
+        self.assertIn("UNDER positive", v)
+
+
 class ReportSmokeTests(unittest.TestCase):
     def test_build_report_runs(self):
         rows = ([{"season": "2024", "prop_key": "pitcher_earned_runs", "side": "OVER",
