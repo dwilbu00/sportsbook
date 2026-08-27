@@ -182,6 +182,43 @@ class TeamMLTests(unittest.TestCase):
         self.assertEqual(stats["legs_dropped_incomplete_moneyline"], 1)
 
 
+class TeamTriadTests(unittest.TestCase):
+    def _tr(self, book, bt, selection, point, price, sid=2,
+            cap="2024-06-26T23:00:00Z", com="2024-06-26T23:10:00Z",
+            home="NYM", away="NYY", eid="G1", gpk=500):
+        return {"book": book, "snapshot_id": sid, "captured_at": cap,
+                "commence_time": com, "event_id": eid, "home": home, "away": away,
+                "kind": "team", "bet_type": bt, "selection": selection,
+                "point": point, "price": price, "game_pk": gpk}
+
+    def test_extracts_all_three_markets(self):
+        rows = [
+            self._tr("draftkings", "moneyline", "NYM", None, -150),
+            self._tr("draftkings", "moneyline", "NYY", None, +130),
+            self._tr("draftkings", "spread", "NYM", -1.5, +120),
+            self._tr("draftkings", "spread", "NYY", +1.5, -140),
+            self._tr("draftkings", "total", "Over", 8.5, -110),
+            self._tr("draftkings", "total", "Under", 8.5, -105),
+        ]
+        triads, stats = d.select_team_triad(rows)
+        self.assertEqual(len(triads), 1)
+        t = triads[0]
+        self.assertEqual((t.ml_home, t.ml_away), (-150, 130))
+        self.assertEqual((t.rl_home_point, t.rl_home, t.rl_away), (-1.5, 120, -140))
+        self.assertEqual((t.total_line, t.total_over, t.total_under), (8.5, -110, -105))
+
+    def test_incomplete_triad_dropped(self):
+        rows = [  # missing the total market
+            self._tr("draftkings", "moneyline", "NYM", None, -150),
+            self._tr("draftkings", "moneyline", "NYY", None, +130),
+            self._tr("draftkings", "spread", "NYM", -1.5, +120),
+            self._tr("draftkings", "spread", "NYY", +1.5, -140),
+        ]
+        triads, stats = d.select_team_triad(rows)
+        self.assertEqual(triads, [])
+        self.assertEqual(stats["events_dropped_incomplete_triad"], 1)
+
+
 class OutcomeValueTests(unittest.TestCase):
     def test_game_pk_exact_hit_and_miss(self):
         idx = {"batter": {("683002", 700): {"H": 2.0, "SO": 1.0}}}

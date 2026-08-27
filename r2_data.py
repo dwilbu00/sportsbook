@@ -312,6 +312,98 @@ def load_team_ml_legs(sport, seasons, kind="team"):
     return by_season, stats_by
 
 
+# ── Team triad (ML + run-line + total) for the COHERENCE edge (DK-internal) ──
+
+TeamTriad = namedtuple("TeamTriad",
+                       "event_id game_date commence_time snapshot_id game_pk "
+                       "home away ml_home ml_away rl_home_point rl_home rl_away "
+                       "total_line total_over total_under")
+
+
+def select_team_triad(rows):
+    """PURE: from ONE book's team rows (ML+spread+total, row['book'] tagged), pick
+    each event's close snapshot (latest captured<=commence) and pull all three
+    markets. The multibook pull captured MAIN lines only (no alternates), so each
+    event has one spread point + one total line per book. Drops+counts events
+    missing any of the three complete two-sided markets."""
+    stats = Counter()
+    by_event = defaultdict(list)
+    for r in rows:
+        by_event[r.get("event_id")].append(r)
+    triads = []
+    for _eid, ev_rows in by_event.items():
+        snaps = {}
+        for r in ev_rows:
+            cap = _parse_ts(r.get("captured_at"))
+            com = _parse_ts(r.get("commence_time"))
+            if cap is None or com is None or cap > com:
+                continue
+            s = snaps.setdefault(r.get("snapshot_id"), {"cap": cap, "rows": []})
+            s["rows"].append(r)
+        if not snaps:
+            stats["events_dropped_no_pre_commence"] += 1
+            continue
+        _sid, close = max(snaps.items(), key=lambda kv: kv[1]["cap"])
+        meta = close["rows"][0]
+        home, away = meta.get("home"), meta.get("away")
+        ml, rl, tot = {}, {}, {}
+        for r in close["rows"]:
+            bt, sel = r.get("bet_type"), r.get("selection")
+            if bt == "moneyline":
+                ml[sel] = r.get("price")
+            elif bt == "spread":
+                rl[sel] = (r.get("point"), r.get("price"))
+            elif bt == "total":
+                tot[sel] = (r.get("point"), r.get("price"))
+        ml_home, ml_away = ml.get(home), ml.get(away)
+        rl_home, rl_away = rl.get(home), rl.get(away)
+        over, under = tot.get("Over"), tot.get("Under")
+        if None in (ml_home, ml_away, rl_home, rl_away, over, under):
+            stats["events_dropped_incomplete_triad"] += 1
+            continue
+        triads.append(TeamTriad(
+            event_id=meta.get("event_id"), game_date=meta.get("game_date"),
+            commence_time=meta.get("commence_time"),
+            snapshot_id=meta.get("snapshot_id"), game_pk=meta.get("game_pk"),
+            home=home, away=away, ml_home=ml_home, ml_away=ml_away,
+            rl_home_point=rl_home[0], rl_home=rl_home[1], rl_away=rl_away[1],
+            total_line=over[0], total_over=over[1], total_under=under[1]))
+        stats["triads_built"] += 1
+    return triads, stats
+
+
+def load_team_triad(sport, seasons, bookmaker="draftkings"):
+    """Fetch each event's close-snapshot ML+RL+total for one book (default DK, the
+    coherence target). Returns (triads_by_season, stats_by_season)."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    by_season, stats_by = {}, {}
+    for s in seasons:
+        rows = db_store.team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=bookmaker)
+        rows = [dict(r, book=bookmaker) for r in rows if r.get("kind") == "team"]
+        triads, stats = select_team_triad(rows)
+        by_season[s], stats_by[s] = triads, stats
+    return by_season, stats_by
+
+
+def build_team_scores_index(seasons=None):
+    """{game_pk(int): (home_score, away_score)} for all final games, from mlb_game."""
+    import mlb_warehouse as wh
+    import db_store
+    from sqlalchemy import select as _select
+    g = wh.mlb_game
+    idx = {}
+    with db_store.get_engine().connect() as conn:
+        rows = conn.execute(
+            _select(g.c.game_pk, g.c.home_score, g.c.away_score)
+            .where(g.c.home_score.isnot(None) & g.c.away_score.isnot(None))
+        ).fetchall()
+    for gpk, hs, as_ in rows:
+        idx[int(gpk)] = (float(hs), float(as_))
+    return idx
+
+
 def build_team_finals_index(seasons=None):
     """{game_pk(int): home_won 1.0/0.0} for all FINAL games (non-tie), from mlb_game.
     ~one query; ties dropped (MLB has none in regulation, but guard anyway)."""

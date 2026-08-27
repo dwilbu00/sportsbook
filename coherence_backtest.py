@@ -1,0 +1,219 @@
+"""Coherence backtest: bet DK's run-line where it contradicts DK's OWN moneyline +
+total, grade vs the final score. Needs no sharper book — the edge is DK's internal
+inconsistency (one of its own prices must be wrong).
+
+Flow per event (DK close snapshot): devig ML -> P_home_win, total -> P_over, RL ->
+DK's own P_home_cover. Solve run means from ML+total, read the IMPLIED P_home_cover
+(coherence.py), and bet DK's run-line at DK's price using that implied cover as
+truth. Grade home_covered = (home_score + rl_home_point > away_score).
+
+CRITICAL calibration guard (the analog of the props projector trap): before trusting
+any residual, the report prints the MEAN incoherence (implied - DK's RL fair) across
+all events. If that's ~0, the run model is coherent with DK on average, so the
+per-event outliers are genuine mispricings. If it's systematically off, the model
+(or its dispersion) is biased and the "edge" would be model error — so we'd tune the
+dispersion to zero the mean before believing any bucket.
+
+Cache-first like r2_backtest; reuses its haircut/gate/BH helpers. Run:
+  python coherence_backtest.py --seasons 2024,2025,2026
+"""
+import argparse
+import os
+import pickle
+from collections import Counter
+
+import coherence
+import r2_backtest as rbt
+import r2_data
+import r2_grade
+from odds_client import american_to_decimal
+from r2_sharp import fair_two_way
+
+_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "r2_backtest_cache")
+
+
+def _incoh_bucket(x):
+    a = abs(x)
+    if a <= 0.02:
+        return "<=0.02"
+    if a <= 0.05:
+        return "(0.02,0.05]"
+    if a <= 0.10:
+        return "(0.05,0.10]"
+    return ">0.10"
+
+
+def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
+                    ev_floor=0.03):
+    """Score + grade the run-line coherence bet for every event. Returns (rows, cov).
+    Every row also carries `incoh` (implied - DK RL fair) so the report can measure
+    the model's average bias and bucket by inconsistency size."""
+    rows, cov = [], Counter()
+    for season, triads in triads_by_season.items():
+        for t in triads:
+            cov["events"] += 1
+            ml_home_fair, _ = fair_two_way(t.ml_home, t.ml_away)
+            over_fair, _ = fair_two_way(t.total_over, t.total_under)
+            rl_home_fair, _ = fair_two_way(t.rl_home, t.rl_away)
+            if None in (ml_home_fair, over_fair, rl_home_fair):
+                cov["dropped_undevigable"] += 1
+                continue
+            implied = coherence.implied_home_cover(
+                ml_home_fair, t.total_line, over_fair, t.rl_home_point, dispersion)
+            if implied is None:
+                cov["dropped_unsolvable"] += 1
+                continue
+            incoh = implied - rl_home_fair          # + => DK underprices home cover
+            cov["priced"] += 1
+            # EV of each DK run-line side under the implied (coherent) cover prob.
+            legs = [("home", t.rl_home, implied), ("away", t.rl_away, 1.0 - implied)]
+            for side, price, fair in legs:
+                try:
+                    dec = american_to_decimal(int(price)) * (1.0 - haircut)
+                except (TypeError, ValueError):
+                    continue
+                evh = fair * dec - 1.0
+                if evh < ev_floor:
+                    continue
+                cov["selected"] += 1
+                if t.game_pk is None or int(t.game_pk) not in scores_idx:
+                    cov["dropped_no_score"] += 1
+                    continue
+                hs, as_ = scores_idx[int(t.game_pk)]
+                home_covered = (hs + t.rl_home_point) > as_
+                won = home_covered if side == "home" else (not home_covered)
+                rows.append({
+                    "season": str(season), "prop_key": "run_line", "side": side,
+                    "incoh": incoh, "incoh_bucket": _incoh_bucket(incoh),
+                    "ev": evh, "ev_bucket": r2_grade.ev_bucket(evh),
+                    "implied": implied, "dk_rl_fair": rl_home_fair,
+                    "result": "win" if won else "loss",
+                    "profit": (dec - 1.0) if won else -1.0,
+                    "game_pk": t.game_pk,
+                })
+                cov["graded"] += 1
+    return rows, cov
+
+
+def build_coherence_report(rows, coverage, all_incoh, min_n=100, min_seasons=2,
+                           min_t=2.0):
+    out = []
+    p = out.append
+    p("=" * 74)
+    p("  Coherence backtest — DK run-line vs DK's own ML+total")
+    p("=" * 74)
+    p("\n  Coverage:")
+    for k in ("events", "priced", "selected", "graded", "dropped_undevigable",
+              "dropped_unsolvable", "dropped_no_score"):
+        if coverage.get(k):
+            p(f"    {k:<22} {coverage[k]:>8,}")
+
+    # CALIBRATION GUARD: mean incoherence across ALL priced events (not just bets).
+    if all_incoh:
+        n = len(all_incoh)
+        mean = sum(all_incoh) / n
+        var = sum((x - mean) ** 2 for x in all_incoh) / (n - 1) if n > 1 else 0.0
+        se = (var / n) ** 0.5 if n else 0.0
+        t = mean / se if se > 0 else 0.0
+        p(f"\n  Model calibration (implied - DK RL fair) over {n:,} priced events:")
+        p(f"    mean bias={mean:+.4f} (t={t:+.2f})  "
+          f"{'OK ~coherent on average' if abs(t) < 3 else 'SYSTEMATIC BIAS -> tune dispersion'}")
+        p("    (a real per-event residual is only trustworthy if this mean ~0)")
+
+    # Verdict: pooled + per season, hardened gate.
+    passed, reason, per, pooled = rbt.hardened_gate(rows, min_n, min_seasons, min_t)
+    p(f"\n  Run-line coherence bet: pooled n={pooled.n:,} ROI={pooled.roi:+.2%} "
+      f"hit={pooled.hit_rate:.1%} t={pooled.t_stat:.2f}")
+    for s in sorted(per):
+        sm = per[s]
+        tag = "" if sm.decided >= min_n else "  (insufficient)"
+        p(f"    {s}: n={sm.decided:,} ROI={sm.roi:+.2%} t={sm.t_stat:.2f}{tag}")
+    p(f"    GATE: {'PASS' if passed else 'FAIL'} — {reason}")
+
+    # By incoherence magnitude (does a bigger contradiction pay more?) + by side.
+    p("\n  By incoherence magnitude |implied - DK RL fair|:")
+    cells = r2_grade.by_key(rows, lambda r: r["incoh_bucket"])
+    for b in ("<=0.02", "(0.02,0.05]", "(0.05,0.10]", ">0.10"):
+        if b in cells:
+            sm = cells[b]
+            tag = "" if sm.decided >= min_n else "  (insufficient)"
+            p(f"    {b:<12} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}{tag}")
+    p("\n  By side:")
+    for side in ("home", "away"):
+        sm = r2_grade.summarize([r for r in rows if r["side"] == side])
+        p(f"    {side:<6} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+    p("=" * 74)
+    text = "\n".join(out)
+    print(text)
+    return {"passed": passed, "pooled": pooled, "text": text}
+
+
+def _cache_path(sport, seasons):
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    tag = f"coh_{sport}_{'-'.join(map(str, seasons))}"
+    return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
+
+
+def load_or_fetch(sport, seasons, refresh=False):
+    path = _cache_path(sport, seasons)
+    if not refresh and os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f), path
+    triads_by_season, stats = r2_data.load_team_triad(sport, seasons)
+    scores_idx = r2_data.build_team_scores_index(seasons)
+    blob = {"triads_by_season": triads_by_season, "scores_idx": scores_idx,
+            "stats": {s: dict(c) for s, c in stats.items()}}
+    with open(path, "wb") as f:
+        pickle.dump(blob, f)
+    return blob, path
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Coherence backtest (DK run-line vs DK ML+total).")
+    ap.add_argument("--sport", default="baseball_mlb")
+    ap.add_argument("--seasons", default="2024,2025,2026")
+    ap.add_argument("--dispersion", type=float, default=0.0,
+                    help="Team-run NegBin dispersion for the coherence model (0=Poisson).")
+    ap.add_argument("--haircut", type=float, default=0.02)
+    ap.add_argument("--ev-floor", type=float, default=0.03)
+    ap.add_argument("--min-n", type=int, default=100)
+    ap.add_argument("--min-seasons", type=int, default=2)
+    ap.add_argument("--min-t", type=float, default=2.0)
+    ap.add_argument("--refresh", action="store_true")
+    args = ap.parse_args()
+    try:
+        from cli_encoding import configure_stdio
+        configure_stdio()
+    except Exception:
+        pass
+
+    seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
+    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh)
+    n = sum(len(v) for v in blob["triads_by_season"].values())
+    print(f"  data: {n:,} team triads (DK ML+RL+total)  (cache: {path})")
+
+    # Precompute the all-events incoherence distribution for the calibration guard.
+    all_incoh = []
+    for season, triads in blob["triads_by_season"].items():
+        for t in triads:
+            mlf, _ = fair_two_way(t.ml_home, t.ml_away)
+            ovf, _ = fair_two_way(t.total_over, t.total_under)
+            rlf, _ = fair_two_way(t.rl_home, t.rl_away)
+            if None in (mlf, ovf, rlf):
+                continue
+            impl = coherence.implied_home_cover(mlf, t.total_line, ovf,
+                                                t.rl_home_point, args.dispersion)
+            if impl is not None:
+                all_incoh.append(impl - rlf)
+
+    rows, cov = grade_coherence(blob["triads_by_season"], blob["scores_idx"],
+                                dispersion=args.dispersion, haircut=args.haircut,
+                                ev_floor=args.ev_floor)
+    build_coherence_report(rows, cov, all_incoh, min_n=args.min_n,
+                           min_seasons=args.min_seasons, min_t=args.min_t)
+    print(f"\n  params: dispersion={args.dispersion} haircut={args.haircut} "
+          f"ev_floor={args.ev_floor} min_n={args.min_n}")
+
+
+if __name__ == "__main__":
+    main()
