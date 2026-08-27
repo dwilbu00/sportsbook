@@ -126,6 +126,19 @@ class F5Tests(unittest.TestCase):
         self.assertEqual(chosen[("evt_f5_1", "first_five")]["close"],
                          wh._hour_bucket("2024-06-26T23:05:00Z"))
 
+    def test_kinds_filter_scans_only_matching_kind(self):
+        # With kinds={'first_five'}, a team file is skipped in pass 1 -> only the F5
+        # event lands in `chosen` (this is the fast F5-only top-up path).
+        def _write(d, name, ts, game):
+            with open(os.path.join(d, name), "w") as f:
+                json.dump({"cached_at": 1.0, "data": {"timestamp": ts, "data": [game]}}, f)
+        with tempfile.TemporaryDirectory() as d:
+            _write(d, "f5.json", "2024-06-26T23:05:00Z", _f5_game())
+            _write(d, "team.json", "2024-05-19T21:55:00Z", _team_game())
+            chosen, _stats = img._scan_snapshots(
+                d, "baseball_mlb", 12, kinds={"first_five"}, progress_every=0)
+        self.assertEqual(set(chosen), {("evt_f5_1", "first_five")})
+
 
 class PerBookLinesTests(unittest.TestCase):
     def test_team_lines_tagged_per_book(self):

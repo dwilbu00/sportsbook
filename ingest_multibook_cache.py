@@ -149,7 +149,8 @@ def _per_book_lines(game, kind):
     return out
 
 
-def _scan_snapshots(cache_dir, sport, early_hour, seasons=None, progress_every=5000):
+def _scan_snapshots(cache_dir, sport, early_hour, seasons=None, kinds=None,
+                    progress_every=5000):
     """PASS 1 (cheap metadata scan — no per-book parse, no enrich): choose, per
     (event_id, kind), the OPEN snapshot (the one at early_hour) and the CLOSE
     snapshot (the one whose ts is NEAREST that game's commence, among the non-early
@@ -176,6 +177,8 @@ def _scan_snapshots(cache_dir, sport, early_hour, seasons=None, progress_every=5
         kind = wh._kind_for_markets(",".join(sorted(mkeys)))
         if kind == "alt":
             continue
+        if kinds and kind not in kinds:
+            continue                        # --kinds filter (e.g. first_five only)
         sdt = wh._parse_utc(ts)
         if not sdt:
             continue
@@ -281,10 +284,18 @@ def main():
                    help="Comma-separated commence YEARS to ingest (e.g. "
                         "'2024,2025,2026'). Guards against re-ingesting a purged "
                         "season (2023) if a stray cache file is present. Default: all.")
+    p.add_argument("--kinds", default=None,
+                   help="Comma-separated snapshot kinds to ingest: team, props, "
+                        "first_five. Use e.g. '--kinds first_five' to add ONLY the F5 "
+                        "snapshots without re-parsing + re-attempting (and skipping) "
+                        "the already-written team/props — much faster on a top-up. "
+                        "Default: all kinds.")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args()
     seasons = ({s.strip() for s in args.seasons.split(",") if s.strip()}
                if args.seasons else None)
+    kinds = ({k.strip() for k in args.kinds.split(",") if k.strip()}
+             if args.kinds else None)
 
     try:
         from cli_encoding import configure_stdio
@@ -309,11 +320,14 @@ def main():
 
     mode = "APPLY (writing)" if args.apply else "DRY-RUN (no writes)"
     print(f"\n{'='*70}\n  Multibook ingest — {args.cache_dir} -> warehouse  [{mode}]\n{'='*70}")
+    if kinds:
+        print(f"  kinds filter: {','.join(sorted(kinds))}  "
+              f"(skipping all other kinds before parse/insert)")
 
     # PASS 1: choose, per (event, kind), the open (12Z) + the nearest-commence close.
     print("  Pass 1: choosing open + nearest-commence close per event (metadata scan)...")
     chosen, scan_stats = _scan_snapshots(args.cache_dir, args.sport, args.early_hour,
-                                         seasons=seasons,
+                                         seasons=seasons, kinds=kinds,
                                          progress_every=max(1, args.progress_every) * 10)
     print(f"  events(x kind): both open+close={scan_stats['n_both']:,}  "
           f"open-only={scan_stats['n_open_only']:,}  close-only={scan_stats['n_close_only']:,}  "
@@ -348,6 +362,8 @@ def main():
         kind = wh._kind_for_markets(",".join(sorted(mkeys)))
         if kind == "alt":
             continue                                     # alternates weren't pulled
+        if kinds and kind not in kinds:
+            continue                    # --kinds filter: skip before parse/insert
         snapshot_hour = wh._hour_bucket(ts or commence)
         ch = chosen.get((game.get("id"), kind))
         if not ch:
