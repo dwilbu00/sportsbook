@@ -55,6 +55,78 @@ def _prop_game():
     }
 
 
+def _f5_game():
+    """First-5-innings payload as the event endpoint returns it: F5-only market
+    keys. DK posts F5 moneyline ONLY (audit-confirmed); Pinnacle posts all three."""
+    return {
+        "id": "evt_f5_1", "sport_key": "baseball_mlb",
+        "home_team": "New York Mets", "away_team": "New York Yankees",
+        "commence_time": "2024-06-26T23:10:00Z",
+        "bookmakers": [
+            {"key": "draftkings", "title": "DraftKings", "markets": [
+                {"key": "h2h_1st_5_innings", "outcomes": [
+                    {"name": "New York Mets", "price": 105},
+                    {"name": "New York Yankees", "price": -125}]}]},
+            {"key": "pinnacle", "title": "Pinnacle", "markets": [
+                {"key": "h2h_1st_5_innings", "outcomes": [
+                    {"name": "New York Mets", "price": 108},
+                    {"name": "New York Yankees", "price": -120}]},
+                {"key": "spreads_1st_5_innings", "outcomes": [
+                    {"name": "New York Mets", "point": 0.5, "price": -130},
+                    {"name": "New York Yankees", "point": -0.5, "price": 110}]},
+                {"key": "totals_1st_5_innings", "outcomes": [
+                    {"name": "Over", "point": 4.5, "price": -105},
+                    {"name": "Under", "point": 4.5, "price": -105}]}]},
+        ],
+    }
+
+
+class F5Tests(unittest.TestCase):
+    def test_kind_is_first_five(self):
+        keys = ",".join(sorted(img._game_market_keys(_f5_game())))
+        self.assertEqual(wh._kind_for_markets(keys), "first_five")
+
+    def test_f5_does_not_collide_with_team_kind(self):
+        # An F5 payload and a full-game team payload for the same event/hour must
+        # resolve to DIFFERENT kinds, so uq_odds_snapshot never drops one.
+        self.assertNotEqual(
+            wh._kind_for_markets(",".join(sorted(img._game_market_keys(_f5_game())))),
+            wh._kind_for_markets(",".join(sorted(img._game_market_keys(_team_game())))))
+
+    def test_f5_lines_parsed_per_book_as_team_shapes(self):
+        lines = img._per_book_lines(_f5_game(), "first_five")
+        self.assertEqual({ln["bookmaker"] for ln in lines}, {"draftkings", "pinnacle"})
+        # F5 keys are shimmed to base shapes -> emitted as moneyline/total/spread.
+        self.assertTrue(all(ln["bet_type"] in ("moneyline", "spread", "total")
+                            for ln in lines))
+        # DK posts F5 moneyline only -> exactly its 2 moneyline sides, no totals.
+        dk = [ln for ln in lines if ln["bookmaker"] == "draftkings"]
+        self.assertEqual(len(dk), 2)
+        self.assertEqual({ln["bet_type"] for ln in dk}, {"moneyline"})
+        dk_mets = [ln for ln in dk if ln["selection"] == "New York Mets"]
+        self.assertEqual(dk_mets[0]["price"], 105)  # DK's own F5 price, un-collapsed
+        # Pinnacle posts all three F5 markets: 2 ml + 2 spread + 2 total = 6 lines.
+        pin = [ln for ln in lines if ln["bookmaker"] == "pinnacle"]
+        self.assertEqual(len(pin), 6)
+        self.assertEqual({ln["bet_type"] for ln in pin},
+                         {"moneyline", "spread", "total"})
+        pin_tot = [ln for ln in pin if ln["bet_type"] == "total"]
+        self.assertEqual({ln["point"] for ln in pin_tot}, {4.5})
+
+    def test_scan_tags_f5_as_own_kind(self):
+        # An F5 file and a team file for distinct events both scan with their own
+        # kind; the F5 event keys on ("evt_f5_1", "first_five").
+        def _write(d, name, ts, game):
+            with open(os.path.join(d, name), "w") as f:
+                json.dump({"cached_at": 1.0, "data": {"timestamp": ts, "data": [game]}}, f)
+        with tempfile.TemporaryDirectory() as d:
+            _write(d, "f5_close.json", "2024-06-26T23:05:00Z", _f5_game())
+            chosen, stats = img._scan_snapshots(d, "baseball_mlb", 12, progress_every=0)
+        self.assertIn(("evt_f5_1", "first_five"), chosen)
+        self.assertEqual(chosen[("evt_f5_1", "first_five")]["close"],
+                         wh._hour_bucket("2024-06-26T23:05:00Z"))
+
+
 class PerBookLinesTests(unittest.TestCase):
     def test_team_lines_tagged_per_book(self):
         lines = img._per_book_lines(_team_game(), "team")

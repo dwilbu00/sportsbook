@@ -35,6 +35,11 @@ from datetime import date as _date, datetime, timedelta, timezone
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _TEAM_MARKETS = {"h2h", "spreads", "totals"}
+# First-five-innings period markets — the sharp SP-matchup signal. A distinct
+# snapshot kind ('first_five') so it never collides with the full-game team
+# snapshot on uq_odds_snapshot (same sport/date/event/hour, different kind).
+_FIRST_FIVE_MARKETS = {"h2h_1st_5_innings", "spreads_1st_5_innings",
+                       "totals_1st_5_innings"}
 
 # Thread-safe accumulator of manifest entries pending a flush().
 _accumulator = []          # list of (sport, game_date, entry dict)
@@ -179,6 +184,8 @@ def _kind_for_markets(markets):
     ms = {m.strip() for m in (markets or "").split(",") if m.strip()}
     if any("alternate" in m for m in ms):
         return "alt"
+    if ms and ms <= _FIRST_FIVE_MARKETS:
+        return "first_five"
     if ms and ms <= _TEAM_MARKETS:
         return "team"
     return "props"

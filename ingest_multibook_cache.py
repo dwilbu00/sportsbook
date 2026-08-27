@@ -39,6 +39,15 @@ from collections import Counter
 
 # props are keyed by these market prefixes in the Odds API payload
 _PROP_PREFIXES = ("batter_", "pitcher_", "player_")
+# First-five-innings period markets map 1:1 onto the full-game market shapes, so
+# renaming the key lets the existing parse_game_odds / _emit_team_lines path read
+# them with byte-identical parity. The lines land under a kind='first_five'
+# snapshot (see warehouse._kind_for_markets), separate from the full-game team lines.
+_FIRST_FIVE_TO_BASE = {
+    "h2h_1st_5_innings": "h2h",
+    "spreads_1st_5_innings": "spreads",
+    "totals_1st_5_innings": "totals",
+}
 # The pull ran two passes: CLOSE (snapshot ts = each game's commence) and EARLY
 # (snapshot ts = a fixed morning time, ~12:00Z per the cache audit). The historical
 # featured endpoint returns the WHOLE SLATE at each ts, so a game recurs across many
@@ -90,6 +99,21 @@ def _game_market_keys(game):
     return keys
 
 
+def _as_full_game_markets(game):
+    """Shim a first-five payload so parse_game_odds can read it: rename each F5
+    market key to its base (h2h/spreads/totals) and drop any non-F5 market. The
+    parsed lines are emitted under a kind='first_five' snapshot, so they never
+    collide with the full-game team snapshot on uq_odds_snapshot."""
+    books = []
+    for bk in game.get("bookmakers") or []:
+        ff = [{**m, "key": _FIRST_FIVE_TO_BASE[m["key"]]}
+              for m in (bk.get("markets") or [])
+              if m.get("key") in _FIRST_FIVE_TO_BASE]
+        if ff:
+            books.append({**bk, "markets": ff})
+    return {**game, "bookmakers": books}
+
+
 def _per_book_lines(game, kind):
     """One line dict per (bookmaker, market, outcome/point), tagged with the book.
 
@@ -108,6 +132,9 @@ def _per_book_lines(game, kind):
         try:
             if kind == "props":
                 wh._emit_prop_lines(parse_player_props(one_book_game), book_lines)
+            elif kind == "first_five":
+                wh._emit_team_lines(
+                    parse_game_odds(_as_full_game_markets(one_book_game)), book_lines)
             else:
                 wh._emit_team_lines(parse_game_odds(one_book_game), book_lines)
         except Exception:
@@ -395,7 +422,8 @@ def main():
 
     # ── Report ──────────────────────────────────────────────────────────────
     print(f"\n  snapshots: {n:,}   (team={snaps_by_kind.get('team', 0):,}, "
-          f"props={snaps_by_kind.get('props', 0):,})")
+          f"props={snaps_by_kind.get('props', 0):,}, "
+          f"first_five={snaps_by_kind.get('first_five', 0):,})")
     print(f"  source split: multibook_close={source_ct.get('multibook_close', 0):,}  "
           f"multibook_open={source_ct.get('multibook_open', 0):,}")
     print(f"  intraday snapshots skipped (not the chosen open/close): {intraday_skipped:,}")
