@@ -44,10 +44,14 @@ def _incoh_bucket(x):
 
 
 def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
-                    ev_floor=0.03):
+                    ev_floor=0.03, bias=0.0):
     """Score + grade the run-line coherence bet for every event. Returns (rows, cov).
-    Every row also carries `incoh` (implied - DK RL fair) so the report can measure
-    the model's average bias and bucket by inconsistency size."""
+
+    ``bias`` is the calibration offset (mean implied-minus-DK-RL over all events):
+    subtracting it makes the run model coherent with DK ON AVERAGE, so the remaining
+    per-event residual is a genuine DK inconsistency rather than the Poisson shape
+    error (the run-line-favorite one-run-game bias). Each row carries the CALIBRATED
+    `incoh` = (implied - bias) - DK RL fair."""
     rows, cov = [], Counter()
     for season, triads in triads_by_season.items():
         for t in triads:
@@ -63,6 +67,7 @@ def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
             if implied is None:
                 cov["dropped_unsolvable"] += 1
                 continue
+            implied = min(1.0 - 1e-6, max(1e-6, implied - bias))   # calibrated fair
             incoh = implied - rl_home_fair          # + => DK underprices home cover
             cov["priced"] += 1
             # EV of each DK run-line side under the implied (coherent) cover prob.
@@ -180,6 +185,9 @@ def main():
     ap.add_argument("--min-seasons", type=int, default=2)
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--raw", action="store_true",
+                    help="Skip the coherent-on-average calibration (see the raw "
+                         "model-biased result; default calibrates the offset out).")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -206,13 +214,19 @@ def main():
             if impl is not None:
                 all_incoh.append(impl - rlf)
 
+    # Coherent-on-average calibration: subtract the systematic model offset so
+    # residuals are genuine DK inconsistencies (default; --raw to skip).
+    bias = 0.0 if args.raw else (sum(all_incoh) / len(all_incoh) if all_incoh else 0.0)
+    print(f"  calibration offset applied: {bias:+.4f}"
+          + ("  (--raw: none)" if args.raw else "  (model made coherent-on-average)"))
+
     rows, cov = grade_coherence(blob["triads_by_season"], blob["scores_idx"],
                                 dispersion=args.dispersion, haircut=args.haircut,
-                                ev_floor=args.ev_floor)
+                                ev_floor=args.ev_floor, bias=bias)
     build_coherence_report(rows, cov, all_incoh, min_n=args.min_n,
                            min_seasons=args.min_seasons, min_t=args.min_t)
     print(f"\n  params: dispersion={args.dispersion} haircut={args.haircut} "
-          f"ev_floor={args.ev_floor} min_n={args.min_n}")
+          f"ev_floor={args.ev_floor} min_n={args.min_n} calibrated={not args.raw}")
 
 
 if __name__ == "__main__":
