@@ -54,6 +54,9 @@ def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
     `incoh` = (implied - bias) - DK RL fair."""
     rows, cov = [], Counter()
     for season, triads in triads_by_season.items():
+        # bias may be a scalar (global) or {season: offset} (leave-one-season-out,
+        # so each season is calibrated from the OTHER seasons = out-of-sample).
+        b = bias.get(str(season), 0.0) if isinstance(bias, dict) else bias
         for t in triads:
             cov["events"] += 1
             ml_home_fair, _ = fair_two_way(t.ml_home, t.ml_away)
@@ -67,7 +70,7 @@ def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
             if implied is None:
                 cov["dropped_unsolvable"] += 1
                 continue
-            implied = min(1.0 - 1e-6, max(1e-6, implied - bias))   # calibrated fair
+            implied = min(1.0 - 1e-6, max(1e-6, implied - b))      # calibrated fair
             incoh = implied - rl_home_fair          # + => DK underprices home cover
             cov["priced"] += 1
             # EV of each DK run-line side under the implied (coherent) cover prob.
@@ -186,8 +189,10 @@ def main():
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--raw", action="store_true",
-                    help="Skip the coherent-on-average calibration (see the raw "
-                         "model-biased result; default calibrates the offset out).")
+                    help="Skip calibration (raw model-biased result).")
+    ap.add_argument("--global-bias", action="store_true",
+                    help="Use one in-sample offset (leaky) instead of the default "
+                         "leave-one-season-out out-of-sample calibration.")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -200,9 +205,11 @@ def main():
     n = sum(len(v) for v in blob["triads_by_season"].values())
     print(f"  data: {n:,} team triads (DK ML+RL+total)  (cache: {path})")
 
-    # Precompute the all-events incoherence distribution for the calibration guard.
-    all_incoh = []
+    # Precompute the per-season incoherence distribution for the calibration guard
+    # + the leave-one-season-out offsets.
+    incoh_by_season = {}
     for season, triads in blob["triads_by_season"].items():
+        vals = []
         for t in triads:
             mlf, _ = fair_two_way(t.ml_home, t.ml_away)
             ovf, _ = fair_two_way(t.total_over, t.total_under)
@@ -212,13 +219,27 @@ def main():
             impl = coherence.implied_home_cover(mlf, t.total_line, ovf,
                                                 t.rl_home_point, args.dispersion)
             if impl is not None:
-                all_incoh.append(impl - rlf)
+                vals.append(impl - rlf)
+        incoh_by_season[str(season)] = vals
+    all_incoh = [v for vals in incoh_by_season.values() for v in vals]
 
-    # Coherent-on-average calibration: subtract the systematic model offset so
-    # residuals are genuine DK inconsistencies (default; --raw to skip).
-    bias = 0.0 if args.raw else (sum(all_incoh) / len(all_incoh) if all_incoh else 0.0)
-    print(f"  calibration offset applied: {bias:+.4f}"
-          + ("  (--raw: none)" if args.raw else "  (model made coherent-on-average)"))
+    # Calibration: default = LEAVE-ONE-SEASON-OUT (each season's offset from the
+    # OTHER seasons = out-of-sample, no leakage). --global-bias = in-sample single
+    # offset (leaky, for comparison). --raw = none.
+    if args.raw:
+        bias = 0.0
+        print("  calibration: NONE (--raw; model-biased)")
+    elif args.global_bias:
+        bias = sum(all_incoh) / len(all_incoh) if all_incoh else 0.0
+        print(f"  calibration: GLOBAL in-sample offset {bias:+.4f} (leaky, comparison only)")
+    else:
+        bias = {}
+        for s in incoh_by_season:
+            others = [v for ss, vals in incoh_by_season.items() if ss != s for v in vals]
+            bias[s] = (sum(others) / len(others)) if others else (
+                sum(incoh_by_season[s]) / len(incoh_by_season[s]) if incoh_by_season[s] else 0.0)
+        print("  calibration: LEAVE-ONE-SEASON-OUT (out-of-sample) offsets = "
+              + ", ".join(f"{s}:{bias[s]:+.4f}" for s in sorted(bias)))
 
     rows, cov = grade_coherence(blob["triads_by_season"], blob["scores_idx"],
                                 dispersion=args.dispersion, haircut=args.haircut,
