@@ -1,0 +1,123 @@
+"""Unit tests for r2_data — the pure DK/Pinnacle pairing + close-selection core and
+the outcome lookup. No warehouse: synthetic warehouse-shaped rows."""
+import unittest
+
+import r2_data as d
+
+
+def _row(book, sid, cap, com, prop="batter_hits", side="OVER", pt=0.5, price=-110,
+         player="Gunnar Henderson", mlbid="683002", eid="E1", gpk=700):
+    return {"book": book, "snapshot_id": sid, "captured_at": cap,
+            "commence_time": com, "event_id": eid, "player": player,
+            "player_mlb_id": mlbid, "prop_key": prop, "direction": side,
+            "point": pt, "price": price, "game_pk": gpk, "game_date": com[:10]}
+
+
+def _two_sided(book, sid, cap, com, pt=0.5, over=-110, under=-110, **kw):
+    return [_row(book, sid, cap, com, side="OVER", pt=pt, price=over, **kw),
+            _row(book, sid, cap, com, side="UNDER", pt=pt, price=under, **kw)]
+
+
+COM = "2024-06-26T23:10:00Z"
+
+
+class ParseTsTests(unittest.TestCase):
+    def test_z_and_offset_and_bad(self):
+        self.assertIsNotNone(d._parse_ts("2024-06-26T23:05:38Z"))
+        self.assertIsNotNone(d._parse_ts("2024-06-26T23:05:38+00:00"))
+        self.assertIsNone(d._parse_ts(None))
+        self.assertIsNone(d._parse_ts("not-a-date"))
+
+    def test_z_equals_offset(self):
+        self.assertEqual(d._parse_ts("2024-06-26T23:05:38Z"),
+                         d._parse_ts("2024-06-26T23:05:38+00:00"))
+
+
+class CloseSelectionTests(unittest.TestCase):
+    def test_picks_latest_pre_commence_snapshot_with_both_books(self):
+        rows = []
+        # open snapshot sid=1 @ 12:00Z (both books), close sid=2 @ 23:05Z (both books)
+        for b in ("draftkings", "pinnacle"):
+            rows += _two_sided(b, 1, "2024-06-26T12:00:00Z", COM, over=100, under=-120)
+            rows += _two_sided(b, 2, "2024-06-26T23:05:00Z", COM, over=-110, under=-110)
+        legs, stats = d.select_prop_legs(rows)
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0].snapshot_id, 2)         # the close, not the open
+        self.assertEqual(legs[0].dk_over_price, -110)    # from sid=2
+
+    def test_post_commence_snapshot_excluded(self):
+        rows = []
+        for b in ("draftkings", "pinnacle"):
+            rows += _two_sided(b, 1, "2024-06-26T22:00:00Z", COM)          # valid close
+            rows += _two_sided(b, 2, "2024-06-26T23:40:00Z", COM, over=250)  # in-play (post-commence)
+        legs, _ = d.select_prop_legs(rows)
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0].snapshot_id, 1)         # NOT the later in-play snap
+
+    def test_never_pairs_across_snapshots(self):
+        # DK only in sid=2, Pinnacle only in sid=1 -> no snapshot has BOTH -> drop.
+        rows = _two_sided("pinnacle", 1, "2024-06-26T12:00:00Z", COM)
+        rows += _two_sided("draftkings", 2, "2024-06-26T23:05:00Z", COM)
+        legs, stats = d.select_prop_legs(rows)
+        self.assertEqual(legs, [])
+        self.assertEqual(stats["events_dropped_no_both_book_close"], 1)
+
+    def test_event_without_pinnacle_dropped(self):
+        rows = _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM)
+        legs, stats = d.select_prop_legs(rows)
+        self.assertEqual(legs, [])
+        self.assertEqual(stats["events_dropped_no_both_book_close"], 1)
+
+
+class OfferAssemblyTests(unittest.TestCase):
+    def test_cross_line_offers_preserved(self):
+        # Pinnacle posts BOTH 0.5 and 1.5 (two-sided); DK posts 0.5 only.
+        rows = _two_sided("pinnacle", 1, "2024-06-26T23:05:00Z", COM, pt=0.5)
+        rows += _two_sided("pinnacle", 1, "2024-06-26T23:05:00Z", COM, pt=1.5)
+        rows += _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM, pt=0.5)
+        legs, _ = d.select_prop_legs(rows)
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0].dk_point, 0.5)
+        pts = sorted(o["point"] for o in legs[0].pinnacle_offers)
+        self.assertEqual(pts, [0.5, 1.5])                # both survive for projection
+
+    def test_one_sided_pinnacle_dropped(self):
+        # Pinnacle posts only OVER (no UNDER) -> can't devig -> leg dropped.
+        rows = [_row("pinnacle", 1, "2024-06-26T23:05:00Z", COM, side="OVER")]
+        rows += _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM)
+        legs, stats = d.select_prop_legs(rows)
+        self.assertEqual(legs, [])
+        self.assertEqual(stats["leg_dropped_no_pinnacle_twosided"], 1)
+
+    def test_dk_and_pin_join_on_mlb_id_despite_name_diff(self):
+        # Books spell the name differently but share the MLBAM id -> one leg.
+        rows = _two_sided("pinnacle", 1, "2024-06-26T23:05:00Z", COM,
+                          player="G. Henderson", mlbid="683002")
+        rows += _two_sided("draftkings", 1, "2024-06-26T23:05:00Z", COM,
+                           player="Gunnar Henderson", mlbid="683002")
+        legs, _ = d.select_prop_legs(rows)
+        self.assertEqual(len(legs), 1)
+        self.assertIsNotNone(legs[0].dk_over_price)
+        self.assertTrue(legs[0].pinnacle_offers)
+
+
+class OutcomeValueTests(unittest.TestCase):
+    def test_game_pk_exact_hit_and_miss(self):
+        idx = {"batter": {("683002", 700): {"H": 2.0, "SO": 1.0}}}
+        self.assertEqual(d.outcome_value(idx, "batter_hits", "683002", 700), 2.0)
+        self.assertEqual(d.outcome_value(idx, "batter_strikeouts", "683002", 700), 1.0)
+        self.assertIsNone(d.outcome_value(idx, "batter_hits", "683002", 999))  # wrong game
+        self.assertIsNone(d.outcome_value(idx, "batter_hits", "999", 700))     # wrong player
+
+    def test_none_inputs(self):
+        idx = {"batter": {}}
+        self.assertIsNone(d.outcome_value(idx, "batter_hits", None, 700))
+        self.assertIsNone(d.outcome_value(idx, "batter_hits", "683002", None))
+
+    def test_ip_to_outs_xform(self):
+        idx = {"pitcher": {("605483", 700): {"IP": 6.1}}}   # 6.1 IP = 19 outs
+        self.assertEqual(d.outcome_value(idx, "pitcher_outs", "605483", 700), 19)
+
+
+if __name__ == "__main__":
+    unittest.main()
