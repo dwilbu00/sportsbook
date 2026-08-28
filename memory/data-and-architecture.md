@@ -80,17 +80,19 @@ scenario route to it with per-call **Azure fallback** (safe-by-default; OFF unle
 the flag is set → zero live/refit impact). Data dir gitignored (code versioned,
 data local).
 
-**AUTO-BUILD + `_valid` marker (f83dce8):** all four backtest tools call
-`warehouse_mirror.autobuild(sport, seasons)` in `load_or_fetch` when
-`ODI_BACKTEST_MIRROR=1`, so the manual `--sync` is now OPTIONAL — the first flagged
-run auto-syncs missing files and verifies them. Verification is expensive (queries
+**AUTO-BUILD + `_valid` marker (f83dce8; default-ON flip 172af30):** the mirror is ON
+BY DEFAULT for backtests — set `ODI_BACKTEST_MIRROR=0` to force the live Azure path.
+All four backtest tools call `warehouse_mirror.autobuild(sport, seasons)` in
+`load_or_fetch`, so the manual `--sync` is OPTIONAL — the first run auto-syncs missing
+files and verifies them. (Production Streamlit Cloud has no mirror dir → `enabled()`
+False → Azure path, so live serving is unaffected; the refit reads Azure directly.) Verification is expensive (queries
 Azure), so a file that PASSES `--verify` is renamed `X.parquet → X_valid.parquet`;
 readers prefer the `_valid` copy; a fresh sync drops any stale `_valid` (data changed
 → must re-verify); a failing verify demotes `_valid → base`. `ensure()` FAST-PATHs to
 instant (no Azure) once every needed file is `_valid`, so verification happens ONCE
 per file, not per run. No-DB box: leaves files as-is (readers fall back). CLIs:
 `--sync`, `--verify`, `--refresh` (re-sync), per-tool `--refresh-mirror` (re-sync +
-re-verify); `ODI_BACKTEST_MIRROR=1` to read. Tests: test_warehouse_mirror.py (14).
+re-verify); `ODI_BACKTEST_MIRROR=0` to force Azure. Tests: test_warehouse_mirror.py (14).
 
 ## Live-analysis performance
 
