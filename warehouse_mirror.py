@@ -358,9 +358,76 @@ def calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
     return out
 
 
+def _row_key(d):
+    return tuple(sorted((k, v) for k, v in d.items()))
+
+
+def verify(sport, seasons, verbose=True):
+    """PARITY self-check (needs Azure + a synced mirror): compare each mirror reader
+    to the live db_store / r2_data reader on real data and report PASS/FAIL. This is
+    the strongest guarantee — 'mirror == Azure on your actual warehouse'. Returns True
+    iff every checked reader matches. Run once after --sync."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    import r2_data
+    ok = True
+
+    def _cmp(name, mrows, arows):
+        nonlocal ok
+        ms, as_ = {_row_key(r) for r in mrows}, {_row_key(r) for r in arows}
+        same = ms == as_
+        ok = ok and same
+        if verbose:
+            extra, missing = len(ms - as_), len(as_ - ms)
+            print(f"  [{'PASS' if same else 'FAIL'}] {name:<34} "
+                  f"mirror={len(mrows):>7,} azure={len(arows):>7,}"
+                  + ("" if same else f"  (+{extra} mirror-only / -{missing} azure-only)"))
+
+    def _cmp_idx(name, midx, aidx):
+        nonlocal ok
+        same = midx == aidx
+        ok = ok and same
+        if verbose:
+            print(f"  [{'PASS' if same else 'FAIL'}] {name:<34} "
+                  f"mirror={len(midx):>7,} azure={len(aidx):>7,}"
+                  + ("" if same else "  (INDEX MISMATCH)"))
+
+    for s in [str(x) for x in seasons]:
+        df, dt = f"{s}-01-01", f"{s}-12-31"
+        for book in BOOKS:
+            m = team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book)
+            a = db_store.team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book)
+            if m is not None:
+                _cmp(f"team {s} {book}", m, a)
+            mp = player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)
+            ap_ = db_store.player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)
+            if mp is not None:
+                _cmp(f"props {s} {book}", mp, ap_)
+
+    # index builders: compare mirror vs the Azure path (flag off so r2_data hits SQL)
+    _saved = os.environ.pop("ODI_BACKTEST_MIRROR", None)
+    try:
+        _cmp_idx("team_scores_index", build_team_scores_index() or {},
+                 r2_data.build_team_scores_index())
+        _cmp_idx("f5_scores_index", build_f5_scores_index() or {},
+                 r2_data.build_f5_scores_index())
+        for s in [str(x) for x in seasons]:
+            mpix = pitcher_game_index(int(s)) or {}
+            import mlb_warehouse as wh
+            apix = {str(a): g for a, g in (wh._pitcher_game_index(int(s)) or {}).items()}
+            _cmp_idx(f"pitcher_game_index {s}", mpix, apix)
+    finally:
+        if _saved is not None:
+            os.environ["ODI_BACKTEST_MIRROR"] = _saved
+    print(f"  VERIFY: {'ALL PASS' if ok else 'MISMATCH — do not rely on the mirror'}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description="Local parquet mirror of the backtest warehouse.")
     ap.add_argument("--sync", action="store_true", help="pull Azure -> local parquet")
+    ap.add_argument("--verify", action="store_true",
+                    help="parity-check mirror vs Azure on real data (run after --sync)")
     ap.add_argument("--sport", default="baseball_mlb")
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--refresh", action="store_true",
@@ -377,9 +444,15 @@ def main():
               f"  (refresh={args.refresh})")
         sync(args.sport, seasons, refresh=args.refresh)
         print("  done.")
-    else:
+    if args.verify:
+        # verify() reads mirror parquet directly (no read-flag needed) and compares
+        # to the live Azure readers.
+        print(f"  verifying mirror vs Azure ({args.sport} {seasons})...")
+        verify(args.sport, seasons)
+    if not (args.sync or args.verify):
         print(f"  mirror dir: {MIRROR_DIR}  enabled={enabled()}")
-        print("  pass --sync to build it; set ODI_BACKTEST_MIRROR=1 to read from it.")
+        print("  --sync to build · --verify to parity-check · "
+              "ODI_BACKTEST_MIRROR=1 to read from it.")
 
 
 if __name__ == "__main__":
