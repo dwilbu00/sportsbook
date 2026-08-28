@@ -241,6 +241,14 @@ def _passes_standalone(sport_key, rec):
 def _pair_conflict(sport_key, a, b):
     """True if two chosen bets may not coexist on the slate."""
     la, lb = a["leg"], b["leg"]
+    # L0 — one run-line per game. A coherence run-line (_leg maps it to "spread") and
+    # the model's OWN run-line/spread are the same market on the same game; betting
+    # both doubles the position. _has_hard_conflict only blocks OPPOSITE teams, so a
+    # same-side duplicate (model HOME -1.5 + coherence HOME -1.5) would slip through.
+    if la.get("bet_type") == "spread" and lb.get("bet_type") == "spread":
+        ga, gb = la.get("game_key"), lb.get("game_key")
+        if ga is not None and ga == gb:
+            return True
     # L1 — structural hard conflicts (cross-game returns False internally).
     if parlay._has_hard_conflict(la, lb):
         return True

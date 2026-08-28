@@ -2865,8 +2865,14 @@ if analyze_clicked and selected_game_labels:
         else:
             try:
                 import coherence_flags as _coh
-                coherence_offset, _ = _coh.compute_offset(
+                coherence_offset, _n_triads = _coh.compute_offset(
                     sport["key"], _coh.DEFAULT_OFFSET_SEASONS)
+                # compute_offset returns (0.0, 0) — not None, no raise — when NO
+                # historical triads were available to fit. Treat that as unfit (skip
+                # coherence) so we never run/forward-log UNCALIBRATED flags off a raw
+                # 0.0 offset; a genuine ~0.0 fit from real triads keeps a nonzero count.
+                if not _n_triads:
+                    coherence_offset = None
                 _coh_cache[sport["key"]] = coherence_offset
                 st.session_state["_coherence_offset_cache"] = _coh_cache
             except Exception:
