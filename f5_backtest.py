@@ -30,7 +30,7 @@ import r2_grade
 from odds_client import american_to_decimal
 from r2_sharp import fair_two_way
 
-_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "r2_backtest_cache")
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
 
 
 def grade_f5_ml(side, h5, a5):
@@ -156,6 +156,7 @@ def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
     legs_by_season, stats = r2_data.load_f5_ml_legs(sport, seasons)
     scores_idx = r2_data.build_f5_scores_index(seasons)
     blob = {"legs_by_season": legs_by_season, "scores_idx": scores_idx,

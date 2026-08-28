@@ -29,7 +29,7 @@ import r2_grade
 from odds_client import american_to_decimal
 from r2_sharp import fair_two_way
 
-_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "r2_backtest_cache")
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
 
 
 def _incoh_bucket(x):
@@ -210,6 +210,7 @@ def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
     triads_by_season, stats = r2_data.load_team_triad(sport, seasons)
     scores_idx = r2_data.build_team_scores_index(seasons)
     blob = {"triads_by_season": triads_by_season, "scores_idx": scores_idx,

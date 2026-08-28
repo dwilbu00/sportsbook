@@ -47,7 +47,7 @@ import r2_grade
 DEFAULT_PROPS = ["pitcher_earned_runs", "pitcher_strikeouts", "pitcher_outs",
                  "batter_total_bases", "batter_hits"]
 PRIMARY_PROP = "pitcher_earned_runs"
-_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "r2_backtest_cache")
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
 
 
 # ── EV / profit with a vig haircut (the pure modules take raw american) ───────
@@ -540,6 +540,7 @@ def load_or_fetch(sport, seasons, prop_keys, refresh=False, refresh_mirror=False
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
     legs_by_season, fetch_stats = r2_data.load_prop_legs(sport, seasons, prop_keys)
     outcome_idx = r2_data.build_outcome_index(seasons, prop_keys)
     blob = {"legs_by_season": legs_by_season, "outcome_idx": outcome_idx,
@@ -564,6 +565,7 @@ def load_or_fetch_ml(sport, seasons, kind, refresh=False, refresh_mirror=False):
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
     legs_by_season, stats = r2_data.load_team_ml_legs(sport, seasons, kind=kind)
     finals_idx = r2_data.build_team_finals_index(seasons)
     blob = {"legs_by_season": legs_by_season, "finals_idx": finals_idx,

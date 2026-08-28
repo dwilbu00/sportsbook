@@ -31,7 +31,7 @@ import r2_data
 import r2_grade
 from odds_client import (american_to_decimal, american_to_implied_prob)
 
-_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "r2_backtest_cache")
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
 
 
 # ── grading helpers ─────────────────────────────────────────────────────────
@@ -606,6 +606,7 @@ def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
     import db_store
     db_store.promote_secrets_from_toml()
     triads_by_season, _ = r2_data.load_team_triad(sport, seasons)

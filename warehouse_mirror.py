@@ -60,6 +60,11 @@ def enabled():
     return flag_on() and os.path.isdir(MIRROR_DIR)
 
 
+def source_label():
+    """Human label of where a cold cache build will read from (for backtest logging)."""
+    return "mirror (parquet)" if enabled() else "Azure SQL (live)"
+
+
 # ── parquet helpers ──────────────────────────────────────────────────────────
 
 def _path(name):

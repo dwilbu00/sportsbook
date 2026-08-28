@@ -41,3 +41,4 @@ historical_odds/*__apiclean.json
 historical_odds/*.json
 cache.zip
 warehouse_mirror_data/
+backtest_cache/
