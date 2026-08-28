@@ -94,6 +94,15 @@ per file, not per run. No-DB box: leaves files as-is (readers fall back). CLIs:
 `--sync`, `--verify`, `--refresh` (re-sync), per-tool `--refresh-mirror` (re-sync +
 re-verify); `ODI_BACKTEST_MIRROR=0` to force Azure. Tests: test_warehouse_mirror.py (14).
 
+**Two-layer backtest cache:** each tool also keeps a per-tool PICKLE of the assembled
+blob (triads/indexes/prop rows) at `deploy/backtest_cache/` (project-local, gitignored;
+55a4a45 moved it out of %TEMP%). Hierarchy: **pickle (fastest) → mirror (parquet) →
+Azure**. ⚠ The pickle has NO TTL/staleness check — reused until its file is missing or
+`--refresh` (cache key = sport+seasons [+prop_keys/kind/`v2`]); so after a mirror
+refresh, `--refresh` the tool too or it serves stale data. A COLD build prints
+"reading from mirror (parquet) / Azure SQL (live)" (`source_label()`); a warm pickle
+just prints its path.
+
 ## Live-analysis performance
 
 - **SHIPPED (pushed):** Phase-3 parallelization (`_analyze_one_event` in a 16-worker pool, workers return candidate lists merged in slate order → zero races, ~5-10x; ed9dbc7) + team-dim per-process cache (`_team_dim`, was ~half of all warehouse round-trips; a395ccf). Hosted-app crash fixed (config.json.example; 90c18e6). Verify picks LIVE (no unit coverage for the Streamlit handler).
