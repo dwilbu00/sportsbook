@@ -43,6 +43,16 @@ def _incoh_bucket(x):
     return ">0.10"
 
 
+def _fav_bucket(imp):
+    """Favorite-strength bin (matches scenario_backtest.dog_runline) so we can test
+    whether coherence's EV-selected edge concentrates in the SAME dog+1.5 /
+    moderate-favorite regime the scenario screen surfaced."""
+    for hi in (0.55, 0.60, 0.65, 0.70):
+        if imp < hi:
+            return f"<{hi:.0%}"
+    return ">=70%"
+
+
 def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
                     ev_floor=0.03, bias=0.0):
     """Score + grade the run-line coherence bet for every event. Returns (rows, cov).
@@ -73,6 +83,7 @@ def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
             implied = min(1.0 - 1e-6, max(1e-6, implied - b))      # calibrated fair
             incoh = implied - rl_home_fair          # + => DK underprices home cover
             cov["priced"] += 1
+            fav_imp = max(ml_home_fair, 1.0 - ml_home_fair)   # favorite strength
             # EV of each DK run-line side under the implied (coherent) cover prob.
             legs = [("home", t.rl_home, implied), ("away", t.rl_away, 1.0 - implied)]
             for side, price, fair in legs:
@@ -90,11 +101,16 @@ def grade_coherence(triads_by_season, scores_idx, dispersion=0.0, haircut=0.02,
                 hs, as_ = scores_idx[int(t.game_pk)]
                 home_covered = (hs + t.rl_home_point) > as_
                 won = home_covered if side == "home" else (not home_covered)
+                # Which structural side is this bet? +1.5 = underdog, -1.5 = favorite.
+                bet_point = t.rl_home_point if side == "home" else -t.rl_home_point
+                bet_side_type = "dog+1.5" if bet_point > 0 else "fav-1.5"
                 rows.append({
                     "season": str(season), "prop_key": "run_line", "side": side,
                     "incoh": incoh, "incoh_bucket": _incoh_bucket(incoh),
                     "ev": evh, "ev_bucket": r2_grade.ev_bucket(evh),
                     "implied": implied, "dk_rl_fair": rl_home_fair,
+                    "fav_imp": fav_imp, "fav_bucket": _fav_bucket(fav_imp),
+                    "bet_side_type": bet_side_type,
                     "result": "win" if won else "loss",
                     "profit": (dec - 1.0) if won else -1.0,
                     "game_pk": t.game_pk,
@@ -150,6 +166,21 @@ def build_coherence_report(rows, coverage, all_incoh, min_n=100, min_seasons=2,
     for side in ("home", "away"):
         sm = r2_grade.summarize([r for r in rows if r["side"] == side])
         p(f"    {side:<6} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+
+    # CONVERGENCE CHECK vs scenario_backtest's dog+1.5 finding: is coherence's
+    # EV-selected edge the SAME inefficiency (dog +1.5, moderate favorites)?
+    p("\n  By structural side (dog +1.5 vs favorite -1.5):")
+    for bt in ("dog+1.5", "fav-1.5"):
+        sm = r2_grade.summarize([r for r in rows if r["bet_side_type"] == bt])
+        p(f"    {bt:<8} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+    p("\n  DOG +1.5 bets by favorite strength (scenario sweet spot = 65-70%):")
+    dogs = [r for r in rows if r["bet_side_type"] == "dog+1.5"]
+    cells = r2_grade.by_key(dogs, lambda r: r["fav_bucket"])
+    for b in ("<55%", "<60%", "<65%", "<70%", ">=70%"):
+        if b in cells:
+            sm = cells[b]
+            tag = "" if sm.decided >= 30 else "  (thin)"
+            p(f"    {b:<8} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}{tag}")
 
     # Realized ROI vs MODELED EV — a real edge is monotone (bigger modeled EV ->
     # bigger realized ROI); a flat/noisy pattern says the signal isn't structural.
