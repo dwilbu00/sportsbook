@@ -150,6 +150,16 @@ def build_coherence_report(rows, coverage, all_incoh, min_n=100, min_seasons=2,
     for side in ("home", "away"):
         sm = r2_grade.summarize([r for r in rows if r["side"] == side])
         p(f"    {side:<6} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+
+    # Realized ROI vs MODELED EV — a real edge is monotone (bigger modeled EV ->
+    # bigger realized ROI); a flat/noisy pattern says the signal isn't structural.
+    p("\n  By modeled-EV bucket (should rise with EV if the edge is real):")
+    cells = r2_grade.by_key(rows, lambda r: r["ev_bucket"])
+    order = ["0%-2%", "2%-5%", "5%-10%", "10%-20%", ">=20%"]
+    for b in [x for x in order if x in cells] + [k for k in sorted(cells) if k not in order]:
+        sm = cells[b]
+        tag = "" if sm.decided >= min_n else "  (insufficient)"
+        p(f"    EV {b:<8} n={sm.decided:>5,} ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}{tag}")
     p("=" * 74)
     text = "\n".join(out)
     print(text)
