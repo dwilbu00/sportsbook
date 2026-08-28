@@ -509,6 +509,10 @@ def main():
                 cov, ("games", "graded", "dog_not_+1.5", "no_score", "pickem"))
         _print_slice(rows, lambda r: r["side"], "side")
         _print_slice(rows, lambda r: r["fav_bucket"], "favorite strength (ML implied)")
+        # Does the hot 65-70% bucket replicate per season, or is it one lucky year?
+        # (an isolated spike that lives in a single season = variance, not edge.)
+        _print_slice(rows, lambda r: (r["fav_bucket"], r["season"]),
+                     "favorite strength x season")
     if want in ("all", "fav_combo"):
         parlay, straights, cov = scenario_fav_combo(blob)
         print(f"  fav_combo coverage: graded_games={cov.get('graded_games',0):,} "
