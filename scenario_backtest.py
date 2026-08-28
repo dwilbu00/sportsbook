@@ -371,6 +371,114 @@ def scenario_er_ml(blob):
     return rows, cov
 
 
+# ── scenario: SP volatility (ER-CV) → team-market mispricing ─────────────────
+
+def _asof_sp_cv(games_sorted, game_date, half_life):
+    """Recency-weighted ER-CV of a starter's PRIOR in-season starts, leakage-safe
+    (strictly before game_date), via props._recency_weighted_cv — the EXACT function
+    the earned_runs high-CV (cv_floor) edge was validated on. games_sorted =
+    [(official_date, outs, er, ...), ...] ascending. Returns None if <5 priors / mean~0."""
+    from props import _recency_weighted_cv
+    gd = (game_date or "")[:10]
+    prior = [g[2] for g in games_sorted if (g[0] or "") < gd]   # ER, oldest→newest
+    prior.reverse()                                             # newest-first (weights convention)
+    return _recency_weighted_cv(prior, half_life)
+
+
+def _cv_bucket(cv):
+    """SP ER-CV bucket; the >=1.3 cut is the validated earned_runs cv_floor threshold."""
+    if cv is None:
+        return None
+    if cv < 1.0:
+        return "a <1.0"
+    if cv < 1.3:
+        return "b 1.0-1.3"
+    return "c >=1.3 (high)"
+
+
+def scenario_team_variance(blob, half_life=5.0):
+    """Does STARTER volatility (recency-weighted ER-CV — the validated cv_floor signal)
+    predict DK mispricing TEAM markets? Fat-right-tailed volatile SPs plausibly make the
+    team total OVER + the underdog ML/+1.5 underpriced. Bets: total OVER (conditioned on
+    the game's MAX SP CV — either starter volatile → blow-up risk), and dog ML + dog +1.5
+    (conditioned on the FAVORITE's SP CV — a volatile favorite can implode). Rows tagged
+    by CV bucket so we see whether +ROI concentrates in the high-CV (>=1.3) cell."""
+    rows, cov = [], Counter()
+    scores = blob["team_scores"]
+    pt_team = blob["pitcher_team"]        # {(aid_str, gpk_int): (team_id, GS)}
+    gt = blob["game_teams"]               # {gpk: (home_tid, away_tid)}
+    pidx = blob["pitcher_idx"]            # {season_str: {aid_str: [(date,outs,er,...)]}}
+    # starters per game_pk (GS==1), mapped to home/away
+    starters = {}
+    for (aid, gpk), (tid, gs) in pt_team.items():
+        if not gs:
+            continue
+        teams = gt.get(gpk)
+        if not teams:
+            continue
+        if str(tid) == str(teams[0]):
+            starters.setdefault(gpk, {})["home"] = aid
+        elif str(tid) == str(teams[1]):
+            starters.setdefault(gpk, {})["away"] = aid
+    for season, triads in blob["triads_by_season"].items():
+        idx = pidx.get(str(season)) or {}
+        for t in triads:
+            cov["games"] += 1
+            gpk = t.game_pk
+            if gpk is None or int(gpk) not in scores:
+                cov["no_score"] += 1
+                continue
+            gpk = int(gpk)
+            hs, as_ = scores[gpk]
+            st = starters.get(gpk) or {}
+            home_cv = _asof_sp_cv(idx.get(str(st.get("home"))) or [], t.game_date, half_life)
+            away_cv = _asof_sp_cv(idx.get(str(st.get("away"))) or [], t.game_date, half_life)
+            try:
+                imp_home = american_to_implied_prob(int(t.ml_home))
+                imp_away = american_to_implied_prob(int(t.ml_away))
+            except (TypeError, ValueError):
+                imp_home = imp_away = None
+            fav_is_home = (imp_home is not None and imp_away is not None
+                           and imp_home > imp_away)
+            # (1) TOTAL OVER — conditioned on the game's MAX SP CV
+            cvs = [c for c in (home_cv, away_cv) if c is not None]
+            if cvs and t.total_line is not None and t.total_over is not None:
+                gv = max(cvs)
+                res = r2_grade.grade_over_under(hs + as_, t.total_line, "OVER")
+                p = r2_grade.profit(t.total_over, res)
+                if p is not None:
+                    rows.append({"season": str(season), "bet": "total_over", "cv": gv,
+                                 "cv_bucket": _cv_bucket(gv), "result": res, "profit": p})
+                    cov["total_over_graded"] += 1
+            else:
+                cov["skip_no_cv"] += 1
+            # (2)+(3) DOG ML + DOG +1.5 — conditioned on the FAVORITE's SP CV
+            if imp_home is not None and imp_away is not None and imp_home != imp_away:
+                fav_cv = home_cv if fav_is_home else away_cv
+                if fav_cv is None:
+                    cov["skip_no_fav_cv"] += 1
+                    continue
+                dog_is_home = not fav_is_home
+                b = _cv_bucket(fav_cv)
+                dog_ml = t.ml_home if dog_is_home else t.ml_away
+                res_ml = "win" if (_winner_home(hs, as_) == dog_is_home) else "loss"
+                p_ml = r2_grade.profit(dog_ml, res_ml)
+                if p_ml is not None:
+                    rows.append({"season": str(season), "bet": "dog_ml", "cv": fav_cv,
+                                 "cv_bucket": b, "result": res_ml, "profit": p_ml})
+                    cov["dog_ml_graded"] += 1
+                dog_point = (t.rl_home_point or 0.0) if dog_is_home else -(t.rl_home_point or 0.0)
+                dog_rl = t.rl_home if dog_is_home else t.rl_away
+                if abs(dog_point - 1.5) < 0.01:
+                    res_rl = _grade_runline(dog_is_home, 1.5, hs, as_)
+                    p_rl = r2_grade.profit(dog_rl, res_rl)
+                    if p_rl is not None:
+                        rows.append({"season": str(season), "bet": "dog_rl", "cv": fav_cv,
+                                     "cv_bucket": b, "result": res_rl, "profit": p_rl})
+                        cov["dog_rl_graded"] += 1
+    return rows, cov
+
+
 # ── reporting ────────────────────────────────────────────────────────────────
 
 def _report(title, rows, cov=None, cov_keys=()):
@@ -459,9 +567,22 @@ def _prop_rows_by_season(sport, seasons, prop_key):
     return by_season
 
 
+def _pitcher_idx_by_season(seasons):
+    """{season_str: {athlete_id_str: [(official_date, outs, er, ...) asc]}} — the as-of
+    pitcher ER series for leakage-safe SP volatility (reuses mlb_warehouse's per-season
+    pitcher game index; one query per season)."""
+    import mlb_warehouse as wh
+    out = {}
+    for s in seasons:
+        idx = wh._pitcher_game_index(int(s)) or {}
+        out[str(s)] = {str(aid): games for aid, games in idx.items()}
+    return out
+
+
 def _cache_path(sport, seasons):
     os.makedirs(_CACHE_DIR, exist_ok=True)
-    tag = f"scenario_{sport}_{'-'.join(map(str, seasons))}"
+    # v2 adds pitcher_idx (SP volatility) — bump so an old cache doesn't KeyError.
+    tag = f"scenario_v2_{sport}_{'-'.join(map(str, seasons))}"
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
@@ -481,6 +602,7 @@ def load_or_fetch(sport, seasons, refresh=False):
         "hits_outcome_idx": r2_data.build_outcome_index(seasons, ["batter_hits"]),
         "pitcher_team": _pitcher_team_index(seasons),
         "game_teams": _game_teams_index(),
+        "pitcher_idx": _pitcher_idx_by_season(seasons),
     }
     with open(path, "wb") as f:
         pickle.dump(blob, f)
@@ -493,7 +615,10 @@ def main():
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
-                             "fav_combo", "er_ml"])
+                             "fav_combo", "er_ml", "team_variance"])
+    ap.add_argument("--cv-half-life", type=float, default=5.0,
+                    help="Half-life (games) for the SP ER-CV in team_variance; 5 "
+                         "matches the live earned_runs cv_floor signal. 0 = equal weight.")
     ap.add_argument("--refresh", action="store_true",
                     help="re-read the warehouse (else use the pickle cache)")
     args = ap.parse_args()
@@ -547,6 +672,24 @@ def main():
         _report("ML of the LOWER earned-runs-line starter", rows, cov,
                 ("games_with_er", "graded", "missing_a_starter_line",
                  "tie_line_skipped", "no_score"))
+    if want in ("all", "team_variance"):
+        rows, cov = scenario_team_variance(blob, half_life=args.cv_half_life)
+        print(f"  team_variance coverage: games={cov.get('games',0):,} "
+              f"total_over={cov.get('total_over_graded',0):,} "
+              f"dog_ml={cov.get('dog_ml_graded',0):,} dog_rl={cov.get('dog_rl_graded',0):,} "
+              f"(skip_no_cv={cov.get('skip_no_cv',0):,} "
+              f"skip_no_fav_cv={cov.get('skip_no_fav_cv',0):,})  "
+              f"cv_half_life={args.cv_half_life}\n")
+        for bet, label in (("total_over", "TEAM TOTAL OVER"),
+                           ("dog_ml", "UNDERDOG ML"),
+                           ("dog_rl", "UNDERDOG +1.5")):
+            br = [r for r in rows if r["bet"] == bet]
+            cond = "max SP ER-CV" if bet == "total_over" else "favorite's SP ER-CV"
+            _report(f"SP volatility → {label}  (conditioned on {cond})", br)
+            _print_slice(br, lambda r: r["cv_bucket"], "SP ER-CV bucket")
+            hi = [r for r in br if r["cv_bucket"] == "c >=1.3 (high)"]
+            if hi:
+                _print_slice(hi, lambda r: r["season"], "high-CV (>=1.3) x season")
 
 
 if __name__ == "__main__":
