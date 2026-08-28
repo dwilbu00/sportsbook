@@ -166,6 +166,63 @@ def scenario_home_runline(blob):
     return rows, cov
 
 
+# ── scenario: UNDERDOG +1.5 run-line (the isolated lead) ─────────────────────
+
+def _fav_bucket(imp):
+    """Favorite-strength bucket by its devigged-ish ML implied prob."""
+    for hi in (0.55, 0.60, 0.65, 0.70):
+        if imp < hi:
+            return f"<{hi:.0%}"
+    return ">=70%"
+
+
+def scenario_dog_runline(blob):
+    """Bet the UNDERDOG's +1.5 run-line in every game with a clear ML favorite
+    (home OR away dog). Isolates the +4.2%/replicating signal that fell out of
+    fav_combo's straights, tagged by side + favorite strength so we can see where
+    the edge concentrates (the favorite-longshot bias should be strongest on heavy
+    favorites)."""
+    rows, cov = [], Counter()
+    scores = blob["team_scores"]
+    for season, triads in blob["triads_by_season"].items():
+        for t in triads:
+            cov["games"] += 1
+            try:
+                imp_home = american_to_implied_prob(int(t.ml_home))
+                imp_away = american_to_implied_prob(int(t.ml_away))
+            except (TypeError, ValueError):
+                cov["bad_ml"] += 1
+                continue
+            if imp_home == imp_away:
+                cov["pickem"] += 1
+                continue
+            fav_is_home = imp_home > imp_away
+            fav_imp = max(imp_home, imp_away)
+            if fav_is_home:                       # bet AWAY dog +1.5
+                dog_is_home, dog_point, dog_price = False, -(t.rl_home_point or 0.0), t.rl_away
+            else:                                 # bet HOME dog +1.5
+                dog_is_home, dog_point, dog_price = True, (t.rl_home_point or 0.0), t.rl_home
+            if abs(dog_point - 1.5) > 0.01:
+                cov["dog_not_+1.5"] += 1
+                continue
+            gpk = t.game_pk
+            if gpk is None or int(gpk) not in scores:
+                cov["no_score"] += 1
+                continue
+            hs, as_ = scores[int(gpk)]
+            result = _grade_runline(dog_is_home, 1.5, hs, as_)
+            p = r2_grade.profit(dog_price, result)
+            if p is None:
+                cov["ungradable"] += 1
+                continue
+            cov["graded"] += 1
+            rows.append({"season": str(season), "result": result, "profit": p,
+                         "price": dog_price,
+                         "side": "home_dog" if dog_is_home else "away_dog",
+                         "fav_bucket": _fav_bucket(fav_imp)})
+    return rows, cov
+
+
 # ── scenario: FAV ML + DOG +1.5 (parlay AND two straights) ───────────────────
 
 def scenario_fav_combo(blob):
@@ -332,6 +389,18 @@ def _report(title, rows, cov=None, cov_keys=()):
     return pooled
 
 
+def _print_slice(rows, keyfn, label):
+    """Print a by-key breakdown (side, favorite bucket, ...) — ROI/hit/t per cell."""
+    cells = r2_grade.by_key(rows, keyfn)
+    print(f"  by {label}:")
+    for k in sorted(cells, key=str):
+        sm = cells[k]
+        tag = "" if sm.n >= 30 else "  (thin)"
+        print(f"    {str(k):<12} n={sm.n:>5,} ROI={sm.roi:+.2%} "
+              f"hit={sm.hit_rate:.1%} t={sm.t_stat:+.2f}{tag}")
+    print("")
+
+
 # ── data load (cache-first, shared across scenarios) ─────────────────────────
 
 def _pitcher_team_index(seasons):
@@ -409,7 +478,8 @@ def main():
     ap.add_argument("--sport", default="baseball_mlb")
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--scenario", default="all",
-                    choices=["all", "under_hits", "home_runline", "fav_combo", "er_ml"])
+                    choices=["all", "under_hits", "home_runline", "dog_runline",
+                             "fav_combo", "er_ml"])
     ap.add_argument("--refresh", action="store_true",
                     help="re-read the warehouse (else use the pickle cache)")
     args = ap.parse_args()
@@ -433,6 +503,12 @@ def main():
         rows, cov = scenario_home_runline(blob)
         _report("HOME +1.5 run-line (home is the +1.5 dog)", rows, cov,
                 ("games", "graded", "home_not_+1.5_dog", "no_score"))
+    if want in ("all", "dog_runline"):
+        rows, cov = scenario_dog_runline(blob)
+        _report("UNDERDOG +1.5 run-line (clear ML favorite; home or away dog)", rows,
+                cov, ("games", "graded", "dog_not_+1.5", "no_score", "pickem"))
+        _print_slice(rows, lambda r: r["side"], "side")
+        _print_slice(rows, lambda r: r["fav_bucket"], "favorite strength (ML implied)")
     if want in ("all", "fav_combo"):
         parlay, straights, cov = scenario_fav_combo(blob)
         print(f"  fav_combo coverage: graded_games={cov.get('graded_games',0):,} "
