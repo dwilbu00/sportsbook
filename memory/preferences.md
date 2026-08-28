@@ -25,6 +25,12 @@ Owner is **Doug** — sole user AND developer of this MLB (+NBA/NFL) sportsbook 
 ## Spend confirmation
 Before EXECUTING any large/irreversible spend (Odds API credits, paid backfills, real money/quota), give one final explicit "firing now — ~N credits, go?" beat — **even after a general go-ahead during scoping**. A planning "let's do it" is NOT consent to spend at the moment of execution (2026-08-15: approved ~10.5k-cr backfill during scoping, fired it, Doug immediately asked to pause). Dry-runs / pricing / diagnostics / reads / code+tests are free — no confirm needed; only the real spend does.
 
+## Verifying prod state (do this instead of asking)
+I can read prod Azure SQL **directly** (read-only, no spend) by calling
+`db_store.promote_secrets_from_toml()` first, then querying — so verify prod state
+(tables, DDL applied, row counts, live calibration) MYSELF rather than asking Doug.
+Never commit `secrets.toml`. Coords/mechanism in [[data-and-architecture]].
+
 ## Backtest execution — handoff to Doug's machine
 Doug runs all backtests on his own (much faster) machine. **Do NOT run long/grading backtests here.** Write the exact copy-pasteable command block + a short "what I'm looking for in the output" note, hand off, wait for pasted output to interpret. Keep doing the CODE side here (build/commit INERT + opt-in features behind their own sweep flags). Cheap dry-runs / store-builds / non-grading utilities are fine to run here.
 

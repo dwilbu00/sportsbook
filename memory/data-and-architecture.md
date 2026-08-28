@@ -1,6 +1,6 @@
 ---
 name: data-and-architecture
-description: THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion (ESPN fully removed for MLB), MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV, and the active 5M-credit odds backfill + relaunch reset.
+description: THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion (ESPN fully removed for MLB), MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV. 5M-credit backfill + clean-slate relaunch + all prod DDL = DONE (2026-08-28).
 metadata:
   type: project
 ---
@@ -11,7 +11,7 @@ The app runs entirely on **Azure SQL** (Blob retired) with the **MLB data layer 
 
 ## Azure SQL warehouse (storage layer) — MIGRATION COMPLETE
 
-- **DB:** `sportsbookstreamlitdb.database.windows.net:1433` / `sportsbook_value_finder_db`, 32 GB. App connects as least-privilege **`StreamlitApp`** (CRUD only). **Owner runs ALL DDL manually** from `sql/*.sql`; the app never issues DDL. Prod is **mssql+pymssql** (TDS wheel, no ODBC needed on Streamlit Cloud). Opt-in `SQL_DRIVER=pyodbc` on the desktop backfill box enables `fast_executemany` (~10x on UPDATE-heavy backfills; needs ODBC Driver 18 + `pip install pyodbc`).
+- **DB:** `sportsbookstreamlitdb.database.windows.net:1433` / `sportsbook_value_finder_db`, 250 GB. App connects as least-privilege **`StreamlitApp`** (CRUD only). **Owner runs ALL DDL manually** from `sql/*.sql`; the app never issues DDL. Prod is **mssql+pymssql** (TDS wheel, no ODBC needed on Streamlit Cloud). Opt-in `SQL_DRIVER=pyodbc` on the desktop backfill box enables `fast_executemany` (~10x on UPDATE-heavy backfills; needs ODBC Driver 18 + `pip install pyodbc`).
 - **Feature-flagged:** SQL used only when `SQL_SERVER/DATABASE/USER/PASSWORD` are set. `db_store._secret` is env-only (app.py promotes st.secrets→env at boot; CLIs call `db_store.promote_secrets_from_toml()` — required before any offline prod probe or it silently reads the empty LOCAL store). **⚠ Streamlit Cloud has NO OS env vars** — app boot promotes secrets (SQL_* + all gate flags) from `st.secrets`→os.environ; I cannot set Cloud secrets, only the owner can.
 - **Schema is fully columnar** (no JSON-text columns), `sql/schema.sql` mirrors `db_store.py` SQLAlchemy metadata (`test_db_store.SchemaParityTests` guards drift). Phase A = prediction_log/wagers/recalibration_*; Phase B = odds warehouse (`odds_snapshot` UNIQUE(sport,game_date,event_id,kind,snapshot_hour) write-once + `odds_line` per-descriptor); Phase C = durable gamelog store. Cross-PROCESS concurrency is NOT guarded (in-process `_lock` only; Community Cloud single-replica) → run offline SQL-writing tools when the app is idle.
 - Live counts prove active writes (SQL is source of truth). Rollback (re-add Blob SAS) is theoretical only; Blob is unconfigured. **Nothing pending on the migration.**
@@ -38,9 +38,9 @@ The whole MLB data layer moved off ESPN onto MLB StatsAPI (grew out of the 2026-
 ## Statcast cache + as-of feature stores
 
 - **Raw Statcast pitch cache is in Azure SQL** (`statcast_pitch` + `statcast_day` manifest) — machine-independent, self-updating (commit 58d13b2). `savant_history.py` is SQL-single-store (`ingest_day`, `load_days`, `missing_days`/`ensure_days`, `--migrate-to-sql`/`--ensure`). Verified populated 2023-26 (~800K pitches/season, ~173K xBA/season). Live-app freshness self-heals idle gaps via a durable `statcast_last_ensured` watermark in `app_settings` (widens lookback after burst-usage gaps; 5710208).
-- **⚠ Refit-box gotcha (historical, now auto-handled):** a missing local Statcast day cache silently dropped method D + the xBA blend and mis-flipped batter_hits. `refit_sport_real_lines` auto-runs `ensure_days` (cap `STATCAST_GAPFILL_CAP=45`) over the obs seasons before the xBA build. **Operator to activate once:** hand-run the 2 tables' DDL + seed via `savant_history.py --migrate-to-sql/--ensure --season 2023,2024,2025,2026`.
+- **⚠ Refit-box gotcha (historical, now auto-handled):** a missing local Statcast day cache silently dropped method D + the xBA blend and mis-flipped batter_hits. `refit_sport_real_lines` auto-runs `ensure_days` (cap `STATCAST_GAPFILL_CAP=45`) over the obs seasons before the xBA build. **✅ Activated (DDL + seed done 2026-08-28)** via `savant_history.py --migrate-to-sql/--ensure`.
 - **`pitcher_asof_daily`** (`pitcher_asof.py`) = durable per-(pitcher, as_of_date, role) as-of feature store: SP rows carry statcast (xwOBAcon/whiff/csw/barrel/hard_hit/gb + K%/BB%/BF once GS-backfilled) + warehouse (era/ip/avg_ip/k9/GS), RAW (fit in code). Team-bullpen RP rows keyed on GS==0. Lazy `get_or_fill` (no cron) + bulk `build_season`. Owner backfilled 2023-26 (~75k SP rows). Unifies fit==serve==grade + kills the per-run 3M-row statcast load.
-- `statcast_asof.py` = single-cutoff live-app derived table (2026 serving-side). Key perf indexes (operator hand-runs the CREATEs on prod): `ix_statcast_pitch_offense (batting_team,p_throws,game_date) INCLUDE(xwoba)`, `ix_statcast_pitch_pitcher (pitcher,game_date) INCLUDE(xwoba)`, `ix_mlb_batter/pitcher_game_gamepk`, `ix_mlb_game_season_status`. **Perf lesson:** the paid Azure tier is NOT slow (full-season GROUP BY = 4.6s server-side); the ~1-file/min stalls were client-side — pymssql 60s query timeout + prewarm thread-pool concurrent connections. Fix = `mlb_starters.precompute_offense_cache([2024,2025,2026])` run ONCE (reads statcast in timeout-safe chunks, ~89s/season) before a backtest.
+- `statcast_asof.py` = single-cutoff live-app derived table (2026 serving-side). Key perf indexes (✅ created on prod 2026-08-28): `ix_statcast_pitch_offense (batting_team,p_throws,game_date) INCLUDE(xwoba)`, `ix_statcast_pitch_pitcher (pitcher,game_date) INCLUDE(xwoba)`, `ix_mlb_batter/pitcher_game_gamepk`, `ix_mlb_game_season_status`. **Perf lesson:** the paid Azure tier is NOT slow (full-season GROUP BY = 4.6s server-side); the ~1-file/min stalls were client-side — pymssql 60s query timeout + prewarm thread-pool concurrent connections. Fix = `mlb_starters.precompute_offense_cache([2024,2025,2026])` run ONCE (reads statcast in timeout-safe chunks, ~89s/season) before a backtest.
 
 ## Additive expected-runs model + game_pk grading (Tier-A) — LIVE, active build
 
@@ -53,17 +53,17 @@ The whole MLB data layer moved off ESPN onto MLB StatsAPI (grew out of the 2026-
 
 DK-vs-DK exact-line CLV via on-demand historical backfill (`backfill_dk_clv.py`), NOT a scheduler (Streamlit Cloud has none). Props (0906e73) + team markets (adbcdfe) both shipped; the warehouse-derived CLV path is fully retired. `dk_close_for_wager` fetches `bookmakers=['draftkings']` at `date=commence_time` (nearest at-or-before = the close); line-moved bets left honestly UNFILLED. Ledger is CLV-filled. **⚠ `--refresh` clears ALL CLV rows** (~400cr; dry-run without `--refresh` under-reports cost). Vendor facts: historical props only after 2023-05-03, team back to 2020-06; 5-min snapshots since Sept 2022; cost `10×markets×regions` (the `bookmakers=` filter does NOT reduce cost). Use Case B (corpus benchmark) + durable SQL cache table remain out of scope.
 
-## Odds warehouse + the 5M-credit backfill (ACTIVE)
+## Odds warehouse + the 5M-credit backfill (DONE 2026-08-28, owner-confirmed)
 
 - **Table decision RESOLVED: keep ONE sport-keyed table** — `warehouse.capture_event_odds → db_store.odds_snapshot/odds_line` is already sport-agnostic (zero refactor). Ensure a `(sport,date,market)` leading index.
 - **Tools:** `backfill_historical_odds.py` (T3) = multi-sport workhorse (`--sport {mlb,nfl,nba,nhl} --category {team,props} --snapshot {early,close}`, `--gap-fill` warehouse-coverage repair, `--dry-run` local cost); `topup_props_odds.py` (T1, MLB props CLOSE) + `topup_team_odds.py` (T2, MLB team CLOSE) = warehouse gap-diff. ⚠ Don't trust T2's MLB-team gap count (blind to `kind='seed'` snapshots → 4× over-reports).
 - **Provenance:** `odds_snapshot.source` ('live'|'backfill_early'|'backfill_close'|'seed'|'sbr') lets backtests filter without affecting reads. `odds_provenance.py --retag`/`--prune-seed` (dry-run default, archives before delete). **Owner boundary: MLB live begins 2026-01-01; 2023-2025 = backfill corpus.** Early-time canonical = 13:00Z. **⚠ ORDERING: RETAG before GAP-FILL** (gap-fill matches on the exact source tag; untagged closes read as missing → wasted re-fetch).
 - **Spend-review CLEARED:** 6 confirmed findings all fixed (the HIGH one: PROP_LABELS dropped ~70% of NFL/NBA prop markets into a black hole while claiming complete coverage — fixed + pre-flight guard). Backfill `--warehouse` asserts `storage_backend()=='Azure SQL'` before spending.
-- **★ Deep re-refit (the backfill payoff):** season-aware join (grades each obs against its own season's gamelog), per-season opp_defense (fixed a future-season leak), and read-scale fixes for the ~1.5M-row prop warehouse — chunked `player_prop_lines` (SQL prop_keys filter, drop ORDER BY, `exclude_early`) + `get_calib_gamelogs_bulk` (ONE query/role/season, replacing thousands of per-(player,season) round-trips). PURE real-line path confirmed (`--real-lines` self-fits residuals on all obs; synthetic sweep + splice retired). Run: `--discard → --real-lines --xstats-strength 0.5 --no-roi-tiebreak → --diff → --promote` (DK-only so `--no-roi-tiebreak`; do NOT pass `--store-label`).
+- **★ Deep re-refit (the backfill payoff):** season-aware join (grades each obs against its own season's gamelog), per-season opp_defense (fixed a future-season leak), and read-scale fixes for the ~1.5M-row prop warehouse — chunked `player_prop_lines` (SQL prop_keys filter, drop ORDER BY, `exclude_early`) + `get_calib_gamelogs_bulk` (ONE query/role/season, replacing thousands of per-(player,season) round-trips). PURE real-line path confirmed (`--real-lines` self-fits residuals on all obs; synthetic sweep + splice retired). ✅ The deep re-refit was RUN + `--promote`d (owner-confirmed 2026-08-28). Re-run recipe for future refits: `--discard → --real-lines --xstats-strength 0.5 --no-roi-tiebreak → --diff → --promote` (DK-only so `--no-roi-tiebreak`; do NOT pass `--store-label`).
 
-## Clean-slate relaunch (staged, execute at relaunch)
+## Clean-slate relaunch (DONE — executed 2026-08-28, owner-confirmed)
 
-"So much has changed it's not even the same app." `archive_app_data.py` (built, f1f1dc0) archives prediction_log + market_prediction_log + wagers + bankroll_ledger to ONE timestamped JSON (fsync + round-trip verify), THEN id-bounded-deletes in one transaction, writes an `app_data_epoch` marker to app_settings. This is the non-destructive archive-then-epoch design (NOT the overturned wipe). **HARD LINE — PRESERVE, never touch:** calibration fits (`calibration/*.json`, `recalibration_params`), resolved facts (mlb_game/gamelogs/statcast), team-market blocks, the 2023-2025 odds corpus. Owner decisions: ZERO the bankroll (re-enter via My Bets after reset), prune the thin ~3,000 pre-relaunch 2026 `live` odds, do a clean early(13:00Z)+close corpus load. **Run with the app STOPPED, explicit confirm required.**
+"So much has changed it's not even the same app." `archive_app_data.py` (built, f1f1dc0) archives prediction_log + market_prediction_log + wagers + bankroll_ledger to ONE timestamped JSON (fsync + round-trip verify), THEN id-bounded-deletes in one transaction, writes an `app_data_epoch` marker to app_settings. This is the non-destructive archive-then-epoch design (NOT the overturned wipe). **HARD LINE — PRESERVE, never touch:** calibration fits (`calibration/*.json`, `recalibration_params`), resolved facts (mlb_game/gamelogs/statcast), team-market blocks, the 2023-2025 odds corpus. ✅ Executed 2026-08-28 (owner-confirmed): bankroll ZEROED (re-enter via My Bets), thin ~3,000 pre-relaunch 2026 `live` odds pruned, clean early(13:00Z)+close corpus loaded, `app_data_epoch` marker set. (Design was archive-then-epoch, NOT the overturned wipe; run had app STOPPED + explicit confirm.)
 
 ## Live-analysis performance
 
@@ -78,11 +78,17 @@ Four adversarial verifiers audited whether the forward-worse-than-backtest Brier
 - **The gap is genuine OOS degradation**, most plausibly (a) sweep selection-optimism / winner's curse (even the data-rich batter_hits n=3262 degrades forward, refuting "data-volume problem"), (b) 2026 ABS-season regime novelty, (c) a metric-definition asymmetry (forward = stored outcomes over ALL rows; backtest = re-derived labels over a curated subset). None fixed by a reset. **Takeaway: trust cv/forward Brier over fit_brier; treat forward Brier as the real objective.**
 - One real-but-small structural defect: `combined_mult` train/serve skew — live folds matchup/lineup/weather/output_def multipliers that the offline fit omits, so params are learned matchup-free but served matchup-scaled. Magnitude ~0.0004 MAE (multiplier ≈1.0 avg); pitcher_outs/pitcher_strikeouts have ZERO gap (no matchup/park). Structural, not the root cause.
 
-## Pending operator actions (DDL / runbooks — owner runs, I never push)
+## Operator DDL / runbooks — ALL APPLIED (2026-08-28, owner-confirmed)
 
-- Hand-run guarded DDL on prod Azure for: statcast_pitch/statcast_day tables + seed; the perf indexes above (WITH ONLINE=ON); the `odds_snapshot.source` ALTER + `v_odds_coverage`/`v_mlb_team_coverage_vs_eligible` views; pitcher BB/BF/HR/HBP/GS ALTERs; then re-derive `mlb_pitcher_game` + `pitcher_asof.py --build` to populate them.
-- Credit-windfall backfill runbook (per sport×category cell, dry-run → confirm cost → `--apply`; must finish before the 5M reverts month-end).
-- Commit C optional legacy re-stamp RUN: `restamp_legacy_ids.py --apply --odds` → `mlb_warehouse.py --backfill-game-pk --apply` (SQL backup + `shadow_stamp.py` re-preview first).
-- `mlb_warehouse.py --backfill-team-game-pk --apply` for legacy team wagers/odds_line.
+⭐ **I can verify prod state DIRECTLY** (read-only, no spend) by calling
+`db_store.promote_secrets_from_toml()` first, then reading Azure SQL — so verify prod
+myself rather than asking Doug. **Never commit `secrets.toml`.**
+
+All prior operator actions are DONE: prod Azure DDL (statcast_pitch/statcast_day tables
++ seed; perf indexes ONLINE=ON; `odds_snapshot.source` ALTER + `v_odds_coverage`/
+`v_mlb_team_coverage_vs_eligible` views; pitcher BB/BF/HR/HBP/GS ALTERs +
+`mlb_pitcher_game`/`pitcher_asof --build` re-derive); the 5M-credit windfall backfill;
+Commit C legacy re-stamp (`restamp_legacy_ids --apply --odds` → `--backfill-game-pk
+--apply`); and the legacy team `--backfill-team-game-pk`.
 
 Related domains: mlb-2026-reset-audit-verdict, calibration-candidate-workflow, edge-strategy-deep-dive, accuracy-improvement-roadmap.
