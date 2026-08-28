@@ -2,10 +2,11 @@
 backtesting.
 
 All four backtest tools (r2_backtest, coherence_backtest, f5_backtest,
-scenario_backtest) read through this when `ODI_BACKTEST_MIRROR` is set AND the mirror
-exists — one shared local columnar store instead of every tool re-hitting Azure on
-every run. The LIVE APP and the CALIBRATION REFIT are untouched (they read Azure
-directly and must — they need fresh data / the full ESPN-shape gamelogs).
+scenario_backtest) read through this BY DEFAULT when the mirror exists — one shared
+local columnar store instead of every tool re-hitting Azure on every run. Set
+`ODI_BACKTEST_MIRROR=0` to force the live Azure path. The CALIBRATION REFIT reads
+Azure directly (it needs the full ESPN-shape gamelogs); production Streamlit Cloud has
+no mirror dir → the readers use Azure there automatically.
 
 Design:
 - `sync()` pulls each read-only table from Azure and writes parquet (season-keyed).
@@ -23,9 +24,10 @@ Only the DEFAULT read path is mirrored (all snapshots, close-picking done downst
 on captured_at); `only_early` / `exclude_early` are NOT mirrored (the backtests don't
 use them). 2024/2025 are immutable done seasons — re-sync only the current season.
 
-Sync (needs Azure; run once per machine or copy the dir):
+Backtests use the mirror BY DEFAULT and auto-build it on first run (each tool calls
+`autobuild()`), so a manual sync is optional:
   python warehouse_mirror.py --sync --sport baseball_mlb --seasons 2024,2025,2026
-Then for backtests:  export ODI_BACKTEST_MIRROR=1
+To force the live Azure path instead:  export ODI_BACKTEST_MIRROR=0
 """
 import argparse
 import os
@@ -44,15 +46,17 @@ _NON_REGULAR_GAME_TYPES = ("S", "A", "E")
 
 
 def flag_on():
-    """True iff mirror reads are REQUESTED (env flag) — regardless of whether the dir
-    exists yet. Backtest tools gate the auto-build `ensure()` on this (it creates the
-    dir); readers gate on `enabled()` (flag AND dir present)."""
-    return str(os.environ.get("ODI_BACKTEST_MIRROR", "")).strip().lower() in (
-        "1", "true", "yes", "on")
+    """Mirror reads are ON BY DEFAULT — set `ODI_BACKTEST_MIRROR` to a falsy value
+    (0/false/no/off) to force the live Azure path instead. Regardless of whether the
+    dir exists yet: backtest tools gate the auto-build `ensure()` on this (it creates
+    the dir); readers gate on `enabled()` (this AND dir present)."""
+    return str(os.environ.get("ODI_BACKTEST_MIRROR", "")).strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def enabled():
-    """True iff mirror reads are on AND the mirror dir exists (readers gate on this)."""
+    """True iff mirror reads are on (default) AND the mirror dir exists (readers gate on
+    this — no dir, e.g. production Streamlit Cloud, means the Azure path is used)."""
     return flag_on() and os.path.isdir(MIRROR_DIR)
 
 
@@ -439,9 +443,11 @@ def verify(sport, seasons, verbose=True):
                 player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book),
                 db_store.player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)))
 
-    # Fact indexes: flag OFF so r2_data hits Azure for the comparison baseline.
+    # Fact indexes: force the mirror OFF (=0) so r2_data hits Azure for the baseline
+    # (the mirror is default-on, so popping the var would NOT disable it).
     gf = _game_file(sport)
-    _saved = os.environ.pop("ODI_BACKTEST_MIRROR", None)
+    _saved = os.environ.get("ODI_BACKTEST_MIRROR")
+    os.environ["ODI_BACKTEST_MIRROR"] = "0"
     try:
         record(gf, (build_team_scores_index() or {}) == r2_data.build_team_scores_index())
         record(gf, (build_f5_scores_index() or {}) == r2_data.build_f5_scores_index())
@@ -452,7 +458,9 @@ def verify(sport, seasons, verbose=True):
             record(_pitcher_file(sport, s), _calib_eq("pitcher", s))
             record(_batter_file(sport, s), _calib_eq("batter", s))
     finally:
-        if _saved is not None:
+        if _saved is None:
+            os.environ.pop("ODI_BACKTEST_MIRROR", None)
+        else:
             os.environ["ODI_BACKTEST_MIRROR"] = _saved
 
     all_ok = True
@@ -478,7 +486,7 @@ def _needed_files(sport, seasons):
 
 def ensure(sport, seasons, refresh=False, verbose=False):
     """Make the mirror ready for (sport, seasons), called by each backtest tool when
-    ODI_BACKTEST_MIRROR is on. FAST PATH: if every needed file is already `_valid`, do
+    the mirror is on (the default; ODI_BACKTEST_MIRROR=0 disables). FAST PATH: if every needed file is already `_valid`, do
     nothing (no Azure, no verify). Otherwise sync missing files + verify (which marks
     passing files `_valid`), so verification happens ONCE per file, not per run.
     refresh=True re-syncs + re-verifies everything. Needs Azure to build/verify; on any
@@ -536,8 +544,8 @@ def main():
         verify(args.sport, seasons)
     if not (args.sync or args.verify):
         print(f"  mirror dir: {MIRROR_DIR}  enabled={enabled()}")
-        print("  --sync to build · --verify to parity-check · "
-              "ODI_BACKTEST_MIRROR=1 to read from it.")
+        print("  --sync to build · --verify to parity-check · reads are ON by default "
+              "(ODI_BACKTEST_MIRROR=0 forces Azure) · backtests auto-build.")
 
 
 if __name__ == "__main__":

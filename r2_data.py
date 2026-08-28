@@ -49,10 +49,10 @@ _SYNONYM = {"batter_hits": ("batter_total_bases", frozenset({0.5}))}
 
 
 # ── local parquet mirror routing (backtest-only; Azure fallback per call) ─────
-# When ODI_BACKTEST_MIRROR is on + the mirror exists, backtest reads come from local
-# parquet instead of Azure. Each mirror reader returns None on a missing slice, so we
-# fall back to the live db_store/mlb_warehouse read for that call. The LIVE APP + the
-# calibration REFIT never import this path (they call db_store directly).
+# By DEFAULT (unless ODI_BACKTEST_MIRROR=0) + the mirror dir exists, backtest reads
+# come from local parquet instead of Azure. Each mirror reader returns None on a
+# missing slice, so we fall back to the live db_store/mlb_warehouse read for that call.
+# Production (Streamlit Cloud) has no mirror dir -> enabled() is False -> Azure path.
 
 def _mirror():
     try:

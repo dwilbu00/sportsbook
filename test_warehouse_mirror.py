@@ -161,10 +161,13 @@ class WarehouseMirrorTests(unittest.TestCase):
             wm._mark_valid(f)
         self.assertTrue(wm.ensure(SPORT, ["2024"]))
 
-    def test_autobuild_noop_when_flag_off(self):
+    def test_flag_default_on_and_explicit_off(self):
+        # ON by default (unset), OFF only when explicitly falsy.
         os.environ.pop("ODI_BACKTEST_MIRROR", None)
+        self.assertTrue(wm.flag_on())                         # default ON
+        os.environ["ODI_BACKTEST_MIRROR"] = "0"
         self.assertFalse(wm.flag_on())
-        self.assertFalse(wm.autobuild(SPORT, ["2024"]))       # no-op, no Azure
+        self.assertFalse(wm.autobuild(SPORT, ["2024"]))       # off -> no-op, no Azure
 
     def test_missing_season_returns_none(self):
         # a season with no parquet -> None (per-call Azure fallback), not empty/wrong

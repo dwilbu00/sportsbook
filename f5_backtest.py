@@ -176,7 +176,7 @@ def main():
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--refresh-mirror", action="store_true",
-                    help="re-sync + re-verify the parquet mirror (with ODI_BACKTEST_MIRROR)")
+                    help="re-sync + re-verify the parquet mirror (on by default; ODI_BACKTEST_MIRROR=0 disables)")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
