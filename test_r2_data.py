@@ -219,6 +219,54 @@ class TeamTriadTests(unittest.TestCase):
         self.assertEqual(stats["events_dropped_incomplete_triad"], 1)
 
 
+class F5MLTests(unittest.TestCase):
+    def _r(self, book, bt, sel, pt, price, sid=2, cap="2024-06-26T23:00:00Z",
+           com="2024-06-26T23:10:00Z", home="Mets", away="Yankees", eid="F1", gpk=700):
+        return {"book": book, "snapshot_id": sid, "captured_at": cap,
+                "commence_time": com, "event_id": eid, "home": home, "away": away,
+                "kind": "first_five", "bet_type": bt, "selection": sel,
+                "point": pt, "price": price, "game_pk": gpk}
+
+    def test_extracts_dk_ml_pin_spread0_fd_ml(self):
+        rows = [
+            self._r("draftkings", "moneyline", "Mets", None, -120),
+            self._r("draftkings", "moneyline", "Yankees", None, -110),
+            self._r("pinnacle", "spread", "Mets", 0.0, +102),      # 0.0 spread == F5 ML
+            self._r("pinnacle", "spread", "Yankees", 0.0, -114),
+            self._r("fanduel", "moneyline", "Mets", None, +102),
+            self._r("fanduel", "moneyline", "Yankees", None, -128),
+        ]
+        legs, stats = d.select_f5_ml_legs(rows)
+        self.assertEqual(len(legs), 1)
+        lg = legs[0]
+        self.assertEqual((lg.dk_home, lg.dk_away), (-120, -110))
+        self.assertEqual((lg.pin_home, lg.pin_away), (102, -114))
+        self.assertEqual((lg.fd_home, lg.fd_away), (102, -128))
+
+    def test_pinnacle_nonzero_spread_ignored(self):
+        # A Pinnacle F5 spread NOT at 0.0 is not the ML -> DK+Pin incomplete -> drop.
+        rows = [
+            self._r("draftkings", "moneyline", "Mets", None, -120),
+            self._r("draftkings", "moneyline", "Yankees", None, -110),
+            self._r("pinnacle", "spread", "Mets", 1.5, +102),
+            self._r("pinnacle", "spread", "Yankees", -1.5, -114),
+        ]
+        legs, stats = d.select_f5_ml_legs(rows)
+        self.assertEqual(legs, [])
+        self.assertEqual(stats["legs_dropped_incomplete_dk_pin"], 1)
+
+    def test_fanduel_optional(self):
+        rows = [
+            self._r("draftkings", "moneyline", "Mets", None, -120),
+            self._r("draftkings", "moneyline", "Yankees", None, -110),
+            self._r("pinnacle", "spread", "Mets", 0.0, +102),
+            self._r("pinnacle", "spread", "Yankees", 0.0, -114),
+        ]
+        legs, _ = d.select_f5_ml_legs(rows)
+        self.assertEqual(len(legs), 1)
+        self.assertIsNone(legs[0].fd_home)
+
+
 class OutcomeValueTests(unittest.TestCase):
     def test_game_pk_exact_hit_and_miss(self):
         idx = {"batter": {("683002", 700): {"H": 2.0, "SO": 1.0}}}

@@ -387,6 +387,106 @@ def load_team_triad(sport, seasons, bookmaker="draftkings"):
     return by_season, stats_by
 
 
+# ── First-five (F5) moneyline legs for the F5 sharp-vs-soft edge ───────────────
+# Pinnacle books NO F5 moneyline but books its F5 "spread" uniformly at 0.0 — a
+# pick'em, which IS the moneyline (home covers 0.0 iff it wins outright; a tie is a
+# push, matching DK's 2-way F5 ML). So Pinnacle's deviged F5 spread-0.0 is its F5 ML,
+# a DIRECT sharp reference (no run-distribution translation needed). DK + FanDuel post
+# F5 ML directly (both executable books).
+
+F5MLLeg = namedtuple("F5MLLeg",
+                     "event_id game_date commence_time snapshot_id game_pk home away "
+                     "dk_home dk_away pin_home pin_away fd_home fd_away")
+
+
+def select_f5_ml_legs(rows):
+    """PURE: per first_five event, pick the close snapshot (latest captured<=commence)
+    and extract each book's F5 moneyline: DK/FanDuel from bet_type='moneyline',
+    Pinnacle from its bet_type='spread' at point 0.0 (== its F5 ML). Requires DK +
+    Pinnacle present (the core comparison); FanDuel optional (None if absent)."""
+    stats = Counter()
+    by_event = defaultdict(list)
+    for r in rows:
+        by_event[r.get("event_id")].append(r)
+    legs = []
+    for _eid, ev_rows in by_event.items():
+        snaps = {}
+        for r in ev_rows:
+            cap = _parse_ts(r.get("captured_at"))
+            com = _parse_ts(r.get("commence_time"))
+            if cap is None or com is None or cap > com:
+                continue
+            snaps.setdefault(r.get("snapshot_id"), {"cap": cap, "rows": []})["rows"].append(r)
+            snaps[r.get("snapshot_id")]["cap"] = cap
+        if not snaps:
+            stats["events_dropped_no_pre_commence"] += 1
+            continue
+        _sid, close = max(snaps.items(), key=lambda kv: kv[1]["cap"])
+        meta = close["rows"][0]
+        home, away = meta.get("home"), meta.get("away")
+        dk, pin, fd = {}, {}, {}
+        for r in close["rows"]:
+            bk, bt, sel = r.get("book"), r.get("bet_type"), r.get("selection")
+            pt, px = r.get("point"), r.get("price")
+            if bk == "draftkings" and bt == "moneyline":
+                dk[sel] = px
+            elif bk == "pinnacle" and bt == "spread" and pt is not None and abs(pt) < 1e-9:
+                pin[sel] = px            # 0.0 spread == Pinnacle's F5 moneyline
+            elif bk == "fanduel" and bt == "moneyline":
+                fd[sel] = px
+        dk_home, dk_away = dk.get(home), dk.get(away)
+        pin_home, pin_away = pin.get(home), pin.get(away)
+        if None in (dk_home, dk_away, pin_home, pin_away):
+            stats["legs_dropped_incomplete_dk_pin"] += 1
+            continue
+        legs.append(F5MLLeg(
+            event_id=meta.get("event_id"), game_date=meta.get("game_date"),
+            commence_time=meta.get("commence_time"),
+            snapshot_id=meta.get("snapshot_id"), game_pk=meta.get("game_pk"),
+            home=home, away=away, dk_home=dk_home, dk_away=dk_away,
+            pin_home=pin_home, pin_away=pin_away,
+            fd_home=fd.get(home), fd_away=fd.get(away)))
+        stats["legs_built"] += 1
+    return legs, stats
+
+
+def load_f5_ml_legs(sport, seasons):
+    """Fetch + pair DK/Pinnacle/FanDuel F5 moneyline legs per season. Returns
+    (legs_by_season, stats_by_season)."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    by_season, stats_by = {}, {}
+    for s in seasons:
+        rows = []
+        for book in ("draftkings", "pinnacle", "fanduel"):
+            fetched = db_store.team_market_lines(
+                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
+            for r in fetched:
+                if r.get("kind") == "first_five":
+                    r["book"] = book
+                    rows.append(r)
+        legs, stats = select_f5_ml_legs(rows)
+        by_season[s], stats_by[s] = legs, stats
+    return by_season, stats_by
+
+
+def build_f5_scores_index(seasons=None):
+    """{game_pk(int): (home_score_f5, away_score_f5)} for games with F5 scores."""
+    import mlb_warehouse as wh
+    import db_store
+    from sqlalchemy import select as _select
+    g = wh.mlb_game
+    idx = {}
+    with db_store.get_engine().connect() as conn:
+        rows = conn.execute(
+            _select(g.c.game_pk, g.c.home_score_f5, g.c.away_score_f5)
+            .where(g.c.home_score_f5.isnot(None) & g.c.away_score_f5.isnot(None))
+        ).fetchall()
+    for gpk, h5, a5 in rows:
+        idx[int(gpk)] = (float(h5), float(a5))
+    return idx
+
+
 def build_team_scores_index(seasons=None):
     """{game_pk(int): (home_score, away_score)} for all final games, from mlb_game."""
     import mlb_warehouse as wh
