@@ -49,5 +49,52 @@ class FlagGamesTests(unittest.TestCase):
         self.assertEqual(evs, sorted(evs, reverse=True))
 
 
+def _game(book="draftkings", home="Mets", away="Yankees"):
+    return {
+        "id": "E1", "commence_time": "2026-08-27T23:05:00Z",
+        "home_team": home, "away_team": away,
+        "bookmakers": [{"key": book, "markets": [
+            {"key": "h2h", "outcomes": [
+                {"name": home, "price": -150}, {"name": away, "price": +130}]},
+            {"key": "spreads", "outcomes": [
+                {"name": home, "price": +120, "point": -1.5},
+                {"name": away, "price": -140, "point": +1.5}]},
+            {"key": "totals", "outcomes": [
+                {"name": "Over", "price": -110, "point": 8.5},
+                {"name": "Under", "price": -110, "point": 8.5}]},
+        ]}]}
+
+
+class TriadsFromUpcomingTests(unittest.TestCase):
+    def test_parses_complete_triad(self):
+        triads, stats = cf.triads_from_upcoming([_game()])
+        self.assertEqual(len(triads), 1)
+        t = triads[0]
+        self.assertEqual((t.home, t.away), ("Mets", "Yankees"))
+        self.assertEqual((t.ml_home, t.ml_away), (-150, +130))
+        self.assertEqual((t.rl_home_point, t.rl_home, t.rl_away), (-1.5, +120, -140))
+        self.assertEqual((t.total_line, t.total_over, t.total_under), (8.5, -110, -110))
+        self.assertEqual(t.game_date, "2026-08-27")
+        self.assertEqual(stats["triads_built"], 1)
+
+    def test_drops_when_book_absent(self):
+        triads, stats = cf.triads_from_upcoming([_game(book="fanduel")])
+        self.assertEqual(triads, [])
+        self.assertEqual(stats["events_dropped_no_book"], 1)
+
+    def test_drops_incomplete_triad(self):
+        g = _game()
+        g["bookmakers"][0]["markets"] = g["bookmakers"][0]["markets"][:2]  # no totals
+        triads, stats = cf.triads_from_upcoming([g])
+        self.assertEqual(triads, [])
+        self.assertEqual(stats["events_dropped_incomplete_triad"], 1)
+
+    def test_flags_run_on_parsed_triads(self):
+        # End-to-end: parsed live triads feed flag_games unchanged.
+        triads, _ = cf.triads_from_upcoming([_game()])
+        flags = cf.flag_games(triads, offset=0.0, ev_floor=-10.0)
+        self.assertTrue(flags)
+
+
 if __name__ == "__main__":
     unittest.main()

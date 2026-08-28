@@ -11,14 +11,18 @@ run-line cover, subtract the historical calibration offset (the Poisson-shape bi
 fit on completed seasons — no leakage for a forward bet), and flag whichever DK
 run-line side is +EV past the floor.
 
-DK-only + DK-internal: needs no other book. Reads the latest pre-commence DK snapshot
-from the warehouse (credit-free) — so run it after the app has captured today's odds
-(live analysis), near game time for the freshest lines.
+DK-only + DK-internal: needs no other book. Two ways to get today's DK odds:
+  • --live (default OFF): one self-contained Odds-API call fetches DK's current
+    ML+spread+total for the whole slate (~3 credits = 3 markets x 1 region, flat
+    regardless of slate size). No app dependency — just run it.
+  • warehouse (default): reads the latest pre-commence DK snapshot already captured
+    (credit-free), so run it after the app's live analysis has stored today's odds.
 
 USAGE
-    python coherence_flags.py                       # today, MLB
+    python coherence_flags.py --live               # today, MLB, self-contained (~3 credits)
+    python coherence_flags.py                       # today, MLB, from warehouse (free)
     python coherence_flags.py --date 2026-08-27
-    python coherence_flags.py --ev-floor 0.05 --haircut 0.03
+    python coherence_flags.py --live --ev-floor 0.05 --haircut 0.03
 """
 import argparse
 import datetime
@@ -92,10 +96,72 @@ def load_triads_for_date(sport, date):
     return r2_data.select_team_triad(rows)
 
 
+def triads_from_upcoming(games, book_key="draftkings"):
+    """PURE: parse the Odds-API upcoming-odds JSON (list of game dicts) into TeamTriad
+    records for one book. Each game needs that book's complete ML+spread+total; games
+    missing any leg (or the book) are dropped and counted. No snapshot timing — these
+    ARE the current live prices."""
+    from collections import Counter
+
+    import r2_data
+    triads, stats = [], Counter()
+    for g in games or []:
+        stats["events"] += 1
+        home, away = g.get("home_team"), g.get("away_team")
+        book = next((b for b in g.get("bookmakers", [])
+                     if b.get("key") == book_key), None)
+        if not home or not away or book is None:
+            stats["events_dropped_no_book"] += 1
+            continue
+        ml, rl, tot = {}, {}, {}
+        for m in book.get("markets", []):
+            key = m.get("key")
+            for o in m.get("outcomes", []):
+                name, price, point = o.get("name"), o.get("price"), o.get("point")
+                if key == "h2h":
+                    ml[name] = price
+                elif key == "spreads":
+                    rl[name] = (point, price)
+                elif key == "totals":
+                    tot[name] = (point, price)
+        ml_home, ml_away = ml.get(home), ml.get(away)
+        rl_home, rl_away = rl.get(home), rl.get(away)
+        over, under = tot.get("Over"), tot.get("Under")
+        if None in (ml_home, ml_away, rl_home, rl_away, over, under):
+            stats["events_dropped_incomplete_triad"] += 1
+            continue
+        commence = g.get("commence_time")
+        triads.append(r2_data.TeamTriad(
+            event_id=g.get("id"), game_date=(commence or "")[:10],
+            commence_time=commence, snapshot_id=None, game_pk=None,
+            home=home, away=away, ml_home=ml_home, ml_away=ml_away,
+            rl_home_point=rl_home[0], rl_home=rl_home[1], rl_away=rl_away[1],
+            total_line=over[0], total_over=over[1], total_under=under[1]))
+        stats["triads_built"] += 1
+    return triads, stats
+
+
+def load_triads_live(sport, book_key="draftkings"):
+    """Self-contained: one Odds-API call fetches the whole slate's current DK
+    ML+spread+total (~3 credits = 3 markets x 1 region) and parses it into triads.
+    No warehouse/app dependency."""
+    import odds_client
+    from backfill_historical_odds import load_config
+    api_key = load_config()["odds_api_key"]
+    games = odds_client.get_upcoming_odds(
+        api_key, sport, regions="us", markets="h2h,spreads,totals",
+        bookmakers=[book_key])
+    return triads_from_upcoming(games, book_key)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Daily coherence run-line flags (DK-internal).")
     ap.add_argument("--sport", default="baseball_mlb")
-    ap.add_argument("--date", default=None, help="YYYY-MM-DD (default: today).")
+    ap.add_argument("--live", action="store_true",
+                    help="Self-contained: fetch DK's current odds via the Odds API "
+                         "(~3 credits) instead of reading the warehouse.")
+    ap.add_argument("--date", default=None,
+                    help="YYYY-MM-DD (default: today). Ignored with --live.")
     ap.add_argument("--offset-seasons", default=",".join(DEFAULT_OFFSET_SEASONS),
                     help="Completed seasons to fit the calibration offset on.")
     ap.add_argument("--dispersion", type=float, default=0.0)
@@ -111,16 +177,24 @@ def main():
     date = args.date or datetime.date.today().isoformat()
     offset_seasons = [s.strip() for s in args.offset_seasons.split(",") if s.strip()]
     offset, n_off = compute_offset(args.sport, offset_seasons, args.dispersion)
-    triads, stats = load_triads_for_date(args.sport, date)
+    if args.live:
+        triads, stats = load_triads_live(args.sport)
+        src = "live (Odds API, current DK prices)"
+    else:
+        triads, stats = load_triads_for_date(args.sport, date)
+        src = f"warehouse {date}"
 
-    print(f"\n  Coherence run-line flags — {args.sport} {date}")
+    print(f"\n  Coherence run-line flags — {args.sport} — {src}")
     print(f"  offset {offset:+.4f} (from {n_off:,} historical triads)  "
           f"ev_floor {args.ev_floor:.0%}  haircut {args.haircut:.0%}")
     print(f"  games with a complete DK triad: {len(triads)}  "
           f"(dropped incomplete: {stats.get('events_dropped_incomplete_triad', 0)})")
     if not triads:
-        print("  No DK triads for this date — run the app's live analysis first to "
-              "capture today's odds, or check the date has games.")
+        msg = ("  No DK triads returned by the Odds API — check the slate has games "
+               "and DK has posted lines." if args.live else
+               "  No DK triads for this date — run the app's live analysis first to "
+               "capture today's odds, or check the date has games.")
+        print(msg)
         return
 
     flags = flag_games(triads, offset, args.dispersion, args.haircut, args.ev_floor)
