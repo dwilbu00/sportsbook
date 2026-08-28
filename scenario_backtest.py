@@ -479,6 +479,45 @@ def scenario_team_variance(blob, half_life=5.0):
     return rows, cov
 
 
+# ── scenario: per-(prop × line × side) realized ROI stratification ───────────
+
+# The 7 gradable DK props (mirrors mlb_warehouse._ACTUAL_STAT_SPEC).
+_ALL_PROPS = ("batter_hits", "batter_strikeouts", "batter_total_bases", "batter_rbis",
+              "pitcher_strikeouts", "pitcher_earned_runs", "pitcher_outs")
+
+
+def scenario_prop_roi(sport, seasons):
+    """Realized ROI of betting EVERY DK prop line (raw DK price, vig in), bucketed by
+    (prop, line, side), to surface bettable strata the prop-aggregate hides — the same
+    'find the +ROI stratum' move that produced cv_floor + dog+1.5, on the prop/line/side
+    axis, extending the replicating DK recreational OVER-bias. Ungated screen; the
+    per-season replication of a cell is the honesty gate. Loads its own data (mirror-
+    backed via r2_data)."""
+    idx = r2_data.build_outcome_index(seasons, list(_ALL_PROPS))
+    rows, cov = [], Counter()
+    for prop_key in _ALL_PROPS:
+        for s in seasons:
+            prop_rows = r2_data._read_player_prop_lines(
+                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31",
+                prop_keys=[prop_key], bookmaker="draftkings")
+            for (eid, pid), rec in _close_prop_offers(prop_rows).items():
+                gpk = rec["game_pk"]
+                actual = r2_data.outcome_value(idx, prop_key, pid, gpk)
+                if actual is None:
+                    cov[f"{prop_key}:no_actual"] += 1
+                    continue
+                for (line, direction), price in rec["offers"].items():
+                    res = r2_grade.grade_over_under(actual, line, direction)
+                    p = r2_grade.profit(price, res)
+                    if p is None:
+                        continue
+                    rows.append({"season": str(s), "prop": prop_key, "line": line,
+                                 "side": str(direction).upper(), "result": res,
+                                 "profit": p})
+                    cov[f"{prop_key}:graded"] += 1
+    return rows, cov
+
+
 # ── reporting ────────────────────────────────────────────────────────────────
 
 def _report(title, rows, cov=None, cov_keys=()):
@@ -521,6 +560,43 @@ def _print_slice(rows, keyfn, label):
         print(f"    {str(k):<12} n={sm.n:>5,} ROI={sm.roi:+.2%} "
               f"hit={sm.hit_rate:.1%} t={sm.t_stat:+.2f}{tag}")
     print("")
+
+
+def _report_prop_roi(rows, cov, min_n=100):
+    """Per (prop, line, side) cell: pooled ROI/hit/t + per-season replication. Ends
+    with the CANDIDATE cells (n>=min_n, +ROI pooled, +ROI every judged season) — the
+    actionable strata to consider gating to."""
+    print("=" * 74)
+    print("  PROP ROI by (prop, line, side) — DK raw price, every line, UNGATED")
+    print("=" * 74)
+    candidates = []
+    for prop in _ALL_PROPS:
+        pr = [r for r in rows if r["prop"] == prop]
+        if not pr:
+            continue
+        print(f"\n  {prop}  (n={len(pr):,}):")
+        cells = r2_grade.by_key(pr, lambda r: (r["side"], r["line"]))
+        for key in sorted(cells, key=lambda k: (k[0], k[1])):
+            side, line = key
+            sm = cells[key]
+            per = r2_grade.by_key([r for r in pr if r["side"] == side and r["line"] == line],
+                                  lambda r: r["season"])
+            judged = [s for s, x in per.items() if x.n >= 30]
+            repl = bool(judged) and all(per[s].roi > 0 for s in judged)
+            thin = "" if sm.n >= min_n else "  (thin)"
+            hit = f"{sm.hit_rate:.1%}" if sm.decided else "n/a"
+            star = "  <== +ROI, replicates" if (sm.n >= min_n and sm.roi > 0 and repl) else ""
+            print(f"    {side:<5} {line:>5}  n={sm.n:>6,} ROI={sm.roi:+.2%} "
+                  f"hit={hit} t={sm.t_stat:+.2f}{thin}{star}")
+            if sm.n >= min_n and sm.roi > 0 and repl:
+                candidates.append((prop, side, line, sm))
+    print(f"\n  === CANDIDATE cells (n>={min_n}, +ROI pooled, +ROI every judged season) ===")
+    if not candidates:
+        print("    (none — no stratum beats vig with per-season replication)")
+    for prop, side, line, sm in sorted(candidates, key=lambda c: -c[3].roi):
+        print(f"    {prop:<20} {side:<5} {line:>5}  n={sm.n:>6,} "
+              f"ROI={sm.roi:+.2%} t={sm.t_stat:+.2f}")
+    print("=" * 74)
 
 
 # ── data load (cache-first, shared across scenarios) ─────────────────────────
@@ -631,7 +707,9 @@ def main():
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
-                             "fav_combo", "er_ml", "team_variance"])
+                             "fav_combo", "er_ml", "team_variance", "prop_roi"])
+    ap.add_argument("--prop-roi-min-n", type=int, default=100,
+                    help="Min pooled bets for a (prop,line,side) cell to be a candidate.")
     ap.add_argument("--cv-half-life", type=float, default=5.0,
                     help="Half-life (games) for the SP ER-CV in team_variance; 5 "
                          "matches the live earned_runs cv_floor signal. 0 = equal weight.")
@@ -709,6 +787,9 @@ def main():
             hi = [r for r in br if r["cv_bucket"] == "c >=1.3 (high)"]
             if hi:
                 _print_slice(hi, lambda r: r["season"], "high-CV (>=1.3) x season")
+    if want in ("all", "prop_roi"):
+        rows, cov = scenario_prop_roi(args.sport, seasons)
+        _report_prop_roi(rows, cov, min_n=args.prop_roi_min_n)
 
 
 if __name__ == "__main__":
