@@ -23,6 +23,19 @@ Bet `pitcher_earned_runs` only on the most volatile starters (recency-weighted C
 - Open: forward-monitor (structure edges decay) + confirm DK/FD fillability on volatile SPs at size; do NOT anchor on the partial-season Kelly line.
 - **Owner hypothesis TESTED → REFUTED + INVERTED (2026-08-28, `scenario_backtest --scenario team_variance`).** Bucketing team ROI by the starter's ER-CV (the cv_floor signal, half_life=5): high SP volatility makes team bets WORSE, monotonically, replicating all 3 seasons — total OVER −10/−17/−27% across CV <1.0 / 1.0-1.3 / ≥1.3; dog ML +2.9/+0.1/−17.9%; dog +1.5 +6.5/−2.2/−10.7%. WHY: ER-CV=σ/μ and a LOW mean inflates CV, so high-CV flags run-SUPPRESSING starters (lower-scoring games) → unders/favorites, NOT overs/dogs. Variance-as-underpricing does NOT carry to team markets ⇒ Monte Carlo shape-sim = no-go on this basis. BYPRODUCT (forward-track, don't backtest-ship — overfit risk): the dog+1.5 edge concentrates in LOW-CV (stable) favorite games (+6.5% t=3.18) and dies on high-CV favorites → a candidate stable-favorite-SP refinement to the coherence flag. Weather/umpire-as-instability is a separate, still-untested form.
 
+## ~ prop_roi screen (2026-08-28) — over-bias CONFIRMED, mostly vig-eaten, 1 marginal cell
+`scenario_backtest.py --scenario prop_roi`: realized DK ROI (raw price) by (prop, line,
+side) over all 7 props (~370k bets). DK's recreational OVER-bias is real, pervasive,
+monotonic — overs bleed hard (batter_hits OVER 0.5 −9.0% / OVER 1.5 −17.6%; K OVER 1.5
+−20.6%; ER OVER 2.5 −14.5%; RBI OVER 0.5 −14.7%), unders bleed less. BUT vig (~4.5%)
+eats the under side almost everywhere → props efficient-after-vig at the cell level too.
+ONLY bettable cell: **`batter_strikeouts UNDER 1.5` +2.21%, t=1.93, n=3,898, hit 68%,
++ROI all 3 seasons** (priced ~−199, beats the ~66.7% breakeven) — small + borderline +
+1-of-~50 (MC caveat), but 3/3 replication + it's the strongest over-biased prop = more
+than noise; forward-track small, don't build a system on it. `pitcher_earned_runs
+UNDER 2.5` +0.78%/t=0.56 = statistically BREAKEVEN, not actionable. ⇒ another
+props-are-efficient confirmation with one marginal asterisk.
+
 ## ✗ EXHAUSTED / DEAD (do not re-litigate)
 - **Sharp-staleness (R2) — REFUTED across all 3 executable markets, well-powered.** DK is an EFFICIENT book for us: props (Brier tie DK 0.2443 vs Pin 0.2444, 65k legs), team ML (tie 0.2455 = 0.2455, 2,195 events), F5 ML (tie 0.2412 vs 0.2413, 2,679, via `f5_backtest.py` commit fcaa8df). Pinnacle is NOT sharper than DK on any of them. The sharpness test became the GATE that killed R2 before we built a decomposition on a false premise (Doug's repeated "is Pinnacle even sharper?" check). ⇒ Odds-shopping DK-vs-Pinnacle only reduces vig, doesn't create +EV; DK-vs-FanDuel line-shopping (both executable) is a real ~1-4% execution multiplier on an edge you ALREADY have, not a standalone edge.
 - **The R2 cross-line projector is a −8% ARTIFACT.** DK hits-0.5 priced off Pinnacle TB-1.5 via Poisson projection = `batter_hits projected n=10,216 ROI −8.41% t=−12.44`, replicating all 3 seasons. The projection overstates the fair → phantom +EV overs that lose. Answers Doug's TB-1.5→hits-0.5 question: NO. Don't bet or serve projected legs.
