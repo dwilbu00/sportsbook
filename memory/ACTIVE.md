@@ -16,6 +16,9 @@ One line per open item. When an item ships, delete it here and fold the durable 
 ## [[edges-and-backtests]]
 - **Variance-mispricing → team markets — BUILT (24c2bed), awaiting Doug's run + verdict.** `scenario_backtest.py --scenario team_variance`: tests whether SP volatility (recency-weighted ER-CV, half_life=5 = the validated cv_floor signal) predicts underpriced team totals-over / underdog ML + run-line (fat right tail from blow-up-prone starters). Bets bucketed by CV (high = >=1.3); per-season replication on the high-CV cell. Convergence of cv_floor + the dog-+1.5/coherence run-shape edge; subsumes the old "market-upset situational study." VERDICT RULE: high-CV bucket +ROI AND replicates per-season → real → justifies the Monte Carlo one-distribution sim; else null → saved the big build.
 
+## [[data-and-architecture]]
+- **Auto-create/refresh the parquet mirror from the backtest tools — QUEUED (Doug: do it once he verifies the manual sync/verify/run flow works).** Add `warehouse_mirror.ensure(sport, seasons, refresh=False)` (sync only MISSING files, or all if refresh); each backtest `load_or_fetch` calls it when `ODI_BACKTEST_MIRROR=1` so the manual `--sync` becomes optional (first flagged run auto-builds). Add a `--refresh-mirror` flag per tool (distinct from `--refresh` = pickle cache). Needs Azure to build; no-DB boxes still need a pre-synced/copied dir.
+
 ## [[modeling-and-calibration]]
 - **value_gate auto-tune** — fold a confirmation-gated `--gate-diag` selection into the offline refit as advisory + `--promote` (never live-auto; threshold argmax overfits vs smooth Platt). `refit_calibration` still never calls `save_value_gate`.
 - **EV floor 4%→3% for DK/FD** — `value_gate.ev_floor` is still 0.04 (chosen on optimistic consensus prices); A/B 0.04 vs 0.03 on DK/FanDuel fills via `--gate-diag`.
