@@ -128,6 +128,44 @@ class WarehouseMirrorTests(unittest.TestCase):
         self.assertEqual(len(idx["999"]), 2)                          # R + S both kept
         self.assertEqual(idx["999"][0][0], "2024-03-10")             # date-ordered (spring first)
 
+    def test_read_prefers_valid_then_base(self):
+        name = wm._team_file(SPORT, "draftkings", "2024")
+        wm._mark_valid(name)                                  # base -> _valid
+        self.assertTrue(wm._is_valid(name))
+        self.assertFalse(os.path.exists(wm._path(name)))      # base gone
+        rows = wm.team_market_lines(SPORT, date_from="2024-01-01",
+                                    date_to="2024-12-31", bookmaker="draftkings")
+        self.assertEqual(len(rows), 1)                        # read via _valid copy
+
+    def test_write_invalidates_stale_valid(self):
+        name = wm._team_file(SPORT, "draftkings", "2024")
+        wm._mark_valid(name)
+        self.assertTrue(wm._is_valid(name))
+        wm._write([{"game_pk": 1}], name)                     # fresh data
+        self.assertFalse(wm._is_valid(name))                  # stale _valid dropped
+        self.assertTrue(os.path.exists(wm._path(name)))       # base present, needs re-verify
+
+    def test_demote(self):
+        name = wm._team_file(SPORT, "draftkings", "2024")
+        wm._mark_valid(name)
+        wm._demote(name)                                      # _valid -> base
+        self.assertFalse(wm._is_valid(name))
+        self.assertTrue(os.path.exists(wm._path(name)))
+
+    def test_ensure_fast_path_needs_no_azure(self):
+        # all needed files marked _valid -> ensure() returns True via the fast path,
+        # never importing db_store / touching Azure.
+        for f in wm._needed_files(SPORT, ["2024"]):
+            if not (wm._is_valid(f) or os.path.exists(wm._path(f))):
+                wm._write([{"game_pk": 1}], f)
+            wm._mark_valid(f)
+        self.assertTrue(wm.ensure(SPORT, ["2024"]))
+
+    def test_autobuild_noop_when_flag_off(self):
+        os.environ.pop("ODI_BACKTEST_MIRROR", None)
+        self.assertFalse(wm.flag_on())
+        self.assertFalse(wm.autobuild(SPORT, ["2024"]))       # no-op, no Azure
+
     def test_missing_season_returns_none(self):
         # a season with no parquet -> None (per-call Azure fallback), not empty/wrong
         self.assertIsNone(wm.team_market_lines(

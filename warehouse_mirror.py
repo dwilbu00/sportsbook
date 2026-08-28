@@ -43,10 +43,17 @@ BOOKS = ("draftkings", "pinnacle", "fanduel")
 _NON_REGULAR_GAME_TYPES = ("S", "A", "E")
 
 
+def flag_on():
+    """True iff mirror reads are REQUESTED (env flag) — regardless of whether the dir
+    exists yet. Backtest tools gate the auto-build `ensure()` on this (it creates the
+    dir); readers gate on `enabled()` (flag AND dir present)."""
+    return str(os.environ.get("ODI_BACKTEST_MIRROR", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def enabled():
-    """True iff mirror reads are turned on AND the mirror dir exists."""
-    flag = str(os.environ.get("ODI_BACKTEST_MIRROR", "")).strip().lower()
-    return flag in ("1", "true", "yes", "on") and os.path.isdir(MIRROR_DIR)
+    """True iff mirror reads are on AND the mirror dir exists (readers gate on this)."""
+    return flag_on() and os.path.isdir(MIRROR_DIR)
 
 
 # ── parquet helpers ──────────────────────────────────────────────────────────
@@ -65,13 +72,43 @@ def _records(df):
     return obj.to_dict("records")
 
 
+# A file that PASSED --verify is renamed base.parquet -> base_valid.parquet, so
+# ensure() can trust it and skip re-verifying on every backtest run. Invariant: at
+# most one of {base, _valid} exists per slice. _write (sync) always produces base and
+# drops any stale _valid (data changed -> must re-verify).
+
+def _valid_name(name):
+    return name[:-len(".parquet")] + "_valid.parquet" if name.endswith(".parquet") \
+        else name + "_valid"
+
+
+def _is_valid(name):
+    return os.path.exists(_path(_valid_name(name)))
+
+
+def _mark_valid(name):
+    """Rename base -> _valid after a passing verify (no-op if base absent)."""
+    base, vp = _path(name), _path(_valid_name(name))
+    if os.path.exists(base):
+        os.replace(base, vp)
+
+
+def _demote(name):
+    """Rename _valid -> base after a FAILING verify (no-op if _valid absent)."""
+    base, vp = _path(name), _path(_valid_name(name))
+    if os.path.exists(vp):
+        os.replace(vp, base)
+
+
 def _read(name):
-    """Read a mirror parquet -> DataFrame, or None if absent (caller falls back)."""
+    """Read a mirror parquet -> DataFrame, preferring the _valid (verified) copy, then
+    the unverified base, else None (caller falls back to Azure)."""
     import pandas as pd
-    p = _path(name)
-    if not os.path.exists(p):
-        return None
-    return pd.read_parquet(p)
+    for n in (_valid_name(name), name):
+        p = _path(n)
+        if os.path.exists(p):
+            return pd.read_parquet(p)
+    return None
 
 
 def _write(df, name):
@@ -79,6 +116,9 @@ def _write(df, name):
     os.makedirs(MIRROR_DIR, exist_ok=True)
     (df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)).to_parquet(
         _path(name), index=False)
+    vp = _path(_valid_name(name))       # fresh data invalidates any prior verification
+    if os.path.exists(vp):
+        os.remove(vp)
 
 
 def _team_file(sport, book, season):
@@ -112,7 +152,7 @@ def sync(sport, seasons, refresh=False, verbose=True):
     seasons = [str(s) for s in seasons]
 
     def _skip(name):
-        return (not refresh) and os.path.exists(_path(name))
+        return (not refresh) and (_is_valid(name) or os.path.exists(_path(name)))
 
     # 1) Odds — store the EXACT db_store reader dicts, per season × book (parity by
     #    construction; the DK-parity NULL-book predicate is already applied in SQL).
@@ -147,7 +187,7 @@ def _sync_facts(sport, seasons, refresh, verbose):
 
     # mlb_game (all seasons in one file — a few thousand rows).
     gf = _game_file(sport)
-    if refresh or not os.path.exists(_path(gf)):
+    if refresh or not (_is_valid(gf) or os.path.exists(_path(gf))):
         with eng.connect() as conn:
             rows = conn.execute(_select(
                 g.c.game_pk, g.c.official_date, g.c.season, g.c.game_type,
@@ -168,7 +208,7 @@ def _sync_facts(sport, seasons, refresh, verbose):
             (wh.mlb_batter_game, _batter_file, ("H", "SO", "TB", "RBI"))):
         for s in seasons:
             f = mk_file(sport, s)
-            if (not refresh) and os.path.exists(_path(f)):
+            if (not refresh) and (_is_valid(f) or os.path.exists(_path(f))):
                 continue
             joined = tbl.join(g, tbl.c.game_pk == g.c.game_pk)
             cols = ([tbl.c.athlete_id, tbl.c.game_pk, tbl.c.season_bucket,
@@ -344,65 +384,128 @@ def _row_key(d):
     return tuple(sorted((k, v) for k, v in d.items()))
 
 
+def _rows_eq(mrows, arows):
+    return {_row_key(r) for r in (mrows or [])} == {_row_key(r) for r in (arows or [])}
+
+
+def _calib_eq(role, season):
+    """Functional parity of the outcome index: same (athlete, game_pk) keys + same
+    stat-column values as get_calib_gamelogs_bulk (the extra ESPN fields the mirror
+    drops aren't read by outcome_value)."""
+    import mlb_warehouse as wh
+    m = calib_gamelogs_bulk(role, season) or {}
+    a = wh.get_calib_gamelogs_bulk(role, int(season)) or {}
+    cols = (("IP", "ER", "K", "BB", "BF") if role == "pitcher"
+            else ("H", "SO", "TB", "RBI"))
+
+    def norm(d):
+        out = {}
+        for aid, games in d.items():
+            for g in games:
+                gpk = g.get("game_pk")
+                if gpk is None:
+                    continue
+                out[(str(aid), int(gpk))] = tuple(g.get(c) for c in cols)
+        return out
+    return norm(m) == norm(a)
+
+
 def verify(sport, seasons, verbose=True):
-    """PARITY self-check (needs Azure + a synced mirror): compare each mirror reader
-    to the live db_store / r2_data reader on real data and report PASS/FAIL. This is
-    the strongest guarantee — 'mirror == Azure on your actual warehouse'. Returns True
-    iff every checked reader matches. Run once after --sync."""
+    """PARITY self-check (needs Azure): compare each mirror parquet to the live
+    db_store / r2_data / mlb_warehouse reader on REAL data. Each file that passes ALL
+    its checks is renamed base -> `_valid` (so ensure() trusts it and never re-verifies
+    it); a failing file is demoted `_valid` -> base. Returns True iff every file passed.
+    'mirror == Azure on your actual warehouse'."""
     import db_store
     db_store.promote_secrets_from_toml()
     import r2_data
-    ok = True
+    import mlb_warehouse as wh
+    seasons = [str(x) for x in seasons]
+    file_ok = {}
 
-    def _cmp(name, mrows, arows):
-        nonlocal ok
-        ms, as_ = {_row_key(r) for r in mrows}, {_row_key(r) for r in arows}
-        same = ms == as_
-        ok = ok and same
-        if verbose:
-            extra, missing = len(ms - as_), len(as_ - ms)
-            print(f"  [{'PASS' if same else 'FAIL'}] {name:<34} "
-                  f"mirror={len(mrows):>7,} azure={len(arows):>7,}"
-                  + ("" if same else f"  (+{extra} mirror-only / -{missing} azure-only)"))
+    def record(f, passed):
+        file_ok[f] = file_ok.get(f, True) and passed
 
-    def _cmp_idx(name, midx, aidx):
-        nonlocal ok
-        same = midx == aidx
-        ok = ok and same
-        if verbose:
-            print(f"  [{'PASS' if same else 'FAIL'}] {name:<34} "
-                  f"mirror={len(midx):>7,} azure={len(aidx):>7,}"
-                  + ("" if same else "  (INDEX MISMATCH)"))
-
-    for s in [str(x) for x in seasons]:
+    # Odds: one file per (season, book).
+    for s in seasons:
         df, dt = f"{s}-01-01", f"{s}-12-31"
         for book in BOOKS:
-            m = team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book)
-            a = db_store.team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book)
-            if m is not None:
-                _cmp(f"team {s} {book}", m, a)
-            mp = player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)
-            ap_ = db_store.player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)
-            if mp is not None:
-                _cmp(f"props {s} {book}", mp, ap_)
+            tf = _team_file(sport, book, s)
+            record(tf, _rows_eq(
+                team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book),
+                db_store.team_market_lines(sport, date_from=df, date_to=dt, bookmaker=book)))
+            pf = _prop_file(sport, book, s)
+            record(pf, _rows_eq(
+                player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book),
+                db_store.player_prop_lines(sport, date_from=df, date_to=dt, bookmaker=book)))
 
-    # index builders: compare mirror vs the Azure path (flag off so r2_data hits SQL)
+    # Fact indexes: flag OFF so r2_data hits Azure for the comparison baseline.
+    gf = _game_file(sport)
     _saved = os.environ.pop("ODI_BACKTEST_MIRROR", None)
     try:
-        _cmp_idx("team_scores_index", build_team_scores_index() or {},
-                 r2_data.build_team_scores_index())
-        _cmp_idx("f5_scores_index", build_f5_scores_index() or {},
-                 r2_data.build_f5_scores_index())
-        for s in [str(x) for x in seasons]:
-            mpix = pitcher_game_index(int(s)) or {}
-            import mlb_warehouse as wh
+        record(gf, (build_team_scores_index() or {}) == r2_data.build_team_scores_index())
+        record(gf, (build_f5_scores_index() or {}) == r2_data.build_f5_scores_index())
+        record(gf, (build_team_finals_index() or {}) == r2_data.build_team_finals_index())
+        for s in seasons:
             apix = {str(a): g for a, g in (wh._pitcher_game_index(int(s)) or {}).items()}
-            _cmp_idx(f"pitcher_game_index {s}", mpix, apix)
+            record(_pitcher_file(sport, s), (pitcher_game_index(int(s)) or {}) == apix)
+            record(_pitcher_file(sport, s), _calib_eq("pitcher", s))
+            record(_batter_file(sport, s), _calib_eq("batter", s))
     finally:
         if _saved is not None:
             os.environ["ODI_BACKTEST_MIRROR"] = _saved
-    print(f"  VERIFY: {'ALL PASS' if ok else 'MISMATCH — do not rely on the mirror'}")
-    return ok
+
+    all_ok = True
+    for f in sorted(file_ok):
+        passed = file_ok[f]
+        all_ok = all_ok and passed
+        (_mark_valid if passed else _demote)(f)
+        if verbose:
+            print(f"  [{'PASS -> _valid' if passed else 'FAIL -> demoted'}] {f}")
+    print(f"  VERIFY: {'ALL PASS' if all_ok else 'MISMATCH — do not rely on the mirror'}")
+    return all_ok
+
+
+def _needed_files(sport, seasons):
+    """Logical filenames the backtest tools read for (sport, seasons)."""
+    files = [_game_file(sport)]
+    for s in [str(x) for x in seasons]:
+        for book in BOOKS:
+            files += [_team_file(sport, book, s), _prop_file(sport, book, s)]
+        files += [_pitcher_file(sport, s), _batter_file(sport, s)]
+    return files
+
+
+def ensure(sport, seasons, refresh=False, verbose=False):
+    """Make the mirror ready for (sport, seasons), called by each backtest tool when
+    ODI_BACKTEST_MIRROR is on. FAST PATH: if every needed file is already `_valid`, do
+    nothing (no Azure, no verify). Otherwise sync missing files + verify (which marks
+    passing files `_valid`), so verification happens ONCE per file, not per run.
+    refresh=True re-syncs + re-verifies everything. Needs Azure to build/verify; on any
+    failure (e.g. no DB) it leaves existing files as-is and returns False — the readers
+    then fall back to Azure per call. Never raises."""
+    seasons = [str(x) for x in seasons]
+    if not refresh and all(_is_valid(f) for f in _needed_files(sport, seasons)):
+        return True                                   # everything validated -> instant
+    try:
+        sync(sport, seasons, refresh=refresh, verbose=verbose)
+        return verify(sport, seasons, verbose=verbose)
+    except Exception as exc:                           # no Azure / transient -> leave as-is
+        if verbose:
+            print(f"  [warehouse_mirror] ensure() skipped (Azure unavailable?): {exc}")
+        return False
+
+
+def autobuild(sport, seasons, refresh=False, verbose=True):
+    """One-liner for backtest tools: if the mirror flag is on, ensure the mirror is
+    built + validated for (sport, seasons) (fast no-op once everything is `_valid`);
+    do nothing if the flag is off. Never raises."""
+    try:
+        if flag_on():
+            return ensure(sport, seasons, refresh=refresh, verbose=verbose)
+    except Exception:
+        pass
+    return False
 
 
 def main():

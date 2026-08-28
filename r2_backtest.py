@@ -531,13 +531,15 @@ def _cache_path(sport, seasons, prop_keys):
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, prop_keys, refresh=False):
+def load_or_fetch(sport, seasons, prop_keys, refresh=False, refresh_mirror=False):
     """Fetch paired legs + the outcome index (or load the local cache). The fetch is
     the only Azure round-trip; re-report with different haircut/floor reads cache."""
     path = _cache_path(sport, seasons, prop_keys)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
+    import warehouse_mirror
+    warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
     legs_by_season, fetch_stats = r2_data.load_prop_legs(sport, seasons, prop_keys)
     outcome_idx = r2_data.build_outcome_index(seasons, prop_keys)
     blob = {"legs_by_season": legs_by_season, "outcome_idx": outcome_idx,
@@ -553,13 +555,15 @@ def _ml_cache_path(sport, seasons, kind):
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch_ml(sport, seasons, kind, refresh=False):
+def load_or_fetch_ml(sport, seasons, kind, refresh=False, refresh_mirror=False):
     """Fetch + pair DK/Pinnacle moneyline legs (kind='team' or 'first_five') + the
     finals index (or load cache). Feeds the sharpness GATE."""
     path = _ml_cache_path(sport, seasons, kind)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
+    import warehouse_mirror
+    warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
     legs_by_season, stats = r2_data.load_team_ml_legs(sport, seasons, kind=kind)
     finals_idx = r2_data.build_team_finals_index(seasons)
     blob = {"legs_by_season": legs_by_season, "finals_idx": finals_idx,
@@ -585,6 +589,8 @@ def main():
     ap.add_argument("--min-seasons", type=int, default=2)
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true", help="Re-fetch (ignore cache).")
+    ap.add_argument("--refresh-mirror", action="store_true",
+                    help="re-sync + re-verify the parquet mirror (with ODI_BACKTEST_MIRROR)")
     ap.add_argument("--sharpness", action="store_true",
                     help="Diagnostic: is Pinnacle sharper than DK? (model-free "
                          "closing-line Brier/log-loss on same-line legs). Cache-only.")
@@ -610,7 +616,8 @@ def main():
     # GATE: moneyline sharpness (team or F5) — its own data/cache path.
     if args.ml_sharpness:
         mlblob, mlpath = load_or_fetch_ml(args.sport, seasons, args.ml_kind,
-                                          refresh=args.refresh)
+                                          refresh=args.refresh,
+                                          refresh_mirror=args.refresh_mirror)
         n = sum(len(v) for v in mlblob["legs_by_season"].values())
         print(f"  data: {n:,} paired {args.ml_kind} moneyline legs "
               f"(DK+Pinnacle)  (cache: {mlpath})")
@@ -620,7 +627,8 @@ def main():
             min_n=args.min_n)
         return
 
-    blob, path = load_or_fetch(args.sport, seasons, prop_keys, refresh=args.refresh)
+    blob, path = load_or_fetch(args.sport, seasons, prop_keys, refresh=args.refresh,
+                               refresh_mirror=args.refresh_mirror)
     print(f"  data: {sum(len(v) for v in blob['legs_by_season'].values()):,} paired "
           f"legs across {len(seasons)} seasons  (cache: {path})")
     # Per-prop paired-leg counts (which props Pinnacle actually references) + the

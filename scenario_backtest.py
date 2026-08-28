@@ -599,11 +599,13 @@ def _cache_path(sport, seasons):
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, refresh=False):
+def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
     path = _cache_path(sport, seasons)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
+    import warehouse_mirror
+    warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
     import db_store
     db_store.promote_secrets_from_toml()
     triads_by_season, _ = r2_data.load_team_triad(sport, seasons)
@@ -634,6 +636,8 @@ def main():
                          "matches the live earned_runs cv_floor signal. 0 = equal weight.")
     ap.add_argument("--refresh", action="store_true",
                     help="re-read the warehouse (else use the pickle cache)")
+    ap.add_argument("--refresh-mirror", action="store_true",
+                    help="re-sync + re-verify the parquet mirror (with ODI_BACKTEST_MIRROR)")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -642,7 +646,8 @@ def main():
         pass
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
-    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh)
+    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh,
+                               refresh_mirror=args.refresh_mirror)
     ng = sum(len(v) for v in blob["triads_by_season"].values())
     print(f"  data: {ng:,} DK team triads + hits/ER prop lines  (cache: {path})\n")
 

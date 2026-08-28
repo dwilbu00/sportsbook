@@ -149,11 +149,13 @@ def _cache_path(sport, seasons):
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, refresh=False):
+def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
     path = _cache_path(sport, seasons)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
+    import warehouse_mirror
+    warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
     legs_by_season, stats = r2_data.load_f5_ml_legs(sport, seasons)
     scores_idx = r2_data.build_f5_scores_index(seasons)
     blob = {"legs_by_season": legs_by_season, "scores_idx": scores_idx,
@@ -173,6 +175,8 @@ def main():
     ap.add_argument("--min-seasons", type=int, default=2)
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--refresh-mirror", action="store_true",
+                    help="re-sync + re-verify the parquet mirror (with ODI_BACKTEST_MIRROR)")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -181,7 +185,8 @@ def main():
         pass
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
-    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh)
+    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh,
+                               refresh_mirror=args.refresh_mirror)
     n = sum(len(v) for v in blob["legs_by_season"].values())
     print(f"  data: {n:,} F5 ML legs (DK+Pinnacle paired)  (cache: {path})")
 

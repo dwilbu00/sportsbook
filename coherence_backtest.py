@@ -203,11 +203,13 @@ def _cache_path(sport, seasons):
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, refresh=False):
+def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
     path = _cache_path(sport, seasons)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
+    import warehouse_mirror
+    warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
     triads_by_season, stats = r2_data.load_team_triad(sport, seasons)
     scores_idx = r2_data.build_team_scores_index(seasons)
     blob = {"triads_by_season": triads_by_season, "scores_idx": scores_idx,
@@ -229,6 +231,8 @@ def main():
     ap.add_argument("--min-seasons", type=int, default=2)
     ap.add_argument("--min-t", type=float, default=2.0)
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--refresh-mirror", action="store_true",
+                    help="re-sync + re-verify the parquet mirror (with ODI_BACKTEST_MIRROR)")
     ap.add_argument("--raw", action="store_true",
                     help="Skip calibration (raw model-biased result).")
     ap.add_argument("--global-bias", action="store_true",
@@ -242,7 +246,8 @@ def main():
         pass
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
-    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh)
+    blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh,
+                               refresh_mirror=args.refresh_mirror)
     n = sum(len(v) for v in blob["triads_by_season"].values())
     print(f"  data: {n:,} team triads (DK ML+RL+total)  (cache: {path})")
 
