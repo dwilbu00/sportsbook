@@ -38,6 +38,10 @@ MIRROR_DIR = os.environ.get(
 # applied in SQL at sync time so the parquet already includes them).
 BOOKS = ("draftkings", "pinnacle", "fanduel")
 
+# Spring / all-star / exhibition — excluded from calib gamelogs (matches
+# mlb_warehouse._NON_REGULAR_GAME_TYPES / get_calib_gamelogs_bulk). Postseason is KEPT.
+_NON_REGULAR_GAME_TYPES = ("S", "A", "E")
+
 
 def enabled():
     """True iff mirror reads are turned on AND the mirror dir exists."""
@@ -153,54 +157,29 @@ def _sync_facts(sport, seasons, refresh, verbose):
         if verbose:
             print(f"  mlb_game {'':<11} {len(rows):>7,} rows -> {gf}")
 
-    # game_pk -> season / official_date, to season-scope + date-order the fact rows.
-    gmeta = _read(gf)
-    pk_season, pk_date = {}, {}
-    if gmeta is not None:
-        for r in _records(gmeta):
-            gpk = r.get("game_pk")
-            if gpk is None:
+    # Fact tables: join mlb_game for official_date + game_type, scope by
+    # season_bucket EXACTLY as mlb_warehouse._game_log_bulk / _pitcher_game_index do
+    # (NOT mlb_game.season) so the mirror indexes match. game_type is stored so
+    # calib_gamelogs_bulk can exclude S/A/E (get_calib_gamelogs_bulk does; the pitcher
+    # as-of index does NOT — each reader applies its own filter).
+    for tbl, mk_file, stat_cols in (
+            (wh.mlb_pitcher_game, _pitcher_file,
+             ("team_id", "GS", "IP", "ER", "K", "BB", "BF")),
+            (wh.mlb_batter_game, _batter_file, ("H", "SO", "TB", "RBI"))):
+        for s in seasons:
+            f = mk_file(sport, s)
+            if (not refresh) and os.path.exists(_path(f)):
                 continue
-            pk_season[int(gpk)] = r.get("season")
-            pk_date[int(gpk)] = r.get("official_date")
-
-    pg, bg = wh.mlb_pitcher_game, wh.mlb_batter_game
-    for s in seasons:
-        si = int(s)
-        pf = _pitcher_file(sport, s)
-        if refresh or not os.path.exists(_path(pf)):
+            joined = tbl.join(g, tbl.c.game_pk == g.c.game_pk)
+            cols = ([tbl.c.athlete_id, tbl.c.game_pk, tbl.c.season_bucket,
+                     g.c.official_date, g.c.game_type] + [tbl.c[c] for c in stat_cols])
             with eng.connect() as conn:
-                rows = conn.execute(_select(
-                    pg.c.athlete_id, pg.c.game_pk, pg.c.team_id, pg.c.GS,
-                    pg.c.IP, pg.c.ER, pg.c.K, pg.c.BB, pg.c.BF)).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r._mapping)
-                gpk = d.get("game_pk")
-                if gpk is None or pk_season.get(int(gpk)) != si:
-                    continue
-                d["official_date"] = pk_date.get(int(gpk))
-                out.append(d)
-            _write(out, pf)
+                rows = conn.execute(
+                    _select(*cols).select_from(joined)
+                    .where(tbl.c.season_bucket == int(s))).fetchall()
+            _write([dict(r._mapping) for r in rows], f)
             if verbose:
-                print(f"  pitcher_game {s} {'':<6} {len(out):>7,} rows -> {pf}")
-        bf = _batter_file(sport, s)
-        if refresh or not os.path.exists(_path(bf)):
-            with eng.connect() as conn:
-                rows = conn.execute(_select(
-                    bg.c.athlete_id, bg.c.game_pk, bg.c.H, bg.c.SO,
-                    bg.c.TB, bg.c.RBI)).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r._mapping)
-                gpk = d.get("game_pk")
-                if gpk is None or pk_season.get(int(gpk)) != si:
-                    continue
-                d["official_date"] = pk_date.get(int(gpk))
-                out.append(d)
-            _write(out, bf)
-            if verbose:
-                print(f"  batter_game {s} {'':<7} {len(out):>7,} rows -> {bf}")
+                print(f"  {mk_file(sport, s):<28} {len(rows):>7,} rows")
 
 
 # ── READERS (mirror the db_store readers + index builders; None = fall back) ──
@@ -347,13 +326,16 @@ def calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
     """{athlete_id_str: [row dict, ...]} for outcome grading — carries the native
     stat columns + game_pk that r2_data.outcome_value reads (H/SO/TB/RBI for batters;
     K/ER/IP for pitchers). NOT the full ESPN shape (no opponent name/completed — the
-    backtests don't read those). None if the season file is absent."""
+    backtests don't read those). EXCLUDES spring/all-star/exhibition (S/A/E) to match
+    mlb_warehouse.get_calib_gamelogs_bulk. None if the season file is absent."""
     fpath = _pitcher_file if role == "pitcher" else _batter_file
     df = _read(fpath(sport, str(season)))
     if df is None:
         return None
     out = {}
     for r in _records(df):
+        if r.get("game_type") in _NON_REGULAR_GAME_TYPES:
+            continue
         out.setdefault(str(r.get("athlete_id")), []).append(r)
     return out
 

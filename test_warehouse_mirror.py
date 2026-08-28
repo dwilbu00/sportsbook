@@ -41,14 +41,19 @@ class WarehouseMirrorTests(unittest.TestCase):
             "home_score_f5": 2.0, "away_score_f5": 1.0,
             "home_team_id": "121", "away_team_id": "112",
         }], wm._game_file(SPORT))
+        wm._write([
+            {"athlete_id": "999", "game_pk": 777, "season_bucket": 2024,
+             "team_id": "121", "GS": 1.0, "IP": 6.0, "ER": 2.0, "K": 7.0, "BB": 1.0,
+             "BF": 24.0, "official_date": "2024-05-01", "game_type": "R"},
+            # a spring (S) start: kept by pitcher_game_index, EXCLUDED from calib bulk
+            {"athlete_id": "999", "game_pk": 555, "season_bucket": 2024,
+             "team_id": "121", "GS": 1.0, "IP": 3.0, "ER": 5.0, "K": 2.0, "BB": 2.0,
+             "BF": 15.0, "official_date": "2024-03-10", "game_type": "S"},
+        ], wm._pitcher_file(SPORT, "2024"))
         wm._write([{
-            "athlete_id": "999", "game_pk": 777, "team_id": "121", "GS": 1.0,
-            "IP": 6.0, "ER": 2.0, "K": 7.0, "BB": 1.0, "BF": 24.0,
-            "official_date": "2024-05-01",
-        }], wm._pitcher_file(SPORT, "2024"))
-        wm._write([{
-            "athlete_id": "111", "game_pk": 777, "H": 1.0, "SO": 1.0, "TB": 2.0,
-            "RBI": 0.0, "official_date": "2024-05-01",
+            "athlete_id": "111", "game_pk": 777, "season_bucket": 2024, "H": 1.0,
+            "SO": 1.0, "TB": 2.0, "RBI": 0.0, "official_date": "2024-05-01",
+            "game_type": "R",
         }], wm._batter_file(SPORT, "2024"))
 
     def tearDown(self):
@@ -94,15 +99,16 @@ class WarehouseMirrorTests(unittest.TestCase):
         self.assertEqual(wm.build_f5_scores_index(), {777: (2.0, 1.0)})
         self.assertEqual(wm.build_team_finals_index(), {777: 1.0})
         self.assertEqual(wm.game_teams_index(), {777: ("121", "112")})
-        self.assertEqual(wm.pitcher_team_index(seasons=["2024"]),
-                         {("999", 777): ("121", 1.0)})
+        pt = wm.pitcher_team_index(seasons=["2024"])
+        self.assertEqual(pt[("999", 777)], ("121", 1.0))
+        self.assertIn(("999", 555), pt)       # spring start also indexed (no type filter)
 
     def test_pitcher_game_index_ip_to_outs(self):
         idx = wm.pitcher_game_index(2024)
         self.assertIn("999", idx)
-        d, outs, er, k, bb, bf = idx["999"][0]
+        d, outs, er, k, bb, bf = idx["999"][1]   # [1] = regular 05-01 (spring 03-10 sorts first)
         self.assertEqual(d, "2024-05-01")
-        self.assertEqual(outs, 18)            # 6.0 IP -> 18 outs
+        self.assertEqual(outs, 18)               # 6.0 IP -> 18 outs
         self.assertEqual((er, k, bb, bf), (2.0, 7.0, 1.0, 24.0))
 
     def test_calib_gamelogs_bulk_stat_cols(self):
@@ -112,6 +118,15 @@ class WarehouseMirrorTests(unittest.TestCase):
         bat = wm.calib_gamelogs_bulk("batter", 2024)
         self.assertEqual(bat["111"][0]["H"], 1.0)
         self.assertEqual(bat["111"][0]["TB"], 2.0)
+
+    def test_game_type_exclusion_parity(self):
+        # calib bulk drops S/A/E (matches get_calib_gamelogs_bulk); the as-of pitcher
+        # index keeps ALL game types (matches _pitcher_game_index).
+        cg = wm.calib_gamelogs_bulk("pitcher", 2024)
+        self.assertEqual({r["game_pk"] for r in cg["999"]}, {777})   # spring 555 dropped
+        idx = wm.pitcher_game_index(2024)
+        self.assertEqual(len(idx["999"]), 2)                          # R + S both kept
+        self.assertEqual(idx["999"][0][0], "2024-03-10")             # date-ordered (spring first)
 
     def test_missing_season_returns_none(self):
         # a season with no parquet -> None (per-call Azure fallback), not empty/wrong
