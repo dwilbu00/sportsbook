@@ -367,7 +367,7 @@ def _clear_bet_selections(rendered_keys=None):
 
 
 def _value_bet_checklist_entries(
-        all_ml, all_spreads, all_totals, all_props):
+        all_ml, all_spreads, all_totals, all_props, all_coherence=()):
     entries = []
     entries.extend(
         make_bet_checklist_entry(candidate, "moneyline")
@@ -376,6 +376,10 @@ def _value_bet_checklist_entries(
     entries.extend(
         make_bet_checklist_entry(candidate, "spread")
         for candidate in all_spreads if candidate.get("is_value")
+    )
+    entries.extend(
+        make_bet_checklist_entry(candidate, "runline_coherence")
+        for candidate in all_coherence if candidate.get("is_value")
     )
     for candidate in all_totals:
         if candidate.get("is_over_value"):
@@ -392,8 +396,9 @@ def _value_bet_checklist_entries(
     type_order = {
         "Moneyline": 0,
         "Spread": 1,
-        "Game total": 2,
-        "Player prop": 3,
+        "Run line (coherence)": 2,
+        "Game total": 3,
+        "Player prop": 4,
     }
     return sorted(entries, key=lambda entry: (
         entry["matchup"], type_order[entry["type"]], entry["bet"]
@@ -424,6 +429,10 @@ def _iter_wager_candidates(ar):
         if c.get("is_value"):
             key = make_bet_checklist_entry(c, "spread")["selection_key"]
             yield key, "spread", None, c
+    for c in ar.get("all_coherence", []):
+        if c.get("is_value"):
+            key = make_bet_checklist_entry(c, "runline_coherence")["selection_key"]
+            yield key, "runline_coherence", None, c
     for c in ar.get("all_totals", []):
         if c.get("is_over_value"):
             key = make_bet_checklist_entry(c, "total", side="OVER")["selection_key"]
@@ -2840,7 +2849,28 @@ if analyze_clicked and selected_game_labels:
     all_spreads = []
     all_totals = []
     all_props = []
+    all_coherence = []
     warnings = []
+
+    # Coherence run-line (DK-internal edge): flag games where DK's own ML + total
+    # imply a different run-line cover than its posted run-line. Fit the calibration
+    # offset ONCE per slate (it's a 3-season SQL read — never per game), MLB-only,
+    # and cache it in session state so a re-analyze is free. If it can't be fit,
+    # coherence is skipped entirely (better no flags than miscalibrated ones).
+    coherence_offset = None
+    if sport["key"] == "baseball_mlb":
+        _coh_cache = st.session_state.get("_coherence_offset_cache") or {}
+        if sport["key"] in _coh_cache:
+            coherence_offset = _coh_cache[sport["key"]]
+        else:
+            try:
+                import coherence_flags as _coh
+                coherence_offset, _ = _coh.compute_offset(
+                    sport["key"], _coh.DEFAULT_OFFSET_SEASONS)
+                _coh_cache[sport["key"]] = coherence_offset
+                st.session_state["_coherence_offset_cache"] = _coh_cache
+            except Exception:
+                coherence_offset = None
 
     progress.progress(10, text="Getting game odds...")
 
@@ -3063,6 +3093,7 @@ if analyze_clicked and selected_game_labels:
         # `warnings` (that would race across threads); it returns its candidates and
         # the main thread merges them in slate order below.
         ml, spreads, totals, props, warns = [], [], [], [], []
+        coherence = []
 
         # Phase 1–3 (MLB): probable-starter / opponent / bullpen matchup
         # features, built once per game and shared by team markets AND props.
@@ -3131,6 +3162,18 @@ if analyze_clicked and selected_game_labels:
                 if book.get("key") == "draftkings"
             ]
             game_odds = parse_game_odds(draftkings_game_odds)
+
+            # Coherence run-line (DK-internal): pure-odds, so it runs off game_odds
+            # alone (no team-stat resolution needed) whenever the slate offset was fit.
+            if coherence_offset is not None:
+                try:
+                    import coherence_flags as _coh
+                    for _c in _coh.run_line_candidates(game_odds, coherence_offset):
+                        _c["event_id"] = eid
+                        coherence.append(_c)
+                except Exception:
+                    pass
+
             home_espn = _resolve_team_dim(sport["key"], home, espn_teams)
             away_espn = _resolve_team_dim(sport["key"], away, espn_teams)
 
@@ -3242,7 +3285,7 @@ if analyze_clicked and selected_game_labels:
             props.extend(new_props)
 
         return {"ml": ml, "spreads": spreads, "totals": totals,
-                "props": props, "warns": warns}
+                "props": props, "coherence": coherence, "warns": warns}
 
     # Build + analyze every game CONCURRENTLY (each game is independent; the heavy
     # per-game cost is blocking Azure SQL / StatsAPI round-trips). Mirrors the
@@ -3266,6 +3309,7 @@ if analyze_clicked and selected_game_labels:
         all_spreads.extend(_r["spreads"])
         all_totals.extend(_r["totals"])
         all_props.extend(_r["props"])
+        all_coherence.extend(_r.get("coherence", []))
         warnings.extend(_r["warns"])
 
     # ── Safe-mode confidence filter for spreads / totals ──
@@ -3301,6 +3345,7 @@ if analyze_clicked and selected_game_labels:
         "all_spreads": all_spreads,
         "all_totals": all_totals,
         "all_props": all_props,
+        "all_coherence": all_coherence,
         "sport_key": sport["key"],
         "total_games": total_games,
         "total_cost": actual_cost,
@@ -3377,8 +3422,11 @@ if "analysis_results" in st.session_state:
     all_spreads = [c for c in ar["all_spreads"] if c.get("games_sampled", 0) >= 5]
     all_totals = ar["all_totals"]
     all_props = [c for c in ar["all_props"] if c.get("no_history") or c.get("games_sampled", 0) >= 5]
+    # Coherence run-line candidates carry no sampled-game history (games_sampled is
+    # None) — they're a DK-internal ML+total consistency edge, so no >=5 gate.
+    all_coherence = ar.get("all_coherence", [])
     checklist_entries = _value_bet_checklist_entries(
-        all_ml, all_spreads, all_totals, all_props)
+        all_ml, all_spreads, all_totals, all_props, all_coherence)
     # A fresh Analyze deferred its selection reset to here — now that the new
     # slate's entries are known and before the checkboxes render below, write
     # their keys False (reliable uncheck) and pop any leftover from a prior slate.
@@ -3397,6 +3445,8 @@ if "analysis_results" in st.session_state:
                   or search_filter in c.get("opponent", "").lower()]
         all_spreads = [c for c in all_spreads if search_filter in c.get("team", "").lower()
                        or search_filter in c.get("opponent", "").lower()]
+        all_coherence = [c for c in all_coherence if search_filter in c.get("team", "").lower()
+                         or search_filter in c.get("opponent", "").lower()]
         all_totals = [c for c in all_totals if search_filter in c.get("matchup", "").lower()]
         all_props = [c for c in all_props if search_filter in c.get("player", "").lower()
                      or search_filter in c.get("matchup", "").lower()]
@@ -3519,6 +3569,34 @@ if "analysis_results" in st.session_state:
                             c.get("market_comparison"), market_key="spreads"),
                     })
                 st.table(rows)
+
+    # Coherence run-line results (DK-internal ML+total consistency edge)
+    value_coh = [c for c in all_coherence if c.get("is_value")]
+    if value_coh:
+        st.subheader("🎯 Coherence Run-Line")
+        st.caption(
+            "DraftKings' posted run-line vs. what its OWN moneyline + total imply "
+            "(after a historical Poisson-shape offset). A marginal, DK-internal "
+            "edge still in forward confirmation (t≈1.66) — bet small; these are "
+            "auto-logged and tracked whether or not you place them."
+        )
+        st.success(f"**{len(value_coh)} coherence run-line flag(s) found!**")
+        for c in sorted(value_coh, key=lambda x: x["edge_pct"], reverse=True):
+            with st.expander(
+                    f"🎯 {c['team']} {c['spread']:+.2f} ({c['home_away']})  —  "
+                    f"Edge: +{c['edge_pct']}%", expanded=True):
+                _select_bet_checkbox(c, "runline_coherence")
+                cols = st.columns(6)
+                cols[0].metric("Run line", f"{c['spread']:+.2f}")
+                cols[1].metric("Coherent fair", f"{c['cover_rate']}%",
+                               help="DK's ML+total imply this cover probability "
+                                    "(calibrated), vs. the run-line's own price.")
+                cols[2].metric("Price Break-even", f"{c['implied_prob']}%")
+                cols[3].metric("Edge", f"{c['edge_pct']:+.2f}%")
+                cols[4].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
+                p_val, p_delta = _dk_payout_strs(c.get("price"))
+                cols[5].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
+                               help="American odds and profit on a $10 bet at DraftKings.")
 
     # Totals results
     if all_totals:
