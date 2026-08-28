@@ -16,9 +16,6 @@ One line per open item. When an item ships, delete it here and fold the durable 
 ## [[edges-and-backtests]]
 - **(next direction — open)** Both edge theses (sharp-staleness, variance→team) are now spent; the coherence run-line is the lone validated edge (forward-tracking). Options if resuming the hunt: sharpen coherence with a stable-favorite-SP filter (forward-track, don't backtest-ship), soft/niche markets, NBA/NFL (data-gated), or consolidate + operate. Monte Carlo sim = no-go on current evidence.
 
-## [[data-and-architecture]]
-- **Auto-create/refresh the parquet mirror from the backtest tools — QUEUED (Doug: do it once he verifies the manual sync/verify/run flow works).** Add `warehouse_mirror.ensure(sport, seasons, refresh=False)` (sync only MISSING files, or all if refresh); each backtest `load_or_fetch` calls it when `ODI_BACKTEST_MIRROR=1` so the manual `--sync` becomes optional (first flagged run auto-builds). Add a `--refresh-mirror` flag per tool (distinct from `--refresh` = pickle cache). Needs Azure to build; no-DB boxes still need a pre-synced/copied dir.
-
 ## [[modeling-and-calibration]]
 - **value_gate auto-tune** — fold a confirmation-gated `--gate-diag` selection into the offline refit as advisory + `--promote` (never live-auto; threshold argmax overfits vs smooth Platt). `refit_calibration` still never calls `save_value_gate`.
 - **EV floor 4%→3% for DK/FD** — `value_gate.ev_floor` is still 0.04 (chosen on optimistic consensus prices); A/B 0.04 vs 0.03 on DK/FanDuel fills via `--gate-diag`.

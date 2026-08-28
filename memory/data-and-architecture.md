@@ -78,8 +78,19 @@ mlb_game/pitcher_game/batter_game raw, scoped by season_bucket + game_type store
 = byte-identical rows. Each reader returns None on a missing slice → r2_data /
 scenario route to it with per-call **Azure fallback** (safe-by-default; OFF unless
 the flag is set → zero live/refit impact). Data dir gitignored (code versioned,
-data local). CLIs: `--sync` (build), `--verify` (real-data parity vs Azure),
-`ODI_BACKTEST_MIRROR=1` (read). Tests: test_warehouse_mirror.py (9).
+data local).
+
+**AUTO-BUILD + `_valid` marker (f83dce8):** all four backtest tools call
+`warehouse_mirror.autobuild(sport, seasons)` in `load_or_fetch` when
+`ODI_BACKTEST_MIRROR=1`, so the manual `--sync` is now OPTIONAL — the first flagged
+run auto-syncs missing files and verifies them. Verification is expensive (queries
+Azure), so a file that PASSES `--verify` is renamed `X.parquet → X_valid.parquet`;
+readers prefer the `_valid` copy; a fresh sync drops any stale `_valid` (data changed
+→ must re-verify); a failing verify demotes `_valid → base`. `ensure()` FAST-PATHs to
+instant (no Azure) once every needed file is `_valid`, so verification happens ONCE
+per file, not per run. No-DB box: leaves files as-is (readers fall back). CLIs:
+`--sync`, `--verify`, `--refresh` (re-sync), per-tool `--refresh-mirror` (re-sync +
+re-verify); `ODI_BACKTEST_MIRROR=1` to read. Tests: test_warehouse_mirror.py (14).
 
 ## Live-analysis performance
 
