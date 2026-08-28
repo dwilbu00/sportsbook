@@ -518,6 +518,61 @@ def scenario_prop_roi(sport, seasons):
     return rows, cov
 
 
+# ── scenario: line-timing feasibility probe (is there an early→close path?) ──
+
+def scenario_line_timing(sport, seasons):
+    """STEP 1 for the line-timing / CLV-decay study: does the warehouse hold a real
+    early→close price PATH per event, or only single (close) captures? A CLV-by-lead-
+    time study is only buildable offline if events have BOTH an early and a near-close
+    snapshot; otherwise it needs Odds-API historical credits. Reports, per market kind
+    (team / props, DK), snapshots-per-event + the lead-time (hours-to-commence)
+    distribution. Mirror-backed; no Azure."""
+    import statistics
+
+    def _lead_hours(cap, com):
+        c1, c2 = r2_data._parse_ts(cap), r2_data._parse_ts(com)
+        if c1 is None or c2 is None:
+            return None
+        return (c2 - c1).total_seconds() / 3600.0
+
+    print("=" * 74)
+    print("  LINE-TIMING feasibility — snapshots-per-event + lead-time coverage (DK)")
+    print("=" * 74)
+    for kind_name, reader in (("team ", r2_data._read_team_market_lines),
+                              ("props", r2_data._read_player_prop_lines)):
+        snaps_by_event = defaultdict(set)
+        leads_by_event = defaultdict(list)
+        for s in seasons:
+            rows = reader(sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31",
+                          bookmaker="draftkings")
+            for r in rows:
+                eid = r.get("event_id")
+                if eid is None:
+                    continue
+                snaps_by_event[eid].add(r.get("captured_at"))
+                lh = _lead_hours(r.get("captured_at"), r.get("commence_time"))
+                if lh is not None:
+                    leads_by_event[eid].append(lh)
+        n_ev = max(len(snaps_by_event), 1)
+        multi = sum(1 for c in snaps_by_event.values() if len(c) >= 2)
+        # a usable PATH = an event with a snapshot >6h out AND one <1h out
+        path = sum(1 for leads in leads_by_event.values()
+                   if leads and max(leads) > 6 and min(leads) < 1)
+        all_leads = [l for leads in leads_by_event.values() for l in leads]
+        print(f"\n  {kind_name} (DK): events={len(snaps_by_event):,}  "
+              f">=2 snapshots={multi:,} ({100*multi/n_ev:.0f}%)  "
+              f"early+close path (>6h & <1h)={path:,} ({100*path/n_ev:.0f}%)")
+        if all_leads:
+            q = statistics.quantiles(all_leads, n=4) if len(all_leads) > 3 else [0, 0, 0]
+            print(f"    lead-hours over {len(all_leads):,} snapshots: "
+                  f"min={min(all_leads):.1f}  p25={q[0]:.1f}  med={q[1]:.1f}  "
+                  f"p75={q[2]:.1f}  max={max(all_leads):.1f}")
+    print("\n  READ: a real CLV-by-lead-time study needs the 'early+close path' % to be")
+    print("  meaningful. If ~0, our captures are single/close-only -> the study needs")
+    print("  Odds-API historical credits (a spend), not just the warehouse.")
+    print("=" * 74)
+
+
 # ── reporting ────────────────────────────────────────────────────────────────
 
 def _report(title, rows, cov=None, cov_keys=()):
@@ -707,7 +762,8 @@ def main():
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
-                             "fav_combo", "er_ml", "team_variance", "prop_roi"])
+                             "fav_combo", "er_ml", "team_variance", "prop_roi",
+                             "line_timing"])
     ap.add_argument("--prop-roi-min-n", type=int, default=100,
                     help="Min pooled bets for a (prop,line,side) cell to be a candidate.")
     ap.add_argument("--cv-half-life", type=float, default=5.0,
@@ -790,6 +846,8 @@ def main():
     if want in ("all", "prop_roi"):
         rows, cov = scenario_prop_roi(args.sport, seasons)
         _report_prop_roi(rows, cov, min_n=args.prop_roi_min_n)
+    if want == "line_timing":          # feasibility probe — explicit only, not in "all"
+        scenario_line_timing(args.sport, seasons)
 
 
 if __name__ == "__main__":
