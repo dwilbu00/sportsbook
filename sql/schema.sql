@@ -989,6 +989,8 @@ CREATE TABLE dbo.mlb_game (
     detailed_state NVARCHAR(64),                         -- detailedState
     home_score     FLOAT,
     away_score     FLOAT,
+    home_score_f5  FLOAT,                                 -- runs through 5 innings (F5 grading)
+    away_score_f5  FLOAT,
     fetched_at     FLOAT,
     CONSTRAINT fk_mlb_game_home
         FOREIGN KEY (home_team_id) REFERENCES dbo.mlb_team (team_id),
@@ -1032,6 +1034,15 @@ IF COL_LENGTH('dbo.mlb_game', 'hp_umpire_id') IS NULL
 GO
 IF COL_LENGTH('dbo.mlb_game', 'hp_umpire_name') IS NULL
     ALTER TABLE dbo.mlb_game ADD hp_umpire_name NVARCHAR(160);
+GO
+-- First-5-innings runs (F5 grading; summed from hydrate=linescore innings[]).
+-- Backfill after this ALTER: re-ingest schedules (--ingest-range ... --no-boxscores),
+-- which upserts these onto existing mlb_game rows. NULL when not final / <5 innings.
+IF COL_LENGTH('dbo.mlb_game', 'home_score_f5') IS NULL
+    ALTER TABLE dbo.mlb_game ADD home_score_f5 FLOAT;
+GO
+IF COL_LENGTH('dbo.mlb_game', 'away_score_f5') IS NULL
+    ALTER TABLE dbo.mlb_game ADD away_score_f5 FLOAT;
 GO
 
 ------------------------------------------------------------------------- mlb_venue

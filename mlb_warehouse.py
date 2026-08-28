@@ -149,6 +149,12 @@ mlb_game = Table(
     Column("detailed_state", String(64)),                # detailedState
     Column("home_score", Float),
     Column("away_score", Float),
+    # Runs through the first 5 innings (F5 grading) — summed from the schedule's
+    # hydrate=linescore innings[]. NULL when not final or <5 innings played
+    # (rain-shortened). Populated by parse_schedule; backfill via a schedule
+    # re-ingest (--ingest-range ... --no-boxscores upserts these).
+    Column("home_score_f5", Float),
+    Column("away_score_f5", Float),
     Column("fetched_at", Float),
     Index("ix_mlb_game_official_date", "official_date"),
     Index("ix_mlb_game_teams", "official_date", "home_team_id", "away_team_id"),
@@ -270,7 +276,8 @@ _TEAM_COLS = ("team_id", "name", "name_norm", "abbreviation", "league_id",
 _GAME_COLS = ("game_pk", "game_date", "official_date", "season", "game_type",
               "game_number", "double_header", "home_team_id", "away_team_id",
               "venue_id", "hp_umpire_id", "hp_umpire_name", "status",
-              "detailed_state", "home_score", "away_score", "fetched_at")
+              "detailed_state", "home_score", "away_score",
+              "home_score_f5", "away_score_f5", "fetched_at")
 _VENUE_COLS = ("venue_id", "name", "team_id", "team_name", "lat", "lon",
                "cf_bearing", "park_hits", "park_runs", "elevation_ft", "roof",
                "fetched_at")
@@ -463,6 +470,21 @@ def parse_teams(raw):
     return out
 
 
+def _first_five_runs(linescore, is_final):
+    """(home, away) runs through the first 5 innings from a hydrate=linescore
+    ``innings[]`` block, or (None, None) if the game isn't final or fewer than 5
+    innings were played (rain-shortened). Missing per-inning runs count as 0."""
+    innings = (linescore or {}).get("innings") or []
+    if not is_final or len(innings) < 5:
+        return None, None
+    try:
+        h5 = sum(int((innings[i].get("home") or {}).get("runs") or 0) for i in range(5))
+        a5 = sum(int((innings[i].get("away") or {}).get("runs") or 0) for i in range(5))
+    except (TypeError, ValueError, AttributeError):
+        return None, None
+    return float(h5), float(a5)
+
+
 def parse_schedule(raw, season):
     """Raw /schedule payload → (mlb_game rows, minimal mlb_team rows).
 
@@ -498,6 +520,8 @@ def parse_schedule(raw, season):
                 as_ = (ls.get("away") or {}).get("runs")
             hid = home_team.get("id")
             aid = away_team.get("id")
+            h5, a5 = _first_five_runs(g.get("linescore"),
+                                      status.get("abstractGameState") == "Final")
             games.append({
                 "game_pk": int(pk),
                 "game_date": g.get("gameDate"),
@@ -513,6 +537,8 @@ def parse_schedule(raw, season):
                 "detailed_state": status.get("detailedState"),
                 "home_score": _f(hs),
                 "away_score": _f(as_),
+                "home_score_f5": h5,
+                "away_score_f5": a5,
                 "fetched_at": _now(),
             })
     return games, list(teams.values())
