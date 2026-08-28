@@ -8,7 +8,7 @@
 ## ▶ Resume here (current state)
 - **Done:** P0 (code side), all of P1, all of P2, and **all of P3** (full `analysis.py` split + correctness + hygiene). **154 tests passing**, all green. P3 was adversarially reviewed (4-dimension workflow, ~262k tokens) with **zero confirmed findings**.
 - **Working tree:** everything is uncommitted (no commits made per user instruction). `calibration/basketball_nba.json` regenerated on the new data-driven pool (2026/2025); the prior P1 version is saved as `calibration/basketball_nba.json.p1bak` (untracked — safe to delete once happy, or `cp` it back to revert). See Git state at bottom.
-- **Next up:** the audit-driven code work (P0–P3) is complete. Only the 👤 **user-only P0 key rotation/history purge** remains, plus the explicitly **deferred P3 residuals** (see P3 section: `backtest.py`/`app.py` god-module splits, app fetch/analyze pure-function extraction, single-bet missing-price *display* number).
+- **Next up:** the audit-driven code work (P0–P3) is complete. The 👤 P0 API key was **ROTATED (owner-confirmed) ✅** — the value in git history is now dead, so the history scrub is moot and this is CLOSED (do not re-flag). Remaining are the explicitly **deferred P3 residuals** (see P3 section: `backtest.py`/`app.py` god-module splits, app fetch/analyze pure-function extraction, single-bet missing-price *display* number).
 
 ## How to resume / verify
 - **Run all tests:** `python -m unittest discover` (currently **154 passing**). CLI tools now self-configure UTF-8 stdout (`cli_encoding.configure_stdio`), so the `PYTHONIOENCODING=utf-8 PYTHONUTF8=1` prefix is no longer required to run them on Windows (still harmless).
@@ -26,7 +26,7 @@
 
 ## P0 — Critical
 - ✅ **P0.1 Committed live API key** — code hygiene done: `config.json` git-ignored + `git rm --cached`, `config.json.example` template added, `load_config`/`save_api_key` fall back to template + read `ODDS_API_KEY` from secrets/env, misleading help text fixed. Files: `config.json.example`, `.gitignore`, `app.py`.
-  - 👤 **STILL REQUIRED (cannot be done for you):** (1) rotate/revoke the key at the-odds-api.com; (2) purge it from git history (`git filter-repo`/BFG) — it remains in history until then.
+  - ✅ **DONE (owner-confirmed):** the key was rotated/revoked at the-odds-api.com, so the value in git history is dead. History purge is optional/moot (a rotated key is worthless) — CLOSED, do not re-flag.
 
 ## P1 — High (money-losing / integrity)
 - ✅ **P1.1 Props flagged +EV while −EV** — added `analysis._prop_is_value(edge, threshold, expected_roi)`: requires edge ≥ threshold AND `expected_roi > 0` at the executable price. Wired into candidate + logged flag. Files: `analysis.py`.
