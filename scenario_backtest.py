@@ -176,6 +176,20 @@ def _fav_bucket(imp):
     return ">=70%"
 
 
+def _fav_bucket_fine(imp):
+    """2.5%-wide favorite-strength bins to check whether the 65-70% signal is a
+    smooth PLATEAU (trust) or a single-bin SPIKE (knife-edge = suspect)."""
+    edges = [0.60, 0.625, 0.65, 0.675, 0.70, 0.725, 0.75]
+    if imp < edges[0]:
+        return "a <60.0%"
+    lo = edges[0]
+    for i, hi in enumerate(edges[1:], 1):
+        if imp < hi:
+            return f"{chr(ord('b') + i - 1)} {lo:.1%}-{hi:.1%}"
+        lo = hi
+    return "z >=75.0%"
+
+
 def scenario_dog_runline(blob):
     """Bet the UNDERDOG's +1.5 run-line in every game with a clear ML favorite
     (home OR away dog). Isolates the +4.2%/replicating signal that fell out of
@@ -217,7 +231,7 @@ def scenario_dog_runline(blob):
                 continue
             cov["graded"] += 1
             rows.append({"season": str(season), "result": result, "profit": p,
-                         "price": dog_price,
+                         "price": dog_price, "fav_imp": fav_imp,
                          "side": "home_dog" if dog_is_home else "away_dog",
                          "fav_bucket": _fav_bucket(fav_imp)})
     return rows, cov
@@ -513,6 +527,9 @@ def main():
         # (an isolated spike that lives in a single season = variance, not edge.)
         _print_slice(rows, lambda r: (r["fav_bucket"], r["season"]),
                      "favorite strength x season")
+        # Knife-edge vs plateau: finer 2.5% bins around the 65-70% sweet spot.
+        _print_slice(rows, lambda r: _fav_bucket_fine(r["fav_imp"]),
+                     "favorite strength (fine 2.5% bins)")
     if want in ("all", "fav_combo"):
         parlay, straights, cov = scenario_fav_combo(blob)
         print(f"  fav_combo coverage: graded_games={cov.get('graded_games',0):,} "
