@@ -28,10 +28,16 @@ import argparse
 import datetime
 
 import coherence
-from odds_client import american_to_decimal
+from odds_client import american_to_decimal, american_to_implied_prob
 from r2_sharp import fair_two_way
 
 DEFAULT_OFFSET_SEASONS = ["2024", "2025", "2026"]
+
+# App-integration defaults (mirror the CLI): the validated coherence run-line was
+# fit Poisson (dispersion 0), and forward-flagged at a 3% EV floor / 2% vig haircut.
+DEFAULT_DISPERSION = 0.0
+DEFAULT_HAIRCUT = 0.02
+DEFAULT_EV_FLOOR = 0.03
 
 
 def compute_offset(sport, seasons, dispersion=0.0):
@@ -139,6 +145,116 @@ def triads_from_upcoming(games, book_key="draftkings"):
             total_line=over[0], total_over=over[1], total_under=under[1]))
         stats["triads_built"] += 1
     return triads, stats
+
+
+def _first_price(entries):
+    """First usable american price from a parse_game_odds entry list (DK-only view)."""
+    for e in entries or []:
+        p = e.get("price")
+        if p is not None:
+            return p
+    return None
+
+
+def _run_line_entry(entries):
+    """The MAIN run-line (|point|==1.5) as (signed_point, price) from a team's
+    parse_game_odds spreads list; falls back to the entry nearest ±1.5. (None, None)
+    if the team has no usable spread."""
+    best = None
+    for e in entries or []:
+        sp, pr = e.get("spread"), e.get("price")
+        if sp is None or pr is None:
+            continue
+        try:
+            sp = float(sp)
+        except (TypeError, ValueError):
+            continue
+        if abs(abs(sp) - 1.5) < 1e-9:
+            return sp, pr
+        d = abs(abs(sp) - 1.5)
+        if best is None or d < best[0]:
+            best = (d, sp, pr)
+    return (best[1], best[2]) if best else (None, None)
+
+
+def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
+                        haircut=DEFAULT_HAIRCUT, ev_floor=DEFAULT_EV_FLOOR):
+    """PURE: from ONE game's parsed DK odds (odds_client.parse_game_odds shape:
+    moneyline/spreads/totals dicts + home_team/away_team), emit the +EV coherence
+    run-line side(s) as spread-shaped candidate dicts tagged type='runline_coherence'.
+
+    Coherence = solve run means from DK's own ML + total, read the implied run-line
+    cover, subtract the historical Poisson-shape ``offset`` (calibration), and flag
+    whichever DK run-line side clears ``ev_floor`` at a vig ``haircut``. Returns a
+    list (0-1 side is +EV in practice; both are checked). The candidate mirrors the
+    analyze_spreads_value key set so it rides the existing pool/checklist/wager rails;
+    ``event_id`` is stamped by the caller. Never raises — returns [] on any gap."""
+    try:
+        home = game_odds.get("home_team")
+        away = game_odds.get("away_team")
+        ml = game_odds.get("moneyline") or {}
+        sp = game_odds.get("spreads") or {}
+        tot = game_odds.get("totals") or {}
+        ml_home, ml_away = _first_price(ml.get(home)), _first_price(ml.get(away))
+        point_h, price_h = _run_line_entry(sp.get(home))
+        point_a, price_a = _run_line_entry(sp.get(away))
+        over_entries, under_entries = tot.get("Over"), tot.get("Under")
+        over_price = _first_price(over_entries)
+        under_price = _first_price(under_entries)
+        total_line = next((e.get("line") for e in (over_entries or [])
+                           if e.get("line") is not None), None)
+        if None in (home, away, ml_home, ml_away, point_h, price_h, point_a,
+                    price_a, over_price, under_price, total_line):
+            return []
+        # The two run-line points must be the complementary main line (±1.5).
+        if abs(float(point_h) + float(point_a)) > 1e-6:
+            return []
+
+        ml_home_fair, _ = fair_two_way(ml_home, ml_away)
+        over_fair, _ = fair_two_way(over_price, under_price)
+        if ml_home_fair is None or over_fair is None:
+            return []
+        implied = coherence.implied_home_cover(
+            ml_home_fair, float(total_line), over_fair, float(point_h), dispersion)
+        if implied is None:
+            return []
+        implied = min(1.0 - 1e-6, max(1e-6, implied - offset))   # calibrated fair
+        rl_home_fair, rl_away_fair = fair_two_way(price_h, price_a)  # devigged market
+
+        out = []
+        sides = [("HOME", home, away, float(point_h), price_h, implied, rl_home_fair),
+                 ("AWAY", away, home, float(point_a), price_a, 1.0 - implied,
+                  rl_away_fair)]
+        for home_away, team, opp, point, price, coh_fair, mkt_fair in sides:
+            try:
+                dec = american_to_decimal(int(price))
+            except (TypeError, ValueError):
+                continue
+            ev = coh_fair * dec * (1.0 - haircut) - 1.0
+            if ev < ev_floor:
+                continue
+            baseline = mkt_fair if mkt_fair is not None else \
+                american_to_implied_prob(int(price))
+            out.append({
+                "type": "runline_coherence",
+                "team": team, "opponent": opp, "home_away": home_away,
+                "spread": point,
+                "cover_rate": round(coh_fair * 100, 2),
+                "model_cover_rate": round(coh_fair * 100, 2),
+                "implied_prob": round(baseline * 100, 2),
+                "edge_pct": round((coh_fair - baseline) * 100, 2),
+                "expected_roi_pct": round(ev * 100, 2),
+                "is_value": True,
+                "price": int(price), "price_missing": False,
+                "games_sampled": None,
+                "pred_game_margin": None, "pred_game_std": None,
+                "model_source": "coherence",
+                "matchup": f"{away} @ {home}",
+                "coherent_fair": round(coh_fair, 4),
+            })
+        return out
+    except Exception:
+        return []
 
 
 def load_triads_live(sport, book_key="draftkings"):

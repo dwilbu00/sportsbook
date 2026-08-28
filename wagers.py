@@ -184,7 +184,9 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "model_prob": _pct(candidate.get("blended_prob")),
                 "model_edge": candidate.get("best_edge_pct"),
             })
-        elif bet_type == "spread":
+        elif bet_type in ("spread", "runline_coherence"):
+            # Coherence run-line grades identically to a spread (run-line cover); the
+            # distinct bet_type is retained in the ledger so its record stays separable.
             home_away = candidate.get("home_away")
             price = candidate.get("price")
             spread = candidate.get("spread")
@@ -454,7 +456,10 @@ def _grade_wager(row):
             status = "won" if actual > line else "lost"
         return status, actual
 
-    # Team markets (moneyline / spread / total).
+    # Team markets (moneyline / spread / total). A coherence run-line grades exactly
+    # like a spread cover, so normalize its bet_type for the shared team graders (its
+    # distinct type only matters for the separable ledger/forward-track record).
+    grade_bt = "spread" if bet_type == "runline_coherence" else bet_type
     # Fast path (Tier A #2, MLB only): when the wager carries a game_pk, grade off
     # the EXACT warehouse game (doubleheader-safe) instead of name+date. A positive
     # 'still live' verdict returns None-from-GRADE_PENDING and stays pending — we do
@@ -464,7 +469,7 @@ def _grade_wager(row):
     game_pk = row.get("game_pk")
     if row.get("sport_key") == "baseball_mlb" and game_pk:
         fast = game_results.grade_team_bet_by_game_pk(
-            row.get("sport_key"), game_pk, bet_type, row.get("side"),
+            row.get("sport_key"), game_pk, grade_bt, row.get("side"),
             row.get("team"), row.get("point"))
         if fast is game_results.GRADE_PENDING:
             return None
@@ -478,7 +483,7 @@ def _grade_wager(row):
         return None
     home_score, away_score = score
     side = row.get("side")
-    if bet_type in ("moneyline", "spread"):
+    if bet_type in ("moneyline", "spread", "runline_coherence"):
         # Grade by the bet's TEAM identity, not the stored side. `side` is set at
         # submit from home_away; if that were ever stale/flipped it would settle
         # the bet on the wrong team (a Yankees ML grading off the Phillies' win).
@@ -490,7 +495,7 @@ def _grade_wager(row):
         if resolved is not None:
             side = resolved
     status = game_results.grade_team_bet(
-        bet_type, side, row.get("point"), home_score, away_score)
+        grade_bt, side, row.get("point"), home_score, away_score)
     if status is None:
         return None
     return status, f"{home_score:g}-{away_score:g}"

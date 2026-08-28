@@ -56,7 +56,7 @@ def _prob(bet_type, side, c):
     """Model probability that the bet hits, as a percent (0–100)."""
     if bet_type == "moneyline":
         return c.get("blended_prob")
-    if bet_type == "spread":
+    if bet_type in ("spread", "runline_coherence"):
         return c.get("cover_rate")
     if bet_type == "total":
         ohr = c.get("over_hit_rate")
@@ -125,6 +125,11 @@ def _leg(bet_type, side, cand):
     elif bet_type == "player_prop":
         mapped = ("player_prop_over" if cand.get("direction") == "OVER"
                   else "player_prop_under")
+    elif bet_type == "runline_coherence":
+        # A coherence run-line IS a run-line: treat it as a spread for structural /
+        # anti-correlation conflict checks so it can't co-select with the model's own
+        # spread (or opposite side) on the same game.
+        mapped = "spread"
     else:
         mapped = bet_type  # moneyline / spread, unchanged
     return {

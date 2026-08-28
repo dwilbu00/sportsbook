@@ -934,6 +934,38 @@ def build_market_prediction_rows(ar, sport_key):
             })
             rows.append(row)
 
+        # Coherence run-line: the flagged +EV side per event (its own bet_type so it
+        # gets a SEPARATE, auto-graded forward-track record — the whole point of the
+        # t~1.66 confirmation). Grades as a run-line cover (see resolve + grade below).
+        coh_by_event = defaultdict(list)
+        for c in ar.get("all_coherence") or []:
+            coh_by_event[c.get("event_id")].append(c)
+        for event_id, cands in coh_by_event.items():
+            if not event_id:
+                continue
+            pick = max(cands, key=lambda c: _mkt_num(c.get("cover_rate")))
+            model_prob = _mkt_prob01(pick.get("cover_rate"))
+            point = _mkt_float(pick.get("spread"))
+            if model_prob is None or point is None:
+                continue
+            home_away = (pick.get("home_away") or "").upper()
+            row = _common(event_id)
+            row.update({
+                "bet_type": "runline_coherence",
+                "team": pick.get("team"),
+                "opponent": pick.get("opponent"),
+                "home_away": home_away,
+                "side": "home" if home_away == "HOME" else "away",
+                "matchup": _mkt_matchup(pick, events.get(event_id)),
+                "book": "draftkings",
+                "point": point,
+                "model_prob": model_prob,
+                "raw_prob": _mkt_prob01(pick.get("model_cover_rate")),
+                "price": _mkt_int(pick.get("price")),
+                "is_value": _mkt_bool(pick.get("is_value")),
+            })
+            rows.append(row)
+
         # Total: over if over_hit_rate >= 50 else under.
         for c in ar.get("all_totals") or []:
             event_id = c.get("event_id")
@@ -1062,7 +1094,10 @@ def resolve_pending_market_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LA
         home_score, away_score = score
         bet_type = r.get("bet_type")
         side = r.get("side")
-        if bet_type in ("moneyline", "spread"):
+        # A coherence run-line grades exactly like a spread cover; normalize for the
+        # shared graders while keeping its distinct bet_type in the log.
+        grade_bt = "spread" if bet_type == "runline_coherence" else bet_type
+        if bet_type in ("moneyline", "spread", "runline_coherence"):
             # Grade by TEAM identity, not the stored side (final_score already
             # matched the game on these home/away names) — mirrors _grade_wager.
             resolved_side = game_results.side_for_team(
@@ -1070,7 +1105,7 @@ def resolve_pending_market_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LA
             if resolved_side is not None:
                 side = resolved_side
         status = game_results.grade_team_bet(
-            bet_type, side, r.get("point"), home_score, away_score)
+            grade_bt, side, r.get("point"), home_score, away_score)
         if status is None:
             continue
         outcome = 1 if status == "won" else (0 if status == "lost" else None)

@@ -1024,7 +1024,7 @@ def make_bet_checklist_entry(candidate, bet_type, side=None):
         except (TypeError, ValueError):
             return str(value)
 
-    if bet_type in ("moneyline", "spread"):
+    if bet_type in ("moneyline", "spread", "runline_coherence"):
         team = candidate["team"]
         opponent = candidate["opponent"]
         matchup = (
@@ -1040,8 +1040,9 @@ def make_bet_checklist_entry(candidate, bet_type, side=None):
         bet = f"{candidate['team']} moneyline"
         team = candidate["team"]
         identity = (candidate.get("event_id") or matchup, bet_type, team)
-    elif bet_type == "spread":
-        type_label = "Spread"
+    elif bet_type in ("spread", "runline_coherence"):
+        type_label = "Run line (coherence)" if bet_type == "runline_coherence" \
+            else "Spread"
         spread = _line(candidate["spread"], signed=True)
         bet = f"{candidate['team']} {spread}"
         team = candidate["team"]
