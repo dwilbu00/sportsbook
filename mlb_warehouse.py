@@ -986,20 +986,30 @@ def ingest_date(date, with_boxscores=True, land_bronze=True, skip_game_pks=None)
 
 
 def ingest_range(start, end, with_boxscores=True, land_bronze=True,
-                 skip_game_pks=None):
-    """Ingest an inclusive [start, end] date range; yields a per-date summary.
-    ``land_bronze=False`` skips the transient raw-JSON audit trail for a fast
-    bulk backfill (see ingest_date). ``skip_game_pks`` (a set) skips already-derived
-    games — see pitcher_cols_done_game_pks / the --skip-existing resume path."""
+                 skip_game_pks=None, progress_every=0):
+    """Ingest an inclusive [start, end] date range; returns a list of per-date
+    summaries. ``land_bronze=False`` skips the transient raw-JSON audit trail for a
+    fast bulk backfill (see ingest_date). ``skip_game_pks`` (a set) skips
+    already-derived games — see pitcher_cols_done_game_pks / --skip-existing.
+    ``progress_every`` > 0 prints a live progress line every N dates (each date
+    commits its own transaction, so this reflects real durable progress); 0 = silent
+    (unchanged for non-CLI callers)."""
     d0 = datetime.date.fromisoformat(str(start))
     d1 = datetime.date.fromisoformat(str(end))
     results = []
     cur = d0
     step = datetime.timedelta(days=1)
+    total_days = (d1 - d0).days + 1
+    n = 0
     while cur <= d1:
         results.append(ingest_date(cur.isoformat(), with_boxscores=with_boxscores,
                                    land_bronze=land_bronze,
                                    skip_game_pks=skip_game_pks))
+        n += 1
+        if progress_every and n % progress_every == 0:
+            games = sum(r.get("games", 0) for r in results)
+            print(f"  ...{n}/{total_days} dates ingested (through {cur.isoformat()}); "
+                  f"{games:,} games so far", flush=True)
         cur += step
     return results
 
@@ -3305,8 +3315,9 @@ def _main_cli():
                   f"them (resume mode).")
         for res in ingest_range(args.ingest_range[0], args.ingest_range[1],
                                 with_boxscores=box, land_bronze=bronze,
-                                skip_game_pks=skip):
-            print(_fmt(res))
+                                skip_game_pks=skip, progress_every=25):
+            pass   # progress streamed live every 25 dates; skip the 1k-line dump
+        print("  [ingest-range] done.")
     if args.standings is not None:
         did = True
         season = args.standings if args.standings and args.standings > 0 else None
