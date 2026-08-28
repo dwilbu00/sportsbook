@@ -3582,9 +3582,11 @@ if "analysis_results" in st.session_state:
         st.subheader("🎯 Coherence Run-Line")
         st.caption(
             "DraftKings' posted run-line vs. what its OWN moneyline + total imply "
-            "(after a historical Poisson-shape offset). A marginal, DK-internal "
-            "edge still in forward confirmation (t≈1.66) — bet small; these are "
-            "auto-logged and tracked whether or not you place them."
+            "(after a historical Poisson-shape offset). Sharpened to the underdog "
+            "+1.5 at MODERATE favorites (~60–70% ML implied), where the edge "
+            "concentrates (~+11% backtest; dead below 60%, negative on heavy favs). "
+            "Still a forward-confirmation lead — bet small; these are auto-logged "
+            "and tracked whether or not you place them."
         )
         st.success(f"**{len(value_coh)} coherence run-line flag(s) found!**")
         for c in sorted(value_coh, key=lambda x: x["edge_pct"], reverse=True):

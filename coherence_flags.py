@@ -39,6 +39,24 @@ DEFAULT_DISPERSION = 0.0
 DEFAULT_HAIRCUT = 0.02
 DEFAULT_EV_FLOOR = 0.03
 
+# SHARPENING (2026-08-28): the coherence run-line edge is a pure UNDERDOG +1.5 signal
+# (coherence_backtest flags 0 favorite -1.5 bets), and its ROI concentrates at
+# MODERATE favorites — flat below ~60% ML implied, ~+11% at 60-70%, NEGATIVE on heavy
+# favorites (>=70%). Two independent methods agree (coherence_backtest + scenario_
+# backtest dog_runline, the latter ~+20% replicating all 3 seasons at 65-70%). So the
+# live flag is sharpened to (a) the dog +1.5 side only and (b) this favorite band.
+# The band is data-selected on 2024-2026, so it's a FORWARD-TRACK hypothesis — widen/
+# relax via the params if the in-app forward log says otherwise.
+DEFAULT_FAV_MIN = 0.60
+DEFAULT_FAV_MAX = 0.70
+
+
+def _fav_band_ok(ml_home_fair, fav_min, fav_max):
+    """True if the game's FAVORITE devigged win prob is in [fav_min, fav_max) — the
+    moderate-favorite band where the dog +1.5 coherence edge concentrates."""
+    fav_imp = max(ml_home_fair, 1.0 - ml_home_fair)
+    return fav_min <= fav_imp < fav_max
+
 
 def compute_offset(sport, seasons, dispersion=0.0):
     """Calibration offset = mean (implied - DK RL fair) over completed-season triads
@@ -60,14 +78,21 @@ def compute_offset(sport, seasons, dispersion=0.0):
     return (sum(vals) / len(vals)) if vals else 0.0, len(vals)
 
 
-def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03):
+def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03,
+               fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX):
     """PURE: flag the +EV DK run-line side per game. Returns flag dicts sorted by EV
-    (descending). ``offset`` is the calibration constant from compute_offset."""
+    (descending). ``offset`` is the calibration constant from compute_offset.
+
+    SHARPENED: only the underdog +1.5 side, only when the favorite is in the moderate
+    [fav_min, fav_max) band (see the module note). Pass fav_min=0.0, fav_max=1.0 to
+    disable the band and recover the raw (all-favorites, dog-only) behavior."""
     flags = []
     for t in triads:
         ml_home_fair, _ = fair_two_way(t.ml_home, t.ml_away)
         over_fair, _ = fair_two_way(t.total_over, t.total_under)
         if ml_home_fair is None or over_fair is None:
+            continue
+        if not _fav_band_ok(ml_home_fair, fav_min, fav_max):
             continue
         implied = coherence.implied_home_cover(
             ml_home_fair, t.total_line, over_fair, t.rl_home_point, dispersion)
@@ -77,6 +102,8 @@ def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03):
         sides = [("home", t.home, t.rl_home_point, t.rl_home, implied),
                  ("away", t.away, -t.rl_home_point, t.rl_away, 1.0 - implied)]
         for side, team, point, price, fair in sides:
+            if point <= 0:          # coherence edge is the UNDERDOG +1.5 side only
+                continue
             try:
                 ev = fair * american_to_decimal(int(price)) * (1.0 - haircut) - 1.0
             except (TypeError, ValueError):
@@ -178,7 +205,8 @@ def _run_line_entry(entries):
 
 
 def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
-                        haircut=DEFAULT_HAIRCUT, ev_floor=DEFAULT_EV_FLOOR):
+                        haircut=DEFAULT_HAIRCUT, ev_floor=DEFAULT_EV_FLOOR,
+                        fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX):
     """PURE: from ONE game's parsed DK odds (odds_client.parse_game_odds shape:
     moneyline/spreads/totals dicts + home_team/away_team), emit the +EV coherence
     run-line side(s) as spread-shaped candidate dicts tagged type='runline_coherence'.
@@ -214,6 +242,9 @@ def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
         over_fair, _ = fair_two_way(over_price, under_price)
         if ml_home_fair is None or over_fair is None:
             return []
+        # SHARPENED: only surface the edge at moderate favorites (see module note).
+        if not _fav_band_ok(ml_home_fair, fav_min, fav_max):
+            return []
         implied = coherence.implied_home_cover(
             ml_home_fair, float(total_line), over_fair, float(point_h), dispersion)
         if implied is None:
@@ -226,6 +257,8 @@ def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
                  ("AWAY", away, home, float(point_a), price_a, 1.0 - implied,
                   rl_away_fair)]
         for home_away, team, opp, point, price, coh_fair, mkt_fair in sides:
+            if point <= 0:          # coherence edge is the UNDERDOG +1.5 side only
+                continue
             try:
                 dec = american_to_decimal(int(price))
             except (TypeError, ValueError):
@@ -283,6 +316,11 @@ def main():
     ap.add_argument("--dispersion", type=float, default=0.0)
     ap.add_argument("--haircut", type=float, default=0.02)
     ap.add_argument("--ev-floor", type=float, default=0.03)
+    ap.add_argument("--fav-min", type=float, default=DEFAULT_FAV_MIN,
+                    help="Min favorite ML-implied prob to flag (moderate-fav band).")
+    ap.add_argument("--fav-max", type=float, default=DEFAULT_FAV_MAX,
+                    help="Max favorite ML-implied prob to flag. Pass --fav-min 0 "
+                         "--fav-max 1 to disable the band (all favorites).")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -313,7 +351,10 @@ def main():
         print(msg)
         return
 
-    flags = flag_games(triads, offset, args.dispersion, args.haircut, args.ev_floor)
+    flags = flag_games(triads, offset, args.dispersion, args.haircut, args.ev_floor,
+                       fav_min=args.fav_min, fav_max=args.fav_max)
+    print(f"  sharpened to dog +1.5 at favorites in "
+          f"[{args.fav_min:.0%}, {args.fav_max:.0%}) ML-implied")
     if not flags:
         print("  No +EV run-line flags today.")
         return

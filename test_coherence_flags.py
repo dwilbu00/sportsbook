@@ -1,8 +1,16 @@
-"""Unit tests for coherence_flags.flag_games — the pure daily-flag selection."""
+"""Unit tests for coherence_flags — pure daily-flag selection + the in-app adapter.
+
+Most tests disable the moderate-favorite band (fav_min=0.0, fav_max=1.0) so they
+exercise the underlying EV / offset / shape mechanics independent of the sharpening
+gate; SharpeningGateTests covers the band + dog-only gate itself.
+"""
 import unittest
 
 import coherence_flags as cf
 import r2_data
+
+# Disable the favorite band so a flag appears regardless of the fixture's ML.
+_NO_BAND = dict(fav_min=0.0, fav_max=1.0)
 
 
 def _triad(ml_home=-150, ml_away=+130, rl_point=-1.5, rl_home=+120, rl_away=-140,
@@ -16,27 +24,25 @@ def _triad(ml_home=-150, ml_away=+130, rl_point=-1.5, rl_home=+120, rl_away=-140
 
 class FlagGamesTests(unittest.TestCase):
     def test_flags_have_actionable_fields(self):
-        # Low floor so at least one side flags; check the record is bettable.
-        flags = cf.flag_games([_triad()], offset=0.0, ev_floor=-10.0)
+        # Low floor so a side flags; check the record is bettable.
+        flags = cf.flag_games([_triad()], offset=0.0, ev_floor=-10.0, **_NO_BAND)
         self.assertTrue(flags)
         f = flags[0]
         for k in ("side", "team", "point", "dk_price", "ev", "coherent_fair"):
             self.assertIn(k, f)
         self.assertIn(f["side"], ("home", "away"))
-        # away side carries the mirrored run-line point
-        away = [x for x in flags if x["side"] == "away"]
-        home = [x for x in flags if x["side"] == "home"]
-        if away and home:
-            self.assertAlmostEqual(away[0]["point"], -home[0]["point"], places=9)
+        # Sharpened: only the underdog +1.5 side is ever flagged.
+        self.assertTrue(all(x["point"] > 0 for x in flags))
 
     def test_high_floor_flags_nothing(self):
-        self.assertEqual(cf.flag_games([_triad()], offset=0.0, ev_floor=0.95), [])
+        self.assertEqual(
+            cf.flag_games([_triad()], offset=0.0, ev_floor=0.95, **_NO_BAND), [])
 
     def test_offset_shifts_fair(self):
         # A positive offset lowers implied home cover -> raises the away-side fair by
         # the same amount. Assert the calibrated fair actually moves with the offset.
-        base = cf.flag_games([_triad()], offset=0.0, ev_floor=-10.0)
-        shifted = cf.flag_games([_triad()], offset=0.10, ev_floor=-10.0)
+        base = cf.flag_games([_triad()], offset=0.0, ev_floor=-10.0, **_NO_BAND)
+        shifted = cf.flag_games([_triad()], offset=0.10, ev_floor=-10.0, **_NO_BAND)
         b_away = next(f for f in base if f["side"] == "away")
         s_away = next(f for f in shifted if f["side"] == "away")
         self.assertAlmostEqual(s_away["coherent_fair"] - b_away["coherent_fair"],
@@ -44,7 +50,7 @@ class FlagGamesTests(unittest.TestCase):
 
     def test_sorted_by_ev_desc(self):
         flags = cf.flag_games([_triad(), _triad(rl_home=+180, rl_away=-220)],
-                              offset=0.0, ev_floor=-10.0)
+                              offset=0.0, ev_floor=-10.0, **_NO_BAND)
         evs = [f["ev"] for f in flags]
         self.assertEqual(evs, sorted(evs, reverse=True))
 
@@ -84,7 +90,8 @@ def _game_odds(home="Mets", away="Yankees", ml_home=-150, ml_away=+130,
 class RunLineCandidatesTests(unittest.TestCase):
     def test_flags_positive_ev_side_with_spread_shape(self):
         # Very low floor so a side flags; check it's spread-shaped + coherence-tagged.
-        cands = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0)
+        cands = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0,
+                                       **_NO_BAND)
         self.assertTrue(cands)
         c = cands[0]
         self.assertEqual(c["type"], "runline_coherence")
@@ -95,25 +102,30 @@ class RunLineCandidatesTests(unittest.TestCase):
         self.assertIn(c["home_away"], ("HOME", "AWAY"))
         self.assertTrue(c["is_value"])
         self.assertEqual(abs(c["spread"]), 1.5)
+        # Sharpened: only the underdog +1.5 side.
+        self.assertTrue(all(x["spread"] > 0 for x in cands))
 
     def test_high_floor_flags_nothing(self):
         self.assertEqual(cf.run_line_candidates(_game_odds(), offset=0.0,
-                                                ev_floor=0.95), [])
+                                                ev_floor=0.95, **_NO_BAND), [])
 
     def test_missing_market_returns_empty(self):
         g = _game_odds()
         del g["totals"]["Over"]        # no total -> can't solve run means
-        self.assertEqual(cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0), [])
+        self.assertEqual(
+            cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0, **_NO_BAND), [])
 
     def test_non_runline_spread_ignored(self):
-        # A 1.0 alt line (not the ±1.5 main) with no 1.5 present -> nearest fallback
-        # still parses, but a mismatched pair (home -1.5, away +2.5) is rejected.
+        # A mismatched pair (home -1.5, away +2.5) is rejected.
         g = _game_odds(rl_away=(+2.5, -140))
-        self.assertEqual(cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0), [])
+        self.assertEqual(
+            cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0, **_NO_BAND), [])
 
     def test_offset_shifts_fair(self):
-        base = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0)
-        shifted = cf.run_line_candidates(_game_odds(), offset=0.10, ev_floor=-10.0)
+        base = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0,
+                                      **_NO_BAND)
+        shifted = cf.run_line_candidates(_game_odds(), offset=0.10, ev_floor=-10.0,
+                                         **_NO_BAND)
         b_away = next(c for c in base if c["home_away"] == "AWAY")
         s_away = next(c for c in shifted if c["home_away"] == "AWAY")
         # +offset lowers implied home cover -> raises away cover by the same amount.
@@ -123,7 +135,8 @@ class RunLineCandidatesTests(unittest.TestCase):
     def test_candidate_feeds_checklist_and_selector(self):
         import analysis
         import bet_selector
-        c = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0)[0]
+        c = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0,
+                                   **_NO_BAND)[0]
         c["event_id"] = "E1"
         entry = analysis.make_bet_checklist_entry(c, "runline_coherence")
         self.assertTrue(entry["selection_key"].startswith("bet_selection:"))
@@ -132,6 +145,45 @@ class RunLineCandidatesTests(unittest.TestCase):
         self.assertIsNotNone(bet_selector._prob("runline_coherence", None, c))
         leg = bet_selector._leg("runline_coherence", None, c)
         self.assertEqual(leg["bet_type"], "spread")   # conflicts as a spread
+
+
+class SharpeningGateTests(unittest.TestCase):
+    """The 2026-08-28 sharpening: dog +1.5 side only, moderate-favorite band."""
+
+    def test_dog_only_never_flags_favorite_side(self):
+        # Band disabled + low floor: still only the underdog +1.5 side is returned.
+        flags = cf.flag_games([_triad()], offset=0.0, ev_floor=-10.0, **_NO_BAND)
+        self.assertTrue(flags)
+        self.assertTrue(all(f["point"] > 0 for f in flags))
+        self.assertTrue(all(f["side"] == "away" for f in flags))  # away is the +1.5 dog
+        cands = cf.run_line_candidates(_game_odds(), offset=0.0, ev_floor=-10.0,
+                                       **_NO_BAND)
+        self.assertTrue(cands)
+        self.assertTrue(all(c["spread"] > 0 for c in cands))
+
+    def test_in_band_moderate_favorite_flags(self):
+        # -190/+160 devigs to a ~63% favorite -> inside the default [0.60,0.70) band.
+        t = _triad(ml_home=-190, ml_away=+160)
+        self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0))
+        g = _game_odds(ml_home=-190, ml_away=+160)
+        self.assertTrue(cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0))
+
+    def test_heavy_favorite_out_of_band_dropped(self):
+        # -350/+280 devigs to a ~75% favorite -> above the band -> nothing (default).
+        t = _triad(ml_home=-350, ml_away=+280)
+        self.assertEqual(cf.flag_games([t], offset=0.0, ev_floor=-10.0), [])
+        g = _game_odds(ml_home=-350, ml_away=+280)
+        self.assertEqual(cf.run_line_candidates(g, offset=0.0, ev_floor=-10.0), [])
+
+    def test_near_pickem_out_of_band_dropped(self):
+        # -120/+100 devigs to a ~52% favorite -> below the band -> nothing (default).
+        t = _triad(ml_home=-120, ml_away=+100)
+        self.assertEqual(cf.flag_games([t], offset=0.0, ev_floor=-10.0), [])
+
+    def test_band_can_be_disabled(self):
+        # A heavy favorite that the default band drops is flagged when the band is off.
+        t = _triad(ml_home=-350, ml_away=+280)
+        self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0, **_NO_BAND))
 
 
 class TriadsFromUpcomingTests(unittest.TestCase):
@@ -159,9 +211,9 @@ class TriadsFromUpcomingTests(unittest.TestCase):
         self.assertEqual(stats["events_dropped_incomplete_triad"], 1)
 
     def test_flags_run_on_parsed_triads(self):
-        # End-to-end: parsed live triads feed flag_games unchanged.
+        # End-to-end: parsed live triads feed flag_games unchanged (band disabled).
         triads, _ = cf.triads_from_upcoming([_game()])
-        flags = cf.flag_games(triads, offset=0.0, ev_floor=-10.0)
+        flags = cf.flag_games(triads, offset=0.0, ev_floor=-10.0, **_NO_BAND)
         self.assertTrue(flags)
 
 
