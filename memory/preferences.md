@@ -25,6 +25,9 @@ Owner is **Doug** — sole user AND developer of this MLB (+NBA/NFL) sportsbook 
 ## Spend confirmation
 Before EXECUTING any large/irreversible spend (Odds API credits, paid backfills, real money/quota), give one final explicit "firing now — ~N credits, go?" beat — **even after a general go-ahead during scoping**. A planning "let's do it" is NOT consent to spend at the moment of execution (2026-08-15: approved ~10.5k-cr backfill during scoping, fired it, Doug immediately asked to pause). Dry-runs / pricing / diagnostics / reads / code+tests are free — no confirm needed; only the real spend does.
 
+## Delegation & models
+⚠ TOOL CONSTRAINT (verified 2026-08-28): the `Agent`/`Workflow` `model` param accepts ONLY the enum aliases `sonnet`|`opus`|`haiku`|`fable` — NOT version strings (`claude-sonnet-4-6` is rejected). And the **`"sonnet"` alias targets sonnet-4-5, which is NOT on Doug's Vertex deployment → it fails at runtime.** So **sonnet-4-6 is NOT reachable via delegation** despite being enabled in GCP (`claude-sonnet-4-6@default`). Usable delegation models here = **`opus`** (default) and **`haiku`** (alias → Doug's `claude-haiku-4-5@20251001`; CONFIRMED working — ran a real read-only verification pass fine). ⇒ Delegate less-demanding work (mechanical scans, read-only verification/red-team, bulk edits, command drafting, summarization) to **`haiku`** to save cost; keep **`opus`** for load-bearing authoring/design/correctness-critical logic (money, calibration, data integrity). If the `sonnet` alias is ever repointed to 4-6 on the deployment, revisit.
+
 ## Verifying prod state (do this instead of asking)
 I can read prod Azure SQL **directly** (read-only, no spend) by calling
 `db_store.promote_secrets_from_toml()` first, then querying — so verify prod state

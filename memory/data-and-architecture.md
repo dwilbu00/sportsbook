@@ -65,6 +65,22 @@ DK-vs-DK exact-line CLV via on-demand historical backfill (`backfill_dk_clv.py`)
 
 "So much has changed it's not even the same app." `archive_app_data.py` (built, f1f1dc0) archives prediction_log + market_prediction_log + wagers + bankroll_ledger to ONE timestamped JSON (fsync + round-trip verify), THEN id-bounded-deletes in one transaction, writes an `app_data_epoch` marker to app_settings. This is the non-destructive archive-then-epoch design (NOT the overturned wipe). **HARD LINE — PRESERVE, never touch:** calibration fits (`calibration/*.json`, `recalibration_params`), resolved facts (mlb_game/gamelogs/statcast), team-market blocks, the 2023-2025 odds corpus. ✅ Executed 2026-08-28 (owner-confirmed): bankroll ZEROED (re-enter via My Bets), thin ~3,000 pre-relaunch 2026 `live` odds pruned, clean early(13:00Z)+close corpus loaded, `app_data_epoch` marker set. (Design was archive-then-epoch, NOT the overturned wipe; run had app STOPPED + explicit confirm.)
 
+## Backtest parquet mirror (offline speed + no-DB portability)
+
+`warehouse_mirror.py` (shipped 2026-08-28) — a shared LOCAL parquet mirror of the
+read-only historical tables that ALL backtest tools read instead of Azure when
+`ODI_BACKTEST_MIRROR=1`. Ends per-tool re-pulling; a synced box backtests with ZERO
+Azure round-trips (works with no DB at all — good for multi-machine). Odds stored as
+the EXACT db_store reader dicts per season×book (shape parity by construction);
+mlb_game/pitcher_game/batter_game raw, scoped by season_bucket + game_type stored so
+`calib_gamelogs_bulk` excludes S/A/E (matches get_calib_gamelogs_bulk) while
+`pitcher_game_index` keeps all types (matches _pitcher_game_index). NaN→None coercion
+= byte-identical rows. Each reader returns None on a missing slice → r2_data /
+scenario route to it with per-call **Azure fallback** (safe-by-default; OFF unless
+the flag is set → zero live/refit impact). Data dir gitignored (code versioned,
+data local). CLIs: `--sync` (build), `--verify` (real-data parity vs Azure),
+`ODI_BACKTEST_MIRROR=1` (read). Tests: test_warehouse_mirror.py (9).
+
 ## Live-analysis performance
 
 - **SHIPPED (pushed):** Phase-3 parallelization (`_analyze_one_event` in a 16-worker pool, workers return candidate lists merged in slate order → zero races, ~5-10x; ed9dbc7) + team-dim per-process cache (`_team_dim`, was ~half of all warehouse round-trips; a395ccf). Hosted-app crash fixed (config.json.example; 90c18e6). Verify picks LIVE (no unit coverage for the Streamlit handler).
