@@ -527,6 +527,11 @@ def _print_slice(rows, keyfn, label):
 
 def _pitcher_team_index(seasons):
     """{(athlete_id_str, game_pk_int): (team_id_str, GS_float)} from mlb_pitcher_game."""
+    _m = r2_data._mirror()
+    if _m is not None:
+        mi = _m.pitcher_team_index(seasons=seasons)
+        if mi is not None:
+            return mi
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
@@ -544,6 +549,11 @@ def _pitcher_team_index(seasons):
 
 def _game_teams_index():
     """{game_pk_int: (home_team_id_str, away_team_id_str)} from mlb_game."""
+    _m = r2_data._mirror()
+    if _m is not None:
+        mi = _m.game_teams_index()
+        if mi is not None:
+            return mi
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
@@ -558,10 +568,10 @@ def _game_teams_index():
 
 
 def _prop_rows_by_season(sport, seasons, prop_key):
-    import db_store
+    # Routes through r2_data's mirror-aware reader (parquet if enabled, else Azure).
     by_season = {}
     for s in seasons:
-        by_season[s] = db_store.player_prop_lines(
+        by_season[s] = r2_data._read_player_prop_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31",
             prop_keys=[prop_key], bookmaker="draftkings")
     return by_season
@@ -569,12 +579,15 @@ def _prop_rows_by_season(sport, seasons, prop_key):
 
 def _pitcher_idx_by_season(seasons):
     """{season_str: {athlete_id_str: [(official_date, outs, er, ...) asc]}} — the as-of
-    pitcher ER series for leakage-safe SP volatility (reuses mlb_warehouse's per-season
-    pitcher game index; one query per season)."""
-    import mlb_warehouse as wh
+    pitcher ER series for leakage-safe SP volatility. Mirror (parquet) if enabled, else
+    mlb_warehouse's per-season pitcher game index."""
+    _m = r2_data._mirror()
     out = {}
     for s in seasons:
-        idx = wh._pitcher_game_index(int(s)) or {}
+        idx = _m.pitcher_game_index(int(s)) if _m is not None else None
+        if idx is None:
+            import mlb_warehouse as wh
+            idx = wh._pitcher_game_index(int(s)) or {}
         out[str(s)] = {str(aid): games for aid, games in idx.items()}
     return out
 

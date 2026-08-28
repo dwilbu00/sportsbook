@@ -12,3 +12,6 @@ streamlit==1.56.0
 # (pip wheel, no system ODBC driver / packages.txt needed on Streamlit Cloud).
 SQLAlchemy>=2.0,<2.1
 pymssql>=2.3,<2.4
+
+# offline backtest parquet mirror (warehouse_mirror.py)
+pyarrow

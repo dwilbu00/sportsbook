@@ -48,6 +48,40 @@ _PIN = "pinnacle"
 _SYNONYM = {"batter_hits": ("batter_total_bases", frozenset({0.5}))}
 
 
+# ── local parquet mirror routing (backtest-only; Azure fallback per call) ─────
+# When ODI_BACKTEST_MIRROR is on + the mirror exists, backtest reads come from local
+# parquet instead of Azure. Each mirror reader returns None on a missing slice, so we
+# fall back to the live db_store/mlb_warehouse read for that call. The LIVE APP + the
+# calibration REFIT never import this path (they call db_store directly).
+
+def _mirror():
+    try:
+        import warehouse_mirror
+        return warehouse_mirror if warehouse_mirror.enabled() else None
+    except Exception:
+        return None
+
+
+def _read_team_market_lines(sport, **kw):
+    m = _mirror()
+    if m is not None:
+        rows = m.team_market_lines(sport, **kw)
+        if rows is not None:
+            return rows
+    import db_store
+    return db_store.team_market_lines(sport, **kw)
+
+
+def _read_player_prop_lines(sport, **kw):
+    m = _mirror()
+    if m is not None:
+        rows = m.player_prop_lines(sport, **kw)
+        if rows is not None:
+            return rows
+    import db_store
+    return db_store.player_prop_lines(sport, **kw)
+
+
 def _parse_ts(s):
     """Parse an ISO String(40) warehouse timestamp (e.g. '2024-06-26T23:05:38Z') to
     an aware UTC datetime, or None. Mirrors mlb_warehouse._parse_utc but dependency-
@@ -173,8 +207,7 @@ def select_prop_legs(rows):
 
 def _fetch_book(sport, season, prop_keys, bookmaker):
     """One book-scoped, season-scoped bulk read, tagged with its book."""
-    import db_store
-    rows = db_store.player_prop_lines(
+    rows = _read_player_prop_lines(
         sport, date_from=f"{season}-01-01", date_to=f"{season}-12-31",
         prop_keys=list(prop_keys), bookmaker=bookmaker)
     for r in rows:
@@ -224,7 +257,10 @@ def build_outcome_index(seasons, prop_keys):
     for role in roles:
         role_idx = {}
         for s in seasons:
-            bulk = wh.get_calib_gamelogs_bulk(role, int(s))
+            _m = _mirror()
+            bulk = (_m.calib_gamelogs_bulk(role, int(s)) if _m is not None else None)
+            if bulk is None:
+                bulk = wh.get_calib_gamelogs_bulk(role, int(s))
             for aid, games in bulk.items():
                 for g in games:
                     gpk = g.get("game_pk")
@@ -301,7 +337,7 @@ def load_team_ml_legs(sport, seasons, kind="team"):
     for s in seasons:
         rows = []
         for book in (_DK, _PIN):
-            fetched = db_store.team_market_lines(
+            fetched = _read_team_market_lines(
                 sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
             for r in fetched:
                 if r.get("bet_type") == "moneyline" and r.get("kind") == kind:
@@ -379,7 +415,7 @@ def load_team_triad(sport, seasons, bookmaker="draftkings"):
     db_store.promote_secrets_from_toml()
     by_season, stats_by = {}, {}
     for s in seasons:
-        rows = db_store.team_market_lines(
+        rows = _read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=bookmaker)
         rows = [dict(r, book=bookmaker) for r in rows if r.get("kind") == "team"]
         triads, stats = select_team_triad(rows)
@@ -459,7 +495,7 @@ def load_f5_ml_legs(sport, seasons):
     for s in seasons:
         rows = []
         for book in ("draftkings", "pinnacle", "fanduel"):
-            fetched = db_store.team_market_lines(
+            fetched = _read_team_market_lines(
                 sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
             for r in fetched:
                 if r.get("kind") == "first_five":
@@ -472,6 +508,11 @@ def load_f5_ml_legs(sport, seasons):
 
 def build_f5_scores_index(seasons=None):
     """{game_pk(int): (home_score_f5, away_score_f5)} for games with F5 scores."""
+    _m = _mirror()
+    if _m is not None:
+        mi = _m.build_f5_scores_index()
+        if mi is not None:
+            return mi
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
@@ -489,6 +530,11 @@ def build_f5_scores_index(seasons=None):
 
 def build_team_scores_index(seasons=None):
     """{game_pk(int): (home_score, away_score)} for all final games, from mlb_game."""
+    _m = _mirror()
+    if _m is not None:
+        mi = _m.build_team_scores_index()
+        if mi is not None:
+            return mi
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
@@ -507,6 +553,11 @@ def build_team_scores_index(seasons=None):
 def build_team_finals_index(seasons=None):
     """{game_pk(int): home_won 1.0/0.0} for all FINAL games (non-tie), from mlb_game.
     ~one query; ties dropped (MLB has none in regulation, but guard anyway)."""
+    _m = _mirror()
+    if _m is not None:
+        mi = _m.build_team_finals_index()
+        if mi is not None:
+            return mi
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
