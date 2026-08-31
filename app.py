@@ -3475,6 +3475,12 @@ if "analysis_results" in st.session_state:
     # Moneyline results
     if all_ml:
         st.subheader("💰 Moneyline Analysis")
+        st.caption(
+            "⏱ Timing: place moneyline bets EARLY, not at close. DraftKings' ML "
+            "prices decay ~2% against you from early to close (validated 3/3 "
+            "seasons, paired early-vs-close) — betting at analysis time captures "
+            "that CLV. Don't wait for game time."
+        )
         if any(c.get("market_comparison") for c in all_ml):
             st.caption(
                 "Market Comparison is line-shopping context only and does not "
