@@ -18,6 +18,14 @@ so instead:
    that resolves to 4-5 which isn't on Doug's Vertex). See [[data-and-architecture]]
    for the model-routing gotcha.
 
+3. **Ultracode = OFF by default** (Doug's call, 2026-08-31). It runs a multi-agent
+   workflow for every substantive task, token cost no object — overkill for our
+   typical single-file-fix / run-backtest / interpret-results loop. Flip it on
+   per-task (type `ultracode`) only for jobs with real breadth or that need
+   independent verification: adversarial audits (e.g. the coherence-commit audit),
+   codebase-wide sweeps/migrations, wide-open design (judge panels). Proactively say
+   "this one's worth ultracode" when a task fits.
+
 **Effort rubric:**
 - LOW (Haiku / `/fast`): mechanical/deterministic — run a known command, flag lookup,
   rename/format edit, status check, read one file.
