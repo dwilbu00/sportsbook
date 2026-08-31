@@ -1294,6 +1294,85 @@ def scenario_under_timing(sport, seasons):
     return rows, cov
 
 
+def _total_line_bucket(x):
+    if x is None:
+        return "unk"
+    if x <= 7.5:
+        return "a <=7.5"
+    if x <= 8.5:
+        return "b 8-8.5"
+    if x <= 9.5:
+        return "c 9-9.5"
+    return "d >=10"
+
+
+def scenario_under_stress(sport, seasons, lead_lo=12.0, lead_hi=24.0):
+    """FREE offline stress-test of the flat-UNDER signal, on the bettable 12-24h window
+    (the strongest OBSERVABLE bucket from under_timing). Breaks under ROI down by total-
+    line value, favorite strength, month, and season (magnitude + t) to judge whether the
+    +9.85% is BROAD + stable (a real market over-lean, bettable) or CONCENTRATED in a
+    suspicious subset (artifact/overfit). Uses the close total snapshot within
+    [lead_lo, lead_hi); scores + month from the warehouse game meta."""
+    import r2_data
+    meta = _load_game_meta(seasons)
+    rows, cov = [], Counter()
+    for s in seasons:
+        team_rows = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        for eid, snaps in _event_snapshots(team_rows).items():
+            pick = next(((ld, sd) for ld, sd in reversed(snaps)
+                         if _mkt_ok("over", sd) and lead_lo <= ld < lead_hi), None)
+            if pick is None:
+                cov["no_total_in_window"] += 1
+                continue
+            lead, sd = pick
+            gpk = sd.get("game_pk")
+            if gpk is None or int(gpk) not in meta:
+                cov["no_meta"] += 1
+                continue
+            m = meta[int(gpk)]
+            hs, as_ = m["home_score"], m["away_score"]
+            if hs is None or as_ is None:
+                cov["no_score"] += 1
+                continue
+            res = r2_grade.grade_over_under(hs + as_, sd["total_line"], "UNDER")
+            p = r2_grade.profit(sd["under"], res) if res else None
+            if p is None:
+                cov["ungradable"] += 1
+                continue
+            try:
+                imp_h = american_to_implied_prob(int(sd["ml_home"]))
+                imp_a = american_to_implied_prob(int(sd["ml_away"]))
+                fav = _fav_bucket(max(imp_h, imp_a))
+            except (TypeError, ValueError):
+                fav = "unk"
+            rows.append({"season": str(s), "result": res, "profit": p,
+                         "line_bucket": _total_line_bucket(sd["total_line"]),
+                         "month": (m["official_date"] or "")[5:7] or "unk",
+                         "fav_bucket": fav})
+            cov["graded"] += 1
+    return rows, cov
+
+
+def _report_under_stress(rows, cov, min_n=80):
+    pooled = r2_grade.summarize(rows)
+    print("=" * 78)
+    print("  UNDER STRESS-TEST — flat-UNDER ROI on the 12-24h window, broken down to test")
+    print("  breadth vs concentration. Broad+ across cells => real over-lean; one cell")
+    print("  carrying it => suspect (artifact/overfit).")
+    print(f"  POOLED: n={pooled.n:,} ROI={pooled.roi:+.2%} hit={pooled.hit_rate:.1%} "
+          f"t={pooled.t_stat:+.2f}   (no_total_in_window={cov.get('no_total_in_window',0):,})")
+    print("=" * 78)
+    _repl_slice(rows, lambda r: r["line_bucket"], "total-line value", min_n)
+    _repl_slice(rows, lambda r: r["fav_bucket"], "favorite strength", min_n)
+    _repl_slice(rows, lambda r: r["month"], "month", min_n)
+    _repl_slice(rows, lambda r: r["season"], "season", 30)
+    print("  READ: want +ROI in MOST line/fav/month cells AND every season with similar")
+    print("  magnitude. If it's one line-bucket or one month, it's a narrow effect (or")
+    print("  overfit), not a broad over-lean — treat with more suspicion before any spend.")
+    print("=" * 78)
+
+
 def _report_under_timing(rows, cov):
     print("=" * 78)
     print("  UNDER-TIMING CONTROL — over/under ROI by how close-to-first-pitch the total")
@@ -1335,7 +1414,7 @@ def main():
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
                              "line_timing", "coherence_stable_sp", "upset_datamine",
-                             "under_timing"])
+                             "under_timing", "under_stress"])
     ap.add_argument("--datamine-min-n", type=int, default=60,
                     help="Min bets for an upset_datamine factor cell to be shown.")
     ap.add_argument("--coh-fav-min", type=float, default=0.60,
@@ -1440,6 +1519,9 @@ def main():
     if want == "under_timing":         # explicit only, not in "all"
         rows, cov = scenario_under_timing(args.sport, seasons)
         _report_under_timing(rows, cov)
+    if want == "under_stress":         # explicit only, not in "all"
+        rows, cov = scenario_under_stress(args.sport, seasons)
+        _report_under_stress(rows, cov)
 
 
 if __name__ == "__main__":
