@@ -1193,7 +1193,10 @@ def _repl_slice(rows, keyfn, label, min_n, top=None):
         print("    (no cells meet n)\n")
         return
     for k, sm, signs in show:
-        star = " ★" if (sm.roi > 0 and set(signs) == {"+"} and len(signs) >= 2) else ""
+        # ★ = +ROI AND positive every season (>=2) AND pooled |t|>=1.5 (magnitude gate,
+        # not just sign — sign-consistency alone flags tiny t~0.5 cells as false leads).
+        star = (" ★" if (sm.roi > 0 and set(signs) == {"+"} and len(signs) >= 2
+                         and sm.t_stat >= 1.5) else "")
         print(f"    {str(k)[:30]:<30} n={sm.n:>5,} ROI={sm.roi:+.2%} "
               f"t={sm.t_stat:+.2f} [{signs}]{star}")
     print("")
