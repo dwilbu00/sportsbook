@@ -1235,6 +1235,98 @@ def _report_upset_datamine(rows, cov, min_n=60):
     print("=" * 78)
 
 
+def _lead_bucket(h):
+    if h is None:
+        return "unk"
+    if h < 1:
+        return "a <1h"
+    if h < 3:
+        return "b 1-3h"
+    if h < 6:
+        return "c 3-6h"
+    if h < 12:
+        return "d 6-12h"
+    if h < 24:
+        return "e 12-24h"
+    return "f >=24h"
+
+
+_LEAD_ORDER = ["a <1h", "b 1-3h", "c 3-6h", "d 6-12h", "e 12-24h", "f >=24h", "unk"]
+
+
+def scenario_under_timing(sport, seasons):
+    """TIMING-CONTROL the flat-UNDER signal from upset_datamine. For each event, take the
+    CLOSE total snapshot (latest pre-commence capture that carries a total) AND its lead
+    hours, grade over/under at THAT line vs the final, and bucket ROI by lead time. Reads
+    RAW snapshots (not the triad) so the per-event capture lead is known. READ: if the
+    under edge SHRINKS toward the <1h bucket (vanishes near-close), it's a stale-high-line
+    ARTIFACT — our captured total is earlier/higher than the true close; if it HOLDS at
+    <1h, it's a real closing-line edge worth a paid true-close confirmation."""
+    import r2_data
+    scores = r2_data.build_team_scores_index(seasons)
+    rows, cov = [], Counter()
+    for s in seasons:
+        team_rows = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        for eid, snaps in _event_snapshots(team_rows).items():
+            cov["events"] += 1
+            close = next(((ld, sd) for ld, sd in reversed(snaps) if _mkt_ok("over", sd)),
+                         None)
+            if close is None:
+                cov["no_total"] += 1
+                continue
+            lead, sd = close
+            gpk = sd.get("game_pk")
+            if gpk is None or int(gpk) not in scores:
+                cov["no_score"] += 1
+                continue
+            hs, as_ = scores[int(gpk)]
+            lb = _lead_bucket(lead)
+            for bet, price, side in (("total_over", sd["over"], "OVER"),
+                                     ("total_under", sd["under"], "UNDER")):
+                res = r2_grade.grade_over_under(hs + as_, sd["total_line"], side)
+                p = r2_grade.profit(price, res) if res else None
+                if p is None:
+                    continue
+                rows.append({"season": str(s), "bet": bet, "result": res, "profit": p,
+                             "lead_bucket": lb, "lead": lead})
+            cov["graded"] += 1
+    return rows, cov
+
+
+def _report_under_timing(rows, cov):
+    print("=" * 78)
+    print("  UNDER-TIMING CONTROL — over/under ROI by how close-to-first-pitch the total")
+    print("  snapshot was captured. Under edge fading toward '<1h' = STALE-LINE ARTIFACT.")
+    print(f"  events={cov.get('events',0):,} graded={cov.get('graded',0):,} "
+          f"(no_total={cov.get('no_total',0):,} no_score={cov.get('no_score',0):,})")
+    print("=" * 78)
+    seasons = sorted({r["season"] for r in rows})
+    for bet in ("total_under", "total_over"):
+        br = [r for r in rows if r["bet"] == bet]
+        pooled = r2_grade.summarize(br)
+        print(f"\n  ── {bet.upper()}  (pooled: n={pooled.n:,} ROI={pooled.roi:+.2%} "
+              f"t={pooled.t_stat:+.2f}) " + "─" * 18)
+        cells = r2_grade.by_key(br, lambda r: r["lead_bucket"])
+        print(f"    {'lead bucket':<12} {'n':>6} {'ROI':>9} {'t':>7}  per-season")
+        for b in _LEAD_ORDER:
+            sm = cells.get(b)
+            if not sm or sm.n < 30:
+                continue
+            signs = []
+            for s in seasons:
+                ss = r2_grade.summarize(
+                    [r for r in br if r["lead_bucket"] == b and r["season"] == s])
+                if ss.n >= 20:
+                    signs.append("+" if ss.roi > 0 else "-")
+            print(f"    {b:<12} {sm.n:>6,} {sm.roi:>+8.2%} {sm.t_stat:>+7.2f}  "
+                  f"[{''.join(signs) or 'n/a'}]")
+    print("\n  READ: compare the '<1h' (near-close) row to the longer-lead rows. Under ROI")
+    print("  high at long leads but ~0 at <1h => the +5% was our stale-high line, NOT a")
+    print("  real edge. Under ROI still clearly + at <1h => real; worth a true-close pull.")
+    print("=" * 78)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Rule-based scenario backtests (DK, 2024-26).")
     ap.add_argument("--sport", default="baseball_mlb")
@@ -1242,7 +1334,8 @@ def main():
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
-                             "line_timing", "coherence_stable_sp", "upset_datamine"])
+                             "line_timing", "coherence_stable_sp", "upset_datamine",
+                             "under_timing"])
     ap.add_argument("--datamine-min-n", type=int, default=60,
                     help="Min bets for an upset_datamine factor cell to be shown.")
     ap.add_argument("--coh-fav-min", type=float, default=0.60,
@@ -1344,6 +1437,9 @@ def main():
     if want == "upset_datamine":       # explicit only, not in "all"
         rows, cov = scenario_upset_datamine(args.sport, seasons)
         _report_upset_datamine(rows, cov, min_n=args.datamine_min_n)
+    if want == "under_timing":         # explicit only, not in "all"
+        rows, cov = scenario_under_timing(args.sport, seasons)
+        _report_under_timing(rows, cov)
 
 
 if __name__ == "__main__":
