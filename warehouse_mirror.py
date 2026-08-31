@@ -261,6 +261,8 @@ def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker):
     if not frames:
         return None
     all_df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    if all_df.empty or "game_date" not in all_df.columns:
+        return []                             # mirrored but 0 rows (e.g. wrong sport key)
     if dates:
         all_df = all_df[all_df["game_date"].isin([str(d) for d in dates])]
     else:
