@@ -449,7 +449,9 @@ def main():
     if not flags:
         print("  No +EV run-line flags today.")
         return
-    print(f"\n  {len(flags)} flag(s) — bet SMALL + track (edge is marginal, t~1.66):")
+    edge_note = ("~+11% backtest, t~3.4, 3/3 seasons" if cv_max is not None
+                 else "marginal, t~1.66 ungated")
+    print(f"\n  {len(flags)} flag(s) — bet SMALL + track (edge {edge_note}):")
     for f in flags:
         sign = "+" if f["point"] > 0 else ""
         px = f["dk_price"]

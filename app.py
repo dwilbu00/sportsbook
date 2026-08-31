@@ -3594,10 +3594,12 @@ if "analysis_results" in st.session_state:
         st.caption(
             "DraftKings' posted run-line vs. what its OWN moneyline + total imply "
             "(after a historical Poisson-shape offset). Sharpened to the underdog "
-            "+1.5 at MODERATE favorites (~60–70% ML implied), where the edge "
-            "concentrates (~+11% backtest; dead below 60%, negative on heavy favs). "
-            "Still a forward-confirmation lead — bet small; these are auto-logged "
-            "and tracked whether or not you place them."
+            "+1.5 at MODERATE favorites (~60–70% ML implied) AND only when the "
+            "favorite's starter is STABLE (recency-weighted ER-CV < 1.0) — the cell "
+            "where the edge concentrates (+11.4% backtest, t≈3.4, positive all 3 "
+            "seasons; volatile-favorite games are dropped). Needs the day's probable "
+            "starters posted to compute (fails closed otherwise). Still a forward-"
+            "confirmation lead — bet small; auto-logged whether or not you place them."
         )
         st.success(f"**{len(value_coh)} coherence run-line flag(s) found!**")
         for c in sorted(value_coh, key=lambda x: x["edge_pct"], reverse=True):
