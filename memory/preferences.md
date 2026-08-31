@@ -21,6 +21,13 @@ commands are run on his machine ([[preferences]] backtest handoff). Gotchas:
 (My own Bash tool here is Git Bash — POSIX — so my local commands differ from what I
 hand Doug. Write handoffs in PowerShell.)
 
+**C:/tmp is a SHARED scratch dir** across Doug's projects AND other concurrent agents
+(e.g. a separate agent cleans the data-warehouse `dw_*` files). Don't assume sole
+ownership: classify tmp files by project before touching, only act on THIS project's
+(sportsbook/MLB) files, and don't be alarmed if other-project files vanish mid-session
+(another agent). Confirmed harmless once 2026-08-31. Sportsbook keeper docs now live in
+repo `deploy/notes/`; project files should NOT accumulate in C:/tmp.
+
 ## Commit / push discipline
 - **Commit proactively.** After a self-contained, verified change (py_compile / tests green), commit directly to `main` without asking. Doug reviews commits after the fact. (This superseded the old "never commit unless asked" rule.)
 - **NEVER push** — Doug runs `git push` himself; commits accumulate locally unpushed until he does.
