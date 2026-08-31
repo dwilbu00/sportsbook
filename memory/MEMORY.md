@@ -12,6 +12,7 @@ Auto-memory for the MLB (+NBA/NFL) sportsbook betting model. Owner = Doug; assis
 
 ## Files
 - [preferences](preferences.md) — How to work with Doug (owner): who he is, commit/push rules, betting books (DK+FD), spend confirmation, backtest handoff, Alpha status, and his defaults-audit methodology.
+- [effort-and-cost](effort-and-cost.md) — Save cost: flag lower-effort prompts, delegate mechanical subtasks to Haiku/Sonnet-4-6; effort rubric (LOW/MED/HIGH).
 - [ACTIVE](ACTIVE.md) — in-flight work only; read this to resume. Links each item to its domain.
 - [edges-and-backtests](edges-and-backtests.md) — What the edge hunt found: the validated coherence run-line + cv_floor variance edge, the exhausted sharp-staleness/mean-edge nulls, and the warehouse backtest tooling.
 - [data-and-architecture](data-and-architecture.md) — THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion (ESPN fully removed for MLB), MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV, and the active 5M-credit odds backfill + relaunch reset.
