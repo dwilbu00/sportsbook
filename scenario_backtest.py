@@ -598,16 +598,15 @@ def _snapshot_sides(rows):
             "over": ov[1] if ov else None, "under": un[1] if un else None}
 
 
-def _pick_early_close(rows, early_min_h, close_max_h):
-    """Per event -> (early_sides, close_sides): early = furthest-out PRE-commence
-    snapshot with lead>=early_min_h; close = nearest-commence snapshot with
-    0<=lead<=close_max_h. Requires both (the path gate); in-play (lead<0) dropped."""
+def _event_snapshots(rows):
+    """Per event -> [(lead_hours, sides), ...] for all PRE-commence snapshots, EARLIEST
+    (largest lead) first; in-play (lead<0) dropped."""
     by_event = defaultdict(list)
     for r in rows:
         by_event[r.get("event_id")].append(r)
     out = {}
     for eid, ev in by_event.items():
-        snaps = defaultdict(list)
+        by_cap, lead_of = defaultdict(list), {}
         for r in ev:
             cap = r2_data._parse_ts(r.get("captured_at"))
             com = r2_data._parse_ts(r.get("commence_time"))
@@ -616,95 +615,133 @@ def _pick_early_close(rows, early_min_h, close_max_h):
             lead = (com - cap).total_seconds() / 3600.0
             if lead < 0:
                 continue
-            snaps[(r.get("captured_at"), lead)].append(r)
-        early = [(ld, rs) for (cap, ld), rs in snaps.items() if ld >= early_min_h]
-        close = [(ld, rs) for (cap, ld), rs in snaps.items() if ld <= close_max_h]
-        if not early or not close:
-            continue
-        out[eid] = (_snapshot_sides(max(early, key=lambda x: x[0])[1]),
-                    _snapshot_sides(min(close, key=lambda x: x[0])[1]))
+            k = r.get("captured_at")
+            by_cap[k].append(r)
+            lead_of[k] = lead
+        snaps = sorted(((lead_of[k], _snapshot_sides(rs)) for k, rs in by_cap.items()),
+                       key=lambda x: -x[0])
+        if snaps:
+            out[eid] = snaps
     return out
 
 
-def scenario_line_timing_study(sport, seasons, early_min_h=6.0, close_max_h=1.0):
-    """For team events with an early→close path, grade each side-category at BOTH the
-    EARLY and the CLOSE price/line (its own line — line moves are part of the timing
-    value). ΔROI = ROI_early − ROI_close answers wait-vs-bet-now per category. Favorite
-    is fixed by the CLOSE moneyline. Returns rows tagged {season, category, timing}."""
+def _mkt_ok(cat, s):
+    """Does this snapshot carry the market for a category (both sides / the ±1.5 RL)?"""
+    if cat in ("fav_ml", "dog_ml"):
+        return s["ml_home"] is not None and s["ml_away"] is not None
+    if cat == "over":
+        return s["total_line"] is not None and s["over"] is not None
+    if cat == "under":
+        return s["total_line"] is not None and s["under"] is not None
+    return (s["rl_pt"] is not None and abs(abs(s["rl_pt"]) - 1.5) < 0.01
+            and s["rl_home"] is not None and s["rl_away"] is not None)
+
+
+_LT_CATS = ("fav_ml", "dog_ml", "over", "under", "rl_dog_+1.5", "rl_fav_-1.5")
+
+
+def scenario_line_timing_study(sport, seasons, min_gap_h=6.0):
+    """Per team event, for EACH side-category independently, pick CLOSE = the LATEST
+    pre-commence snapshot that carries that market, and EARLY = the earliest snapshot
+    carrying it at least ``min_gap_h`` hours before that close. Grade the category at
+    both (own line+price; line moves are part of the timing value). Only events where
+    BOTH exist for a category are counted — a close capture that dropped spreads/totals
+    just lowers that market's paired-n instead of faking a 0% ROI. Favorite is fixed by
+    the close moneyline. Returns rows tagged {season, category, timing}."""
     scores = r2_data.build_team_scores_index(seasons)
-    rows = []
-    cov = Counter()
+    rows, cov = [], Counter()
+
+    def cat_pr(sd, cat, fav_home, winner_home, hs, as_):
+        """(price, result) for a category off one snapshot, or (None, None) if N/A."""
+        if cat == "fav_ml":
+            return (sd["ml_home"] if fav_home else sd["ml_away"],
+                    "win" if winner_home == fav_home else "loss")
+        if cat == "dog_ml":
+            return (sd["ml_away"] if fav_home else sd["ml_home"],
+                    "win" if winner_home != fav_home else "loss")
+        if cat == "over":
+            return sd["over"], r2_grade.grade_over_under(hs + as_, sd["total_line"], "OVER")
+        if cat == "under":
+            return sd["under"], r2_grade.grade_over_under(hs + as_, sd["total_line"], "UNDER")
+        dog_home = not fav_home
+        if cat == "rl_dog_+1.5":
+            if abs((sd["rl_pt"] if dog_home else -sd["rl_pt"]) - 1.5) > 0.01:
+                return None, None
+            return (sd["rl_home"] if dog_home else sd["rl_away"],
+                    _grade_runline(dog_home, 1.5, hs, as_))
+        if abs((sd["rl_pt"] if fav_home else -sd["rl_pt"]) + 1.5) > 0.01:
+            return None, None
+        return (sd["rl_home"] if fav_home else sd["rl_away"],
+                _grade_runline(fav_home, -1.5, hs, as_))
+
     for s in seasons:
         team_rows = r2_data._read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
-        for eid, (early, close) in _pick_early_close(team_rows, early_min_h, close_max_h).items():
-            cov["paths"] += 1
-            gpk = close.get("game_pk")
-            if gpk is None or int(gpk) not in scores:
-                cov["no_score"] += 1
+        for eid, snaps in _event_snapshots(team_rows).items():
+            cov["events"] += 1
+            close_ml = next((sd for ld, sd in reversed(snaps)
+                             if sd["ml_home"] is not None and sd["ml_away"] is not None), None)
+            gpk = snaps[0][1].get("game_pk")
+            if close_ml is None or gpk is None or int(gpk) not in scores:
+                cov["no_close_ml_or_score"] += 1
+                continue
+            try:
+                fav_home = (american_to_implied_prob(int(close_ml["ml_home"]))
+                            > american_to_implied_prob(int(close_ml["ml_away"])))
+            except (TypeError, ValueError):
                 continue
             hs, as_ = scores[int(gpk)]
-            try:
-                imp_h = american_to_implied_prob(int(close["ml_home"]))
-                imp_a = american_to_implied_prob(int(close["ml_away"]))
-            except (TypeError, ValueError):
-                cov["no_close_ml"] += 1
-                continue
-            fav_home = imp_h > imp_a
             winner_home = hs > as_
-            for timing, sd in (("early", early), ("close", close)):
-                def _emit(cat, price, result):
-                    p = r2_grade.profit(price, result) if result else None
-                    if price is not None and p is not None:
-                        rows.append({"season": str(s), "category": cat,
-                                     "timing": timing, "result": result, "profit": p})
-                # moneyline
-                _emit("fav_ml", sd["ml_home"] if fav_home else sd["ml_away"],
-                      "win" if winner_home == fav_home else "loss")
-                _emit("dog_ml", sd["ml_away"] if fav_home else sd["ml_home"],
-                      "win" if winner_home != fav_home else "loss")
-                # totals (grade at THIS timing's line)
-                if sd["total_line"] is not None:
-                    _emit("over", sd["over"],
-                          r2_grade.grade_over_under(hs + as_, sd["total_line"], "OVER"))
-                    _emit("under", sd["under"],
-                          r2_grade.grade_over_under(hs + as_, sd["total_line"], "UNDER"))
-                # run-line ±1.5 (dog +1.5 = our coherence edge's side)
-                if sd["rl_pt"] is not None and abs(abs(sd["rl_pt"]) - 1.5) < 0.01:
-                    dog_home = not fav_home
-                    dog_pt = sd["rl_pt"] if dog_home else -sd["rl_pt"]
-                    if abs(dog_pt - 1.5) < 0.01:
-                        _emit("rl_dog_+1.5", sd["rl_home"] if dog_home else sd["rl_away"],
-                              _grade_runline(dog_home, 1.5, hs, as_))
-                        _emit("rl_fav_-1.5", sd["rl_home"] if fav_home else sd["rl_away"],
-                              _grade_runline(fav_home, -1.5, hs, as_))
+            for cat in _LT_CATS:
+                close = next(((ld, sd) for ld, sd in reversed(snaps) if _mkt_ok(cat, sd)), None)
+                if close is None:
+                    continue
+                c_lead, c_sd = close
+                early = next(((ld, sd) for ld, sd in snaps
+                              if _mkt_ok(cat, sd) and ld >= c_lead + min_gap_h), None)
+                if early is None:
+                    cov[f"no_early:{cat}"] += 1
+                    continue
+                e_sd = early[1]
+                ep, er = cat_pr(e_sd, cat, fav_home, winner_home, hs, as_)
+                cp, cr = cat_pr(c_sd, cat, fav_home, winner_home, hs, as_)
+                pe = r2_grade.profit(ep, er) if er else None
+                pc = r2_grade.profit(cp, cr) if cr else None
+                if pe is None or pc is None:
+                    continue
+                cov[f"pairs:{cat}"] += 1
+                rows.append({"season": str(s), "category": cat, "timing": "early",
+                             "result": er, "profit": pe})
+                rows.append({"season": str(s), "category": cat, "timing": "close",
+                             "result": cr, "profit": pc})
     return rows, cov
 
 
 def _report_line_timing(rows, cov):
     print("=" * 74)
     print("  LINE TIMING — realized ROI at EARLY vs CLOSE, by team side-category")
-    print(f"  (paths={cov.get('paths',0):,}  no_score={cov.get('no_score',0):,})")
+    print(f"  events={cov.get('events',0):,}   n = PAIRED events (both an early >=6h out")
+    print("  AND a close price for that same market); ROIs are on that identical set.")
     print("=" * 74)
     print(f"  {'category':<14} {'n':>6}  {'ROI@early':>10} {'ROI@close':>10} "
           f"{'ΔROI(e-c)':>10}  per-season Δ")
-    for cat in ("fav_ml", "dog_ml", "over", "under", "rl_dog_+1.5", "rl_fav_-1.5"):
-        e = r2_grade.summarize([r for r in rows if r["category"] == cat and r["timing"] == "early"])
-        c = r2_grade.summarize([r for r in rows if r["category"] == cat and r["timing"] == "close"])
+    for cat in _LT_CATS:
+        er = [r for r in rows if r["category"] == cat and r["timing"] == "early"]
+        cr = [r for r in rows if r["category"] == cat and r["timing"] == "close"]
+        e, c = r2_grade.summarize(er), r2_grade.summarize(cr)
         d = e.roi - c.roi
-        # per-season sign consistency of ΔROI
-        seasons = sorted({r["season"] for r in rows if r["category"] == cat})
         signs = []
-        for s in seasons:
-            es = r2_grade.summarize([r for r in rows if r["category"] == cat and r["timing"] == "early" and r["season"] == s])
-            cs = r2_grade.summarize([r for r in rows if r["category"] == cat and r["timing"] == "close" and r["season"] == s])
+        for s in sorted({r["season"] for r in er}):
+            es = r2_grade.summarize([r for r in er if r["season"] == s])
+            cs = r2_grade.summarize([r for r in cr if r["season"] == s])
             if es.n >= 30:
                 signs.append("+" if (es.roi - cs.roi) > 0 else "-")
-        repl = "".join(signs) if signs else "n/a"
-        print(f"  {cat:<14} {e.n:>6,}  {e.roi:>+9.2%} {c.roi:>+9.2%} {d:>+9.2%}  {repl}")
-    print("\n  ΔROI>0 => betting EARLY beat CLOSE for that category (bet early);"
-          " <0 => wait.")
-    print("  per-season Δ = sign of ΔROI each season (want all-same to trust it).")
+        thin = "" if e.n >= 100 else "  (thin)"
+        print(f"  {cat:<14} {e.n:>6,}  {e.roi:>+9.2%} {c.roi:>+9.2%} {d:>+9.2%}  "
+              f"{''.join(signs) or 'n/a'}{thin}")
+    print("\n  ΔROI>0 => betting EARLY beat CLOSE for that market (bet early); <0 => wait.")
+    print("  n=0 or thin => close capture lacks that market (RL/totals dropped near game")
+    print("  time) -> not answerable offline for that market, NOT a real 0% ROI.")
     print("=" * 74)
 
 
