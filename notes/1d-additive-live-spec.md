@@ -1,0 +1,25 @@
+# Tier A #1d — wire additive+RP expected-runs into live MLB spreads (INERT)
+
+Design+stress workflow wf_b0eec4e9-246 → GO_WITH_FIXES (fit==serve GAPS, inertness RISKY, all fixable). Ship v1 features (v1≈fip once RP in, and v1 is the only live-on-demand-servable family). INERT behind ODI_MLB_ADDITIVE_RUNS (OFF=byte-identical). Candidate-stage persistence only. Activation = owner flag-flip + promote AFTER the ROI re-baseline clears the SHRINK-REFIT'D baseline (the agreed bar).
+
+## Architecture
+NEW pure `additive_runs.py` imported by BOTH the bake-off and live → same code on same rows = fit==serve by construction. Live seam swaps ONLY the two run scalars in analysis._mlb_expected_runs_projection and reuses the incumbent challenger block's spread_share/margin_share + downstream cover/shrink/market-blend (so OFF byte-identical, and additive only substitutes home_runs/away_runs).
+
+## Commit plan
+- ✅ COMMIT 1 DONE (12d1286): additive_runs.py extraction (exp_ip, feat_from_row, window_diff, make_feat_getter, make_bp_getter [abbr_to_id→resolve_id CALLABLE], make_additive_projector [lazy `import mlb_starters` inside project() = circular-import fix]) + backtest_starters aliases + call site (.get) + tests. Behavior-preserving.
+- ⏸ COMMIT 2: calibration_loader.save_/load_expected_runs_additive (mirror save_starter_adjustment/load_expected_runs_challenger; candidate-aware _load_write_blob + _write_path; preserves other blocks) + round-trip tests.
+- ⏸ COMMIT 3: pitcher_asof.load_sp_series(entity_id, season) + load_rp_series(team_id, season) single-entity readers. ⚠ STRESS FIX #2: span season_bucket IN {season, season-1, season-2} (NOT just {season, season-1}) — a starter's FIRST start of the season selects the season-1 final row as cur, so the blend needs season-2; else it diverges from the bake-off (which loads min(seasons)-1). Add a first-start golden sub-case.
+- ⏸ COMMIT 4 (live wiring, the careful one): mlb_starters._mlb_additive_runs_enabled (env→bool, espn_client idiom) + live_additive_runs(sport_key, factors) [get_or_fill SP warm@today, build series via load_sp/rp_series, reuse ar.make_feat_getter/make_bp_getter(resolve_id=identity)/make_additive_projector, CROSSED mapping a_off_faced=home_offense_factor/a_ip=away_avg_ip/away_abbr=away_team_id]; gated build_matchup_features surfacing (home/away_sp_id, home/away_team_id, game_date, home/away_avg_ip); analysis.py seam (home_runs=away_runs=None; if flag&pair: swap; else existing multiplicative guarded by `if home_runs is None`); app.py add ODI_MLB_ADDITIVE_RUNS to the boot gate tuple. ⚠ STRESS FIX #3: derive ONE league_bp=model['league_rate9'] and feed BOTH make_additive_projector AND make_bp_getter (don't read a 2nd bullpen.league_bp) — else config drift breaks fit==serve. + fit==serve GOLDEN test (bake-off path vs live path, same rows/model, assertAlmostEqual ~1e-9, incl first-start + RP strictly-before + crossed orientation) + INERTNESS tests (flag unset → analysis dict + build_matchup_features keys deep-equal baseline) + a BOOT SMOKE test (import mlb_starters flag-unset, no ImportError = the circular-import guard holds).
+- ⏸ COMMIT 5 (optional): backtest_starters --additive-save (fit v1/blend/team-RP → calibration_loader.save_expected_runs_additive under set_candidate_mode(True)).
+
+## Persistence block (expected_runs_challenger["additive"] or a sibling "expected_runs_additive")
+{enabled, feature_keys:['xwobacon','k9'], model:{feature_keys,intercept,coef,league_rate9,n}, blend:{mode:'blend',blend_k:200.0,n_starts:10}, bullpen:{league_rp_era, league_bp=model.league_rate9}, exp_ip:{default:5.2,lo:3.5,hi:7.0}, run_env:1.0, full_game_ip:9.0, meta:{seasons,fit_timestamp,holdout_metrics}}. predict defaults (prior_strength=150,lo=1.5,hi=9.0) are code-fixed in make_additive_projector (NOT threaded → guarantees fit==serve).
+
+## Accepted residuals / activation open-questions (owner, post-baseline — NOT blocking inert ship)
+- OBSTACLE 4 exp_ip: live avg_ip (IP/games) vs bake-off statcast-BBE avg-ip → grade the re-baseline on the LIVE avg_ip source so served==graded.
+- OBSTACLE offense_factor: live season-leaderboard vs bake-off as-of statcast (same as the incumbent already tolerates).
+- RP freshness: today's bullpen = most-recent-strictly-before bulk RP row (no on-demand RP compute); ensure the hourly pitcher_asof RP build is <=1 day fresh before activation, or add on-demand RP + telemetry.
+- analysis validation gate (228-233) couples additive to multiplicative validity → additive serves ≤ its own inputs; relax intentionally at activation if wanted.
+- run_env stays 1.0 (park not on the team path; bake-off used 1.0).
+
+## PRE-EXISTING red test (NOT #1d): test_modeling.test_mlb_spreads_use_validated_expected_runs_ensemble — the shrink promote (2777b5d, prob_shrink spreads 0.25→0.6) leaks through an incompletely-mocked test (mocks _shrink_factor→0.25 + hardcodes 0.25, but analyze_spreads_value applies the spread shrink via a path the mock misses). Stale test, not a bug. FIX = fully isolate the test from live calibration. OFFERED, owner deferred.

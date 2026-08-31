@@ -1,0 +1,46 @@
+# LENS: Will it actually ship through the confirmation gate as the code exists, and is the claimed validation sound (not variance/correlation dressed up as mean-at-line Brier, not hand-waved plumbing)?
+
+## Gate-first minimal GameContext with a starter-neutralized te  — score 8
+STRENGTHS:
+  + The ONLY thing it claims gate-validation for is a per-batter MEAN scalar — exactly what the gate can see. project_and_empirical:598-606 applies feat_mult and shifts the line; this is verified-real and identical to how `rest` is scored.
+  + First verdict is genuinely free and end-to-end real: diagnose_features (refit_calibration.py:1746-1806) iterates FEATURE_REGISTRY, injects params['features']={name:s}, re-runs join_book_lines_to_actuals (:1772) then build_real_line_obs→select_method_at_real_lines. Adding one registry entry + attaching obs['gc_factor'] in join makes the --feature-diag verdict work with ZERO gate/sweep/refit changes. Confirmed against the code.
+  + Plumbing is precisely correct: obs flows unmodified through build_real_line_obs:816-819 into project_and_empirical, which reads obs.get(...). Attaching gc in join_book_lines_to_actuals + a new kwarg on projection_multiplier is the minimal true change (it correctly identifies that projection_multiplier's ctx is dates-only and must be extended).
+  + Strength-0 == production byte-parity genuinely holds: strengths_from_params drops zero (prop_features.py:134), projection_multiplier returns 1.0 on empty (:150).
+  + Sweep-axis auto-adoption (phase 3) is feasible: upcoming_opp/player_team_name/upcoming_is_home/upcoming_date ARE in scope at backtest.py:2646-2662, and it reuses get_expected_runs_team_factors which is verified as-of-safe (mlb_starters.py:194, cutoff=as_of-1d).
+  + Leakage-safe by construction (xwOBA expected-runs path only) and honest that it may ship nowhere — the correct gate-respecting posture, matching rest/xBA/NegBin-E precedent.
+  + Cleanest double-counting story: neutralizes the opposing starter (owned by the SHIPPED opp0.5 matchup_mult) instead of replacing it, so no risky runtime REPLACE of a validated signal.
+FATAL FLAWS:
+  ! Signal is likely too weak to clear MIN_CALIB_BRIER_GAIN (0.002) in both folds: after starter-neutralization and own-offense-redundancy the mean shift collapses toward a ~38%-of-PA opposing-bullpen residual. Honest, but means the shippable payoff may be nothing (same fate as rest/xBA/CSW/NegBin-E).
+  ! EPS/STARTER_SHARE/RUN_CAP are hand-set, not fit — a bad choice biases the mean shift; only a small CAP + the 2-fold gate protect it.
+  ! It does NOT deliver the roadmap's bottom-up reconciliation through the gate — the real-lineup r is deferred to runtime and left un-gated (matchup_mult-style). Defensible given single-prop Brier limits, but the headline §3.1 vision is only scaffolded, not validated.
+  ! Historical Savant xwOBA coverage gaps → complete=False → gc_factor 1.0 for those obs, shrinking the effective n the gate sees (fail-open but power-reducing).
+
+## Design C — Shared-Environment Reconciliation, Phased (recon   — score 7
+STRENGTHS:
+  + Its key insight is sound and code-verified: recon r=(opp_staff_xwoba/league)^pitch_w depends only on (opponent, date), which are present on the offline obs AND in the sweep loop (backtest.py:2646) — so it sidesteps the lineup-grouping plumbing gap entirely and is genuinely computable in all three paths → real 3-way parity + sweep auto-adoption via _best_per_prop.
+  + Phase 1 is a per-batter MEAN scalar on the existing feat_mult seam — gate-visible, and strength-0/absent-field returns 1.0 so byte-parity holds.
+  + Correctly stages variance (method axis) and correlation (parlay-CLV/backtest_props) AFTER the shippable scalar, with honest caveats, rather than claiming the gate sees them.
+  + Phasing gets a real accept/reject/size verdict in Phase 1 without harness rework, using the machinery that already accepted/rejected rest.
+FATAL FLAWS:
+  ! Requires a NEW Savant query get_asof_team_staff_suppression that does not exist — more build surface and a new network dependency in the calibration/refit path, where Design A reuses the existing, cached, leakage-safe get_expected_runs_team_factors for the same effect.
+  ! recon's opp_staff = all-pitchers team xwOBA INCLUDES the starter, so it overlaps the SHIPPED opp0.5 matchup_mult (log5 starter) heavily → it must REPLACE matchup_mult at runtime. Replacing a validated, gate-cleared signal with a coarser team-level scalar is a genuine net-negative regression risk (the design flags this itself).
+  ! '1-line ctx augmentation in project_and_empirical' understates the change: projection_multiplier builds ctx from dates only (prop_features.py:152), so its signature must change too — same real edit Design A names explicitly.
+  ! Like A, Phase 1 is a degenerate scalar, not the bottom-up reconciliation; the full λ closure + correlation depend on the same unbuilt DK-CLV instrument.
+
+## Design B — roadmap-faithful full-joint bottom-up GameContext  — score 4
+STRENGTHS:
+  + Most faithful to the §3.1 vision (one shared run/total joint, bottom-up reconciliation, retained-not-discarded run PMF).
+  + Honest that correlation is Brier-invisible and needs a separate instrument, and that its payoff may clear the gate nowhere.
+  + Its Phase-1 gamma, IF the plumbing existed, would ride the real feat_mult seam like A/C.
+FATAL FLAWS:
+  ! Phase-1 gamma is internally inconsistent with the plumbing: gamma=mu_H/S requires the lineup sum S=Σ mu_i over ALL batters in the game, but the offline obs is per-player with no roster — the exact named plumbing gap. The text waffles between 'computed from each obs OWN prior_games' (which is not a team reconciliation) and a game-grouped sum (which join_book_lines_to_actuals does not provide). The core value is hand-waved over the hardest plumbing.
+  ! Method 'G' is badly under-scoped: _score_abc_real:890 scores D only when rows carry a precomputed p_dist supplied by a DIFFERENT per-bucket caller — build_real_line_obs rows have none. G additionally needs the full-game lineup joined offline and λ-marginalization across it. 'wired like method D' understates this by a large margin; D's prob is per-player and split-independent, G's is not.
+  ! The headline joint value is largely gate-invisible: single-prop Brier sees a mean shift and only PARTIALLY a variance change off the line; batter-to-batter correlation is entirely invisible. So the layers that justify the ~1030 LOC cannot be gate-validated.
+  ! The only correlation validator (parlay-CLV) depends on DK closing-line capture that MEMORY confirms is decided-but-NOT-built, plus sparse realized SGP outcomes — Phase 4 is unvalidatable now.
+  ! Mischaracterizes the sweep as carrying no opposing-team field (false — backtest.py:2646), then bypasses it, losing auto-adoption; the runtime REPLACE of matchup_mult+lineup_mult is subtle and silently double-counts on a wiring error.
+  ! Highest LOC and highest risk for the least gate-legible payoff.
+
+RANKING: ['Gate-first minimal GameContext with a starter-neutralized team-run→hits reconciliation scalar riding the prop_features seam', 'Design C — Shared-Environment Reconciliation, Phased (recon scalar v1)', 'Design B — roadmap-faithful full-joint bottom-up GameContext with a three-tier validator stack']
+
+RECOMMENDATION:
+Build Design A. It is the only one whose FIRST-phase verdict is verifiably real end-to-end: adding one FEATURE_REGISTRY entry + a gc_factor attach in join_book_lines_to_actuals + one kwarg on projection_multiplier makes `refit_calibration.py --feature-diag` score the feature through the exact ship-path gate (diagnose_features:1746-1806 → build_real_line_obs → select_method_at_real_lines) with strength-0 byte-parity intact and zero changes to the gate/sweep/refit — confirmed against the code. It reuses the existing leakage-safe get_expected_runs_team_factors rather than adding a new Savant query, and its double-counting story is lowest-regret because it NEUTRALIZES the starter instead of replacing the already-shipped matchup_mult. Grafts: (1) take Design C's discipline of framing the runtime piece as an explicit REPLACE-not-stack, but keep A's choice to leave matchup_mult intact — do NOT replace a gate-cleared signal with a coarser one. (2) For the first gate run, use A's own conservative fallback (drop the own_offense term, ship the pure opposing-bullpen residual) to maximize orthogonality and give the cleanest read on whether ANY signal survives. (3) Fit EPS/STARTER_SHARE offline on completed games rather than hand-setting them, noting them fit-elsewhere like LEAGUE_AVG. (4) Still BUILD the full GameContext object (retain the joint run/total PMF that A/B/C all correctly note is discarded today) so totals-unification and the deferred lineup-reconciliation/correlation have their foundation — but keep those OUT of the single-prop gate, exactly as A proposes, because the code confirms single-prop Brier cannot see variance-at-line or correlation, and the parlay-CLV instrument needed to validate them is not built. Treat Design B as the north-star architecture to grow INTO, not the thing to build now: its joint/correlation payoff is real but un-gateable and un-CLV-able today, and its Phase-1 gamma hand-waves the per-player→game plumbing gap that A solves minimally.
