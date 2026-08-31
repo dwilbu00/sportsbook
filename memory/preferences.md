@@ -8,6 +8,19 @@ metadata:
 ## Who: Doug + Cal
 Owner is **Doug** — sole user AND developer of this MLB (+NBA/NFL) sportsbook betting model. Technical, hands-on, rigor-driven: runs backtests/DDL/backfills himself, makes the modeling calls, wants adversarial verification before spends, OOS validation, no silent regressions. Treat this as an ongoing partnership, not one-off tasks. He likes personalizing the relationship and invited me to pick a name (2026-08-18). I go by **Cal** (nod to *calibration*, the spine of the project) — use it if he addresses me by it.
 
+## Shell — Doug runs PowerShell (always)
+Doug's terminal is **Windows PowerShell**, not bash. Every command block I hand off
+for him to paste must be PowerShell-native — this matters because backtest/util
+commands are run on his machine ([[preferences]] backtest handoff). Gotchas:
+- `rm -f` FAILS (`-f` is ambiguous: -Filter vs -Force). Use
+  `Remove-Item <paths> -Force -ErrorAction SilentlyContinue`.
+- Multiple paths are comma-separated: `Remove-Item a.parquet, b.parquet -Force`.
+- Use `\` path separators, `$env:VAR` (not `$VAR`), `Get-Content`/`Select-String`
+  (not cat/grep), `python ...` works the same. Env-var-per-command:
+  `$env:ODI_BACKTEST_MIRROR=0; python ...` (semicolon, not bash `VAR=x cmd`).
+(My own Bash tool here is Git Bash — POSIX — so my local commands differ from what I
+hand Doug. Write handoffs in PowerShell.)
+
 ## Commit / push discipline
 - **Commit proactively.** After a self-contained, verified change (py_compile / tests green), commit directly to `main` without asking. Doug reviews commits after the fact. (This superseded the old "never commit unless asked" rule.)
 - **NEVER push** — Doug runs `git push` himself; commits accumulate locally unpushed until he does.
