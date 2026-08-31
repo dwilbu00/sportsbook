@@ -5,6 +5,7 @@ exercise the underlying EV / offset / shape mechanics independent of the sharpen
 gate; SharpeningGateTests covers the band + dog-only gate itself.
 """
 import unittest
+from unittest import mock
 
 import coherence_flags as cf
 import r2_data
@@ -184,6 +185,85 @@ class SharpeningGateTests(unittest.TestCase):
         # A heavy favorite that the default band drops is flagged when the band is off.
         t = _triad(ml_home=-350, ml_away=+280)
         self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0, **_NO_BAND))
+
+
+class StableFavSpGateTests(unittest.TestCase):
+    """The 2026-08-31 stable-favorite-SP gate: flag only when the favorite starter's
+    recency-weighted ER-CV < cv_max (validated <1.0). In-band ML (-190/+160 ~63%)
+    isolates the CV gate from the favorite-band gate."""
+
+    _IN = dict(ml_home=-190, ml_away=+160)
+
+    def test_gate_inert_without_sport(self):
+        # Default callers (no sport) get the ungated behavior — byte-identical.
+        t = _triad(**self._IN)
+        self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0))
+        self.assertTrue(cf.run_line_candidates(_game_odds(**self._IN), offset=0.0,
+                                               ev_floor=-10.0))
+
+    def test_stable_favorite_flags(self):
+        t = _triad(**self._IN)
+        with mock.patch.object(cf, "favorite_sp_er_cv", return_value=0.7):
+            self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0,
+                                          sport="baseball_mlb"))
+            self.assertTrue(cf.run_line_candidates(
+                _game_odds(**self._IN), offset=0.0, ev_floor=-10.0,
+                sport="baseball_mlb", game_date="2026-08-31"))
+
+    def test_volatile_favorite_dropped(self):
+        t = _triad(**self._IN)
+        with mock.patch.object(cf, "favorite_sp_er_cv", return_value=1.5):
+            self.assertEqual(cf.flag_games([t], offset=0.0, ev_floor=-10.0,
+                                           sport="baseball_mlb"), [])
+            self.assertEqual(cf.run_line_candidates(
+                _game_odds(**self._IN), offset=0.0, ev_floor=-10.0,
+                sport="baseball_mlb", game_date="2026-08-31"), [])
+
+    def test_no_cv_fails_closed(self):
+        # No computable CV (no probable / thin history) -> skip (validated cell needs CV).
+        t = _triad(**self._IN)
+        with mock.patch.object(cf, "favorite_sp_er_cv", return_value=None):
+            self.assertEqual(cf.flag_games([t], offset=0.0, ev_floor=-10.0,
+                                           sport="baseball_mlb"), [])
+
+    def test_cv_max_none_disables_gate(self):
+        # cv_max=None recovers the ungated all-CV behavior even with sport set.
+        t = _triad(**self._IN)
+        with mock.patch.object(cf, "favorite_sp_er_cv", return_value=1.5) as m:
+            self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0,
+                                          sport="baseball_mlb", cv_max=None))
+            m.assert_not_called()
+
+    def test_non_mlb_sport_no_gate(self):
+        # Non-MLB never invokes the CV path (gate not applicable).
+        t = _triad(**self._IN)
+        with mock.patch.object(cf, "favorite_sp_er_cv") as m:
+            self.assertTrue(cf.flag_games([t], offset=0.0, ev_floor=-10.0,
+                                          sport="americanfootball_nfl"))
+            m.assert_not_called()
+
+    def test_favorite_sp_er_cv_computes_from_probable_and_log(self):
+        import mlb_starters
+        import mlb_warehouse
+        probs = {mlb_starters._norm("Mets"): {"pitcher_id": 111, "team_id": 1}}
+        log = [{"ER": 2}, {"ER": 3}, {"ER": 2}, {"ER": 4}, {"ER": 3}]  # >=5, newest-first
+        with mock.patch.object(mlb_starters, "get_probable_starters", return_value=probs), \
+             mock.patch.object(mlb_warehouse, "get_pitcher_game_log", return_value=log):
+            cv = cf.favorite_sp_er_cv("baseball_mlb", "2026-08-31", "Mets")
+            self.assertIsNotNone(cv)
+            self.assertGreater(cv, 0.0)
+            # Unknown favorite team -> None (no probable starter).
+            self.assertIsNone(cf.favorite_sp_er_cv("baseball_mlb", "2026-08-31", "Padres"))
+        self.assertIsNone(cf.favorite_sp_er_cv("basketball_nba", "2026-08-31", "Mets"))
+
+    def test_favorite_sp_er_cv_fails_closed_on_thin_history(self):
+        import mlb_starters
+        import mlb_warehouse
+        probs = {mlb_starters._norm("Mets"): {"pitcher_id": 111, "team_id": 1}}
+        with mock.patch.object(mlb_starters, "get_probable_starters", return_value=probs), \
+             mock.patch.object(mlb_warehouse, "get_pitcher_game_log",
+                               return_value=[{"ER": 2}, {"ER": 3}]):   # <5 priors
+            self.assertIsNone(cf.favorite_sp_er_cv("baseball_mlb", "2026-08-31", "Mets"))
 
 
 class TriadsFromUpcomingTests(unittest.TestCase):

@@ -50,6 +50,64 @@ DEFAULT_EV_FLOOR = 0.03
 DEFAULT_FAV_MIN = 0.60
 DEFAULT_FAV_MAX = 0.70
 
+# STABLE-FAVORITE-SP SHARPENING (2026-08-31): scenario_backtest --scenario
+# coherence_stable_sp confirmed (with PRE-REGISTERED cuts — no new tuned params) that
+# the in-band dog+1.5 edge concentrates where the FAVORITE's starter is STABLE:
+# recency-weighted ER-CV < 1.0 = +11.43% t=3.37 (n=624), 3/3 seasons + STRENGTHENING
+# (2026 +13.19%); CV 1.0-1.3 breakeven; CV>=1.3 NEGATIVE. Gating to <1.0 keeps 77% of
+# flags and lifts the pooled in-band edge +8.63%/t=2.87 -> +11.43%/t=3.37. So the live
+# flag additionally requires a computable favorite-SP ER-CV below the threshold — the
+# EXACT props._recency_weighted_cv the earned_runs cv_floor edge was validated on.
+# Fails CLOSED: no probable starter / <5 priors / warehouse off -> no computable CV ->
+# skip (the validated cell REQUIRES a computed CV). cv_max=None disables (recovers the
+# ungated all-CV band behavior, itself still a valid +8.63%/t=2.87 edge).
+DEFAULT_FAV_CV_MAX = 1.0
+DEFAULT_CV_HALF_LIFE = 5.0
+
+
+def favorite_sp_er_cv(sport, game_date, fav_team, half_life=DEFAULT_CV_HALF_LIFE):
+    """Recency-weighted ER-CV of the FAVORITE team's probable starter, as-of game_date
+    (leakage-safe — priors strictly before it), via the EXACT props._recency_weighted_cv
+    the cv_floor edge was validated on. MLB-only. Returns None when unavailable (no
+    probable starter, <5 priors, mean~0, warehouse off) — the caller treats None as
+    'skip' when the gate is active. Never raises."""
+    if sport != "baseball_mlb" or not fav_team or not game_date:
+        return None
+    gd = str(game_date)[:10]
+    try:
+        import mlb_starters
+        import mlb_warehouse
+        from props import _recency_weighted_cv
+        rec = (mlb_starters.get_probable_starters(gd) or {}).get(
+            mlb_starters._norm(fav_team))
+        if not rec or not rec.get("pitcher_id"):
+            return None
+        log = mlb_warehouse.get_pitcher_game_log(
+            rec["pitcher_id"], season=int(gd[:4]), as_of_date=gd)   # newest-first
+        er = [r.get("ER") for r in log if r.get("ER") is not None]
+        return _recency_weighted_cv(er, half_life)
+    except Exception:
+        return None
+
+
+def _fav_cv_ok(sport, game_date, fav_team, cv_max, half_life, cov=None):
+    """Stable-favorite-SP gate → True = KEEP the flag. Disabled (always True) when
+    cv_max is None or the sport isn't MLB. Otherwise require a computable favorite-SP
+    ER-CV STRICTLY below cv_max (skips both volatile favorites AND no-CV favorites —
+    the validated stable cell)."""
+    if cv_max is None or sport != "baseball_mlb":
+        return True
+    cv = favorite_sp_er_cv(sport, game_date, fav_team, half_life)
+    if cv is None:
+        if cov is not None:
+            cov["skip_no_fav_cv"] += 1
+        return False
+    if cv >= cv_max:
+        if cov is not None:
+            cov["skip_volatile_fav"] += 1
+        return False
+    return True
+
 
 def _fav_band_ok(ml_home_fair, fav_min, fav_max):
     """True if the game's FAVORITE devigged win prob is in [fav_min, fav_max) — the
@@ -79,13 +137,20 @@ def compute_offset(sport, seasons, dispersion=0.0):
 
 
 def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03,
-               fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX):
-    """PURE: flag the +EV DK run-line side per game. Returns flag dicts sorted by EV
+               fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX,
+               sport=None, cv_max=DEFAULT_FAV_CV_MAX,
+               cv_half_life=DEFAULT_CV_HALF_LIFE, cov=None):
+    """Flag the +EV DK run-line side per game. Returns flag dicts sorted by EV
     (descending). ``offset`` is the calibration constant from compute_offset.
 
     SHARPENED: only the underdog +1.5 side, only when the favorite is in the moderate
     [fav_min, fav_max) band (see the module note). Pass fav_min=0.0, fav_max=1.0 to
-    disable the band and recover the raw (all-favorites, dog-only) behavior."""
+    disable the band and recover the raw (all-favorites, dog-only) behavior.
+
+    STABLE-FAVORITE-SP GATE: when ``sport`` is MLB and ``cv_max`` is set, additionally
+    require the favorite starter's recency-weighted ER-CV < cv_max (see module note).
+    This does per-game I/O (probables + as-of ER); ``sport=None`` or ``cv_max=None``
+    disables it (pure, byte-identical to the ungated flag)."""
     flags = []
     for t in triads:
         ml_home_fair, _ = fair_two_way(t.ml_home, t.ml_away)
@@ -93,6 +158,9 @@ def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03,
         if ml_home_fair is None or over_fair is None:
             continue
         if not _fav_band_ok(ml_home_fair, fav_min, fav_max):
+            continue
+        fav_team = t.home if ml_home_fair >= 0.5 else t.away
+        if not _fav_cv_ok(sport, t.game_date, fav_team, cv_max, cv_half_life, cov):
             continue
         implied = coherence.implied_home_cover(
             ml_home_fair, t.total_line, over_fair, t.rl_home_point, dispersion)
@@ -206,7 +274,9 @@ def _run_line_entry(entries):
 
 def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
                         haircut=DEFAULT_HAIRCUT, ev_floor=DEFAULT_EV_FLOOR,
-                        fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX):
+                        fav_min=DEFAULT_FAV_MIN, fav_max=DEFAULT_FAV_MAX,
+                        sport=None, game_date=None, cv_max=DEFAULT_FAV_CV_MAX,
+                        cv_half_life=DEFAULT_CV_HALF_LIFE):
     """PURE: from ONE game's parsed DK odds (odds_client.parse_game_odds shape:
     moneyline/spreads/totals dicts + home_team/away_team), emit the +EV coherence
     run-line side(s) as spread-shaped candidate dicts tagged type='runline_coherence'.
@@ -244,6 +314,10 @@ def run_line_candidates(game_odds, offset, dispersion=DEFAULT_DISPERSION,
             return []
         # SHARPENED: only surface the edge at moderate favorites (see module note).
         if not _fav_band_ok(ml_home_fair, fav_min, fav_max):
+            return []
+        # STABLE-FAVORITE-SP GATE (MLB): require the favorite starter's ER-CV < cv_max.
+        fav_team = home if ml_home_fair >= 0.5 else away
+        if not _fav_cv_ok(sport, game_date, fav_team, cv_max, cv_half_life):
             return []
         implied = coherence.implied_home_cover(
             ml_home_fair, float(total_line), over_fair, float(point_h), dispersion)
@@ -321,6 +395,13 @@ def main():
     ap.add_argument("--fav-max", type=float, default=DEFAULT_FAV_MAX,
                     help="Max favorite ML-implied prob to flag. Pass --fav-min 0 "
                          "--fav-max 1 to disable the band (all favorites).")
+    ap.add_argument("--cv-max", type=float, default=DEFAULT_FAV_CV_MAX,
+                    help="Max favorite-SP recency-weighted ER-CV to flag (stable-SP "
+                         "gate; validated <1.0). Pass 0 (or negative) to DISABLE the "
+                         "gate and flag every CV bucket.")
+    ap.add_argument("--cv-half-life", type=float, default=DEFAULT_CV_HALF_LIFE,
+                    help="Half-life (games) for the favorite-SP ER-CV; 5 matches the "
+                         "live earned_runs cv_floor signal.")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -351,10 +432,20 @@ def main():
         print(msg)
         return
 
+    from collections import Counter
+    cov = Counter()
+    cv_max = args.cv_max if args.cv_max and args.cv_max > 0 else None
     flags = flag_games(triads, offset, args.dispersion, args.haircut, args.ev_floor,
-                       fav_min=args.fav_min, fav_max=args.fav_max)
+                       fav_min=args.fav_min, fav_max=args.fav_max,
+                       sport=args.sport, cv_max=cv_max, cv_half_life=args.cv_half_life,
+                       cov=cov)
+    gate = (f"stable-fav-SP: favorite ER-CV < {cv_max}" if cv_max is not None
+            else "stable-fav-SP gate OFF")
     print(f"  sharpened to dog +1.5 at favorites in "
-          f"[{args.fav_min:.0%}, {args.fav_max:.0%}) ML-implied")
+          f"[{args.fav_min:.0%}, {args.fav_max:.0%}) ML-implied; {gate}")
+    if cv_max is not None:
+        print(f"  (gate skipped: {cov.get('skip_volatile_fav', 0)} volatile-favorite, "
+              f"{cov.get('skip_no_fav_cv', 0)} no-CV/unavailable)")
     if not flags:
         print("  No +EV run-line flags today.")
         return

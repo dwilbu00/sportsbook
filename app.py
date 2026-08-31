@@ -3174,7 +3174,12 @@ if analyze_clicked and selected_game_labels:
             if coherence_offset is not None:
                 try:
                     import coherence_flags as _coh
-                    for _c in _coh.run_line_candidates(game_odds, coherence_offset):
+                    # Stable-favorite-SP gate (MLB): only flag when the favorite
+                    # starter's ER-CV < 1.0 (validated +11.43% vs the ungated +8.63%).
+                    # sport+game_date enable it; non-MLB is a no-op inside the gate.
+                    for _c in _coh.run_line_candidates(
+                            game_odds, coherence_offset,
+                            sport=sport["key"], game_date=game_date):
                         _c["event_id"] = eid
                         coherence.append(_c)
                 except Exception:
