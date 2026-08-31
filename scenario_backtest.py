@@ -1306,6 +1306,40 @@ def _total_line_bucket(x):
     return "d >=10"
 
 
+def _load_weather(seasons):
+    """{(venue_id, official_date): temp_f} from weather_game (first-pitch-hour Visual
+    Crossing temps). Empty/partial if the weather backfill hasn't run for a season."""
+    import db_store
+    import mlb_warehouse as wh
+    from sqlalchemy import or_ as _or
+    from sqlalchemy import select as _sel
+    db_store.promote_secrets_from_toml()
+    w = wh.weather_game
+    out = {}
+    with db_store.get_engine().connect() as conn:
+        rows = conn.execute(_sel(w.c.venue_id, w.c.weather_date, w.c.temp_f).where(
+            _or(*[w.c.weather_date.like(f"{s}-%") for s in seasons]))).fetchall()
+    for r in rows:
+        m = r._mapping
+        if m["temp_f"] is not None:
+            out[(str(m["venue_id"]), m["weather_date"])] = m["temp_f"]
+    return out
+
+
+def _temp_bucket(t):
+    if t is None:
+        return "z unk"
+    if t < 55:
+        return "a <55F cold"
+    if t < 65:
+        return "b 55-65 cool"
+    if t < 75:
+        return "c 65-75 mild"
+    if t < 85:
+        return "d 75-85 warm"
+    return "e >=85 hot"
+
+
 def scenario_under_stress(sport, seasons, lead_lo=12.0, lead_hi=24.0):
     """FREE offline stress-test of the flat-UNDER signal, on the bettable 12-24h window
     (the strongest OBSERVABLE bucket from under_timing). Breaks under ROI down by total-
@@ -1315,6 +1349,7 @@ def scenario_under_stress(sport, seasons, lead_lo=12.0, lead_hi=24.0):
     [lead_lo, lead_hi); scores + month from the warehouse game meta."""
     import r2_data
     meta = _load_game_meta(seasons)
+    weather = _load_weather(seasons)
     rows, cov = [], Counter()
     for s in seasons:
         team_rows = r2_data._read_team_market_lines(
@@ -1346,11 +1381,14 @@ def scenario_under_stress(sport, seasons, lead_lo=12.0, lead_hi=24.0):
                 fav = _fav_bucket(max(imp_h, imp_a))
             except (TypeError, ValueError):
                 fav = "unk"
+            temp = weather.get((str(m["venue_id"]), m["official_date"]))
             rows.append({"season": str(s), "result": res, "profit": p,
                          "line_bucket": _total_line_bucket(sd["total_line"]),
                          "month": (m["official_date"] or "")[5:7] or "unk",
-                         "fav_bucket": fav})
+                         "fav_bucket": fav, "temp_bucket": _temp_bucket(temp)})
             cov["graded"] += 1
+            if temp is not None:
+                cov["with_temp"] += 1
     return rows, cov
 
 
@@ -1361,8 +1399,10 @@ def _report_under_stress(rows, cov, min_n=80):
     print("  breadth vs concentration. Broad+ across cells => real over-lean; one cell")
     print("  carrying it => suspect (artifact/overfit).")
     print(f"  POOLED: n={pooled.n:,} ROI={pooled.roi:+.2%} hit={pooled.hit_rate:.1%} "
-          f"t={pooled.t_stat:+.2f}   (no_total_in_window={cov.get('no_total_in_window',0):,})")
+          f"t={pooled.t_stat:+.2f}   (temp coverage={cov.get('with_temp',0):,}/{pooled.n:,})")
     print("=" * 78)
+    # Mechanism test FIRST: is it literally cold-weather run-environment?
+    _repl_slice(rows, lambda r: r["temp_bucket"], "game-time temperature (MECHANISM)", min_n)
     _repl_slice(rows, lambda r: r["line_bucket"], "total-line value", min_n)
     _repl_slice(rows, lambda r: r["fav_bucket"], "favorite strength", min_n)
     _repl_slice(rows, lambda r: r["month"], "month", min_n)
