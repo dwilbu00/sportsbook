@@ -479,6 +479,103 @@ def scenario_team_variance(blob, half_life=5.0):
     return rows, cov
 
 
+def scenario_coherence_stable_sp(blob, half_life=5.0, fav_min=0.60, fav_max=0.70):
+    """SHARPEN the coherence dog+1.5 edge with a STABLE-favorite-SP filter. The live
+    coherence edge is dog +1.5 at MODERATE favorites (~[fav_min,fav_max) ML-implied).
+    The team_variance byproduct found dog+1.5 concentrates in LOW-CV (stable) favorite
+    games (+6.5%/t=3.18) and dies on high-CV (volatile) favorites. Test that DIRECTLY
+    on the coherence band: bet dog+1.5 everywhere, tag by (in-band?, favorite-SP ER-CV
+    bucket), so a fav-SP-CV_MAX gate's lift on the live flag is measurable. Per-season
+    replication of the IN-BAND STABLE cell is the honesty gate. fav_cv via the EXACT
+    _asof_sp_cv the earned_runs cv_floor edge was validated on (leakage-safe, priors
+    strictly before game_date)."""
+    rows, cov = [], Counter()
+    scores = blob["team_scores"]
+    pt_team = blob["pitcher_team"]        # {(aid_str, gpk_int): (team_id, GS)}
+    gt = blob["game_teams"]               # {gpk: (home_tid, away_tid)}
+    pidx = blob["pitcher_idx"]            # {season_str: {aid_str: [(date,outs,er,...)]}}
+    starters = {}                         # gpk -> {"home"/"away": aid} (GS==1)
+    for (aid, gpk), (tid, gs) in pt_team.items():
+        if not gs:
+            continue
+        teams = gt.get(gpk)
+        if not teams:
+            continue
+        if str(tid) == str(teams[0]):
+            starters.setdefault(gpk, {})["home"] = aid
+        elif str(tid) == str(teams[1]):
+            starters.setdefault(gpk, {})["away"] = aid
+    for season, triads in blob["triads_by_season"].items():
+        idx = pidx.get(str(season)) or {}
+        for t in triads:
+            cov["games"] += 1
+            try:
+                imp_home = american_to_implied_prob(int(t.ml_home))
+                imp_away = american_to_implied_prob(int(t.ml_away))
+            except (TypeError, ValueError):
+                cov["bad_ml"] += 1
+                continue
+            if imp_home == imp_away:
+                cov["pickem"] += 1
+                continue
+            fav_is_home = imp_home > imp_away
+            fav_imp = max(imp_home, imp_away)
+            dog_is_home = not fav_is_home
+            dog_point = (t.rl_home_point or 0.0) if dog_is_home else -(t.rl_home_point or 0.0)
+            if abs(dog_point - 1.5) > 0.01:
+                cov["dog_not_+1.5"] += 1
+                continue
+            gpk = t.game_pk
+            if gpk is None or int(gpk) not in scores:
+                cov["no_score"] += 1
+                continue
+            gpk = int(gpk)
+            hs, as_ = scores[gpk]
+            st = starters.get(gpk) or {}
+            fav_aid = st.get("home") if fav_is_home else st.get("away")
+            fav_cv = _asof_sp_cv(idx.get(str(fav_aid)) or [], t.game_date, half_life)
+            if fav_cv is None:
+                cov["no_fav_cv"] += 1
+                continue
+            dog_rl = t.rl_home if dog_is_home else t.rl_away
+            res = _grade_runline(dog_is_home, 1.5, hs, as_)
+            p = r2_grade.profit(dog_rl, res)
+            if p is None:
+                cov["ungradable"] += 1
+                continue
+            cov["graded"] += 1
+            in_band = (fav_min <= fav_imp < fav_max)
+            rows.append({"season": str(season), "result": res, "profit": p,
+                         "fav_imp": fav_imp, "in_band": in_band,
+                         "band": "in_band" if in_band else "out_band",
+                         "cv": fav_cv, "cv_bucket": _cv_bucket(fav_cv),
+                         "side": "home_dog" if dog_is_home else "away_dog"})
+    return rows, cov
+
+
+def _report_coherence_stable_sp(rows, cov, fav_min, fav_max, half_life):
+    band = [r for r in rows if r["in_band"]]
+    print("=" * 74)
+    print(f"  COHERENCE dog+1.5 × STABLE-favorite-SP  "
+          f"(band=[{fav_min:.2f},{fav_max:.2f}) ML-implied, cv_half_life={half_life})")
+    print(f"  games={cov.get('games',0):,}  graded={cov.get('graded',0):,}  "
+          f"in-band={len(band):,}  (no_fav_cv={cov.get('no_fav_cv',0):,}, "
+          f"dog_not_+1.5={cov.get('dog_not_+1.5',0):,})")
+    print("=" * 74)
+    # 1) THE MONEY TABLE — in-band dog+1.5 (the coherence bet) by favorite-SP CV.
+    _report("IN-BAND dog+1.5 (the coherence bet), all favorite-SP CV pooled", band)
+    _print_slice(band, lambda r: r["cv_bucket"], "favorite SP ER-CV bucket (IN-BAND)")
+    # 2) HONESTY GATE — does the stable (<1.0) in-band cell replicate per season?
+    stable = [r for r in band if r["cv_bucket"] == "a <1.0"]
+    if stable:
+        _print_slice(stable, lambda r: r["season"], "STABLE (<1.0) IN-BAND × season")
+    # 3) INTERACTION — is the CV effect band-SPECIFIC or does it hold out-of-band too?
+    _print_slice(rows, lambda r: (r["band"], r["cv_bucket"]), "band × CV bucket")
+    print("  READ: want the IN-BAND '<1.0' cell +ROI & replicating, and clearly better")
+    print("  than IN-BAND '>=1.3'. If so, add a favorite-SP-CV_MAX gate to coherence_flags.")
+    print("=" * 74)
+
+
 # ── scenario: per-(prop × line × side) realized ROI stratification ───────────
 
 # The 7 gradable DK props (mirrors mlb_warehouse._ACTUAL_STAT_SPEC).
@@ -935,7 +1032,11 @@ def main():
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
-                             "line_timing"])
+                             "line_timing", "coherence_stable_sp"])
+    ap.add_argument("--coh-fav-min", type=float, default=0.60,
+                    help="Coherence band lower ML-implied bound (coherence_stable_sp).")
+    ap.add_argument("--coh-fav-max", type=float, default=0.70,
+                    help="Coherence band upper ML-implied bound (coherence_stable_sp).")
     ap.add_argument("--prop-roi-min-n", type=int, default=100,
                     help="Min pooled bets for a (prop,line,side) cell to be a candidate.")
     ap.add_argument("--cv-half-life", type=float, default=5.0,
@@ -1015,6 +1116,12 @@ def main():
             hi = [r for r in br if r["cv_bucket"] == "c >=1.3 (high)"]
             if hi:
                 _print_slice(hi, lambda r: r["season"], "high-CV (>=1.3) x season")
+    if want in ("all", "coherence_stable_sp"):
+        rows, cov = scenario_coherence_stable_sp(
+            blob, half_life=args.cv_half_life,
+            fav_min=args.coh_fav_min, fav_max=args.coh_fav_max)
+        _report_coherence_stable_sp(rows, cov, args.coh_fav_min, args.coh_fav_max,
+                                    args.cv_half_life)
     if want in ("all", "prop_roi"):
         rows, cov = scenario_prop_roi(args.sport, seasons)
         _report_prop_roi(rows, cov, min_n=args.prop_roi_min_n)
