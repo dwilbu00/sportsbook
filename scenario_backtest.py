@@ -1025,6 +1025,213 @@ def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
     return blob, path
 
 
+# ── scenario: UPSET DATAMINE — what schedule/venue/umpire factors move ROI? ──
+
+def _load_game_meta(seasons):
+    """Direct warehouse read of per-game schedule/venue/umpire meta (regular-season,
+    final), keyed by game_pk. Read-only + mirror-independent (this datamine is
+    exploratory + run infrequently, so a live Azure read is fine)."""
+    import db_store
+    import mlb_warehouse as wh
+    from sqlalchemy import select as _sel
+    db_store.promote_secrets_from_toml()
+    g = wh.mlb_game
+    eng = db_store.get_engine()
+    out = {}
+    for s in seasons:
+        with eng.connect() as conn:
+            rows = conn.execute(_sel(
+                g.c.game_pk, g.c.official_date, g.c.venue_id, g.c.double_header,
+                g.c.game_number, g.c.hp_umpire_name, g.c.home_team_id,
+                g.c.away_team_id, g.c.home_score, g.c.away_score
+            ).where((g.c.season == int(s)) & (g.c.game_type == "R")
+                    & (g.c.home_score.isnot(None)))).fetchall()
+        for r in rows:
+            out[int(r._mapping["game_pk"])] = dict(r._mapping)
+    return out
+
+
+def _rest_bucket(r):
+    if r is None:
+        return "unk"
+    if r <= 0:
+        return "0 (DH/same-day)"
+    if r == 1:
+        return "1 (daily)"
+    if r == 2:
+        return "2 (1 off-day)"
+    return "3+ (rested)"
+
+
+def _team_schedule_features(meta):
+    """Per (game_pk, team_id): days rest since the team's previous game, whether it
+    traveled (venue changed from its last game), and whether it's a doubleheader game.
+    Built from the team's own game sequence within the regular-season meta."""
+    import datetime as _dt
+    by_team = defaultdict(list)      # tid -> [(official_date, game_number, gpk, venue_id)]
+    for gpk, m in meta.items():
+        for tid in (m["home_team_id"], m["away_team_id"]):
+            by_team[str(tid)].append(
+                (m["official_date"], m["game_number"] or 1, gpk, m["venue_id"]))
+    feat = defaultdict(dict)
+    for tid, games in by_team.items():
+        games.sort(key=lambda x: (x[0] or "", x[1]))
+        prev_date, prev_venue = None, None
+        for od, gn, gpk, ven in games:
+            rest = None
+            if prev_date and od:
+                try:
+                    rest = (_dt.date.fromisoformat(od)
+                            - _dt.date.fromisoformat(prev_date)).days
+                except ValueError:
+                    rest = None
+            traveled = (prev_venue is not None and ven is not None and ven != prev_venue)
+            dh = (meta[gpk]["double_header"] not in (None, "N")) or (gn and gn > 1)
+            feat[gpk][tid] = {"rest": rest, "traveled": bool(traveled), "dh": bool(dh)}
+            prev_date, prev_venue = od, ven
+    return feat
+
+
+def scenario_upset_datamine(sport, seasons):
+    """DATAMINE: which schedule / venue / umpire factors move the realized ROI of the
+    base team bets? For each game, tag it with candidate factors (home-plate umpire,
+    doubleheader, favorite/underdog days-rest, favorite/underdog travel) and record the
+    realized ROI of each base bet (dog ML, dog +1.5, total OVER, total UNDER). The
+    reporter stratifies ROI by factor bucket with per-season replication — a +ROI cell
+    that replicates is a candidate edge (or a bet-disqualification signal, if -ROI).
+    Read-only; loads its own odds (r2_data) + game meta (warehouse). Actionable output,
+    not descriptive: every cell is a bet you could actually place."""
+    import r2_data
+    triads_by_season, _ = r2_data.load_team_triad(sport, seasons)
+    meta = _load_game_meta(seasons)
+    feat = _team_schedule_features(meta)
+    rows, cov = [], Counter()
+    for season, triads in triads_by_season.items():
+        for t in triads:
+            gpk = t.game_pk
+            if gpk is None or int(gpk) not in meta:
+                cov["no_meta"] += 1
+                continue
+            gpk = int(gpk)
+            m = meta[gpk]
+            hs, as_ = m["home_score"], m["away_score"]
+            if hs is None or as_ is None:
+                cov["no_score"] += 1
+                continue
+            try:
+                imp_home = american_to_implied_prob(int(t.ml_home))
+                imp_away = american_to_implied_prob(int(t.ml_away))
+            except (TypeError, ValueError):
+                cov["bad_ml"] += 1
+                continue
+            if imp_home == imp_away:
+                cov["pickem"] += 1
+                continue
+            fav_is_home = imp_home > imp_away
+            dog_is_home = not fav_is_home
+            winner_home = hs > as_
+            fav_tid = str(m["home_team_id"] if fav_is_home else m["away_team_id"])
+            dog_tid = str(m["away_team_id"] if fav_is_home else m["home_team_id"])
+            ff = feat.get(gpk, {}).get(fav_tid, {})
+            df = feat.get(gpk, {}).get(dog_tid, {})
+            tags = {
+                "ump": m["hp_umpire_name"] or "unknown",
+                "dh": "DH" if (ff.get("dh") or df.get("dh")) else "single",
+                "fav_rest": _rest_bucket(ff.get("rest")),
+                "dog_rest": _rest_bucket(df.get("rest")),
+                "fav_travel": "fav_traveled" if ff.get("traveled") else "fav_settled",
+                "dog_travel": "dog_traveled" if df.get("traveled") else "dog_settled",
+            }
+            base = {}
+            dog_ml = t.ml_home if dog_is_home else t.ml_away
+            base["dog_ml"] = (dog_ml, "win" if winner_home == dog_is_home else "loss")
+            dog_point = ((t.rl_home_point or 0.0) if dog_is_home
+                         else -(t.rl_home_point or 0.0))
+            if abs(dog_point - 1.5) < 0.01:
+                dog_rl = t.rl_home if dog_is_home else t.rl_away
+                base["dog_rl"] = (dog_rl, _grade_runline(dog_is_home, 1.5, hs, as_))
+            if t.total_line is not None:
+                base["total_over"] = (t.total_over,
+                                      r2_grade.grade_over_under(hs + as_, t.total_line, "OVER"))
+                base["total_under"] = (t.total_under,
+                                       r2_grade.grade_over_under(hs + as_, t.total_line, "UNDER"))
+            emitted = False
+            for bet, (price, res) in base.items():
+                p = r2_grade.profit(price, res) if res else None
+                if p is None:
+                    continue
+                rows.append({"season": str(season), "bet": bet, "result": res,
+                             "profit": p, **tags})
+                emitted = True
+            if emitted:
+                cov["graded_games"] += 1
+    return rows, cov
+
+
+def _repl_slice(rows, keyfn, label, min_n, top=None):
+    """Print ROI by factor bucket, gated to n>=min_n, with a per-season sign string and
+    a ★ on cells that are +ROI AND positive every season (>=2 seasons) — the honesty
+    gate. ``top`` shows only the best+worst N cells (for high-cardinality factors)."""
+    seasons = sorted({r["season"] for r in rows})
+    cells = r2_grade.by_key(rows, keyfn)
+    items = []
+    for k, sm in cells.items():
+        if sm.n < min_n:
+            continue
+        signs = []
+        for s in seasons:
+            ss = r2_grade.summarize([r for r in rows if keyfn(r) == k and r["season"] == s])
+            if ss.n >= max(20, min_n // 3):
+                signs.append("+" if ss.roi > 0 else "-")
+        items.append((k, sm, "".join(signs) or "n/a"))
+    items.sort(key=lambda x: x[1].roi, reverse=True)
+    show = items
+    if top and len(items) > 2 * top:
+        show = items[:top] + items[-top:]
+    print(f"  by {label} (n>={min_n:,}):")
+    if not show:
+        print("    (no cells meet n)\n")
+        return
+    for k, sm, signs in show:
+        star = " ★" if (sm.roi > 0 and set(signs) == {"+"} and len(signs) >= 2) else ""
+        print(f"    {str(k)[:30]:<30} n={sm.n:>5,} ROI={sm.roi:+.2%} "
+              f"t={sm.t_stat:+.2f} [{signs}]{star}")
+    print("")
+
+
+def _report_upset_datamine(rows, cov, min_n=60):
+    print("=" * 78)
+    print("  UPSET DATAMINE — realized ROI of base bets, stratified by market-blind factor")
+    print(f"  graded_games={cov.get('graded_games',0):,}  (no_meta={cov.get('no_meta',0):,} "
+          f"no_score={cov.get('no_score',0):,} pickem={cov.get('pickem',0):,})")
+    print("  ★ = +ROI AND positive every season (>=2) at n>=min — a candidate signal.")
+    print("=" * 78)
+    # Which factors to cross with which base bets (the plausible story per factor).
+    plan = [
+        ("dog_ml",      [("dh", "doubleheader"), ("dog_rest", "underdog days-rest"),
+                         ("fav_rest", "favorite days-rest"), ("dog_travel", "underdog travel"),
+                         ("fav_travel", "favorite travel")]),
+        ("dog_rl",      [("dh", "doubleheader"), ("dog_rest", "underdog days-rest"),
+                         ("fav_rest", "favorite days-rest")]),
+        ("total_over",  [("ump", "home-plate umpire"), ("dh", "doubleheader")]),
+        ("total_under", [("ump", "home-plate umpire"), ("dh", "doubleheader")]),
+    ]
+    for bet, factors in plan:
+        br = [r for r in rows if r["bet"] == bet]
+        pooled = r2_grade.summarize(br)
+        print(f"\n  ── {bet.upper()}  (baseline: n={pooled.n:,} ROI={pooled.roi:+.2%} "
+              f"t={pooled.t_stat:+.2f}) " + "─" * 20)
+        for fkey, flabel in factors:
+            top = 5 if fkey == "ump" else None      # umpire is high-cardinality
+            _repl_slice(br, lambda r, _k=fkey: r[_k], flabel, min_n, top=top)
+    print("=" * 78)
+    print("  READ: a ★ cell (or a clearly -ROI replicating cell) is the deliverable — a")
+    print("  factor the market misprices in a bettable (or disqualifiable) direction.")
+    print("  Everything else = the market is efficient on that factor. Verify a ★ with a")
+    print("  finer cut before trusting it (high-cardinality umpire cells overfit easily).")
+    print("=" * 78)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Rule-based scenario backtests (DK, 2024-26).")
     ap.add_argument("--sport", default="baseball_mlb")
@@ -1032,7 +1239,9 @@ def main():
     ap.add_argument("--scenario", default="all",
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
-                             "line_timing", "coherence_stable_sp"])
+                             "line_timing", "coherence_stable_sp", "upset_datamine"])
+    ap.add_argument("--datamine-min-n", type=int, default=60,
+                    help="Min bets for an upset_datamine factor cell to be shown.")
     ap.add_argument("--coh-fav-min", type=float, default=0.60,
                     help="Coherence band lower ML-implied bound (coherence_stable_sp).")
     ap.add_argument("--coh-fav-max", type=float, default=0.70,
@@ -1129,6 +1338,9 @@ def main():
         scenario_line_timing(args.sport, seasons)                    # coverage probe
         rows, cov = scenario_line_timing_study(args.sport, seasons)  # early-vs-close study
         _report_line_timing(rows, cov)
+    if want == "upset_datamine":       # explicit only, not in "all"
+        rows, cov = scenario_upset_datamine(args.sport, seasons)
+        _report_upset_datamine(rows, cov, min_n=args.datamine_min_n)
 
 
 if __name__ == "__main__":
