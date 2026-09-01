@@ -33,6 +33,17 @@ BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 _TABLES = ("odds_snapshot", "odds_line")
 
+# Snapshot role → the `source` value stored on odds_snapshot. `source` becomes the
+# window selector (Doug 2026-09-01): a reader picks a window with WHERE source=...
+ROLE_TO_SOURCE = {"early_12h": "early_12h", "early_4h": "early_4h", "close": "closing"}
+
+# Per-kind market strings recorded on the snapshot meta (drives _kind_for_markets
+# identity + is human-auditable). Full and F5 come from the SAME cached team payload.
+_KIND_MARKETS = {
+    "team": "h2h,spreads,totals",
+    "first_five": "h2h_1st_5_innings,spreads_1st_5_innings,totals_1st_5_innings",
+}
+
 
 def _engine():
     import db_store
@@ -118,6 +129,158 @@ def _latest_backup():
     return d if os.path.isdir(d) else None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PURGE — empty odds_line + odds_snapshot (all sports). DESTRUCTIVE.
+# ──────────────────────────────────────────────────────────────────────────────
+def purge(eng, apply=False, force=False):
+    """Empty odds_line then odds_snapshot (ALL sports — Doug is repopulating NBA/NFL
+    too). Refuses to run without a completed --backup unless --force. On SQL Server,
+    odds_snapshot can't be TRUNCATEd while odds_line's FK references it, so we
+    truncate the (already-emptied) child, drop the FK, truncate the parent, and
+    re-add the FK. On SQLite (local/tests) falls back to DELETE."""
+    from sqlalchemy import text
+    if not apply:
+        c = snapshot_counts(eng)
+        print(f"  [dry-run] would TRUNCATE odds_line ({c['line_total']} rows) + "
+              f"odds_snapshot ({c['snapshot_total']} rows, ALL sports). "
+              f"Re-run with --apply --yes.")
+        return
+    if not force and not _latest_backup():
+        raise SystemExit("REFUSING to purge: no backup found. Run --backup first "
+                         "(or --force to override).")
+    dialect = eng.dialect.name
+    print(f"  PURGE (dialect={dialect}) — emptying odds_line + odds_snapshot…")
+    if dialect == "mssql":
+        with eng.begin() as c:
+            c.execute(text("TRUNCATE TABLE odds_line"))
+            c.execute(text("ALTER TABLE odds_line "
+                           "DROP CONSTRAINT fk_odds_line_snapshot"))
+            c.execute(text("TRUNCATE TABLE odds_snapshot"))
+            c.execute(text(
+                "ALTER TABLE odds_line ADD CONSTRAINT fk_odds_line_snapshot "
+                "FOREIGN KEY (snapshot_id) REFERENCES odds_snapshot(id) "
+                "ON DELETE CASCADE"))
+    else:  # sqlite / others: no TRUNCATE, but CASCADE or child-first DELETE works
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM odds_line"))
+            c.execute(text("DELETE FROM odds_snapshot"))
+    after = snapshot_counts(eng)
+    print(f"  PURGE done. Now: odds_snapshot={after['snapshot_total']}, "
+          f"odds_line={after['line_total']}.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOAD — reload MLB from the precise cache (per-book lines, source=role, per kind)
+# ──────────────────────────────────────────────────────────────────────────────
+def _kinds_for_group(group):
+    return ["team", "first_five"] if group == "team" else ["props"]
+
+
+def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
+    """Reload MLB odds from the precise cache. Drives off backfill_precise's PLAN
+    (role explicit per offset), reads each cached payload (0 credits), emits PER-BOOK
+    lines via ingest_multibook_cache._per_book_lines (byte-identical to live capture;
+    F5 via the key-shim), and writes one snapshot per (event, kind, role) with
+    source=ROLE_TO_SOURCE[role] through db_store.capture_odds_snapshot (write-once).
+    Dry-run by default (counts only). Cached-only reads → spends nothing."""
+    import backfill_precise as bp
+    import ingest_multibook_cache as im
+    import warehouse as wh
+    import db_store
+    from collections import Counter
+    db_store.promote_secrets_from_toml()
+
+    games = bp.enumerate_games(seasons)
+    id_by_pk, _ = bp.resolve_event_ids(None, games, allow_api=False)
+    specs = bp._group_specs(tier, books)
+    gpk_cache, id_cache = {}, {}
+    snaps = Counter()          # (kind, source) -> snapshots
+    src_lines = Counter()      # source -> lines
+    books_ct = Counter()
+    written = skipped = errors = pending = empty = 0
+    n = 0
+
+    mode = "APPLY (writing)" if apply else "DRY-RUN (no writes)"
+    print(f"\n=== LOAD precise → warehouse [{mode}] seasons={','.join(seasons)} ===")
+    for g in games:
+        eid = id_by_pk.get(g["game_pk"])
+        if not eid:
+            continue
+        for group, markets, offsets, regions in specs:
+            if group == "props" and g["official_date"] < bp.PROPS_MIN_DATE:
+                continue
+            markets_csv = ",".join(markets)
+            for hours_before, role in offsets:
+                ts = bp._offset_ts(g["commence"], hours_before)
+                if not bp.is_historical_event_cached(bp.SPORT_KEY, eid, ts,
+                                                     regions=regions,
+                                                     markets=markets_csv,
+                                                     bookmakers=books):
+                    pending += 1
+                    continue
+                data, snap = bp.get_historical_event_odds(
+                    api_key=None, sport=bp.SPORT_KEY, event_id=eid, date=ts,
+                    regions=regions, markets=markets_csv, bookmakers=books)
+                if not data:
+                    empty += 1
+                    continue
+                source = ROLE_TO_SOURCE[role]
+                snapshot_hour = wh._hour_bucket(snap or ts)
+                commence = data.get("commence_time") or g["commence"]
+                for kind in _kinds_for_group(group):
+                    lines = im._per_book_lines(data, kind)
+                    if not lines:
+                        continue
+                    meta = {
+                        "sport": bp.SPORT_KEY, "game_date": commence[:10],
+                        "event_id": eid, "kind": kind,
+                        "snapshot_hour": snapshot_hour, "captured_at": snap,
+                        "commence_time": commence,
+                        "home": data.get("home_team"), "away": data.get("away_team"),
+                        "regions": regions,
+                        "markets": _KIND_MARKETS.get(kind, markets_csv),
+                        "bookmakers": ",".join(books), "source": source,
+                    }
+                    meta, lines = im._enrich_lines_fast(
+                        bp.SPORT_KEY, meta, lines, gpk_cache, id_cache)
+                    snaps[(kind, source)] += 1
+                    src_lines[source] += len(lines)
+                    for ln in lines:
+                        books_ct[ln.get("bookmaker")] += 1
+                    if apply:
+                        try:
+                            ok = db_store.capture_odds_snapshot(meta, lines)
+                            written += 1 if ok else 0
+                            skipped += 0 if ok else 1
+                        except Exception as exc:
+                            errors += 1
+                            if errors <= 5:
+                                print(f"  [err] {eid} {kind}/{source}: "
+                                      f"{type(exc).__name__} ({exc})")
+                    n += 1
+                    if progress_every and n % progress_every == 0:
+                        print(f"  …{n:,} snapshots "
+                              f"({'written ' + format(written, ',') if apply else 'dry-run'})")
+                if limit and n >= limit:
+                    break
+            if limit and n >= limit:
+                break
+        if limit and n >= limit:
+            break
+
+    print(f"\n  snapshots {'written' if apply else 'planned'}: {n:,}")
+    for (kind, source) in sorted(snaps):
+        print(f"    {kind:11} source={source:9} : {snaps[(kind, source)]:,}")
+    print(f"  lines by source: "
+          f"{', '.join(f'{s}={src_lines[s]:,}' for s in sorted(src_lines))}")
+    print(f"  books: {', '.join(f'{b}={books_ct[b]:,}' for b in sorted(books_ct))}")
+    print(f"  pending(uncached)={pending:,}  empty={empty:,}"
+          + (f"  written={written:,} skipped(dup)={skipped:,} errors={errors:,}"
+             if apply else ""))
+    if not apply:
+        print("  [dry-run] nothing written. Re-run with --apply --yes.")
+
+
 def main():
     p = argparse.ArgumentParser(description="Phase 3: back up / purge / reload the "
                                             "Azure odds warehouse from precise parquet.")
@@ -126,9 +289,33 @@ def main():
                         "Free, read-only. Do this FIRST.")
     p.add_argument("--counts", action="store_true",
                    help="Print current warehouse odds row counts and exit (free).")
+    p.add_argument("--purge", action="store_true",
+                   help="DESTRUCTIVE: empty odds_line + odds_snapshot (all sports). "
+                        "Dry-run unless --apply --yes; refuses without a backup.")
+    p.add_argument("--load", action="store_true",
+                   help="Reload MLB from the precise cache (per-book, source=role). "
+                        "Dry-run unless --apply --yes. Spends nothing (cached reads).")
+    p.add_argument("--apply", action="store_true",
+                   help="Actually write/destroy (with --purge/--load). Needs --yes.")
+    p.add_argument("--yes", action="store_true", help="Double-confirm with --apply.")
+    p.add_argument("--force", action="store_true",
+                   help="Allow --purge without a backup present (not recommended).")
+    p.add_argument("--seasons", default="2024,2025,2026",
+                   help="Seasons to reload (default 2024,2025,2026).")
+    p.add_argument("--tier", choices=["team", "props", "all"], default="all")
+    p.add_argument("--books", default="draftkings,fanduel,pinnacle")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Cap snapshots processed (0=all); for a fast dry-run sample.")
     p.add_argument("--chunksize", type=int, default=200_000,
                    help="odds_line read chunk size for the backup stream.")
     args = p.parse_args()
+
+    apply = bool(args.apply and args.yes)
+    if (args.apply and not args.yes):
+        print("--apply requires --yes (double-confirm). Nothing done.")
+        return
+    seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
+    books = [b.strip() for b in args.books.split(",") if b.strip()]
 
     eng = _engine()
     if args.counts:
@@ -139,6 +326,12 @@ def main():
         return
     if args.backup:
         backup(eng, chunksize=args.chunksize)
+        return
+    if args.purge:
+        purge(eng, apply=apply, force=args.force)
+        return
+    if args.load:
+        load(eng, seasons, args.tier, books, apply=apply, limit=args.limit)
         return
     p.print_help()
 
