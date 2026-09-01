@@ -501,6 +501,114 @@ def verify_cache(games, id_by_pk, tier, books):
           "to fix BEFORE the full spend; scattered partials = normal book gaps.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 2 — compile cached raw responses → parquet (FREE, re-runnable)
+# ──────────────────────────────────────────────────────────────────────────────
+PARQUET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "odds_backfill", "parquet")
+
+
+def _flatten(data, meta):
+    """Flatten one cached event payload into line-level row dicts (one per
+    book × market × outcome), stamped with `meta` (game/role/snapshot identity).
+    Generic over ALL markets incl. the F5 period markets and props — reads the raw
+    bookmakers[].markets[].outcomes[] so nothing is dropped by a market-specific
+    parser. Only the requested books are kept (defensive; the API already filters)."""
+    rows = []
+    keep = meta["_books"]
+    for bm in data.get("bookmakers", []):
+        bk = bm.get("key")
+        if bk not in keep:
+            continue
+        for mk in bm.get("markets", []):
+            mkey = mk.get("key")
+            mupd = mk.get("last_update")
+            for oc in mk.get("outcomes", []):
+                rows.append({
+                    "game_pk": meta["game_pk"], "season": meta["season"],
+                    "official_date": meta["official_date"],
+                    "commence": meta["commence"], "home": meta["home"],
+                    "away": meta["away"], "event_id": meta["event_id"],
+                    "role": meta["role"], "group": meta["group"],
+                    "requested_ts": meta["requested_ts"],
+                    "snapshot_ts": meta["snapshot_ts"], "lead_h": meta["lead_h"],
+                    "book": bk, "market": mkey, "market_last_update": mupd,
+                    "outcome": oc.get("name"), "description": oc.get("description"),
+                    "point": oc.get("point"), "price": oc.get("price"),
+                    "source": "backfill_precise",
+                })
+    return rows
+
+
+def compile_parquet(games, id_by_pk, tier, books, seasons):
+    """Read every cached (game, offset, group) payload (0 credits) and write one
+    parquet per (season, group) to PARQUET_DIR. Re-runnable: skips calls not yet
+    cached (records them as pending) so it can be run repeatedly as Phase 1 fills in.
+    Never spends — cached-only reads via get_historical_event_odds(api_key=None)."""
+    import pandas as pd
+    specs = _group_specs(tier, books)
+    os.makedirs(PARQUET_DIR, exist_ok=True)
+    grand = {"rows": 0, "read": 0, "empty": 0, "pending": 0}
+    for season in seasons:
+        s_games = [g for g in games if str(g["season"]) == str(season)]
+        for group, markets, offsets, regions in specs:
+            markets_csv = ",".join(markets)
+            rows = []
+            read = empty = pending = 0
+            for g in s_games:
+                eid = id_by_pk.get(g["game_pk"])
+                if not eid:
+                    continue
+                if group == "props" and g["official_date"] < PROPS_MIN_DATE:
+                    continue
+                gc = _parse_ts(g["commence"])
+                for hours_before, role in offsets:
+                    ts = _offset_ts(g["commence"], hours_before)
+                    if not is_historical_event_cached(SPORT_KEY, eid, ts,
+                                                      regions=regions,
+                                                      markets=markets_csv,
+                                                      bookmakers=books):
+                        pending += 1
+                        continue
+                    data, snap = get_historical_event_odds(
+                        api_key=None, sport=SPORT_KEY, event_id=eid, date=ts,
+                        regions=regions, markets=markets_csv, bookmakers=books)
+                    read += 1
+                    if not data:
+                        empty += 1
+                        continue
+                    sc = _parse_ts(snap)
+                    meta = {
+                        "game_pk": g["game_pk"], "season": g["season"],
+                        "official_date": g["official_date"],
+                        "commence": g["commence"], "home": g["home"],
+                        "away": g["away"], "event_id": eid, "role": role,
+                        "group": group, "requested_ts": ts, "snapshot_ts": snap,
+                        "lead_h": ((gc - sc).total_seconds() / 3600.0
+                                   if (gc and sc) else None),
+                        "_books": set(books),
+                    }
+                    rows.extend(_flatten(data, meta))
+            if rows:
+                out = os.path.join(PARQUET_DIR,
+                                   f"mlb_precise_{group}_{season}.parquet")
+                pd.DataFrame(rows).to_parquet(out, index=False)
+                print(f"  [{season} {group:5}] {len(rows):>8} rows "
+                      f"({read} snapshots read, {empty} empty, {pending} pending) "
+                      f"→ {os.path.basename(out)}")
+            else:
+                print(f"  [{season} {group:5}] no rows "
+                      f"({read} read, {empty} empty, {pending} pending) — "
+                      f"nothing cached yet")
+            grand["rows"] += len(rows)
+            grand["read"] += read
+            grand["empty"] += empty
+            grand["pending"] += pending
+    print(f"\n=== Phase 2 compile done. {grand['rows']} line rows from "
+          f"{grand['read']} snapshots ({grand['empty']} empty, "
+          f"{grand['pending']} pending/uncached). Parquet dir: {PARQUET_DIR} ===")
+
+
 _UNMAPPED_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "odds_backfill", "unmapped_games.csv")
 
@@ -782,6 +890,10 @@ def main():
     p.add_argument("--verify", action="store_true",
                    help="FREE read-only audit of what already landed in the cache "
                         "(per group/role book + lead-time coverage). Spends nothing.")
+    p.add_argument("--compile", action="store_true",
+                   help="PHASE 2 (FREE): compile cached raw responses → parquet in "
+                        "odds_backfill/parquet/ (per season/group). Re-runnable; "
+                        "spends nothing (cached-only reads).")
     args = p.parse_args()
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
@@ -815,14 +927,19 @@ def main():
     print(f"Enumerated {len(games)} regular-season final games "
           f"({', '.join(seasons)}), newest-first.")
 
-    # Resolve event_ids. Dry-run/verify resolve only via free sources (warehouse +
-    # cache); probe/real runs may make the 1-credit/date harvest calls.
+    # Resolve event_ids. Dry-run/verify/compile resolve only via free sources
+    # (warehouse + cached listings); probe/real runs may make the 1cr/date harvest.
+    _free = args.dry_run or args.verify or args.compile
     id_by_pk, harvest_credits = resolve_event_ids(
-        api_key, games, allow_api=(not (args.dry_run or args.verify)),
+        api_key, games, allow_api=(not _free),
         max_credits=args.max_credits, workers=args.workers)
 
     if args.verify:
         verify_cache(games, id_by_pk, args.tier, books)
+        return
+
+    if args.compile:
+        compile_parquet(games, id_by_pk, args.tier, books, seasons)
         return
 
     if args.probe:
