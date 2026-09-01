@@ -50,6 +50,7 @@ Examples
     python backfill_precise.py --seasons 2026 --tier all --max-credits 500000
 """
 import argparse
+import os
 
 from odds_client import (
     get_historical_events,
@@ -63,10 +64,14 @@ from backfill_historical_odds import load_config, _names_match
 
 SPORT_KEY = "baseball_mlb"
 
-# The four books we keep: three bet books + Pinnacle (reference-only).
-DEFAULT_BOOKS = ["draftkings", "fanduel", "bet365", "pinnacle"]
+# Books we keep: the bet books + Pinnacle (reference-only). bet365 was dropped
+# 2026-09-01 — the historical per-event endpoint carries no bet365 MLB depth (probe
+# 2026-08-30 showed it absent from the full 33-book slate), so paying to request it
+# would just add an always-empty book. DK/FD are the executable bet books here;
+# Pinnacle is the sole reference.
+DEFAULT_BOOKS = ["draftkings", "fanduel", "pinnacle"]
 
-# Region needed per book (Odds API region grouping). bet365 US = us; Pinnacle = eu.
+# Region needed per book (Odds API region grouping). DK/FD = us; Pinnacle = eu.
 _BOOK_REGION = {
     "draftkings": "us", "fanduel": "us", "bet365": "us", "pinnacle": "eu",
 }
@@ -104,9 +109,20 @@ def enumerate_games(seasons):
     ordered NEWEST-FIRST. Fail-open → [] if the warehouse is unavailable."""
     import mlb_warehouse as wh
     import db_store
-    from sqlalchemy import select, or_
+    from sqlalchemy import select, func
     if not wh.enabled():
         return []
+    # Terminal-state denylist: a postponed/suspended/cancelled game can surface as
+    # abstractGameState 'Final' with a PARTIAL (0-0) linescore that passes the
+    # score-not-null test, so gate on detailed_state too — same guard the rest of the
+    # codebase uses (mlb_starters._is_genuine_final / mlb_warehouse.final_game_by_pk).
+    # coalesce('') keeps NULL detailed_state rows enumerated (trust abstract state),
+    # matching that convention. Without this we'd spend ~500 cr/game fetching odds for
+    # ungradable games and pollute the cache.
+    try:
+        from mlb_starters import _NON_FINAL_DETAILED
+    except Exception:
+        _NON_FINAL_DETAILED = ("postpon", "suspend", "cancel")
     g = wh.mlb_game
     home = wh.mlb_team.alias("home_t")
     away = wh.mlb_team.alias("away_t")
@@ -119,8 +135,11 @@ def enumerate_games(seasons):
             .where(g.c.game_type == "R")
             .where(g.c.status == "Final")
             .where(g.c.home_score.isnot(None))
-            .where(g.c.away_score.isnot(None))
-            .order_by(g.c.game_date.desc(), g.c.game_pk.desc()))
+            .where(g.c.away_score.isnot(None)))
+    for bad in _NON_FINAL_DETAILED:
+        stmt = stmt.where(
+            ~func.lower(func.coalesce(g.c.detailed_state, "")).like(f"%{bad}%"))
+    stmt = stmt.order_by(g.c.game_date.desc(), g.c.game_pk.desc())
     out = []
     with db_store.get_engine().connect() as conn:
         for r in conn.execute(stmt).fetchall():
@@ -142,9 +161,39 @@ def enumerate_games(seasons):
 # ──────────────────────────────────────────────────────────────────────────────
 # Event-ID mapping — warehouse reuse first (free), then historical-events harvest
 # ──────────────────────────────────────────────────────────────────────────────
+def _parse_ts(ts):
+    """ISO ts → aware UTC datetime, or None. Uses the same normalizer the fetch path
+    uses so warehouse/listing commence strings compare consistently."""
+    from datetime import datetime, timezone
+    try:
+        d = _normalize_snapshot_date(ts)
+        return datetime.strptime(d, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _nearest(cands, commence, used):
+    """From (commence_time, event_id) candidates, pick the UNUSED event whose
+    commence is nearest `commence` (falls back to the first unused when times are
+    unparseable). Returns event_id or None. Disambiguates same-day same-matchup
+    (doubleheader) games so each game_pk binds to ITS OWN event."""
+    gc = _parse_ts(commence)
+    best = None
+    for ct, eid in cands:
+        if not eid or eid in used:
+            continue
+        ec = _parse_ts(ct)
+        dist = abs((ec - gc).total_seconds()) if (gc and ec) else float("inf")
+        if best is None or dist < best[0]:
+            best = (dist, eid)
+    return best[1] if best else None
+
+
 def _warehouse_event_ids():
-    """{(official_date, home_norm, away_norm) -> event_id} from odds_snapshot rows
-    already in the warehouse (free, no API). Fail-open → {}."""
+    """{(official_date, home_norm, away_norm) -> [(commence_time, event_id), ...]}
+    from odds_snapshot rows already in the warehouse (free, no API). MULTI-valued so
+    a split doubleheader (two distinct event_ids sharing date+matchup) is not
+    collapsed to one id. Fail-open → {}."""
     try:
         import db_store
         from sqlalchemy import select
@@ -157,12 +206,16 @@ def _warehouse_event_ids():
     idx = {}
     try:
         with eng.connect() as c:
-            q = (select(t.c.game_date, t.c.event_id, t.c.home, t.c.away)
+            q = (select(t.c.game_date, t.c.event_id, t.c.home, t.c.away,
+                        t.c.commence_time)
                  .where(t.c.sport == SPORT_KEY).distinct())
-            for gd, eid, h, a in c.execute(q).all():
+            for gd, eid, h, a, ct in c.execute(q).all():
                 if not eid:
                     continue
-                idx[((gd or "")[:10], norm(h or ""), norm(a or ""))] = eid
+                key = ((gd or "")[:10], norm(h or ""), norm(a or ""))
+                bucket = idx.setdefault(key, [])
+                if not any(e == eid for _c, e in bucket):   # dedupe by event_id
+                    bucket.append((ct, eid))
     except Exception:
         return {}
     return idx
@@ -175,21 +228,24 @@ def _harvest_ts(official_date):
     return f"{official_date}T12:00:00Z"
 
 
-def resolve_event_ids(api_key, games, allow_api):
+def resolve_event_ids(api_key, games, allow_api, max_credits=None):
     """Map each game to its Odds-API event_id.
 
     Order of resolution (cheapest first):
       1. Warehouse odds_snapshot mapping (free).
       2. Cached historical-events listing (free).
-      3. Live historical-events call, 1 credit/date — ONLY when allow_api=True.
+      3. Live historical-events call, 1 credit/date — ONLY when allow_api=True,
+         and STOPPED once harvest spend would reach `max_credits` (the hard cap
+         bounds harvest too, not just the fetch loop).
 
-    Returns (id_by_pk, harvest_credits). In dry-run (allow_api=False) uncached
-    dates are NOT called; their harvest cost is counted so the estimate is honest
-    and those games are left unmapped (planned at full, cache-unknown cost)."""
+    Doubleheaders: same-day same-matchup games are disambiguated by NEAREST commence
+    time (one event per game_pk), in BOTH the warehouse-reuse and listing passes.
+
+    Returns (id_by_pk, harvest_credits). In dry-run (allow_api=False) uncached dates
+    are NOT called; their harvest cost is counted so the estimate is honest and those
+    games are left unmapped (planned at full, cache-unknown cost)."""
     wh_idx = _warehouse_event_ids()
     id_by_pk = {}
-    dates = sorted({g["official_date"] for g in games})
-    # Group games by date for listing-based matching.
     by_date = {}
     for g in games:
         by_date.setdefault(g["official_date"], []).append(g)
@@ -200,39 +256,56 @@ def resolve_event_ids(api_key, games, allow_api):
     except Exception:
         norm = lambda s: (s or "").lower().strip()
 
-    # Pass 1: warehouse reuse.
+    # Pass 1: warehouse reuse — cluster by (date, matchup) so a DH is matched
+    # one-to-one by nearest commence instead of collapsing to a single event_id.
     unresolved_dates = set()
     for d, gs in by_date.items():
+        clusters = {}
         for g in gs:
-            eid = wh_idx.get((d, norm(g["home"]), norm(g["away"])))
-            if eid:
-                id_by_pk[g["game_pk"]] = eid
-            else:
+            clusters.setdefault((d, norm(g["home"]), norm(g["away"])), []).append(g)
+        for key, cluster in clusters.items():
+            cands = list(wh_idx.get(key) or [])
+            used = set()
+            for g in sorted(cluster, key=lambda x: x["commence"]):
+                eid = _nearest(cands, g["commence"], used)
+                if eid:
+                    id_by_pk[g["game_pk"]] = eid
+                    used.add(eid)
+            # Any game in this matchup still unmapped (no candidate, or fewer
+            # warehouse events than DH games) → let the harvest pass fill it.
+            if any(g["game_pk"] not in id_by_pk for g in cluster):
                 unresolved_dates.add(d)
 
-    # Pass 2/3: historical-events listing per still-unresolved date.
+    # Pass 2/3: historical-events listing per still-unresolved date, cap-bounded.
     harvest_credits = 0
     for d in sorted(unresolved_dates):
         ts = _harvest_ts(d)
         cached = is_historical_events_cached(SPORT_KEY, ts)
-        if not cached and not allow_api:
-            harvest_credits += 1          # would-be spend, not made in dry-run
-            continue
         if not cached:
+            if not allow_api:
+                harvest_credits += 1      # would-be spend, not made in dry-run
+                continue
+            if max_credits is not None and harvest_credits >= max_credits:
+                continue                  # hard cap reached — stop harvesting
             harvest_credits += 1
         try:
             events, _ = get_historical_events(api_key, SPORT_KEY, date=ts)
-        except Exception:
+        except Exception as e:
+            print(f"  [warn] events harvest failed {d}: {e}")
             continue
         gs = by_date.get(d, [])
-        for ev in events or []:
-            for g in gs:
-                if g["game_pk"] in id_by_pk:
-                    continue
-                if (_names_match(g["home"], ev.get("home_team"))
-                        and _names_match(g["away"], ev.get("away_team"))):
-                    id_by_pk[g["game_pk"]] = ev.get("id")
-                    break
+        # Events already bound to this date's games (from warehouse) can't be reused.
+        used = {id_by_pk[g["game_pk"]] for g in gs if g["game_pk"] in id_by_pk}
+        # Name-matching candidates from the listing, carrying commence for DH tiebreak.
+        for g in sorted((x for x in gs if x["game_pk"] not in id_by_pk),
+                        key=lambda x: x["commence"]):
+            cands = [(ev.get("commence_time"), ev.get("id")) for ev in (events or [])
+                     if _names_match(g["home"], ev.get("home_team"))
+                     and _names_match(g["away"], ev.get("away_team"))]
+            eid = _nearest(cands, g["commence"], used)
+            if eid:
+                id_by_pk[g["game_pk"]] = eid
+                used.add(eid)
     return id_by_pk, harvest_credits
 
 
@@ -258,7 +331,8 @@ def _regions_for(books, market_group):
         r = _BOOK_REGION.get(b)
         if r and r not in regions:
             regions.append(r)
-    # Deterministic order: us before eu.
+    # Deterministic (sorted) order → "eu,us" for team; the exact string is part of
+    # the odds_client cache key, so it must be computed identically everywhere.
     return ",".join(sorted(regions))
 
 
@@ -274,14 +348,46 @@ def _group_specs(tier, books):
     return specs
 
 
+_UNMAPPED_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "odds_backfill", "unmapped_games.csv")
+
+
+def _write_unmapped(unmapped_games, dry_run):
+    """Print + persist the games with no resolved event_id (audit trail)."""
+    tag = "expected in dry-run" if dry_run else "INVESTIGATE name-match/harvest"
+    print(f"\n  UNMAPPED ({len(unmapped_games)}) — no event_id ({tag}):")
+    for g in unmapped_games[:20]:
+        print(f"    {g['official_date']}  {g['away']} @ {g['home']}  "
+              f"(pk={g['game_pk']})")
+    if len(unmapped_games) > 20:
+        print(f"    … +{len(unmapped_games) - 20} more (full list in the CSV)")
+    try:
+        os.makedirs(os.path.dirname(_UNMAPPED_CSV), exist_ok=True)
+        with open(_UNMAPPED_CSV, "w", encoding="utf-8") as f:
+            f.write("official_date,away,home,game_pk,commence\n")
+            for g in unmapped_games:
+                f.write(f"{g['official_date']},{g['away']},{g['home']},"
+                        f"{g['game_pk']},{g['commence']}\n")
+        print(f"    → wrote {_UNMAPPED_CSV}")
+    except OSError as e:
+        print(f"    [warn] could not write unmapped manifest: {e}")
+
+
 def plan_and_run(api_key, games, id_by_pk, tier, books, max_credits,
-                 dry_run, harvest_credits):
+                 dry_run, harvest_credits, workers=12):
     """Price (and, unless dry_run, execute) the per-event fetch plan. Cache-aware:
     an already-cached call is free. Returns nothing; prints a full report."""
     specs = _group_specs(tier, books)
     n_markets = {g: len(m) for g, m, _o, _r in specs}
     n_regions = {g: len(r.split(",")) for g, m, _o, r in specs}
-    cost_per_call = {g: CREDIT_PER_MARKET * n_markets[g] * n_regions[g]
+    # BILLING (probe-verified 2026-09-01): The Odds API bills a per-event call with a
+    # `bookmakers=` filter as ONE region, regardless of how many regions those books
+    # span — so a team call at regions=us,eu +books costs 10×markets×1 (=60), NOT
+    # 10×markets×2 (=120), and STILL returns Pinnacle (eu) alongside DK/FD (us) in a
+    # single call. We always pass `books`, so billing is 1 region; we keep the full
+    # regions STRING on the call itself (needed to actually return the eu book).
+    cost_per_call = {g: CREDIT_PER_MARKET * n_markets[g]
+                     * (1 if books else n_regions[g])
                      for g, m, _o, r in specs}
 
     print(f"\n=== PRECISE BACKFILL {SPORT_KEY} — Phase 1 (fetch → cache) ===")
@@ -294,11 +400,14 @@ def plan_and_run(api_key, games, id_by_pk, tier, books, max_credits,
         print(f"  Event-ID harvest (uncached dates): ~{harvest_credits} credits")
 
     # Build the task list (newest-first — games already sorted DESC).
-    tasks = []            # (game, group, markets_csv, regions, ts, role)
+    tasks = []            # (game, group, markets_csv, regions, ts, role, eid)
     est_credits = harvest_credits
     cached_calls = new_calls = unmapped_calls = 0
+    unmapped_games = []
     for g in games:
         eid = id_by_pk.get(g["game_pk"])
+        if not eid:
+            unmapped_games.append(g)   # once per game, for the audit manifest
         for group, markets, offsets, regions in specs:
             if group == "props" and g["official_date"] < PROPS_MIN_DATE:
                 continue
@@ -323,6 +432,13 @@ def plan_and_run(api_key, games, id_by_pk, tier, books, max_credits,
     print(f"  ESTIMATED credits this run: ~{est_credits}  "
           f"(cap: {max_credits})")
 
+    # Audit trail: surface + persist the games we could NOT map to an event_id, so a
+    # name-match miss or harvest failure is fixable/re-runnable (free) before the
+    # credit window closes — never a silent, unrecoverable gap. (In dry-run, unmapped
+    # is expected/large because uncached dates aren't harvested — informational only.)
+    if unmapped_games:
+        _write_unmapped(unmapped_games, dry_run)
+
     if dry_run:
         print("\n  [dry-run] No API calls made. Re-run without --dry-run to fetch.")
         return
@@ -330,41 +446,90 @@ def plan_and_run(api_key, games, id_by_pk, tier, books, max_credits,
         print("\n  Nothing new to fetch (all cached or unmapped). Done.")
         return
 
-    # ── Real fetch loop (cache-only; no warehouse/parquet in Phase 1) ──
-    spent = 0
-    fetched = empty = 0
-    try:
-        for i, (g, group, markets_csv, regions, ts, role, eid) in enumerate(tasks, 1):
-            this_cost = cost_per_call[group]
-            if spent + this_cost > max_credits:
-                print(f"  [stop] Budget cap {max_credits} reached "
-                      f"(spent ~{spent}).")
-                break
-            # Re-check cache (a prior offset/group may have primed it mid-run).
-            if is_historical_event_cached(SPORT_KEY, eid, ts, regions=regions,
-                                          markets=markets_csv, bookmakers=books):
-                continue
-            try:
-                data, snap_ts = get_historical_event_odds(
-                    api_key, SPORT_KEY, eid, date=ts, regions=regions,
-                    markets=markets_csv, bookmakers=books)
-            except Exception as e:
-                print(f"  [warn] {g['official_date']} {g['away']}@{g['home']} "
-                      f"{group}/{role}: {e}; skipping.")
-                continue
-            spent += this_cost
+    # ── Budget-slice BEFORE dispatch ──────────────────────────────────────────
+    # Each task in `tasks` is a distinct cache key = exactly one genuine paid call
+    # (cached calls were already excluded at plan time). So we can pick the prefix
+    # that fits --max-credits deterministically, newest-first, and enforce the cap
+    # WITHOUT racing a shared counter across worker threads. A worker that finds a
+    # call cached (primed since planning) simply spends less — the cap still holds.
+    # Seed `committed` with harvest spend already made this run so the fetch prefix
+    # + harvest together never exceed --max-credits (the cap bounds the WHOLE run).
+    budgeted, committed = [], harvest_credits
+    for t in tasks:
+        c = cost_per_call[t[1]]
+        if committed + c > max_credits:
+            break
+        committed += c
+        budgeted.append(t)
+    if len(budgeted) < len(tasks):
+        print(f"  [budget] cap {max_credits} allows {len(budgeted)}/{len(tasks)} "
+              f"calls (~{committed} cr) this run; re-run to continue "
+              f"(already-fetched calls re-read free).")
+
+    # ── Concurrent fetch loop (cache-only; no warehouse/parquet in Phase 1) ──
+    # Network-bound per-event calls → threads. odds_client writes each response to
+    # its own cache file (distinct key per task), so concurrent writes never collide.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    lock = threading.Lock()
+    ctr = {"spent": 0, "fetched": 0, "empty": 0, "done": 0, "err": 0}
+    total = len(budgeted)
+
+    def _fetch(task):
+        g, group, markets_csv, regions, ts, role, eid = task
+        # Re-check cache (another task/run may have primed this exact key): free skip.
+        if is_historical_event_cached(SPORT_KEY, eid, ts, regions=regions,
+                                      markets=markets_csv, bookmakers=books):
+            with lock:
+                ctr["done"] += 1
+            return
+        try:
+            data, _snap = get_historical_event_odds(
+                api_key, SPORT_KEY, eid, date=ts, regions=regions,
+                markets=markets_csv, bookmakers=books)
+        except Exception as e:
+            with lock:
+                ctr["err"] += 1
+                ctr["done"] += 1
+            return ("err", g, group, role, str(e))
+        with lock:
+            ctr["spent"] += cost_per_call[group]
             if data is None:
-                empty += 1
+                ctr["empty"] += 1
             else:
-                fetched += 1
-            if i % 50 == 0 or i == len(tasks):
-                print(f"  [{i}/{len(tasks)}] spent ~{spent}, fetched {fetched}, "
+                ctr["fetched"] += 1
+            ctr["done"] += 1
+        return None
+
+    n_workers = max(1, int(workers))
+    print(f"  Dispatching {total} calls across {n_workers} workers…")
+    ex = ThreadPoolExecutor(max_workers=n_workers)
+    try:
+        futures = [ex.submit(_fetch, t) for t in budgeted]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res and res[0] == "err":
+                _, g, group, role, msg = res
+                print(f"  [warn] {g['official_date']} {g['away']}@{g['home']} "
+                      f"{group}/{role}: {msg}")
+            with lock:
+                done = ctr["done"]
+                spent = ctr["spent"]
+                fetched = ctr["fetched"]
+                empty = ctr["empty"]
+            if done % 100 == 0 or done == total:
+                print(f"  [{done}/{total}] spent ~{spent}, fetched {fetched}, "
                       f"empty {empty} (remaining: {get_remaining_credits()})")
     except KeyboardInterrupt:
-        print("\n  [interrupt] Cache is already persisted per-call; safe to resume.")
+        print("\n  [interrupt] Cancelling pending calls; cache is persisted "
+              "per-call, so re-running resumes for free.")
+        ex.shutdown(wait=False, cancel_futures=True)
+    else:
+        ex.shutdown(wait=True)
 
-    print(f"\n=== Phase 1 done. Spent ~{spent} credits. "
-          f"Snapshots fetched: {fetched}, empty/expired: {empty}. ===")
+    print(f"\n=== Phase 1 done. Spent ~{ctr['spent']} credits. "
+          f"Snapshots fetched: {ctr['fetched']}, empty/expired: {ctr['empty']}, "
+          f"errors: {ctr['err']}. ===")
     print(f"  Account credits remaining: {get_remaining_credits()}")
 
 
@@ -389,11 +554,19 @@ def run_probe(api_key, games, id_by_pk, books):
     team_csv = ",".join(TEAM_MARKETS)
     print(f"\n=== PROBE — event {eid} ({target['away']}@{target['home']} "
           f"{target['official_date']}) @ {ts} ===")
+    # The prod-shaped variant derives regions the SAME way plan_and_run does
+    # (_regions_for → sorted "eu,us"), so it seeds the exact cache key the real run
+    # checks — that event's early_4h team snapshot then re-reads free instead of
+    # being re-fetched. The us-only / no-books variants are diagnostic (region
+    # multiplier + bookmakers-billing) and intentionally not reused.
+    prod_regions = _regions_for(books, "team")
     variants = [
-        ("team us-only  +books", "us", team_csv, books),
-        ("team us,eu    +books", "us,eu", team_csv, books),
-        ("team us,eu    no-books", "us,eu", team_csv, None),
+        ("team us-only    +books", "us", team_csv, books),
+        ("team eu-only    +books", "eu", team_csv, books),
+        (f"team {prod_regions} +books (prod)", prod_regions, team_csv, books),
+        (f"team {prod_regions} no-books", prod_regions, team_csv, None),
     ]
+    want = set(books)
     for label, regions, markets_csv, bks in variants:
         before = get_remaining_credits()
         try:
@@ -405,11 +578,23 @@ def run_probe(api_key, games, id_by_pk, books):
             continue
         after = get_remaining_credits()
         delta = (before - after) if (before is not None and after is not None) else "?"
-        n_books = len(data.get("bookmakers", [])) if data else 0
+        keys = sorted({b.get("key") for b in (data.get("bookmakers", []) if data else [])})
+        # For the +books variants, call out whether every requested book came back —
+        # a silently-dropped Pinnacle (our sole reference) would gut the corpus.
+        miss = ""
+        if bks is not None:
+            missing = sorted(want - set(keys))
+            got = [k for k in keys if k in want]
+            miss = f"  requested={got or '[]'}  MISSING={missing or 'none'}"
         print(f"  [{label}] regions={regions} → header-cost≈{delta} credits, "
-              f"snapshot={snap}, books_returned={n_books}")
-    print("  (Compare the three: us-only vs us,eu shows the region multiplier; "
-          "+books vs no-books shows whether the bookmakers filter changes billing.)")
+              f"snapshot={snap}, books_returned={len(keys)}{miss}")
+        if bks is None:
+            print(f"      all books present @ this snapshot: {keys}")
+    print("\n  KEY QUESTIONS: (1) us-only vs us,eu (+books) → does the bookmakers "
+          "filter bill us,eu as ONE region (60) or two (120)? (2) Does the cheap "
+          "us,eu +books call actually RETURN pinnacle, or must we make a separate "
+          "eu call? (3) Is any MISSING book just absent at this snapshot vs never "
+          "returned in its region?")
 
 
 def main():
@@ -424,6 +609,10 @@ def main():
                    help="Hard cap on credits this run may spend (default 5000).")
     p.add_argument("--limit-games", type=int, default=0,
                    help="Cap enumerated games (0 = all); for testing/probe scoping.")
+    p.add_argument("--workers", type=int, default=12,
+                   help="Concurrent API workers for the fetch loop (default 12). "
+                        "Network-bound calls parallelize well; the --max-credits "
+                        "cap is enforced by budget-slicing BEFORE dispatch.")
     p.add_argument("--dry-run", action="store_true",
                    help="Price the plan and spend nothing.")
     p.add_argument("--probe", action="store_true",
@@ -457,14 +646,16 @@ def main():
     # Resolve event_ids. Dry-run resolves only via free sources (warehouse + cache);
     # probe/real runs may make the 1-credit/date harvest calls.
     id_by_pk, harvest_credits = resolve_event_ids(
-        api_key, games, allow_api=(not args.dry_run))
+        api_key, games, allow_api=(not args.dry_run),
+        max_credits=args.max_credits)
 
     if args.probe:
         run_probe(api_key, games, id_by_pk, books)
         return
 
     plan_and_run(api_key, games, id_by_pk, args.tier, books,
-                 args.max_credits, args.dry_run, harvest_credits)
+                 args.max_credits, args.dry_run, harvest_credits,
+                 workers=args.workers)
 
 
 if __name__ == "__main__":

@@ -42,3 +42,6 @@ historical_odds/*.json
 cache.zip
 warehouse_mirror_data/
 backtest_cache/
+
+# Precise-backfill outputs (raw cache is under cache/hist_event_odds/; these are compiled artifacts + audit)
+odds_backfill/
