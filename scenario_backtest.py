@@ -1235,6 +1235,100 @@ def _report_upset_datamine(rows, cov, min_n=60):
     print("=" * 78)
 
 
+def _diff_bucket(d):
+    if d is None:
+        return "unk"
+    if d >= 1.0:
+        return "a DK >=+1.0"
+    if d >= 0.5:
+        return "b DK +0.5"
+    if d > -0.5:
+        return "c equal (0)"
+    if d > -1.0:
+        return "d DK -0.5"
+    return "e DK <=-1.0"
+
+
+def scenario_under_dkpin(sport, seasons, lead_lo=12.0, lead_hi=24.0):
+    """DK-vs-PINNACLE total integrity check for the flat-under signal. Per event, compare
+    our captured DK total (12-24h window = the bet line) to Pinnacle's total (an
+    INDEPENDENT capture — Pinnacle is NOT sharper, so this is a line-level / capture
+    check, not beat-the-sharp). Reports the (DK−Pin) gap distribution + the DK-under ROI
+    bucketed by that gap. mean gap ~0 & flat ROI => our capture is fine + it's a both-book
+    regime miss (real, likely decays); DK systematically higher & unders concentrate in
+    DK>Pin => DK over-shades totals (line-level edge); wild gaps => capture artifact."""
+    import r2_data
+    meta = _load_game_meta(seasons)
+    rows, cov = [], Counter()
+    for s in seasons:
+        dk = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        pin = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="pinnacle")
+        dk_snaps, pin_snaps = _event_snapshots(dk), _event_snapshots(pin)
+        for eid, snaps in dk_snaps.items():
+            dpick = next(((ld, sd) for ld, sd in reversed(snaps)
+                          if _mkt_ok("over", sd) and lead_lo <= ld < lead_hi), None)
+            if dpick is None:
+                cov["no_dk_total"] += 1
+                continue
+            dsd = dpick[1]
+            psnaps = pin_snaps.get(eid)
+            ppick = (next(((ld, sd) for ld, sd in reversed(psnaps) if _mkt_ok("over", sd)),
+                          None) if psnaps else None)
+            if ppick is None:
+                cov["no_pin_total"] += 1
+                continue
+            psd = ppick[1]
+            gpk = dsd.get("game_pk")
+            if gpk is None or int(gpk) not in meta:
+                cov["no_meta"] += 1
+                continue
+            m = meta[int(gpk)]
+            hs, as_ = m["home_score"], m["away_score"]
+            if hs is None or as_ is None:
+                cov["no_score"] += 1
+                continue
+            diff = dsd["total_line"] - psd["total_line"]
+            res = r2_grade.grade_over_under(hs + as_, dsd["total_line"], "UNDER")
+            p = r2_grade.profit(dsd["under"], res) if res else None
+            if p is None:
+                cov["ungradable"] += 1
+                continue
+            rows.append({"season": str(s), "result": res, "profit": p, "diff": diff,
+                         "diff_bucket": _diff_bucket(diff),
+                         "dk_line": dsd["total_line"], "pin_line": psd["total_line"]})
+            cov["matched"] += 1
+    return rows, cov
+
+
+def _report_under_dkpin(rows, cov):
+    import statistics
+    print("=" * 78)
+    print("  DK-vs-PINNACLE TOTAL — integrity check for the flat-under signal (Pinnacle")
+    print("  = independent capture, NOT a sharper reference). Is DK's total offset?")
+    print(f"  matched={cov.get('matched',0):,}  (no_dk_total={cov.get('no_dk_total',0):,} "
+          f"no_pin_total={cov.get('no_pin_total',0):,})")
+    print("=" * 78)
+    diffs = [r["diff"] for r in rows]
+    if diffs:
+        pos = sum(1 for d in diffs if d > 0) / len(diffs)
+        eq = sum(1 for d in diffs if d == 0) / len(diffs)
+        neg = sum(1 for d in diffs if d < 0) / len(diffs)
+        print(f"  DK−Pin total gap:  mean {sum(diffs)/len(diffs):+.3f}  "
+              f"median {statistics.median(diffs):+.2f}  |  "
+              f"DK>Pin {pos:.0%}   equal {eq:.0%}   DK<Pin {neg:.0%}")
+    pooled = r2_grade.summarize(rows)
+    print(f"  DK-under (matched set): n={pooled.n:,} ROI={pooled.roi:+.2%} "
+          f"t={pooled.t_stat:+.2f}\n")
+    _repl_slice(rows, lambda r: r["diff_bucket"], "DK-minus-Pinnacle total gap", 50)
+    print("  READ: mean~0 & flat ROI across gap buckets => capture is fine, edge is a")
+    print("  BOTH-BOOK regime miss (real in-sample, likely decays; not a capture bug).")
+    print("  DK systematically higher & under ROI concentrated in 'DK >=+0.5' => DK")
+    print("  over-shades totals (a real line-level under edge). Wild gaps => capture bug.")
+    print("=" * 78)
+
+
 def _lead_bucket(h):
     if h is None:
         return "unk"
@@ -1454,7 +1548,7 @@ def main():
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
                              "line_timing", "coherence_stable_sp", "upset_datamine",
-                             "under_timing", "under_stress"])
+                             "under_timing", "under_stress", "under_dkpin"])
     ap.add_argument("--datamine-min-n", type=int, default=60,
                     help="Min bets for an upset_datamine factor cell to be shown.")
     ap.add_argument("--coh-fav-min", type=float, default=0.60,
@@ -1562,6 +1656,9 @@ def main():
     if want == "under_stress":         # explicit only, not in "all"
         rows, cov = scenario_under_stress(args.sport, seasons)
         _report_under_stress(rows, cov)
+    if want == "under_dkpin":          # explicit only, not in "all"
+        rows, cov = scenario_under_dkpin(args.sport, seasons)
+        _report_under_dkpin(rows, cov)
 
 
 if __name__ == "__main__":
