@@ -1402,7 +1402,8 @@ def list_odds_snapshots(sport, game_date):
 
 
 def team_market_lines(sport, dates=None, date_from=None, date_to=None,
-                      only_early=False, bookmaker="draftkings", max_retries=3):
+                      only_early=False, bookmaker="draftkings", max_retries=3,
+                      snapshot_source=None):
     """Bulk-read warehoused team-market lines (moneyline/spread/total) for a
     sport, joining each odds_line to its parent odds_snapshot.
 
@@ -1438,6 +1439,10 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
         # view; default (unset) keeps every snapshot and the assembler picks the
         # nearest-pre-commence (close), byte-identical to before.
         stmt = stmt.where(odds_snapshot.c.source == "backfill_early")
+    if snapshot_source is not None:
+        # Exact snapshot-window selection by role source ('early_12h'|'early_4h'|
+        # 'closing') — the precise-backfill scheme where source IS the window label.
+        stmt = stmt.where(odds_snapshot.c.source == snapshot_source)
     if dates:
         stmt = stmt.where(odds_snapshot.c.game_date.in_(list(dates)))
     else:
@@ -1479,7 +1484,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                       exclude_early=False, only_early=False, prop_keys=None,
-                      bookmaker="draftkings", max_retries=3):
+                      bookmaker="draftkings", max_retries=3, snapshot_source=None):
     """Bulk-read warehoused player-prop lines for a sport, joining each odds_line
     to its parent odds_snapshot.
 
@@ -1527,6 +1532,10 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
         # the EARLY-snapshot set ONLY (opening / pre-close lines) — the bet-early ROI
         # view. Mutually exclusive with exclude_early (the caller picks one).
         stmt = stmt.where(odds_snapshot.c.source == "backfill_early")
+    if snapshot_source is not None:
+        # Exact snapshot-window selection by role source ('early_4h'|'closing' for
+        # props) — the precise-backfill scheme where source IS the window label.
+        stmt = stmt.where(odds_snapshot.c.source == snapshot_source)
     if prop_keys:
         # filter to the requested prop markets IN SQL so a single-prop caller
         # doesn't transfer/materialize all seven props' lines.

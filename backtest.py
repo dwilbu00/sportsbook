@@ -2202,9 +2202,9 @@ def run_prop_lag_backtest(sport, espn_sport, espn_league, sport_key,
     import warehouse as _wh
     import mlb_starters
     import mlb_warehouse
-    pe = _wh.load_prop_market_store(sport_key, snapshot="early").get("games", {})
+    pe = _wh.load_prop_market_store(sport_key, snapshot="early_4h").get("games", {})
     pc = _wh.load_prop_market_store(sport_key, snapshot="close").get("games", {})
-    te = _wh.load_team_market_store(sport_key, snapshot="early").get("games", {})
+    te = _wh.load_team_market_store(sport_key, snapshot="early_4h").get("games", {})
     tc = _wh.load_team_market_store(sport_key, snapshot="close").get("games", {})
     print("\n=== SLOW-PROP-LAG: game-total move (early->close) vs stale batter props ===")
     if not (pe and pc and te and tc):
@@ -6899,12 +6899,14 @@ def main():
                         "local JSON (the warehouse has no label concept). NOTE the "
                         "local JSON has historically held TEAM markets only, so "
                         "props-odds needs --source warehouse.")
-    p.add_argument("--snapshot", choices=["close", "early"], default="close",
+    p.add_argument("--snapshot",
+                   choices=["close", "closing", "early_12h", "early_4h"],
+                   default="close",
                    help="(odds / props-odds mode, --source warehouse) Which "
-                        "warehoused snapshot to grade: 'close' (default, the "
-                        "nearest-pre-commence closing line = CLV reference) or "
-                        "'early' (the backfill_early opening/pre-close line = the "
-                        "bet-early ROI view that matches DK entry timing).")
+                        "warehoused snapshot to grade: 'close' (default, nearest-"
+                        "pre-commence = CLV reference) or an exact precise-backfill "
+                        "window by source — 'closing', 'early_4h', or 'early_12h' "
+                        "(team only; props have no 12h snapshot).")
     p.add_argument("--xstats-strength", type=float, default=None,
                    help="(props-odds mode) Override the xBA blend weight for xstats "
                         "props (batter_hits) — 0 turns xBA OFF, 0.75 = the shipped "

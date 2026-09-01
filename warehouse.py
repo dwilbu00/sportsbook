@@ -871,6 +871,23 @@ def _assemble_team_entry(event_id, rows):
 SBR_EVENT_PREFIX = "sbr-"   # synthetic id prefix stamped by ingest_sbr_odds.py
 
 
+# Precise-backfill snapshot windows: `source` IS the window label. Selecting one of
+# these filters odds_snapshot.source exactly; 'close' keeps the legacy nearest-commence
+# assembly (works pre- and post-reload); bare 'early' is REJECTED (ambiguous — there
+# are now two early windows) so a caller must name the window it means.
+_ROLE_SNAPSHOTS = ("early_12h", "early_4h", "closing")
+
+
+def _snapshot_source(snapshot):
+    """Map a ``snapshot`` selector → the odds_snapshot.source to filter on (or None
+    for the legacy 'close' nearest-commence path). Raises on bare 'early'."""
+    if snapshot == "early":
+        raise ValueError(
+            "snapshot='early' is ambiguous — there are two early windows now. "
+            "Pass 'early_12h' or 'early_4h' (or 'closing' / 'close').")
+    return snapshot if snapshot in _ROLE_SNAPSHOTS else None
+
+
 def load_team_market_store(sport_key, dates=None, include_sbr=False,
                            snapshot="close"):
     """Assemble a historical_odds-shaped store from the SQL warehouse's captured
@@ -911,10 +928,12 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False,
         return empty
     try:
         # 'close' (default) keeps every snapshot → the assembler picks the
-        # nearest-pre-commence (close), byte-identical to before; 'early' reads only
-        # the backfill_early (opening / pre-close) snapshots — the bet-early view.
-        rows = _db.team_market_lines(sport_key, dates=dates,
-                                     only_early=(snapshot == "early"))
+        # nearest-pre-commence (close), byte-identical to before. A precise-window
+        # selector ('early_12h'|'early_4h'|'closing') filters odds_snapshot.source
+        # exactly; bare 'early' raises (ambiguous). Legacy only_early kept for the
+        # pre-precise 'backfill_early' rows (harmless once purged).
+        _src = _snapshot_source(snapshot)
+        rows = _db.team_market_lines(sport_key, dates=dates, snapshot_source=_src)
     except Exception as e:
         _ops.ops_event("database_failure", op="team_market_lines",
                        sport=sport_key, error=type(e).__name__)
@@ -1054,11 +1073,14 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
         def et_local_date(c):
             return (str(c)[:10] if c else None)
 
-    # 'close' drops early + the assembler picks the nearest-pre-commence snapshot;
-    # 'early' reads only the backfill_early snapshots (assembler picks the one early
-    # snapshot per event). Mutually exclusive db filters.
-    _excl_early = snapshot != "early"
-    _only_early = snapshot == "early"
+    # A precise-window selector ('early_4h'|'closing' for props; 'early_12h' has no
+    # props) filters odds_snapshot.source EXACTLY. Legacy 'close' keeps exclude_early
+    # (drops the old backfill_early rows + the assembler picks nearest-pre-commence) —
+    # byte-identical to before, and still yields the closing window post-reload. Bare
+    # 'early' raises (ambiguous).
+    _src = _snapshot_source(snapshot)
+    _excl_early = _src is None          # legacy 'close' path only
+    _only_early = False
     out = []
 
     def _assemble(rows):
@@ -1074,7 +1096,7 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
         if dates:
             _assemble(_db.player_prop_lines(
                 sport_key, dates=dates, exclude_early=_excl_early,
-                only_early=_only_early, prop_keys=prop_keys))
+                only_early=_only_early, prop_keys=prop_keys, snapshot_source=_src))
         else:
             # Empty years return fast (indexed sport+game_date scan finds nothing).
             import datetime as _dt
@@ -1082,7 +1104,7 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
                 _assemble(_db.player_prop_lines(
                     sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
                     exclude_early=_excl_early, only_early=_only_early,
-                    prop_keys=prop_keys))
+                    prop_keys=prop_keys, snapshot_source=_src))
     except Exception as e:
         _ops.ops_event("database_failure", op="player_prop_lines",
                        sport=sport_key, error=type(e).__name__)

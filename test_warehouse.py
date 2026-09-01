@@ -210,9 +210,10 @@ class PropMarketStoreTests(unittest.TestCase):
 
         def _fake(sport, dates=None, date_from=None, date_to=None,
                   exclude_early=False, only_early=False, prop_keys=None,
-                  max_retries=3):
+                  max_retries=3, snapshot_source=None):
             seen["exclude_early"] = exclude_early
             seen["only_early"] = only_early
+            seen["snapshot_source"] = snapshot_source
             return []
 
         with patch.object(warehouse, "_sql", return_value=True), \
@@ -224,13 +225,21 @@ class PropMarketStoreTests(unittest.TestCase):
 
     def test_close_excludes_early(self):
         seen = self._capture_prop_filters("close")
-        self.assertTrue(seen["exclude_early"])   # default = closing set
+        self.assertTrue(seen["exclude_early"])   # legacy default = closing set
         self.assertFalse(seen["only_early"])
+        self.assertIsNone(seen["snapshot_source"])
 
-    def test_early_reads_only_early(self):
-        seen = self._capture_prop_filters("early")
-        self.assertFalse(seen["exclude_early"])
-        self.assertTrue(seen["only_early"])       # opening/pre-close set
+    def test_bare_early_raises(self):
+        # Ambiguous now that there are two early windows — must name one.
+        with self.assertRaises(ValueError):
+            self._capture_prop_filters("early")
+
+    def test_precise_window_filters_source(self):
+        for snap in ("early_4h", "closing"):
+            seen = self._capture_prop_filters(snap)
+            self.assertFalse(seen["exclude_early"])   # exact source, not legacy flags
+            self.assertFalse(seen["only_early"])
+            self.assertEqual(seen["snapshot_source"], snap)
 
     def test_store_shape_and_implied(self):
         with patch.object(warehouse, "load_prop_lines",
@@ -259,8 +268,8 @@ class PropMarketStoreTests(unittest.TestCase):
             return []
 
         with patch.object(warehouse, "load_prop_lines", _fake):
-            warehouse.load_prop_market_store("baseball_mlb", snapshot="early")
-        self.assertEqual(seen["snapshot"], "early")
+            warehouse.load_prop_market_store("baseball_mlb", snapshot="early_4h")
+        self.assertEqual(seen["snapshot"], "early_4h")
 
     def test_store_empty_on_no_rows(self):
         with patch.object(warehouse, "load_prop_lines", return_value=[]):

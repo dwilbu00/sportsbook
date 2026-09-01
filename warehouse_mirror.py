@@ -274,16 +274,16 @@ def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker):
 
 
 def team_market_lines(sport, dates=None, date_from=None, date_to=None,
-                      only_early=False, bookmaker="draftkings"):
-    if only_early:
+                      only_early=False, bookmaker="draftkings", snapshot_source=None):
+    if only_early or snapshot_source is not None:
         return None                           # not mirrored -> Azure
     return _odds_lines(_team_file, sport, dates, date_from, date_to, bookmaker)
 
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                       exclude_early=False, only_early=False, prop_keys=None,
-                      bookmaker="draftkings"):
-    if only_early or exclude_early:
+                      bookmaker="draftkings", snapshot_source=None):
+    if only_early or exclude_early or snapshot_source is not None:
         return None                           # not mirrored -> Azure
     rows = _odds_lines(_prop_file, sport, dates, date_from, date_to, bookmaker)
     if rows is not None and prop_keys:
