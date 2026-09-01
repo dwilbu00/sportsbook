@@ -108,14 +108,34 @@ def pairs_from_upcoming(games):
 
 
 def load_live(sport):
-    """One Odds-API call for DK full totals + Pinnacle first-5 totals for the slate."""
+    """DK full-game totals (bulk, US region — a featured market) + Pinnacle FIRST-5
+    totals (PER-EVENT, EU region — Pinnacle is an EU book AND period markets aren't on
+    the bulk endpoint). Cost ~= 1 (bulk DK) + 1 per game (per-event Pin F5); per-event
+    calls are cached 1h so same-hour re-runs are free."""
     import odds_client
     from backfill_historical_odds import load_config
     api_key = load_config()["odds_api_key"]
-    games = odds_client.get_upcoming_odds(
-        api_key, sport, regions="us", markets="totals,totals_1st_5_innings",
-        bookmakers=["draftkings", "pinnacle"])
-    return pairs_from_upcoming(games)
+    dk_games = odds_client.get_upcoming_odds(
+        api_key, sport, regions="us", markets="totals", bookmakers=["draftkings"])
+    pairs = []
+    for g in dk_games or []:
+        dk = _total_from_market(_book_market(g, "draftkings", "totals"))
+        if dk is None:
+            continue
+        try:
+            ev = odds_client.get_event_odds(
+                api_key, sport, g.get("id"), regions="eu",
+                markets="totals_1st_5_innings", bookmakers=["pinnacle"])
+        except Exception:
+            ev = None
+        pf = (_total_from_market(_book_market(ev, "pinnacle", "totals_1st_5_innings"))
+              if ev else None)
+        if pf is None:
+            continue
+        pairs.append({"event_id": g.get("id"), "home": g.get("home_team"),
+                      "away": g.get("away_team"), "commence_time": g.get("commence_time"),
+                      "dk": dk, "pin_f5": pf})
+    return pairs
 
 
 def _close_total(rows):
@@ -174,8 +194,9 @@ def main():
     ap = argparse.ArgumentParser(description="Daily UNDER / F5-shape flags (DK vs Pinnacle F5).")
     ap.add_argument("--sport", default="baseball_mlb")
     ap.add_argument("--live", action="store_true",
-                    help="Fetch DK totals + Pinnacle F5 via the Odds API (~2 credits) "
-                         "instead of reading the warehouse.")
+                    help="Fetch DK totals (bulk/US) + Pinnacle F5 (per-event/EU) via the "
+                         "Odds API (~1 + 1-per-game credits; 1h-cached) instead of the "
+                         "warehouse.")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD (default today). Ignored with --live.")
     args = ap.parse_args()
     try:
