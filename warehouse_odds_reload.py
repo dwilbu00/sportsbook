@@ -281,6 +281,79 @@ def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
         print("  [dry-run] nothing written. Re-run with --apply --yes.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# VERIFY — parity-check the reloaded warehouse against the precise parquet
+# ──────────────────────────────────────────────────────────────────────────────
+def verify(eng, seasons, books, sample=2000):
+    """Post-load parity check. (1) Warehouse composition: MLB snapshot/line counts by
+    (kind, source) and book. (2) Price parity: for closing team moneyline + totals,
+    match warehouse odds_line prices to the parquet on (event_id, book, selection,
+    point). Reports match/mismatch/missing so a reload can be trusted before we rely
+    on it. Read-only."""
+    import pandas as pd
+    from sqlalchemy import text
+    from collections import Counter
+    print(f"\n=== VERIFY (read-only) seasons={','.join(seasons)} ===")
+    with eng.connect() as c:
+        print("  Warehouse MLB composition (kind, source):")
+        for kind, src, n in c.execute(text(
+                "SELECT kind, source, COUNT(*) FROM odds_snapshot "
+                "WHERE sport='baseball_mlb' GROUP BY kind, source ORDER BY kind, source")).all():
+            print(f"    {kind:11} {str(src):9} : {n:,}")
+        print("  MLB odds_line by bookmaker (source=closing):")
+        for bk, n in c.execute(text(
+                "SELECT l.bookmaker, COUNT(*) FROM odds_line l "
+                "JOIN odds_snapshot s ON l.snapshot_id=s.id "
+                "WHERE s.sport='baseball_mlb' AND s.source='closing' "
+                "GROUP BY l.bookmaker ORDER BY l.bookmaker")).all():
+            print(f"    {str(bk):12} : {n:,}")
+
+    # Price parity on closing team moneyline + totals.
+    _MK = {"h2h": "moneyline", "totals": "total"}
+    par = {}   # (event_id, book, bet_type, selection, point) -> price
+    for season in seasons:
+        p = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "odds_backfill", "parquet", f"mlb_precise_team_{season}.parquet")
+        if not os.path.exists(p):
+            continue
+        df = pd.read_parquet(p)
+        df = df[(df["role"] == "close") & (df["market"].isin(_MK))]
+        for r in df.itertuples(index=False):
+            pt = None if pd.isna(r.point) else float(r.point)
+            par[(r.event_id, r.book, _MK[r.market], r.outcome, pt)] = int(r.price)
+    if not par:
+        print("  [parity] no closing team parquet found — run --compile first.")
+        return
+    match = mism = miss = 0
+    examples = []
+    with eng.connect() as c:
+        rows = c.execute(text(
+            "SELECT s.event_id, l.bookmaker, l.bet_type, l.selection, l.point, l.price "
+            "FROM odds_line l JOIN odds_snapshot s ON l.snapshot_id=s.id "
+            "WHERE s.sport='baseball_mlb' AND s.source='closing' AND s.kind='team' "
+            "AND l.bet_type IN ('moneyline','total')")).all()
+    for eid, bk, bt, sel, pt, price in rows:
+        key = (eid, bk, bt, sel, None if pt is None else float(pt))
+        if key not in par:
+            miss += 1
+            continue
+        if int(price) == par[key]:
+            match += 1
+        else:
+            mism += 1
+            if len(examples) < 8:
+                examples.append(f"{eid[:8]} {bk} {bt} {sel} pt={pt}: "
+                                f"wh={price} vs parquet={par[key]}")
+    tot = match + mism + miss
+    print(f"\n  PRICE PARITY (closing team moneyline+total): {match:,} match, "
+          f"{mism:,} mismatch, {miss:,} warehouse-rows-not-in-parquet "
+          f"(of {tot:,} warehouse rows)")
+    for e in examples:
+        print(f"    MISMATCH {e}")
+    print(f"  === VERIFY {'OK' if mism == 0 else f'MISMATCHES ({mism})'} ===")
+
+
 def main():
     p = argparse.ArgumentParser(description="Phase 3: back up / purge / reload the "
                                             "Azure odds warehouse from precise parquet.")
@@ -295,6 +368,9 @@ def main():
     p.add_argument("--load", action="store_true",
                    help="Reload MLB from the precise cache (per-book, source=role). "
                         "Dry-run unless --apply --yes. Spends nothing (cached reads).")
+    p.add_argument("--verify", action="store_true",
+                   help="Read-only parity check: warehouse composition + closing "
+                        "team price parity vs the parquet. Run after --load --apply.")
     p.add_argument("--apply", action="store_true",
                    help="Actually write/destroy (with --purge/--load). Needs --yes.")
     p.add_argument("--yes", action="store_true", help="Double-confirm with --apply.")
@@ -332,6 +408,9 @@ def main():
         return
     if args.load:
         load(eng, seasons, args.tier, books, apply=apply, limit=args.limit)
+        return
+    if args.verify:
+        verify(eng, seasons, books)
         return
     p.print_help()
 
