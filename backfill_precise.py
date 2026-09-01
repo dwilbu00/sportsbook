@@ -348,6 +348,115 @@ def _group_specs(tier, books):
     return specs
 
 
+def verify_cache(games, id_by_pk, tier, books):
+    """FREE read-only audit of what actually landed in the cache (0 credits): for
+    every planned (game, offset, group) that is cached, read the payload and tally
+    per (group, role) — cached, empty(404), and per-book presence + snapshot lead
+    to first pitch. Confirms Pinnacle (eu) really returns in the combined us,eu call
+    and that book/role coverage is healthy BEFORE committing the full spend."""
+    from collections import defaultdict
+    specs = _group_specs(tier, books)
+    stats = defaultdict(lambda: {"cached": 0, "empty": 0, "data": 0,
+                                 "books": defaultdict(int), "lead_h": []})
+    # Per-game cache outcome: to distinguish a few all-empty games (systematic
+    # mapping gap) from scattered per-offset misses.
+    per_game = {}   # game_pk -> {"g": g, "cached": n, "data": n, "empty": n}
+    for g in games:
+        eid = id_by_pk.get(g["game_pk"])
+        if not eid:
+            continue
+        gc = _parse_ts(g["commence"])
+        pg = per_game.setdefault(g["game_pk"],
+                                 {"g": g, "cached": 0, "data": 0, "empty": 0})
+        for group, markets, offsets, regions in specs:
+            if group == "props" and g["official_date"] < PROPS_MIN_DATE:
+                continue
+            markets_csv = ",".join(markets)
+            for hours_before, role in offsets:
+                ts = _offset_ts(g["commence"], hours_before)
+                if not is_historical_event_cached(SPORT_KEY, eid, ts, regions=regions,
+                                                  markets=markets_csv, bookmakers=books):
+                    continue
+                s = stats[(group, role)]
+                s["cached"] += 1
+                pg["cached"] += 1
+                # Cached → this read costs 0 credits.
+                data, snap = get_historical_event_odds(
+                    api_key=None, sport=SPORT_KEY, event_id=eid, date=ts,
+                    regions=regions, markets=markets_csv, bookmakers=books)
+                if not data:
+                    s["empty"] += 1
+                    pg["empty"] += 1
+                    continue
+                s["data"] += 1
+                pg["data"] += 1
+                for b in data.get("bookmakers", []):
+                    if b.get("key") in books:
+                        s["books"][b.get("key")] += 1
+                sc = _parse_ts(snap)
+                if gc and sc:
+                    s["lead_h"].append((gc - sc).total_seconds() / 3600.0)
+
+    # Intended lead (hours before commence) per role, to compare against what the
+    # API actually returned (it serves the closest snapshot AT OR BEFORE the request,
+    # so observed lead >= target; a big gap means no snapshot existed near the offset).
+    target_lead = {"early_12h": 12.0, "early_4h": 4.0, "close": 10.0 / 60.0}
+
+    def _pct(xs, q):
+        if not xs:
+            return float("nan")
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+    print(f"\n=== CACHE VERIFY (free, read-only) — books={','.join(books)} ===")
+    if not stats:
+        print("  No cached snapshots found for this plan yet. Run a fetch first.")
+        return
+    print("  BOOK COVERAGE (count / % of non-empty snapshots holding ≥1 line):")
+    for (group, role) in sorted(stats):
+        s = stats[(group, role)]
+        n = s["data"] or 1
+        bk = "  ".join(f"{b}={s['books'].get(b, 0)}({100 * s['books'].get(b, 0) // n}%)"
+                       for b in books)
+        print(f"  [{group:5} {role:9}] cached={s['cached']:5} data={s['data']:5} "
+              f"empty={s['empty']:4}  {bk}")
+    print("\n  SNAPSHOT LEAD vs COMMENCE (observed hours-before-first-pitch; the API "
+          "serves the closest snapshot at/before the request, so observed >= target):")
+    for (group, role) in sorted(stats):
+        s = stats[(group, role)]
+        lead = s["lead_h"]
+        tgt = target_lead.get(role, float("nan"))
+        med = _pct(lead, 0.5)
+        p10, p90 = _pct(lead, 0.10), _pct(lead, 0.90)
+        # How many landed within a role-appropriate tolerance of the target.
+        tol = 2.0 if role != "close" else 1.0
+        on = sum(1 for x in lead if abs(x - tgt) <= tol)
+        onpct = (100 * on // len(lead)) if lead else 0
+        print(f"  [{group:5} {role:9}] target={tgt:5.2f}h  median={med:6.2f}h  "
+              f"p10={p10:6.2f}  p90={p90:6.2f}  within±{tol:g}h={onpct:3d}%  "
+              f"(n={len(lead)})")
+    # All-empty games: cached ≥1 call but data on none — a systematic per-game gap
+    # (bad/stale event_id, wrong commence) vs scattered per-offset misses.
+    touched = [pg for pg in per_game.values() if pg["cached"] > 0]
+    all_empty = [pg for pg in touched if pg["data"] == 0]
+    partial = [pg for pg in touched if 0 < pg["empty"] and pg["data"] > 0]
+    print(f"\n  PER-GAME: {len(touched)} games with cached calls — "
+          f"{len(all_empty)} ALL-EMPTY (no data at any offset), "
+          f"{len(partial)} partial, "
+          f"{len(touched) - len(all_empty) - len(partial)} full.")
+    for pg in all_empty[:15]:
+        g = pg["g"]
+        print(f"    ALL-EMPTY  {g['official_date']}  {g['away']} @ {g['home']}  "
+              f"(pk={g['game_pk']}, commence={g['commence']}, "
+              f"eid={id_by_pk.get(g['game_pk'])})")
+    if len(all_empty) > 15:
+        print(f"    … +{len(all_empty) - 15} more all-empty")
+    print("\n  READS: Pinnacle>0 confirms the eu book lands in the us,eu call. "
+          "close median≈0h and early_* medians near target confirm game-relative "
+          "capture works. A cluster of ALL-EMPTY games = a systematic mapping gap "
+          "to fix BEFORE the full spend; scattered partials = normal book gaps.")
+
+
 _UNMAPPED_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "odds_backfill", "unmapped_games.csv")
 
@@ -609,6 +718,14 @@ def main():
                    help="Hard cap on credits this run may spend (default 5000).")
     p.add_argument("--limit-games", type=int, default=0,
                    help="Cap enumerated games (0 = all); for testing/probe scoping.")
+    p.add_argument("--skip-recent-days", type=int, default=0,
+                   help="Skip games whose commence is within the last N days. The "
+                        "Odds API historical archive LAGS for the newest games, and "
+                        "get_historical_event_odds caches 404s PERMANENTLY — so "
+                        "fetching a not-yet-archived game would poison it forever. "
+                        "Recent games are already captured live in the warehouse; "
+                        "mop them up in a later run once archived. Recommend ~7 for "
+                        "the current season.")
     p.add_argument("--workers", type=int, default=12,
                    help="Concurrent API workers for the fetch loop (default 12). "
                         "Network-bound calls parallelize well; the --max-credits "
@@ -618,6 +735,9 @@ def main():
     p.add_argument("--probe", action="store_true",
                    help="Fire a few tiny real calls to read the true per-call cost "
                         "and billing model before the full spend.")
+    p.add_argument("--verify", action="store_true",
+                   help="FREE read-only audit of what already landed in the cache "
+                        "(per group/role book + lead-time coverage). Spends nothing.")
     args = p.parse_args()
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
@@ -638,16 +758,28 @@ def main():
         print("No enumerated games (warehouse unavailable or empty). "
               "Ensure SQL secrets are set and mlb_game is populated.")
         return
+    if args.skip_recent_days > 0:
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
+        before = len(games)
+        games = [g for g in games
+                 if (_parse_ts(g["commence"]) or cutoff) < cutoff]
+        print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
+              f"last {args.skip_recent_days}d (archive lag; already live in warehouse).")
     if args.limit_games:
         games = games[:args.limit_games]
     print(f"Enumerated {len(games)} regular-season final games "
           f"({', '.join(seasons)}), newest-first.")
 
-    # Resolve event_ids. Dry-run resolves only via free sources (warehouse + cache);
-    # probe/real runs may make the 1-credit/date harvest calls.
+    # Resolve event_ids. Dry-run/verify resolve only via free sources (warehouse +
+    # cache); probe/real runs may make the 1-credit/date harvest calls.
     id_by_pk, harvest_credits = resolve_event_ids(
-        api_key, games, allow_api=(not args.dry_run),
+        api_key, games, allow_api=(not (args.dry_run or args.verify)),
         max_credits=args.max_credits)
+
+    if args.verify:
+        verify_cache(games, id_by_pk, args.tier, books)
+        return
 
     if args.probe:
         run_probe(api_key, games, id_by_pk, books)
