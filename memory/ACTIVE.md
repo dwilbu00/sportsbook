@@ -28,7 +28,11 @@ Odds API topped off to **5M credits on 2026-09-01** (monthly reset is independen
 - **Books (store ONLY these 4):** DraftKings, FanDuel, bet365 (3 bet books), Pinnacle (sole reference). Drop all others. Regions ~us+eu (bet365 US=us; Pinnacle=eu).
 - **Seasons:** 2024, 2025, 2026 (R). ~7,000 games. Nominal est ~3.5M credits (region-vs-`bookmakers`-param cost Q could ~2× it — DRY-RUN + one probe call to read real credits/call decides).
 - **Safety:** newest-first, `--max-credits` cap, `--dry-run` prices before spend, resumable via cache, store tagged role(early/mid/close)+exact-ts+source="backfill_precise", never overwrite. **NOTHING fires without Doug's explicit "go, ~N credits".**
-- BUILD: new focused `backfill_precise.py` (reuse odds_client historical primitives + warehouse.capture_event_odds), NOT a refactor of the multi-mode backfill_historical_odds.py. IN PROGRESS.
+- **Split by MARKET GROUP × region-need** (not arbitrary us/eu): team+F5 → us+eu (Pinnacle); props → us only (Pinnacle has no MLB props — never pay eu for props). Probe also tests `bookmakers=` vs `regions=` billing (could ~halve team cost).
+- **3-phase raw-first pipeline** (protects the one-time spend): Phase1 FETCH (credits; odds_client permanently caches raw to `cache/hist_event_odds/`), Phase2 COMPILE cached raw → parquet (FREE, re-runnable), Phase3 LOAD parquet → Azure (FREE). Only Phase1 races Sep-21; a later parse/schema bug re-runs Phase2/3 for $0. Parquets → dedicated `deploy/odds_backfill/parquet/` (separate from cache).
+- **Effort:** build at HIGH (mechanical, spend-critical); assurance goes on `--dry-run`+probe AND a pre-fire multi-agent REVIEW of the tool (the ultracode-worthy step), NOT on ultracode-ing the build.
+- **Cache hygiene DONE (commit 0bd299e):** odds_client cache now foldered by purpose (`cache/<type>/`), legacy files self-migrate — so the ~42k backfill JSONs land in `cache/hist_event_odds/` cleanly.
+- BUILD: new focused `backfill_precise.py` (reuse odds_client historical primitives + warehouse.capture_event_odds), NOT a refactor of the multi-mode backfill_historical_odds.py. NEXT.
 
 ## Review findings (session audit 2026-09-01, workflow weezv0bnw — 4 confirmed)
 - **[FIXED, deeaaeb] under_dkpin kind contamination** — was missing `kind=='team'` filter → Pinnacle F5 leaked → the impossible +3.5 gap. Fixed; f5_decomp already superseded it.
