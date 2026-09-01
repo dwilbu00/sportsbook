@@ -176,13 +176,14 @@ def _kinds_for_group(group):
     return ["team", "first_five"] if group == "team" else ["props"]
 
 
-def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
-    """Reload MLB odds from the precise cache. Drives off backfill_precise's PLAN
-    (role explicit per offset), reads each cached payload (0 credits), emits PER-BOOK
-    lines via ingest_multibook_cache._per_book_lines (byte-identical to live capture;
-    F5 via the key-shim), and writes one snapshot per (event, kind, role) with
-    source=ROLE_TO_SOURCE[role] through db_store.capture_odds_snapshot (write-once).
-    Dry-run by default (counts only). Cached-only reads → spends nothing."""
+def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
+         apply=False, limit=0, progress_every=500):
+    """Reload one sport's odds from the precise cache. Drives off backfill_precise's
+    PLAN (role explicit per offset), reads each cached payload (0 credits), emits
+    PER-BOOK lines via ingest_multibook_cache._per_book_lines (byte-identical to live
+    capture; F5 via the key-shim for MLB), and writes one snapshot per (event, kind,
+    role) with source=ROLE_TO_SOURCE[role] through db_store.capture_odds_snapshot
+    (write-once). Dry-run by default (counts only). Cached-only reads → spends nothing."""
     import backfill_precise as bp
     import ingest_multibook_cache as im
     import warehouse as wh
@@ -190,8 +191,9 @@ def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
     from collections import Counter
     db_store.promote_secrets_from_toml()
 
-    games = bp.enumerate_games(seasons)
-    id_by_pk, _ = bp.resolve_event_ids(None, games, allow_api=False)
+    games, id_by_pk, _ = bp.enumerate_for_sport(
+        sport, None, seasons=seasons, date_from=date_from, date_to=date_to,
+        allow_api=False, verbose=True)
     specs = bp._group_specs(tier, books)
     gpk_cache, id_cache = {}, {}
     snaps = Counter()          # (kind, source) -> snapshots
@@ -201,7 +203,7 @@ def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
     n = 0
 
     mode = "APPLY (writing)" if apply else "DRY-RUN (no writes)"
-    print(f"\n=== LOAD precise → warehouse [{mode}] seasons={','.join(seasons)} ===")
+    print(f"\n=== LOAD precise → warehouse [{mode}] sport={bp.SPORT_KEY} ===")
     for g in games:
         eid = id_by_pk.get(g["game_pk"])
         if not eid:
@@ -284,46 +286,46 @@ def load(eng, seasons, tier, books, apply=False, limit=0, progress_every=500):
 # ──────────────────────────────────────────────────────────────────────────────
 # VERIFY — parity-check the reloaded warehouse against the precise parquet
 # ──────────────────────────────────────────────────────────────────────────────
-def verify(eng, seasons, books, sample=2000):
-    """Post-load parity check. (1) Warehouse composition: MLB snapshot/line counts by
-    (kind, source) and book. (2) Price parity: for closing team moneyline + totals,
-    match warehouse odds_line prices to the parquet on (event_id, book, selection,
-    point). Reports match/mismatch/missing so a reload can be trusted before we rely
-    on it. Read-only."""
+def verify(eng, sport, books, sample=2000):
+    """Post-load parity check for one sport. (1) Warehouse composition: snapshot counts
+    by (kind, source) + book. (2) Price parity: closing team moneyline + totals matched
+    to the parquet on (event_id, book, selection, point). Reports match/mismatch/missing
+    so a reload can be trusted before we rely on it. Read-only."""
     import pandas as pd
+    import glob
     from sqlalchemy import text
-    from collections import Counter
-    print(f"\n=== VERIFY (read-only) seasons={','.join(seasons)} ===")
+    import backfill_precise as bp
+    bp.configure_sport(sport)
+    sport_key, tag = bp.SPORT_KEY, bp.SPORT_TAG
+    print(f"\n=== VERIFY (read-only) sport={sport_key} ===")
     with eng.connect() as c:
-        print("  Warehouse MLB composition (kind, source):")
+        print("  Warehouse composition (kind, source):")
         for kind, src, n in c.execute(text(
                 "SELECT kind, source, COUNT(*) FROM odds_snapshot "
-                "WHERE sport='baseball_mlb' GROUP BY kind, source ORDER BY kind, source")).all():
+                "WHERE sport=:sp GROUP BY kind, source ORDER BY kind, source"),
+                {"sp": sport_key}).all():
             print(f"    {kind:11} {str(src):9} : {n:,}")
-        print("  MLB odds_line by bookmaker (source=closing):")
+        print("  odds_line by bookmaker (source=closing):")
         for bk, n in c.execute(text(
                 "SELECT l.bookmaker, COUNT(*) FROM odds_line l "
                 "JOIN odds_snapshot s ON l.snapshot_id=s.id "
-                "WHERE s.sport='baseball_mlb' AND s.source='closing' "
-                "GROUP BY l.bookmaker ORDER BY l.bookmaker")).all():
+                "WHERE s.sport=:sp AND s.source='closing' "
+                "GROUP BY l.bookmaker ORDER BY l.bookmaker"), {"sp": sport_key}).all():
             print(f"    {str(bk):12} : {n:,}")
 
-    # Price parity on closing team moneyline + totals.
+    # Price parity on closing team moneyline + totals (glob this sport's team parquet).
     _MK = {"h2h": "moneyline", "totals": "total"}
     par = {}   # (event_id, book, bet_type, selection, point) -> price
-    for season in seasons:
-        p = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "odds_backfill", "parquet", f"mlb_precise_team_{season}.parquet")
-        if not os.path.exists(p):
-            continue
+    pdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "odds_backfill", "parquet")
+    for p in glob.glob(os.path.join(pdir, f"{tag}_precise_team_*.parquet")):
         df = pd.read_parquet(p)
         df = df[(df["role"] == "close") & (df["market"].isin(_MK))]
         for r in df.itertuples(index=False):
             pt = None if pd.isna(r.point) else float(r.point)
             par[(r.event_id, r.book, _MK[r.market], r.outcome, pt)] = int(r.price)
     if not par:
-        print("  [parity] no closing team parquet found — run --compile first.")
+        print(f"  [parity] no {tag} closing team parquet — run --compile first.")
         return
     match = mism = miss = 0
     examples = []
@@ -331,8 +333,8 @@ def verify(eng, seasons, books, sample=2000):
         rows = c.execute(text(
             "SELECT s.event_id, l.bookmaker, l.bet_type, l.selection, l.point, l.price "
             "FROM odds_line l JOIN odds_snapshot s ON l.snapshot_id=s.id "
-            "WHERE s.sport='baseball_mlb' AND s.source='closing' AND s.kind='team' "
-            "AND l.bet_type IN ('moneyline','total')")).all()
+            "WHERE s.sport=:sp AND s.source='closing' AND s.kind='team' "
+            "AND l.bet_type IN ('moneyline','total')"), {"sp": sport_key}).all()
     for eid, bk, bt, sel, pt, price in rows:
         key = (eid, bk, bt, sel, None if pt is None else float(pt))
         if key not in par:
@@ -376,8 +378,15 @@ def main():
     p.add_argument("--yes", action="store_true", help="Double-confirm with --apply.")
     p.add_argument("--force", action="store_true",
                    help="Allow --purge without a backup present (not recommended).")
+    p.add_argument("--sport", choices=["mlb", "nba", "nfl"], default="mlb",
+                   help="Sport to --load/--verify (default mlb). --backup/--purge are "
+                        "all-sports.")
     p.add_argument("--seasons", default="2024,2025,2026",
-                   help="Seasons to reload (default 2024,2025,2026).")
+                   help="MLB reload seasons (default 2024,2025,2026).")
+    p.add_argument("--date-from", default=None,
+                   help="NBA/NFL reload: enumerate from this date (default props floor).")
+    p.add_argument("--date-to", default=None,
+                   help="NBA/NFL reload: enumerate through this date (default today).")
     p.add_argument("--tier", choices=["team", "props", "all"], default="all")
     p.add_argument("--books", default="draftkings,fanduel,pinnacle")
     p.add_argument("--limit", type=int, default=0,
@@ -407,10 +416,12 @@ def main():
         purge(eng, apply=apply, force=args.force)
         return
     if args.load:
-        load(eng, seasons, args.tier, books, apply=apply, limit=args.limit)
+        load(eng, args.sport, seasons, args.tier, books,
+             date_from=args.date_from, date_to=args.date_to,
+             apply=apply, limit=args.limit)
         return
     if args.verify:
-        verify(eng, seasons, books)
+        verify(eng, args.sport, books)
         return
     p.print_help()
 

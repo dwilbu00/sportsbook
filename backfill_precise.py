@@ -63,6 +63,7 @@ from odds_client import (
 from backfill_historical_odds import load_config, _names_match
 
 SPORT_KEY = "baseball_mlb"
+SPORT_TAG = "mlb"   # short parquet/file tag; reassigned by configure_sport()
 
 # Books we keep: the bet books + Pinnacle (reference-only). bet365 was dropped
 # 2026-09-01 — the historical per-event endpoint carries no bet365 MLB depth (probe
@@ -244,6 +245,55 @@ def enumerate_via_events(api_key, sport_key, date_from, date_to, allow_api,
                         "away": ev.get("away_team"), "season": int(ct[:4])}
     games = sorted(seen.values(), key=lambda g: g["commence"], reverse=True)
     return games, enum_credits
+
+
+def configure_sport(sport):
+    """Point the module-global market sets + keys at `sport` so the whole pipeline
+    (enumerate/fetch/compile/load/verify/validate) targets it. Returns the config."""
+    global SPORT_KEY, TEAM_MARKETS, PROP_MARKETS, SPORT_TAG
+    sc = SPORT_CONFIGS[sport]
+    SPORT_KEY, TEAM_MARKETS, PROP_MARKETS, SPORT_TAG = (
+        sc["key"], sc["team"], sc["props"], sport)
+    return sc
+
+
+def enumerate_for_sport(sport, api_key, seasons=None, date_from=None, date_to=None,
+                        allow_api=True, workers=12, max_credits=None,
+                        skip_recent_days=0, limit_games=0, verbose=True):
+    """Configure `sport` and return (games, id_by_pk, harvest_credits). MLB uses the
+    warehouse (mlb_game); NBA/NFL use the events-listing enumerator. Shared by the CLI
+    and by the Phase-3 reload so enumeration is identical everywhere."""
+    from datetime import datetime, timezone, timedelta, date
+    sc = configure_sport(sport)
+    harvest_credits = 0
+    if sc["warehouse"]:
+        games = enumerate_games(seasons)
+        id_by_pk, harvest_credits = ({}, 0)
+    else:
+        d_to = date_to or date.today().isoformat()
+        games, harvest_credits = enumerate_via_events(
+            api_key, SPORT_KEY, date_from or PROPS_MIN_DATE, d_to,
+            allow_api=allow_api, months=sc.get("months"), workers=workers,
+            max_credits=max_credits)
+    if skip_recent_days > 0 and games:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=skip_recent_days)
+        before = len(games)
+        games = [g for g in games if (_parse_ts(g["commence"]) or cutoff) < cutoff]
+        if verbose:
+            print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
+                  f"last {skip_recent_days}d.")
+    if limit_games:
+        games = games[:limit_games]
+    if sc["warehouse"]:
+        id_by_pk, harvest_credits = resolve_event_ids(
+            api_key, games, allow_api=allow_api, max_credits=max_credits,
+            workers=workers)
+    else:
+        id_by_pk = {g["game_pk"]: g["event_id"] for g in games}
+    if verbose:
+        print(f"Enumerated {len(games)} {SPORT_KEY} games, newest-first."
+              + (f" (enum ~{harvest_credits} cr)" if not sc["warehouse"] else ""))
+    return games, id_by_pk, harvest_credits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -607,17 +657,22 @@ def validate_parquet(seasons, tier, books):
     present/absent per market family, two-sided market balance, no duplicate lines,
     book/role whitelist, season/group integrity, sane lead times."""
     import pandas as pd
+    import glob
     specs = _group_specs(tier, books)
-    groups = [g for g, *_ in specs]
+    groups = set(g for g, *_ in specs)
     book_set, role_set = set(books), {"early_12h", "early_4h", "close"}
+    # Glob this sport's parquet (season is derived from the filename, not --seasons),
+    # so NBA/NFL (commence-year seasons) validate without an explicit season list.
     files = []
-    for season in seasons:
-        for group in groups:
-            p = os.path.join(PARQUET_DIR, f"mlb_precise_{group}_{season}.parquet")
-            if os.path.exists(p):
-                files.append((season, group, p))
+    for path in sorted(glob.glob(os.path.join(PARQUET_DIR,
+                                              f"{SPORT_TAG}_precise_*.parquet"))):
+        base = os.path.basename(path)[:-len(".parquet")]
+        parts = base.split("_")          # {tag}_precise_{group}_{season}
+        group, season = parts[-2], parts[-1]
+        if group in groups:
+            files.append((season, group, path))
     if not files:
-        print("  No parquet files found — run --compile first.")
+        print(f"  No {SPORT_TAG} parquet files found — run --compile first.")
         return
     fails = 0
 
@@ -749,16 +804,19 @@ def _flatten(data, meta):
     return rows
 
 
-def compile_parquet(games, id_by_pk, tier, books, seasons):
+def compile_parquet(games, id_by_pk, tier, books, seasons=None):
     """Read every cached (game, offset, group) payload (0 credits) and write one
-    parquet per (season, group) to PARQUET_DIR. Re-runnable: skips calls not yet
-    cached (records them as pending) so it can be run repeatedly as Phase 1 fills in.
-    Never spends — cached-only reads via get_historical_event_odds(api_key=None)."""
+    parquet per (season, group) to PARQUET_DIR, named `{SPORT_TAG}_precise_...`.
+    Seasons are derived from the enumerated games (so NBA/NFL commence-year seasons
+    work without an explicit list). Re-runnable: skips calls not yet cached (records
+    them pending). Never spends — cached-only reads via
+    get_historical_event_odds(api_key=None)."""
     import pandas as pd
     specs = _group_specs(tier, books)
     os.makedirs(PARQUET_DIR, exist_ok=True)
     grand = {"rows": 0, "read": 0, "empty": 0, "pending": 0}
-    for season in seasons:
+    all_seasons = sorted({str(g["season"]) for g in games})
+    for season in all_seasons:
         s_games = [g for g in games if str(g["season"]) == str(season)]
         for group, markets, offsets, regions in specs:
             markets_csv = ",".join(markets)
@@ -800,7 +858,7 @@ def compile_parquet(games, id_by_pk, tier, books, seasons):
                     rows.extend(_flatten(data, meta))
             if rows:
                 out = os.path.join(PARQUET_DIR,
-                                   f"mlb_precise_{group}_{season}.parquet")
+                                   f"{SPORT_TAG}_precise_{group}_{season}.parquet")
                 pd.DataFrame(rows).to_parquet(out, index=False)
                 print(f"  [{season} {group:5}] {len(rows):>8} rows "
                       f"({read} snapshots read, {empty} empty, {pending} pending) "
@@ -1119,12 +1177,7 @@ def main():
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     books = [b.strip() for b in args.books.split(",") if b.strip()]
-
-    # Reassign the sport-scoped globals so the whole pipeline (fetch/compile/load/
-    # verify) targets the chosen sport's key + market sets.
-    global SPORT_KEY, TEAM_MARKETS, PROP_MARKETS
-    _sc = SPORT_CONFIGS[args.sport]
-    SPORT_KEY, TEAM_MARKETS, PROP_MARKETS = _sc["key"], _sc["team"], _sc["props"]
+    configure_sport(args.sport)   # point the pipeline globals at this sport
 
     # --validate reads only the parquet (no warehouse/enumeration/API) → dispatch early.
     if args.validate:
@@ -1143,56 +1196,22 @@ def main():
     except Exception:
         pass
 
-    harvest_credits = 0
-    if _sc["warehouse"]:                       # MLB: warehouse enumeration + resolve
-        games = enumerate_games(seasons)
-        if not games:
-            print("No enumerated games (warehouse unavailable or empty). "
-                  "Ensure SQL secrets are set and mlb_game is populated.")
-            return
-        if args.skip_recent_days > 0:
-            from datetime import datetime, timezone, timedelta
-            cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
-            before = len(games)
-            games = [g for g in games
-                     if (_parse_ts(g["commence"]) or cutoff) < cutoff]
-            print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
-                  f"last {args.skip_recent_days}d (archive lag; already live).")
-        if args.limit_games:
-            games = games[:args.limit_games]
-        print(f"Enumerated {len(games)} {SPORT_KEY} regular-season final games "
-              f"({', '.join(seasons)}), newest-first.")
-        id_by_pk, harvest_credits = resolve_event_ids(
-            api_key, games, allow_api=(not _free),
-            max_credits=args.max_credits, workers=args.workers)
-    else:                                       # NBA/NFL: events-listing enumeration
-        from datetime import date
-        date_to = args.date_to or date.today().isoformat()
-        games, harvest_credits = enumerate_via_events(
-            api_key, SPORT_KEY, args.date_from, date_to, allow_api=(not _free),
-            months=_sc.get("months"), workers=args.workers,
-            max_credits=args.max_credits)
-        if args.skip_recent_days > 0:
-            from datetime import datetime, timezone, timedelta
-            cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
-            before = len(games)
-            games = [g for g in games
-                     if (_parse_ts(g["commence"]) or cutoff) < cutoff]
-            print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
-                  f"last {args.skip_recent_days}d (archive lag).")
-        if args.limit_games:
-            games = games[:args.limit_games]
-        id_by_pk = {g["game_pk"]: g["event_id"] for g in games}
-        print(f"Enumerated {len(games)} {SPORT_KEY} games "
-              f"({args.date_from}..{date_to}), newest-first. "
-              f"(enum ~{harvest_credits} cr)")
+    games, id_by_pk, harvest_credits = enumerate_for_sport(
+        args.sport, api_key, seasons=seasons, date_from=args.date_from,
+        date_to=args.date_to, allow_api=(not _free), workers=args.workers,
+        max_credits=args.max_credits, skip_recent_days=args.skip_recent_days,
+        limit_games=args.limit_games)
+    if not games:
+        print("No enumerated games (warehouse unavailable/empty, or no events in "
+              "the date range). For MLB ensure SQL secrets + mlb_game are populated.")
+        return
 
     if args.verify:
         verify_cache(games, id_by_pk, args.tier, books)
         return
 
     if args.compile:
-        compile_parquet(games, id_by_pk, args.tier, books, seasons)
+        compile_parquet(games, id_by_pk, args.tier, books)
         return
 
     if args.probe:
