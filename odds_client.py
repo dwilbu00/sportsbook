@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import time
 from datetime import datetime
@@ -37,10 +38,28 @@ def _ensure_cache_dir():
 
 
 def _cache_key(*parts):
-    """Generate a cache filename from variable key parts."""
-    raw = "_".join(str(p) for p in parts if p)
-    safe = hashlib.md5(raw.encode()).hexdigest()
-    return os.path.join(CACHE_DIR, f"{safe}.json")
+    """Cache path for these key parts, HYGIENICALLY foldered by PURPOSE: the first
+    part is the cache TYPE (e.g. 'hist_event_odds', 'all_odds') and becomes a
+    dedicated sub-folder, so cache/ isn't a flat pile of opaque hashes. The remaining
+    parts hash to the filename (unique per query). Legacy flat files (cache/<md5 of ALL
+    parts>.json) are LAZILY migrated into the sub-folder on first access — zero re-fetch,
+    so a permanently-cached historical response is never orphaned by this change."""
+    parts = [str(p) for p in parts if p]
+    if not parts:
+        return os.path.join(CACHE_DIR, "misc", "index.json")
+    category = re.sub(r"[^a-z0-9_-]+", "-", parts[0].lower()) or "misc"
+    rest = "_".join(parts[1:])
+    name = hashlib.md5(rest.encode()).hexdigest() if rest else "index"
+    new_path = os.path.join(CACHE_DIR, category, f"{name}.json")
+    legacy_path = os.path.join(
+        CACHE_DIR, f"{hashlib.md5('_'.join(parts).encode()).hexdigest()}.json")
+    if not os.path.exists(new_path) and os.path.exists(legacy_path):
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        try:
+            os.replace(legacy_path, new_path)      # self-heal old flat cache -> subfolder
+        except OSError:
+            pass
+    return new_path
 
 
 def _read_cache(cache_path):
@@ -113,8 +132,8 @@ def _is_quota_error(resp):
 
 
 def _write_cache(cache_path, data):
-    """Write data to cache with a timestamp."""
-    _ensure_cache_dir()
+    """Write data to cache with a timestamp (creating the per-purpose sub-folder)."""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     with open(cache_path, "w") as f:
         json.dump({"cached_at": time.time(), "data": data}, f)
 
