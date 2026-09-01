@@ -1306,9 +1306,31 @@ def scenario_f5_decomp(sport, seasons, lead_lo=12.0, lead_hi=24.0):
                 if p is None:
                     continue
                 rows.append({"season": str(s), "bet": bet, "result": res, "profit": p,
-                             "gap": gap, "gap_bucket": b})
+                             "gap": gap, "gap_bucket": b,
+                             "line_bucket": _total_line_bucket(dsd["total_line"])})
             cov["graded"] += 1
     return rows, cov, integ
+
+
+def _gap_x_line_under(rows, min_n=30):
+    """Tautology check: UNDER ROI by gap WITHIN each fixed total-line bucket. If ROI
+    rises with the gap down a line COLUMN, the gap is real shape info (not line-height)."""
+    gaps = ["a <3.5 (few late)", "b 3.5-4.0", "c 4.0-4.5", "d 4.5-5.0",
+            "e >=5.0 (many late)"]
+    lines = ["a <=7.5", "b 8-8.5", "c 9-9.5", "d >=10"]
+    under = [r for r in rows if r["bet"] == "under"]
+    print("  TAUTOLOGY CHECK — UNDER ROI by gap WITHIN each line bucket (n>=%d):" % min_n)
+    for g in gaps:
+        parts = []
+        for ln in lines:
+            sm = r2_grade.summarize([r for r in under
+                                     if r["gap_bucket"] == g and r["line_bucket"] == ln])
+            if sm.n >= min_n:
+                parts.append(f"{ln[2:]}={sm.roi:+.1%}(n={sm.n})")
+        if parts:
+            print(f"    gap {g[2:]:<16} | " + "  ".join(parts))
+    print("  Read DOWN a line column: ROI rising with gap => real shape edge; flat => the")
+    print("  gap was just proxying the line.\n")
 
 
 def _report_f5_decomp(rows, cov, integ):
@@ -1332,6 +1354,8 @@ def _report_f5_decomp(rows, cov, integ):
         print(f"\n  ── {bet.upper()} @ DK full total  (pooled n={pooled.n:,} "
               f"ROI={pooled.roi:+.2%} t={pooled.t_stat:+.2f}) " + "─" * 12)
         _repl_slice(br, lambda r: r["gap_bucket"], "implied late-innings gap", 50)
+    print()
+    _gap_x_line_under(rows)
     print("  READ (Doug's hypothesis): if DK misprices game SHAPE, OVER ROI should be")
     print("  highest in the LOW-gap buckets (DK implied few late runs → full total too")
     print("  low) and UNDER highest in the HIGH-gap buckets. Flat across gaps => DK's")
