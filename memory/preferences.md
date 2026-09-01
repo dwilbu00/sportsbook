@@ -35,9 +35,10 @@ repo `deploy/notes/`; project files should NOT accumulate in C:/tmp.
 - **Never commit `.streamlit/secrets.toml`** (gitignored live Azure + Odds API creds).
 - **Push = deploy** (Streamlit Cloud) → it's the durable sync point. When Doug says he pushed, update the relevant topic memory to the now-pushed/deployed state (record shipped SHAs + what's live vs still pending).
 
-## Betting books — DK AND FanDuel (both executable)
-- Doug bets at **DraftKings AND FanDuel** (FD added 2026-08-27). A bet best-priced at FD is actionable; **line-shopping DK vs FD is a legit profit lever** (take the edge at whichever prices it better).
-- All other books (Pinnacle/BetMGM/etc.) are **analysis-only** — never recommend, never display their price/payout, never drive staking. Pinnacle = the R2 sharp reference, never bet.
+## Betting books — DK, FanDuel AND bet365 (all executable)
+- Doug bets at **DraftKings, FanDuel, AND bet365** (FD added 2026-08-27; bet365 added 2026-09-01). A bet best-priced at any of the three is actionable; **line-shopping across DK/FD/bet365 is a legit profit lever** (take the edge at whichever prices it best).
+- **Pinnacle is the ONLY reference book** — analysis-only (the sharp reference), never bet, never displayed as a recommended price. All other books (BetMGM/etc.) are noise: ignore.
+- The precise historical backfill (2026-09) stores exactly these 4 books (DK/FD/bet365/Pinnacle); everything else is dropped.
 - De-vigged multi-book/Pinnacle consensus IS the preferred edge *baseline* — that's analysis, not execution.
 - ⚠ **LIVE APP CODE is still DK-only** (DK-anchoring, DK-only EV/display). Surfacing FD prices / a DK-vs-FD line-shop is a future code change, not built. DK-line anchoring shipped commit 7ea856b: prop analysis anchors on the line DK actually posts (not cross-book modal); DK-alone guard raises the edge bar 2× (`_DK_SELFDEVIG_EDGE_MULT`) when <3 peers and no sharp at DK's line.
 - ⚠ **FD data caveat (warehouse, 2026-08-27):** FanDuel fully covers TEAM markets (ML/spread/total, 6k+ events) + pitcher_strikeouts/pitcher_outs, but has NO batter props or earned_runs captured — so FD can't line-shop the batter over-bias or ER under (our strongest signals) without a credit re-pull.
