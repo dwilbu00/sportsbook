@@ -97,6 +97,33 @@ CREDIT_PER_MARKET = 10  # Odds API: cost = 10 × markets × regions (probe verif
 # after it, but keep the guard so a stray earlier date can't burn empty calls.
 PROPS_MIN_DATE = "2023-05-03"
 
+# ── Multi-sport config ─────────────────────────────────────────────────────────
+# MLB enumerates from the warehouse (mlb_game) + captures the F5 period markets.
+# NBA/NFL have no game warehouse, so they enumerate via the historical events
+# LISTING (per in-season date → event_id + commence directly) and capture full-game
+# team markets + player props (no period markets — no proven edge there yet). Same
+# offsets, books, and per-event fetch as MLB. SPORT_KEY / TEAM_MARKETS / PROP_MARKETS
+# are reassigned (module globals) in main() per --sport so the pipeline stays generic.
+SPORT_CONFIGS = {
+    "mlb": {"key": "baseball_mlb", "team": TEAM_MARKETS, "props": PROP_MARKETS,
+            "warehouse": True},
+    "nba": {"key": "basketball_nba",
+            "team": ["h2h", "spreads", "totals"],
+            "props": ["player_points", "player_rebounds", "player_assists",
+                      "player_threes", "player_steals", "player_blocks",
+                      "player_turnovers", "player_points_rebounds_assists",
+                      "player_points_rebounds", "player_points_assists"],
+            "warehouse": False, "months": (10, 11, 12, 1, 2, 3, 4, 5, 6)},
+    "nfl": {"key": "americanfootball_nfl",
+            "team": ["h2h", "spreads", "totals"],
+            "props": ["player_pass_yds", "player_pass_tds",
+                      "player_pass_completions", "player_pass_attempts",
+                      "player_pass_interceptions", "player_rush_yds",
+                      "player_rush_attempts", "player_receptions",
+                      "player_reception_yds", "player_anytime_td"],
+            "warehouse": False, "months": (9, 10, 11, 12, 1, 2)},
+}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Enumeration — regular-season final games from the warehouse
@@ -156,6 +183,67 @@ def enumerate_games(seasons):
                 "season": m["season"],
             })
     return out
+
+
+def enumerate_via_events(api_key, sport_key, date_from, date_to, allow_api,
+                         months=None, workers=12, max_credits=None):
+    """Enumerate NBA/NFL games via the historical events LISTING (1 credit / in-season
+    date; cached free). Returns (games, enum_credits) where each game already carries
+    its event_id (no resolve step needed):
+        {game_pk(=event_id), event_id, commence, official_date, home, away, season}
+    NEWEST-FIRST. `months` restricts to in-season months to avoid wasted off-day
+    calls. Listings are fetched concurrently; dedupe by event_id (an event recurs
+    across the days it's upcoming). In dry-run (allow_api=False) uncached dates are
+    counted, not called."""
+    from datetime import date, timedelta
+    d0, d1 = date.fromisoformat(date_from[:10]), date.fromisoformat(date_to[:10])
+    dates = []
+    d = d0
+    while d <= d1:
+        if not months or d.month in months:
+            dates.append(d.isoformat())
+        d += timedelta(days=1)
+
+    enum_credits = 0
+    to_fetch = []
+    for ds in dates:
+        ts = f"{ds}T12:00:00Z"
+        if is_historical_events_cached(sport_key, ts):
+            to_fetch.append(ts)
+            continue
+        if not allow_api:
+            enum_credits += 1
+            continue
+        if max_credits is not None and enum_credits >= max_credits:
+            continue
+        enum_credits += 1
+        to_fetch.append(ts)
+
+    seen = {}
+    if to_fetch:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _list(ts):
+            try:
+                events, _ = get_historical_events(api_key, sport_key, date=ts)
+                return events
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            for fut in as_completed([ex.submit(_list, ts) for ts in to_fetch]):
+                for ev in (fut.result() or []):
+                    eid, ct = ev.get("id"), ev.get("commence_time")
+                    if not eid or not ct or eid in seen:
+                        continue
+                    if not (date_from[:10] <= ct[:10] <= date_to[:10]):
+                        continue
+                    seen[eid] = {
+                        "game_pk": eid, "event_id": eid, "commence": ct,
+                        "official_date": ct[:10], "home": ev.get("home_team"),
+                        "away": ev.get("away_team"), "season": int(ct[:4])}
+    games = sorted(seen.values(), key=lambda g: g["commence"], reverse=True)
+    return games, enum_credits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -982,8 +1070,16 @@ def run_probe(api_key, games, id_by_pk, books):
 def main():
     p = argparse.ArgumentParser(
         description="Precise game-relative historical-odds backfill (Phase 1).")
+    p.add_argument("--sport", choices=list(SPORT_CONFIGS), default="mlb",
+                   help="mlb (warehouse-enumerated + F5) | nba | nfl (events-listing "
+                        "enumerated, team+props). Default mlb.")
     p.add_argument("--seasons", default="2024,2025,2026",
-                   help="Comma-separated seasons (default 2024,2025,2026).")
+                   help="MLB only: comma-separated seasons (default 2024,2025,2026).")
+    p.add_argument("--date-from", default=PROPS_MIN_DATE,
+                   help=f"NBA/NFL: enumerate games from this date (default the props "
+                        f"floor {PROPS_MIN_DATE}).")
+    p.add_argument("--date-to", default=None,
+                   help="NBA/NFL: enumerate games through this date (default: today).")
     p.add_argument("--tier", choices=["team", "props", "all"], default="all")
     p.add_argument("--books", default=",".join(DEFAULT_BOOKS),
                    help="Comma-separated books to store (default the 4).")
@@ -1024,6 +1120,12 @@ def main():
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     books = [b.strip() for b in args.books.split(",") if b.strip()]
 
+    # Reassign the sport-scoped globals so the whole pipeline (fetch/compile/load/
+    # verify) targets the chosen sport's key + market sets.
+    global SPORT_KEY, TEAM_MARKETS, PROP_MARKETS
+    _sc = SPORT_CONFIGS[args.sport]
+    SPORT_KEY, TEAM_MARKETS, PROP_MARKETS = _sc["key"], _sc["team"], _sc["props"]
+
     # --validate reads only the parquet (no warehouse/enumeration/API) → dispatch early.
     if args.validate:
         validate_parquet(seasons, args.tier, books)
@@ -1031,39 +1133,59 @@ def main():
 
     cfg = load_config()
     api_key = cfg["odds_api_key"]
+    _free = args.dry_run or args.verify or args.compile
 
-    # Warehouse reads (enumeration + event-id reuse) need the Azure SQL_* secrets in
-    # the env; outside Streamlit they aren't promoted yet. Free/read-only.
+    # Warehouse reads (MLB enumeration + event-id reuse) need the Azure SQL_* secrets
+    # in the env; outside Streamlit they aren't promoted yet. Free/read-only.
     try:
         import db_store
         db_store.promote_secrets_from_toml()
     except Exception:
         pass
 
-    games = enumerate_games(seasons)
-    if not games:
-        print("No enumerated games (warehouse unavailable or empty). "
-              "Ensure SQL secrets are set and mlb_game is populated.")
-        return
-    if args.skip_recent_days > 0:
-        from datetime import datetime, timezone, timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
-        before = len(games)
-        games = [g for g in games
-                 if (_parse_ts(g["commence"]) or cutoff) < cutoff]
-        print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
-              f"last {args.skip_recent_days}d (archive lag; already live in warehouse).")
-    if args.limit_games:
-        games = games[:args.limit_games]
-    print(f"Enumerated {len(games)} regular-season final games "
-          f"({', '.join(seasons)}), newest-first.")
-
-    # Resolve event_ids. Dry-run/verify/compile resolve only via free sources
-    # (warehouse + cached listings); probe/real runs may make the 1cr/date harvest.
-    _free = args.dry_run or args.verify or args.compile
-    id_by_pk, harvest_credits = resolve_event_ids(
-        api_key, games, allow_api=(not _free),
-        max_credits=args.max_credits, workers=args.workers)
+    harvest_credits = 0
+    if _sc["warehouse"]:                       # MLB: warehouse enumeration + resolve
+        games = enumerate_games(seasons)
+        if not games:
+            print("No enumerated games (warehouse unavailable or empty). "
+                  "Ensure SQL secrets are set and mlb_game is populated.")
+            return
+        if args.skip_recent_days > 0:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
+            before = len(games)
+            games = [g for g in games
+                     if (_parse_ts(g["commence"]) or cutoff) < cutoff]
+            print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
+                  f"last {args.skip_recent_days}d (archive lag; already live).")
+        if args.limit_games:
+            games = games[:args.limit_games]
+        print(f"Enumerated {len(games)} {SPORT_KEY} regular-season final games "
+              f"({', '.join(seasons)}), newest-first.")
+        id_by_pk, harvest_credits = resolve_event_ids(
+            api_key, games, allow_api=(not _free),
+            max_credits=args.max_credits, workers=args.workers)
+    else:                                       # NBA/NFL: events-listing enumeration
+        from datetime import date
+        date_to = args.date_to or date.today().isoformat()
+        games, harvest_credits = enumerate_via_events(
+            api_key, SPORT_KEY, args.date_from, date_to, allow_api=(not _free),
+            months=_sc.get("months"), workers=args.workers,
+            max_credits=args.max_credits)
+        if args.skip_recent_days > 0:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=args.skip_recent_days)
+            before = len(games)
+            games = [g for g in games
+                     if (_parse_ts(g["commence"]) or cutoff) < cutoff]
+            print(f"  [skip-recent] dropped {before - len(games)} game(s) within the "
+                  f"last {args.skip_recent_days}d (archive lag).")
+        if args.limit_games:
+            games = games[:args.limit_games]
+        id_by_pk = {g["game_pk"]: g["event_id"] for g in games}
+        print(f"Enumerated {len(games)} {SPORT_KEY} games "
+              f"({args.date_from}..{date_to}), newest-first. "
+              f"(enum ~{harvest_credits} cr)")
 
     if args.verify:
         verify_cache(games, id_by_pk, args.tier, books)
