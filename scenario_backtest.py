@@ -774,6 +774,7 @@ def scenario_line_timing_study(sport, seasons, min_gap_h=6.0):
     for s in seasons:
         team_rows = r2_data._read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        team_rows = [r for r in team_rows if r.get("kind") == "team"]  # drop F5
         for eid, snaps in _event_snapshots(team_rows).items():
             cov["events"] += 1
             close_ml = next((sd for ld, sd in reversed(snaps)
@@ -1235,6 +1236,109 @@ def _report_upset_datamine(rows, cov, min_n=60):
     print("=" * 78)
 
 
+def _late_gap_bucket(g):
+    """DK full-game total MINUS Pinnacle first-5 total = DK's implied innings-6-9 runs
+    (normal ~4.6). Low = DK implies few late runs (full total maybe too low → over)."""
+    if g is None:
+        return "unk"
+    if g < 3.5:
+        return "a <3.5 (few late)"
+    if g < 4.0:
+        return "b 3.5-4.0"
+    if g < 4.5:
+        return "c 4.0-4.5"
+    if g < 5.0:
+        return "d 4.5-5.0"
+    return "e >=5.0 (many late)"
+
+
+def scenario_f5_decomp(sport, seasons, lead_lo=12.0, lead_hi=24.0):
+    """Doug's period decomposition: DK full-game total MINUS Pinnacle FIRST-5 total = DK's
+    implied runs in innings 6-9. Bet at DK's full total, grade BOTH over & under, and
+    bucket ROI by that implied late-innings gap. Hypothesis: anomalously LOW gap (DK
+    implies few late runs → full total too low) → OVER wins; high gap → UNDER. Also
+    reports the DK-full vs Pin-FULL gap (integrity: ~0 => DK not line-offset). Everything
+    kind-filtered (no full/F5 contamination) — the fix for the under_dkpin mixing bug."""
+    import r2_data
+    meta = _load_game_meta(seasons)
+    rows, cov, integ = [], Counter(), []
+    for s in seasons:
+        dk = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        pin = r2_data._read_team_market_lines(
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="pinnacle")
+        dk_full = _event_snapshots([r for r in dk if r.get("kind") == "team"])
+        pin_f5 = _event_snapshots([r for r in pin if r.get("kind") == "first_five"])
+        pin_full = _event_snapshots([r for r in pin if r.get("kind") == "team"])
+        for eid, snaps in dk_full.items():
+            dpick = next(((ld, sd) for ld, sd in reversed(snaps)
+                          if _mkt_ok("over", sd) and lead_lo <= ld < lead_hi), None)
+            if dpick is None:
+                cov["no_dk_total"] += 1
+                continue
+            dsd = dpick[1]
+            gpk = dsd.get("game_pk")
+            if gpk is None or int(gpk) not in meta:
+                cov["no_meta"] += 1
+                continue
+            m = meta[int(gpk)]
+            hs, as_ = m["home_score"], m["away_score"]
+            if hs is None or as_ is None:
+                cov["no_score"] += 1
+                continue
+            pu = pin_full.get(eid)
+            pup = (next(((ld, sd) for ld, sd in reversed(pu) if _mkt_ok("over", sd)), None)
+                   if pu else None)
+            if pup is not None:
+                integ.append(dsd["total_line"] - pup[1]["total_line"])
+            pf = pin_f5.get(eid)
+            pfp = (next(((ld, sd) for ld, sd in reversed(pf) if _mkt_ok("over", sd)), None)
+                   if pf else None)
+            if pfp is None:
+                cov["no_pin_f5"] += 1
+                continue
+            gap = dsd["total_line"] - pfp[1]["total_line"]
+            b = _late_gap_bucket(gap)
+            for bet, price, side in (("over", dsd["over"], "OVER"),
+                                     ("under", dsd["under"], "UNDER")):
+                res = r2_grade.grade_over_under(hs + as_, dsd["total_line"], side)
+                p = r2_grade.profit(price, res) if res else None
+                if p is None:
+                    continue
+                rows.append({"season": str(s), "bet": bet, "result": res, "profit": p,
+                             "gap": gap, "gap_bucket": b})
+            cov["graded"] += 1
+    return rows, cov, integ
+
+
+def _report_f5_decomp(rows, cov, integ):
+    import statistics
+    print("=" * 78)
+    print("  F5 DECOMPOSITION — DK full total − Pinnacle FIRST-5 total = DK's implied")
+    print("  innings-6-9 runs. Over/under ROI (bet at DK's full total) by that gap.")
+    print(f"  graded={cov.get('graded',0):,}  (no_pin_f5={cov.get('no_pin_f5',0):,} "
+          f"no_dk_total={cov.get('no_dk_total',0):,})")
+    if integ:
+        print(f"  INTEGRITY DK_full − Pin_FULL: mean {sum(integ)/len(integ):+.3f}  "
+              f"median {statistics.median(integ):+.2f}  n={len(integ):,}  (want ~0)")
+    over_gaps = [r["gap"] for r in rows if r["bet"] == "over"]
+    if over_gaps:
+        print(f"  implied late gap (DK_full − Pin_F5): mean {sum(over_gaps)/len(over_gaps):+.2f}"
+              f"  median {statistics.median(over_gaps):+.2f}")
+    print("=" * 78)
+    for bet in ("over", "under"):
+        br = [r for r in rows if r["bet"] == bet]
+        pooled = r2_grade.summarize(br)
+        print(f"\n  ── {bet.upper()} @ DK full total  (pooled n={pooled.n:,} "
+              f"ROI={pooled.roi:+.2%} t={pooled.t_stat:+.2f}) " + "─" * 12)
+        _repl_slice(br, lambda r: r["gap_bucket"], "implied late-innings gap", 50)
+    print("  READ (Doug's hypothesis): if DK misprices game SHAPE, OVER ROI should be")
+    print("  highest in the LOW-gap buckets (DK implied few late runs → full total too")
+    print("  low) and UNDER highest in the HIGH-gap buckets. Flat across gaps => DK's")
+    print("  full-vs-F5 split is coherent (no shape edge).")
+    print("=" * 78)
+
+
 def _diff_bucket(d):
     if d is None:
         return "unk"
@@ -1362,6 +1466,7 @@ def scenario_under_timing(sport, seasons):
     for s in seasons:
         team_rows = r2_data._read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        team_rows = [r for r in team_rows if r.get("kind") == "team"]  # drop F5
         for eid, snaps in _event_snapshots(team_rows).items():
             cov["events"] += 1
             close = next(((ld, sd) for ld, sd in reversed(snaps) if _mkt_ok("over", sd)),
@@ -1448,6 +1553,7 @@ def scenario_under_stress(sport, seasons, lead_lo=12.0, lead_hi=24.0):
     for s in seasons:
         team_rows = r2_data._read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
+        team_rows = [r for r in team_rows if r.get("kind") == "team"]  # drop F5
         for eid, snaps in _event_snapshots(team_rows).items():
             pick = next(((ld, sd) for ld, sd in reversed(snaps)
                          if _mkt_ok("over", sd) and lead_lo <= ld < lead_hi), None)
@@ -1548,7 +1654,8 @@ def main():
                     choices=["all", "under_hits", "home_runline", "dog_runline",
                              "fav_combo", "er_ml", "team_variance", "prop_roi",
                              "line_timing", "coherence_stable_sp", "upset_datamine",
-                             "under_timing", "under_stress", "under_dkpin"])
+                             "under_timing", "under_stress", "under_dkpin",
+                             "f5_decomp"])
     ap.add_argument("--datamine-min-n", type=int, default=60,
                     help="Min bets for an upset_datamine factor cell to be shown.")
     ap.add_argument("--coh-fav-min", type=float, default=0.60,
@@ -1659,6 +1766,9 @@ def main():
     if want == "under_dkpin":          # explicit only, not in "all"
         rows, cov = scenario_under_dkpin(args.sport, seasons)
         _report_under_dkpin(rows, cov)
+    if want == "f5_decomp":            # explicit only, not in "all"
+        rows, cov, integ = scenario_f5_decomp(args.sport, seasons)
+        _report_f5_decomp(rows, cov, integ)
 
 
 if __name__ == "__main__":
