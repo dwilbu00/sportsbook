@@ -507,6 +507,100 @@ def verify_cache(games, id_by_pk, tier, books):
 PARQUET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "odds_backfill", "parquet")
 
+# Markets whose outcomes carry a line point (the two-way totals/spreads/props);
+# h2h/h2h_1st_5_innings are moneyline (no point).
+_MONEYLINE_MARKETS = {"h2h", "h2h_1st_5_innings"}
+
+
+def validate_parquet(seasons, tier, books):
+    """FREE data-quality assertions on the compiled parquet (feeds Phase 3 →
+    backtests → bets, so silent parse errors matter). Reports PASS/FAIL per check
+    with counts; never raises. Checks: schema, non-null numeric prices, point
+    present/absent per market family, two-sided market balance, no duplicate lines,
+    book/role whitelist, season/group integrity, sane lead times."""
+    import pandas as pd
+    specs = _group_specs(tier, books)
+    groups = [g for g, *_ in specs]
+    book_set, role_set = set(books), {"early_12h", "early_4h", "close"}
+    files = []
+    for season in seasons:
+        for group in groups:
+            p = os.path.join(PARQUET_DIR, f"mlb_precise_{group}_{season}.parquet")
+            if os.path.exists(p):
+                files.append((season, group, p))
+    if not files:
+        print("  No parquet files found — run --compile first.")
+        return
+    fails = 0
+
+    def chk(cond, label, detail=""):
+        nonlocal fails
+        ok = bool(cond)
+        if not ok:
+            fails += 1
+        print(f"    [{'PASS' if ok else 'FAIL'}] {label}{('  — ' + detail) if detail and not ok else ''}")
+
+    REQ = ["game_pk", "season", "official_date", "commence", "home", "away",
+           "event_id", "role", "group", "requested_ts", "snapshot_ts", "lead_h",
+           "book", "market", "outcome", "description", "point", "price", "source"]
+    print(f"\n=== PARQUET VALIDATE (free) — {len(files)} file(s) ===")
+    for season, group, path in files:
+        df = pd.read_parquet(path)
+        print(f"\n  {os.path.basename(path)}  ({len(df):,} rows)")
+        chk(all(c in df.columns for c in REQ), "schema: all required columns",
+            "missing " + ",".join(c for c in REQ if c not in df.columns))
+        chk(df["price"].notna().all(), "price: no nulls",
+            f"{int(df['price'].isna().sum())} null")
+        chk(pd.to_numeric(df["price"], errors="coerce").notna().all(),
+            "price: all numeric",
+            f"{int(pd.to_numeric(df['price'], errors='coerce').isna().sum())} non-numeric")
+        chk(set(df["book"].unique()) <= book_set, "books: whitelist only",
+            f"extra {sorted(set(df['book'].unique()) - book_set)}")
+        chk(set(df["role"].unique()) <= role_set, "roles: whitelist only",
+            f"extra {sorted(set(df['role'].unique()) - role_set)}")
+        chk((df["season"].astype(str) == str(season)).all(), "season: matches file")
+        chk((df["group"] == group).all(), "group: matches file")
+        # Point present for line markets, absent for moneyline.
+        ml = df[df["market"].isin(_MONEYLINE_MARKETS)]
+        line = df[~df["market"].isin(_MONEYLINE_MARKETS)]
+        chk(ml["point"].isna().all() if len(ml) else True,
+            "point: null for moneyline (h2h)",
+            f"{int(ml['point'].notna().sum())} unexpected points")
+        chk(line["point"].notna().all() if len(line) else True,
+            "point: present for totals/spreads/props",
+            f"{int(line['point'].isna().sum())} missing points")
+        # No duplicate lines on the natural grain.
+        keyc = ["game_pk", "role", "book", "market", "outcome", "description", "point"]
+        dups = int(df.duplicated(subset=keyc).sum())
+        chk(dups == 0, "no duplicate lines (game,role,book,market,outcome,desc,point)",
+            f"{dups} dups")
+        # Two-sided balance. TEAM standard markets are single-line 2-way, so each
+        # (game,role,book,market) must have exactly 2 outcomes. PROPS legitimately
+        # carry several LINES per player (e.g. hits 0.5 AND 1.5) and can be one-sided
+        # (Over-only), so the grain includes `point` and the valid count is 1 or 2 —
+        # a count >2 at a single (player, point) is the real contamination signal.
+        if group == "props":
+            sides = df.groupby(["game_pk", "role", "book", "market", "description",
+                                "point"], dropna=False).size()
+            bad = int((sides > 2).sum())
+            chk(bad == 0, "props: ≤2 outcomes per (player, line) [Over/Under]",
+                f"{bad}/{len(sides)} (player,line) groups have >2 sides")
+        else:
+            sides = df.groupby(["game_pk", "role", "book", "market"],
+                               dropna=False).size()
+            bad = int((sides != 2).sum())
+            chk(bad == 0, "team: exactly 2 outcomes per market",
+                f"{bad}/{len(sides)} markets != 2 sides")
+        # Sane lead times per role.
+        for role, lo, hi in [("close", -0.5, 2.0), ("early_4h", 3.5, 8.0),
+                             ("early_12h", 11.5, 18.0)]:
+            rl = df[df["role"] == role]["lead_h"].dropna()
+            if len(rl):
+                chk(rl.between(lo, hi).mean() >= 0.98,
+                    f"lead_h[{role}] in [{lo},{hi}]h",
+                    f"{100 * rl.between(lo, hi).mean():.0f}% in range")
+    print(f"\n=== VALIDATE {'PASSED' if fails == 0 else f'FAILED ({fails} checks)'} ===")
+
 
 def _flatten(data, meta):
     """Flatten one cached event payload into line-level row dicts (one per
@@ -894,10 +988,20 @@ def main():
                    help="PHASE 2 (FREE): compile cached raw responses → parquet in "
                         "odds_backfill/parquet/ (per season/group). Re-runnable; "
                         "spends nothing (cached-only reads).")
+    p.add_argument("--validate", action="store_true",
+                   help="FREE data-quality assertions on the compiled parquet "
+                        "(schema, prices, points, two-sided balance, dups, lead "
+                        "times). Run after --compile. Spends nothing.")
     args = p.parse_args()
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     books = [b.strip() for b in args.books.split(",") if b.strip()]
+
+    # --validate reads only the parquet (no warehouse/enumeration/API) → dispatch early.
+    if args.validate:
+        validate_parquet(seasons, args.tier, books)
+        return
+
     cfg = load_config()
     api_key = cfg["odds_api_key"]
 
