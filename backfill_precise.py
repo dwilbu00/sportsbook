@@ -172,11 +172,16 @@ def _parse_ts(ts):
         return None
 
 
-def _nearest(cands, commence, used):
+def _nearest(cands, commence, used, max_dist=None):
     """From (commence_time, event_id) candidates, pick the UNUSED event whose
-    commence is nearest `commence` (falls back to the first unused when times are
-    unparseable). Returns event_id or None. Disambiguates same-day same-matchup
-    (doubleheader) games so each game_pk binds to ITS OWN event."""
+    commence is nearest `commence`. Returns event_id or None.
+
+    `max_dist` (seconds): reject the best match if it is farther than this from the
+    game's commence — the guard that stops a same-matchup game from a DIFFERENT day
+    (a series game, ~24h off) or an event with a missing/unparseable commence from
+    being bound. With no max_dist the nearest is always returned (legacy behavior).
+    Disambiguates doubleheaders (same-day same-matchup) so each game_pk binds its own
+    event."""
     gc = _parse_ts(commence)
     best = None
     for ct, eid in cands:
@@ -186,14 +191,22 @@ def _nearest(cands, commence, used):
         dist = abs((ec - gc).total_seconds()) if (gc and ec) else float("inf")
         if best is None or dist < best[0]:
             best = (dist, eid)
-    return best[1] if best else None
+    if best is None:
+        return None
+    if max_dist is not None and best[0] > max_dist:
+        return None
+    return best[1]
 
 
 def _warehouse_event_ids():
-    """{(official_date, home_norm, away_norm) -> [(commence_time, event_id), ...]}
-    from odds_snapshot rows already in the warehouse (free, no API). MULTI-valued so
-    a split doubleheader (two distinct event_ids sharing date+matchup) is not
-    collapsed to one id. Fail-open → {}."""
+    """{(home_norm, away_norm) -> [(commence_time, event_id), ...]} from odds_snapshot
+    rows already in the warehouse (free, no API). Keyed by MATCHUP ONLY (not date):
+    odds_snapshot.game_date is the commence-UTC date, which differs from a game's
+    official (local play) date for night games — so keying/looking-up by date would
+    bind a series game to the WRONG day's event. Matching by nearest COMMENCE
+    (Pass 1 below) is date-robust and still disambiguates doubleheaders. MULTI-valued
+    so a matchup's many meetings (and split DHs) each keep their own event_id.
+    Fail-open → {}."""
     try:
         import db_store
         from sqlalchemy import select
@@ -206,13 +219,12 @@ def _warehouse_event_ids():
     idx = {}
     try:
         with eng.connect() as c:
-            q = (select(t.c.game_date, t.c.event_id, t.c.home, t.c.away,
-                        t.c.commence_time)
+            q = (select(t.c.event_id, t.c.home, t.c.away, t.c.commence_time)
                  .where(t.c.sport == SPORT_KEY).distinct())
-            for gd, eid, h, a, ct in c.execute(q).all():
+            for eid, h, a, ct in c.execute(q).all():
                 if not eid:
                     continue
-                key = ((gd or "")[:10], norm(h or ""), norm(a or ""))
+                key = (norm(h or ""), norm(a or ""))
                 bucket = idx.setdefault(key, [])
                 if not any(e == eid for _c, e in bucket):   # dedupe by event_id
                     bucket.append((ct, eid))
@@ -256,25 +268,31 @@ def resolve_event_ids(api_key, games, allow_api, max_credits=None, workers=12):
     except Exception:
         norm = lambda s: (s or "").lower().strip()
 
-    # Pass 1: warehouse reuse — cluster by (date, matchup) so a DH is matched
-    # one-to-one by nearest commence instead of collapsing to a single event_id.
+    # Pass 1: warehouse reuse — group by MATCHUP (across all dates) and bind each game
+    # to the event whose COMMENCE matches (nearest, within tolerance), one-to-one. The
+    # commence gate rejects a series game from a different day (~24h off) and events
+    # with missing commence, routing those to the authoritative harvest pass. This is
+    # what makes reuse robust to the game_date-vs-official_date day shift.
+    # Accept a warehouse event only if its commence is within 2h of the game's — real
+    # matches agree to the minute, so 2h is generous, while it cleanly SEPARATES
+    # doubleheader games (~3.5-4h apart) and any >2h-off series game, routing those to
+    # the harvest pass whose date-scoped listing carries BOTH DH events for correct
+    # one-to-one binding.
+    _MATCH_TOL_S = 2 * 3600
     unresolved_dates = set()
-    for d, gs in by_date.items():
-        clusters = {}
-        for g in gs:
-            clusters.setdefault((d, norm(g["home"]), norm(g["away"])), []).append(g)
-        for key, cluster in clusters.items():
-            cands = list(wh_idx.get(key) or [])
-            used = set()
-            for g in sorted(cluster, key=lambda x: x["commence"]):
-                eid = _nearest(cands, g["commence"], used)
-                if eid:
-                    id_by_pk[g["game_pk"]] = eid
-                    used.add(eid)
-            # Any game in this matchup still unmapped (no candidate, or fewer
-            # warehouse events than DH games) → let the harvest pass fill it.
-            if any(g["game_pk"] not in id_by_pk for g in cluster):
-                unresolved_dates.add(d)
+    by_matchup = {}
+    for g in games:
+        by_matchup.setdefault((norm(g["home"]), norm(g["away"])), []).append(g)
+    for mk, gs in by_matchup.items():
+        cands = list(wh_idx.get(mk) or [])
+        used = set()
+        for g in sorted(gs, key=lambda x: x["commence"]):
+            eid = _nearest(cands, g["commence"], used, max_dist=_MATCH_TOL_S)
+            if eid:
+                id_by_pk[g["game_pk"]] = eid
+                used.add(eid)
+            else:
+                unresolved_dates.add(g["official_date"])
 
     # Pass 2/3: historical-events listing per still-unresolved date, cap-bounded.
     # Decide which dates to actually fetch (cap-bounded; cached = free) BEFORE the
@@ -326,7 +344,9 @@ def resolve_event_ids(api_key, games, allow_api, max_credits=None, workers=12):
             cands = [(ev.get("commence_time"), ev.get("id")) for ev in (events or [])
                      if _names_match(g["home"], ev.get("home_team"))
                      and _names_match(g["away"], ev.get("away_team"))]
-            eid = _nearest(cands, g["commence"], used)
+            # 24h gate: the date-scoped listing separates same-date (~13h from the
+            # noon harvest ts) from next-day (~37h) series games cleanly.
+            eid = _nearest(cands, g["commence"], used, max_dist=24 * 3600)
             if eid:
                 id_by_pk[g["game_pk"]] = eid
                 used.add(eid)
