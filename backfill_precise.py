@@ -228,7 +228,7 @@ def _harvest_ts(official_date):
     return f"{official_date}T12:00:00Z"
 
 
-def resolve_event_ids(api_key, games, allow_api, max_credits=None):
+def resolve_event_ids(api_key, games, allow_api, max_credits=None, workers=12):
     """Map each game to its Odds-API event_id.
 
     Order of resolution (cheapest first):
@@ -277,26 +277,50 @@ def resolve_event_ids(api_key, games, allow_api, max_credits=None):
                 unresolved_dates.add(d)
 
     # Pass 2/3: historical-events listing per still-unresolved date, cap-bounded.
+    # Decide which dates to actually fetch (cap-bounded; cached = free) BEFORE the
+    # network phase so the cap is deterministic and the fetch can run in parallel.
     harvest_credits = 0
+    to_fetch = []   # dates whose listing we'll read (cached free, or within cap)
     for d in sorted(unresolved_dates):
         ts = _harvest_ts(d)
-        cached = is_historical_events_cached(SPORT_KEY, ts)
-        if not cached:
-            if not allow_api:
-                harvest_credits += 1      # would-be spend, not made in dry-run
-                continue
-            if max_credits is not None and harvest_credits >= max_credits:
-                continue                  # hard cap reached — stop harvesting
-            harvest_credits += 1
-        try:
-            events, _ = get_historical_events(api_key, SPORT_KEY, date=ts)
-        except Exception as e:
-            print(f"  [warn] events harvest failed {d}: {e}")
+        if is_historical_events_cached(SPORT_KEY, ts):
+            to_fetch.append((d, ts))          # free re-read
             continue
+        if not allow_api:
+            harvest_credits += 1              # dry-run: count, don't call
+            continue
+        if max_credits is not None and harvest_credits >= max_credits:
+            continue                          # hard cap reached — stop harvesting
+        harvest_credits += 1
+        to_fetch.append((d, ts))
+
+    # Fetch the listings CONCURRENTLY (independent network calls; cached ones return
+    # instantly). Matching is done serially afterward (CPU-cheap, order-independent).
+    listings = {}
+    if to_fetch:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _harvest(item):
+            d, ts = item
+            try:
+                events, _ = get_historical_events(api_key, SPORT_KEY, date=ts)
+                return d, events, None
+            except Exception as e:
+                return d, None, str(e)
+
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            for fut in as_completed([ex.submit(_harvest, it) for it in to_fetch]):
+                d, events, err = fut.result()
+                if err:
+                    print(f"  [warn] events harvest failed {d}: {err}")
+                    continue
+                listings[d] = events
+
+    # Serial matching: per-date, nearest-commence one-to-one (DH-aware).
+    for d, events in listings.items():
         gs = by_date.get(d, [])
         # Events already bound to this date's games (from warehouse) can't be reused.
         used = {id_by_pk[g["game_pk"]] for g in gs if g["game_pk"] in id_by_pk}
-        # Name-matching candidates from the listing, carrying commence for DH tiebreak.
         for g in sorted((x for x in gs if x["game_pk"] not in id_by_pk),
                         key=lambda x: x["commence"]):
             cands = [(ev.get("commence_time"), ev.get("id")) for ev in (events or [])
@@ -775,7 +799,7 @@ def main():
     # cache); probe/real runs may make the 1-credit/date harvest calls.
     id_by_pk, harvest_credits = resolve_event_ids(
         api_key, games, allow_api=(not (args.dry_run or args.verify)),
-        max_credits=args.max_credits)
+        max_credits=args.max_credits, workers=args.workers)
 
     if args.verify:
         verify_cache(games, id_by_pk, args.tier, books)
