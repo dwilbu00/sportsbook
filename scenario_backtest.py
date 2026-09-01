@@ -1393,6 +1393,8 @@ def scenario_under_dkpin(sport, seasons, lead_lo=12.0, lead_hi=24.0):
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="draftkings")
         pin = r2_data._read_team_market_lines(
             sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker="pinnacle")
+        dk = [r for r in dk if r.get("kind") == "team"]      # drop F5 (contamination)
+        pin = [r for r in pin if r.get("kind") == "team"]
         dk_snaps, pin_snaps = _event_snapshots(dk), _event_snapshots(pin)
         for eid, snaps in dk_snaps.items():
             dpick = next(((ld, sd) for ld, sd in reversed(snaps)
