@@ -90,21 +90,36 @@ def backup(eng, chunksize=200_000):
     snap.to_parquet(snap_path, index=False)
     print(f"  wrote {snap_path} ({len(snap)} rows)")
 
-    # odds_line (large) — chunked stream to a single parquet file.
+    # odds_line (large) — chunked stream to ONE parquet with a PINNED schema. Don't
+    # infer the schema from chunk-1: odds_line has nullable string cols (player,
+    # prop_key, direction, …) that are all-NULL for early (team-only) rows → pyarrow
+    # infers `null` type, then a later chunk with real strings infers `string` and
+    # ParquetWriter.write_table rejects the schema mismatch, aborting the backup
+    # mid-stream. A fixed schema (from_pandas maps by NAME + casts null→declared) makes
+    # every chunk conform. ORDER BY id makes chunking deterministic.
+    line_schema = pa.schema([
+        ("id", pa.int64()), ("snapshot_id", pa.int64()),
+        ("bet_type", pa.string()), ("selection", pa.string()),
+        ("point", pa.float64()), ("player", pa.string()),
+        ("prop_key", pa.string()), ("direction", pa.string()),
+        ("price", pa.int64()), ("implied_prob", pa.float64()),
+        ("player_mlb_id", pa.string()), ("team_code", pa.string()),
+        ("game_pk", pa.int64()), ("bookmaker", pa.string()),
+        ("region", pa.string()),
+    ])
     line_path = os.path.join(dest, "odds_line.parquet")
-    writer = None
+    writer = pq.ParquetWriter(line_path, line_schema)
     written = 0
-    for chunk in pd.read_sql("SELECT * FROM odds_line", eng, chunksize=chunksize):
-        table = pa.Table.from_pandas(chunk, preserve_index=False)
-        if writer is None:
-            writer = pq.ParquetWriter(line_path, table.schema)
-        writer.write_table(table)
-        written += len(chunk)
-        print(f"    odds_line … {written}/{counts['line_total']} rows")
-    if writer is not None:
+    try:
+        for chunk in pd.read_sql("SELECT * FROM odds_line ORDER BY id", eng,
+                                 chunksize=chunksize):
+            table = pa.Table.from_pandas(chunk, schema=line_schema,
+                                         preserve_index=False)
+            writer.write_table(table)
+            written += len(chunk)
+            print(f"    odds_line … {written}/{counts['line_total']} rows")
+    finally:
         writer.close()
-    else:                                   # empty table → still emit a valid file
-        pd.DataFrame().to_parquet(line_path, index=False)
     print(f"  wrote {line_path} ({written} rows)")
 
     # Manifest (also the sentinel --purge checks for).
@@ -120,13 +135,19 @@ def backup(eng, chunksize=200_000):
 
 
 def _latest_backup():
+    """Return the latest backup dir ONLY if it holds a COMPLETE restore set (manifest
+    + both parquet files) — not just an empty stamp dir — so the purge gate actually
+    enforces a restorable backup."""
     p = os.path.join(BACKUP_DIR, "LATEST.txt")
     if not os.path.exists(p):
         return None
     with open(p, encoding="utf-8") as f:
         stamp = f.read().strip()
     d = os.path.join(BACKUP_DIR, stamp)
-    return d if os.path.isdir(d) else None
+    required = ("manifest.json", "odds_snapshot.parquet", "odds_line.parquet")
+    if os.path.isdir(d) and all(os.path.isfile(os.path.join(d, r)) for r in required):
+        return d
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,6 +215,29 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
     games, id_by_pk, _ = bp.enumerate_for_sport(
         sport, None, seasons=seasons, date_from=date_from, date_to=date_to,
         allow_api=False, verbose=True)
+    # CRITICAL: for MLB the warehouse event-id resolution reads odds_snapshot, which
+    # --purge TRUNCATEd before this runs → id_by_pk would be ~empty and the reload
+    # would silently write nothing. Recover game_pk→event_id from the compiled parquet
+    # (it persists BOTH), so the reload is self-contained on cache+parquet and immune
+    # to the purge (also 0 credits, order-independent). Live-resolved ids win; parquet
+    # fills the rest.
+    import glob
+    import pandas as _pd
+    pmap = {}
+    for _p in glob.glob(os.path.join(bp.PARQUET_DIR,
+                                     f"{bp.SPORT_TAG}_precise_*.parquet")):
+        _df = _pd.read_parquet(_p, columns=["game_pk", "event_id"]).drop_duplicates()
+        for _pk, _eid in _df.itertuples(index=False):
+            if _eid:
+                pmap[_pk] = _eid
+    id_by_pk = {**pmap, **id_by_pk}
+    resolved = sum(1 for g in games if id_by_pk.get(g["game_pk"]))
+    print(f"  event_id coverage: {resolved}/{len(games)} games mapped "
+          f"({len(pmap)} from parquet).")
+    if apply and games and resolved < 0.5 * len(games):
+        raise SystemExit(
+            f"ABORT: only {resolved}/{len(games)} games have an event_id — refusing "
+            f"to write a near-empty reload. Run Phase-2 --compile (parquet) first.")
     specs = bp._group_specs(tier, books)
     gpk_cache, id_cache = {}, {}
     snaps = Counter()          # (kind, source) -> snapshots
@@ -227,7 +271,13 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
                     empty += 1
                     continue
                 source = ROLE_TO_SOURCE[role]
-                snapshot_hour = wh._hour_bucket(snap or ts)
+                # Bucket on the REQUESTED offset `ts` (−12h/−4h/−10min → three distinct
+                # UTC hours), NOT the served `snap`: uq_odds_snapshot is
+                # (sport,game_date,event_id,kind,snapshot_hour) with NO source, so two
+                # roles whose served snapshots landed in the same hour (archive gap /
+                # late props) would collide and one window would be silently dropped.
+                # captured_at still records the true served time (snap) for provenance.
+                snapshot_hour = wh._hour_bucket(ts)
                 commence = data.get("commence_time") or g["commence"]
                 for kind in _kinds_for_group(group):
                     lines = im._per_book_lines(data, kind)
@@ -279,6 +329,9 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
     print(f"  pending(uncached)={pending:,}  empty={empty:,}"
           + (f"  written={written:,} skipped(dup)={skipped:,} errors={errors:,}"
              if apply else ""))
+    if apply and skipped:
+        print(f"  [warn] {skipped:,} write-once COLLISIONS (dup uq) — a window may "
+              f"have been dropped; investigate if nonzero (expected 0).")
     if not apply:
         print("  [dry-run] nothing written. Re-run with --apply --yes.")
 
@@ -328,6 +381,7 @@ def verify(eng, sport, books, sample=2000):
         print(f"  [parity] no {tag} closing team parquet — run --compile first.")
         return
     match = mism = miss = 0
+    seen = set()
     examples = []
     with eng.connect() as c:
         rows = c.execute(text(
@@ -340,6 +394,7 @@ def verify(eng, sport, books, sample=2000):
         if key not in par:
             miss += 1
             continue
+        seen.add(key)
         if int(price) == par[key]:
             match += 1
         else:
@@ -348,12 +403,30 @@ def verify(eng, sport, books, sample=2000):
                 examples.append(f"{eid[:8]} {bk} {bt} {sel} pt={pt}: "
                                 f"wh={price} vs parquet={par[key]}")
     tot = match + mism + miss
+    # Coverage the OTHER direction: parquet closing lines missing from the warehouse
+    # (an empty/incomplete reload or a write-once drop would show up here).
+    missing_from_wh = sum(1 for k in par if k not in seen)
     print(f"\n  PRICE PARITY (closing team moneyline+total): {match:,} match, "
           f"{mism:,} mismatch, {miss:,} warehouse-rows-not-in-parquet "
-          f"(of {tot:,} warehouse rows)")
+          f"(of {tot:,} warehouse rows); {missing_from_wh:,} parquet lines "
+          f"MISSING from warehouse (of {len(par):,}).")
     for e in examples:
         print(f"    MISMATCH {e}")
-    print(f"  === VERIFY {'OK' if mism == 0 else f'MISMATCHES ({mism})'} ===")
+    # OK requires: warehouse non-empty, zero price mismatches, and near-complete
+    # parquet→warehouse coverage (tiny gap tolerated for empty/lag games).
+    cover_ok = missing_from_wh <= 0.02 * max(len(par), 1)
+    ok = (tot > 0 and mism == 0 and cover_ok)
+    if ok:
+        print("  === VERIFY OK ===")
+    else:
+        why = []
+        if tot == 0:
+            why.append("warehouse EMPTY (no closing team rows)")
+        if mism:
+            why.append(f"{mism} price mismatches")
+        if not cover_ok:
+            why.append(f"{missing_from_wh}/{len(par)} parquet lines missing from wh")
+        print(f"  === VERIFY FAILED: {'; '.join(why)} ===")
 
 
 def main():
