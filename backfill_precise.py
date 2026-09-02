@@ -645,9 +645,10 @@ def verify_cache(games, id_by_pk, tier, books):
 PARQUET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "odds_backfill", "parquet")
 
-# Markets whose outcomes carry a line point (the two-way totals/spreads/props);
-# h2h/h2h_1st_5_innings are moneyline (no point).
+# Markets whose outcomes DON'T carry a line point: moneyline (h2h) and yes/no props
+# (player_anytime_td is a binary TD market — no Over/Under line).
 _MONEYLINE_MARKETS = {"h2h", "h2h_1st_5_innings"}
+_NO_POINT_MARKETS = _MONEYLINE_MARKETS | {"player_anytime_td"}
 
 
 def validate_parquet(seasons, tier, books):
@@ -720,14 +721,15 @@ def validate_parquet(seasons, tier, books):
             f"extra {sorted(set(df['role'].unique()) - role_set)}")
         chk((df["season"].astype(str) == str(season)).all(), "season: matches file")
         chk((df["group"] == group).all(), "group: matches file")
-        # Point present for line markets, absent for moneyline.
-        ml = df[df["market"].isin(_MONEYLINE_MARKETS)]
-        line = df[~df["market"].isin(_MONEYLINE_MARKETS)]
+        # Point present for line markets, absent for point-less ones (moneyline +
+        # yes/no props like player_anytime_td).
+        ml = df[df["market"].isin(_NO_POINT_MARKETS)]
+        line = df[~df["market"].isin(_NO_POINT_MARKETS)]
         chk(ml["point"].isna().all() if len(ml) else True,
-            "point: null for moneyline (h2h)",
+            "point: null for moneyline/yes-no (h2h, anytime_td)",
             f"{int(ml['point'].notna().sum())} unexpected points")
         chk(line["point"].notna().all() if len(line) else True,
-            "point: present for totals/spreads/props",
+            "point: present for totals/spreads/over-under props",
             f"{int(line['point'].isna().sum())} missing points")
         # No duplicate lines on the natural grain. Team must be exact; props tolerate
         # the rare raw-API double-listing (same outcome, two prices) — collapsed on load.

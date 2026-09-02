@@ -30,10 +30,10 @@ repo `deploy/notes/`; project files should NOT accumulate in C:/tmp.
 
 ## Commit / push discipline
 - **Commit proactively.** After a self-contained, verified change (py_compile / tests green), commit directly to `main` without asking. Doug reviews commits after the fact. (This superseded the old "never commit unless asked" rule.)
-- **NEVER push** — Doug runs `git push` himself; commits accumulate locally unpushed until he does.
+- **Push only on EXPLICIT authorization** (updated 2026-09-02). Default is still don't-push — commits accumulate locally. But when Doug explicitly says to push (e.g. "push it", "you can push"), I MAY run `git push`, and then I record the push in memory myself (shipped SHAs + what's now live/deployed) so Doug doesn't have to tell me he pushed. A general go-ahead on WORK is NOT push authorization — it must name the push. When in doubt, commit and ask.
 - Commit message ends with the `Co-Authored-By` trailer.
 - **Never commit `.streamlit/secrets.toml`** (gitignored live Azure + Odds API creds).
-- **Push = deploy** (Streamlit Cloud) → it's the durable sync point. When Doug says he pushed, update the relevant topic memory to the now-pushed/deployed state (record shipped SHAs + what's live vs still pending).
+- **Push = deploy** (Streamlit Cloud) → it's the durable sync point. On any push (mine-when-authorized or Doug's), update the relevant topic memory to the now-pushed/deployed state (record shipped SHAs + what's live vs still pending).
 
 ## Betting books — DK, FanDuel AND bet365 (all executable)
 - Doug bets at **DraftKings, FanDuel, AND bet365** (FD added 2026-08-27; bet365 added 2026-09-01). A bet best-priced at any of the three is actionable; **line-shopping across DK/FD/bet365 is a legit profit lever** (take the edge at whichever prices it best).

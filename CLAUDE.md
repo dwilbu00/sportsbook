@@ -21,7 +21,7 @@ so any machine gets it via `git pull`). At the start of substantive work:
 
 ## Standing rules (safety-critical — full versions in `memory/preferences.md`)
 
-- **Commit** proactively to `main` after verified changes; **NEVER `git push`** (Doug pushes).
+- **Commit** proactively to `main` after verified changes. **Push only on Doug's EXPLICIT authorization** (he names the push); then record the push in memory. Default: commit, don't push.
 - Bets execute at **DraftKings AND FanDuel** only; all other books (Pinnacle, etc.) are
   analysis-only — never recommend/display their prices or size off them.
 - **Confirm before any real spend** (Odds API credits, paid backfills): one explicit
