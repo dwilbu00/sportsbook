@@ -188,6 +188,10 @@ def purge(eng, apply=False, force=False):
     after = snapshot_counts(eng)
     print(f"  PURGE done. Now: odds_snapshot={after['snapshot_total']}, "
           f"odds_line={after['line_total']}.")
+    if after["snapshot_total"] or after["line_total"]:
+        raise SystemExit(
+            f"PURGE INCOMPLETE: odds_snapshot={after['snapshot_total']}, "
+            f"odds_line={after['line_total']} still present — aborting before --load.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -406,16 +410,28 @@ def verify(eng, sport, books, sample=2000):
     # Coverage the OTHER direction: parquet closing lines missing from the warehouse
     # (an empty/incomplete reload or a write-once drop would show up here).
     missing_from_wh = sum(1 for k in par if k not in seen)
+    # Purge-completeness: after a reload the ONLY snapshots for this sport must be the
+    # three role sources. Any legacy source surviving = the purge was skipped/incomplete
+    # (verify's parity is scoped to source='closing', so it would otherwise MISS a
+    # warehouse still carrying the mixed-timing/40-book legacy corpus the reload exists
+    # to eliminate).
+    with eng.connect() as c:
+        legacy = c.execute(text(
+            "SELECT COUNT(*) FROM odds_snapshot WHERE sport=:sp AND "
+            "(source IS NULL OR source NOT IN ('early_12h','early_4h','closing'))"),
+            {"sp": sport_key}).scalar() or 0
     print(f"\n  PRICE PARITY (closing team moneyline+total): {match:,} match, "
           f"{mism:,} mismatch, {miss:,} warehouse-rows-not-in-parquet "
           f"(of {tot:,} warehouse rows); {missing_from_wh:,} parquet lines "
-          f"MISSING from warehouse (of {len(par):,}).")
+          f"MISSING from warehouse (of {len(par):,}); {legacy:,} legacy/non-role "
+          f"snapshots surviving.")
     for e in examples:
         print(f"    MISMATCH {e}")
-    # OK requires: warehouse non-empty, zero price mismatches, and near-complete
-    # parquet→warehouse coverage (tiny gap tolerated for empty/lag games).
+    # OK requires: warehouse non-empty, zero price mismatches, near-complete
+    # parquet→warehouse coverage (tiny gap tolerated for empty/lag games), and ZERO
+    # legacy snapshots (purge actually happened).
     cover_ok = missing_from_wh <= 0.02 * max(len(par), 1)
-    ok = (tot > 0 and mism == 0 and cover_ok)
+    ok = (tot > 0 and mism == 0 and cover_ok and legacy == 0)
     if ok:
         print("  === VERIFY OK ===")
     else:
@@ -426,6 +442,8 @@ def verify(eng, sport, books, sample=2000):
             why.append(f"{mism} price mismatches")
         if not cover_ok:
             why.append(f"{missing_from_wh}/{len(par)} parquet lines missing from wh")
+        if legacy:
+            why.append(f"{legacy} legacy/non-role snapshots survive (purge incomplete)")
         print(f"  === VERIFY FAILED: {'; '.join(why)} ===")
 
 
