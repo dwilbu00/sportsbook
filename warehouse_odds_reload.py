@@ -212,7 +212,7 @@ def _kinds_for_group(group):
 
 
 def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
-         apply=False, limit=0, progress_every=500):
+         apply=False, limit=0, progress_every=500, workers=12):
     """Reload one sport's odds from the precise cache. Drives off backfill_precise's
     PLAN (role explicit per offset), reads each cached payload (0 credits), emits
     PER-BOOK lines via ingest_multibook_cache._per_book_lines (byte-identical to live
@@ -261,7 +261,14 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
     n = 0
 
     mode = "APPLY (writing)" if apply else "DRY-RUN (no writes)"
-    print(f"\n=== LOAD precise → warehouse [{mode}] sport={bp.SPORT_KEY} ===")
+    print(f"\n=== LOAD precise → warehouse [{mode}] sport={bp.SPORT_KEY} "
+          f"workers={workers} ===")
+
+    # Build the work list: one cached payload per (game, group, offset); a worker emits
+    # 1-2 kind-snapshots from it. Parallelised because the cost is one transaction +
+    # commit round-trip per snapshot over Azure latency — serial that is ~55k×latency
+    # for MLB. Threads overlap the network waits (each capture uses its own pooled conn).
+    tasks = []
     for g in games:
         eid = id_by_pk.get(g["game_pk"])
         if not eid:
@@ -272,67 +279,76 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
             markets_csv = ",".join(markets)
             for hours_before, role in offsets:
                 ts = bp._offset_ts(g["commence"], hours_before)
-                if not bp.is_historical_event_cached(bp.SPORT_KEY, eid, ts,
-                                                     regions=regions,
-                                                     markets=markets_csv,
-                                                     bookmakers=books):
-                    pending += 1
+                tasks.append((g, eid, group, markets_csv, regions, ts, role))
+    if limit:
+        tasks = tasks[:limit]
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    lock = threading.Lock()
+    st = {"n": 0, "written": 0, "skipped": 0, "errors": 0, "pending": 0, "empty": 0}
+
+    def _work(task):
+        g, eid, group, markets_csv, regions, ts, role = task
+        if not bp.is_historical_event_cached(bp.SPORT_KEY, eid, ts, regions=regions,
+                                             markets=markets_csv, bookmakers=books):
+            with lock:
+                st["pending"] += 1
+            return
+        data, snap = bp.get_historical_event_odds(
+            api_key=None, sport=bp.SPORT_KEY, event_id=eid, date=ts,
+            regions=regions, markets=markets_csv, bookmakers=books)
+        if not data:
+            with lock:
+                st["empty"] += 1
+            return
+        source = ROLE_TO_SOURCE[role]
+        snapshot_hour = wh._hour_bucket(ts)   # rigid per-role hour (uq safe)
+        commence = data.get("commence_time") or g["commence"]
+        for kind in _kinds_for_group(group):
+            lines = im._per_book_lines(data, kind)
+            if not lines:
+                continue
+            meta = {
+                "sport": bp.SPORT_KEY, "game_date": commence[:10],
+                "event_id": eid, "kind": kind,
+                "snapshot_hour": snapshot_hour, "captured_at": snap,
+                "commence_time": commence,
+                "home": data.get("home_team"), "away": data.get("away_team"),
+                "regions": regions, "markets": _KIND_MARKETS.get(kind, markets_csv),
+                "bookmakers": ",".join(books), "source": source,
+            }
+            # enrich caches are shared; GIL-safe dict ops, benign double-compute.
+            meta, lines = im._enrich_lines_fast(
+                bp.SPORT_KEY, meta, lines, gpk_cache, id_cache)
+            ok = None
+            if apply:
+                try:
+                    ok = db_store.capture_odds_snapshot(meta, lines)
+                except Exception as exc:
+                    with lock:
+                        st["errors"] += 1
+                        if st["errors"] <= 5:
+                            print(f"  [err] {eid} {kind}/{source}: "
+                                  f"{type(exc).__name__} ({exc})")
                     continue
-                data, snap = bp.get_historical_event_odds(
-                    api_key=None, sport=bp.SPORT_KEY, event_id=eid, date=ts,
-                    regions=regions, markets=markets_csv, bookmakers=books)
-                if not data:
-                    empty += 1
-                    continue
-                source = ROLE_TO_SOURCE[role]
-                # Bucket on the REQUESTED offset `ts` (−12h/−4h/−10min → three distinct
-                # UTC hours), NOT the served `snap`: uq_odds_snapshot is
-                # (sport,game_date,event_id,kind,snapshot_hour) with NO source, so two
-                # roles whose served snapshots landed in the same hour (archive gap /
-                # late props) would collide and one window would be silently dropped.
-                # captured_at still records the true served time (snap) for provenance.
-                snapshot_hour = wh._hour_bucket(ts)
-                commence = data.get("commence_time") or g["commence"]
-                for kind in _kinds_for_group(group):
-                    lines = im._per_book_lines(data, kind)
-                    if not lines:
-                        continue
-                    meta = {
-                        "sport": bp.SPORT_KEY, "game_date": commence[:10],
-                        "event_id": eid, "kind": kind,
-                        "snapshot_hour": snapshot_hour, "captured_at": snap,
-                        "commence_time": commence,
-                        "home": data.get("home_team"), "away": data.get("away_team"),
-                        "regions": regions,
-                        "markets": _KIND_MARKETS.get(kind, markets_csv),
-                        "bookmakers": ",".join(books), "source": source,
-                    }
-                    meta, lines = im._enrich_lines_fast(
-                        bp.SPORT_KEY, meta, lines, gpk_cache, id_cache)
-                    snaps[(kind, source)] += 1
-                    src_lines[source] += len(lines)
-                    for ln in lines:
-                        books_ct[ln.get("bookmaker")] += 1
-                    if apply:
-                        try:
-                            ok = db_store.capture_odds_snapshot(meta, lines)
-                            written += 1 if ok else 0
-                            skipped += 0 if ok else 1
-                        except Exception as exc:
-                            errors += 1
-                            if errors <= 5:
-                                print(f"  [err] {eid} {kind}/{source}: "
-                                      f"{type(exc).__name__} ({exc})")
-                    n += 1
-                    if progress_every and n % progress_every == 0:
-                        print(f"  …{n:,} snapshots "
-                              f"({'written ' + format(written, ',') if apply else 'dry-run'})")
-                if limit and n >= limit:
-                    break
-            if limit and n >= limit:
-                break
-        if limit and n >= limit:
-            break
+            with lock:
+                snaps[(kind, source)] += 1
+                src_lines[source] += len(lines)
+                for ln in lines:
+                    books_ct[ln.get("bookmaker")] += 1
+                if apply:
+                    st["written"] += 1 if ok else 0
+                    st["skipped"] += 0 if ok else 1
+                st["n"] += 1
+                nn = st["n"]
+            if progress_every and nn % progress_every == 0:
+                print(f"  …{nn:,} snapshots ({'written ' + format(st['written'], ',') if apply else 'dry-run'})")
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        list(ex.map(_work, tasks))
+    pending, empty = st["pending"], st["empty"]
+    written, skipped, errors, n = st["written"], st["skipped"], st["errors"], st["n"]
 
     print(f"\n  snapshots {'written' if apply else 'planned'}: {n:,}")
     for (kind, source) in sorted(snaps):
@@ -492,6 +508,9 @@ def main():
     p.add_argument("--books", default="draftkings,fanduel,pinnacle")
     p.add_argument("--limit", type=int, default=0,
                    help="Cap snapshots processed (0=all); for a fast dry-run sample.")
+    p.add_argument("--workers", type=int, default=12,
+                   help="Concurrent write workers for --load (default 12). Overlaps the "
+                        "per-snapshot Azure round-trip; each uses its own pooled conn.")
     p.add_argument("--chunksize", type=int, default=200_000,
                    help="odds_line read chunk size for the backup stream.")
     args = p.parse_args()
@@ -519,7 +538,7 @@ def main():
     if args.load:
         load(eng, args.sport, seasons, args.tier, books,
              date_from=args.date_from, date_to=args.date_to,
-             apply=apply, limit=args.limit)
+             apply=apply, limit=args.limit, workers=args.workers)
         return
     if args.verify:
         verify(eng, args.sport, books)
