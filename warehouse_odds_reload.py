@@ -172,16 +172,26 @@ def purge(eng, apply=False, force=False):
     dialect = eng.dialect.name
     print(f"  PURGE (dialect={dialect}) — emptying odds_line + odds_snapshot…")
     if dialect == "mssql":
+        # DELETE, not TRUNCATE: TRUNCATE (and ALTER for the FK dance) needs DDL/ALTER
+        # permission the app SQL login lacks (db_datawriter has only DELETE). Delete the
+        # child (odds_line) in COMMITTED batches so the transaction log stays bounded on
+        # the ~3.7M-row table and the Azure round-trip never times out, then the small
+        # parent (odds_snapshot). Child-first respects the FK — no constraint drop.
+        # Non-atomic but idempotent: re-running continues until both are empty (and the
+        # --backup restore point exists regardless).
+        deleted = 0
+        while True:
+            with eng.begin() as c:
+                r = c.execute(text("DELETE TOP (100000) FROM odds_line"))
+            n = r.rowcount or 0
+            deleted += n
+            if n:
+                print(f"    … deleted {deleted:,} odds_line rows")
+            if n == 0:
+                break
         with eng.begin() as c:
-            c.execute(text("TRUNCATE TABLE odds_line"))
-            c.execute(text("ALTER TABLE odds_line "
-                           "DROP CONSTRAINT fk_odds_line_snapshot"))
-            c.execute(text("TRUNCATE TABLE odds_snapshot"))
-            c.execute(text(
-                "ALTER TABLE odds_line ADD CONSTRAINT fk_odds_line_snapshot "
-                "FOREIGN KEY (snapshot_id) REFERENCES odds_snapshot(id) "
-                "ON DELETE CASCADE"))
-    else:  # sqlite / others: no TRUNCATE, but CASCADE or child-first DELETE works
+            c.execute(text("DELETE FROM odds_snapshot"))
+    else:  # sqlite / others: no TRUNCATE, but child-first DELETE works
         with eng.begin() as c:
             c.execute(text("DELETE FROM odds_line"))
             c.execute(text("DELETE FROM odds_snapshot"))
