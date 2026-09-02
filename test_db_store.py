@@ -26,8 +26,16 @@ class _SqliteBackend:
         recalibration._LOAD_CACHE.clear()
         db_store.configure_engine("sqlite://")
         db_store.create_all()
+        # Isolate the SQL reader/assembler under test from the machine's real
+        # warehouse-mirror parquet (load_team_market_store/load_prop_lines are now
+        # mirror-first). Force the mirror OFF so these read the seeded SQLite only.
+        import warehouse_mirror as _wm
+        self._wm_enabled = _wm.enabled
+        _wm.enabled = lambda: False
 
     def tearDown(self):
+        import warehouse_mirror as _wm
+        _wm.enabled = self._wm_enabled
         db_store.configure_engine(None)  # → enabled() False (no SQL_* env)
         recalibration._NDJSON_CACHE.clear()
         recalibration._LOAD_CACHE.clear()

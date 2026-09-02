@@ -888,6 +888,46 @@ def _snapshot_source(snapshot):
     return snapshot if snapshot in _ROLE_SNAPSHOTS else None
 
 
+def _mirror_first_team_lines(sport_key, dates=None, snapshot_source=None):
+    """Mirror-first team-market read — parquet (0 DTU on the 20-DTU tier) with Azure
+    fallback. The season-keyed mirror can't serve a fully-unscoped read, so when
+    `dates` is None we read per-YEAR (the mirror serves each; a year with no mirror
+    file falls back to _db, which returns fast for empty years)."""
+    def _one(**kw):
+        try:
+            import warehouse_mirror as _wm
+            if _wm.enabled():
+                r = _wm.team_market_lines(sport_key, snapshot_source=snapshot_source,
+                                          **kw)
+                if r is not None:
+                    return r
+        except Exception:
+            pass
+        return _db.team_market_lines(sport_key, snapshot_source=snapshot_source, **kw)
+    if dates:
+        return _one(dates=dates)
+    import datetime as _dt
+    out = []
+    for _yr in range(2019, _dt.date.today().year + 2):
+        out.extend(_one(date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31"))
+    return out
+
+
+def _mirror_first_prop_lines(sport_key, **kw):
+    """Mirror-first player-prop read (parquet, 0 DTU) with Azure fallback. load_prop_
+    lines already scopes each call by season (dates or date_from/date_to), so the
+    season-keyed mirror can serve it; a missing season file falls back to _db."""
+    try:
+        import warehouse_mirror as _wm
+        if _wm.enabled():
+            r = _wm.player_prop_lines(sport_key, **kw)
+            if r is not None:
+                return r
+    except Exception:
+        pass
+    return _db.player_prop_lines(sport_key, **kw)
+
+
 def load_team_market_store(sport_key, dates=None, include_sbr=False,
                            snapshot="close"):
     """Assemble a historical_odds-shaped store from the SQL warehouse's captured
@@ -933,7 +973,7 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False,
         # exactly; bare 'early' raises (ambiguous). Legacy only_early kept for the
         # pre-precise 'backfill_early' rows (harmless once purged).
         _src = _snapshot_source(snapshot)
-        rows = _db.team_market_lines(sport_key, dates=dates, snapshot_source=_src)
+        rows = _mirror_first_team_lines(sport_key, dates=dates, snapshot_source=_src)
     except Exception as e:
         _ops.ops_event("database_failure", op="team_market_lines",
                        sport=sport_key, error=type(e).__name__)
@@ -1094,14 +1134,14 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
 
     try:
         if dates:
-            _assemble(_db.player_prop_lines(
+            _assemble(_mirror_first_prop_lines(
                 sport_key, dates=dates, exclude_early=_excl_early,
                 only_early=_only_early, prop_keys=prop_keys, snapshot_source=_src))
         else:
             # Empty years return fast (indexed sport+game_date scan finds nothing).
             import datetime as _dt
             for _yr in range(2019, _dt.date.today().year + 2):
-                _assemble(_db.player_prop_lines(
+                _assemble(_mirror_first_prop_lines(
                     sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
                     exclude_early=_excl_early, only_early=_only_early,
                     prop_keys=prop_keys, snapshot_source=_src))

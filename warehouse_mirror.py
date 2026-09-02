@@ -244,10 +244,17 @@ def _seasons_from(dates=None, date_from=None, date_to=None):
     return yrs
 
 
-def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker):
+def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker,
+                only_early=False, exclude_early=False, snapshot_source=None):
     """Shared team/prop reader: concat the season×book parquet(s), apply the same
-    date filter the SQL reader would. Returns None if ANY needed season file is
-    missing (so the caller falls back to Azure for the whole call)."""
+    date + source filter the SQL reader would. Returns None if ANY needed season file
+    is missing (so the caller falls back to Azure for the whole call).
+
+    Source (snapshot-window) filtering mirrors db_store: `snapshot_source` keeps that
+    exact window (early_12h/early_4h/closing); legacy only_early/exclude_early key on
+    'backfill_early'. If a source filter is requested but the mirror parquet predates
+    the `source` column (stale mirror), return None → fall back to Azure + signal a
+    re-sync is needed."""
     import pandas as pd
     seasons = _seasons_from(dates, date_from, date_to)
     if not seasons:
@@ -270,22 +277,31 @@ def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker):
             all_df = all_df[all_df["game_date"] >= str(date_from)]
         if date_to is not None:
             all_df = all_df[all_df["game_date"] <= str(date_to)]
+    if only_early or exclude_early or snapshot_source is not None:
+        if "source" not in all_df.columns:
+            return None                       # stale mirror (pre-source) -> re-sync/Azure
+        if snapshot_source is not None:
+            all_df = all_df[all_df["source"] == snapshot_source]
+        elif only_early:
+            all_df = all_df[all_df["source"] == "backfill_early"]
+        elif exclude_early:
+            all_df = all_df[all_df["source"].isna()
+                            | (all_df["source"] != "backfill_early")]
     return _records(all_df)
 
 
 def team_market_lines(sport, dates=None, date_from=None, date_to=None,
                       only_early=False, bookmaker="draftkings", snapshot_source=None):
-    if only_early or snapshot_source is not None:
-        return None                           # not mirrored -> Azure
-    return _odds_lines(_team_file, sport, dates, date_from, date_to, bookmaker)
+    return _odds_lines(_team_file, sport, dates, date_from, date_to, bookmaker,
+                       only_early=only_early, snapshot_source=snapshot_source)
 
 
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                       exclude_early=False, only_early=False, prop_keys=None,
                       bookmaker="draftkings", snapshot_source=None):
-    if only_early or exclude_early or snapshot_source is not None:
-        return None                           # not mirrored -> Azure
-    rows = _odds_lines(_prop_file, sport, dates, date_from, date_to, bookmaker)
+    rows = _odds_lines(_prop_file, sport, dates, date_from, date_to, bookmaker,
+                       only_early=only_early, exclude_early=exclude_early,
+                       snapshot_source=snapshot_source)
     if rows is not None and prop_keys:
         keys = set(prop_keys)
         rows = [r for r in rows if r.get("prop_key") in keys]
