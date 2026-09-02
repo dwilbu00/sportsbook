@@ -342,9 +342,13 @@ def load(eng, sport, seasons, tier, books, date_from=None, date_to=None,
                     st["skipped"] += 0 if ok else 1
                 st["n"] += 1
                 nn = st["n"]
-            if progress_every and nn % progress_every == 0:
-                print(f"  …{nn:,} snapshots ({'written ' + format(st['written'], ',') if apply else 'dry-run'})")
+            if progress_every and (nn in (1, 5, 25, 100) or nn % progress_every == 0):
+                print(f"  …{nn:,}/{len(tasks):,} snapshots "
+                      f"({'written ' + format(st['written'], ',') if apply else 'dry-run'})",
+                      flush=True)
 
+    print(f"  Dispatching {len(tasks):,} tasks across {max(1, int(workers))} "
+          f"workers…", flush=True)
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
         list(ex.map(_work, tasks))
     pending, empty = st["pending"], st["empty"]
