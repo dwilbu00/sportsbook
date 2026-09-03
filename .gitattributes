@@ -1,0 +1,1 @@
+warehouse_mirror_data/**/*.parquet filter=lfs diff=lfs merge=lfs -text
