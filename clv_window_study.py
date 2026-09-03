@@ -35,6 +35,7 @@ Usage (run on the fast box; reads the LFS-materialized mirror):
 import argparse
 import statistics as stats
 
+import db_store as _db
 import warehouse as _wh
 import warehouse_mirror as _mir
 from odds_client import devig_two_way, american_to_implied_prob
@@ -228,6 +229,11 @@ def main():
     ap.add_argument("--props", action="store_true",
                     help="include the props section (slower; team-only by default)")
     args = ap.parse_args()
+    # Promote SQL_* + gate flags from secrets.toml so _sql() is on and the store
+    # loaders pass their SQL-configured gate — the mirror then serves reads at 0 DTU
+    # (SQL is only the fallback for any mirror-missing slice). Without this the loaders
+    # return empty on a box whose creds live only in secrets.toml. Same as the other CLIs.
+    _db.promote_secrets_from_toml()
     sports = ["mlb", "nba", "nfl"] if args.sport == "all" else [args.sport]
     seasons = [x.strip() for x in args.seasons.split(",") if x.strip()]
     print(f"reading from: {_mir.source_label()}  (mirror enabled={_mir.enabled()})  "
