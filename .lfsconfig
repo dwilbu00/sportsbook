@@ -6,9 +6,8 @@
 #     correct there (warehouse_mirror._read treats the leftover pointer stubs as absent);
 #   - this keeps GitHub LFS bandwidth (1GB/mo free) from being spent on every rebuild.
 #
-# To MATERIALIZE the mirror on a dev machine, override the exclude explicitly:
-#   git lfs pull -I "warehouse_mirror_data/**" -X ""
-# or make normal pulls fetch it on this machine once:
+# To MATERIALIZE the mirror on a dev machine, clear the exclude locally once, then pull
+# (the `-X ""` inline form is rejected by some git-lfs versions — use the config form):
 #   git config lfs.fetchexclude ""   &&   git lfs pull
 [lfs]
 	fetchexclude = warehouse_mirror_data/**

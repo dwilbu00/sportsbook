@@ -103,8 +103,9 @@ so a PLAIN clone/checkout (Streamlit Cloud, CI) pulls only ~130B pointer stubs �
 download bandwidth** (GitHub free tier = 1GB storage + 1GB/mo bandwidth; blobs already live on
 GitHub as of push of 79d9db3). `_read()` magic-byte-checks (`PAR1`) and treats pointer stubs as
 absent → readers fall back to Azure automatically on a pointer-only checkout (no crash). **To
-materialize the mirror on a dev machine:** `git lfs pull -I "warehouse_mirror_data/**" -X ""`
-(or once: `git config lfs.fetchexclude ""` then normal `git lfs pull`). Verified via fresh local
+materialize the mirror on a dev machine (once):** `git config lfs.fetchexclude "" && git lfs pull`
+(the inline `-X ""` form is REJECTED by some git-lfs versions — use the config-clear form).
+Verified via fresh local
 clone: stubs by default, opt-in pull fetches real blobs. ⚠ LFS keeps EVERY version of each blob
 — frequent full re-syncs accumulate against the 1GB storage cap; `git lfs prune` (local) helps.
 

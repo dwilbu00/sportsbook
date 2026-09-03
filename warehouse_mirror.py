@@ -12,8 +12,9 @@ machines via `git pull`, but `.lfsconfig` EXCLUDES `warehouse_mirror_data/` from
 downloads by default — so a plain clone (production Streamlit Cloud, CI) gets only
 tiny pointer stubs, never the ~40MB of blobs. `_read()` treats those stubs as absent,
 so the readers fall back to Azure automatically there. To materialize the mirror on a
-dev machine: `git lfs pull -I "warehouse_mirror_data/**" -X ""` (or set
-`git config lfs.fetchexclude ""` once, then a normal `git lfs pull`).
+dev machine, clear the exclude locally once then pull:
+`git config lfs.fetchexclude "" && git lfs pull` (the inline `-X ""` form is rejected
+by some git-lfs versions).
 
 Design:
 - `sync()` pulls each read-only table from Azure and writes parquet (season-keyed).
