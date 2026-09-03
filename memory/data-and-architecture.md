@@ -85,8 +85,9 @@ data local).
 BY DEFAULT for backtests — set `ODI_BACKTEST_MIRROR=0` to force the live Azure path.
 All four backtest tools call `warehouse_mirror.autobuild(sport, seasons)` in
 `load_or_fetch`, so the manual `--sync` is OPTIONAL — the first run auto-syncs missing
-files and verifies them. (Production Streamlit Cloud has no mirror dir → `enabled()`
-False → Azure path, so live serving is unaffected; the refit reads Azure directly.) Verification is expensive (queries
+files and verifies them. (Production Streamlit Cloud only gets LFS *pointer stubs* for
+the mirror (see LFS note below) → `_read()` treats them as absent → Azure path, so live
+serving is unaffected; the refit reads Azure directly.) Verification is expensive (queries
 Azure), so a file that PASSES `--verify` is renamed `X.parquet → X_valid.parquet`;
 readers prefer the `_valid` copy; a fresh sync drops any stale `_valid` (data changed
 → must re-verify); a failing verify demotes `_valid → base`. `ensure()` FAST-PATHs to
@@ -94,6 +95,18 @@ instant (no Azure) once every needed file is `_valid`, so verification happens O
 per file, not per run. No-DB box: leaves files as-is (readers fall back). CLIs:
 `--sync`, `--verify`, `--refresh` (re-sync), per-tool `--refresh-mirror` (re-sync +
 re-verify); `ODI_BACKTEST_MIRROR=0` to force Azure. Tests: test_warehouse_mirror.py (14).
+
+**MIRROR IN GIT LFS (2026-09-03) — share across machines:** `warehouse_mirror_data/*.parquet`
+(~42MB, 73 files: MLB/NBA/NFL odds + MLB fact tables) is tracked in Git LFS (`.gitattributes`)
+and committed to `main` (was gitignored). `.lfsconfig` sets `fetchexclude=warehouse_mirror_data/**`
+so a PLAIN clone/checkout (Streamlit Cloud, CI) pulls only ~130B pointer stubs — **zero LFS
+download bandwidth** (GitHub free tier = 1GB storage + 1GB/mo bandwidth; blobs already live on
+GitHub as of push of 79d9db3). `_read()` magic-byte-checks (`PAR1`) and treats pointer stubs as
+absent → readers fall back to Azure automatically on a pointer-only checkout (no crash). **To
+materialize the mirror on a dev machine:** `git lfs pull -I "warehouse_mirror_data/**" -X ""`
+(or once: `git config lfs.fetchexclude ""` then normal `git lfs pull`). Verified via fresh local
+clone: stubs by default, opt-in pull fetches real blobs. ⚠ LFS keeps EVERY version of each blob
+— frequent full re-syncs accumulate against the 1GB storage cap; `git lfs prune` (local) helps.
 
 **Two-layer backtest cache:** each tool also keeps a per-tool PICKLE of the assembled
 blob (triads/indexes/prop rows) at `deploy/backtest_cache/` (project-local, gitignored;
