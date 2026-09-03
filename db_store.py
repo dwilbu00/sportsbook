@@ -1437,6 +1437,9 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
+               # team bet_types only live under team/first_five snapshots — filtering
+               # kind lets the JOIN skip props snapshots (result-identical, faster read).
+               & odds_snapshot.c.kind.in_(("team", "first_five"))
                & odds_line.c.bet_type.in_(("moneyline", "spread", "total")))
     )
     # DK-parity (multibook per-book grain); 'draftkings' also matches legacy NULL.
@@ -1532,6 +1535,9 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
         )
         .select_from(joined)
         .where((odds_snapshot.c.sport == sport)
+               # player_prop lines only live under props snapshots — filtering kind
+               # lets the JOIN skip team/first_five snapshots (result-identical, faster).
+               & (odds_snapshot.c.kind == "props")
                & (odds_line.c.bet_type == "player_prop"))
     )
     # DK-parity (multibook per-book grain); 'draftkings' also matches legacy NULL.
