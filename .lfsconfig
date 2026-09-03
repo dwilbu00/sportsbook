@@ -1,0 +1,14 @@
+# Exclude the warehouse mirror from LFS downloads BY DEFAULT.
+#
+# The parquet blobs are LFS-tracked (.gitattributes) so they can be shared across dev
+# machines, but a plain `git clone`/checkout should NOT pull the ~40MB of blobs:
+#   - production Streamlit Cloud + CI only need the code, and reading Azure directly is
+#     correct there (warehouse_mirror._read treats the leftover pointer stubs as absent);
+#   - this keeps GitHub LFS bandwidth (1GB/mo free) from being spent on every rebuild.
+#
+# To MATERIALIZE the mirror on a dev machine, override the exclude explicitly:
+#   git lfs pull -I "warehouse_mirror_data/**" -X ""
+# or make normal pulls fetch it on this machine once:
+#   git config lfs.fetchexclude ""   &&   git lfs pull
+[lfs]
+	fetchexclude = warehouse_mirror_data/**

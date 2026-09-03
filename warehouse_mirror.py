@@ -5,8 +5,15 @@ All four backtest tools (r2_backtest, coherence_backtest, f5_backtest,
 scenario_backtest) read through this BY DEFAULT when the mirror exists — one shared
 local columnar store instead of every tool re-hitting Azure on every run. Set
 `ODI_BACKTEST_MIRROR=0` to force the live Azure path. The CALIBRATION REFIT reads
-Azure directly (it needs the full ESPN-shape gamelogs); production Streamlit Cloud has
-no mirror dir → the readers use Azure there automatically.
+Azure directly (it needs the full ESPN-shape gamelogs).
+
+The parquet blobs are stored in Git LFS (see `.gitattributes`) so they travel across
+machines via `git pull`, but `.lfsconfig` EXCLUDES `warehouse_mirror_data/` from LFS
+downloads by default — so a plain clone (production Streamlit Cloud, CI) gets only
+tiny pointer stubs, never the ~40MB of blobs. `_read()` treats those stubs as absent,
+so the readers fall back to Azure automatically there. To materialize the mirror on a
+dev machine: `git lfs pull -I "warehouse_mirror_data/**" -X ""` (or set
+`git config lfs.fetchexclude ""` once, then a normal `git lfs pull`).
 
 Design:
 - `sync()` pulls each read-only table from Azure and writes parquet (season-keyed).
@@ -109,13 +116,27 @@ def _demote(name):
         os.replace(vp, base)
 
 
+def _is_real_parquet(path):
+    """True iff `path` is an actual parquet file (magic bytes 'PAR1'), not a Git-LFS
+    pointer. A pointer-only checkout (e.g. Streamlit Cloud, or a fresh clone before
+    `git lfs pull`) leaves ~130-byte text stubs where the blobs go; treating those as
+    absent makes every reader fall back to Azure automatically instead of crashing on
+    a bad parquet read."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"PAR1"
+    except OSError:
+        return False
+
+
 def _read(name):
     """Read a mirror parquet -> DataFrame, preferring the _valid (verified) copy, then
-    the unverified base, else None (caller falls back to Azure)."""
+    the unverified base, else None (caller falls back to Azure). LFS-pointer stubs are
+    treated as absent (see `_is_real_parquet`)."""
     import pandas as pd
     for n in (_valid_name(name), name):
         p = _path(n)
-        if os.path.exists(p):
+        if os.path.exists(p) and _is_real_parquet(p):
             return pd.read_parquet(p)
     return None
 
