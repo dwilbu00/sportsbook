@@ -188,6 +188,14 @@ def sync(sport, seasons, refresh=False, verbose=True):
 
 
 def _sync_facts(sport, seasons, refresh, verbose):
+    # The game/pitcher/batter fact tables are MLB-ONLY (mlb_game, mlb_pitcher_game,
+    # mlb_batter_game). Without this guard a --sport nba/nfl sync would dump MLB data
+    # into nba/nfl-named files (mlb_game__basketball_nba.parquet etc.). NBA/NFL fact
+    # mirrors await their own stats warehouse ([[wishlist]]).
+    if not str(sport).startswith("baseball"):
+        if verbose:
+            print(f"  [facts] skipped — {sport} has no MLB-style fact tables.")
+        return
     import mlb_warehouse as wh
     import db_store
     from sqlalchemy import select as _select
