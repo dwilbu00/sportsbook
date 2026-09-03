@@ -548,10 +548,23 @@ def main():
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--refresh", action="store_true",
                     help="overwrite existing files (else skip; 2024/25 are immutable)")
+    ap.add_argument("--timeout", type=int, default=600,
+                    help="SQL query timeout (s) for the bulk pulls — 60s (live default) "
+                         "intermittently times out ~200k-row prop reads on a low-DTU "
+                         "tier under throttle. Default 600.")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
         configure_stdio()
+    except Exception:
+        pass
+    # Raise the query timeout for the bulk reads, then reset any cached engine so it
+    # rebuilds with it (get_engine reads SQL_TIMEOUT at build time).
+    import os as _os
+    _os.environ["SQL_TIMEOUT"] = str(args.timeout)
+    try:
+        import db_store as _dbs
+        _dbs.configure_engine(None)
     except Exception:
         pass
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]

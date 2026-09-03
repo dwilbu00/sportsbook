@@ -706,12 +706,17 @@ def get_engine():
             # into one parameterized round-trip (~10x+). Enabled only when the desktop
             # backfill opts into SQL_DRIVER=pyodbc; unset (cloud/pymssql) it is inert.
             is_pyodbc = "pyodbc" in str(url)
+            # Query timeout: 60s is right for the live app, but bulk offline reads
+            # (mirror sync of ~200k-row per-season prop pulls) intermittently exceed
+            # it on a low-DTU tier under throttle. SQL_TIMEOUT (env) raises it for
+            # those tools without affecting the live default.
+            _qt = int(os.environ.get("SQL_TIMEOUT", "60") or 60)
             eng_kwargs = dict(pool_pre_ping=True, pool_recycle=1500)
             if is_pyodbc:
                 eng_kwargs["fast_executemany"] = True
-                eng_kwargs["connect_args"] = {"timeout": 60}
+                eng_kwargs["connect_args"] = {"timeout": _qt}
             else:
-                eng_kwargs["connect_args"] = {"login_timeout": 60, "timeout": 60}
+                eng_kwargs["connect_args"] = {"login_timeout": 60, "timeout": _qt}
             _ENGINE = create_engine(url, **eng_kwargs)
         return _ENGINE
 
