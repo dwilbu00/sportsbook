@@ -216,8 +216,10 @@ class PropMarketStoreTests(unittest.TestCase):
             seen["snapshot_source"] = snapshot_source
             return []
 
+        import warehouse_mirror as _wm
         with patch.object(warehouse, "_sql", return_value=True), \
              patch.object(warehouse, "_ensure_durable"), \
+             patch.object(_wm, "enabled", return_value=False), \
              patch.object(warehouse._db, "player_prop_lines", _fake):
             warehouse.load_prop_lines("baseball_mlb", dates=["2025-07-01"],
                                       snapshot=snapshot)

@@ -1411,8 +1411,9 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
     (warehouse.load_team_market_store) from the growing Azure warehouse instead
     of the local historical_odds JSON. Player props are excluded. Optional date
     filter: ``dates`` (explicit game_date list) OR ``date_from``/``date_to``
-    (inclusive range). Ordered by (event_id, captured_at) so the assembler can
-    pick each event's closing snapshot. Retries transient OperationalErrors like
+    (inclusive range). NO server-side ORDER BY (it times out the Azure round-trip on
+    a low-DTU tier); the assembler groups by event + picks the closing snapshot by
+    captured_at VALUE, never by row order. Retries transient OperationalErrors like
     read_rows (Azure SQL serverless cold-resume safety). Returns row dicts."""
     engine = get_engine()
     joined = odds_line.join(odds_snapshot,
@@ -1451,7 +1452,11 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
             stmt = stmt.where(odds_snapshot.c.game_date >= date_from)
         if date_to is not None:
             stmt = stmt.where(odds_snapshot.c.game_date <= date_to)
-    stmt = stmt.order_by(odds_snapshot.c.event_id, odds_snapshot.c.captured_at)
+    # NO server-side ORDER BY: a sort over the JOIN result times out the Azure
+    # round-trip on a low-DTU tier (the exact reason player_prop_lines dropped its
+    # ORDER BY). The team assembler (_assemble_team_entry) groups rows by snapshot_id
+    # and picks the closing snapshot by captured_at VALUE (_closing_sort_key), never
+    # relying on row order — so this is result-identical and far cheaper.
 
     last_exc = None
     for attempt in range(max_retries):
