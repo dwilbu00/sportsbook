@@ -44,6 +44,19 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MIRROR_DIR = os.environ.get(
     "ODI_MIRROR_DIR", os.path.join(_SCRIPT_DIR, "warehouse_mirror_data"))
 
+# In-process memo for the SMALL, immutable-within-a-run parquets (mlb_game dim + team
+# dim) that get re-read many times per backtest — e.g. the 30-team × per-season defense
+# lookup calls _team_final_games ~90×, each otherwise re-reading + re-parsing mlb_game
+# from disk. One parse per process instead. `_write` clears it so a --sync sees fresh
+# data. Odds/prop parquets are NOT memoized (large, read once per slice).
+_SMALL_MEMO = {}
+
+
+def _memo(key, builder):
+    if key not in _SMALL_MEMO:
+        _SMALL_MEMO[key] = builder()
+    return _SMALL_MEMO[key]
+
 # Books the backtests read (DK-parity 'draftkings' also captures legacy NULL rows,
 # applied in SQL at sync time so the parquet already includes them).
 BOOKS = ("draftkings", "pinnacle", "fanduel")
@@ -150,6 +163,7 @@ def _write(df, name):
     vp = _path(_valid_name(name))       # fresh data invalidates any prior verification
     if os.path.exists(vp):
         os.remove(vp)
+    _SMALL_MEMO.clear()                  # a fresh write invalidates the small-file memo
 
 
 def _team_file(sport, book, season):
@@ -434,7 +448,16 @@ def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
 
 
 def _game_df(sport):
-    return _read(_game_file(sport))
+    return _memo(("game_df", sport), lambda: _read(_game_file(sport)))
+
+
+def _game_records(sport):
+    """Memoized list-of-dicts of the mlb_game dim (re-read ~90× by the defense lookup;
+    parse once). None if the parquet is absent."""
+    def _build():
+        df = _game_df(sport)
+        return _records(df) if df is not None else None
+    return _memo(("game_records", sport), _build)
 
 
 def build_team_scores_index(sport="baseball_mlb"):
@@ -557,13 +580,19 @@ def calib_gamelogs_bulk_full(role, season, sport="baseball_mlb"):
     return out
 
 
-def team_name_map(sport="baseball_mlb"):
-    """{team_id(str): name} from the mirrored team dim (mirror of mlb_warehouse.
-    _team_name_map). None if the team-dim parquet is absent (caller -> Azure)."""
+def _build_team_name_map(sport):
     df = _read(_team_dim_file(sport))
     if df is None:
         return None
     return {str(r.get("team_id")): r.get("name") for r in _records(df)}
+
+
+def team_name_map(sport="baseball_mlb"):
+    """{team_id(str): name} from the mirrored team dim (mirror of mlb_warehouse.
+    _team_name_map). None if the team-dim parquet is absent (caller -> Azure). Memoized;
+    returns a fresh copy so callers may mutate freely."""
+    cached = _memo(("team_name_map", sport), lambda: _build_team_name_map(sport))
+    return dict(cached) if cached is not None else None
 
 
 def team_final_games(team_id, as_of_date=None, season=None, limit=None,
@@ -585,7 +614,7 @@ def team_final_games(team_id, as_of_date=None, season=None, limit=None,
     non_final = [b.lower() for b in mlb_starters._NON_FINAL_DETAILED]
     tid = str(team_id)
     out = []
-    for r in _records(df):
+    for r in _game_records(sport):      # memoized parse (defense lookup calls this ~90×)
         if tid not in (str(r.get("home_team_id")), str(r.get("away_team_id"))):
             continue
         if r.get("status") != "Final":
@@ -632,7 +661,7 @@ def calib_gamelogs_bulk_espn(role, season, sport="baseball_mlb"):
                                           "away_team_id")):
         return None
     gmeta = {r.get("game_pk"): (r.get("game_date"), str(r.get("home_team_id")),
-                                str(r.get("away_team_id"))) for r in _records(gdf)}
+                                str(r.get("away_team_id"))) for r in _game_records(sport)}
     out = {}
     for r in _records(fdf):
         if r.get("game_type") in _NON_REGULAR_GAME_TYPES:
