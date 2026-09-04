@@ -133,6 +133,23 @@ class WarehouseMirrorTests(unittest.TestCase):
         self.assertEqual({r["game_pk"] for r in pit["999"]}, {777})   # spring dropped
         self.assertIs(pit["999"][0]["completed"], True)
 
+    def test_statcast_days_reads_and_filters(self):
+        import savant_history as sh
+        wm._write([
+            dict(zip(sh.PITCH_COLS, ("2024-04-05", "p1", "b1", "R", "TB", "R",
+                                     0.4, 0.35, "hit_into_play", "X", 95.0, 5, 20.0,
+                                     "line_drive"))),
+            dict(zip(sh.PITCH_COLS, ("2024-05-02", "p2", "b2", "L", "NYY", "L",
+                                     0.5, 0.45, "ball", "B", None, None, None, None))),
+        ], wm._statcast_file("2024"))
+        apr = wm.statcast_days("2024-04-01", "2024-04-30")
+        self.assertEqual([r["game_date"] for r in apr], ["2024-04-05"])   # May excluded
+        self.assertEqual(set(apr[0].keys()), set(sh.PITCH_COLS))
+        both = wm.statcast_days("2024-04-01", "2024-05-31")
+        self.assertEqual(len(both), 2)
+        # A season with no file -> None -> caller falls back to Azure.
+        self.assertIsNone(wm.statcast_days("2023-04-01", "2023-04-30"))
+
     def test_game_type_exclusion_parity(self):
         # calib bulk drops S/A/E (matches get_calib_gamelogs_bulk); the as-of pitcher
         # index keeps ALL game types (matches _pitcher_game_index).

@@ -164,6 +164,10 @@ def _game_file(sport):
     return f"mlb_game__{sport}.parquet"
 
 
+def _statcast_file(season):
+    return f"statcast__baseball_mlb__{season}.parquet"
+
+
 def available_seasons(sport, kind="team"):
     """Seasons (as strings, sorted) for which a mirror ODDS parquet exists for this
     sport across ANY book. `kind`: 'team' or 'props'. Empty list if the dir is absent
@@ -282,6 +286,54 @@ def _sync_facts(sport, seasons, refresh, verbose):
             _write([dict(r._mapping) for r in rows], f)
             if verbose:
                 print(f"  {mk_file(sport, s):<28} {len(rows):>7,} rows")
+
+
+# ── Statcast (savant) mirror — OPT-IN (heavy: ~1 row/pitch). NOT part of the default
+#    fact sync so a routine backtest autobuild doesn't pull ~700k rows/season it never
+#    uses; build explicitly (`warehouse_mirror.py --statcast`). savant_history.load_days
+#    reads it mirror-first when present, else Azure. ────────────────────────────────
+
+def sync_statcast(seasons, refresh=False, verbose=True):
+    """Mirror the Azure statcast_pitch rows to season-keyed parquet (one file per
+    season, the exact savant_history.load_days shape). Heavy + opt-in. Existing files
+    are skipped unless refresh (2024/25 immutable; refresh the live season)."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    import savant_history as sh
+    for s in [str(x) for x in seasons]:
+        f = _statcast_file(s)
+        if (not refresh) and (_is_valid(f) or os.path.exists(_path(f))):
+            if verbose:
+                print(f"  statcast {s}  (exists, skip)")
+            continue
+        rows = sh.load_days(f"{s}-01-01", f"{s}-12-31")   # Azure read (the sync step)
+        _write(rows, f)
+        if verbose:
+            print(f"  statcast {s} {len(rows):>9,} pitches -> {f}")
+
+
+def statcast_days(start, end):
+    """savant_history.load_days served from the parquet mirror: all statcast rows in
+    [start, end] (YYYY-MM-DD, inclusive), same shape/order as the Azure reader. Returns
+    None if ANY season the range spans has no mirror file (caller falls back to Azure)."""
+    import pandas as pd
+    seasons = sorted({str(start)[:4], str(end)[:4]})
+    # Fill any interior seasons (a range never realistically spans >1, but be safe).
+    if len(seasons) == 2:
+        seasons = [str(y) for y in range(int(seasons[0]), int(seasons[1]) + 1)]
+    frames = []
+    for s in seasons:
+        df = _read(_statcast_file(s))
+        if df is None:
+            return None
+        frames.append(df)
+    if not frames:
+        return None
+    all_df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    if all_df.empty or "game_date" not in all_df.columns:
+        return []
+    m = (all_df["game_date"] >= str(start)) & (all_df["game_date"] <= str(end))
+    return _records(all_df[m].sort_values("game_date"))
 
 
 # ── READERS (mirror the db_store readers + index builders; None = fall back) ──
@@ -626,6 +678,9 @@ def main():
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--refresh", action="store_true",
                     help="overwrite existing files (else skip; 2024/25 are immutable)")
+    ap.add_argument("--statcast", action="store_true",
+                    help="ALSO mirror statcast_pitch to season parquet (heavy, opt-in) "
+                         "so method-D/xBA + platoon refits read savant 0 DTU.")
     ap.add_argument("--timeout", type=int, default=600,
                     help="SQL query timeout (s) for the bulk pulls — 60s (live default) "
                          "intermittently times out ~200k-row prop reads on a low-DTU "
@@ -651,12 +706,16 @@ def main():
               f"  (refresh={args.refresh})")
         sync(args.sport, seasons, refresh=args.refresh)
         print("  done.")
+    if args.statcast:
+        print(f"  syncing statcast {seasons} -> {MIRROR_DIR} (refresh={args.refresh})")
+        sync_statcast(seasons, refresh=args.refresh)
+        print("  done.")
     if args.verify:
         # verify() reads mirror parquet directly (no read-flag needed) and compares
         # to the live Azure readers.
         print(f"  verifying mirror vs Azure ({args.sport} {seasons})...")
         verify(args.sport, seasons)
-    if not (args.sync or args.verify):
+    if not (args.sync or args.verify or args.statcast):
         print(f"  mirror dir: {MIRROR_DIR}  enabled={enabled()}")
         print("  --sync to build · --verify to parity-check · reads are ON by default "
               "(ODI_BACKTEST_MIRROR=0 forces Azure) · backtests auto-build.")

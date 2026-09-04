@@ -276,9 +276,18 @@ def ingest_day(day, rows):
 def load_days(start, end):
     """All statcast_pitch rows in [start, end] (inclusive, YYYY-MM-DD) as trimmed
     dicts — the SAME shape fetch_statcast_day emits, so every downstream aggregator
-    is unchanged. SQL-ONLY: returns [] when SQL is off (local/tests patch this) or
-    the range has not been ingested. Lexicographic date compare is correct for the
-    zero-padded YYYY-MM-DD strings."""
+    is unchanged. Mirror-FIRST (parquet, 0 DTU) when the statcast mirror is present
+    (opt-in `warehouse_mirror --statcast`); else Azure. SQL-ONLY on the Azure path:
+    returns [] when SQL is off (local/tests patch this) or the range has not been
+    ingested. Lexicographic date compare is correct for the zero-padded dates."""
+    try:
+        import warehouse_mirror as _wm
+        if _wm.enabled():
+            rows = _wm.statcast_days(start, end)
+            if rows is not None:
+                return rows
+    except Exception:
+        pass
     if not enabled():
         return []
     engine = db_store.get_engine()
