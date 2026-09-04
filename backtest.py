@@ -3809,8 +3809,11 @@ def _iter_pool_players(players):
             yield None, None, entry
 
 
-def fetch_player_data(espn_sport, espn_league, players, season_year=None):
+def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=False):
     """Resolve each player → (athlete_id, gamelog). Returns {name: gamelog_list}.
+
+    ``quiet`` suppresses ALL output (used by parallel workers). Otherwise prints ONE
+    summary line (not a line per player — that was ~150 lines × every worker).
 
     For MLB (P3/P4/P6) each player's per-game log comes from the StatsAPI warehouse.
     The whole season's logs are pulled ONCE per role (mlb_warehouse.get_calib_gamelogs_
@@ -3821,6 +3824,8 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
     (ESPN was fully removed for MLB in P4.)"""
     data = {}
     _bulk_by_role = {}
+    _n_ok = 0
+    _skips = {}
 
     def _bulk_for(role):
         # Lazily pull the WHOLE season's gamelogs for a role once (one query), then
@@ -3854,7 +3859,7 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
                     rrole = "pitcher" if resolved[1] else "batter"
             gamelog = _bulk_for(rrole).get(str(rid)) if rid else None
             if not gamelog:
-                print(f"  [skip] {name}: no warehouse gamelog")
+                _skips["no_warehouse_gamelog"] = _skips.get("no_warehouse_gamelog", 0) + 1
                 continue
             # Own copy: the bulk index shares one list per id, and we sort in place.
             gamelog = list(gamelog)
@@ -3867,21 +3872,26 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None):
             # so a suffixed key is harmless.
             key = name if name not in data else f"{name} ({rid})"
             data[key] = gamelog
-            print(f"  [ok]   {key}: {len(gamelog)} games (warehouse)")
+            _n_ok += 1
             continue
         aid = cached_athlete_id(espn_sport, espn_league, name)
         if not aid:
-            print(f"  [skip] {name}: athlete not found")
+            _skips["athlete_not_found"] = _skips.get("athlete_not_found", 0) + 1
             continue
         gamelog = cached_gamelog(espn_sport, espn_league, aid,
                                  season_year=season_year, player_name=name)
         if not gamelog:
-            print(f"  [skip] {name}: empty gamelog")
+            _skips["empty_gamelog"] = _skips.get("empty_gamelog", 0) + 1
             continue
         # Sort newest-first by game_date
         gamelog.sort(key=lambda g: g.get("game_date") or "", reverse=True)
         data[name] = gamelog
-        print(f"  [ok]   {name}: {len(gamelog)} games")
+        _n_ok += 1
+    if not quiet:
+        _sk = sum(_skips.values())
+        _brk = (" [" + ", ".join(f"{k}={v}" for k, v in sorted(_skips.items())) + "]") \
+            if _skips else ""
+        print(f"  fetched {_n_ok} player gamelogs ({_sk} skipped){_brk}")
     return data
 
 
@@ -4097,6 +4107,9 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             props, games_per_player, min_sample, variants, sweep, season_year,
             safe_mode, cushion_sweep, safe_target, quantile_mode, calibrate,
             cross_season, _emit_prints, combined_sweep)
+    # Setup-phase logger: silent in parallel workers (_emit_prints=False) so 16 workers
+    # don't each dump the "=== Fetching… ===" / "Built…" setup banners.
+    _log = print if _emit_prints else (lambda *a, **k: None)
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
     # STEP-2: resolve each prop's LOCKED live window so the refit fits methods at the
     # SAME window production serves (fit==serve). A variant carrying the "__calib__"
@@ -4116,7 +4129,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     # StatsAPI warehouse; NBA/NFL stay on ESPN. (ESPN fully removed for MLB in P4.)
     use_warehouse = espn_sport == "baseball"
     if use_warehouse:
-        print("=== MLB sweep inputs: StatsAPI warehouse (ESPN bypassed) ===")
+        _log("=== MLB sweep inputs: StatsAPI warehouse (ESPN bypassed) ===")
     # Sweep mode + cushion-sweep mode always use the fine-grained offsets so
     # the cushion-for-target metric is well-resolved. Coarse offsets only
     # apply for a non-sweep, plain --safe-mode invocation.
@@ -4129,11 +4142,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
         safe_mode = True
 
     season_label = f" (season {season_year})" if season_year else ""
-    print(f"\n=== Fetching gamelogs for {len(players)} players{season_label} ===")
+    _log(f"\n=== Fetching gamelogs for {len(players)} players{season_label} ===")
     player_data = fetch_player_data(espn_sport, espn_league, players,
-                                    season_year=season_year)
+                                    season_year=season_year,
+                                    quiet=not _emit_prints)
     if not player_data:
-        print("No player data resolved. Aborting.")
+        _log("No player data resolved. Aborting.")
         return
 
     # ── Reliability filter inputs (streak-based: see prop_filter.py) ──
@@ -4296,14 +4310,12 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     import time as _sweep_time
     _sweep_t0 = _sweep_time.time()
     _sweep_np = len(player_data)
-    _sweep_step = max(1, _sweep_np // 20)     # progress every ~5% of players
+    _sweep_bar = sweep and _emit_prints    # in-place bar only on the serial/main path
+    _sweep_step = max(1, _sweep_np // 100)     # refresh ~1% (single-line \r, cheap)
     for _sweep_pi, (name, gamelog) in enumerate(player_data.items(), 1):
-        if sweep and (_sweep_pi % _sweep_step == 0 or _sweep_pi == _sweep_np):
-            _el = _sweep_time.time() - _sweep_t0
-            _eta = (_el / _sweep_pi) * (_sweep_np - _sweep_pi)
-            print(f"  [sweep] player {_sweep_pi}/{_sweep_np}  "
-                  f"({len(variants)} variants)  elapsed {_el:.0f}s  eta {_eta:.0f}s",
-                  flush=True)
+        if _sweep_bar and (_sweep_pi % _sweep_step == 0 or _sweep_pi == _sweep_np):
+            _progress_bar(_sweep_pi, _sweep_np,
+                          f"sweep ({len(variants)} variants)", _sweep_t0)
         is_pitcher_log = _gamelog_is_pitcher(gamelog)
         test_slice = gamelog[:games_per_player]
         for prop_key in props:
@@ -4657,7 +4669,10 @@ def _emit_props_sweep_reports(results, props, sweep, safe_mode, quantile_mode,
     else:
         _print_props_results(results, props)
 
-    if safe_mode:
+    # In SWEEP mode the per-variant safe/cushion detail is a 576-line dump whose info
+    # is already in the sweep ranking's cushion column — skip it (safe_mode stays on
+    # only to compute the tallies the ranking uses).
+    if safe_mode and not sweep:
         _print_safe_mode_results(results, props, cushion_sweep=cushion_sweep)
 
     if quantile_mode:
@@ -4678,6 +4693,20 @@ def _emit_props_sweep_reports(results, props, sweep, safe_mode, quantile_mode,
             if calibrate == "sweep":
                 _print_calibration_k_sweep(results, props,
                                            k_values=(0, 5, 10, 15, 20, 30, 60))
+
+
+def _progress_bar(done, total, prefix, t0, width=32):
+    """In-place \\r progress bar (terminal-agnostic: PowerShell/cmd/bash). One line
+    that fills 0->100%, newline on completion. No deps."""
+    import time as _t
+    frac = (done / total) if total else 1.0
+    fill = int(width * frac)
+    el = _t.time() - t0
+    eta = (el / done * (total - done)) if done else 0.0
+    end = "\n" if done >= total else ""
+    print(f"\r  {prefix} [{'#' * fill}{'-' * (width - fill)}] {frac * 100:5.1f}% "
+          f"({done}/{total})  elapsed {el:4.0f}s  eta {eta:4.0f}s   ",
+          end=end, flush=True)
 
 
 def _contiguous_chunks(items, n):
@@ -4731,17 +4760,21 @@ def _merge_props_results(parts):
 
 
 def _props_sweep_worker(payload):
-    """Top-level (picklable) worker: run the sweep on one player chunk, prints off,
-    returns the raw accumulator. workers=1 prevents recursive fan-out."""
+    """Top-level (picklable) worker: run the sweep on one player chunk, ALL stdout
+    suppressed (16 workers would otherwise each dump setup/fetch banners), returns the
+    raw accumulator. workers=1 prevents recursive fan-out."""
+    import os
+    import contextlib
     (sport, espn_sport, espn_league, sport_key, chunk, props, games_per_player,
      min_sample, variants, sweep, season_year, safe_mode, cushion_sweep,
      safe_target, quantile_mode, calibrate, cross_season) = payload
-    return run_player_props_backtest(
-        sport, espn_sport, espn_league, sport_key, chunk, props, games_per_player,
-        min_sample, variants, sweep=sweep, season_year=season_year,
-        safe_mode=safe_mode, cushion_sweep=cushion_sweep, safe_target=safe_target,
-        quantile_mode=quantile_mode, calibrate=calibrate, cross_season=cross_season,
-        workers=1, _emit_prints=False)
+    with open(os.devnull, "w") as _dn, contextlib.redirect_stdout(_dn):
+        return run_player_props_backtest(
+            sport, espn_sport, espn_league, sport_key, chunk, props,
+            games_per_player, min_sample, variants, sweep=sweep,
+            season_year=season_year, safe_mode=safe_mode, cushion_sweep=cushion_sweep,
+            safe_target=safe_target, quantile_mode=quantile_mode, calibrate=calibrate,
+            cross_season=cross_season, workers=1, _emit_prints=False)
 
 
 def _run_props_sweep_parallel(workers, sport, espn_sport, espn_league, sport_key,
@@ -4749,16 +4782,28 @@ def _run_props_sweep_parallel(workers, sport, espn_sport, espn_league, sport_key
                               sweep, season_year, safe_mode, cushion_sweep,
                               safe_target, quantile_mode, calibrate, cross_season,
                               emit_prints, combined_sweep=False):
-    from concurrent.futures import ProcessPoolExecutor
+    import time as _t
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     chunks = _contiguous_chunks(players, workers)
     payloads = [(sport, espn_sport, espn_league, sport_key, chunk, props,
                  games_per_player, min_sample, variants, sweep, season_year,
                  safe_mode, cushion_sweep, safe_target, quantile_mode, calibrate,
                  cross_season) for chunk in chunks]
-    print(f"\n=== Parallel sweep: {len(payloads)} workers over {len(players)} "
-          f"players ({len(variants)} variants) ===", flush=True)
+    if emit_prints:
+        print(f"\n=== Parallel sweep: {len(payloads)} workers over {len(players)} "
+              f"players ({len(variants)} variants) ===", flush=True)
+    # Submit with index so results reassemble IN INPUT ORDER (byte-identical merge)
+    # while the progress bar advances on completion order.
+    parts = [None] * len(payloads)
+    t0 = _t.time()
     with ProcessPoolExecutor(max_workers=len(payloads)) as ex:
-        parts = list(ex.map(_props_sweep_worker, payloads))    # order preserved
+        futs = {ex.submit(_props_sweep_worker, p): i for i, p in enumerate(payloads)}
+        done = 0
+        for fut in as_completed(futs):
+            parts[futs[fut]] = fut.result()
+            done += 1
+            if emit_prints:
+                _progress_bar(done, len(payloads), "sweep chunks", t0)
     merged = _merge_props_results(parts)
     if emit_prints:
         _emit_props_sweep_reports(merged, props, sweep, safe_mode, quantile_mode,
