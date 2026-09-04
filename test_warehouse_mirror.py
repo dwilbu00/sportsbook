@@ -36,11 +36,14 @@ class WarehouseMirrorTests(unittest.TestCase):
             "price": -120, "implied_prob": 0.54, "player_mlb_id": "111", "game_pk": 777,
         }], wm._prop_file(SPORT, "draftkings", "2024"))
         wm._write([{
-            "game_pk": 777, "official_date": "2024-05-01", "season": 2024,
-            "game_type": "R", "home_score": 5.0, "away_score": 3.0,
+            "game_pk": 777, "game_date": "2024-05-01", "official_date": "2024-05-01",
+            "season": 2024, "game_type": "R", "status": "Final",
+            "detailed_state": "Final", "home_score": 5.0, "away_score": 3.0,
             "home_score_f5": 2.0, "away_score_f5": 1.0,
             "home_team_id": "121", "away_team_id": "112",
         }], wm._game_file(SPORT))
+        wm._write([{"team_id": "121", "name": "Mets"},
+                   {"team_id": "112", "name": "Cubs"}], wm._team_dim_file(SPORT))
         wm._write([
             {"athlete_id": "999", "game_pk": 777, "season_bucket": 2024,
              "team_id": "121", "GS": 1.0, "IP": 6.0, "ER": 2.0, "K": 7.0, "BB": 1.0,
@@ -51,9 +54,9 @@ class WarehouseMirrorTests(unittest.TestCase):
              "BF": 15.0, "official_date": "2024-03-10", "game_type": "S"},
         ], wm._pitcher_file(SPORT, "2024"))
         wm._write([{
-            "athlete_id": "111", "game_pk": 777, "season_bucket": 2024, "H": 1.0,
-            "SO": 1.0, "TB": 2.0, "RBI": 0.0, "official_date": "2024-05-01",
-            "game_type": "R",
+            "athlete_id": "111", "game_pk": 777, "season_bucket": 2024,
+            "team_id": "112", "H": 1.0, "SO": 1.0, "TB": 2.0, "RBI": 0.0,
+            "official_date": "2024-05-01", "game_type": "R",
         }], wm._batter_file(SPORT, "2024"))
 
     def tearDown(self):
@@ -132,6 +135,40 @@ class WarehouseMirrorTests(unittest.TestCase):
         pit = wm.calib_gamelogs_bulk_full("pitcher", 2024)
         self.assertEqual({r["game_pk"] for r in pit["999"]}, {777})   # spring dropped
         self.assertIs(pit["999"][0]["completed"], True)
+
+    def test_team_name_map(self):
+        self.assertEqual(wm.team_name_map(SPORT), {"121": "Mets", "112": "Cubs"})
+
+    def test_team_final_games(self):
+        games = wm.team_final_games("121", sport=SPORT)
+        self.assertEqual(len(games), 1)
+        g = games[0]
+        self.assertEqual(g["date"], "2024-05-01")
+        self.assertEqual(g["home_team"], "Mets")
+        self.assertEqual(g["away_team"], "Cubs")
+        self.assertEqual((g["home_score"], g["away_score"], g["total_score"]), (5, 3, 8))
+        # as_of is strict-before -> the same-day game is excluded
+        self.assertEqual(wm.team_final_games("121", as_of_date="2024-05-01",
+                                             sport=SPORT), [])
+
+    def test_calib_gamelogs_bulk_espn_full_shape(self):
+        bat = wm.calib_gamelogs_bulk_espn("batter", 2024, SPORT)
+        row = bat["111"][0]
+        self.assertEqual(row["opponent"], "Mets")     # 111 is on Cubs (away)
+        self.assertIs(row["is_home"], False)
+        self.assertEqual(row["game_date"], "2024-05-01")
+        self.assertIs(row["completed"], True)
+        self.assertEqual(row["H"], 1.0)
+        pit = wm.calib_gamelogs_bulk_espn("pitcher", 2024, SPORT)
+        prow = pit["999"][0]
+        self.assertEqual(prow["opponent"], "Cubs")     # 999 is on Mets (home)
+        self.assertIs(prow["is_home"], True)
+        self.assertEqual({r["game_pk"] for r in pit["999"]}, {777})   # spring dropped
+
+    def test_calib_gamelog_singular_and_missing(self):
+        gl = wm.calib_gamelog("111", "batter", 2024, SPORT)
+        self.assertEqual(gl[0]["opponent"], "Mets")
+        self.assertEqual(wm.calib_gamelog("nobody", "batter", 2024, SPORT), [])
 
     def test_statcast_days_reads_and_filters(self):
         import savant_history as sh

@@ -1525,6 +1525,14 @@ def _team_name_map():
     lookups key on (the warehouse is MLBAM-keyed; those lookups are name-keyed).
     Tiny (30 rows). Fail-open → {}. Served from the per-process _team_dim cache
     (a fresh copy per call so callers may mutate freely)."""
+    try:
+        import warehouse_mirror as _wm
+        if _wm.enabled():
+            r = _wm.team_name_map()
+            if r is not None:
+                return r
+    except Exception:
+        pass
     if not enabled():
         return {}
     return dict(_team_dim()["by_id"])
@@ -2252,9 +2260,19 @@ def get_calib_gamelog(mlb_player_id, role, season=None):
     The opponent NAME is the canonical mlb_team.name, which the real-line fit's
     park/opp-defense features key on; that resolution is pinned by golden tests in
     test_mlb_warehouse.py (CalibParkNameGoldenTests + the reader shape tests)."""
+    _season = season if season is not None else _current_season()
+    if mlb_player_id:
+        try:
+            import warehouse_mirror as _wm
+            if _wm.enabled():
+                r = _wm.calib_gamelog(mlb_player_id, role, _season)
+                if r is not None:
+                    return r
+        except Exception:
+            pass
     if not enabled() or not mlb_player_id:
         return []
-    season = season if season is not None else _current_season()
+    season = _season
     rows = (get_pitcher_game_log(mlb_player_id, season=season,
                                  exclude_game_types=_NON_REGULAR_GAME_TYPES)
             if role == "pitcher"
@@ -2320,9 +2338,18 @@ def get_calib_gamelogs_bulk(role, season):
     season) instead of one per player — the calibration join pre-loads these to
     avoid thousands of round-trips on a multi-season corpus. Logs are UNORDERED (the
     reader sorts). role ∈ {'pitcher','batter'}. Fail-open -> {}."""
+    _season = season if season is not None else _current_season()
+    try:
+        import warehouse_mirror as _wm
+        if _wm.enabled():
+            r = _wm.calib_gamelogs_bulk_espn(role, _season)
+            if r is not None:
+                return r
+    except Exception:
+        pass
     if not enabled():
         return {}
-    season = season if season is not None else _current_season()
+    season = _season
     table, stats = ((mlb_pitcher_game, _PITCHER_GAME_STATS) if role == "pitcher"
                     else (mlb_batter_game, _BATTER_GAME_STATS))
     by_ath = _game_log_bulk(table, stats, season,
@@ -2592,6 +2619,16 @@ def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
     away_score, total_score}) so compute_recent_form / compute_team_defense /
     annotate_opponent_strength work UNCHANGED on it. Ordered game_date DESC,
     game_pk DESC; leakage-safe via as_of_date (strict official_date <)."""
+    if team_id:
+        try:
+            import warehouse_mirror as _wm
+            if _wm.enabled():
+                r = _wm.team_final_games(team_id, as_of_date=as_of_date,
+                                         season=season, limit=limit)
+                if r is not None:
+                    return r
+        except Exception:
+            pass
     if not enabled() or not team_id:
         return []
     g = mlb_game

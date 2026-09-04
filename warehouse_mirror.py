@@ -168,6 +168,10 @@ def _statcast_file(season):
     return f"statcast__baseball_mlb__{season}.parquet"
 
 
+def _team_dim_file(sport):
+    return f"team_dim__{sport}.parquet"
+
+
 def available_seasons(sport, kind="team"):
     """Seasons (as strings, sorted) for which a mirror ODDS parquet exists for this
     sport across ANY book. `kind`: 'team' or 'props'. Empty list if the dir is absent
@@ -251,17 +255,31 @@ def _sync_facts(sport, seasons, refresh, verbose):
     eng = db_store.get_engine()
     g = wh.mlb_game
 
-    # mlb_game (all seasons in one file — a few thousand rows).
+    # mlb_game (all seasons in one file — a few thousand rows). game_date/status/
+    # detailed_state added so the mirror can replicate _team_final_games' genuine-final
+    # filter + return game_date (the defense lookup + calib gamelogs key on it).
     gf = _game_file(sport)
     if refresh or not (_is_valid(gf) or os.path.exists(_path(gf))):
         with eng.connect() as conn:
             rows = conn.execute(_select(
-                g.c.game_pk, g.c.official_date, g.c.season, g.c.game_type,
+                g.c.game_pk, g.c.game_date, g.c.official_date, g.c.season,
+                g.c.game_type, g.c.status, g.c.detailed_state,
                 g.c.home_score, g.c.away_score, g.c.home_score_f5, g.c.away_score_f5,
                 g.c.home_team_id, g.c.away_team_id)).fetchall()
         _write([dict(r._mapping) for r in rows], gf)
         if verbose:
             print(f"  mlb_game {'':<11} {len(rows):>7,} rows -> {gf}")
+
+    # team dim (team_id -> name), ~30 rows — for opponent/venue NAME resolution in the
+    # calib gamelogs + defense lookup (mirror of mlb_warehouse._team_name_map).
+    tdf = _team_dim_file(sport)
+    if refresh or not (_is_valid(tdf) or os.path.exists(_path(tdf))):
+        t = wh.mlb_team
+        with eng.connect() as conn:
+            rows = conn.execute(_select(t.c.team_id, t.c.name)).fetchall()
+        _write([dict(r._mapping) for r in rows], tdf)
+        if verbose:
+            print(f"  team_dim {'':<11} {len(rows):>7,} rows -> {tdf}")
 
     # Fact tables: join mlb_game for official_date + game_type, scope by
     # season_bucket EXACTLY as mlb_warehouse._game_log_bulk / _pitcher_game_index do
@@ -271,7 +289,9 @@ def _sync_facts(sport, seasons, refresh, verbose):
     for tbl, mk_file, stat_cols in (
             (wh.mlb_pitcher_game, _pitcher_file,
              ("team_id", "GS", "IP", "ER", "K", "BB", "BF")),
-            (wh.mlb_batter_game, _batter_file, ("H", "SO", "TB", "RBI"))):
+            # team_id added for the batter facts so the mirror can reconstruct
+            # opponent/is_home (get_calib_gamelog full ESPN shape for the sweep).
+            (wh.mlb_batter_game, _batter_file, ("team_id", "H", "SO", "TB", "RBI"))):
         for s in seasons:
             f = mk_file(sport, s)
             if (not refresh) and (_is_valid(f) or os.path.exists(_path(f))):
@@ -535,6 +555,111 @@ def calib_gamelogs_bulk_full(role, season, sport="baseball_mlb"):
             logs.append(g)
         out[aid] = logs
     return out
+
+
+def team_name_map(sport="baseball_mlb"):
+    """{team_id(str): name} from the mirrored team dim (mirror of mlb_warehouse.
+    _team_name_map). None if the team-dim parquet is absent (caller -> Azure)."""
+    df = _read(_team_dim_file(sport))
+    if df is None:
+        return None
+    return {str(r.get("team_id")): r.get("name") for r in _records(df)}
+
+
+def team_final_games(team_id, as_of_date=None, season=None, limit=None,
+                     sport="baseball_mlb"):
+    """Mirror of mlb_warehouse._team_final_games (genuine-final games for a team, most-
+    recent-first, {date,home_team,away_team,home_score,away_score,total_score,game_pk}).
+    Replicates the Final + genuine-final(detailed_state) + regular/postseason filter
+    from the mlb_game parquet + team dim. None if the parquet predates the game_date/
+    status/detailed_state columns (stale mirror -> Azure)."""
+    df = _game_df(sport)
+    names = team_name_map(sport)
+    if df is None or names is None:
+        return None
+    need = ("game_date", "status", "detailed_state", "home_team_id", "away_team_id",
+            "home_score", "away_score", "game_type", "official_date", "season")
+    if any(c not in df.columns for c in need):
+        return None
+    import mlb_starters
+    non_final = [b.lower() for b in mlb_starters._NON_FINAL_DETAILED]
+    tid = str(team_id)
+    out = []
+    for r in _records(df):
+        if tid not in (str(r.get("home_team_id")), str(r.get("away_team_id"))):
+            continue
+        if r.get("status") != "Final":
+            continue
+        det = r.get("detailed_state")
+        if det is not None and any(b in str(det).lower() for b in non_final):
+            continue
+        if r.get("game_type") in _NON_REGULAR_GAME_TYPES:
+            continue
+        if r.get("home_score") is None or r.get("away_score") is None:
+            continue
+        if season is not None and r.get("season") != int(season):
+            continue
+        if as_of_date is not None and str(r.get("official_date")) >= str(as_of_date):
+            continue
+        try:
+            hs, as_ = int(r["home_score"]), int(r["away_score"])
+        except (TypeError, ValueError):
+            continue
+        out.append({"date": r.get("game_date"),
+                    "home_team": names.get(str(r.get("home_team_id"))),
+                    "away_team": names.get(str(r.get("away_team_id"))),
+                    "home_score": hs, "away_score": as_, "total_score": hs + as_,
+                    "game_pk": r.get("game_pk")})
+    out.sort(key=lambda d: (d["date"] or "", d["game_pk"] or 0), reverse=True)
+    return out[:int(limit)] if limit else out
+
+
+def calib_gamelogs_bulk_espn(role, season, sport="baseball_mlb"):
+    """Full ESPN-shape bulk gamelogs (adds opponent NAME + is_home + game_date +
+    completed) — mirror of mlb_warehouse.get_calib_gamelogs_bulk, for the SYNTHETIC
+    sweep (which uses opponent for opp-defense/park weighting). Needs the fact parquet's
+    team_id + the mlb_game (game_date/team ids) + team dim; None if any is absent/stale
+    so the caller falls back to Azure (batter mirrors predating team_id -> None)."""
+    fpath = _pitcher_file if role == "pitcher" else _batter_file
+    fdf = _read(fpath(sport, str(season)))
+    gdf = _game_df(sport)
+    names = team_name_map(sport)
+    if fdf is None or gdf is None or names is None:
+        return None
+    if "team_id" not in fdf.columns:
+        return None
+    if any(c not in gdf.columns for c in ("game_pk", "game_date", "home_team_id",
+                                          "away_team_id")):
+        return None
+    gmeta = {r.get("game_pk"): (r.get("game_date"), str(r.get("home_team_id")),
+                                str(r.get("away_team_id"))) for r in _records(gdf)}
+    out = {}
+    for r in _records(fdf):
+        if r.get("game_type") in _NON_REGULAR_GAME_TYPES:
+            continue
+        g = dict(r)
+        tid = str(r.get("team_id"))
+        meta = gmeta.get(r.get("game_pk"))
+        if meta:
+            gd, home_id, away_id = meta
+            g["game_date"] = gd
+            g["is_home"] = (tid == home_id)
+            g["opponent"] = names.get(away_id if tid == home_id else home_id)
+        elif g.get("game_date") is None:
+            g["game_date"] = r.get("official_date")
+        g["completed"] = True
+        out.setdefault(str(r.get("athlete_id")), []).append(g)
+    return out
+
+
+def calib_gamelog(mlb_player_id, role, season, sport="baseball_mlb"):
+    """Singular full ESPN-shape gamelog (mirror of mlb_warehouse.get_calib_gamelog).
+    None if the mirror can't serve it (-> Azure); [] if the player simply has no games
+    that season (matching the Azure reader)."""
+    bulk = calib_gamelogs_bulk_espn(role, season, sport)
+    if bulk is None:
+        return None
+    return bulk.get(str(mlb_player_id), [])
 
 
 def _row_key(d):
