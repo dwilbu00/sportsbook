@@ -538,6 +538,11 @@ def pitcher_game_index(season, sport="baseball_mlb"):
 
 
 def calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
+    return _memo(("cg_bulk", role, str(season), sport),
+                 lambda: _calib_gamelogs_bulk(role, season, sport))
+
+
+def _calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
     """{athlete_id_str: [row dict, ...]} for outcome grading — carries the native
     stat columns + game_pk that r2_data.outcome_value reads (H/SO/TB/RBI for batters;
     K/ER/IP for pitchers). NOT the full ESPN shape (no opponent name/completed — the
@@ -556,6 +561,11 @@ def calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
 
 
 def calib_gamelogs_bulk_full(role, season, sport="baseball_mlb"):
+    return _memo(("cg_full", role, str(season), sport),
+                 lambda: _calib_gamelogs_bulk_full(role, season, sport))
+
+
+def _calib_gamelogs_bulk_full(role, season, sport="baseball_mlb"):
     """Full-shape variant of calib_gamelogs_bulk for the CALIBRATION actuals join
     (book_line_calibration.join_book_lines_to_actuals). Same rows PLUS ``game_date``
     (from official_date) and ``completed``=True — the only fields the join reads beyond
@@ -644,6 +654,11 @@ def team_final_games(team_id, as_of_date=None, season=None, limit=None,
 
 
 def calib_gamelogs_bulk_espn(role, season, sport="baseball_mlb"):
+    return _memo(("cg_espn", role, str(season), sport),
+                 lambda: _calib_gamelogs_bulk_espn(role, season, sport))
+
+
+def _calib_gamelogs_bulk_espn(role, season, sport="baseball_mlb"):
     """Full ESPN-shape bulk gamelogs (adds opponent NAME + is_home + game_date +
     completed) — mirror of mlb_warehouse.get_calib_gamelogs_bulk, for the SYNTHETIC
     sweep (which uses opponent for opp-defense/park weighting). Needs the fact parquet's
