@@ -687,7 +687,18 @@ def _variant_confirms(cand_obs, base_obs, cand_method, negbin_eligible=False):
     return True
 
 
-def _best_per_prop(results, props, k_values=(0,)):
+def _best_per_prop_worker(payload):
+    """Top-level (picklable) worker: winner selection for ONE prop on its results
+    slice, all stdout suppressed. Each prop is fully independent (per-prop base_obs +
+    negbin eligibility, no cross-prop state), so this is byte-identical to serial."""
+    import os
+    import contextlib
+    sliced, prop_key, k_values = payload
+    with open(os.devnull, "w") as _dn, contextlib.redirect_stdout(_dn):
+        return _best_per_prop(sliced, [prop_key], k_values=k_values, workers=1)
+
+
+def _best_per_prop(results, props, k_values=(0,), workers=1):
     """
     For each prop, evaluate every (variant × method) on a chronological holdout
     and return the winner by lowest Brier. Method A (empirical) is the safe
@@ -698,6 +709,18 @@ def _best_per_prop(results, props, k_values=(0,)):
                     "baseline_brier", "cv_brier", "confirmed"}}
     """
     from props import PROP_NEGBIN_ELIGIBLE
+    # PARALLEL: each prop's winner is fully independent (per-prop base_obs + negbin
+    # eligibility, no cross-prop state), so fan out over props and merge the dicts —
+    # byte-identical to serial. Slice results per prop so workers pickle ~1/N the data.
+    if workers and int(workers) > 1 and len(props) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        payloads = [({v: {pk: results[v][pk]} for v in results}, pk, k_values)
+                    for pk in props if any(results[v].get(pk) for v in results)]
+        winners = {}
+        with ProcessPoolExecutor(max_workers=min(int(workers), len(payloads))) as ex:
+            for part in ex.map(_best_per_prop_worker, payloads):
+                winners.update(part)
+        return winners
     winners = {}
     for prop_key in props:
         # §2.2: a whitelisted count prop admits method E (NegBin) as a candidate in
@@ -938,7 +961,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         print("Calibration run produced no results; aborting.")
         sys.exit(2)
 
-    curr_winners = _best_per_prop(curr_results, props)
+    curr_winners = _best_per_prop(curr_results, props, workers=workers)
 
     warmup_results = None
     warmup_winners = {}
@@ -962,7 +985,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             workers=workers, combined_sweep=combined_sweep,
         )
         if warmup_results:
-            warmup_winners = _best_per_prop(warmup_results, props)
+            warmup_winners = _best_per_prop(warmup_results, props, workers=workers)
         else:
             # A requested warmup that yields nothing would otherwise ship a calibration
             # with NO warmup block (degrading players with < warmup_games current-season
