@@ -264,7 +264,16 @@ def _book_line_id_key(row):
     return (mlb_id, row.get("prop_key"), row.get("game_date"), _round_line(row))
 
 
-def harvest_real_line_book_lines(sport_key, target_props, label=""):
+# Which precise snapshot WINDOW the warehouse odds are read at for calibration/scoring.
+# CLI-settable (refit_calibration/recalibration `--snapshot`); "close" = legacy nearest-
+# pre-commence (post-purge ~= closing); "closing"/"early_4h" filter odds_snapshot.source
+# exactly. Set once at CLI entry so all harvest_real_line_book_lines calls inherit it
+# without threading the arg through every diagnostic; the prediction-log + local-JSON
+# backstops have no window concept and stay unfiltered.
+SNAPSHOT = "close"
+
+
+def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=None):
     """Union of real book lines for calibration, deduped by (player, prop,
     ET-date, line), preferring the primary (richer: prices/teams) on a collision.
 
@@ -274,7 +283,10 @@ def harvest_real_line_book_lines(sport_key, target_props, label=""):
     unioned as a BACKSTOP — it covers analyses that ran on cached/credit-exhausted
     odds (no fresh fetch → no warehouse capture). True same-day doubleheaders are
     dropped from both sources by event_id (ambiguous box-score attribution).
+    ``snapshot`` selects the precise window (default = module ``SNAPSHOT``); it only
+    affects the warehouse primary (the mirror/db filter odds_snapshot.source).
     Returns (book_lines, n_primary, n_pred)."""
+    snapshot = snapshot if snapshot is not None else SNAPSHOT
     target = set(target_props or [])
     try:
         import warehouse
@@ -292,7 +304,8 @@ def harvest_real_line_book_lines(sport_key, target_props, label=""):
         # diagnostic then transfers ~1/7 the rows). The Python filter stays as a
         # belt-and-suspenders on the assembled output.
         primary = [r for r in warehouse.load_prop_lines(
-                       sport_key, prop_keys=(list(target) or None))
+                       sport_key, prop_keys=(list(target) or None),
+                       snapshot=snapshot)
                    if r.get("prop_key") in target]
     else:
         primary = harvest_book_lines_from_store(sport_key, target_props, label)

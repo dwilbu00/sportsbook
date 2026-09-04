@@ -3600,7 +3600,20 @@ def main():
                         "blocks), then exit.")
     p.add_argument("--discard", action="store_true",
                    help="Delete the staged candidate without promoting, then exit.")
+    p.add_argument("--snapshot", choices=["close", "closing", "early_4h"],
+                   default="close",
+                   help="(--real-lines + all real-line diagnostics) Precise warehouse "
+                        "window to read book prices at: 'close' (legacy nearest-pre-"
+                        "commence; post-purge ~= closing), 'closing' (exact "
+                        "source=closing — recalibrate/validate vs the SHARP line), or "
+                        "'early_4h' (the execution window, for gate/ROI EV). Props have "
+                        "no early_12h.")
     args = p.parse_args()
+
+    # Snapshot window for the warehouse book-price reads — set once so every
+    # harvest_real_line_book_lines call (real-line refit + all diagnostics) inherits it.
+    import book_line_calibration as _blc
+    _blc.SNAPSHOT = args.snapshot
 
     # Candidate-file management (--promote/--diff/--discard) are pure local-file
     # operations: handle + exit before any SQL/backend setup so they always work.

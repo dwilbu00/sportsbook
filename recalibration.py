@@ -2639,9 +2639,21 @@ def _main_cli():
                         "all years (the per-year counts still print).")
     p.add_argument("--show", action="store_true",
                    help="Print current recalibration params for the sport.")
+    p.add_argument("--snapshot", choices=["close", "closing", "early_4h"],
+                   default="close",
+                   help="(--seed) Precise warehouse window to read book prices at: "
+                        "'close' (legacy nearest-pre-commence; post-purge ~= closing), "
+                        "'closing' (exact source=closing), or 'early_4h'. Platt maps "
+                        "raw_prob->outcome so this only shapes the seed obs' line.")
     args = p.parse_args()
     seasons = ([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
                if args.seasons else None)
+    # Snapshot window for the warehouse book-price reads in the seed path.
+    try:
+        import book_line_calibration as _blc
+        _blc.SNAPSHOT = args.snapshot
+    except Exception:
+        pass
 
     # Target the durable SQL backend when the SQL_* secrets are
     # configured (mirrors the app's boot promotion + refit_calibration.main;
