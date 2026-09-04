@@ -119,6 +119,20 @@ class WarehouseMirrorTests(unittest.TestCase):
         self.assertEqual(bat["111"][0]["H"], 1.0)
         self.assertEqual(bat["111"][0]["TB"], 2.0)
 
+    def test_calib_gamelogs_bulk_full_adds_join_fields(self):
+        # The calibration actuals join needs game_date + completed on top of the
+        # stat columns + game_pk; the full-shape reader adds them (game_date from
+        # official_date), still dropping S/A/E.
+        bat = wm.calib_gamelogs_bulk_full("batter", 2024)
+        row = bat["111"][0]
+        self.assertEqual(row["game_date"], "2024-05-01")   # from official_date
+        self.assertIs(row["completed"], True)
+        self.assertEqual(row["H"], 1.0)
+        self.assertEqual(row["game_pk"], 777)
+        pit = wm.calib_gamelogs_bulk_full("pitcher", 2024)
+        self.assertEqual({r["game_pk"] for r in pit["999"]}, {777})   # spring dropped
+        self.assertIs(pit["999"][0]["completed"], True)
+
     def test_game_type_exclusion_parity(self):
         # calib bulk drops S/A/E (matches get_calib_gamelogs_bulk); the as-of pitcher
         # index keeps ALL game types (matches _pitcher_game_index).

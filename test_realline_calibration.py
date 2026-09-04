@@ -19,6 +19,25 @@ import player_id_map
 import refit_calibration
 from test_backfill_player_ids import _Backend
 
+_PRIOR_MIRROR = None
+
+
+def setUpModule():
+    # These tests inject gamelogs by mocking mlb_warehouse.get_calib_gamelogs_bulk.
+    # The calibration actuals join is now mirror-first, so disable the parquet mirror
+    # module-wide to exercise the mocked path deterministically (a real mirror dir on
+    # the dev box would otherwise shadow the mocks).
+    global _PRIOR_MIRROR
+    _PRIOR_MIRROR = os.environ.get("ODI_BACKTEST_MIRROR")
+    os.environ["ODI_BACKTEST_MIRROR"] = "0"
+
+
+def tearDownModule():
+    if _PRIOR_MIRROR is None:
+        os.environ.pop("ODI_BACKTEST_MIRROR", None)
+    else:
+        os.environ["ODI_BACKTEST_MIRROR"] = _PRIOR_MIRROR
+
 
 def _day(i):
     return (date(2026, 1, 1) + timedelta(days=i)).isoformat()

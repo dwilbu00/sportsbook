@@ -544,12 +544,23 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     def _bulk_gamelogs(role, season):
         key = (role, season)
         if key not in _bulk_cache:
+            data = None
+            # Mirror-first (parquet, 0 DTU on the 20-DTU tier). The mirror full-shape
+            # reader returns exactly the fields the match reads (stats + game_pk +
+            # game_date + completed); None when the season parquet is absent -> Azure.
             try:
-                import mlb_warehouse
-                _bulk_cache[key] = (
-                    mlb_warehouse.get_calib_gamelogs_bulk(role, season) or {})
+                import warehouse_mirror as _wm
+                if _wm.enabled():
+                    data = _wm.calib_gamelogs_bulk_full(role, int(season))
             except Exception:
-                _bulk_cache[key] = {}
+                data = None
+            if data is None:
+                try:
+                    import mlb_warehouse
+                    data = mlb_warehouse.get_calib_gamelogs_bulk(role, season) or {}
+                except Exception:
+                    data = {}
+            _bulk_cache[key] = data
         return _bulk_cache[key]
 
     for _, rows in by_player.items():

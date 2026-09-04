@@ -460,6 +460,31 @@ def calib_gamelogs_bulk(role, season, sport="baseball_mlb"):
     return out
 
 
+def calib_gamelogs_bulk_full(role, season, sport="baseball_mlb"):
+    """Full-shape variant of calib_gamelogs_bulk for the CALIBRATION actuals join
+    (book_line_calibration.join_book_lines_to_actuals). Same rows PLUS ``game_date``
+    (from official_date) and ``completed``=True — the only fields the join reads beyond
+    the stat columns + game_pk. It intentionally omits opponent/is_home: the calibration
+    fit takes game context from _attach_gamecontext (StatsAPI), NOT from the gamelog,
+    and _match_rows_to_gamelog never reads them (matching is game_pk-dominant, date is a
+    rare fallback). Excludes S/A/E to match mlb_warehouse.get_calib_gamelogs_bulk. None
+    if the season file is absent (caller falls back to Azure)."""
+    base = calib_gamelogs_bulk(role, season, sport)
+    if base is None:
+        return None
+    out = {}
+    for aid, rows in base.items():
+        logs = []
+        for r in rows:
+            g = dict(r)
+            if g.get("game_date") is None:
+                g["game_date"] = r.get("official_date")
+            g["completed"] = True
+            logs.append(g)
+        out[aid] = logs
+    return out
+
+
 def _row_key(d):
     return tuple(sorted((k, v) for k, v in d.items()))
 
