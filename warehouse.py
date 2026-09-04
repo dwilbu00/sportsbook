@@ -70,6 +70,17 @@ def _sql():
     return _db is not None and _db.enabled()
 
 
+def _mirror_on():
+    """True when the parquet mirror is available — the odds loaders can then serve
+    offline (0 DTU) even with SQL unconfigured, so a backtest/calibration box needs no
+    SQL creds. Never raises."""
+    try:
+        import warehouse_mirror as _wm
+        return _wm.enabled()
+    except Exception:
+        return False
+
+
 # ── SQL-off hardening (WS1 Layer B) ──
 # Reads that silently return [] when SQL is off would make a mis-deployed prod
 # look like an empty warehouse instead of failing loud. _ensure_durable raises
@@ -985,7 +996,7 @@ def load_team_market_store(sport_key, dates=None, include_sbr=False,
     empty = {"sport_key": sport_key, "games": {},
              "bookmaker": "warehouse (DK best-available, pre-close; timing varies by season)"}
     _ensure_durable("read the team-market warehouse")
-    if not _sql():
+    if not _sql() and not _mirror_on():
         return empty
     try:
         # 'close' (default) keeps every snapshot → the assembler picks the
@@ -1126,7 +1137,7 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
     (exclude_early) ONE SEASON AT A TIME and ASSEMBLES each season immediately —
     peak memory is one season's raw rows, not the whole table."""
     _ensure_durable("read the player-prop warehouse")
-    if not _sql():
+    if not _sql() and not _mirror_on():
         return []
     try:
         from pricing_common import et_local_date

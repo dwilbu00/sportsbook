@@ -300,9 +300,16 @@ def precompute_offense_cache(seasons, min_pa=40, chunk_days=10, verbose=True):
         from sqlalchemy import select
     except Exception:
         return 0
-    if not sh.enabled():
+    _mirror_ok = False
+    try:
+        import warehouse_mirror as _wm
+        _mirror_ok = _wm.enabled()
+    except Exception:
+        _mirror_ok = False
+    if not sh.enabled() and not _mirror_ok:
         if verbose:
-            print("  [offense-precompute] SQL not configured — nothing to do.")
+            print("  [offense-precompute] neither SQL nor the statcast mirror is "
+                  "available — nothing to do.")
         return 0
     sp = sh.statcast_pitch
     written = 0
@@ -315,36 +322,55 @@ def precompute_offense_cache(seasons, min_pa=40, chunk_days=10, verbose=True):
                               if info.get("abbr")}
         except Exception:
             statsapi_abbrs = set()
-        # 1) chunk-read the whole season into {date -> [(team, hand, xwoba)]}.
+        # 1) read the whole season into {date -> [(team, hand, xwoba)]}. Prefer the
+        #    parquet mirror (0 DTU, one pass); fall back to the chunked Azure read.
         date_rows, chunks, failed = {}, 0, 0
-        d = s0
-        while d <= s1:
-            hi = min(d + timedelta(days=chunk_days), s1 + timedelta(days=1))
-            stmt = select(sp.c.game_date, sp.c.batting_team, sp.c.p_throws,
-                          sp.c.xwoba).where(
-                (sp.c.xwoba.isnot(None)) & (sp.c.batting_team.isnot(None))
-                & (sp.c.p_throws.in_(("L", "R")))
-                & (sp.c.game_date >= d.isoformat())
-                & (sp.c.game_date < hi.isoformat()))
-            rows = None
-            for _attempt in range(4):
-                try:
-                    with db_store.get_engine().connect() as conn:
-                        rows = conn.execute(stmt).all()
-                    break
-                except Exception:
-                    rows = None
-                    time.sleep(1.0)
-            chunks += 1
-            if rows is None:
-                failed += 1
-                if verbose:
-                    print(f"  [offense-precompute] {season}: chunk {d}..{hi} FAILED "
-                          f"after retries (cache will be incomplete).")
-            for gd, team, hand, xw in (rows or []):
-                date_rows.setdefault(str(gd)[:10], []).append(
+        mirror_rows = None
+        try:
+            import warehouse_mirror as _wm
+            if _wm.enabled():
+                mirror_rows = _wm.statcast_days(f"{season}-01-01", f"{season}-12-31")
+        except Exception:
+            mirror_rows = None
+        if mirror_rows is not None:
+            for r in mirror_rows:
+                xw, team, hand = r.get("xwoba"), r.get("batting_team"), r.get("p_throws")
+                if xw is None or team is None or hand not in ("L", "R"):
+                    continue
+                date_rows.setdefault(str(r.get("game_date"))[:10], []).append(
                     (str(team), hand, float(xw)))
-            d = hi
+            if verbose:
+                print(f"  [offense-precompute] {season}: {len(mirror_rows):,} pitches "
+                      f"from mirror (0 DTU)")
+        else:
+            d = s0
+            while d <= s1:
+                hi = min(d + timedelta(days=chunk_days), s1 + timedelta(days=1))
+                stmt = select(sp.c.game_date, sp.c.batting_team, sp.c.p_throws,
+                              sp.c.xwoba).where(
+                    (sp.c.xwoba.isnot(None)) & (sp.c.batting_team.isnot(None))
+                    & (sp.c.p_throws.in_(("L", "R")))
+                    & (sp.c.game_date >= d.isoformat())
+                    & (sp.c.game_date < hi.isoformat()))
+                rows = None
+                for _attempt in range(4):
+                    try:
+                        with db_store.get_engine().connect() as conn:
+                            rows = conn.execute(stmt).all()
+                        break
+                    except Exception:
+                        rows = None
+                        time.sleep(1.0)
+                chunks += 1
+                if rows is None:
+                    failed += 1
+                    if verbose:
+                        print(f"  [offense-precompute] {season}: chunk {d}..{hi} FAILED "
+                              f"after retries (cache will be incomplete).")
+                for gd, team, hand, xw in (rows or []):
+                    date_rows.setdefault(str(gd)[:10], []).append(
+                        (str(team), hand, float(xw)))
+                d = hi
         # 2) walk every calendar date, accumulate, snapshot -> cache[cutoff=date].
         cum, cur, season_written = {}, s0, 0
         while cur <= s1:

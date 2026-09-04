@@ -299,6 +299,16 @@ def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=Non
             use_warehouse = db_store.enabled()
         except Exception:
             use_warehouse = False
+        # warehouse.load_prop_lines is mirror-FIRST, so the warehouse path serves fully
+        # offline (0 DTU) from the parquet mirror even when SQL isn't configured for this
+        # CLI run. Gating only on db_store.enabled() would skip the mirror and fall back
+        # to the (usually empty) local store — the "0 backfill store" symptom.
+        if not use_warehouse:
+            try:
+                import warehouse_mirror as _wm
+                use_warehouse = _wm.enabled()
+            except Exception:
+                pass
     if use_warehouse:
         # Pass the target props so the warehouse read filters in SQL (a single-prop
         # diagnostic then transfers ~1/7 the rows). The Python filter stays as a
