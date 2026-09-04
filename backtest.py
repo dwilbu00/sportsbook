@@ -4084,7 +4084,19 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               variants, sweep=False, season_year=None,
                               safe_mode=False, cushion_sweep=False,
                               safe_target=0.80, quantile_mode=False,
-                              calibrate=False, cross_season="strict"):
+                              calibrate=False, cross_season="strict",
+                              workers=1, _emit_prints=True):
+    # PARALLEL: the accumulator is pure-append/additive and per-player independent
+    # (no cross-obs state feeds the per-obs math), so we can split the player pool into
+    # CONTIGUOUS chunks, run each in its own process, and merge the raw cells IN ORDER
+    # -> byte-identical to serial (float sums stay order-stable). Workers run the exact
+    # same body with workers=1 + prints suppressed; the scorers print once on the merge.
+    if workers and int(workers) > 1 and len(players) > 1:
+        return _run_props_sweep_parallel(
+            int(workers), sport, espn_sport, espn_league, sport_key, list(players),
+            props, games_per_player, min_sample, variants, sweep, season_year,
+            safe_mode, cushion_sweep, safe_target, quantile_mode, calibrate,
+            cross_season, _emit_prints)
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
     # STEP-2: resolve each prop's LOCKED live window so the refit fits methods at the
     # SAME window production serves (fit==serve). A variant carrying the "__calib__"
@@ -4613,12 +4625,30 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
 
                     total_observations += 1
 
-    print(f"\nProcessed {total_observations} (player, prop, game) observations")
-    print(f"Skipped {skipped} game-prop observations (eligibility, history, or data)")
-    if reliability_skips:
-        print("As-of reliability skips: " + ", ".join(
-            f"{reason}={count}"
-            for reason, count in sorted(reliability_skips.items())))
+    if _emit_prints:
+        _emit_props_sweep_reports(
+            results, props, sweep, safe_mode, quantile_mode, calibrate,
+            cushion_sweep, safe_target,
+            counters={"total": total_observations, "skipped": skipped,
+                      "reliability_skips": dict(reliability_skips)})
+    # Return the full per-variant results dict so callers like
+    # refit_calibration.py can fit persistent calibration files.
+    return results
+
+
+def _emit_props_sweep_reports(results, props, sweep, safe_mode, quantile_mode,
+                              calibrate, cushion_sweep, safe_target, counters=None):
+    """Print the sweep report tables from a (possibly merged) results dict. Split out
+    so the parallel path can print ONCE on the merged cells. ``counters`` (the
+    obs/skip summary) is available only on the serial path; None on parallel."""
+    if counters is not None:
+        print(f"\nProcessed {counters['total']} (player, prop, game) observations")
+        print(f"Skipped {counters['skipped']} game-prop observations "
+              "(eligibility, history, or data)")
+        if counters.get("reliability_skips"):
+            print("As-of reliability skips: " + ", ".join(
+                f"{reason}={count}"
+                for reason, count in sorted(counters["reliability_skips"].items())))
 
     if sweep:
         _print_props_sweep_results(results, props, top_k=10, safe_target=safe_target)
@@ -4643,9 +4673,91 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 _print_calibration_k_sweep(results, props,
                                            k_values=(0, 5, 10, 15, 20, 30, 60))
 
-    # Return the full per-variant results dict so callers like
-    # refit_calibration.py can fit persistent calibration files.
-    return results
+
+def _contiguous_chunks(items, n):
+    """Split ``items`` into up to ``n`` CONTIGUOUS, order-preserving chunks (so a
+    merge in chunk order reproduces the serial obs order exactly -> byte-identical
+    float pools). Empty chunks omitted."""
+    items = list(items)
+    n = max(1, min(int(n), len(items)))
+    k, r = divmod(len(items), n)
+    out, i = [], 0
+    for j in range(n):
+        sz = k + (1 if j < r else 0)
+        if sz:
+            out.append(items[i:i + sz])
+        i += sz
+    return out
+
+
+def _merge_props_results(parts):
+    """Merge per-chunk raw accumulators into one, IN ORDER (parts[0] first). Lists
+    concatenate (errors/calib_obs/cushions), counters sum (n/hits/decisive/safe/
+    quantile). All (variant, prop) cells exist in every part (init'd for the full
+    grid), so keys align. Mutates+returns parts[0]."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return {}
+    merged = parts[0]
+    for part in parts[1:]:
+        for vname, by_prop in part.items():
+            for pk, cell in by_prop.items():
+                m = merged[vname][pk]
+                m["errors"].extend(cell["errors"])
+                m["n"] += cell["n"]
+                m["hits"] += cell["hits"]
+                m["decisive"] += cell["decisive"]
+                for off, t in cell.get("safe", {}).items():
+                    mt = m["safe"].setdefault(off, {"hits": 0, "n": 0})
+                    mt["hits"] += t["hits"]
+                    mt["n"] += t["n"]
+                for q, t in cell.get("quantile", {}).items():
+                    mq = m["quantile"].setdefault(q, {"hits": 0, "n": 0,
+                                                       "cushions": []})
+                    mq["hits"] += t["hits"]
+                    mq["n"] += t["n"]
+                    mq["cushions"].extend(t["cushions"])
+                if cell.get("calib_obs") is not None:
+                    if m.get("calib_obs") is None:
+                        m["calib_obs"] = []
+                    m["calib_obs"].extend(cell["calib_obs"])
+    return merged
+
+
+def _props_sweep_worker(payload):
+    """Top-level (picklable) worker: run the sweep on one player chunk, prints off,
+    returns the raw accumulator. workers=1 prevents recursive fan-out."""
+    (sport, espn_sport, espn_league, sport_key, chunk, props, games_per_player,
+     min_sample, variants, sweep, season_year, safe_mode, cushion_sweep,
+     safe_target, quantile_mode, calibrate, cross_season) = payload
+    return run_player_props_backtest(
+        sport, espn_sport, espn_league, sport_key, chunk, props, games_per_player,
+        min_sample, variants, sweep=sweep, season_year=season_year,
+        safe_mode=safe_mode, cushion_sweep=cushion_sweep, safe_target=safe_target,
+        quantile_mode=quantile_mode, calibrate=calibrate, cross_season=cross_season,
+        workers=1, _emit_prints=False)
+
+
+def _run_props_sweep_parallel(workers, sport, espn_sport, espn_league, sport_key,
+                              players, props, games_per_player, min_sample, variants,
+                              sweep, season_year, safe_mode, cushion_sweep,
+                              safe_target, quantile_mode, calibrate, cross_season,
+                              emit_prints):
+    from concurrent.futures import ProcessPoolExecutor
+    chunks = _contiguous_chunks(players, workers)
+    payloads = [(sport, espn_sport, espn_league, sport_key, chunk, props,
+                 games_per_player, min_sample, variants, sweep, season_year,
+                 safe_mode, cushion_sweep, safe_target, quantile_mode, calibrate,
+                 cross_season) for chunk in chunks]
+    print(f"\n=== Parallel sweep: {len(payloads)} workers over {len(players)} "
+          f"players ({len(variants)} variants) ===", flush=True)
+    with ProcessPoolExecutor(max_workers=len(payloads)) as ex:
+        parts = list(ex.map(_props_sweep_worker, payloads))    # order preserved
+    merged = _merge_props_results(parts)
+    if emit_prints:
+        _emit_props_sweep_reports(merged, props, sweep, safe_mode, quantile_mode,
+                                  calibrate, cushion_sweep, safe_target, counters=None)
+    return merged
 
 
 # ────────────────────────────────────────────────────────────────
