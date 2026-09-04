@@ -300,12 +300,17 @@ def _sync_facts(sport, seasons, refresh, verbose):
     # (NOT mlb_game.season) so the mirror indexes match. game_type is stored so
     # calib_gamelogs_bulk can exclude S/A/E (get_calib_gamelogs_bulk does; the pitcher
     # as-of index does NOT — each reader applies its own filter).
+    # Mirror the FULL Azure stat set (pinned to mlb_warehouse's own tuples so it can't
+    # drift) — a reduced set silently broke method D, which needs AB ("per-AB hit rate
+    # + expected AB"): the batter facts previously carried only H/SO/TB/RBI, so
+    # project_distributional returned None on mirror gamelogs and D was excluded. Full
+    # set = the mirror gamelog is byte-shape-identical to get_calib_gamelog. team_id
+    # added so the mirror can reconstruct opponent/is_home for the ESPN-shape readers.
     for tbl, mk_file, stat_cols in (
             (wh.mlb_pitcher_game, _pitcher_file,
-             ("team_id", "GS", "IP", "ER", "K", "BB", "BF")),
-            # team_id added for the batter facts so the mirror can reconstruct
-            # opponent/is_home (get_calib_gamelog full ESPN shape for the sweep).
-            (wh.mlb_batter_game, _batter_file, ("team_id", "H", "SO", "TB", "RBI"))):
+             ("team_id",) + tuple(wh._PITCHER_GAME_STATS)),
+            (wh.mlb_batter_game, _batter_file,
+             ("team_id",) + tuple(wh._BATTER_GAME_STATS))):
         for s in seasons:
             f = mk_file(sport, s)
             if (not refresh) and (_is_valid(f) or os.path.exists(_path(f))):
