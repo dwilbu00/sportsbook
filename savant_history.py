@@ -305,9 +305,23 @@ def ingested_days(start, end):
         return {r[0] for r in rows}
 
 
+def _in_mlb_season(d):
+    """True if calendar date ``d`` could carry MLB Statcast data — spring training
+    through the World Series. Conservative window (Feb 15 - Nov 10) so NO real-data day
+    is ever skipped (earliest spring games ~Feb 20, latest WS ~Nov 5), while the clear
+    off-season (mid-Nov through mid-Feb) is excluded. Without this, the ~4 gameless
+    off-season months are walked as 'missing' every run and re-fetched from Savant
+    (wasted external reads that just return empty) — the perpetual-missing bug. The few
+    GAMELESS in-season days (All-Star break, postseason off-days) still self-resolve:
+    fetch_statcast_day manifests an empty day (n_rows=0), so they're fetched once."""
+    m, day = d.month, d.day
+    return (3 <= m <= 10) or (m == 2 and day >= 15) or (m == 11 and day <= 10)
+
+
 def missing_days(start, end):
-    """Calendar days in [start, min(end, today)] NOT yet ingested (per the manifest),
-    oldest-first. ``end`` is capped at today — future days have no games."""
+    """In-SEASON calendar days in [start, min(end, today)] NOT yet ingested (per the
+    manifest), oldest-first. ``end`` is capped at today — future days have no games.
+    Off-season days (``_in_mlb_season`` False) are skipped so they're never re-fetched."""
     d0 = _date.fromisoformat(start)
     d1 = _date.fromisoformat(end)
     today = _date.today()
@@ -318,7 +332,7 @@ def missing_days(start, end):
     day = d0
     while day <= d1:
         ds = day.isoformat()
-        if ds not in have:
+        if ds not in have and _in_mlb_season(day):
             out.append(ds)
         day += timedelta(days=1)
     return out

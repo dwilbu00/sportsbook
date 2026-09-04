@@ -73,6 +73,18 @@ class IngestLoadTests(_Backend, unittest.TestCase):
         miss = sh.missing_days("2024-07-03", "2024-07-06")
         self.assertEqual(miss, ["2024-07-04", "2024-07-06"])   # gaps only, oldest-first
 
+    def test_missing_days_skips_offseason(self):
+        # Off-season days (mid-Nov..mid-Feb) are NEVER reported missing → never
+        # re-fetched from Savant every run. In-season un-ingested days still are.
+        miss = sh.missing_days("2023-12-20", "2024-03-02")
+        self.assertNotIn("2024-01-15", miss)   # deep off-season
+        self.assertNotIn("2024-02-14", miss)   # last off-season day
+        self.assertNotIn("2023-12-25", miss)
+        self.assertIn("2024-02-15", miss)      # spring-training window opens
+        self.assertIn("2024-03-01", miss)      # in-season, un-ingested
+        self.assertTrue(sh._in_mlb_season(sh._date.fromisoformat("2024-11-10")))
+        self.assertFalse(sh._in_mlb_season(sh._date.fromisoformat("2024-11-11")))
+
 
 class SqlOffTests(unittest.TestCase):
     def setUp(self):
