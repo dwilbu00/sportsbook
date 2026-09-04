@@ -687,15 +687,67 @@ def _variant_confirms(cand_obs, base_obs, cand_method, negbin_eligible=False):
     return True
 
 
-def _best_per_prop_worker(payload):
-    """Top-level (picklable) worker: winner selection for ONE prop on its results
-    slice, all stdout suppressed. Each prop is fully independent (per-prop base_obs +
-    negbin eligibility, no cross-prop state), so this is byte-identical to serial."""
+def _eval_one_variant(prop_key, vname, obs, base_obs, is_baseline, negbin_eligible,
+                      k_values):
+    """Best ELIGIBLE calibration candidate for ONE (prop, variant), or None. The single
+    source of truth for the per-variant gate logic, shared by the serial loop and the
+    parallel chunk worker (so they can't diverge). Iterates methods in A,B,C,E order and
+    keeps the min-Brier eligible one (first on ties) — matching the serial encounter
+    order, so the global reduce (min Brier, first variant-index on ties) is identical."""
+    evals = _evaluate_calibration_methods(
+        obs, k_values, holdout=True, negbin_eligible=negbin_eligible)
+    by_method = {}
+    for e in evals:
+        if e["brier"] is None or e["k"] not in (None, 0):
+            continue
+        if e["method"] in ("A", "B", "C", "E"):
+            by_method[e["method"]] = e
+    baseline = by_method.get("A")
+    best = None
+    for method, e in by_method.items():
+        if method != "A":
+            if (baseline is None
+                    or baseline["brier"] - e["brier"] < MIN_CALIB_BRIER_GAIN):
+                continue
+            if not _confirms_over_baseline(obs, method,
+                                           negbin_eligible=negbin_eligible):
+                continue
+        if (base_obs and not is_baseline
+                and not _variant_confirms(obs, base_obs, method,
+                                          negbin_eligible=negbin_eligible)):
+            continue
+        if best is None or e["brier"] < best["brier"]:
+            best = {
+                "variant": vname, "method": method, "brier": e["brier"],
+                "hit": e["hit"],
+                "baseline_brier": (round(baseline["brier"], 4) if baseline else None),
+                "cv_brier": _cv_brier(obs, method, negbin_eligible=negbin_eligible),
+                "confirmed": method != "A", "variant_confirmed": not is_baseline,
+            }
+    return best
+
+
+def _reduce_chunk_worker(payload):
+    """Winner candidate for one (prop, variant-CHUNK): evaluate each variant in the
+    chunk, return the chunk's best (min Brier, first variant-index on ties). stdout
+    suppressed. Returns (prop_key, best_candidate_or_None, best_index)."""
     import os
     import contextlib
-    sliced, prop_key, k_values = payload
+    (prop_key, slice_obs, base_obs, base_flags, negbin_eligible, k_values,
+     idx_map) = payload
+    best, best_idx = None, None
     with open(os.devnull, "w") as _dn, contextlib.redirect_stdout(_dn):
-        return _best_per_prop(sliced, [prop_key], k_values=k_values, workers=1)
+        for vname, obs in slice_obs.items():
+            if not obs:
+                continue
+            cand = _eval_one_variant(prop_key, vname, obs, base_obs,
+                                     base_flags[vname], negbin_eligible, k_values)
+            if cand is None:
+                continue
+            i = idx_map[vname]
+            if best is None or (cand["brier"], i) < (best["brier"], best_idx):
+                best, best_idx = cand, i
+    return prop_key, best, best_idx
 
 
 def _best_per_prop(results, props, k_values=(0,), workers=1):
@@ -709,24 +761,57 @@ def _best_per_prop(results, props, k_values=(0,), workers=1):
                     "baseline_brier", "cv_brier", "confirmed"}}
     """
     from props import PROP_NEGBIN_ELIGIBLE
-    # PARALLEL: each prop's winner is fully independent (per-prop base_obs + negbin
-    # eligibility, no cross-prop state), so fan out over props and merge the dicts —
-    # byte-identical to serial. Slice results per prop so workers pickle ~1/N the data.
-    if workers and int(workers) > 1 and len(props) > 1:
-        from concurrent.futures import ProcessPoolExecutor
-        payloads = [({v: {pk: results[v][pk]} for v in results}, pk, k_values)
-                    for pk in props if any(results[v].get(pk) for v in results)]
-        winners = {}
-        with ProcessPoolExecutor(max_workers=min(int(workers), len(payloads))) as ex:
-            for part in ex.map(_best_per_prop_worker, payloads):
-                winners.update(part)
-        return winners
+    vnames = list(results.keys())
+    # PARALLEL over (prop × variant-CHUNK): the per-prop split alone tail-stalls on the
+    # single heaviest prop (batter_hits' 576 variants serialize on one core). Chunking
+    # each prop's variants across all workers breaks that tail. Byte-identical: each
+    # (prop, variant) candidate is independent; the global winner = min Brier, first
+    # variant-index on ties, so the merge (min by (brier, index)) matches serial.
+    if workers and int(workers) > 1 and len(vnames) > 1:
+        import time as _t
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from backtest import _contiguous_chunks
+        try:
+            from backtest import _progress_bar
+        except Exception:
+            _progress_bar = None
+        vindex = {v: i for i, v in enumerate(vnames)}
+        payloads = []
+        for pk in props:
+            if not any(results[v].get(pk) for v in vnames):
+                continue
+            negbin_eligible = pk in PROP_NEGBIN_ELIGIBLE
+            base_obs = _baseline_variant_obs(results, pk)
+            for chunk in _contiguous_chunks(vnames, int(workers)):
+                payloads.append((
+                    pk,
+                    {v: (results[v][pk].get("calib_obs") or []) for v in chunk},
+                    base_obs,
+                    {v: _is_baseline_variant(v) for v in chunk},
+                    negbin_eligible, k_values,
+                    {v: vindex[v] for v in chunk}))
+        best_by_prop = {}     # pk -> (brier, index, candidate)
+        t0 = _t.time()
+        print(f"\n=== Post-sweep winner selection: {len(vnames)} variants × "
+              f"{len(props)} props ({len(payloads)} chunks) ===", flush=True)
+        with ProcessPoolExecutor(max_workers=int(workers)) as ex:
+            futs = [ex.submit(_reduce_chunk_worker, p) for p in payloads]
+            done = 0
+            for fut in as_completed(futs):
+                pk, cand, idx = fut.result()
+                if cand is not None:
+                    cur = best_by_prop.get(pk)
+                    if cur is None or (cand["brier"], idx) < (cur[0], cur[1]):
+                        best_by_prop[pk] = (cand["brier"], idx, cand)
+                done += 1
+                if _progress_bar:
+                    _progress_bar(done, len(futs), "reduce chunks", t0)
+        return {pk: v[2] for pk, v in best_by_prop.items()}
+
     winners = {}
     for prop_key in props:
         # §2.2: a whitelisted count prop admits method E (NegBin) as a candidate in
-        # the SYNTHETIC sweep too (not just the real-line path) — the fix that lets
-        # a count prop with NO stored book lines (e.g. batter_total_bases) select
-        # the count model. Non-count props are unaffected (E never scored).
+        # the SYNTHETIC sweep too — non-count props never score E.
         negbin_eligible = prop_key in PROP_NEGBIN_ELIGIBLE
         base_obs = _baseline_variant_obs(results, prop_key)
         best = None
@@ -734,51 +819,11 @@ def _best_per_prop(results, props, k_values=(0,), workers=1):
             obs = by_prop[prop_key].get("calib_obs") or []
             if not obs:
                 continue
-            is_baseline = _is_baseline_variant(vname)
-            evals = _evaluate_calibration_methods(
-                obs, k_values, holdout=True, negbin_eligible=negbin_eligible)
-            by_method = {}
-            for e in evals:
-                if e["brier"] is None or e["k"] not in (None, 0):
-                    continue
-                # Persist non-shrinkage methods A, B, C (+ E for count props) —
-                # per-player shrinkage variants (B*, C*) overfit out-of-sample per
-                # the NBA holdout sweep.
-                if e["method"] in ("A", "B", "C", "E"):
-                    by_method[e["method"]] = e
-            baseline = by_method.get("A")
-            for method, e in by_method.items():
-                if method != "A":
-                    # Fancier methods must clear the baseline margin AND confirm.
-                    if (baseline is None
-                            or baseline["brier"] - e["brier"] < MIN_CALIB_BRIER_GAIN):
-                        continue
-                    if not _confirms_over_baseline(
-                            obs, method, negbin_eligible=negbin_eligible):
-                        continue
-                # P2.1 variant gate: a non-baseline knob combo must ALSO beat the
-                # baseline variant out-of-sample in both folds — else it's likely a
-                # single-split winner's-curse and we keep the baseline (the floor).
-                # Only active when the sweep actually contains the baseline cell
-                # (always true in the real grid; skipped in narrow unit fixtures).
-                if (base_obs and not is_baseline
-                        and not _variant_confirms(
-                            obs, base_obs, method,
-                            negbin_eligible=negbin_eligible)):
-                    continue
-                if best is None or e["brier"] < best["brier"]:
-                    best = {
-                        "variant": vname,
-                        "method": method,
-                        "brier": e["brier"],
-                        "hit": e["hit"],
-                        "baseline_brier": (round(baseline["brier"], 4)
-                                           if baseline else None),
-                        "cv_brier": _cv_brier(
-                            obs, method, negbin_eligible=negbin_eligible),
-                        "confirmed": method != "A",
-                        "variant_confirmed": not is_baseline,
-                    }
+            cand = _eval_one_variant(prop_key, vname, obs, base_obs,
+                                     _is_baseline_variant(vname), negbin_eligible,
+                                     k_values)
+            if cand is not None and (best is None or cand["brier"] < best["brier"]):
+                best = cand
         if best:
             winners[prop_key] = best
     return winners
