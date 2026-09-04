@@ -888,11 +888,33 @@ def _snapshot_source(snapshot):
     return snapshot if snapshot in _ROLE_SNAPSHOTS else None
 
 
+def _unscoped_season_range(sport_key, kind):
+    """Season strings to iterate for an UNSCOPED (dates=None) odds read. When the
+    mirror is enabled AND has files for this sport, iterate ONLY the seasons it actually
+    holds (0 DTU, no Azure) instead of blindly probing 2019..now (one wasted Azure round-
+    trip per empty year on the 20-DTU tier). The current season lands in the mirror once
+    synced (autobuild / --refresh-mirror keep it fresh; the documented live-season
+    staleness caveat), so no speculative Azure probe is needed. Mirror off/absent -> the
+    full legacy range (Azure holds the data in that deployment)."""
+    import datetime as _dt
+    this_year = _dt.date.today().year
+    try:
+        import warehouse_mirror as _wm
+        if _wm.enabled():
+            seasons = _wm.available_seasons(sport_key, kind)
+            if seasons:
+                return seasons
+    except Exception:
+        pass
+    return [str(y) for y in range(2019, this_year + 2)]
+
+
 def _mirror_first_team_lines(sport_key, dates=None, snapshot_source=None):
     """Mirror-first team-market read — parquet (0 DTU on the 20-DTU tier) with Azure
     fallback. The season-keyed mirror can't serve a fully-unscoped read, so when
-    `dates` is None we read per-YEAR (the mirror serves each; a year with no mirror
-    file falls back to _db, which returns fast for empty years)."""
+    `dates` is None we read per-SEASON — over the mirror's own season files when it's
+    enabled (`_unscoped_season_range`), else the legacy 2019..now range; each per-season
+    call the mirror serves, and a season with no mirror file falls back to _db."""
     def _one(**kw):
         try:
             import warehouse_mirror as _wm
@@ -906,10 +928,9 @@ def _mirror_first_team_lines(sport_key, dates=None, snapshot_source=None):
         return _db.team_market_lines(sport_key, snapshot_source=snapshot_source, **kw)
     if dates:
         return _one(dates=dates)
-    import datetime as _dt
     out = []
-    for _yr in range(2019, _dt.date.today().year + 2):
-        out.extend(_one(date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31"))
+    for _s in _unscoped_season_range(sport_key, "team"):
+        out.extend(_one(date_from=f"{_s}-01-01", date_to=f"{_s}-12-31"))
     return out
 
 
@@ -1138,11 +1159,11 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
                 sport_key, dates=dates, exclude_early=_excl_early,
                 only_early=_only_early, prop_keys=prop_keys, snapshot_source=_src))
         else:
-            # Empty years return fast (indexed sport+game_date scan finds nothing).
-            import datetime as _dt
-            for _yr in range(2019, _dt.date.today().year + 2):
+            # Per-season over the mirror's own files (0 DTU) when enabled, else the
+            # legacy 2019..now range; empty years return fast either way.
+            for _s in _unscoped_season_range(sport_key, "props"):
                 _assemble(_mirror_first_prop_lines(
-                    sport_key, date_from=f"{_yr}-01-01", date_to=f"{_yr}-12-31",
+                    sport_key, date_from=f"{_s}-01-01", date_to=f"{_s}-12-31",
                     exclude_early=_excl_early, only_early=_only_early,
                     prop_keys=prop_keys, snapshot_source=_src))
     except Exception as e:

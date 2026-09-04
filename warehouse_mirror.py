@@ -164,6 +164,29 @@ def _game_file(sport):
     return f"mlb_game__{sport}.parquet"
 
 
+def available_seasons(sport, kind="team"):
+    """Seasons (as strings, sorted) for which a mirror ODDS parquet exists for this
+    sport across ANY book. `kind`: 'team' or 'props'. Empty list if the dir is absent
+    or nothing matches. Used to serve an UNSCOPED (dates=None) read from the mirror's
+    own season files instead of blindly probing 2019..now into Azure. Counts pointer
+    stubs too (the per-season read still falls back to Azure if a file is a stub)."""
+    prefix = f"{'team' if kind == 'team' else 'props'}__{sport}__"
+    seasons = set()
+    try:
+        for fn in os.listdir(MIRROR_DIR):
+            if not (fn.startswith(prefix) and fn.endswith(".parquet")):
+                continue
+            stem = fn[:-len(".parquet")]
+            if stem.endswith("_valid"):
+                stem = stem[:-len("_valid")]
+            seg = stem.rsplit("__", 1)
+            if len(seg) == 2 and seg[1].isdigit():
+                seasons.add(seg[1])
+    except OSError:
+        pass
+    return sorted(seasons)
+
+
 def _pitcher_file(sport, season):
     return f"pitcher_game__{sport}__{season}.parquet"
 
