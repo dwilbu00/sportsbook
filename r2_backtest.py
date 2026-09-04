@@ -525,23 +525,40 @@ def build_report(rows, coverage, min_n=100, min_seasons=2, min_t=2.0,
 
 # ── Fetch + cache ─────────────────────────────────────────────────────────────
 
-def _cache_path(sport, seasons, prop_keys):
+def _snap_tag(snapshot):
+    """Cache-filename suffix for a precise window; empty for the default 'close' so
+    existing caches stay valid (default is the legacy self-pick-close read)."""
+    return "" if snapshot in (None, "close") else f"_{snapshot}"
+
+
+def _snap_src(snapshot):
+    """Driver --snapshot -> r2_data snapshot_source: 'close' -> None (self-pick close
+    over all snapshots); a precise window filters odds_snapshot.source exactly."""
+    return None if snapshot in (None, "close") else snapshot
+
+
+def _cache_path(sport, seasons, prop_keys, snapshot="close"):
     os.makedirs(_CACHE_DIR, exist_ok=True)
-    tag = f"{sport}_{'-'.join(map(str, seasons))}_{'-'.join(sorted(prop_keys))}"
+    tag = (f"{sport}_{'-'.join(map(str, seasons))}_{'-'.join(sorted(prop_keys))}"
+           f"{_snap_tag(snapshot)}")
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, prop_keys, refresh=False, refresh_mirror=False):
+def load_or_fetch(sport, seasons, prop_keys, refresh=False, refresh_mirror=False,
+                  snapshot="close"):
     """Fetch paired legs + the outcome index (or load the local cache). The fetch is
-    the only Azure round-trip; re-report with different haircut/floor reads cache."""
-    path = _cache_path(sport, seasons, prop_keys)
+    the only Azure round-trip; re-report with different haircut/floor reads cache.
+    ``snapshot`` selects the precise window (default 'close' = self-pick close)."""
+    path = _cache_path(sport, seasons, prop_keys, snapshot)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
-    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
-    legs_by_season, fetch_stats = r2_data.load_prop_legs(sport, seasons, prop_keys)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}"
+          f" (snapshot={snapshot})")
+    legs_by_season, fetch_stats = r2_data.load_prop_legs(
+        sport, seasons, prop_keys, snapshot_source=_snap_src(snapshot))
     outcome_idx = r2_data.build_outcome_index(seasons, prop_keys)
     blob = {"legs_by_season": legs_by_season, "outcome_idx": outcome_idx,
             "fetch_stats": {s: dict(c) for s, c in fetch_stats.items()}}
@@ -550,23 +567,27 @@ def load_or_fetch(sport, seasons, prop_keys, refresh=False, refresh_mirror=False
     return blob, path
 
 
-def _ml_cache_path(sport, seasons, kind):
+def _ml_cache_path(sport, seasons, kind, snapshot="close"):
     os.makedirs(_CACHE_DIR, exist_ok=True)
-    tag = f"ml_{kind}_{sport}_{'-'.join(map(str, seasons))}"
+    tag = f"ml_{kind}_{sport}_{'-'.join(map(str, seasons))}{_snap_tag(snapshot)}"
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch_ml(sport, seasons, kind, refresh=False, refresh_mirror=False):
+def load_or_fetch_ml(sport, seasons, kind, refresh=False, refresh_mirror=False,
+                     snapshot="close"):
     """Fetch + pair DK/Pinnacle moneyline legs (kind='team' or 'first_five') + the
-    finals index (or load cache). Feeds the sharpness GATE."""
-    path = _ml_cache_path(sport, seasons, kind)
+    finals index (or load cache). Feeds the sharpness GATE. ``snapshot`` selects the
+    precise window (default 'close' = self-pick close)."""
+    path = _ml_cache_path(sport, seasons, kind, snapshot)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
-    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
-    legs_by_season, stats = r2_data.load_team_ml_legs(sport, seasons, kind=kind)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}"
+          f" (snapshot={snapshot})")
+    legs_by_season, stats = r2_data.load_team_ml_legs(
+        sport, seasons, kind=kind, snapshot_source=_snap_src(snapshot))
     finals_idx = r2_data.build_team_finals_index(seasons)
     blob = {"legs_by_season": legs_by_season, "finals_idx": finals_idx,
             "stats": {s: dict(c) for s, c in stats.items()}}
@@ -604,6 +625,11 @@ def main():
                          "log-loss, model-free). --ml-kind selects team vs first_five.")
     ap.add_argument("--ml-kind", default="team", choices=("team", "first_five"),
                     help="Moneyline snapshot kind for --ml-sharpness (default team).")
+    ap.add_argument("--snapshot", default="close",
+                    choices=("close", "closing", "early_4h", "early_12h"),
+                    help="Precise odds window: 'close' (default, self-pick nearest-pre-"
+                         "commence) or an exact source window (closing/early_4h/"
+                         "early_12h). Cached per window. Props have no early_12h.")
     args = ap.parse_args()
 
     try:
@@ -619,7 +645,8 @@ def main():
     if args.ml_sharpness:
         mlblob, mlpath = load_or_fetch_ml(args.sport, seasons, args.ml_kind,
                                           refresh=args.refresh,
-                                          refresh_mirror=args.refresh_mirror)
+                                          refresh_mirror=args.refresh_mirror,
+                                          snapshot=args.snapshot)
         n = sum(len(v) for v in mlblob["legs_by_season"].values())
         print(f"  data: {n:,} paired {args.ml_kind} moneyline legs "
               f"(DK+Pinnacle)  (cache: {mlpath})")
@@ -630,7 +657,8 @@ def main():
         return
 
     blob, path = load_or_fetch(args.sport, seasons, prop_keys, refresh=args.refresh,
-                               refresh_mirror=args.refresh_mirror)
+                               refresh_mirror=args.refresh_mirror,
+                               snapshot=args.snapshot)
     print(f"  data: {sum(len(v) for v in blob['legs_by_season'].values()):,} paired "
           f"legs across {len(seasons)} seasons  (cache: {path})")
     # Per-prop paired-leg counts (which props Pinnacle actually references) + the

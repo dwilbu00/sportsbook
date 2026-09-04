@@ -197,21 +197,32 @@ def build_coherence_report(rows, coverage, all_incoh, min_n=100, min_seasons=2,
     return {"passed": passed, "pooled": pooled, "text": text}
 
 
-def _cache_path(sport, seasons):
+def _snap_tag(snapshot):
+    return "" if snapshot in (None, "close") else f"_{snapshot}"
+
+
+def _snap_src(snapshot):
+    return None if snapshot in (None, "close") else snapshot
+
+
+def _cache_path(sport, seasons, snapshot="close"):
     os.makedirs(_CACHE_DIR, exist_ok=True)
-    tag = f"coh_{sport}_{'-'.join(map(str, seasons))}"
+    tag = f"coh_{sport}_{'-'.join(map(str, seasons))}{_snap_tag(snapshot)}"
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
-    path = _cache_path(sport, seasons)
+def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False,
+                  snapshot="close"):
+    path = _cache_path(sport, seasons, snapshot)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
-    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
-    triads_by_season, stats = r2_data.load_team_triad(sport, seasons)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}"
+          f" (snapshot={snapshot})")
+    triads_by_season, stats = r2_data.load_team_triad(
+        sport, seasons, snapshot_source=_snap_src(snapshot))
     scores_idx = r2_data.build_team_scores_index(seasons)
     blob = {"triads_by_season": triads_by_season, "scores_idx": scores_idx,
             "stats": {s: dict(c) for s, c in stats.items()}}
@@ -239,6 +250,12 @@ def main():
     ap.add_argument("--global-bias", action="store_true",
                     help="Use one in-sample offset (leaky) instead of the default "
                          "leave-one-season-out out-of-sample calibration.")
+    ap.add_argument("--snapshot", default="close",
+                    choices=("close", "closing", "early_4h", "early_12h"),
+                    help="Precise odds window: 'close' (default, self-pick nearest-pre-"
+                         "commence) or an exact source window (closing/early_4h/"
+                         "early_12h). Cached per window. Use early_4h to test the "
+                         "coherence RL edge at the execution window.")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -248,7 +265,8 @@ def main():
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh,
-                               refresh_mirror=args.refresh_mirror)
+                               refresh_mirror=args.refresh_mirror,
+                               snapshot=args.snapshot)
     n = sum(len(v) for v in blob["triads_by_season"].values())
     print(f"  data: {n:,} team triads (DK ML+RL+total)  (cache: {path})")
 

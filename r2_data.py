@@ -205,25 +205,29 @@ def select_prop_legs(rows):
 
 # ── DB-touching orchestration ────────────────────────────────────────────────
 
-def _fetch_book(sport, season, prop_keys, bookmaker):
-    """One book-scoped, season-scoped bulk read, tagged with its book."""
+def _fetch_book(sport, season, prop_keys, bookmaker, snapshot_source=None):
+    """One book-scoped, season-scoped bulk read, tagged with its book. ``snapshot_
+    source`` (early_12h/early_4h/closing) filters the precise window; None = all
+    snapshots (the leg selector then self-picks the close)."""
     rows = _read_player_prop_lines(
         sport, date_from=f"{season}-01-01", date_to=f"{season}-12-31",
-        prop_keys=list(prop_keys), bookmaker=bookmaker)
+        prop_keys=list(prop_keys), bookmaker=bookmaker,
+        snapshot_source=snapshot_source)
     for r in rows:
         r["book"] = bookmaker
     return rows
 
 
-def load_prop_legs(sport, seasons, prop_keys):
+def load_prop_legs(sport, seasons, prop_keys, snapshot_source=None):
     """Fetch + pair DK/Pinnacle prop legs for each season. Returns
-    (legs_by_season={season: [PropLeg]}, stats_by_season={season: Counter})."""
+    (legs_by_season={season: [PropLeg]}, stats_by_season={season: Counter}).
+    ``snapshot_source`` selects the precise window (None = all -> self-pick close)."""
     import db_store
     db_store.promote_secrets_from_toml()
     legs_by_season, stats_by_season = {}, {}
     for s in seasons:
-        dk = _fetch_book(sport, s, prop_keys, _DK)
-        pin = _fetch_book(sport, s, prop_keys, _PIN)
+        dk = _fetch_book(sport, s, prop_keys, _DK, snapshot_source)
+        pin = _fetch_book(sport, s, prop_keys, _PIN, snapshot_source)
         legs, stats = select_prop_legs(dk + pin)
         # Assert the same-snapshot invariant held (defensive; select_prop_legs
         # already only pairs within one snapshot_id).
@@ -325,12 +329,13 @@ def select_team_ml_legs(rows):
     return legs, stats
 
 
-def load_team_ml_legs(sport, seasons, kind="team"):
+def load_team_ml_legs(sport, seasons, kind="team", snapshot_source=None):
     """Fetch + pair DK/Pinnacle MONEYLINE legs per season (bulk reads). ``kind``
     selects the snapshot kind: 'team' = full-game moneyline, 'first_five' = the F5
     moneyline (the SP-matchup R2 shot). CRITICAL: full-game and F5 moneyline share
     bet_type='moneyline' and are distinguished ONLY by snapshot kind, so we MUST
-    filter on kind or the two would be mixed. Returns (legs_by_season, stats_by)."""
+    filter on kind or the two would be mixed. ``snapshot_source`` selects the precise
+    window (None = all -> self-pick close). Returns (legs_by_season, stats_by)."""
     import db_store
     db_store.promote_secrets_from_toml()
     by_season, stats_by = {}, {}
@@ -338,7 +343,8 @@ def load_team_ml_legs(sport, seasons, kind="team"):
         rows = []
         for book in (_DK, _PIN):
             fetched = _read_team_market_lines(
-                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
+                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book,
+                snapshot_source=snapshot_source)
             for r in fetched:
                 if r.get("bet_type") == "moneyline" and r.get("kind") == kind:
                     r["book"] = book
@@ -408,15 +414,17 @@ def select_team_triad(rows):
     return triads, stats
 
 
-def load_team_triad(sport, seasons, bookmaker="draftkings"):
+def load_team_triad(sport, seasons, bookmaker="draftkings", snapshot_source=None):
     """Fetch each event's close-snapshot ML+RL+total for one book (default DK, the
-    coherence target). Returns (triads_by_season, stats_by_season)."""
+    coherence target). ``snapshot_source`` selects the precise window (None = all ->
+    self-pick close). Returns (triads_by_season, stats_by_season)."""
     import db_store
     db_store.promote_secrets_from_toml()
     by_season, stats_by = {}, {}
     for s in seasons:
         rows = _read_team_market_lines(
-            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=bookmaker)
+            sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=bookmaker,
+            snapshot_source=snapshot_source)
         rows = [dict(r, book=bookmaker) for r in rows if r.get("kind") == "team"]
         triads, stats = select_team_triad(rows)
         by_season[s], stats_by[s] = triads, stats
@@ -486,8 +494,9 @@ def select_f5_ml_legs(rows):
     return legs, stats
 
 
-def load_f5_ml_legs(sport, seasons):
-    """Fetch + pair DK/Pinnacle/FanDuel F5 moneyline legs per season. Returns
+def load_f5_ml_legs(sport, seasons, snapshot_source=None):
+    """Fetch + pair DK/Pinnacle/FanDuel F5 moneyline legs per season. ``snapshot_
+    source`` selects the precise window (None = all -> self-pick close). Returns
     (legs_by_season, stats_by_season)."""
     import db_store
     db_store.promote_secrets_from_toml()
@@ -496,7 +505,8 @@ def load_f5_ml_legs(sport, seasons):
         rows = []
         for book in ("draftkings", "pinnacle", "fanduel"):
             fetched = _read_team_market_lines(
-                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book)
+                sport, date_from=f"{s}-01-01", date_to=f"{s}-12-31", bookmaker=book,
+                snapshot_source=snapshot_source)
             for r in fetched:
                 if r.get("kind") == "first_five":
                     r["book"] = book

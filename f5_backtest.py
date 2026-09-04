@@ -143,21 +143,32 @@ def build_edge_report(rows, cov, min_n=100, min_seasons=2, min_t=2.0):
     return {"text": text}
 
 
-def _cache_path(sport, seasons):
+def _snap_tag(snapshot):
+    return "" if snapshot in (None, "close") else f"_{snapshot}"
+
+
+def _snap_src(snapshot):
+    return None if snapshot in (None, "close") else snapshot
+
+
+def _cache_path(sport, seasons, snapshot="close"):
     os.makedirs(_CACHE_DIR, exist_ok=True)
-    tag = f"f5_{sport}_{'-'.join(map(str, seasons))}"
+    tag = f"f5_{sport}_{'-'.join(map(str, seasons))}{_snap_tag(snapshot)}"
     return os.path.join(_CACHE_DIR, tag.replace("/", "_") + ".pkl")
 
 
-def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False):
-    path = _cache_path(sport, seasons)
+def load_or_fetch(sport, seasons, refresh=False, refresh_mirror=False,
+                  snapshot="close"):
+    path = _cache_path(sport, seasons, snapshot)
     if not refresh and os.path.exists(path):
         with open(path, "rb") as f:
             return pickle.load(f), path
     import warehouse_mirror
     warehouse_mirror.autobuild(sport, seasons, refresh=refresh_mirror)
-    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}")
-    legs_by_season, stats = r2_data.load_f5_ml_legs(sport, seasons)
+    print(f"  cold cache build — reading from {warehouse_mirror.source_label()}"
+          f" (snapshot={snapshot})")
+    legs_by_season, stats = r2_data.load_f5_ml_legs(
+        sport, seasons, snapshot_source=_snap_src(snapshot))
     scores_idx = r2_data.build_f5_scores_index(seasons)
     blob = {"legs_by_season": legs_by_season, "scores_idx": scores_idx,
             "stats": {s: dict(c) for s, c in stats.items()}}
@@ -178,6 +189,11 @@ def main():
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--refresh-mirror", action="store_true",
                     help="re-sync + re-verify the parquet mirror (on by default; ODI_BACKTEST_MIRROR=0 disables)")
+    ap.add_argument("--snapshot", default="close",
+                    choices=("close", "closing", "early_4h", "early_12h"),
+                    help="Precise odds window: 'close' (default, self-pick nearest-pre-"
+                         "commence) or an exact source window (closing/early_4h/"
+                         "early_12h). Cached per window.")
     args = ap.parse_args()
     try:
         from cli_encoding import configure_stdio
@@ -187,7 +203,8 @@ def main():
 
     seasons = [s.strip() for s in args.seasons.split(",") if s.strip()]
     blob, path = load_or_fetch(args.sport, seasons, refresh=args.refresh,
-                               refresh_mirror=args.refresh_mirror)
+                               refresh_mirror=args.refresh_mirror,
+                               snapshot=args.snapshot)
     n = sum(len(v) for v in blob["legs_by_season"].values())
     print(f"  data: {n:,} F5 ML legs (DK+Pinnacle paired)  (cache: {path})")
 
