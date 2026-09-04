@@ -4281,7 +4281,17 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     skipped = 0
     reliability_skips = defaultdict(int)
 
-    for name, gamelog in player_data.items():
+    import time as _sweep_time
+    _sweep_t0 = _sweep_time.time()
+    _sweep_np = len(player_data)
+    _sweep_step = max(1, _sweep_np // 20)     # progress every ~5% of players
+    for _sweep_pi, (name, gamelog) in enumerate(player_data.items(), 1):
+        if sweep and (_sweep_pi % _sweep_step == 0 or _sweep_pi == _sweep_np):
+            _el = _sweep_time.time() - _sweep_t0
+            _eta = (_el / _sweep_pi) * (_sweep_np - _sweep_pi)
+            print(f"  [sweep] player {_sweep_pi}/{_sweep_np}  "
+                  f"({len(variants)} variants)  elapsed {_el:.0f}s  eta {_eta:.0f}s",
+                  flush=True)
         is_pitcher_log = _gamelog_is_pitcher(gamelog)
         test_slice = gamelog[:games_per_player]
         for prop_key in props:
