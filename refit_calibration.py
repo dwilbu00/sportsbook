@@ -858,7 +858,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
                 nba_max_players=150, nba_min_games=15, seasons=None,
-                focused_grid=False, workers=1):
+                focused_grid=False, workers=1, combined_sweep=False):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     # Resolve the set of seasons to POOL for the main fit. `--seasons` pools
     # several seasons' residuals into ONE fit (triples the thin pitcher-prop
@@ -927,6 +927,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             cushion_sweep=False, safe_target=0.80,
             quantile_mode=False, calibrate=True,
             cross_season="strict", workers=workers,
+            combined_sweep=combined_sweep,
         )
         if not season_res:
             print(f"  [WARN] pool season {sy} produced no results; excluding it.")
@@ -958,7 +959,7 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
             cushion_sweep=False, safe_target=0.80,
             quantile_mode=False, calibrate=True,
             cross_season="all",  # within a single prior season this is fine
-            workers=workers,
+            workers=workers, combined_sweep=combined_sweep,
         )
         if warmup_results:
             warmup_winners = _best_per_prop(warmup_results, props)
@@ -3472,6 +3473,10 @@ def main():
                    help="Parallel processes for the variant sweep (default 1=serial). "
                         "Splits the player pool into contiguous chunks; results are "
                         "byte-identical to serial. Use 4-8 for the full grid.")
+    p.add_argument("--combined-sweep", action="store_true",
+                   help="Also print the (variant × method × k) combined-sweep ranking "
+                        "table. Diagnostic-only (~5 min/season, single-threaded) — the "
+                        "refit result doesn't use it, so it's OFF by default.")
     p.add_argument("--nba-max-players", type=int, default=150,
                    help="Data-driven NBA pool size (top-N by minutes) when "
                         "--players is omitted.")
@@ -3757,7 +3762,7 @@ def main():
                 nba_max_players=args.nba_max_players,
                 nba_min_games=args.nba_min_games,
                 seasons=seasons, focused_grid=args.focused_grid,
-                workers=args.workers)
+                workers=args.workers, combined_sweep=args.combined_sweep)
     _report_staging(args.sport, staging)
 
 

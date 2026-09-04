@@ -4085,7 +4085,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               safe_mode=False, cushion_sweep=False,
                               safe_target=0.80, quantile_mode=False,
                               calibrate=False, cross_season="strict",
-                              workers=1, _emit_prints=True):
+                              workers=1, _emit_prints=True, combined_sweep=False):
     # PARALLEL: the accumulator is pure-append/additive and per-player independent
     # (no cross-obs state feeds the per-obs math), so we can split the player pool into
     # CONTIGUOUS chunks, run each in its own process, and merge the raw cells IN ORDER
@@ -4096,7 +4096,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             int(workers), sport, espn_sport, espn_league, sport_key, list(players),
             props, games_per_player, min_sample, variants, sweep, season_year,
             safe_mode, cushion_sweep, safe_target, quantile_mode, calibrate,
-            cross_season, _emit_prints)
+            cross_season, _emit_prints, combined_sweep)
     variants = {name: _resolve_params(p, sport_key) for name, p in variants.items()}
     # STEP-2: resolve each prop's LOCKED live window so the refit fits methods at the
     # SAME window production serves (fit==serve). A variant carrying the "__calib__"
@@ -4630,14 +4630,16 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             results, props, sweep, safe_mode, quantile_mode, calibrate,
             cushion_sweep, safe_target,
             counters={"total": total_observations, "skipped": skipped,
-                      "reliability_skips": dict(reliability_skips)})
+                      "reliability_skips": dict(reliability_skips)},
+            combined_sweep=combined_sweep)
     # Return the full per-variant results dict so callers like
     # refit_calibration.py can fit persistent calibration files.
     return results
 
 
 def _emit_props_sweep_reports(results, props, sweep, safe_mode, quantile_mode,
-                              calibrate, cushion_sweep, safe_target, counters=None):
+                              calibrate, cushion_sweep, safe_target, counters=None,
+                              combined_sweep=False):
     """Print the sweep report tables from a (possibly merged) results dict. Split out
     so the parallel path can print ONCE on the merged cells. ``counters`` (the
     obs/skip summary) is available only on the serial path; None on parallel."""
@@ -4663,10 +4665,14 @@ def _emit_props_sweep_reports(results, props, sweep, safe_mode, quantile_mode,
 
     if calibrate:
         if sweep:
-            # Combined sweep: rank (projection_variant × calibration_method × k)
-            _print_combined_sweep_results(results, props,
-                                          k_values=(0, 5, 15, 30, 60),
-                                          top_n=15)
+            # Combined sweep: rank (projection_variant × calibration_method × k).
+            # Diagnostic-only (the refit re-derives methods from calib_obs, so this
+            # never affects the result) + expensive (~5 min/season single-threaded),
+            # so it's OPT-IN via combined_sweep (default OFF).
+            if combined_sweep:
+                _print_combined_sweep_results(results, props,
+                                              k_values=(0, 5, 15, 30, 60),
+                                              top_n=15)
         else:
             _print_calibration_results(results, props)
             if calibrate == "sweep":
@@ -4742,7 +4748,7 @@ def _run_props_sweep_parallel(workers, sport, espn_sport, espn_league, sport_key
                               players, props, games_per_player, min_sample, variants,
                               sweep, season_year, safe_mode, cushion_sweep,
                               safe_target, quantile_mode, calibrate, cross_season,
-                              emit_prints):
+                              emit_prints, combined_sweep=False):
     from concurrent.futures import ProcessPoolExecutor
     chunks = _contiguous_chunks(players, workers)
     payloads = [(sport, espn_sport, espn_league, sport_key, chunk, props,
@@ -4756,7 +4762,8 @@ def _run_props_sweep_parallel(workers, sport, espn_sport, espn_league, sport_key
     merged = _merge_props_results(parts)
     if emit_prints:
         _emit_props_sweep_reports(merged, props, sweep, safe_mode, quantile_mode,
-                                  calibrate, cushion_sweep, safe_target, counters=None)
+                                  calibrate, cushion_sweep, safe_target, counters=None,
+                                  combined_sweep=combined_sweep)
     return merged
 
 
