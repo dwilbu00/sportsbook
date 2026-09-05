@@ -654,6 +654,17 @@ def _compute_asof_row(entity_id, as_of_date, role):
     return row
 
 
+# When True, get_or_fill NEVER computes/persists a missing row — it returns the
+# materialized row or None. Set by an OFFLINE backtest over a FULLY-BUILT store
+# (build_season already ran): there, a post-prewarm miss is a genuine pitcher
+# season-DEBUT (no prior in-season data → _compute_asof_row returns None anyway),
+# so the on-demand Azure round-trip + statcast aggregate is pure waste and recurs
+# every run (debut None-rows are never persisted). Skipping is BYTE-IDENTICAL
+# (None either way). LIVE pricing leaves this False so today's not-yet-materialized
+# row still lazily fills. Guarded on a non-empty prewarm (see backtest.run_odds).
+SKIP_ONDEMAND_FILL = False
+
+
 def get_or_fill(entity_id, as_of_date, role="SP"):
     """Read-through: the as-of feature row, computing + persisting it on a miss.
     The lazy self-fill path (no cron) for live pricing + backtest stragglers.
@@ -662,7 +673,7 @@ def get_or_fill(entity_id, as_of_date, role="SP"):
     hit = asof_pitcher_features(entity_id, as_of_date, role)
     if hit is not None:
         return hit
-    if not enabled():
+    if SKIP_ONDEMAND_FILL or not enabled():
         return None
     row = _compute_asof_row(entity_id, as_of_date, role)
     if row is None:

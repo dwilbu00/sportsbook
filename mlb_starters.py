@@ -401,6 +401,43 @@ def precompute_offense_cache(seasons, min_pa=40, chunk_days=10, verbose=True):
     return written
 
 
+def ensure_offense_cache(seasons, min_pa=40, max_age_h=20, verbose=True):
+    """Self-materializing guard for the warehouse team-offense cache: (re)build it
+    when missing or older than ``max_age_h`` hours. The odds backtest reads that
+    cache with a 24h TTL (see get_expected_runs_team_factors), so a stale precompute
+    silently falls back to the slow per-cutoff _warehouse_team_factors recompute (the
+    "it flew last time, now it sits" trap). precompute reads the statcast mirror
+    (0 DTU) in seconds, so this is cheap to call at the top of every backtest.
+
+    No-op when ODI_MLB_WAREHOUSE_OFFENSE is off (offense then comes from Savant, not
+    this cache). Returns True if it rebuilt. Freshness is probed via a mid-season
+    sentinel cutoff of the most recent target season (the whole cache is written in
+    one pass, so one fresh entry ⇒ all fresh)."""
+    if not _mlb_warehouse_offense_enabled():
+        return False
+    try:
+        target = sorted({int(s) for s in seasons if s is not None})
+    except (TypeError, ValueError):
+        return False
+    if not target:
+        return False
+    y = target[-1]
+    max_age = max_age_h * 3600
+    # A mid/late-season cutoff that a prior precompute would have written once the
+    # season has min_pa data; try several so an early-in-season current year still
+    # finds a valid sentinel from a completed month.
+    fresh = any(
+        _read_cache(f"wh_expected_runs_teams_v1_{y}_{y}-{mm}_{min_pa}", max_age) is not None
+        for mm in ("07-01", "06-01", "08-01", "05-01", "09-01"))
+    if fresh:
+        return False
+    if verbose:
+        print("[offense-cache] missing/stale (>%dh) — refreshing from the statcast "
+              "mirror (0 DTU)..." % max_age_h)
+    precompute_offense_cache(target, min_pa=min_pa, verbose=verbose)
+    return True
+
+
 def _warehouse_team_factors(season, as_of, min_pa=40):
     """Warehouse-native team OFFENSE inputs for the expected-runs challenger, derived
     from statcast_pitch (leakage-safe: game_date in [season-01-01, as_of-1d]) instead of
@@ -793,7 +830,11 @@ def live_additive_runs(sport_key, factors):
                      str(asp): pitcher_asof.load_sp_series(asp, season)}
         for pid in (str(hsp), str(asp)):
             if not any(r.get("as_of_date") == gd10 for r in sp_series.get(pid, [])):
-                pitcher_asof.get_or_fill(pid, gd, "SP")     # genuine miss -> lazy fill
+                if pitcher_asof.SKIP_ONDEMAND_FILL:
+                    continue   # built-store backtest: a post-prewarm miss is a genuine
+                    # season-debut (no prior in-season data) -> get_or_fill would return
+                    # None anyway; skip the per-game Azure connect + statcast aggregate.
+                pitcher_asof.get_or_fill(pid, gd, "SP")     # genuine miss -> lazy fill (live)
                 sp_series[pid] = pitcher_asof.load_sp_series(pid, season)
         feat_getter = ar.make_feat_getter(
             sp_series, blend.get("mode", "blend"), feature_keys,

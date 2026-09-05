@@ -1443,8 +1443,27 @@ def _run_odds_backtest_impl(
             if ns or nr:
                 print(f"[prewarm] pitcher_asof series cache: {ns} SP + {nr} RP "
                       f"entities (bulk).")
+            # Built store: a post-prewarm as-of miss is a genuine pitcher season-DEBUT
+            # (no prior in-season data) -> get_or_fill returns None anyway. Skip the
+            # per-game Azure connect + statcast aggregate — byte-identical, and it
+            # otherwise recurs EVERY run (debut None-rows are never persisted), the
+            # "it flew last time, now it sits" tax. Guarded on ns>0 so a fresh/unbuilt
+            # store still lazily fills.
+            if ns > 0:
+                pitcher_asof.SKIP_ONDEMAND_FILL = True
         except Exception:
             pass
+        # Self-materialize the team-offense as-of cache (additive expected-runs reads
+        # it per-cutoff from disk under ODI_MLB_WAREHOUSE_OFFENSE=1; 24h read TTL means
+        # a stale cache silently falls back to the slow per-cutoff recompute). Cheap:
+        # rebuilds from the statcast mirror (0 DTU) in seconds, only when stale. No-op
+        # when the flag is off. Removes the manual precompute_offense_cache step.
+        if sport_key == "baseball_mlb":
+            try:
+                import mlb_starters as _ms
+                _ms.ensure_offense_cache(seasons_list)
+            except Exception:
+                pass
 
     print(f"\n=== Loading {sport_key} team list ===")
     if use_warehouse:
