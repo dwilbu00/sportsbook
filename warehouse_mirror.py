@@ -92,6 +92,21 @@ def _path(name):
     return os.path.join(MIRROR_DIR, name)
 
 
+# Mirror files are named by the FULL sport key (team__baseball_mlb__…). A short alias
+# (--sport mlb) would silently miss every file — the mirror reader returns nothing and
+# verify then compares empty-vs-empty into a bogus "PASS". Normalize so `mlb` /
+# `baseball_mlb` (etc.) are interchangeable everywhere.
+_SPORT_ALIASES = {
+    "mlb": "baseball_mlb", "baseball": "baseball_mlb",
+    "nba": "basketball_nba", "basketball": "basketball_nba",
+    "nfl": "americanfootball_nfl", "football": "americanfootball_nfl",
+}
+
+
+def _canonical_sport(sport):
+    return _SPORT_ALIASES.get(str(sport).strip().lower(), sport)
+
+
 def _records(df):
     """DataFrame -> list[dict] with NaN coerced back to None (so a mirrored row is
     byte-identical to the SQL reader's dict — never NaN where the reader gives None)."""
@@ -223,6 +238,7 @@ def sync(sport, seasons, refresh=False, verbose=True):
     """Pull the read-only tables from Azure into the local parquet mirror. Skips a
     file that already exists unless ``refresh`` (2024/2025 are immutable; pass
     --refresh or --seasons <current> to refresh the live season)."""
+    sport = _canonical_sport(sport)
     import db_store
     db_store.promote_secrets_from_toml()
     seasons = [str(s) for s in seasons]
@@ -436,6 +452,7 @@ def _odds_lines(kind_file, sport, dates, date_from, date_to, bookmaker,
 
 def team_market_lines(sport, dates=None, date_from=None, date_to=None,
                       only_early=False, bookmaker="draftkings", snapshot_source=None):
+    sport = _canonical_sport(sport)
     return _odds_lines(_team_file, sport, dates, date_from, date_to, bookmaker,
                        only_early=only_early, snapshot_source=snapshot_source)
 
@@ -443,6 +460,7 @@ def team_market_lines(sport, dates=None, date_from=None, date_to=None,
 def player_prop_lines(sport, dates=None, date_from=None, date_to=None,
                       exclude_early=False, only_early=False, prop_keys=None,
                       bookmaker="draftkings", snapshot_source=None):
+    sport = _canonical_sport(sport)
     rows = _odds_lines(_prop_file, sport, dates, date_from, date_to, bookmaker,
                        only_early=only_early, exclude_early=exclude_early,
                        snapshot_source=snapshot_source)
@@ -747,6 +765,7 @@ def verify(sport, seasons, verbose=True):
     its checks is renamed base -> `_valid` (so ensure() trusts it and never re-verifies
     it); a failing file is demoted `_valid` -> base. Returns True iff every file passed.
     'mirror == Azure on your actual warehouse'."""
+    sport = _canonical_sport(sport)
     import db_store
     db_store.promote_secrets_from_toml()
     import r2_data
@@ -790,6 +809,12 @@ def verify(sport, seasons, verbose=True):
         else:
             os.environ["ODI_BACKTEST_MIRROR"] = _saved
 
+    # Guard: an empty comparison set is NOT a pass — it means the wrong sport key,
+    # an empty mirror, or Azure returning nothing. Never let that mark files/return True.
+    if not file_ok:
+        print(f"  VERIFY: NO FILES CHECKED for sport={sport} {seasons} — nothing "
+              f"compared (wrong --sport key? empty mirror? SQL unreachable?). NOT a pass.")
+        return False
     all_ok = True
     for f in sorted(file_ok):
         passed = file_ok[f]
@@ -803,7 +828,9 @@ def verify(sport, seasons, verbose=True):
 
 def mark_valid_trusted(sport, seasons, verbose=True):
     """OFFLINE trust-mark: rename every PRESENT real-parquet needed file base -> _valid
-    WITHOUT the Azure parity check. For when the mirror is already trusted — it was
+    WITHOUT the Azure parity check. ⚠ files are named by the FULL sport key
+    (baseball_mlb) — a short alias is normalized so `--mark-valid --sport mlb` works.
+    For when the mirror is already trusted — it was
     parity-verified elsewhere and/or validated end-to-end by the calibration runs — and
     the full ``verify()`` Azure parity (esp. the large per-book prop reads) is
     prohibitively slow on a low-DTU tier, silently re-run by ``ensure`` every backtest.
@@ -811,6 +838,7 @@ def mark_valid_trusted(sport, seasons, verbose=True):
     Returns the count marked. ⚠ Trust-only: run a real ``--verify`` at least once after a
     fresh ``--sync`` if you have DTU headroom; use this to (re)establish the _valid markers
     a slow/flaky verify passed but didn't persist, or to skip re-verifying immutable data."""
+    sport = _canonical_sport(sport)
     seasons = [str(x) for x in seasons]
     marked = skipped = already = 0
     for f in _needed_files(sport, seasons):
@@ -850,6 +878,7 @@ def ensure(sport, seasons, refresh=False, verbose=False):
     refresh=True re-syncs + re-verifies everything. Needs Azure to build/verify; on any
     failure (e.g. no DB) it leaves existing files as-is and returns False — the readers
     then fall back to Azure per call. Never raises."""
+    sport = _canonical_sport(sport)
     seasons = [str(x) for x in seasons]
     if not refresh and all(_is_valid(f) for f in _needed_files(sport, seasons)):
         return True                                   # everything validated -> instant
@@ -895,6 +924,7 @@ def main():
                          "intermittently times out ~200k-row prop reads on a low-DTU "
                          "tier under throttle. Default 600.")
     args = ap.parse_args()
+    args.sport = _canonical_sport(args.sport)   # `mlb` -> `baseball_mlb` etc.
     try:
         from cli_encoding import configure_stdio
         configure_stdio()
