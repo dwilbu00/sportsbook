@@ -30,6 +30,7 @@ from collections import Counter, defaultdict
 import r2_data
 import r2_grade
 from odds_client import (american_to_decimal, american_to_implied_prob)
+from r2_sharp import fair_two_way   # devigged fair prob — MUST match coherence_flags' live band
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
 
@@ -201,17 +202,20 @@ def scenario_dog_runline(blob):
     for season, triads in blob["triads_by_season"].items():
         for t in triads:
             cov["games"] += 1
-            try:
-                imp_home = american_to_implied_prob(int(t.ml_home))
-                imp_away = american_to_implied_prob(int(t.ml_away))
-            except (TypeError, ValueError):
+            # Band/bucket on the DEVIGGED fair prob (Clarke power method) — the EXACT
+            # basis coherence_flags._fav_band_ok uses live. Raw american-implied (with
+            # vig) shifts the [fav_min,fav_max) boundary vs the live gate, so boundary
+            # games near 0.60/0.70 classify oppositely and the backtest measures a
+            # different population than we actually bet.
+            fair_home, fair_away = fair_two_way(t.ml_home, t.ml_away)
+            if fair_home is None or fair_away is None:
                 cov["bad_ml"] += 1
                 continue
-            if imp_home == imp_away:
+            if fair_home == fair_away:
                 cov["pickem"] += 1
                 continue
-            fav_is_home = imp_home > imp_away
-            fav_imp = max(imp_home, imp_away)
+            fav_is_home = fair_home > fair_away
+            fav_imp = max(fair_home, fair_away)
             if fav_is_home:                       # bet AWAY dog +1.5
                 dog_is_home, dog_point, dog_price = False, -(t.rl_home_point or 0.0), t.rl_away
             else:                                 # bet HOME dog +1.5
@@ -509,17 +513,20 @@ def scenario_coherence_stable_sp(blob, half_life=5.0, fav_min=0.60, fav_max=0.70
         idx = pidx.get(str(season)) or {}
         for t in triads:
             cov["games"] += 1
-            try:
-                imp_home = american_to_implied_prob(int(t.ml_home))
-                imp_away = american_to_implied_prob(int(t.ml_away))
-            except (TypeError, ValueError):
+            # Band/bucket on the DEVIGGED fair prob (Clarke power method) — the EXACT
+            # basis coherence_flags._fav_band_ok uses live. Raw american-implied (with
+            # vig) shifts the [fav_min,fav_max) boundary vs the live gate, so boundary
+            # games near 0.60/0.70 classify oppositely and the backtest measures a
+            # different population than we actually bet.
+            fair_home, fair_away = fair_two_way(t.ml_home, t.ml_away)
+            if fair_home is None or fair_away is None:
                 cov["bad_ml"] += 1
                 continue
-            if imp_home == imp_away:
+            if fair_home == fair_away:
                 cov["pickem"] += 1
                 continue
-            fav_is_home = imp_home > imp_away
-            fav_imp = max(imp_home, imp_away)
+            fav_is_home = fair_home > fair_away
+            fav_imp = max(fair_home, fair_away)
             dog_is_home = not fav_is_home
             dog_point = (t.rl_home_point or 0.0) if dog_is_home else -(t.rl_home_point or 0.0)
             if abs(dog_point - 1.5) > 0.01:
@@ -557,7 +564,7 @@ def _report_coherence_stable_sp(rows, cov, fav_min, fav_max, half_life):
     band = [r for r in rows if r["in_band"]]
     print("=" * 74)
     print(f"  COHERENCE dog+1.5 × STABLE-favorite-SP  "
-          f"(band=[{fav_min:.2f},{fav_max:.2f}) ML-implied, cv_half_life={half_life})")
+          f"(band=[{fav_min:.2f},{fav_max:.2f}) devigged-fair ML, cv_half_life={half_life})")
     print(f"  games={cov.get('games',0):,}  graded={cov.get('graded',0):,}  "
           f"in-band={len(band):,}  (no_fav_cv={cov.get('no_fav_cv',0):,}, "
           f"dog_not_+1.5={cov.get('dog_not_+1.5',0):,})")
