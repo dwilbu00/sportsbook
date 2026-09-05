@@ -207382,7 +207382,7 @@
     "n_players": 225,
     "prob_shrink": {
       "source": "odds backtest --fit-shares",
-      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
+      "fit_timestamp": "2026-09-05T03:51:49.837412Z"
     },
     "starter_adjustment": {
       "team_markets": {
@@ -207696,22 +207696,22 @@
     },
     "prob_shrink_holdout": {
       "moneyline": {
-        "brier": 0.2468,
-        "raw_brier": 0.2472,
-        "n": 4864,
-        "n_warehouse": 4864,
+        "brier": 0.2472,
+        "raw_brier": 0.2476,
+        "n": 6835,
+        "n_warehouse": 6835,
         "n_log": 0
       },
       "spreads": {
-        "brier": 0.2494,
-        "raw_brier": 0.2787,
-        "n": 4477
+        "brier": 0.2486,
+        "raw_brier": 0.2729,
+        "n": 3381
       },
       "totals": {
-        "brier": 0.25,
-        "raw_brier": 0.264,
-        "n": 4655,
-        "n_warehouse": 4655,
+        "brier": 0.2499,
+        "raw_brier": 0.2623,
+        "n": 3446,
+        "n_warehouse": 3446,
         "n_log": 0
       }
     },
@@ -207735,18 +207735,18 @@
     ],
     "market_blend": {
       "source": "odds backtest --fit-shares",
-      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
+      "fit_timestamp": "2026-09-05T03:51:49.837412Z"
     },
     "expected_runs_challenger_share": {
       "source": "odds backtest --fit-shares",
-      "n": 4477,
-      "shrink": 0.1,
-      "share_brier": 0.24154,
-      "fit_timestamp": "2026-08-24T19:05:47.991331Z"
+      "n": 3381,
+      "shrink": 0.2,
+      "share_brier": 0.24187,
+      "fit_timestamp": "2026-09-05T03:51:49.837412Z"
     }
   },
   "prob_shrink": {
-    "spreads": 0.1,
+    "spreads": 0.2,
     "totals": 0.05,
     "moneyline": 0.75
   },
@@ -207991,26 +207991,26 @@
   },
   "market_blend": {
     "moneyline": {
-      "w": 0.0,
-      "n": 4864,
-      "blend_brier": 0.24121,
-      "model_brier": 0.24684,
-      "market_brier": 0.24121,
+      "w": 0.1,
+      "n": 6835,
+      "blend_brier": 0.24239,
+      "model_brier": 0.2472,
+      "market_brier": 0.24248,
       "on_shrunk": true
     },
     "totals": {
-      "w": 0.5,
-      "n": 4655,
-      "blend_brier": 0.24994,
-      "model_brier": 0.25,
-      "market_brier": 0.25001,
+      "w": 0.75,
+      "n": 3446,
+      "blend_brier": 0.24993,
+      "model_brier": 0.24995,
+      "market_brier": 0.25007,
       "on_shrunk": true
     },
     "spreads": {
-      "w": 0.0,
-      "n": 4477,
-      "blend_brier": 0.23834,
-      "model_brier": 0.24154,
+      "w": 0.05,
+      "n": 3381,
+      "blend_brier": 0.23917,
+      "model_brier": 0.24187,
       "on_shrunk": true,
       "on_shares": true
     }
