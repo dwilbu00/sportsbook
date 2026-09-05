@@ -801,6 +801,37 @@ def verify(sport, seasons, verbose=True):
     return all_ok
 
 
+def mark_valid_trusted(sport, seasons, verbose=True):
+    """OFFLINE trust-mark: rename every PRESENT real-parquet needed file base -> _valid
+    WITHOUT the Azure parity check. For when the mirror is already trusted — it was
+    parity-verified elsewhere and/or validated end-to-end by the calibration runs — and
+    the full ``verify()`` Azure parity (esp. the large per-book prop reads) is
+    prohibitively slow on a low-DTU tier, silently re-run by ``ensure`` every backtest.
+    Skips LFS pointer stubs (never a real file) and already-_valid slices. Zero Azure.
+    Returns the count marked. ⚠ Trust-only: run a real ``--verify`` at least once after a
+    fresh ``--sync`` if you have DTU headroom; use this to (re)establish the _valid markers
+    a slow/flaky verify passed but didn't persist, or to skip re-verifying immutable data."""
+    seasons = [str(x) for x in seasons]
+    marked = skipped = already = 0
+    for f in _needed_files(sport, seasons):
+        if _is_valid(f):
+            already += 1
+            continue
+        base = _path(f)
+        if os.path.exists(base) and _is_real_parquet(base):
+            _mark_valid(f)
+            marked += 1
+            if verbose:
+                print(f"  [marked _valid] {f}")
+        else:
+            skipped += 1
+            if verbose:
+                print(f"  [SKIP missing/stub] {f}")
+    print(f"  MARK-VALID (trusted, no Azure): {marked} marked, {already} already valid, "
+          f"{skipped} missing/stub.")
+    return marked
+
+
 def _needed_files(sport, seasons):
     """Logical filenames the backtest tools read for (sport, seasons)."""
     files = [_game_file(sport)]
@@ -848,6 +879,10 @@ def main():
     ap.add_argument("--sync", action="store_true", help="pull Azure -> local parquet")
     ap.add_argument("--verify", action="store_true",
                     help="parity-check mirror vs Azure on real data (run after --sync)")
+    ap.add_argument("--mark-valid", action="store_true",
+                    help="OFFLINE: mark present real-parquet files _valid WITHOUT Azure "
+                         "parity (trust the mirror — use when verify passed but didn't "
+                         "persist, or the low-DTU Azure parity is too slow). No Azure.")
     ap.add_argument("--sport", default="baseball_mlb")
     ap.add_argument("--seasons", default="2024,2025,2026")
     ap.add_argument("--refresh", action="store_true",
@@ -889,7 +924,10 @@ def main():
         # to the live Azure readers.
         print(f"  verifying mirror vs Azure ({args.sport} {seasons})...")
         verify(args.sport, seasons)
-    if not (args.sync or args.verify or args.statcast):
+    if args.mark_valid:
+        print(f"  trust-marking mirror _valid ({args.sport} {seasons}) — no Azure...")
+        mark_valid_trusted(args.sport, seasons)
+    if not (args.sync or args.verify or args.statcast or args.mark_valid):
         print(f"  mirror dir: {MIRROR_DIR}  enabled={enabled()}")
         print("  --sync to build · --verify to parity-check · reads are ON by default "
               "(ODI_BACKTEST_MIRROR=0 forces Azure) · backtests auto-build.")
