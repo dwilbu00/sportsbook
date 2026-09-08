@@ -418,6 +418,21 @@ def build_matchup_features(home_team, away_team, date, season,
             qb_edge = 0.0
     result["qb_edge"] = qb_edge
     result["starter_edge"] = base_edge + qb_scale * qb_edge
+
+    # ── full validated NFL margin model (HFA + EPA + QB + injuries + rest) ──
+    # When fit (calibration has nfl_margin_model), hand analysis a ready margin +
+    # std so the live model IS the validated one (bypasses the recency-margin base).
+    # Reuses team_ratings + starter_ids; degrades silently to the starter_edge path.
+    try:
+        import nfl_model
+        w = nfl_model.weights()
+        if w:
+            pm = nfl_model.predict(ha, aa, date, season, team_ratings=team_ratings,
+                                   starter_ids=starter_ids, w=w)
+            if pm:
+                result["nfl_pred_margin"], result["nfl_pred_std"] = pm
+    except Exception:
+        pass
     return result
 
 

@@ -178,6 +178,20 @@ def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
 
     home_stats = _team_margin_stats(home_team, home_team_stats, True)
     away_stats = _team_margin_stats(away_team, away_team_stats, False)
+
+    # NFL: the validated dedicated margin model (nfl_model: HFA + EPA + QB +
+    # injuries + rest) supplies pred_margin + pred_std directly, replacing the
+    # noisier recency-weighted-raw-margin base. Fires only when build_matchup_features
+    # populated it (calibration has nfl_margin_model); works even if recency stats
+    # are thin (early season). Everything downstream (ML Φ, spread overlays) is
+    # unchanged — it just consumes a sharper margin.
+    if sport_key == "americanfootball_nfl" and matchup_features \
+            and matchup_features.get("nfl_pred_margin") is not None:
+        pstd = float(matchup_features.get("nfl_pred_std") or 13.2)
+        stub = {"mean": 0.0, "std": pstd / (2 ** 0.5), "margins": [], "weights": []}
+        return (float(matchup_features["nfl_pred_margin"]), pstd,
+                home_stats or stub, away_stats or stub)
+
     if not home_stats or not away_stats:
         return None
 
