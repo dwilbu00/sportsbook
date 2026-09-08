@@ -137,21 +137,34 @@ def ingest_schedules(seasons, verbose=True):
 
 
 def _ingest_per_season(layer, loader_name, cols, seasons, verbose=True, **kw):
-    """Generic: load a season-keyed layer via nflreadpy, select cols, write one
-    parquet per season (immutable; re-run to refresh the current season)."""
+    """Generic: load a season-keyed layer via nflreadpy ONE SEASON AT A TIME, select
+    cols, write one parquet per season. Per-season isolation so a not-yet-published
+    or out-of-range season (e.g. the current season before games play) is SKIPPED
+    without killing the whole layer. Immutable; re-run to refresh the live season."""
     nflreadpy = _require_nflreadpy()
     loader = getattr(nflreadpy, loader_name)
-    df = _to_pandas(loader(seasons=[int(s) for s in seasons], **kw))
-    df, missing = _select(df, cols)
-    total = 0
-    for s, sub in _per_season(df):
-        if s is None or s not in {str(x) for x in seasons}:
+    total, done, missing_note = 0, 0, None
+    for s in seasons:
+        try:
+            df = _to_pandas(loader(seasons=[int(s)], **kw))
+        except Exception as exc:
+            if verbose:
+                print(f"    [{layer} {s}] skip: {type(exc).__name__}: {str(exc)[:90]}")
             continue
-        _write(sub, f"{layer}__{SPORT}__{s}.parquet", verbose)
-        total += len(sub)
+        df, missing = _select(df, cols)
+        missing_note = missing_note or missing
+        if "season" in df.columns:
+            df = df[df["season"].astype(str) == str(s)]
+        if len(df) == 0:
+            if verbose:
+                print(f"    [{layer} {s}] 0 rows (not published yet / no data)")
+            continue
+        _write(df, f"{layer}__{SPORT}__{s}.parquet", verbose)
+        total += len(df)
+        done += 1
     if verbose:
-        print(f"  [{layer}] {total:,} rows across {len(seasons)} season(s)"
-              + (f"; cols not in feed: {missing}" if missing else ""))
+        print(f"  [{layer}] {total:,} rows across {done}/{len(seasons)} season(s)"
+              + (f"; cols not in feed: {missing_note}" if missing_note else ""))
     return total
 
 
@@ -199,21 +212,22 @@ def ingest_ngs(seasons, verbose=True):
     nflreadpy = _require_nflreadpy()
     total = 0
     for stype in ("passing", "rushing", "receiving"):
-        try:
-            df = _to_pandas(nflreadpy.load_nextgen_stats(
-                seasons=[int(s) for s in seasons], stat_type=stype))
-        except Exception as exc:
-            if verbose:
-                print(f"  [ngs:{stype}] skipped: {type(exc).__name__}: {exc}")
-            continue
-        # NGS carries season+week; drop the season==0 season-aggregate rows.
-        if "week" in df.columns:
-            df = df[df["week"] != 0]
-        for s, sub in _per_season(df):
-            if s is None or s not in {str(x) for x in seasons}:
+        for s in seasons:
+            try:
+                df = _to_pandas(nflreadpy.load_nextgen_stats(
+                    seasons=[int(s)], stat_type=stype))
+            except Exception as exc:
+                if verbose:
+                    print(f"    [ngs:{stype} {s}] skip: {type(exc).__name__}: {str(exc)[:80]}")
                 continue
-            _write(sub, f"nfl_ngs_{stype}__{SPORT}__{s}.parquet", verbose)
-            total += len(sub)
+            if "week" in df.columns:      # drop season-aggregate (week==0) rows
+                df = df[df["week"] != 0]
+            if "season" in df.columns:
+                df = df[df["season"].astype(str) == str(s)]
+            if len(df) == 0:
+                continue
+            _write(df, f"nfl_ngs_{stype}__{SPORT}__{s}.parquet", verbose)
+            total += len(df)
     if verbose:
         print(f"  [ngs] {total:,} player-week rows (passing+rushing+receiving)")
     return total
