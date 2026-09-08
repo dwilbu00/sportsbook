@@ -1,0 +1,53 @@
+SETUP — materialize the repo on the review machine
+===================================================
+
+Goal: get the code + the mirror parquet data (the NFL/MLB data lives in Git LFS,
+and a plain clone pulls only ~130-byte pointer stubs by design, so you must opt in).
+
+1. Get the latest code
+----------------------
+    git clone <repo-url>          # or, if already cloned:  git pull
+    cd .../SPORTSBOOK_ODDS/deploy
+
+
+2. Materialize the mirror parquets (the actual data)
+----------------------------------------------------
+The repo's .lfsconfig sets  fetchexclude = warehouse_mirror_data/**  so LFS blobs
+are NOT pulled by default. Clear that exclude, then pull the blobs:
+
+    git config lfs.fetchexclude ""
+    git lfs pull
+
+(NOTE: the inline form  git lfs pull -X ""  is rejected by some git-lfs versions —
+use the config-clear form above.)
+
+
+3. Verify the data materialized
+-------------------------------
+    # Windows: prefix with  PYTHONIOENCODING=utf-8
+    python nfl_data.py --layers --seasons 2023,2024,2025,2026
+
+Expect real row counts (e.g. nfl_pbp 2024 ~49k), NOT dashes ("—").
+If you see dashes, the LFS pull didn't materialize — re-check step 2.
+
+    python nfl_schedule.py --audit --seasons 2023,2024,2025,2026   # expect 837/837 clean
+    python test_nfl_epa.py                                          # expect ALL PASS
+
+
+4. Python deps
+--------------
+Runtime + review is pure-stdlib + pandas (for parquet reads). You do NOT need
+nflreadpy to REVIEW or run the tests/backtests — it's only for RE-INGESTING data:
+    pip install nflreadpy        # optional, offline-ingest box only
+
+Odds-API pulls cost paid credits — do NOT run any ingest/backfill that hits the
+Odds API. nflverse pulls are free. Reviewing + the committed data need neither.
+
+
+5. Where to start
+-----------------
+    HANDOFF.md          <- read this first (what to review + what to scrutinize)
+    memory/ACTIVE.md    <- current state
+    memory/modeling-and-calibration.md , memory/data-and-architecture.md
+
+Run commands are listed at the bottom of HANDOFF.md.
