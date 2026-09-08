@@ -344,26 +344,44 @@ def _abbr(team_name):
     return None
 
 
+def _qb_scale():
+    """qb_scale = w_qb/w_epa from calibration (fit by backtest_nfl_epa). 0.0 when
+    absent → the QB term is inert and the model is team-only."""
+    try:
+        from calibration_loader import load_starter_adjustment
+        return float((load_starter_adjustment("americanfootball_nfl") or {})
+                     .get("qb_scale", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def build_matchup_features(home_team, away_team, date, season,
-                           team_ratings=None):
+                           team_ratings=None, qb_scale=None, starter_ids=None):
     """
     Assemble NFL EPA matchup features for one game.
 
     Returns a dict with:
-      * ``starter_edge`` — the home-minus-away NET EPA/play difference (raw, not
-        squashed; naturally bounded to ≈ ±0.5). This is the SAME generic
-        margin-edge hook the MLB path uses, so it feeds analyze_moneyline_value
-        and analyze_spreads_value via _predict_margin with the calibratable
-        NFL 'spreads' starter_adjustment weight — no analysis.py change needed.
-      * ``home`` / ``away`` — {off_epa, def_epa, net_epa} for transparency.
+      * ``starter_edge`` — the home-minus-away margin edge fed to _predict_margin
+        via the NFL 'spreads' starter_adjustment weight (no analysis.py change).
+        It is the team net-EPA/play difference PLUS the starting-QB adjustment:
+            starter_edge = (net_epa_h - net_epa_a) + qb_scale·(qb_delta_h - qb_delta_a)
+        where qb_delta is the starter-vs-team-baseline-QB EPA delta (0 when the
+        usual QB starts). qb_scale = w_qb/w_epa is fit + saved by backtest_nfl_epa;
+        multiplying the whole edge by the spreads weight (w_epa) reproduces the
+        joint EPA+QB fit. The QB layer is a validated OOS prediction improvement
+        (not a betting edge — the market prices the QB).
+      * ``qb_edge`` — the raw (qb_delta_h - qb_delta_a) for transparency.
+      * ``home`` / ``away`` — {off_epa, def_epa, net_epa}.
 
     Returns starter_edge=None (graceful degrade to the team-only model) when
     either team can't be resolved.
 
     ``date`` (YYYY-MM-DD) makes the ratings leakage-safe: only games before it
-    are counted. Pass ``team_ratings`` from team_epa(...) to avoid recomputing.
+    are counted. ``starter_ids`` = {abbr: gsis_id} overrides the projected starter
+    (the backtest passes game-actual starters; live projects from recent-starter +
+    injury + depth). ``qb_scale`` overrides the calibration value (for testing).
     """
-    result = {"home": None, "away": None, "starter_edge": None}
+    result = {"home": None, "away": None, "starter_edge": None, "qb_edge": 0.0}
     ha, aa = _abbr(home_team), _abbr(away_team)
     if not ha or not aa:
         return result
@@ -379,7 +397,27 @@ def build_matchup_features(home_team, away_team, date, season,
                       "net_epa": h["net_epa"]}
     result["away"] = {"off_epa": a["off_epa"], "def_epa": a["def_epa"],
                       "net_epa": a["net_epa"]}
-    result["starter_edge"] = h["net_epa"] - a["net_epa"]
+    base_edge = h["net_epa"] - a["net_epa"]
+
+    # ── starting-QB adjustment ──
+    if qb_scale is None:
+        qb_scale = _qb_scale()
+    qb_edge = 0.0
+    if qb_scale:
+        try:
+            import nfl_qb_asof
+            qr, _lg = nfl_qb_asof.qb_ratings(season, date)
+            if starter_ids:   # backtest: game-actual starters
+                dh = nfl_qb_asof.qb_edge_delta(season, date, ha, starter_ids.get(ha), qr)
+                da = nfl_qb_asof.qb_edge_delta(season, date, aa, starter_ids.get(aa), qr)
+            else:             # live: project the starter (recent + injury + depth)
+                dh = nfl_qb_asof.projected_qb_delta(season, date, ha, qr)
+                da = nfl_qb_asof.projected_qb_delta(season, date, aa, qr)
+            qb_edge = dh - da
+        except Exception:
+            qb_edge = 0.0
+    result["qb_edge"] = qb_edge
+    result["starter_edge"] = base_edge + qb_scale * qb_edge
     return result
 
 

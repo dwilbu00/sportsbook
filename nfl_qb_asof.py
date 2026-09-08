@@ -197,6 +197,123 @@ def qb_edge_delta(season, as_of_date, team, starter_id, ratings=None):
     return sr["epa"] - br["epa"]
 
 
+# ── LIVE starter projection (no game pbp available for an upcoming game) ────────
+# The backtest uses the game-actual starter (public pre-game = the ceiling). For a
+# game that hasn't happened, we project: the team's most-recent actual starter,
+# UNLESS he's ruled Out/Doubtful this week, in which case the depth-chart backup.
+# Depth charts are the fragile piece (schema drift — 2025+ mirror is currently
+# broken to team+gsis_id only), so this degrades to the recent starter (qb_diff→0)
+# when a backup can't be resolved: conservative, never invents a phantom downgrade.
+_OUT_STATUSES = {"Out", "Doubtful"}
+_INJ_CACHE = {}
+_WEEK_CACHE = {}
+
+
+def _injured_out(season, week):
+    """set of gsis_ids ruled Out/Doubtful for (season, week)."""
+    key = (season, str(week))
+    if key in _INJ_CACHE:
+        return _INJ_CACHE[key]
+    out = set()
+    df = nfl_data.injuries([str(season)])
+    if df is not None and "report_status" in df.columns and "week" in df.columns:
+        sub = df[(df["week"].astype(str) == str(week)) &
+                 (df["report_status"].isin(_OUT_STATUSES))]
+        out = set(str(g) for g in sub["gsis_id"].dropna())
+    _INJ_CACHE[key] = out
+    return out
+
+
+def _week_for(season, team, as_of_date):
+    """The week number of `team`'s game on as_of_date (its gameday), via the spine.
+    None if not found."""
+    key = (season, team, as_of_date)
+    if key in _WEEK_CACHE:
+        return _WEEK_CACHE[key]
+    wk = None
+    try:
+        import nfl_schedule
+        for g in nfl_schedule.load_games([str(season)]):
+            if str(g.get("gameday"))[:10] == str(as_of_date)[:10] and \
+                    team in (g.get("home_team"), g.get("away_team")):
+                wk = g.get("week")
+                break
+    except Exception:
+        wk = None
+    _WEEK_CACHE[key] = wk
+    return wk
+
+
+def _depth_backup_qb(season, week, team, exclude):
+    """Best available depth-chart QB for (season, week, team) excluding `exclude`
+    and anyone Out/Doubtful. None when the depth mirror lacks a usable schema
+    (e.g. the 2025+ drift) — caller then keeps the recent starter."""
+    df = nfl_data.depth_charts([str(season)])
+    if df is None or not {"club_code", "week", "position", "depth_team",
+                          "gsis_id"} <= set(df.columns):
+        return None
+    sub = df[(df["club_code"] == team) & (df["week"].astype(str) == str(week)) &
+             (df["position"] == "QB")]
+    if not len(sub):
+        return None
+    out = _injured_out(season, week)
+    cand = []
+    for r in sub.to_dict("records"):
+        gid = str(r.get("gsis_id"))
+        if gid in ("", "None", "nan") or gid == exclude or gid in out:
+            continue
+        try:
+            depth = int(r.get("depth_team"))
+        except (TypeError, ValueError):
+            depth = 99
+        cand.append((depth, gid))
+    if not cand:
+        return None
+    cand.sort()
+    return cand[0][1]
+
+
+def recent_starter(season, team, as_of_date):
+    """The passer with the most dropbacks in `team`'s MOST RECENT game strictly
+    before as_of_date. This is the best live starter projection: it already
+    reflects a mid-season change (incl. season-ending/IR injuries that never show
+    as Out/Doubtful on the weekly report — the team-baseline QB would miss those)."""
+    latest_date, latest = None, {}
+    for p in _dropbacks(season):
+        if p["posteam"] != team or (p["game_date"] or "") >= (as_of_date or "9999"):
+            continue
+        gd = p["game_date"]
+        if latest_date is None or gd > latest_date:
+            latest_date, latest = gd, {}
+        if gd == latest_date:
+            latest[p["passer_id"]] = latest.get(p["passer_id"], 0) + 1
+    if not latest:
+        return None
+    return max(latest.items(), key=lambda kv: kv[1])[0]
+
+
+def projected_starter(season, team, as_of_date):
+    """Projected starting QB gsis_id for an upcoming game (live path): the most-
+    recent-game actual starter, unless he's ruled Out/Doubtful this week, then the
+    depth-chart backup; degrades to the recent starter when no backup resolves
+    (conservative — never invents a phantom change)."""
+    rs = recent_starter(season, team, as_of_date)
+    if not rs:
+        return None
+    week = _week_for(season, team, as_of_date)
+    if week is not None and rs in _injured_out(season, week):
+        backup = _depth_backup_qb(season, week, team, exclude=rs)
+        if backup:
+            return backup
+    return rs
+
+
+def projected_qb_delta(season, as_of_date, team, ratings=None):
+    """qb_edge_delta for an upcoming game using the PROJECTED starter (live)."""
+    return qb_edge_delta(season, as_of_date, team,
+                         projected_starter(season, team, as_of_date), ratings)
+
+
 if __name__ == "__main__":
     import argparse
     try:

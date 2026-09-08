@@ -189,37 +189,59 @@ def fit_ols_through_origin(xs, ys):
     return sxy / sxx if sxx else 0.0
 
 
-def fit(seasons, do_save=False):
-    data = build_dataset(seasons)
+def fit(seasons, do_save=False, with_qb=True):
+    """Fit the NFL margin weight(s). With ``with_qb`` (default), jointly fits the
+    team-EPA weight w_epa and the starting-QB weight w_qb (margin ~ w_epa·base_edge
+    + w_qb·qb_diff), then saves spreads=w_epa AND qb_scale=w_qb/w_epa. The live
+    model folds qb_scale·qb_diff into starter_edge, so spreads_weight·starter_edge
+    reproduces the joint fit with NO analysis.py change. Pass with_qb=False for the
+    legacy team-only fit."""
+    data = build_dataset_qb(seasons) if with_qb else \
+        [(e, 0.0, m, None) for (e, m) in build_dataset(seasons)]
     if not data:
         print("No games; aborting.")
         return
-    xs = [d[0] for d in data]
-    ys = [d[1] for d in data]
-    w = fit_ols_through_origin(xs, ys)
+    xs = [d[0] for d in data]           # base_edge
+    qs = [d[1] for d in data]           # qb_diff
+    ys = [d[2] for d in data]           # margin
+    w = fit_ols_through_origin(xs, ys)  # team-only weight (reference)
     corr = _pearson(xs, ys)
+    w_epa, w_qb = (_fit2(xs, qs, ys) if with_qb else (w, 0.0))
+    qb_scale = (w_qb / w_epa) if w_epa else 0.0
     seasons_str = f"{seasons[0]}-{seasons[-1]}" if len(seasons) > 1 else str(seasons[0])
-    print(f"\n=== NFL EPA margin fit — {seasons_str} ({len(data)} games) ===")
-    print(f"  corr(edge, margin) = {corr:+.4f}")
-    print(f"  OLS margin weight (points per unit net-EPA edge) = {w:.3f}")
-    # A predicted-margin RMSE sanity check: baseline (predict 0) vs edge model.
+    n_qb = sum(1 for d in data if abs(d[1]) > 1e-9)
+    print(f"\n=== NFL EPA margin fit — {seasons_str} ({len(data)} games, "
+          f"{n_qb} QB-change) ===")
+    print(f"  corr(base_edge, margin) = {corr:+.4f}")
+    print(f"  team-only OLS weight            = {w:.3f}")
+    if with_qb:
+        print(f"  JOINT fit: w_epa={w_epa:.3f}  w_qb={w_qb:.3f}  "
+              f"qb_scale(w_qb/w_epa)={qb_scale:.4f}")
+    # predicted-margin RMSE sanity: baseline (predict 0) vs team-only vs +QB.
     base_rmse = (sum(y * y for y in ys) / len(ys)) ** 0.5
-    mdl_rmse = (sum((y - w * x) ** 2 for x, y in zip(xs, ys)) / len(ys)) ** 0.5
-    print(f"  margin RMSE: baseline={base_rmse:.3f}  edge-model={mdl_rmse:.3f}")
+    team_rmse = (sum((y - w * x) ** 2 for x, y in zip(xs, ys)) / len(ys)) ** 0.5
+    qb_rmse = (sum((y - w_epa * x - w_qb * q) ** 2 for x, q, y in zip(xs, qs, ys))
+               / len(ys)) ** 0.5
+    print(f"  margin RMSE (in-sample): baseline={base_rmse:.3f}  "
+          f"team-only={team_rmse:.3f}  +QB={qb_rmse:.3f}")
+    print("  (OOS validation: --oos-qb; QB layer lift confirmed robust in the "
+          "shrink/prior sweep.)")
 
     if do_save:
         cur = load_starter_adjustment(SPORT_KEY) or {}
         cur["enabled"] = True
-        cur["spreads"] = round(w, 3)
-        # moneyline shares the margin model, so it needs no separate weight; keep
-        # any existing value for transparency but it is unused by _predict_margin.
+        cur["spreads"] = round(w_epa, 3)
+        cur["qb_scale"] = round(qb_scale, 4)   # live model folds qb_scale·qb_diff into starter_edge
         save_starter_adjustment(SPORT_KEY, cur, meta={
-            "source": f"backtest_nfl_epa.py --seasons {seasons_str}",
+            "source": f"backtest_nfl_epa.py --seasons {seasons_str}"
+                      + (" (joint EPA+QB)" if with_qb else ""),
             "corr": round(corr, 4),
             "games": len(data),
+            "w_epa": round(w_epa, 3), "w_qb": round(w_qb, 3),
+            "qb_change_games": n_qb,
         })
-        print(f"\n  [save] wrote starter_adjustment['spreads']={round(w,3)} "
-              f"to calibration/{active_write_label(SPORT_KEY)}")
+        print(f"\n  [save] wrote starter_adjustment spreads={round(w_epa,3)} "
+              f"qb_scale={round(qb_scale,4)} to calibration/{active_write_label(SPORT_KEY)}")
 
 
 def main():
@@ -235,6 +257,8 @@ def main():
     ap.add_argument("--oos-qb", action="store_true",
                     help="leave-one-season-out OOS test of whether the starting-QB "
                          "adjustment improves margin prediction (go/no-go, no save)")
+    ap.add_argument("--no-qb", action="store_true",
+                    help="legacy team-only fit (skip the starting-QB weight)")
     args = ap.parse_args()
     if args.oos_qb:
         oos_qb_value(_parse_seasons(args.seasons))
@@ -245,7 +269,7 @@ def main():
         _n = existing_candidate_notice(SPORT_KEY)
         if _n:
             print(_n)
-    fit(_parse_seasons(args.seasons), do_save=args.save)
+    fit(_parse_seasons(args.seasons), do_save=args.save, with_qb=not args.no_qb)
     if args.save and staging and has_candidate(SPORT_KEY):
         print(f"\n⇢ Staged to calibration/{SPORT_KEY}.candidate.json — live file "
               f"UNTOUCHED. Promote: python refit_calibration.py --sport nfl "
