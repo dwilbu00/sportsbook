@@ -39,6 +39,49 @@ SB_ODDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "calibration", "nfl_preseason_sb_odds.json")
 
 
+SB_WINNER_SPORT = "americanfootball_nfl_super_bowl_winner"
+
+
+def fetch_sb_odds(season, book="draftkings", path=SB_ODDS_PATH):
+    """Pull the current Super Bowl-winner futures (outrights) for one book from the
+    Odds API and MERGE into the SB-odds file under ``season``. Small spend (~1 credit:
+    1 market × 1 region). Pre-season now = the anchoring-relevant odds. Returns the
+    {abbr: american} dict written."""
+    import backfill_historical_odds as _cfg
+    import odds_client
+    import nfl_epa
+    api_key = _cfg.load_config()["odds_api_key"]
+    data = odds_client.get_upcoming_odds(api_key, SB_WINNER_SPORT, regions="us",
+                                         markets="outrights", bookmakers=[book])
+    odds = {}
+    for event in (data or []):
+        for bm in event.get("bookmakers", []):
+            if bm.get("key") != book:
+                continue
+            for mk in bm.get("markets", []):
+                if mk.get("key") != "outrights":
+                    continue
+                for oc in mk.get("outcomes", []):
+                    ab = nfl_epa._abbr(oc.get("name"))
+                    price = oc.get("price")
+                    if ab and price is not None:
+                        odds[ab] = int(price)
+    if not odds:
+        print("  ⚠ no outrights parsed — check the response / book key.")
+        return {}
+    allsb = load_sb_odds(path)
+    allsb[str(season)] = odds
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(allsb, f, indent=2, sort_keys=True)
+    print(f"  wrote {len(odds)}/32 teams for {season} → {os.path.basename(path)} "
+          f"(book={book}).")
+    missing = set(nfl_epa.TEAM_ABBR_TO_NAME) - set(odds)
+    if missing:
+        print(f"  ⚠ missing teams (no SB price returned): {sorted(missing)}")
+    return odds
+
+
 def load_sb_odds(path=SB_ODDS_PATH):
     """{season(str): {team_abbr: american_odds(int)}} or {} if absent."""
     try:
@@ -213,7 +256,15 @@ def main():
     ap.add_argument("--backtest", action="store_true",
                     help="grade the Week-1 fade ATS on 2023-2025 (needs historical SB odds)")
     ap.add_argument("--seasons", default="2023,2024,2025")
+    ap.add_argument("--fetch-sb-odds", action="store_true",
+                    help="pull current Super Bowl futures (outrights, DK) from the Odds "
+                         "API into the SB-odds file for --season (~1 credit spend)")
+    ap.add_argument("--book", default="draftkings")
     args = ap.parse_args()
+
+    if args.fetch_sb_odds:
+        fetch_sb_odds(args.season, book=args.book)
+        # fall through to print this week's plays with the freshly-written odds
 
     sb = load_sb_odds()
     if not sb:
