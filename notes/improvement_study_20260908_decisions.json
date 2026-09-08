@@ -1,0 +1,48 @@
+{
+  "command": "decisions",
+  "study_date": "2026-09-08",
+  "result": {
+    "greedy_counterexample": {
+      "scope": "synthetic candidates, unmodified production NBA conflict rules and selector",
+      "greedy": [
+        "A"
+      ],
+      "greedy_sum_ev_pct": 10,
+      "feasible_optimum": [
+        "B",
+        "C"
+      ],
+      "optimum_sum_ev_pct": 18
+    },
+    "negative_correlation": {
+      "production_rejects_pair": true,
+      "p_each": 0.55,
+      "rho": -0.4,
+      "p_both": 0.20350000000000004,
+      "sum_bernoulli_variance_independent": 0.495,
+      "sum_bernoulli_variance_correlated": 0.297,
+      "variance_reduction_fraction": 0.4
+    },
+    "single_line_parser": {
+      "raw_fd_lines": [
+        0.5,
+        1.5
+      ],
+      "analyzed_line": 1.5,
+      "fd_lines_retained_in_output_offers": [
+        1.5
+      ]
+    },
+    "sgp_price_sensitivity": {
+      "joint_probability": 0.35,
+      "production_surrogate_roi": 0.10250000000000026,
+      "hypothetical_ticket_decimal_2_5_roi": -0.125,
+      "hypothetical_ticket_decimal_3_roi": 0.04999999999999982
+    },
+    "line_shopping_example": {
+      "probability": 0.54,
+      "dk_minus110_roi": 0.030909090909090997,
+      "fd_plus100_roi": 0.08000000000000007
+    }
+  }
+}

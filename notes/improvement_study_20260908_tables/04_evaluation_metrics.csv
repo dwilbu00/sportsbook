@@ -1,0 +1,6 @@
+﻿Question,Primary evidence,What it does not establish,Source,Interpretation
+Is the point forecast better?,Paired MAE/RMSE on identical games,"Accurate tails, prices or profitability",../APPLICATION_IMPROVEMENT_STUDY_2026-09-08.md,Recommended evaluation framework; see report sources 4 and 5
+Are probabilities better?,Brier and log loss; reliability by relevant subgroup,A positive edge at executable odds,../APPLICATION_IMPROVEMENT_STUDY_2026-09-08.md,Recommended evaluation framework; see report sources 4 and 5
+Is the full distribution useful?,"CRPS or appropriate discrete log score, interval coverage, tail diagnostics",A profitable selection rule,../APPLICATION_IMPROVEMENT_STUDY_2026-09-08.md,Recommended evaluation framework; see report sources 4 and 5
+Does a signal add beyond the market?,Comparison with market-only and market-plus-signal models at the same decision time,Ability to obtain or retain the quoted price,../APPLICATION_IMPROVEMENT_STUDY_2026-09-08.md,Recommended evaluation framework; see report sources 4 and 5
+Is the strategy actionable?,"Real offered/accepted prices, settlement, turnover, drawdown and forward results",Permanent future profitability,../APPLICATION_IMPROVEMENT_STUDY_2026-09-08.md,Recommended evaluation framework; see report sources 4 and 5

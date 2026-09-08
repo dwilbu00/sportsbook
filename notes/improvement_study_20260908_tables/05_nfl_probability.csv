@@ -1,0 +1,6 @@
+﻿Method,2024 Brier,2025 Brier,Pooled Brier,Pooled log loss,Source,Interpretation
+OLS margin + normal probability,0.221880,0.226838,0.224354,0.638646,../improvement_study_20260908_nfl.json,"Expanding seasons, projected QB, inherited injury limitations; reused periods, not a production promotion"
+"Same, with 0.65 shrink toward 50%",0.225740,0.227892,0.226814,0.645139,../improvement_study_20260908_nfl.json,"Expanding seasons, projected QB, inherited injury limitations; reused periods, not a production promotion"
+OLS + empirical training residuals,0.219563,0.227049,0.223299,0.636557,../improvement_study_20260908_nfl.json,"Expanding seasons, projected QB, inherited injury limitations; reused periods, not a production promotion"
+Standardized ridge + normal probability,0.222269,0.226771,0.224515,0.638944,../improvement_study_20260908_nfl.json,"Expanding seasons, projected QB, inherited injury limitations; reused periods, not a production promotion"
+Regularized direct logistic win model,0.225478,0.225915,0.225696,0.641927,../improvement_study_20260908_nfl.json,"Expanding seasons, projected QB, inherited injury limitations; reused periods, not a production promotion"

@@ -1,0 +1,139 @@
+{
+  "command": "mlb",
+  "study_date": "2026-09-08",
+  "result": {
+    "scope": "Exploratory opportunity-mechanism screen at exact-ID DK closing thresholds; 20 prior AB-positive games, same-season history, strict-before-date, quote lead 0..60 min. Empirical H/AB basis only: excludes shipped xBA, contextual adjustments, calibrators and full eligibility/participation rules. No ROI or live-model superiority claim.",
+    "rounding_discontinuity": [
+      {
+        "expected_ab": 3.49,
+        "rounded_ab": 3,
+        "p_hit": 0.578125
+      },
+      {
+        "expected_ab": 3.51,
+        "rounded_ab": 4,
+        "p_hit": 0.68359375
+      },
+      {
+        "expected_ab": 4.49,
+        "rounded_ab": 4,
+        "p_hit": 0.68359375
+      },
+      {
+        "expected_ab": 4.51,
+        "rounded_ab": 5,
+        "p_hit": 0.7626953125
+      }
+    ],
+    "metrics": [
+      {
+        "season": 2024,
+        "line": 0.5,
+        "method": "rounded",
+        "n": 27349,
+        "brier": 0.24202942162108665,
+        "mean_probability": 0.609700322874266,
+        "observed_rate": 0.6036783794654283
+      },
+      {
+        "season": 2024,
+        "line": 0.5,
+        "method": "adjacent_mixture",
+        "n": 27349,
+        "brier": 0.2408060814274547,
+        "mean_probability": 0.6057435394879288,
+        "observed_rate": 0.6036783794654283
+      },
+      {
+        "season": 2024,
+        "line": 0.5,
+        "method": "empirical_ab_mixture",
+        "n": 27349,
+        "brier": 0.2408798773559665,
+        "mean_probability": 0.5929647172651458,
+        "observed_rate": 0.6036783794654283
+      },
+      {
+        "season": 2024,
+        "line": 1.5,
+        "method": "rounded",
+        "n": 4731,
+        "brier": 0.21978683633358911,
+        "mean_probability": 0.295534847034078,
+        "observed_rate": 0.3153667300782076
+      },
+      {
+        "season": 2024,
+        "line": 1.5,
+        "method": "adjacent_mixture",
+        "n": 4731,
+        "brier": 0.2197324096095057,
+        "mean_probability": 0.287336403095301,
+        "observed_rate": 0.3153667300782076
+      },
+      {
+        "season": 2024,
+        "line": 1.5,
+        "method": "empirical_ab_mixture",
+        "n": 4731,
+        "brier": 0.21939358727663477,
+        "mean_probability": 0.2879324070469214,
+        "observed_rate": 0.3153667300782076
+      },
+      {
+        "season": 2025,
+        "line": 0.5,
+        "method": "rounded",
+        "n": 27978,
+        "brier": 0.24068550379674872,
+        "mean_probability": 0.6233308695429246,
+        "observed_rate": 0.6099435270569733
+      },
+      {
+        "season": 2025,
+        "line": 0.5,
+        "method": "adjacent_mixture",
+        "n": 27978,
+        "brier": 0.239469180415014,
+        "mean_probability": 0.616165020584978,
+        "observed_rate": 0.6099435270569733
+      },
+      {
+        "season": 2025,
+        "line": 0.5,
+        "method": "empirical_ab_mixture",
+        "n": 27978,
+        "brier": 0.23940464175951215,
+        "mean_probability": 0.6036610438161754,
+        "observed_rate": 0.6099435270569733
+      },
+      {
+        "season": 2025,
+        "line": 1.5,
+        "method": "rounded",
+        "n": 4587,
+        "brier": 0.22289619355015108,
+        "mean_probability": 0.2988225903151883,
+        "observed_rate": 0.3195988663614563
+      },
+      {
+        "season": 2025,
+        "line": 1.5,
+        "method": "adjacent_mixture",
+        "n": 4587,
+        "brier": 0.2230695241029273,
+        "mean_probability": 0.2884058410652068,
+        "observed_rate": 0.3195988663614563
+      },
+      {
+        "season": 2025,
+        "line": 1.5,
+        "method": "empirical_ab_mixture",
+        "n": 4587,
+        "brier": 0.22273268051443867,
+        "mean_probability": 0.28892919584235505,
+        "observed_rate": 0.3195988663614563
+      }
+    ]
+  }
+}

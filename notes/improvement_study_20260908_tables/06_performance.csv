@@ -1,0 +1,4 @@
+﻿Component,Existing approach,Prototype / alternative,Measurement and limit,Source,Interpretation
+NFL EPA at 58 historical dates,"Repeatedly scan 35,082 plays",Accumulate daily sums/counts and snapshot before each date,"0.680 s → 0.0277 s, 24.6× for this component; maximum numerical difference 0",../improvement_study_20260908_performance.json,Local component timings; not deployed application or Azure latency
+Read 2025 NFL PBP,All columns,Five required EPA columns,Arrow buffers 21.12 MB → 3.42 MB; median local reads 8.21 ms → 4.93 ms,../improvement_study_20260908_performance.json,Local component timings; not deployed application or Azure latency
+Independent parlay probability,"5,000 Monte Carlo samples per call",Exact product,Removes simulation error entirely under the independence assumption,../improvement_study_20260908_performance.json,Local component timings; not deployed application or Azure latency

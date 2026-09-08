@@ -1,0 +1,71 @@
+{
+  "command": "performance",
+  "study_date": "2026-09-08",
+  "result": {
+    "scope": "Local component benchmark; excludes network, Azure, and Streamlit UI",
+    "epa_prefix": {
+      "plays": 35082,
+      "dates": 58,
+      "repeated_scan_seconds": 0.6799651999026537,
+      "prefix_seconds": 0.02766590006649494,
+      "ratio": 24.577736428901954,
+      "max_abs_difference": 0.0
+    },
+    "copula_independence": [
+      {
+        "legs": 3,
+        "calls": 30,
+        "seconds": 0.2318983000004664,
+        "exact_independent": 0.16637500000000005,
+        "sample_min": 0.1578,
+        "sample_max": 0.1774,
+        "rmse_vs_exact": 0.005542739244573333,
+        "theoretical_mc_se": 0.005266770535631869
+      },
+      {
+        "legs": 4,
+        "calls": 30,
+        "seconds": 0.2533090999349952,
+        "exact_independent": 0.09150625000000004,
+        "sample_min": 0.0826,
+        "sample_max": 0.1018,
+        "rmse_vs_exact": 0.005065211979358152,
+        "theoretical_mc_se": 0.004077569281102101
+      },
+      {
+        "legs": 5,
+        "calls": 30,
+        "seconds": 0.32024859997909516,
+        "exact_independent": 0.050328437500000024,
+        "sample_min": 0.046,
+        "sample_max": 0.055,
+        "rmse_vs_exact": 0.002174429126170725,
+        "theoretical_mc_se": 0.0030917789661878683
+      }
+    ],
+    "parquet_projection": [
+      {
+        "columns": "all",
+        "rows": 48771,
+        "arrow_bytes": 21120987,
+        "median_seconds": 0.00821219990029931,
+        "timings": [
+          0.009814299992285669,
+          0.00821219990029931,
+          0.007564600091427565
+        ]
+      },
+      {
+        "columns": "epa_only",
+        "rows": 48771,
+        "arrow_bytes": 3416377,
+        "median_seconds": 0.004925500019453466,
+        "timings": [
+          0.004925500019453466,
+          0.005397600005380809,
+          0.00440179998986423
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+﻿Season / hit line,Observations,Rounded count Brier,Adjacent-count mixture,Empirical AB mixture,Source,Interpretation
+2024 / 0.5,"27,349",0.242029,0.240806,0.240880,../improvement_study_20260908_mlb.json,"Exploratory empirical H/AB component screen; not deployed D+xBA, no ROI or independent confirmation"
+2025 / 0.5,"27,978",0.240686,0.239469,0.239405,../improvement_study_20260908_mlb.json,"Exploratory empirical H/AB component screen; not deployed D+xBA, no ROI or independent confirmation"
+2024 / 1.5,"4,731",0.219787,0.219732,0.219394,../improvement_study_20260908_mlb.json,"Exploratory empirical H/AB component screen; not deployed D+xBA, no ROI or independent confirmation"
+2025 / 1.5,"4,587",0.222896,0.223070,0.222733,../improvement_study_20260908_mlb.json,"Exploratory empirical H/AB component screen; not deployed D+xBA, no ROI or independent confirmation"

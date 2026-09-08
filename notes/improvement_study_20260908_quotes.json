@@ -1,0 +1,99 @@
+{
+  "command": "quotes",
+  "study_date": "2026-09-08",
+  "result": {
+    "scope": "Historical team quotes only; complete same event/side/line/window; capture timestamps within 60s and both before start; not a selectable bet cohort or realized ROI",
+    "results": [
+      {
+        "sport": "baseball_mlb",
+        "snapshot": "closing",
+        "exact_line_side_pairs": 22952,
+        "distinct_events": 6661,
+        "fd_better": 9489,
+        "same_price": 3125,
+        "mean_decimal_gain_if_choose_best": 0.013405517041345223,
+        "mean_decimal_gain_when_fd_better": 0.0324252742262573
+      },
+      {
+        "sport": "baseball_mlb",
+        "snapshot": "early_12h",
+        "exact_line_side_pairs": 22022,
+        "distinct_events": 6461,
+        "fd_better": 9406,
+        "same_price": 2765,
+        "mean_decimal_gain_if_choose_best": 0.016031958470580605,
+        "mean_decimal_gain_when_fd_better": 0.03753516791825708
+      },
+      {
+        "sport": "baseball_mlb",
+        "snapshot": "early_4h",
+        "exact_line_side_pairs": 23438,
+        "distinct_events": 6708,
+        "fd_better": 9634,
+        "same_price": 3345,
+        "mean_decimal_gain_if_choose_best": 0.012586518182259507,
+        "mean_decimal_gain_when_fd_better": 0.030621010292277175
+      },
+      {
+        "sport": "americanfootball_nfl",
+        "snapshot": "closing",
+        "exact_line_side_pairs": 3672,
+        "distinct_events": 823,
+        "fd_better": 1564,
+        "same_price": 630,
+        "mean_decimal_gain_if_choose_best": 0.024068438915660413,
+        "mean_decimal_gain_when_fd_better": 0.05650850875850706
+      },
+      {
+        "sport": "americanfootball_nfl",
+        "snapshot": "early_12h",
+        "exact_line_side_pairs": 3758,
+        "distinct_events": 836,
+        "fd_better": 1552,
+        "same_price": 734,
+        "mean_decimal_gain_if_choose_best": 0.02628534144496584,
+        "mean_decimal_gain_when_fd_better": 0.0636471089885191
+      },
+      {
+        "sport": "americanfootball_nfl",
+        "snapshot": "early_4h",
+        "exact_line_side_pairs": 3738,
+        "distinct_events": 829,
+        "fd_better": 1544,
+        "same_price": 708,
+        "mean_decimal_gain_if_choose_best": 0.0262177920668503,
+        "mean_decimal_gain_when_fd_better": 0.06347286706339794
+      },
+      {
+        "sport": "basketball_nba",
+        "snapshot": "closing",
+        "exact_line_side_pairs": 17107,
+        "distinct_events": 3909,
+        "fd_better": 7044,
+        "same_price": 3677,
+        "mean_decimal_gain_if_choose_best": 0.025106471918228148,
+        "mean_decimal_gain_when_fd_better": 0.060973369549280086
+      },
+      {
+        "sport": "basketball_nba",
+        "snapshot": "early_12h",
+        "exact_line_side_pairs": 16782,
+        "distinct_events": 3937,
+        "fd_better": 6643,
+        "same_price": 4159,
+        "mean_decimal_gain_if_choose_best": 0.02251915886536539,
+        "mean_decimal_gain_when_fd_better": 0.05688943610997471
+      },
+      {
+        "sport": "basketball_nba",
+        "snapshot": "early_4h",
+        "exact_line_side_pairs": 17770,
+        "distinct_events": 3934,
+        "fd_better": 7099,
+        "same_price": 4291,
+        "mean_decimal_gain_if_choose_best": 0.02446450742072462,
+        "mean_decimal_gain_when_fd_better": 0.06123880784142506
+      }
+    ]
+  }
+}
