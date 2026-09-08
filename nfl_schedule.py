@@ -126,7 +126,11 @@ def _load_from_mirror(want):
         if want is not None and str(r.get("season")) not in want:
             continue
         rec = {k: r.get(k) for k in _FIELDS}
+        # Normalize to match the CSV path exactly (parquet may store season/week as
+        # ints; the CSV path yields strs). Keeps `str(week)=='1'` filters consistent
+        # across the mirror-first and CSV-fallback readers.
         rec["season"] = str(rec["season"])
+        rec["week"] = str(rec["week"]) if rec.get("week") is not None else None
         rec["home_score"] = _to_int(rec["home_score"])
         rec["away_score"] = _to_int(rec["away_score"])
         out.append(rec)
