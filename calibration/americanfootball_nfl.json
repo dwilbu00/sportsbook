@@ -1175,9 +1175,12 @@
       "fit_timestamp": "2026-07-09T18:32:37.302254Z"
     },
     "starter_adjustment": {
-      "source": "backtest_nfl_epa.py --seasons 2023-2025",
-      "corr": 0.3818,
-      "games": 768
+      "source": "backtest_nfl_epa.py --seasons 2023-2025 (joint EPA+QB)",
+      "corr": 0.3819,
+      "games": 768,
+      "w_epa": 32.907,
+      "w_qb": 13.759,
+      "qb_change_games": 281
     }
   },
   "prob_shrink": {
@@ -1187,6 +1190,7 @@
   },
   "starter_adjustment": {
     "enabled": true,
-    "spreads": 32.293
+    "spreads": 32.907,
+    "qb_scale": 0.4181
   }
 }

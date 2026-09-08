@@ -68,10 +68,22 @@ _PLAYER_WEEK_COLS = [
 _ROSTER_COLS = ["season", "week", "team", "position", "depth_chart_position",
                 "status", "full_name", "football_name", "gsis_id", "jersey_number",
                 "years_exp"]
+# depth charts: nflverse changed the schema in 2025 (week-keyed → dt-snapshot).
+# We keep the union of BOTH shapes' useful fields; ingest_depth stamps season and
+# selects whatever is present. Old: week/club_code/position/depth_team. New: dt/
+# team/pos_abb/pos_rank (snapshot-based, no week).
 _DEPTH_COLS = ["season", "week", "club_code", "team", "position", "depth_team",
-               "formation", "gsis_id", "full_name", "jersey_number"]
+               "formation", "gsis_id", "full_name", "jersey_number",
+               "dt", "player_name", "pos_abb", "pos_rank", "pos_grp"]
 _INJURY_COLS = ["season", "week", "team", "gsis_id", "full_name", "position",
                 "report_status", "practice_status", "report_primary_injury"]
+# snap_counts: the RELIABLE regular/starter detector for ALL positions (incl.
+# O-line + defense, which player_week can't see). Keyed to the game_id spine;
+# pfr_player_id (join to injuries/roster by name+team+season). offense_pct /
+# defense_pct = snap share.
+_SNAP_COLS = ["game_id", "season", "week", "game_type", "player", "pfr_player_id",
+              "position", "team", "opponent", "offense_snaps", "offense_pct",
+              "defense_snaps", "defense_pct", "st_snaps", "st_pct"]
 _TEAM_WEEK_COLS = None   # keep all team_stats cols (compact, ~1 row/team/week)
 
 
@@ -199,7 +211,37 @@ def ingest_rosters(seasons, verbose=True):
 
 
 def ingest_depth(seasons, verbose=True):
-    return _ingest_per_season("nfl_depth", "load_depth_charts", _DEPTH_COLS,
+    """Depth charts, schema-tolerant (2025 nflverse reshaped this feed). Stamps a
+    season column when the new snapshot format omits it, selects whatever union
+    cols are present. The new format is dt-snapshot (no week) → consumers pick the
+    latest dt before a game date; the old format is week-keyed."""
+    nflreadpy = _require_nflreadpy()
+    total, done, note = 0, 0, None
+    for s in seasons:
+        try:
+            df = _to_pandas(nflreadpy.load_depth_charts(seasons=[int(s)]))
+        except Exception as exc:
+            if verbose:
+                print(f"    [nfl_depth {s}] skip: {type(exc).__name__}: {str(exc)[:90]}")
+            continue
+        if "season" not in df.columns:
+            df["season"] = str(s)            # new snapshot format omits season
+        df, missing = _select(df, _DEPTH_COLS)
+        note = note or missing
+        df = df[df["season"].astype(str) == str(s)]
+        if len(df) == 0:
+            if verbose:
+                print(f"    [nfl_depth {s}] 0 rows")
+            continue
+        _write(df, f"nfl_depth__{SPORT}__{s}.parquet", verbose)
+        total += len(df); done += 1
+    if verbose:
+        print(f"  [nfl_depth] {total:,} rows across {done}/{len(seasons)} season(s)")
+    return total
+
+
+def ingest_snap_counts(seasons, verbose=True):
+    return _ingest_per_season("nfl_snap", "load_snap_counts", _SNAP_COLS,
                               seasons, verbose)
 
 
@@ -248,6 +290,7 @@ _LAYERS = [
     ("player_week", ingest_player_week), ("rosters", ingest_rosters),
     ("depth", ingest_depth), ("injuries", ingest_injuries),
     ("ngs", ingest_ngs), ("team_week", ingest_team_week),
+    ("snap", ingest_snap_counts),
 ]
 
 

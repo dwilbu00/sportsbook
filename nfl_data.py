@@ -70,6 +70,7 @@ def rosters(seasons):           return _concat("nfl_roster", seasons)
 def depth_charts(seasons):      return _concat("nfl_depth", seasons)
 def injuries(seasons):          return _concat("nfl_injury", seasons)
 def team_week(seasons):         return _concat("nfl_team_week", seasons)
+def snap_counts(seasons):       return _concat("nfl_snap", seasons)
 def ngs(seasons, stat_type="passing"):
     return _concat(f"nfl_ngs_{stat_type}", seasons)
 
