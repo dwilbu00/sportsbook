@@ -1,10 +1,13 @@
-# NFL work — handoff for independent review (2026-09-08)
+# Codebase handoff for independent review (2026-09-08)
 
-You're being asked to give an **impartial second opinion** on the NFL modeling work in this
-repo. The author (an AI assistant, "Cal") and the owner (Doug) are both deep in it and want
-fresh eyes — especially on whether the conclusions are *sound* and the methodology is *honest*,
-not just whether the code runs. **Please be adversarial.** The most useful thing you can do is
-find where we fooled ourselves.
+You're being asked to give an **impartial second opinion** on this sports-betting modeling repo —
+both the **MLB** system (mature, the bulk of the code) and the **NFL** work (built this session).
+The author (an AI assistant, "Cal") and the owner (Doug) are both deep in it and want fresh eyes —
+especially on whether the conclusions are *sound* and the methodology is *honest*, not just whether
+the code runs. **Please be adversarial.** The most useful thing you can do is find where we fooled
+ourselves. The two big claims to stress-test are the same for both sports: **(a) is the model
+leakage-free and validated out-of-sample honestly, and (b) is the "no durable edge / at the
+efficient-market floor" verdict correct, or did we stop short / mis-measure?**
 
 ## Project in one line
 A sportsbook betting model (MLB, now pivoting to NFL). Bets execute at DraftKings + FanDuel only;
@@ -82,8 +85,75 @@ sigma 13.12. Wired via `nfl_epa.build_matchup_features` → `analysis._predict_m
 nflverse data pulls are FREE (no paid API). Odds-API pulls cost credits — do not run those without
 Doug's explicit go. The mirror parquets are in `warehouse_mirror_data/` (Git LFS).
 
-## Bottom line we reached (challenge it)
+---
+
+# MLB system (the mature system — also in scope)
+
+MLB is the older, larger part of the codebase and the source of most of the shared infrastructure
+the NFL work reuses. It is currently **parked/efficient** — every candidate edge dissolved on a
+clean data corpus (see below). Full reasoning is in `memory/modeling-and-calibration.md`,
+`memory/edges-and-backtests.md`, `memory/data-and-architecture.md`; this is the review summary.
+
+## What's there (MLB)
+- **Props model** — the heavy statistical machinery. Per-prop residual method bake-off (A=raw,
+  B=Gaussian, C=empirical-CDF, D=binomial P(≥k) distributional, E=NegBin), plus an **online Platt**
+  sigmoid overlay (seed-as-Bayesian-prior, champion-gated). Live: `batter_hits` = pooled C +
+  per-line-bucket **D+xBA blend**, `batter_strikeouts`=C, `pitcher_strikeouts`=C,
+  `batter_total_bases`=E, `batter_rbis`=A, `pitcher_earned_runs`=E, `pitcher_outs`=A (suppressed).
+- **Team markets** — shared `analysis._predict_margin` (recency + Pythagorean + starter/pitcher
+  adjustment) → `prob_shrink` + `market_blend` calibration. Verdict: well-calibrated but **at the
+  efficient-market variance floor (~0.24-0.25 Brier), no durable global edge**.
+- **Bet sizing** — vig-aware fractional-Kelly (half-Kelly, 5% per-bet cap, 25% slate cap); durable
+  bankroll ledger (`bankroll.py`, SQL/NDJSON, idempotent txn reconcile).
+- **Data** — Azure SQL warehouse (2024-2026; 2023 purged) + mirror-parquet cache (Git LFS),
+  leakage-safe as-of primitives (`savant_history`, `pitcher_asof`, `book_line_calibration`).
+- **Refit workflow** — candidate-staging (`refit_calibration.py` → `*.candidate.json` → `--diff`
+  → `--promote`/`--discard`); live file never touched mid-refit.
+- Key files: `analysis.py`, `props.py`, `mlb_starters.py`, `savant_history.py`, `pitcher_asof.py`,
+  `backtest.py` / `backtest_props.py` / `backtest_starters.py`, `calibration_loader.py`,
+  `recalibration.py`, `warehouse_mirror.py`, `pricing_common.py`, `wagers.py`, `db_store.py`,
+  `r2_sharp.py` (devig).
+
+## Central MLB claims (verify these)
+1. **No look-ahead leakage** in the as-of/backtest machinery (four adversarial verifiers agreed;
+   every primitive is strict-before-date). Re-audit if you can.
+2. **No durable team-market edge** — model Brier ≥ market on all 3 markets; overconfidence is a
+   point-estimate/shrinkage issue, not variance. The only claimed edges are situational.
+3. **Every "structural" edge died on the clean corpus** — coherence run-line (was a raw-band/dirty-
+   capture artifact), the under/f5 family. **Lone survivor: `batter_strikeouts UNDER 1.5`** (+1.26%,
+   t=1.69, replicates every season; an inverted public over-bias). `cv_floor` (earned_runs) is
+   flagged SUSPECT/unre-validated.
+4. **The forward-vs-backtest Brier gap is a pitcher-prop artifact** (pitchers fit on synthetic
+   season-avg lines, graded on real book lines, and have no online Platt), NOT regime change or
+   grading corruption — so a "2026-only reset" was judged a NO-OP and abandoned.
+5. **The SBR odds-source confound** — pre-mid-2025 backtests used SBR prices that were unfairly
+   pessimistic (same games, identical model Brier, ML swung −8.6% SBR → +1.2% clean API). A durable
+   methodological lesson: judge on clean-API prices.
+
+## Please scrutinize (MLB self-deceptions to challenge)
+- **The `batter_strikeouts UNDER 1.5` survivor** — +1.26% at t=1.69 across a large multiple-
+  comparisons search. Is it real, or the one cell that survived by chance? (Same skepticism we
+  applied to the NFL props artifact.)
+- **The "no team edge" verdict** — is the model genuinely at the variance floor, or under-tuned /
+  mis-specified in a way that hides a real edge? The OOS ML "+3.3% at EV≥12%" is claimed unstable
+  across seasons — agree?
+- **Incumbent hysteresis** in the refit sweep (a bare re-sweep resets non-A incumbents to A and can
+  silently lose a within-band real-line method). Does the candidate-staging actually contain it?
+- **value_gate EV floor (4%)** was chosen on de-vigged *consensus* prices, optimistic vs the DK/FD
+  prices we actually bet — is the ROI story robust to real book prices?
+- The claim that calibration is a single slot (shrink OR Platt OR blend, never stacked) — is that
+  respected everywhere, or is there hidden double-anchoring?
+
+## Standing constraints (apply to any run)
+Bets execute at **DraftKings + FanDuel only** (Pinnacle/others analysis-only). **Odds-API pulls
+cost paid credits — do not run any ingest/backfill/`--source live` path that hits it.** MLB
+backtests read the warehouse/mirror; nflverse + committed mirror data are free. Never commit
+`secrets.toml`.
+
+---
+
+# NFL bottom line we reached (challenge it)
 The NFL team model is genuinely good and at its noise-limited ceiling (~0.5 RMSE behind the sharp
 market, which is irreducible from box-score data). No amount of matchup cleverness closed the gap
-(7 tests). This is offered as a *robust* finding — if you can break it, that's exactly the value
-of this review.
+(7 tests). Like MLB, it lands at "no durable team-market edge, market is efficient for us." Both
+verdicts are offered as *robust* — if you can break either, that's exactly the value of this review.
