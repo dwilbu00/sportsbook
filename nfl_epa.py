@@ -105,6 +105,69 @@ def fetch_pbp(season, force=False):
 _PLAYS_CACHE = {}
 
 
+def _plays_from_mirror(season):
+    """Build the trimmed play list from the pbp MIRROR parquet (dep-free of
+    nflreadpy; pandas only), or return None if the mirror is absent / an LFS
+    stub. Same shape + REG-only / pass-or-rush / non-null-epa filtering as the
+    live CSV path, so it's a drop-in. This is the preferred source — it removes
+    the ~19MB/season runtime download and keeps EPA on the same game_id spine as
+    every other NFL layer."""
+    try:
+        import nfl_data
+    except Exception:
+        return None
+    df = nfl_data.pbp([str(season)])
+    if df is None or len(df) == 0:
+        return None
+    need = ("game_id", "game_date", "home_team", "away_team", "posteam",
+            "defteam", "epa", "pass", "rush", "season_type",
+            "total_home_score", "total_away_score")
+    if any(c not in df.columns for c in need):
+        return None
+
+    def _truthy(v):
+        try:
+            return float(v) == 1.0
+        except (TypeError, ValueError):
+            return str(v) == "1"
+
+    plays, final_score = [], {}
+    for r in df.to_dict("records"):
+        if str(r.get("season_type")) != "REG":
+            continue
+        gid = r.get("game_id")
+        hs, as_ = r.get("total_home_score"), r.get("total_away_score")
+        try:
+            if gid and hs is not None and as_ is not None and hs == hs and as_ == as_:
+                final_score[gid] = (float(hs), float(as_))
+        except (TypeError, ValueError):
+            pass
+        pt, dt, epa = r.get("posteam"), r.get("defteam"), r.get("epa")
+        if not pt or not dt or epa is None or epa != epa:   # epa!=epa → NaN
+            continue
+        if not (_truthy(r.get("pass")) or _truthy(r.get("rush"))):
+            continue
+        try:
+            e = float(epa)
+        except (TypeError, ValueError):
+            continue
+        gd = r.get("game_date")
+        plays.append({
+            "game_id": gid,
+            "game_date": str(gd)[:10] if gd is not None and gd == gd else None,
+            "home_team": r.get("home_team"),
+            "away_team": r.get("away_team"),
+            "posteam": pt, "defteam": dt, "epa": e,
+        })
+    if not plays:
+        return None
+    for p in plays:
+        sc = final_score.get(p["game_id"])
+        if sc:
+            p["home_score"], p["away_score"] = sc
+    return plays
+
+
 def load_plays(season, force=False):
     """
     Return a list of trimmed regular-season pass/rush plays for `season`:
@@ -112,9 +175,18 @@ def load_plays(season, force=False):
          epa, home_score, away_score}
     Scores are the game's FINAL totals (constant per game_id), used for the
     totals baseline; epa is per play. Cached in memory and as compact JSON.
+
+    Source order: in-memory cache → pbp MIRROR parquet (preferred, dep-free of
+    nflreadpy, same game_id spine) → trimmed JSON cache → live pbp download.
     """
     if not force and season in _PLAYS_CACHE:
         return _PLAYS_CACHE[season]
+
+    mirror = _plays_from_mirror(season)
+    if mirror is not None:
+        _PLAYS_CACHE[season] = mirror
+        return mirror
+
     tpath = _trimmed_path(season)
     if not force and os.path.exists(tpath):
         try:
