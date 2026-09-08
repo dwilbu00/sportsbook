@@ -14,7 +14,7 @@ Auto-memory for the MLB (+NBA/NFL) sportsbook betting model. Owner = Doug; assis
 - [preferences](preferences.md) — How to work with Doug (owner): who he is, commit/push rules, betting books (DK+FD), spend confirmation, backtest handoff, Alpha status, and his defaults-audit methodology.
 - [effort-and-cost](effort-and-cost.md) — Save cost: flag lower-effort prompts, delegate mechanical subtasks to Haiku/Sonnet-4-6; effort rubric (LOW/MED/HIGH).
 - [ACTIVE](ACTIVE.md) — in-flight work only; read this to resume. Links each item to its domain.
-- [edges-and-backtests](edges-and-backtests.md) — What the edge hunt found: the validated coherence run-line + cv_floor variance edge, the exhausted sharp-staleness/mean-edge nulls, and the warehouse backtest tooling.
+- [edges-and-backtests](edges-and-backtests.md) — What the edge hunt found: on the CLEAN corpus MLB is efficient — coherence RL + under/f5 DEAD (dirty-data artifacts), cv_floor unre-validated; one thin survivor (batter_K UNDER 1.5); the exhausted nulls; backtest tooling. MLB parked → pivoted to NFL.
 - [data-and-architecture](data-and-architecture.md) — THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion (ESPN fully removed for MLB), MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV, and the active 5M-credit odds backfill + relaunch reset.
 - [modeling-and-calibration](modeling-and-calibration.md) — The model itself: live calibration state, refit/candidate workflow, method A-E bake-off outcomes, Kelly sizing, online Platt, team-market audit verdict, cross-sport parity, and why forward Brier lagged backtest.
 - [wishlist](wishlist.md) — parked owner ideas; append/transfer-only (never expanded per-item as work is done).
