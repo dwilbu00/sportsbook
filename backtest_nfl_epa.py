@@ -22,6 +22,7 @@ Usage:
 import argparse
 
 import nfl_epa
+import nfl_qb_asof
 from calibration_loader import (
     load_starter_adjustment, save_starter_adjustment, set_candidate_mode,
     has_candidate, active_write_label, existing_candidate_notice,
@@ -64,6 +65,111 @@ def build_dataset(seasons):
             graded += 1
         print(f"  {season}: {graded} games graded")
     return data
+
+
+def build_dataset_qb(seasons):
+    """Like build_dataset but each row is (base_edge, qb_diff, margin, season),
+    where qb_diff = (home starter-vs-baseline QB delta) - (away delta). All
+    leakage-safe (EPA + QB ratings as-of the game date; starter identity is
+    public pre-game). Used by the OOS QB-value comparison."""
+    data = []
+    for season in seasons:
+        plays = nfl_epa.load_plays(season)
+        starters = nfl_qb_asof.game_starters(season)
+        games = {}
+        for p in plays:
+            if "home_score" in p:
+                games[p["game_id"]] = (p["game_date"], p["home_team"],
+                                       p["away_team"],
+                                       p["home_score"] - p["away_score"])
+        graded = 0
+        for gid, (d, h, a, margin) in sorted(games.items(), key=lambda kv: kv[1][0]):
+            ratings = nfl_epa.team_epa(season, as_of_date=d)
+            rh, ra = ratings.get(h), ratings.get(a)
+            if not rh or not ra or rh["off_plays"] <= 0 or ra["off_plays"] <= 0:
+                continue
+            base_edge = rh["net_epa"] - ra["net_epa"]
+            qb_r, _lg = nfl_qb_asof.qb_ratings(season, d)
+            gs = starters.get(gid, {})
+            dh = nfl_qb_asof.qb_edge_delta(season, d, h, gs.get(h), qb_r)
+            da = nfl_qb_asof.qb_edge_delta(season, d, a, gs.get(a), qb_r)
+            data.append((base_edge, dh - da, float(margin), season))
+            graded += 1
+        print(f"  {season}: {graded} games graded (QB dataset)")
+    return data
+
+
+def _fit1(xs, ys):
+    """OLS slope through origin for y = w*x."""
+    sxx = sum(x * x for x in xs)
+    return (sum(x * y for x, y in zip(xs, ys)) / sxx) if sxx else 0.0
+
+
+def _fit2(x1s, x2s, ys):
+    """OLS (no intercept) for y = a*x1 + b*x2 via the 2x2 normal equations."""
+    s11 = sum(x * x for x in x1s)
+    s22 = sum(x * x for x in x2s)
+    s12 = sum(p * q for p, q in zip(x1s, x2s))
+    s1y = sum(x * y for x, y in zip(x1s, ys))
+    s2y = sum(x * y for x, y in zip(x2s, ys))
+    det = s11 * s22 - s12 * s12
+    if abs(det) < 1e-12:
+        return _fit1(x1s, ys), 0.0
+    a = (s1y * s22 - s2y * s12) / det
+    b = (s11 * s2y - s12 * s1y) / det
+    return a, b
+
+
+def _rmse(pred, ys):
+    n = len(ys)
+    return (sum((p - y) ** 2 for p, y in zip(pred, ys)) / n) ** 0.5 if n else 0.0
+
+
+def oos_qb_value(seasons):
+    """Leave-one-season-out: for each held-out season, fit on the OTHERS and
+    measure held-out margin RMSE for (a) base EPA edge only and (b) EPA edge +
+    QB delta. If QB info helps, the QB model's OOS RMSE is LOWER. This is the
+    honest go/no-go before building the full odds beat-the-close backtest."""
+    data = build_dataset_qb(seasons)
+    if len(seasons) < 2:
+        print("Need >=2 seasons for leave-one-out OOS."); return
+    print(f"\n=== OOS QB-value (leave-one-season-out, {len(data)} games) ===")
+    print("  held  n     base_RMSE   +QB_RMSE    delta     w_epa   w_qb   n_qb!=0")
+    tot_b = tot_q = 0.0
+    ntot = 0
+    for test in seasons:
+        tr = [d for d in data if d[3] != test]
+        te = [d for d in data if d[3] == test]
+        if not tr or not te:
+            continue
+        # base model: fit w on train base_edge, apply to test
+        wb = _fit1([d[0] for d in tr], [d[2] for d in tr])
+        pb = [wb * d[0] for d in te]
+        rb = _rmse(pb, [d[2] for d in te])
+        # qb model: fit (w_epa, w_qb) on train, apply to test
+        wa, wq = _fit2([d[0] for d in tr], [d[1] for d in tr], [d[2] for d in tr])
+        pq = [wa * d[0] + wq * d[1] for d in te]
+        rq = _rmse(pq, [d[2] for d in te])
+        nqb = sum(1 for d in te if abs(d[1]) > 1e-9)
+        print(f"  {test}  {len(te):<4}  {rb:8.4f}   {rq:8.4f}   {rq-rb:+7.4f}   "
+              f"{wa:6.2f}  {wq:6.2f}  {nqb}")
+        tot_b += rb * len(te); tot_q += rq * len(te); ntot += len(te)
+    if ntot:
+        print(f"  ---- weighted OOS RMSE: base={tot_b/ntot:.4f}  "
+              f"+QB={tot_q/ntot:.4f}  delta={ (tot_q-tot_b)/ntot:+.4f} "
+              f"({'QB HELPS' if tot_q < tot_b else 'QB does NOT help'}) ----")
+        # restrict to the games that actually HAVE a QB change — where the signal lives
+        te_all = data
+        chg = [d for d in te_all if abs(d[1]) > 1e-9]
+        print(f"\n  On the {len(chg)} QB-CHANGE games only (pooled, in-sample weights):")
+        if chg:
+            wa, wq = _fit2([d[0] for d in te_all], [d[1] for d in te_all],
+                           [d[2] for d in te_all])
+            wb = _fit1([d[0] for d in te_all], [d[2] for d in te_all])
+            rb = _rmse([wb * d[0] for d in chg], [d[2] for d in chg])
+            rq = _rmse([wa * d[0] + wq * d[1] for d in chg], [d[2] for d in chg])
+            print(f"    base_RMSE={rb:.4f}  +QB_RMSE={rq:.4f}  delta={rq-rb:+.4f} "
+                  f"({'QB HELPS' if rq < rb else 'QB does NOT help'})")
 
 
 def _pearson(xs, ys):
@@ -126,7 +232,13 @@ def main():
     ap.add_argument("--live", action="store_true",
                     help="with --save, write the LIVE calibration file directly "
                          "(skip candidate staging)")
+    ap.add_argument("--oos-qb", action="store_true",
+                    help="leave-one-season-out OOS test of whether the starting-QB "
+                         "adjustment improves margin prediction (go/no-go, no save)")
     args = ap.parse_args()
+    if args.oos_qb:
+        oos_qb_value(_parse_seasons(args.seasons))
+        return
     staging = not args.live
     set_candidate_mode(staging)
     if staging and args.save:
