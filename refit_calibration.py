@@ -2143,6 +2143,236 @@ def diagnose_divergence(sport, store_label="", props_filter=None, seasons=None,
           "across seasons is the go-signal to validate at true DK/FD execution prices.)")
 
 
+def diagnose_spike_prediction(sport, store_label="", props_filter=None, seasons=None,
+                              hh_window=50, hh_min=25):
+    """Keep-if-better PREDICTION gate for the recent-HH%-SPIKE feature (NO WRITE).
+
+    The divergence EDGE test found the market already prices contact quality (no
+    edge), but the spike still SEPARATES outcomes — so it may improve OUR standalone
+    prediction (which uses only SEASON-to-date HH%). This isolates the spike's
+    INCREMENTAL value over the shipped method: candidate P(over) =
+    sigmoid(logit(incumbent) + β·z_spike), with the incumbent held fixed (β is the
+    ONLY new parameter, so any Brier gain is purely the spike's marginal signal).
+    β is grid-fit on TRAIN, scored OOS, and the improvement is 2-fold confirmed.
+
+    Incumbent per prop = its shipped method (batter_hits → D via project_distributional;
+    NegBin-count props → E). Ships nothing; it answers whether wiring recent-HH% into
+    serving is worth it. OFFLINE + FREE (store + free ESPN gamelogs + cached raw
+    Statcast). z_spike = (rolling last-``hh_window``-BBE HH%) − (season-to-date HH%),
+    standardized on TRAIN (leakage-safe)."""
+    import math
+    import book_line_calibration as blc
+    import savant_history as sh
+    import backtest_props
+    import mlb_starters
+    from stats import negbin_at_least, fit_negbin_params
+    from props import PROP_NEGBIN_ELIGIBLE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    target = props_filter or ["batter_hits", "batter_total_bases"]
+    target = [p for p in target if p in existing]
+    if not target:
+        print("None of the requested props are calibrated; run refit first.")
+        return
+    print(f"\n=== recent-HH%-SPIKE prediction gate: {sport_key} {target} ===")
+    print(f"  z_spike = rolling last {hh_window} BBE HH% − season HH% (std on train); "
+          f"candidate = sigmoid(logit(incumbent) + β·z_spike)")
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, target, store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+    print(f"  {len(book_lines):,} real book lines ({n_store:,} store + {n_pred:,} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league) if o.get("prop_key") in target]
+    if not enriched:
+        print("  No observations joined to actuals.")
+        return
+
+    years = sorted({str(o["game_date"])[:4] for o in enriched if o.get("game_date")})
+    raw = []
+    for y in years:
+        try:
+            raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+        except Exception:
+            pass
+    if not raw:
+        print(f"  [warn] no raw Statcast days cached for {years} — no HH% signal, "
+              f"aborting.")
+        return
+    quality_index = backtest_props.build_batter_quality_index(raw)
+    xba_index = backtest_props.build_batter_xba_index(raw)
+    pid_cache = {}
+
+    def _pid(player, season):
+        k = (player, season)
+        if k not in pid_cache:
+            pid = None
+            try:
+                info = mlb_starters.find_player_id(player, season)
+                if info and info[0] and not info[1]:
+                    pid = str(info[0])
+            except Exception:
+                pid = None
+            pid_cache[k] = pid
+        return pid_cache[k]
+
+    def _logit(p):
+        p = min(1.0 - 1e-6, max(1e-6, p))
+        return math.log(p / (1.0 - p))
+
+    def _sig(x):
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    B_GRID = [i * 0.05 for i in range(-12, 13)]     # β ∈ [-0.6, 0.6]
+
+    for prop_key in target:
+        cfg = existing[prop_key]
+        incumbent = cfg.get("method")
+        is_negbin = prop_key in PROP_NEGBIN_ELIGIBLE and incumbent == "E"
+        is_dist = prop_key == "batter_hits"          # shipped D (distributional)
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": cfg.get("use_minutes", False),
+        }
+        defense_by_season = None
+        if (cfg.get("opp_defense_strength") or 0.0) > 0:
+            defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
+        ship_xstats = cfg.get("xstats_strength") or (
+            LINE_COND_XSTATS_STRENGTH if is_dist else 0.0)
+
+        rows = []
+        for obs in enriched:
+            if obs.get("prop_key") != prop_key:
+                continue
+            gd = obs.get("game_date")
+            if not gd or obs["actual"] == obs["line"]:
+                continue
+            season = int(str(gd)[:4])
+            pid = _pid(obs["player"], season)
+            if not pid:
+                continue
+            qw = quality_index.asof_window(pid, gd, hh_window, min_count=hh_min)
+            qs = quality_index.asof(pid, gd)
+            if (not qw or qw.get("hard_hit_pct") is None
+                    or not qs or qs.get("hard_hit_pct") is None):
+                continue
+            proj, emp = blc.project_and_empirical(
+                obs, params, sport_key, defense_by_season=defense_by_season)
+            if proj is None:
+                continue
+            # Incumbent prob p0 (rate_mult=1). D closed-form now; E needs a train
+            # fit, filled per split below.
+            p0 = None
+            if is_dist:
+                p0 = blc.project_distributional(
+                    obs, params, sport_key, xba_index=xba_index,
+                    quality_index=quality_index, xstats_strength=ship_xstats,
+                    defense_by_season=defense_by_season)
+                if p0 is None:
+                    continue
+            rows.append({
+                "game_date": gd, "season": season,
+                "spike": qw["hard_hit_pct"] - qs["hard_hit_pct"],
+                "proj": proj, "line": obs["line"],
+                "over": 1 if obs["actual"] > obs["line"] else 0,
+                "actual": obs["actual"], "p0": p0,
+            })
+        if len(rows) < 200:
+            print(f"\n  {prop_key}: only {len(rows)} usable obs (<200) — skipped.")
+            continue
+        rows.sort(key=lambda r: r["game_date"])
+
+        def _fill_incumbent(train, allrows):
+            if not is_negbin:
+                return True
+            nb = fit_negbin_params([(r["proj"], r["actual"]) for r in train])
+            if nb is None:
+                return False
+            ms, disp = nb
+            for r in allrows:
+                r["p0"] = negbin_at_least(int(r["line"]) + 1, max(1e-9, ms * r["proj"]),
+                                          disp)
+            return True
+
+        def _brier(subset, prob_fn):
+            return sum((prob_fn(r) - r["over"]) ** 2 for r in subset) / len(subset)
+
+        def _eval(train, test):
+            if not _fill_incumbent(train, train + test):
+                return None
+            mu = sum(r["spike"] for r in train) / len(train)
+            var = sum((r["spike"] - mu) ** 2 for r in train) / len(train)
+            sd = math.sqrt(var) if var > 0 else 1e-9
+            for r in train + test:
+                r["z"] = (r["spike"] - mu) / sd
+            base_tr = _brier(train, lambda r: r["p0"])
+            best_b, best_tr = 0.0, base_tr
+            for b in B_GRID:
+                tr = _brier(train, lambda r: _sig(_logit(r["p0"]) + b * r["z"]))
+                if tr < best_tr:
+                    best_b, best_tr = b, tr
+            base_te = _brier(test, lambda r: r["p0"])
+            cand_te = _brier(test, lambda r: _sig(_logit(r["p0"]) + best_b * r["z"]))
+            return best_b, base_te, cand_te
+
+        split = len(rows) // 2
+        main = _eval(rows[:split], rows[split:])
+        if main is None:
+            print(f"\n  {prop_key}: incumbent fit failed — skipped.")
+            continue
+        best_b, base_te, cand_te = main
+        delta = base_te - cand_te
+
+        # 2-fold confirmation (expanding).
+        folds = blc._real_line_folds(rows)
+        fold_deltas = []
+        for tr, te in folds:
+            fr = _eval(tr, te)
+            if fr:
+                fold_deltas.append(fr[1] - fr[2])
+        confirmed = (delta >= MIN_CALIB_BRIER_GAIN and len(fold_deltas) == len(folds)
+                     and folds and all(d > 0 for d in fold_deltas))
+
+        # Residual-by-spike-quartile (interpretation): does the incumbent
+        # systematically mis-predict as a function of the spike?
+        _fill_incumbent(rows[:split], rows)
+        rr = sorted(rows, key=lambda r: r["spike"])
+        qn = len(rr) // 4
+        print(f"\n  {prop_key} (incumbent={incumbent}, n={len(rows)}):")
+        print("    residual (realized OVER − incumbent P) by spike quartile:")
+        for qi, (lo, hi, lbl) in enumerate([
+                (0, qn, "Q1 low spike"), (qn, 2 * qn, "Q2"),
+                (2 * qn, 3 * qn, "Q3"), (3 * qn, len(rr), "Q4 high spike")]):
+            sub = rr[lo:hi]
+            if not sub:
+                continue
+            resid = sum(r["over"] - r["p0"] for r in sub) / len(sub)
+            print(f"      {lbl:<14} n={len(sub):<6} mean_resid={resid:+.4f}")
+        print(f"    OOS Brier: incumbent={base_te:.4f}  +spike(β={best_b:+.2f})="
+              f"{cand_te:.4f}  Δ={delta:+.4f}")
+        print(f"    2-fold Δ: {['%+.4f' % d for d in fold_deltas]}")
+        verdict = ("SHIP — spike improves prediction OOS + confirmed"
+                   if confirmed else
+                   f"no — Δ<{MIN_CALIB_BRIER_GAIN} or not 2-fold confirmed")
+        print(f"    verdict: {verdict}")
+
+    print("\n  (Diagnostic only — nothing written. A confirmed Δ is the go-signal to "
+          "wire recent-HH% into serving as a bounded projection nudge.)")
+
+
 def diagnose_center(sport, prop_filter=None, store_label=""):
     """Mean-vs-median central-tendency diagnostic (NO WRITE).
 
@@ -4026,6 +4256,10 @@ def main():
     p.add_argument("--div-props", default=None,
                    help="Comma-separated props for --div-diag (default "
                         "batter_total_bases,batter_hits).")
+    p.add_argument("--spike-diag", action="store_true",
+                   help="Keep-if-better PREDICTION gate for the recent-HH%-spike "
+                        "feature: does sigmoid(logit(incumbent)+β·z_spike) beat the "
+                        "shipped method OOS (2-fold confirmed)? (no write).")
     p.add_argument("--center-diag", action="store_true",
                    help="Mean-vs-median: re-score each calibrated prop's incumbent "
                         "method on the real-line holdout with a recency-weighted "
@@ -4199,6 +4433,15 @@ def main():
 
     if args.div_diag:
         diagnose_divergence(
+            args.sport, store_label=args.store_label,
+            props_filter=([p.strip() for p in args.div_props.split(",") if p.strip()]
+                          if args.div_props else None),
+            seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+                     if args.seasons else None))
+        return
+
+    if args.spike_diag:
+        diagnose_spike_prediction(
             args.sport, store_label=args.store_label,
             props_filter=([p.strip() for p in args.div_props.split(",") if p.strip()]
                           if args.div_props else None),

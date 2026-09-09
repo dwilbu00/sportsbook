@@ -1054,7 +1054,8 @@ def project_distributional(obs, params, sport_key, team_defense=None,
                            quality_index=None, xstats_strength=0.0,
                            hardhit_coef=None, barrel_coef=None,
                            xba_window=None, xba_min_count=None,
-                           home_ab_delta=0.0, defense_by_season=None):
+                           home_ab_delta=0.0, defense_by_season=None,
+                           rate_mult=1.0):
     """Distributional P(over) for a batter_hits obs at its REAL book line
     (§2.4b-2 method "D"), or None if not applicable / too thin.
 
@@ -1135,7 +1136,7 @@ def project_distributional(obs, params, sport_key, team_defense=None,
 
     import props
     p_over, _ = props._dist_p_over(
-        r_emp, expected_ab, xba, hh, brl, 1.0, 1.0, line,
+        r_emp, expected_ab, xba, hh, brl, rate_mult, 1.0, line,
         xstats_strength, hardhit_coef, barrel_coef)
     return p_over
 
@@ -1143,7 +1144,8 @@ def project_distributional(obs, params, sport_key, team_defense=None,
 def project_distributional_tb(obs, params, sport_key, team_defense=None,
                               league_avg_def=None, quality_index=None,
                               hardhit_coef=None, barrel_coef=None,
-                              triple_share=None, defense_by_season=None):
+                              triple_share=None, defense_by_season=None,
+                              rate_mult=1.0):
     """Distributional P(over) for a batter_total_bases obs at its REAL book line
     (method "F"), or None if not applicable / too thin.
 
@@ -1214,7 +1216,7 @@ def project_distributional_tb(obs, params, sport_key, team_defense=None,
 
     import props
     p_over, _ = props._tb_dist_p_over(
-        ab_w, h_w, hr_w, tb_w, expected_ab, None, hh, brl, 1.0, 1.0, line,
+        ab_w, h_w, hr_w, tb_w, expected_ab, None, hh, brl, rate_mult, 1.0, line,
         hardhit_coef, barrel_coef, triple_share)
     return p_over
 
