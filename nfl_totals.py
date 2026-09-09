@@ -27,6 +27,15 @@ from nfl_market_scan import _load_closing_odds, _total_outcome, _profit
 LEAGUE_PACE = 64.0     # ~offensive plays per team-game (centering)
 
 
+def expected_total_signal(off_h, def_h, off_a, def_a):
+    """Combined expected-scoring signal for a game. def_epa is EPA ALLOWED (higher =
+    weaker defense), so each offense's expected scoring is its own offense PLUS the
+    opponent's allowed level: home = off_h + def_away, away = off_a + def_home.
+    Scoring must RISE as the opposing defense weakens (def rises) — guarded by
+    test_nfl_signs so the sign can't silently invert again. [review 2026-09-09]"""
+    return (off_h + def_a) + (off_a + def_h)
+
+
 def _weather(season):
     """{game_id: (wind, temp, roof)} from the pbp mirror."""
     pb = nfl_data.pbp([str(season)])
@@ -89,11 +98,8 @@ def build_rows(seasons):
             rh, ra = R.get(h), R.get(a)
             if not rh or not ra or rh["off_plays"] <= 0 or ra["off_plays"] <= 0:
                 continue
-            # def_epa is EPA ALLOWED (higher = weaker defense = more scoring), so
-            # expected scoring is offense PLUS the opponent's allowed level:
-            # home = off_h + def_away, away = off_a + def_home. (The old subtraction
-            # collapsed this to net-EPA sum and inverted the defense effect.) [review 2026-09-09]
-            epa_sum = ((rh["off_epa"] + ra["def_epa"]) + (ra["off_epa"] + rh["def_epa"]))
+            epa_sum = expected_total_signal(rh["off_epa"], rh["def_epa"],
+                                            ra["off_epa"], ra["def_epa"])
             pace = _pace_asof(s, d, R)
             pace_c = (pace(h) + pace(a)) - 2 * LEAGUE_PACE
             wind, cold, dome = _wx_terms(wx, gid)
