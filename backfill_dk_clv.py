@@ -89,7 +89,18 @@ SPORT_MAP = {
     "nhl": "icehockey_nhl",
 }
 
-REGIONS = "us"  # DraftKings lives in the US region
+REGIONS = "us"  # DraftKings + FanDuel live in the US region
+
+# Books Doug bets. Fetching both is cost-NEUTRAL (the Odds-API historical charge is
+# per market x region, independent of the bookmakers filter). Book-aware CLV compares
+# a bet to the CLOSE at the book it was actually placed (DK or FD). [DK+FD 2026-09-09]
+_EXEC_BOOKS_API = ["draftkings", "fanduel"]
+
+
+def _wager_book_key(row):
+    """The Odds-API bookmaker key for the book a wager was placed at (from the
+    recorded 'book' title). Defaults to draftkings for legacy/None rows."""
+    return "fanduel" if "fanduel" in str(row.get("book") or "").lower() else "draftkings"
 
 # Team-market bet_type -> the featured Odds-API market key that carries its close.
 TEAM_MARKET_KEY = {"moneyline": "h2h", "spread": "spreads", "total": "totals"}
@@ -371,7 +382,7 @@ def main():
         return is_historical_event_cached(
             sport_full, eid, groups[eid]["commence"], regions=REGIONS,
             markets=",".join(sorted(groups[eid]["markets"])),
-            bookmakers=["draftkings"])
+            bookmakers=_EXEC_BOOKS_API)
 
     new_cost = sum(per_event_cost[eid] for eid in order if not _cached(eid))
     print(f"  {len(groups)} event(s), {n_wagers} wager(s) needing CLV.")
@@ -424,7 +435,7 @@ def main():
             try:
                 data, _snap = get_historical_event_odds(
                     api_key, sport_full, eid, date=g["commence"],
-                    regions=REGIONS, markets=markets, bookmakers=["draftkings"])
+                    regions=REGIONS, markets=markets, bookmakers=_EXEC_BOOKS_API)
             except requests.exceptions.RequestException as e:
                 print(f"  [warn] {eid}: request failed ({e}); skipping.")
                 continue
@@ -442,18 +453,24 @@ def main():
             # Parse each family of markets from the one payload: props per
             # prop_key, and the featured team lines once (only if a team bet
             # rides this event).
+            # Parse each executable book once (book-aware CLV: a bet is compared to
+            # the close at the book it was PLACED at — DK or FD — for a like-for-like
+            # comparison now that the app line-shops DK/FD).
             need = {row.get("prop_key") for row in g["rows"]
                     if row.get("bet_type") == "player_prop"}
-            dk_by_prop = {prop: dk_prop_lines(data, prop) for prop in need}
+            by_prop_book = {prop: {bk: dk_prop_lines(data, prop, book_key=bk)
+                                   for bk in _EXEC_BOOKS_API} for prop in need}
             has_team = any(row.get("bet_type") in TEAM_MARKET_KEY
                            for row in g["rows"])
-            dk_lines = dk_game_lines(data) if has_team else {}
+            lines_by_book = ({bk: dk_game_lines(data, book_key=bk)
+                              for bk in _EXEC_BOOKS_API} if has_team else {})
             for row in g["rows"]:
+                bk = _wager_book_key(row)
                 if row.get("bet_type") == "player_prop":
                     res = dk_close_for_wager(
-                        dk_by_prop.get(row.get("prop_key"), []), row)
+                        by_prop_book.get(row.get("prop_key"), {}).get(bk, []), row)
                 else:
-                    res = dk_close_for_team_wager(dk_lines, row)
+                    res = dk_close_for_team_wager(lines_by_book.get(bk, {}), row)
                 if res is None:
                     n_unmatched += 1
                     continue

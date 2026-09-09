@@ -3152,25 +3152,31 @@ if analyze_clicked and selected_game_labels:
         if eid in odds_results:
             raw_game_odds = odds_results[eid]
             market_comparisons = build_market_comparisons(raw_game_odds)
-            # Team-market analysis runs on a DraftKings-ONLY view of the odds, so
-            # every executable price the analyzers surface (moneyline best_price,
-            # spread/total consensus price) is DK's price — the team-market
-            # equivalent of the props' P1.1b "stake at DK" rule (props instead
-            # parse all books and carry dk_over/under_price separately). This is
-            # what makes a submitted team bet's executed_price DraftKings, hence
-            # its CLV a true DK-vs-DK comparison against the DK close backfilled
-            # by backfill_dk_clv.py. Do NOT widen this to all books without giving
-            # the team path its own dk_price field, or team CLV silently reverts
-            # to a mixed DK-close-vs-best-of-book comparison.
-            draftkings_game_odds = dict(raw_game_odds)
-            draftkings_game_odds["bookmakers"] = [
+            # TWO views (DK+FD offer preservation, 2026-09-09). Doug bets DK AND FD,
+            # so the value analyzers line-shop the EXECUTABLE view = DraftKings +
+            # FanDuel: best_price/best_book on each candidate become the better of the
+            # two, and analysis-only books (Pinnacle etc.) are excluded from execution.
+            # Coherence (DK-internal run-line vs ML) + the DK-close CLV baseline still
+            # need a DK-ONLY view, kept as dk_game_odds. (A bet placed at FanDuel
+            # records best_book='FanDuel'; book-aware CLV should compare it to the FD
+            # close — see backfill_dk_clv. Until FD closes are captured, the DK close
+            # is a directional proxy and best_book flags the mismatch.)
+            _EXEC_BOOKS = ("draftkings", "fanduel")
+            exec_raw = dict(raw_game_odds)
+            exec_raw["bookmakers"] = [
+                book for book in raw_game_odds.get("bookmakers", [])
+                if book.get("key") in _EXEC_BOOKS
+            ]
+            game_odds = parse_game_odds(exec_raw)          # value analyzers: DK+FD
+            dk_only_raw = dict(raw_game_odds)
+            dk_only_raw["bookmakers"] = [
                 book for book in raw_game_odds.get("bookmakers", [])
                 if book.get("key") == "draftkings"
             ]
-            game_odds = parse_game_odds(draftkings_game_odds)
+            dk_game_odds = parse_game_odds(dk_only_raw)    # coherence + CLV-DK baseline
 
-            # Coherence run-line (DK-internal): pure-odds, so it runs off game_odds
-            # alone (no team-stat resolution needed) whenever the slate offset was fit.
+            # Coherence run-line (DK-internal): pure-odds, so it runs off dk_game_odds
+            # (DK-only) whenever the slate offset was fit.
             if coherence_offset is not None:
                 try:
                     import coherence_flags as _coh
@@ -3178,7 +3184,7 @@ if analyze_clicked and selected_game_labels:
                     # starter's ER-CV < 1.0 (validated +11.43% vs the ungated +8.63%).
                     # sport+game_date enable it; non-MLB is a no-op inside the gate.
                     for _c in _coh.run_line_candidates(
-                            game_odds, coherence_offset,
+                            dk_game_odds, coherence_offset,
                             sport=sport["key"], game_date=game_date):
                         _c["event_id"] = eid
                         coherence.append(_c)

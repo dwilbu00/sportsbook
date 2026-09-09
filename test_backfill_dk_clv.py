@@ -393,7 +393,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(by_eid["E1"]["markets"], "batter_hits,pitcher_outs")
         self.assertEqual(by_eid["E2"]["markets"], "batter_hits")
         for c in self.calls:
-            self.assertEqual(c["bookmakers"], ["draftkings"])
+            # DK+FD offer preservation: fetch both executable books (cost-neutral),
+            # book-aware CLV compares each bet to its own book's close.
+            self.assertEqual(c["bookmakers"], ["draftkings", "fanduel"])
             self.assertEqual(c["sport"], "baseball_mlb")
         # date passed is the wager's commence_time (nearest snapshot = the close).
         self.assertEqual(by_eid["E1"]["date"], _C1)
