@@ -16,14 +16,18 @@ class FeatureStoreTests(unittest.TestCase):
         fs.CACHE_DIR = self._orig
 
     def test_season_version_count_and_max_date(self):
+        v = f"v{fs.FEATURE_SCHEMA_VERSION}"
         games = [{"date": "2025-04-01"}, {"date": "2025-04-03"},
                  {"date": "2025-04-02"}]
-        self.assertEqual(fs.season_version(games), "3:2025-04-03")
+        self.assertEqual(fs.season_version(games), f"{v}:3:2025-04-03:")
         # A new completed game bumps the version (count AND max date change).
         games2 = games + [{"date": "2025-04-05"}]
-        self.assertEqual(fs.season_version(games2), "4:2025-04-05")
+        self.assertEqual(fs.season_version(games2), f"{v}:4:2025-04-05:")
         self.assertNotEqual(fs.season_version(games), fs.season_version(games2))
-        self.assertEqual(fs.season_version([]), "0:")
+        self.assertEqual(fs.season_version([]), f"{v}:0::")
+        # the calibration fingerprint (extra) also bumps the version
+        self.assertNotEqual(fs.season_version(games),
+                            fs.season_version(games, extra="abc123"))
 
     def test_save_load_round_trip(self):
         feats = {("2025-04-01", "NYY", "BOS"): {"home_sp_id": 1, "edge": 0.12},

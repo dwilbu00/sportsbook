@@ -3473,8 +3473,13 @@ def _print_calibration_diff(sport):
                   f"{c['candidate_method']} "
                   f"(n {c['live_nobs']} -> {c['candidate_nobs']})")
     if nobs_changes:
-        print(f"  ~ re-fit, method unchanged ({len(nobs_changes)}): "
-              f"{', '.join(c['prop'] for c in nobs_changes)}")
+        print(f"  ~ re-fit / nested change, method unchanged ({len(nobs_changes)}):")
+        for c in nobs_changes:
+            flds = c.get("changed_fields") or []
+            note = (f" [{', '.join(flds)}]" if flds else "")
+            nobs = ("" if c["live_nobs"] == c["candidate_nobs"]
+                    else f" (n {c['live_nobs']} -> {c['candidate_nobs']})")
+            print(f"      {c['prop']}{nobs}{note}")
     blocks = d["blocks"]
     for label, keys in (("added", blocks["added"]),
                         ("removed", blocks["removed"]),

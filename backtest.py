@@ -1290,8 +1290,16 @@ def _prewarm_matchup_features(pw_games, schedules, sport_key, use_warehouse,
         for g in all_completed_games(schedules):
             if g.get("date"):
                 sg[int(str(g["date"])[:4])].append(g)
+        # fold the serving-calibration fingerprint into the cache version so cached
+        # features that embed fitted values (e.g. NFL nfl_pred_margin) invalidate
+        # when model weights / calibration change. [review 2026-09-09]
+        try:
+            import calibration_loader
+            _cal_fp = calibration_loader.serving_fingerprint(sport_key)
+        except Exception:
+            _cal_fp = ""
         for s, gs in sg.items():
-            ver[s] = feature_store.season_version(gs)
+            ver[s] = feature_store.season_version(gs, extra=_cal_fp)
             cache[s] = feature_store.load(sport_key, s, ver[s]) or {}
 
     def _one(g):

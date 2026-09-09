@@ -225,6 +225,23 @@ def _serving_blob(sport_key):
     return _read_json(_serving_path(sport_key)) or {}
 
 
+def serving_fingerprint(sport_key):
+    """Short stable hash of the SERVING calibration (candidate-aware) that feeds
+    feature computation. Used as the feature-cache `extra` so cached features that
+    embed FITTED values (e.g. NFL nfl_pred_margin) invalidate when model weights /
+    calibration change — which game-count/date alone can't detect. Excludes volatile
+    fit_timestamp/meta so identical calibration → identical fingerprint. [review 2026-09-09]"""
+    import hashlib
+    blob = dict(_serving_blob(sport_key))
+    blob.pop("fit_timestamp", None)
+    blob.pop("meta", None)
+    try:
+        payload = json.dumps(blob, sort_keys=True, default=str)
+    except Exception:
+        payload = str(blob)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def _load_write_blob(sport_key):
     """The blob a save STARTS from (to preserve other props/blocks).
 
@@ -362,13 +379,24 @@ def diff_calibration(sport_key):
 
     changed = []
     for k in sorted(set(cand_props) & set(live_props)):
-        cm = _field(cand_props, k, "method")
-        lm = _field(live_props, k, "method")
-        cn = _field(cand_props, k, "n_obs")
-        ln = _field(live_props, k, "n_obs")
-        if cm != lm or cn != ln:
-            changed.append({"prop": k, "live_method": lm, "candidate_method": cm,
-                            "live_nobs": ln, "candidate_nobs": cn})
+        cv, lv = cand_props.get(k), live_props.get(k)
+        if cv == lv:
+            continue
+        # DEEP compare (not just method/n_obs) — residual params, distribution
+        # params, projection knobs, or per-line_methods can change while method +
+        # n_obs are unchanged; those MUST show in --diff or promotion is blind.
+        # [review 2026-09-09]
+        if isinstance(cv, dict) and isinstance(lv, dict):
+            fields = sorted(set(cv) | set(lv))
+            changed_fields = [f for f in fields if cv.get(f) != lv.get(f)]
+        else:
+            changed_fields = ["<value>"]
+        changed.append({"prop": k,
+                        "live_method": _field(live_props, k, "method"),
+                        "candidate_method": _field(cand_props, k, "method"),
+                        "live_nobs": _field(live_props, k, "n_obs"),
+                        "candidate_nobs": _field(cand_props, k, "n_obs"),
+                        "changed_fields": changed_fields})
     _skip = {"props", "sport_key", "fit_timestamp", "meta"}
     cand_blocks = set(cand_blob) - _skip
     live_blocks = set(live_blob) - _skip

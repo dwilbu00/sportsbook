@@ -22,14 +22,22 @@ import os
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".feature_cache")
 
+# Bump when the SHAPE/LOGIC of build_matchup_features output changes (a code change
+# that game-count/date can't detect). NFL now emits a FITTED nfl_pred_margin, so the
+# cache must also key on the calibration fingerprint (passed as `extra`). [review 2026-09-09]
+FEATURE_SCHEMA_VERSION = 2
 
-def season_version(games):
-    """Version marker for a season's feature cache, derived from the games in scope:
-    ``"<game_count>:<max_date>"``. Bumps when games are added/completed or re-ingested
-    (count or max date changes) so the current season auto-refreshes and stable past
-    seasons stay cached. ``games`` = the loaded schedule dicts (need a 'date' key)."""
+
+def season_version(games, extra=""):
+    """Version marker for a season's feature cache:
+    ``"v<schema>:<game_count>:<max_date>:<extra>"``. Bumps when games are added/
+    completed/re-ingested (count/max-date), when the feature schema changes
+    (FEATURE_SCHEMA_VERSION), OR when ``extra`` changes — pass a calibration
+    fingerprint here (see calibration_loader.serving_fingerprint) because cached NFL
+    features embed a fitted margin that must invalidate when the model weights change.
+    ``games`` = loaded schedule dicts (need a 'date' key)."""
     dates = [g.get("date") for g in (games or []) if g and g.get("date")]
-    return f"{len(games or [])}:{max(dates) if dates else ''}"
+    return f"v{FEATURE_SCHEMA_VERSION}:{len(games or [])}:{max(dates) if dates else ''}:{extra}"
 
 
 def _path(sport_key, season):
