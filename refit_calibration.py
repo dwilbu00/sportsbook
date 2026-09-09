@@ -2552,6 +2552,188 @@ def diagnose_rbi_context(sport, store_label="", seasons=None, result_games=15):
           "go-signal for the full method-G distributional RBI model.)")
 
 
+def diagnose_pitcher_k_context(sport, store_label="", seasons=None, result_games=8):
+    """Pitcher-K opportunity PROBE (NO WRITE): does the expected-BATTERS-FACED signal
+    (BF/leash — a structurally DIFFERENT opportunity variable, since pitchers get
+    pulled) add incremental prediction value for pitcher_strikeouts over incumbent C?
+
+    K = sum over BF of a per-BF K event; the count incumbent conflates BF with per-BF
+    rate. A pitcher whose recent K count is low because he was PULLED EARLY (low BF)
+    but whose per-BF K% is stable, and who projects to go DEEP tonight, is
+    under-counted — the pitcher analog of the TB opportunity structure. Probes two
+    features, each as a sole logit augmentation of C (candidate = sigmoid(logit(C) +
+    β·z_feat), β grid-fit on train, 2-fold confirmed):
+      • exp_bf   = trailing mean batters faced (opportunity),
+      • k_per_bf = trailing K/BF (per-BF rate / form).
+    A confirmed positive Δ is the go-signal for the full pitcher distributional model
+    (expected_BF × per-BF K dist). OFFLINE + FREE; writes nothing. Cheap probe BEFORE
+    the build (the HH%-spike/RBI lesson)."""
+    import math
+    import book_line_calibration as blc
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    cfg = existing.get("pitcher_strikeouts")
+    if not cfg:
+        print("No pitcher_strikeouts calibration; run refit first.")
+        return
+    incumbent = cfg.get("method")
+    print(f"\n=== pitcher-K opportunity PROBE: {sport_key} pitcher_strikeouts "
+          f"(incumbent={incumbent}) ===")
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, ["pitcher_strikeouts"], store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+    print(f"  {len(book_lines):,} real book lines ({n_store:,} store + {n_pred:,} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league)
+        if o.get("prop_key") == "pitcher_strikeouts"]
+    if not enriched:
+        print("  No pitcher_strikeouts observations joined to actuals.")
+        return
+
+    params = {
+        "half_life": cfg.get("half_life"),
+        "venue_strength": cfg.get("venue_strength", 0.0),
+        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+        "use_minutes": cfg.get("use_minutes", False),
+    }
+    defense_by_season = None
+    if (cfg.get("opp_defense_strength") or 0.0) > 0:
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
+
+    rows = []
+    for obs in enriched:
+        gd = obs.get("game_date")
+        if not gd or obs["actual"] == obs["line"]:
+            continue
+        pg = obs["prior_games"][:result_games]
+        bf = sum((g.get("BF") or 0) for g in pg)
+        k = sum((g.get("K") or 0) for g in pg)
+        n_bf_games = sum(1 for g in pg if (g.get("BF") or 0) > 0)
+        if bf < 40 or n_bf_games < 3:            # need real BF history
+            continue
+        proj, emp = blc.project_and_empirical(
+            obs, params, sport_key, defense_by_season=defense_by_season)
+        if proj is None:
+            continue
+        rows.append({
+            "game_date": gd, "season": int(str(gd)[:4]),
+            "exp_bf": bf / n_bf_games,
+            "k_per_bf": k / bf,
+            "proj": proj, "line": obs["line"], "actual": obs["actual"],
+            "over": 1 if obs["actual"] > obs["line"] else 0,
+        })
+    if len(rows) < 200:
+        print(f"  Only {len(rows)} usable obs (<200) — too thin to judge.")
+        return
+    rows.sort(key=lambda r: r["game_date"])
+    print(f"  built {len(rows):,} usable obs")
+
+    def _logit(p):
+        p = min(1.0 - 1e-6, max(1e-6, p))
+        return math.log(p / (1.0 - p))
+
+    def _sig(x):
+        if x >= 0:
+            return 1.0 / (1.0 + math.exp(-x))
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    def _fit_C(train, allrows):
+        resid = [r["actual"] - r["proj"] for r in train]
+        mu = sum(resid) / len(resid)
+        srt = sorted(resid)
+        for r in allrows:
+            corrected = r["proj"] + mu
+            r["p0"] = 1.0 - blc._empirical_cdf(srt, r["line"] - corrected)
+
+    B_GRID = [i * 0.05 for i in range(-12, 13)]
+
+    def _brier(sub, fn):
+        return sum((fn(r) - r["over"]) ** 2 for r in sub) / len(sub)
+
+    def _fit_C_recal(train, allrows):
+        # Raw C, then a Platt (α + γ·logit) recalibration fit on train — isolates
+        # whether a feature adds signal BEYOND fixing C's over/under-confidence
+        # (a negative β on a projection-correlated feature can be mere shrinkage).
+        _fit_C(train, allrows)
+        for r in allrows:
+            r["p0_raw"] = r["p0"]
+        best = (0.0, 1.0)
+        best_tr = _brier(train, lambda r: r["p0_raw"])
+        for a in [i * 0.05 for i in range(-6, 7)]:
+            for g in [0.4 + 0.1 * i for i in range(0, 10)]:
+                tr = _brier(train, lambda r: _sig(a + g * _logit(r["p0_raw"])))
+                if tr < best_tr:
+                    best_tr, best = tr, (a, g)
+        a, g = best
+        for r in allrows:
+            r["p0"] = _sig(a + g * _logit(r["p0_raw"]))
+
+    def _gate(feat, train, test, base_builder=_fit_C):
+        base_builder(train, train + test)
+        mu = sum(r[feat] for r in train) / len(train)
+        var = sum((r[feat] - mu) ** 2 for r in train) / len(train)
+        sd = math.sqrt(var) if var > 0 else 1e-9
+        z = lambda r: (r[feat] - mu) / sd
+        base_tr = _brier(train, lambda r: r["p0"])
+        best_b, best_tr = 0.0, base_tr
+        for b in B_GRID:
+            tr = _brier(train, lambda r: _sig(_logit(r["p0"]) + b * z(r)))
+            if tr < best_tr:
+                best_b, best_tr = b, tr
+        base_te = _brier(test, lambda r: r["p0"])
+        cand_te = _brier(test, lambda r: _sig(_logit(r["p0"]) + best_b * z(r)))
+        return best_b, base_te, cand_te
+
+    split = len(rows) // 2
+    folds = blc._real_line_folds(rows)
+    print(f"\n  incremental prediction gate vs incumbent {incumbent} (n={len(rows)}, "
+          f"single split + {len(folds)}-fold):")
+    print("    {:<20}{:>8}{:>12}{:>12}{:>10}{:>22}".format(
+        "feature", "beta", "base", "+feat", "delta", "2-fold delta"))
+
+    def _run(feat, label, base_builder):
+        best_b, base_te, cand_te = _gate(feat, rows[:split], rows[split:], base_builder)
+        delta = base_te - cand_te
+        fdeltas = [b1 - c1 for (_b, b1, c1) in (_gate(feat, tr, te, base_builder)
+                                                for tr, te in folds)]
+        confirmed = (delta >= MIN_CALIB_BRIER_GAIN and folds
+                     and all(d > 0 for d in fdeltas))
+        print("    {:<20}{:>8}{:>12}{:>12}{:>10}{:>22}  {}".format(
+            label, f"{best_b:+.2f}", f"{base_te:.4f}", f"{cand_te:.4f}",
+            f"{delta:+.4f}", str(['%+.4f' % d for d in fdeltas]),
+            "SHIP" if confirmed else "no"))
+
+    for feat in ("exp_bf", "k_per_bf"):
+        _run(feat, feat, _fit_C)
+    # Decisive: does exp_bf survive OVER a Platt-recalibrated C? If the gain
+    # collapses, it was just C over-confidence (fix by recalibration, not a feature).
+    _run("exp_bf", "exp_bf (vs recal-C)", _fit_C_recal)
+    _run("k_per_bf", "k_per_bf (vs recal-C)", _fit_C_recal)
+
+    _fit_C(rows[:split], rows)
+    rr = sorted(rows, key=lambda r: r["exp_bf"])
+    qn = len(rr) // 4
+    print("\n  residual (realized OVER − incumbent C) by expected-BF quartile:")
+    for lo, hi, lbl in [(0, qn, "Q1 low BF"), (qn, 2 * qn, "Q2"),
+                        (2 * qn, 3 * qn, "Q3"), (3 * qn, len(rr), "Q4 high BF")]:
+        sub = rr[lo:hi]
+        if sub:
+            resid = sum(r["over"] - r["p0"] for r in sub) / len(sub)
+            print(f"    {lbl:<11} n={len(sub):<6} mean_bf={sum(r['exp_bf'] for r in sub)/len(sub):.1f}"
+                  f"  mean_resid={resid:+.4f}")
+    print("\n  (Diagnostic only — nothing written. A confirmed exp_bf Δ is the "
+          "go-signal for the full expected-BF × per-BF-K distributional model.)")
+
+
 def diagnose_center(sport, prop_filter=None, store_label=""):
     """Mean-vs-median central-tendency diagnostic (NO WRITE).
 
@@ -4444,6 +4626,11 @@ def main():
                         "exp-AB) add incremental prediction value over the incumbent "
                         "A for batter_rbis? Go/no-go for the method-G RBI model "
                         "(no write).")
+    p.add_argument("--pk-diag", action="store_true",
+                   help="Pitcher-K opportunity PROBE: does expected-BF (+ K/BF) add "
+                        "incremental prediction value over the incumbent for "
+                        "pitcher_strikeouts? Go/no-go for the expected-BF × per-BF-K "
+                        "model (no write).")
     p.add_argument("--center-diag", action="store_true",
                    help="Mean-vs-median: re-score each calibrated prop's incumbent "
                         "method on the real-line holdout with a recency-weighted "
@@ -4635,6 +4822,13 @@ def main():
 
     if args.rbi_diag:
         diagnose_rbi_context(
+            args.sport, store_label=args.store_label,
+            seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+                     if args.seasons else None))
+        return
+
+    if args.pk_diag:
+        diagnose_pitcher_k_context(
             args.sport, store_label=args.store_label,
             seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
                      if args.seasons else None))
