@@ -126,29 +126,80 @@ def _oos_rmse(rows):
     return tot / len(rows)
 
 
-def fit(seasons, do_save=False):
+_FEATURE_SETS = {                      # name -> column indices into build_dataset rows
+    "HFA+net":          [0, 1],
+    "HFA+net+QB":       [0, 1, 2],
+    "HFA+net+QB+rest":  [0, 1, 2, 5],
+    "HFA+net+QB+inj+rest (full)": [0, 1, 2, 3, 4, 5],
+}
+
+
+def chrono_eval(seasons):
+    """Expanding-window CHRONOLOGICAL validation: for each test season Y, train
+    STRICTLY on seasons < Y (everything known before the bet) and score Y. This is
+    the honest replacement for LOSO (which trains on future seasons under an
+    exchangeability assumption). Reports per feature set: per-fold + games-weighted
+    pooled RMSE. Note: QB uses pbp (2016+); injuries/rest use snap/injury/spine
+    layers that only exist 2023+, so those features are 0 for earlier seasons and
+    only the 2024/2025 folds truly exercise them. [review 2026-09-09]"""
+    from nfl_injury_edge import _rmse
+    rows = build_dataset(seasons)
+    yrs = sorted({r[7] for r in rows})
+    print(f"=== CHRONOLOGICAL eval ({len(rows)} games, train strictly < test season) ===")
+    for name, idx in _FEATURE_SETS.items():
+        folds = []
+        tot = n = 0.0
+        for test in yrs:
+            tr = [r for r in rows if r[7] < test]
+            te = [r for r in rows if r[7] == test]
+            if not tr or not te:
+                continue
+            # skip folds where a non-constant feature is all-zero in train (no data
+            # yet — e.g. rest/injuries pre-2023) → the design matrix is singular and
+            # the fit is garbage. Only score a set on folds where its features exist.
+            if any(i != 0 and len({r[i] for r in tr}) <= 1 for i in idx):
+                continue
+            b = _solve([[r[i] for i in idx] for r in tr], [r[6] for r in tr])
+            rm = _rmse([sum(bi * r[i] for bi, i in zip(b, idx)) for r in te],
+                       [r[6] for r in te])
+            folds.append(f"{test}:{rm:.3f}")
+            tot += rm * len(te); n += len(te)
+        if n:
+            print(f"  {name:<28} pooled={tot/n:.4f} ({len(folds)} folds)   [{' '.join(folds)}]")
+
+
+def fit(seasons, do_save=False, features=None):
+    """Fit the margin model. ``features`` = subset of FEATURE_KEYS to include
+    (default all). Unselected features get coefficient 0 (predict() then ignores
+    them). The honest shipped set is HFA+w_epa+w_qb — those need only pbp so they
+    fit on the full 2016-2025, unlike w_off/w_def/w_rest (2023+ data only)."""
     from nfl_injury_edge import _rmse
     rows = build_dataset(seasons)
     if not rows:
         print("no games"); return
-    X = [list(r[:6]) for r in rows]
+    sel = [i for i, k in enumerate(FEATURE_KEYS) if (features is None or k in features)]
+    X = [[r[i] for i in sel] for r in rows]
     y = [r[6] for r in rows]
     b = _solve(X, y)
-    resid = [yi - sum(bi * xi for bi, xi in zip(b, xr)) for xr, yi in zip(X, y)]
+    coef = {k: 0.0 for k in FEATURE_KEYS}
+    for j, i in enumerate(sel):
+        coef[FEATURE_KEYS[i]] = b[j]
+    resid = [yi - sum(b[j] * xr[j] for j in range(len(sel)))
+             for xr, yi in zip(X, y)]
     sigma = (sum(e * e for e in resid) / len(resid)) ** 0.5
-    oos = _oos_rmse(rows)
-    model = dict(zip(FEATURE_KEYS, [round(x, 4) for x in b]))
+    model = {k: round(coef[k], 4) for k in FEATURE_KEYS}
     model["sigma"] = round(sigma, 3)
     ss = f"{seasons[0]}-{seasons[-1]}" if len(seasons) > 1 else str(seasons[0])
-    print(f"=== NFL margin model — {ss} ({len(rows)} games) ===")
+    print(f"=== NFL margin model — {ss} ({len(rows)} games, features={features or 'ALL'}) ===")
     print(f"  {model}")
-    print(f"  in-sample RMSE={ (sum(e*e for e in resid)/len(resid))**0.5:.3f}  "
-          f"OOS RMSE={oos:.3f}")
+    print(f"  in-sample RMSE={sigma:.3f}")
+    print("  (chronological OOS: run --chrono; LOSO --oos-qb. HFA+net is the robust core.)")
     if do_save:
         cur = load_starter_adjustment(SPORT_KEY) or {}
         cur["nfl_margin_model"] = model
         save_starter_adjustment(SPORT_KEY, cur, meta={
-            "nfl_margin_model": f"nfl_model.py --seasons {ss}", "oos_rmse": round(oos, 3)})
+            "nfl_margin_model": f"nfl_model.py --seasons {ss} features={features or 'ALL'}",
+            "in_sample_rmse": round(sigma, 3)})
         print(f"  [save] wrote starter_adjustment['nfl_margin_model'] "
               f"(candidate-staged unless --live)")
     return model
@@ -167,15 +218,24 @@ def main():
     ap.add_argument("--seasons", default="2023,2024,2025")
     ap.add_argument("--save", action="store_true")
     ap.add_argument("--live", action="store_true", help="write live (skip candidate staging)")
+    ap.add_argument("--chrono", action="store_true",
+                    help="expanding-window chronological eval (train strictly < test season)")
+    ap.add_argument("--features", default=None,
+                    help="comma list of feature keys to fit/save (subset of "
+                         "hfa,w_epa,w_qb,w_off,w_def,w_rest); default = all")
     args = ap.parse_args()
     seasons = [int(s) for s in args.seasons.split(",") if s.strip()]
+    if args.chrono:
+        chrono_eval(seasons)
+        return
     staging = not args.live
     set_candidate_mode(staging)
     if staging and args.save:
         n = existing_candidate_notice(SPORT_KEY)
         if n:
             print(n)
-    fit(seasons, do_save=args.save)
+    feats = [f.strip() for f in args.features.split(",")] if args.features else None
+    fit(seasons, do_save=args.save, features=feats)
     if args.save and staging and has_candidate(SPORT_KEY):
         print("  ⇢ staged to candidate; promote: python refit_calibration.py --sport nfl --promote")
 

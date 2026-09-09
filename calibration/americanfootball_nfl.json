@@ -1181,8 +1181,9 @@
       "w_epa": 32.907,
       "w_qb": 13.759,
       "qb_change_games": 281,
-      "nfl_margin_model": "nfl_model.py --seasons 2023-2025",
-      "oos_rmse": 13.185
+      "nfl_margin_model": "nfl_model.py --seasons 2016-2025 features=['hfa', 'w_epa', 'w_qb']",
+      "oos_rmse": 13.185,
+      "in_sample_rmse": 13.189
     }
   },
   "prob_shrink": {
@@ -1195,13 +1196,13 @@
     "spreads": 32.907,
     "qb_scale": 0.4181,
     "nfl_margin_model": {
-      "hfa": 2.1278,
-      "w_epa": 32.5206,
-      "w_qb": 10.8797,
-      "w_off": 0.0652,
-      "w_def": 0.6489,
-      "w_rest": 0.3452,
-      "sigma": 13.123
+      "hfa": 1.7799,
+      "w_epa": 32.3802,
+      "w_qb": 4.3825,
+      "w_off": 0.0,
+      "w_def": 0.0,
+      "w_rest": 0.0,
+      "sigma": 13.189
     }
   }
 }
