@@ -46,6 +46,7 @@ from stats import (
     _weighted_mean,
     _weighted_rate,
     _weighted_std,
+    bases_sum_at_least,
     hits_at_least,
     negbin_at_least,
 )
@@ -369,6 +370,13 @@ DEFAULT_PLAYER_PROP_XSTATS_STRENGTH = 0.0
 # Which props blend toward which Statcast stat. Only batter_hits ← xBA for v1
 # (strikeouts ← whiff/CSW is §2.4b, pending a raw re-pull).
 PROP_XSTATS_KIND = {"batter_hits": "xba"}
+# §opportunity-first: props served by the total-bases distributional method ("F").
+# TB = sum over AB of per-AB bases {0,1,2,3,4}; the per-AB bases multinomial is
+# estimated from the batter's weighted game-log components (AB/H/HR/TB) with a
+# league triple share, then convolved over expected AB. Whitelisted to
+# batter_total_bases; eligibility only makes F a CANDIDATE in the real-line
+# selection — it ships per-bucket only if it clears the gate (vs incumbent E).
+PROP_TBDIST_ELIGIBLE = {"batter_total_bases"}
 # Minimum official ABs behind the as-of xBA before it is trusted (mirrors MIN_BBE).
 XSTATS_MIN_N = 40
 # ── Rest / days-off candidate feature (§2.6) ──
@@ -568,6 +576,162 @@ def _distributional_over_rate(prop_key, line, values, at_bats, weights,
         barrel_coef=cfg.get("dist_barrel_coef"))
     meta["n_ab_sample"] = n_ab
     return p_over, meta
+
+
+# ── Total-bases distributional method ("F") — opportunity × per-AB bases dist ──
+# TB = sum over AB of a per-AB bases outcome {0,1,2,3,4}. The batter's per-AB bases
+# multinomial is estimated from the WEIGHTED game-log component sums (AB/H/HR/TB):
+# HR/AB pins the 4-base mass, and (TB - 4·HR) vs (H - HR) pins the non-HR extra-base
+# mass; the 1B/2B/3B split that H+HR+TB alone leave underdetermined is closed with a
+# small league triple share (triples are ~2% of non-HR hits, so the residual error
+# on the TB tail is negligible). Barrel%/hard-hit% give a bounded contact-quality
+# nudge on the extra-base masses (hard contact turns outs into extra-base hits). The
+# per-AB pmf is then convolved over the (float) expected AB via the SAME adjacent-
+# count mixture ``_dist_p_over`` uses for hits (smooth in expected_ab, preserves
+# E[trials]). Ships OFF: activated only when a bucket's calibration method is "F".
+_MLB_TRIPLE_SHARE = 0.02           # league triples as a share of non-HR hits (~2%)
+
+
+def _tb_dist_p_over(ab_w, h_w, hr_w, tb_w, expected_ab, xwoba, hh, brl,
+                    rate_mult, exposure_mult, line,
+                    hardhit_coef=None, barrel_coef=None, triple_share=None):
+    """Per-AB bases multinomial → P(total_bases OVER) via n-fold convolution
+    (method "F"), or (None, None) when the AB history is unusable.
+
+    ``ab_w/h_w/hr_w/tb_w`` are the recency×venue×defense-WEIGHTED component sums
+    (at-bats / hits / home-runs / total-bases) over the player's prior games;
+    ``expected_ab`` is the weighted mean AB/game (the opportunity count). The
+    per-AB bases pmf {p0..p4} is derived from those sums (see the module note),
+    nudged by contact quality, scaled by ``rate_mult`` (defense/matchup/park/
+    weather on per-AB hit production), and convolved over ``expected_ab ·
+    exposure_mult`` trials with the ⌊m⌋/⌈m⌉ mixture. Returns (p_over, meta).
+    Shared by the runtime and the offline real-line projector so they can't drift.
+    xwOBA is carried in meta only (not in the composite) — it's the level-upgrade
+    hook for a future xSLG add, kept out so runtime/offline stay byte-identical."""
+    if ab_w <= 0 or expected_ab <= 0:
+        return None, None
+    a = _DIST_HARDHIT_COEF if hardhit_coef is None else hardhit_coef
+    b = _DIST_BARREL_COEF if barrel_coef is None else barrel_coef
+    t = _MLB_TRIPLE_SHARE if triple_share is None else triple_share
+    # Component per-AB masses from the weighted sums.
+    hr = max(0.0, hr_w)
+    nonhr_count = max(0.0, h_w - hr_w)                     # non-HR hits (weighted)
+    extra = max(0.0, (tb_w - 4.0 * hr_w) - nonhr_count)   # 2B + 2·3B (weighted)
+    tri = min(t * nonhr_count, extra / 2.0)               # can't exceed the extra mass
+    dbl = min(extra - 2.0 * tri, max(0.0, nonhr_count - tri))
+    sng = max(0.0, nonhr_count - dbl - tri)
+    rm = rate_mult or 1.0
+    p1 = (sng / ab_w) * rm
+    p2 = (dbl / ab_w) * rm
+    p3 = (tri / ab_w) * rm
+    p4 = (hr / ab_w) * rm
+    # Bounded contact-quality nudge on the extra-base masses.
+    q = 1.0
+    lg_hh = _MLB_LEAGUE_QUALITY["hard_hit_pct"]
+    lg_brl = _MLB_LEAGUE_QUALITY["barrel_pct"]
+    if hh is not None and lg_hh > 0:
+        q += a * (hh / lg_hh - 1.0)
+    if brl is not None and lg_brl > 0:
+        q += b * (brl / lg_brl - 1.0)
+    lo_q, hi_q = _DIST_QADJ_BOUNDS
+    q = max(lo_q, min(hi_q, q))
+    p2 *= q
+    p3 *= q
+    p4 *= q
+    hit_mass = p1 + p2 + p3 + p4
+    if hit_mass <= 0:
+        return None, None
+    if hit_mass > 1.0:                # scale hits down to leave room for outs
+        p1 /= hit_mass
+        p2 /= hit_mass
+        p3 /= hit_mass
+        p4 /= hit_mass
+        p0 = 0.0
+    else:
+        p0 = 1.0 - hit_mass
+    pmf = [p0, p1, p2, p3, p4]
+    k = int(line) + 1                 # OVER ⇔ total bases >= k
+    m = max(0.0, expected_ab * (exposure_mult or 1.0))
+    lo = int(m)
+    w_hi = m - lo
+    _surv = lambda nn: bases_sum_at_least(k, nn, pmf) if nn >= 1 else 0.0
+    p_over = (1.0 - w_hi) * _surv(lo) + w_hi * _surv(lo + 1)
+    meta = {
+        "method": "F",
+        "k": k,
+        "n_ab_expected": round(m, 3),
+        "pmf": [round(x, 4) for x in pmf],
+        "slg_emp": round(tb_w / ab_w, 3),
+        "hr_rate": round(hr / ab_w, 4),
+        "xwoba": round(xwoba, 3) if xwoba is not None else None,
+        "hard_hit_pct": round(hh, 3) if hh is not None else None,
+        "barrel_pct": round(brl, 3) if brl is not None else None,
+        "q_adj": round(q, 3),
+        "rate_mult": round(rm, 3),
+        "exposure_mult": round(exposure_mult or 1.0, 3),
+        "triple_share": t,
+    }
+    return max(0.0, min(1.0, p_over)), meta
+
+
+def _tb_distributional_over_rate(prop_key, line, values, hits, home_runs, at_bats,
+                                 weights, rate_mult, exposure_mult, player_name,
+                                 commence_iso, cfg, teams=None):
+    """P(over) for batter_total_bases as a per-AB bases convolution (method "F"),
+    or (None, None) to fall back. Runtime wrapper around ``_tb_dist_p_over``.
+
+    ``values`` = TB per game, ``hits`` = H per game, ``home_runs`` = HR per game,
+    ``at_bats`` = AB per game — all index-aligned, most-recent-first, with
+    ``weights`` the recency/venue/defense weights. A game missing any component
+    (older pre-backfill row) is skipped. Rate multipliers scale the per-AB hit
+    RATE; the batting-order exposure multiplier scales the AB COUNT — passed
+    separately, mirroring the batter_hits method-D contract. xwOBA / contact-quality
+    come from statcast_asof (fail-open). Fails OPEN (returns None) when the prop
+    isn't whitelisted or no usable AB history exists."""
+    if prop_key not in PROP_TBDIST_ELIGIBLE:
+        return None, None
+    n = len(values)
+    hits = hits or [None] * n
+    home_runs = home_runs or [None] * n
+    ab_w = tb_w = h_w = hr_w = w_valid = 0.0
+    for tb, h, hr, ab, w in zip(values, hits, home_runs, at_bats, weights):
+        if ab is None or ab <= 0 or w is None or w <= 0:
+            continue
+        if tb is None or h is None or hr is None:   # need full components per game
+            continue
+        ab_w += w * ab
+        tb_w += w * tb
+        h_w += w * h
+        hr_w += w * hr
+        w_valid += w
+    if ab_w <= 0 or w_valid <= 0:
+        return None, None
+    expected_ab = ab_w / w_valid
+    if expected_ab <= 0:
+        return None, None
+
+    xwoba = hh = brl = None
+    try:
+        import mlb_starters
+        import statcast_asof
+        season = int(str(commence_iso)[:4]) if commence_iso else None
+        if season:
+            pid_info = mlb_starters.find_player_id(player_name, season, teams=teams)
+            if pid_info and pid_info[0] and not pid_info[1]:   # batter only
+                rates = statcast_asof.get_rates(pid_info[0], season, "bat")
+                if rates and (rates.get("n_ab") or 0) >= XSTATS_MIN_N:
+                    xwoba = rates.get("xwoba")
+                    hh = rates.get("hard_hit_pct")
+                    brl = rates.get("barrel_pct")
+    except Exception:
+        xwoba = hh = brl = None    # fail open — never block a rec on Statcast
+
+    return _tb_dist_p_over(
+        ab_w, h_w, hr_w, tb_w, expected_ab, xwoba, hh, brl,
+        rate_mult, exposure_mult, line,
+        hardhit_coef=cfg.get("dist_hardhit_coef"),
+        barrel_coef=cfg.get("dist_barrel_coef"),
+        triple_share=cfg.get("triple_share"))
 
 
 def _negbin_over_rate(avg_stat, mean_scale, dispersion, line):
@@ -1328,6 +1492,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             plate_appearances = (history.get("plate_appearances")
                                  or [None] * len(values))
             at_bats = history.get("at_bats") or [None] * len(values)
+            # Per-game hit + HR components (batter_total_bases method "F" needs the
+            # extra-base split, which TB alone can't supply). Additive warehouse
+            # keys; absent → all-None (F fails open to the incumbent count method).
+            hits_hist = history.get("hits") or [None] * len(values)
+            home_runs_hist = history.get("home_runs") or [None] * len(values)
             player_team_id = history.get("team_id")
             # Present only on warehouse-sourced (MLB flip) dicts — the player's team
             # DISPLAY NAME, since team_id is then MLBAM (not an ESPN id).
@@ -1341,10 +1510,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # ramping up) or their last game had limited minutes.
             synthetic = [
                 {"game_date": gd, "MIN": m, "_value": v, "_opp": o,
-                 "_ha": ha, "_pa": pa, "_ab": ab}
-                for v, o, ha, m, gd, pa, ab in zip(
+                 "_ha": ha, "_pa": pa, "_ab": ab, "_h": h, "_hr": hr}
+                for v, o, ha, m, gd, pa, ab, h, hr in zip(
                     values, opponents, past_home_aways, minutes, game_dates,
-                    plate_appearances, at_bats)
+                    plate_appearances, at_bats, hits_hist, home_runs_hist)
             ]
             # STEP-1 recency window: keep the newest `recent_n` games BEFORE the
             # reliability filter (recent_n falsy → full season, no cap). `synthetic`
@@ -1409,6 +1578,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             past_home_aways = [g["_ha"] for g in eligible]
             plate_appearances = [g.get("_pa") for g in eligible]
             at_bats = [g.get("_ab") for g in eligible]
+            hits = [g.get("_h") for g in eligible]
+            home_runs = [g.get("_hr") for g in eligible]
 
             # Resolve the player's upcoming home/away by matching their team NAME
             # to the home/away team names of the upcoming game. Prefer the
@@ -1665,6 +1836,25 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         "curr_games": curr_games,
                         "mean_scale": method_cfg.get("mean_scale"),
                         "dispersion": method_cfg.get("dispersion"),
+                        "empirical_over": round(empirical_over * 100, 2),
+                    }
+            elif method == "F":
+                # §opportunity-first total-bases distributional. Whitelisted to
+                # batter_total_bases; fails open to the raw empirical over-rate.
+                # Rate multipliers scale the per-AB hit RATE; the batting-order
+                # exposure multiplier scales the AB COUNT (n) — passed separately,
+                # mirroring method D (not the lumped combined_mult).
+                rate_mult = (output_def_mult * matchup_mult
+                             * park_mult * weather_mult)
+                p_tb, dist_meta = _tb_distributional_over_rate(
+                    prop_key, line, values, hits, home_runs, at_bats, weights,
+                    rate_mult, lineup_mult, player_name, commence_iso,
+                    method_cfg, teams=(home_team_name, away_team_name))
+                if p_tb is not None:
+                    over_rate = max(0.0, min(1.0, p_tb))
+                    calibration_meta = {
+                        "method": "F",
+                        "curr_games": curr_games,
                         "empirical_over": round(empirical_over * 100, 2),
                     }
             elif method:

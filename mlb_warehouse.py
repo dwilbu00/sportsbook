@@ -2190,6 +2190,7 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
     names = _team_name_map()
     values, opponents, home_aways, game_dates = [], [], [], []
     plate_appearances, at_bats = [], []
+    hits, home_runs = [], []       # per-game components for the TB method ("F")
     own_team_id = None
     for r in rows:
         v = r.get(col)
@@ -2211,6 +2212,8 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
         if is_pitcher:
             plate_appearances.append(None)
             at_bats.append(None)
+            hits.append(None)
+            home_runs.append(None)
         else:
             ab = r.get("AB")
             if ab is None:                       # match ESPN: PA None when AB None
@@ -2220,6 +2223,13 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
                     (ab or 0.0) + (r.get("BB") or 0.0) + (r.get("HBP") or 0.0)
                     + (r.get("SF") or 0.0) + (r.get("SH") or 0.0))
             at_bats.append(ab)
+            # Per-game H / HR (index-aligned) — the extra-base split for method "F".
+            # Kept as raw floats (None when the column is unpopulated on an older
+            # row) so the TB distributional simply skips that game.
+            _h = r.get("H")
+            _hr = r.get("HR")
+            hits.append(float(_h) if _h is not None else None)
+            home_runs.append(float(_hr) if _hr is not None else None)
     if not values:              # every candidate game lacked the stat (pre-backfill)
         return None
     return {
@@ -2233,6 +2243,8 @@ def get_player_history(mlb_player_id, prop_key, n=20, as_of_date=None,
         "game_dates": game_dates,
         "plate_appearances": plate_appearances,
         "at_bats": at_bats,
+        "hits": hits,               # per-game H (batter) — TB method "F" component
+        "home_runs": home_runs,     # per-game HR (batter) — TB method "F" component
         "team_id": own_team_id,
         "team_name": names.get(own_team_id),
         "found": True,

@@ -1140,6 +1140,85 @@ def project_distributional(obs, params, sport_key, team_defense=None,
     return p_over
 
 
+def project_distributional_tb(obs, params, sport_key, team_defense=None,
+                              league_avg_def=None, quality_index=None,
+                              hardhit_coef=None, barrel_coef=None,
+                              triple_share=None, defense_by_season=None):
+    """Distributional P(over) for a batter_total_bases obs at its REAL book line
+    (method "F"), or None if not applicable / too thin.
+
+    The total-bases analog of ``project_distributional``: mirrors its recency×venue×
+    opp_defense weighting, derives the WEIGHTED component sums (AB/H/HR/TB) from the
+    prior games, looks up the batter's leakage-safe as-of contact quality, and
+    returns ``props._tb_dist_p_over`` — the SAME composite the runtime uses, so the
+    two can't drift. Offline eval applies NO output (park/weather/matchup)
+    multipliers — rate_mult = exposure_mult = 1, the same limitation the C/D real-
+    line fits have. Fails open."""
+    if obs.get("prop_key") != "batter_total_bases":
+        return None
+    prior_games = obs["prior_games"]
+    if not prior_games:
+        return None
+    line = obs["line"]
+    upcoming_is_home = obs["test_game"].get("is_home")
+    prior_home_aways = [g.get("is_home") for g in prior_games]
+    prior_opponents = [g.get("opponent") for g in prior_games]
+
+    base_w = _recency_weights(len(prior_games), params.get("half_life"))
+    venue_s = params.get("venue_strength", 0.0)
+    def_s = params.get("opp_defense_strength", 0.0)
+    team_defense, league_avg_def = _obs_season_defense(
+        obs, team_defense, league_avg_def, defense_by_season)
+    weights = []
+    for bw, ph, opp in zip(base_w, prior_home_aways, prior_opponents):
+        w = bw * venue_mult(ph, upcoming_is_home, venue_s)
+        if def_s > 0 and team_defense:
+            opp_pa = _resolve_opp_pts_allowed(opp, team_defense)
+            w *= opp_defense_mult(opp_pa, league_avg_def, def_s)
+        weights.append(w)
+
+    ab_w = h_w = hr_w = tb_w = w_valid = 0.0
+    for g, w in zip(prior_games, weights):
+        ab = g.get("AB")
+        h = g.get("H")
+        hr = g.get("HR")
+        tb = g.get("TB")
+        if ab is None or ab <= 0 or w <= 0 or h is None or hr is None or tb is None:
+            continue
+        ab_w += w * ab
+        h_w += w * h
+        hr_w += w * hr
+        tb_w += w * tb
+        w_valid += w
+    if ab_w <= 0 or w_valid <= 0:
+        return None
+    expected_ab = ab_w / w_valid
+    if expected_ab <= 0:
+        return None
+
+    hh = brl = None
+    try:
+        import mlb_starters
+        game_date = obs.get("game_date")
+        player = obs.get("player")
+        season = int(str(game_date)[:4]) if game_date else None
+        pid_info = (mlb_starters.find_player_id(player, season)
+                    if (player and season) else None)
+        if pid_info and pid_info[0] and not pid_info[1] and quality_index is not None:
+            q = quality_index.asof(str(pid_info[0]), game_date)
+            if q:
+                hh = q.get("hard_hit_pct")
+                brl = q.get("barrel_pct")
+    except Exception:
+        hh = brl = None   # fail open
+
+    import props
+    p_over, _ = props._tb_dist_p_over(
+        ab_w, h_w, hr_w, tb_w, expected_ab, None, hh, brl, 1.0, 1.0, line,
+        hardhit_coef, barrel_coef, triple_share)
+    return p_over
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Step 4: forecaster comparison with chronological holdout
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1244,13 +1323,19 @@ def evaluate_calibration(per_prop_obs, prop_key, label, shrinkage_k=15):
 def build_real_line_obs(enriched, params, sport_key, prop_key,
                         team_defense=None, league_avg_def=None,
                         xstats_strength=0.0, xba_index=None,
-                        defense_by_season=None):
+                        defense_by_season=None, tb_dist=False,
+                        quality_index=None, triple_share=None):
     """Project every joined observation for one prop at its REAL book line.
 
     Returns a list of row dicts {player, projected, line, actual,
     empirical_over, game_date}, reusing project_and_empirical (which evaluates
     the empirical over-rate at obs["line"], the book line). ``xstats_strength`` +
     ``xba_index`` opt into the P2.4a xBA projection blend (batter_hits).
+
+    ``tb_dist`` attaches a leakage-safe total-bases distributional ``p_tb`` (method
+    F) via ``project_distributional_tb`` and DROPS a row whose p_tb is None (so the
+    per-bucket F-candidacy — has_f = all(p_tb) — is not silently disabled). Used by
+    the TB diagnostic; off by default so other callers are unchanged.
     """
     rows = []
     for obs in enriched:
@@ -1262,6 +1347,14 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
             defense_by_season=defense_by_season)
         if projected is None:
             continue
+        p_tb = None
+        if tb_dist:
+            p_tb = project_distributional_tb(
+                obs, params, sport_key, team_defense, league_avg_def,
+                quality_index=quality_index, triple_share=triple_share,
+                defense_by_season=defense_by_season)
+            if p_tb is None:         # keep has_f = all(p_tb) intact for the gate
+                continue
         rows.append({
             "player": obs["player"],
             "projected": projected,
@@ -1269,6 +1362,7 @@ def build_real_line_obs(enriched, params, sport_key, prop_key,
             "actual": obs["actual"],
             "empirical_over": emp,
             "game_date": obs["game_date"],
+            "p_tb": p_tb,
             # Book prices (de-vigged consensus) for the ROI tiebreaker; None when
             # the obs is prediction-log-sourced. select_method_at_real_lines uses
             # them only inside the noise band and no-ops when absent.
@@ -1320,8 +1414,12 @@ def _score_abc_real(train, test, negbin_eligible=False):
     sigma = math.sqrt(var) if var > 0 else 1e-6
     srt = sorted(resid)
     nb = _fit_negbin_real(train) if negbin_eligible else None
-    pA, pB, pC, pD, pE, out = [], [], [], [], [], []
+    pA, pB, pC, pD, pE, pF, out = [], [], [], [], [], [], []
     has_d = bool(test) and all(r.get("p_dist") is not None for r in test)
+    # F (total-bases distributional, §opportunity-first): like D it needs no train
+    # fit (its prob is a closed form on each obs's own weighted components), scored
+    # only when every test row carries a precomputed leakage-safe ``p_tb``.
+    has_f = bool(test) and all(r.get("p_tb") is not None for r in test)
     for r in test:
         out.append(1 if r["actual"] > r["line"] else 0)
         pA.append(max(0.0, min(1.0, r["empirical_over"])))
@@ -1331,6 +1429,8 @@ def _score_abc_real(train, test, negbin_eligible=False):
         pC.append(1.0 - _empirical_cdf(srt, r["line"] - corrected))
         if has_d:
             pD.append(r["p_dist"])
+        if has_f:
+            pF.append(r["p_tb"])
         if nb is not None:
             mean_scale, disp = nb
             mean = max(1e-9, mean_scale * r["projected"])
@@ -1340,6 +1440,9 @@ def _score_abc_real(train, test, negbin_eligible=False):
     if has_d:
         scores["D"] = _brier(pD, out)
         probs["D"] = pD
+    if has_f:
+        scores["F"] = _brier(pF, out)
+        probs["F"] = pF
     if nb is not None:
         scores["E"] = _brier(pE, out)
         probs["E"] = pE
@@ -1509,6 +1612,11 @@ def select_method_at_real_lines(rows, shrinkage_k=15, negbin_eligible=False,
     candidate_methods = ["B", "C"]
     if any(r.get("p_dist") is not None for r in usable):
         candidate_methods.append("D")
+    # F (total-bases distributional) is a candidate only when the rows carry a
+    # leakage-safe p_tb (the per-bucket line-conditional path supplies it for
+    # batter_total_bases); other callers pass rows without it, so unchanged.
+    if any(r.get("p_tb") is not None for r in usable):
+        candidate_methods.append("F")
     if negbin_eligible:
         candidate_methods.append("E")
     best_method, best_brier = "A", baseline

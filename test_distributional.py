@@ -60,12 +60,16 @@ class DistPOverCompositeTests(unittest.TestCase):
         p, meta = props._dist_p_over(0.28, 3.9, 0.30, 0.45, 0.09, 1.0, 1.0,
                                      0.5, 0.5)
         self.assertEqual(meta["k"], 1)
-        self.assertEqual(meta["n_ab_expected"], 4)
+        # Adjacent-count mixture: n_ab_expected is the FLOAT expected trials m
+        # (= expected_ab * exposure_mult), no longer round()ed to an integer.
+        self.assertEqual(meta["n_ab_expected"], 3.9)
         self.assertAlmostEqual(meta["p_ab"], round(0.29 * (
             1 + 0.1 * (0.45 / 0.39 - 1) + 0.1 * (0.09 / 0.075 - 1)), 4), places=4)
-        # meta["p_ab"] is rounded to 4dp, so compare the survival at 3 places.
-        self.assertAlmostEqual(p, stats.hits_at_least(1, 4, meta["p_ab"]),
-                               places=3)
+        # meta["p_ab"] is rounded to 4dp; p is the ⌊m⌋/⌈m⌉ mixture (m=3.9 → 0.1·
+        # surv(3) + 0.9·surv(4)), so compare against that mixture at 3 places.
+        mix = (0.1 * stats.hits_at_least(1, 3, meta["p_ab"])
+               + 0.9 * stats.hits_at_least(1, 4, meta["p_ab"]))
+        self.assertAlmostEqual(p, mix, places=3)
 
     def test_missing_xba_drops_blend(self):
         # xba None -> s forced to 0 -> level = r_emp regardless of strength.
@@ -647,14 +651,19 @@ class SelectLineMethodsTests(unittest.TestCase):
     def test_deep_bucket_adopts_d(self):
         lm = self._run(self._enriched(n_top=160))
         self.assertIsNotNone(lm)
-        self.assertEqual(len(lm), 2)
+        # LINE_BUCKETS = [0.5, 1.5, None] → three buckets. The line-1.5 rows fall in
+        # the cap=1.5 bucket (index 1); the open top (None) bucket is empty here and
+        # inherits the pooled method.
+        self.assertEqual(len(lm), 3)
         self.assertEqual(lm[0]["max_line"], 0.5)
         self.assertEqual(lm[0]["method"], "C")           # small 0.5 bucket inherits
-        self.assertIsNone(lm[1]["max_line"])
-        self.assertEqual(lm[1]["method"], "D")           # deep top bucket flips
+        self.assertEqual(lm[1]["max_line"], 1.5)
+        self.assertEqual(lm[1]["method"], "D")           # deep 1.5 bucket flips
         self.assertTrue(lm[1]["confirmed"])
         self.assertEqual(lm[1]["xstats_strength"],
                          refit_calibration.LINE_COND_XSTATS_STRENGTH)
+        self.assertIsNone(lm[2]["max_line"])
+        self.assertEqual(lm[2]["method"], "C")           # empty top bucket inherits
 
     def test_thin_bucket_returns_none(self):
         self.assertIsNone(self._run(self._enriched(n_top=40)))   # < MIN_BUCKET_OBS
@@ -779,6 +788,167 @@ class LineupGatingTests(unittest.TestCase):
             cand, log = self._run("out")
         self.assertTrue(cand["is_value"])
         log.assert_called()
+
+
+class BasesSumAtLeastTests(unittest.TestCase):
+    """Pure convolution primitive for the total-bases method (F)."""
+
+    def test_edges(self):
+        pmf = [0.7, 0.2, 0.07, 0.01, 0.02]
+        self.assertEqual(stats.bases_sum_at_least(0, 4, pmf), 1.0)   # k<=0
+        self.assertEqual(stats.bases_sum_at_least(2, 0, pmf), 0.0)   # n=0
+        self.assertEqual(stats.bases_sum_at_least(1, 4, [1, 0, 0, 0, 0]), 0.0)  # all outs
+
+    def test_n1_equals_pmf_tail(self):
+        pmf = [0.7, 0.2, 0.07, 0.01, 0.02]
+        self.assertAlmostEqual(stats.bases_sum_at_least(1, 1, pmf), 0.3, places=9)
+        self.assertAlmostEqual(stats.bases_sum_at_least(2, 1, pmf), 0.10, places=9)
+        self.assertAlmostEqual(stats.bases_sum_at_least(4, 1, pmf), 0.02, places=9)
+
+    def test_matches_bruteforce_convolution(self):
+        pmf = [0.6, 0.25, 0.1, 0.01, 0.04]
+        # exact 2-fold sum PMF by hand
+        joint = {}
+        for i, pi in enumerate(pmf):
+            for j, pj in enumerate(pmf):
+                joint[i + j] = joint.get(i + j, 0.0) + pi * pj
+        for k in range(0, 9):
+            want = sum(v for s, v in joint.items() if s >= k)
+            self.assertAlmostEqual(stats.bases_sum_at_least(k, 2, pmf),
+                                   max(0.0, min(1.0, want)), places=9)
+
+    def test_monotone_in_n(self):
+        pmf = [0.7, 0.2, 0.07, 0.01, 0.02]
+        prev = -1.0
+        for n in (1, 2, 3, 4, 5, 6):
+            cur = stats.bases_sum_at_least(2, n, pmf)
+            self.assertGreaterEqual(cur, prev)
+            prev = cur
+
+    def test_normalizes_pmf(self):
+        # unnormalized pmf is normalized internally
+        self.assertAlmostEqual(stats.bases_sum_at_least(1, 1, [7, 3]),
+                               0.3, places=9)
+
+
+class TBDistPOverTests(unittest.TestCase):
+    """props._tb_dist_p_over — per-AB bases multinomial → P(TB over)."""
+
+    # 40 wtd AB, 12 H (.300), 4 HR, TB=27 (5 1B, 3 2B, 0 3B, 4 HR), 4 AB/game
+    ARGS = (40.0, 12.0, 4.0, 27.0, 4.0)
+
+    def test_pmf_normalized_and_tails_monotone(self):
+        p1, meta = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 0.5)
+        self.assertAlmostEqual(sum(meta["pmf"]), 1.0, places=3)
+        p2, _ = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 1.5)
+        p3, _ = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 2.5)
+        self.assertGreater(p1, p2)          # P(>=1) > P(>=2) > P(>=3)
+        self.assertGreater(p2, p3)
+
+    def test_hr_mass_matches_rate(self):
+        _, meta = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 1.5)
+        self.assertAlmostEqual(meta["hr_rate"], 0.10, places=4)      # 4/40
+
+    def test_empty_history_returns_none(self):
+        self.assertEqual(props._tb_dist_p_over(0, 0, 0, 0, 0, None, None, None,
+                                               1, 1, 1.5), (None, None))
+
+    def test_rate_and_exposure_raise_prob(self):
+        base, _ = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 1.5)
+        hot, _ = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.15, 1.0, 1.5)
+        more, _ = props._tb_dist_p_over(40.0, 12.0, 4.0, 27.0, 4.5, None, None,
+                                        None, 1.0, 1.0, 1.5)
+        self.assertGreater(hot, base)
+        self.assertGreater(more, base)
+
+    def test_quality_nudge_lifts_extra_base_mass(self):
+        # elite barrel/hard-hit raises the XBH masses vs the no-nudge baseline
+        _, flat = props._tb_dist_p_over(*self.ARGS, None, None, None, 1.0, 1.0, 1.5)
+        _, hot = props._tb_dist_p_over(*self.ARGS, 0.36, 0.55, 0.16, 1.0, 1.0, 1.5)
+        self.assertGreater(hot["q_adj"], 1.0)
+        self.assertGreaterEqual(hot["pmf"][4], flat["pmf"][4])
+
+
+class TBDistributionalOverRateTests(unittest.TestCase):
+    """Runtime wrapper: whitelist gate + component handling (no Statcast)."""
+
+    def _series(self, n=12):
+        vals = [3.0 if i % 2 else 1.0 for i in range(n)]   # TB per game
+        hits = [2.0 if i % 2 else 1.0 for i in range(n)]   # H per game
+        hrs = [1.0 if i % 4 == 0 else 0.0 for i in range(n)]
+        abs_ = [4.0] * n
+        w = [1.0] * n
+        return vals, hits, hrs, abs_, w
+
+    def test_off_whitelist_returns_none(self):
+        v, h, hr, ab, w = self._series()
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            p, meta = props._tb_distributional_over_rate(
+                "batter_rbis", 1.5, v, h, hr, ab, w, 1.0, 1.0, "P", "2026-05-01", {})
+        self.assertIsNone(p)
+
+    def test_batter_total_bases_prices(self):
+        v, h, hr, ab, w = self._series()
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            p, meta = props._tb_distributional_over_rate(
+                "batter_total_bases", 1.5, v, h, hr, ab, w, 1.0, 1.0, "P",
+                "2026-05-01", {})
+        self.assertIsNotNone(p)
+        self.assertEqual(meta["method"], "F")
+
+    def test_games_missing_components_are_skipped(self):
+        # a game with H/HR None is skipped, not counted as zero
+        v = [2.0, 1.0, 3.0]
+        h = [1.0, None, 2.0]
+        hr = [0.0, None, 1.0]
+        ab = [4.0, 4.0, 4.0]
+        w = [1.0, 1.0, 1.0]
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            p, meta = props._tb_distributional_over_rate(
+                "batter_total_bases", 1.5, v, h, hr, ab, w, 1.0, 1.0, "P",
+                "2026-05-01", {})
+        self.assertIsNotNone(p)   # 2 usable games still price
+
+    def test_no_usable_ab_returns_none(self):
+        with patch.object(mlb_starters, "find_player_id", return_value=None):
+            p, _ = props._tb_distributional_over_rate(
+                "batter_total_bases", 1.5, [2.0], [1.0], [0.0], [0.0], [1.0],
+                1.0, 1.0, "P", "2026-05-01", {})
+        self.assertIsNone(p)
+
+
+class TBMethodSelectionTests(unittest.TestCase):
+    """Offline gate: F is scored/candidate only when rows carry p_tb."""
+
+    def _rows(self, with_ptb):
+        rows = []
+        for i in range(120):
+            actual = 1 if i % 2 == 0 else 2
+            o = 1 if actual > 1.5 else 0
+            r = {"player": f"P{i % 20}", "projected": 1.4, "line": 1.5,
+                 "actual": actual, "empirical_over": 0.5,
+                 "game_date": f"2026-{2 + i // 28:02d}-{1 + i % 28:02d}"}
+            if with_ptb:
+                r["p_tb"] = 0.97 if o else 0.03      # near-perfect
+            rows.append(r)
+        return rows
+
+    def test_f_scored_when_ptb_present(self):
+        scores, _, probs, _ = blc._score_abc_real(
+            self._rows(True)[:60], self._rows(True)[60:])
+        self.assertIn("F", scores)
+        self.assertIn("F", probs)
+
+    def test_f_not_scored_without_ptb(self):
+        scores, _, _, _ = blc._score_abc_real(
+            self._rows(False)[:60], self._rows(False)[60:])
+        self.assertNotIn("F", scores)
+
+    def test_f_selected_when_it_wins(self):
+        sel = blc.select_method_at_real_lines(self._rows(True), negbin_eligible=True)
+        self.assertEqual(sel["method"], "F")
+        self.assertTrue(sel["confirmed"])
+        self.assertIn("F", sel["single_split"])
 
 
 if __name__ == "__main__":

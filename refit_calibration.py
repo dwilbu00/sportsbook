@@ -239,8 +239,8 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
     serve a different xBA weight than the pooled method was fit under). Falls back
     to ``LINE_COND_XSTATS_STRENGTH`` when the caller passes no strength."""
     import book_line_calibration as blc
-    from props import (_DIST_HARDHIT_COEF, _DIST_BARREL_COEF,
-                       PROP_NEGBIN_ELIGIBLE, PROP_XSTATS_KIND)
+    from props import (_DIST_HARDHIT_COEF, _DIST_BARREL_COEF, _MLB_TRIPLE_SHARE,
+                       PROP_NEGBIN_ELIGIBLE, PROP_XSTATS_KIND, PROP_TBDIST_ELIGIBLE)
 
     rows = []
     for obs in enriched:
@@ -267,10 +267,21 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
         # could never bucket (the real reason the re-run kept them pooled).
         if p_dist is None and prop_key in PROP_XSTATS_KIND:
             continue
+        # Method F (total-bases distributional) is batter_total_bases-only, so
+        # project_distributional_tb returns None for every other prop. Mirror the D
+        # drop-guard: for a TB-eligible prop the bucket's F-candidacy needs EVERY row
+        # to carry a p_tb (has_f = all(p_tb)), so drop a p_tb-less TB row; for any
+        # other prop keep it (p_tb=None) so F simply won't be a candidate.
+        p_tb = blc.project_distributional_tb(
+            obs, params, sport_key, team_defense, league_avg_def,
+            quality_index=quality_index, triple_share=_MLB_TRIPLE_SHARE,
+            defense_by_season=defense_by_season)
+        if p_tb is None and prop_key in PROP_TBDIST_ELIGIBLE:
+            continue
         rows.append({
             "player": obs["player"], "projected": projected, "line": obs["line"],
             "actual": obs["actual"], "empirical_over": emp,
-            "game_date": obs["game_date"], "p_dist": p_dist,
+            "game_date": obs["game_date"], "p_dist": p_dist, "p_tb": p_tb,
             # Book prices for the ROI tiebreaker (None when unpriced); harmless to
             # existing consumers, used only inside select_method_at_real_lines.
             "over_price": obs.get("over_price"),
@@ -314,6 +325,10 @@ def _select_line_methods(prop_key, enriched, params, sport_key, team_defense,
                     entry.update({"xstats_strength": xstats_strength,
                                   "dist_hardhit_coef": _DIST_HARDHIT_COEF,
                                   "dist_barrel_coef": _DIST_BARREL_COEF})
+                elif sel_b["method"] == "F":
+                    entry.update({"dist_hardhit_coef": _DIST_HARDHIT_COEF,
+                                  "dist_barrel_coef": _DIST_BARREL_COEF,
+                                  "triple_share": _MLB_TRIPLE_SHARE})
                 elif sel_b["method"] == "E":
                     entry.update({"mean_scale": sel_b.get("mean_scale"),
                                   "dispersion": sel_b.get("dispersion")})
@@ -1767,6 +1782,145 @@ def diagnose_negbin(sport, store_label=""):
 
     print("\n  (Diagnostic only — nothing written. Run --real-lines to apply the "
           "gate for real.)")
+
+
+def diagnose_tb_distributional(sport, store_label="", seasons=None):
+    """§opportunity-first diagnostic (NO WRITE): score the total-bases distributional
+    model (method "F") against A/B/C and the incumbent NegBin "E" on the SAME
+    batter_total_bases real-line chronological holdout the ship path uses.
+
+    F models TB as a sum over expected AB of a per-AB bases outcome {0,1,2,3,4},
+    the per-AB multinomial estimated from the batter's weighted game-log components
+    (AB/H/HR/TB) with a league triple share + a bounded contact-quality nudge. This
+    reuses book_line_calibration.select_method_at_real_lines(..., negbin_eligible=
+    True) verbatim on rows carrying a leakage-safe p_tb, so the diagnostic and the
+    ship path share ONE scoring/gate impl (no drift). OFFLINE + FREE (store + free
+    ESPN gamelogs + cached raw Statcast days); writes nothing."""
+    import book_line_calibration as blc
+    from props import _MLB_TRIPLE_SHARE
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    cfg = existing.get("batter_total_bases")
+    if not cfg:
+        print("No batter_total_bases calibration to compare against; run refit "
+              "first.")
+        return
+    incumbent = cfg.get("method")
+    print(f"\n=== §opportunity-first total-bases (method F) diagnostic: "
+          f"{sport_key} batter_total_bases ===")
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, ["batter_total_bases"], store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+        print(f"  [seasons] tb-diag scoped to {sorted(_yset)}")
+    print(f"  {len(book_lines):,} real book lines ({n_store:,} store + {n_pred:,} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines (store or prediction log); nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league)
+        if o.get("prop_key") == "batter_total_bases"]
+    if not enriched:
+        print("  No batter_total_bases observations joined to actuals.")
+        return
+
+    defense_by_season = None
+    if (cfg.get("opp_defense_strength") or 0.0) > 0:
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
+
+    # Leakage-safe as-of contact-quality index from the raw pitch cache (barrel% /
+    # hard-hit% for F's power nudge). No xBA index needed — F uses game-log SLG.
+    import savant_history as sh
+    import backtest_props
+    years = sorted({str(o["game_date"])[:4] for o in enriched if o.get("game_date")})
+    raw = []
+    for y in years:
+        try:
+            raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+        except Exception:
+            pass
+    if not raw:
+        print(f"  [warn] no raw Statcast days cached for {years} — F's contact-"
+              f"quality nudge will no-op (empirical bases shape only).")
+    quality_index = backtest_props.build_batter_quality_index(raw) if raw else None
+
+    params = {
+        "half_life": cfg.get("half_life"),
+        "venue_strength": cfg.get("venue_strength", 0.0),
+        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+        "use_minutes": cfg.get("use_minutes", False),
+    }
+    rows = blc.build_real_line_obs(
+        enriched, params, sport_key, "batter_total_bases",
+        defense_by_season=defense_by_season, tb_dist=True,
+        quality_index=quality_index, triple_share=_MLB_TRIPLE_SHARE)
+    usable = sorted([r for r in rows if r["actual"] != r["line"]],
+                    key=lambda r: r["game_date"])
+    n_usable = len(usable)
+    sel = blc.select_method_at_real_lines(rows, negbin_eligible=True,
+                                          roi_tiebreak=False)
+    if sel is None:
+        print(f"\n  Only {n_usable} usable real-line obs with a p_tb (need >=20) — "
+              f"can't score F.")
+        return
+    ss = sel.get("single_split", {})
+    folds = blc._real_line_folds(usable)
+    print(f"\n  batter_total_bases (incumbent={incumbent}, n_usable={n_usable}, "
+          f"folds={len(folds)}):")
+    print("    holdout Brier — " + "  ".join(
+        f"{m}={ss[m]:.4f}" for m in ("A", "B", "C", "E", "F") if m in ss))
+
+    # Per-line-bucket Brier on the SAME single split (E fit on train, all methods
+    # scored on test) — the design's thesis is that the per-AB bases distribution
+    # helps most at the 1.5+ lines, which the pooled number hides.
+    split = n_usable // 2
+    _, _, probs, out = blc._score_abc_real(usable[:split], usable[split:],
+                                           negbin_eligible=True)
+    test = usable[split:]
+    buckets = [("line 0.5", lambda ln: abs(ln - 0.5) < 1e-9),
+               ("line 1.5", lambda ln: abs(ln - 1.5) < 1e-9),
+               ("line >=2.5", lambda ln: ln >= 2.5)]
+    print("    per-bucket OOS Brier (single split; lower better):")
+    hdr = "      {:<12}".format("bucket")
+    for m in ("A", "C", "E", "F"):
+        hdr += "{:>10}".format(m)
+    hdr += "{:>8}".format("n")
+    print(hdr)
+    for bname, pred in buckets:
+        idx = [i for i, r in enumerate(test) if pred(r["line"])]
+        if not idx:
+            continue
+        line_str = "      {:<12}".format(bname)
+        for m in ("A", "C", "E", "F"):
+            pv = probs.get(m)
+            if pv is None:
+                line_str += "{:>10}".format("-")
+                continue
+            br = sum((pv[i] - out[i]) ** 2 for i in idx) / len(idx)
+            line_str += "{:>10}".format(f"{br:.4f}")
+        line_str += "{:>8}".format(len(idx))
+        print(line_str)
+    f_br = ss.get("F")
+    e_br = ss.get("E")
+    inc_br = ss.get(incumbent)
+    if f_br is not None and inc_br is not None:
+        gain = inc_br - f_br
+        print(f"    F vs incumbent {incumbent}: {gain:+.4f} "
+              f"(>= {MIN_CALIB_BRIER_GAIN} threshold: "
+              f"{'YES' if gain >= MIN_CALIB_BRIER_GAIN else 'no'})")
+    if f_br is not None and e_br is not None:
+        print(f"    F vs E (NegBin): {e_br - f_br:+.4f}")
+    gate = ("F CONFIRMED under the full 2-fold gate — would be adopted"
+            if sel["method"] == "F"
+            else f"gate keeps method {sel['method']} (F not confirmed)")
+    print(f"    cv_brier(winner={sel['method']})={sel.get('cv_brier')}")
+    print(f"    {gate}")
+    print("\n  (Diagnostic only — nothing written. Run a normal refit to let the "
+          "per-bucket gate adopt F for a batter_total_bases line bucket.)")
 
 
 def diagnose_center(sport, prop_filter=None, store_label=""):
@@ -3639,6 +3793,11 @@ def main():
                         "vs A/B/C on the real-line holdout for each eligible count "
                         "prop, and report whether E would clear the ship gate (no "
                         "write).")
+    p.add_argument("--tb-diag", action="store_true",
+                   help="§opportunity-first: score the total-bases distributional "
+                        "model (method F) vs A/B/C/E on the batter_total_bases real-"
+                        "line holdout, and report whether F beats the incumbent E "
+                        "(no write).")
     p.add_argument("--center-diag", action="store_true",
                    help="Mean-vs-median: re-score each calibrated prop's incumbent "
                         "method on the real-line holdout with a recency-weighted "
@@ -3801,6 +3960,13 @@ def main():
 
     if args.negbin_diag:
         diagnose_negbin(args.sport, store_label=args.store_label)
+        return
+
+    if args.tb_diag:
+        diagnose_tb_distributional(
+            args.sport, store_label=args.store_label,
+            seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+                     if args.seasons else None))
         return
 
     if args.center_diag:

@@ -180,6 +180,43 @@ def hits_at_least(k, n, p):
     return max(0.0, min(1.0, 1.0 - cdf))
 
 
+def bases_sum_at_least(k, n, pmf):
+    """P(sum of n iid per-at-bat base outcomes >= k) — the total-bases analog of
+    ``hits_at_least``.
+
+    Each at-bat independently produces ``j`` bases with probability ``pmf[j]``
+    (j = 0..len(pmf)-1 — a batter's per-AB {out/BB, single, double, triple, HR}
+    distribution → {0,1,2,3,4} bases). Total bases in a game is the sum of ``n``
+    such iid draws; this returns the upper tail P(sum >= k), so a line of (k - 0.5)
+    total bases maps to ``bases_sum_at_least(k, n, pmf)`` (the same OVER ⇔ X >= k
+    convention ``hits_at_least`` / ``negbin_at_least`` use). Exact via repeated
+    convolution of the per-AB pmf — O(n^2 · L^2) for max bases L, trivial at the
+    small n (~3-6 AB) and L=4 here. ``pmf`` is normalized defensively; ``n`` is
+    coerced to a non-negative integer (the caller mixes over ⌊m⌋/⌈m⌉ expected AB)."""
+    k = int(k)
+    if k <= 0:                       # OVER a sub-zero threshold is certain
+        return 1.0
+    n = int(round(n))
+    if n <= 0:                       # no at-bats → 0 bases, can't clear k >= 1
+        return 0.0
+    total = sum(pmf)
+    if total <= 0:
+        return 0.0
+    p = [max(0.0, x) / total for x in pmf]
+    dist = [1.0]                     # PMF of the sum over 0 AB: all mass at 0
+    for _ in range(n):
+        conv = [0.0] * (len(dist) + len(p) - 1)
+        for i, di in enumerate(dist):
+            if di == 0.0:
+                continue
+            for j, pj in enumerate(p):
+                if pj:
+                    conv[i + j] += di * pj
+        dist = conv
+    tail = sum(dist[k:]) if k < len(dist) else 0.0
+    return max(0.0, min(1.0, tail))
+
+
 def negbin_at_least(k, mean, dispersion):
     """P(X >= k) for X ~ Negative Binomial with variance = mean + dispersion*mean^2.
 
