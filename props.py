@@ -459,8 +459,10 @@ def _dist_p_over(r_emp, expected_ab, xba, hh, brl, rate_mult, exposure_mult,
       level       = (1-s)·r_emp + s·xBA               (s = xstats_strength, xba≠None)
       quality_adj = clamp(1 + a·(hh/LG-1) + b·(brl/LG-1))
       p_AB        = clamp(level · quality_adj · rate_mult)
-      n           = round(expected_ab · exposure_mult); k = int(line)+1
-      P(over)     = hits_at_least(k, n, p_AB)
+      m           = expected_ab · exposure_mult   (float expected trials); k = int(line)+1
+      P(over)     = adjacent-count mixture: (1-f)·hits_at_least(k, ⌊m⌋, p_AB)
+                                            + f·hits_at_least(k, ⌈m⌉, p_AB), f = m-⌊m⌋
+                    (smooth in m, preserves E[trials]=m — no rounding discontinuity)
     Returns (p_over, meta). ``expected_ab`` must be > 0."""
     a = _DIST_HARDHIT_COEF if hardhit_coef is None else hardhit_coef
     b = _DIST_BARREL_COEF if barrel_coef is None else barrel_coef
@@ -477,12 +479,20 @@ def _dist_p_over(r_emp, expected_ab, xba, hh, brl, rate_mult, exposure_mult,
     q_adj = max(lo_q, min(hi_q, q_adj))
     lo_p, hi_p = _DIST_PAB_BOUNDS
     p_ab = max(lo_p, min(hi_p, level * q_adj * (rate_mult or 1.0)))
-    n = max(1, int(round(expected_ab * (exposure_mult or 1.0))))
     k = int(line) + 1                     # half-integer lines: OVER ⇔ hits >= k
-    p_over = hits_at_least(k, n, p_ab)
+    # ADJACENT-COUNT MIXTURE over the (float) expected trials, weighted to preserve
+    # the mean — instead of rounding to a single n. round() made P(over) DISCONTINUOUS
+    # in expected_ab (a 0.02 AB change across a rounding boundary jumped P(>=1 hit)
+    # ~10.5pp), so a real exposure signal could look inert until it flipped a whole AB.
+    # The mixture is smooth in expected_ab and keeps E[trials] = m. [study §2.1]
+    m = max(0.0, expected_ab * (exposure_mult or 1.0))
+    lo = int(m)                           # floor (m >= 0)
+    w_hi = m - lo                         # fractional part → weight on ceil
+    _surv = lambda nn: hits_at_least(k, nn, p_ab) if nn >= 1 else 0.0
+    p_over = (1.0 - w_hi) * _surv(lo) + w_hi * _surv(lo + 1)
     meta = {
         "k": k,
-        "n_ab_expected": n,
+        "n_ab_expected": round(m, 3),
         "p_ab": round(p_ab, 4),
         "r_emp": round(r_emp, 4),
         "xba": round(xba, 3) if xba is not None else None,
