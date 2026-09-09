@@ -59,10 +59,24 @@ def _profit(price, outcome):
     return -1.0
 
 
+def _after_kickoff(captured_at, commence_time):
+    """True if the quote was captured at/after kickoff (post-start info leak) — such
+    rows must NOT be graded as pregame 'closing'. [review 2026-09-09]"""
+    if not captured_at or not commence_time:
+        return False
+    try:
+        from datetime import datetime
+        c = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00"))
+        k = datetime.fromisoformat(str(commence_time).replace("Z", "+00:00"))
+        return c >= k
+    except (TypeError, ValueError):
+        return False
+
+
 def _load_closing_odds(seasons, book, snapshot):
     """{event_id: game dict} from the odds mirror for one book+window. Each dict:
     home, away, commence_time, ml{home,away price}, spread{home,away (point,price)},
-    total{over,under (point,price)}."""
+    total{over,under (point,price)}. Rejects post-kickoff captures (info-leak)."""
     import warehouse_mirror as wm
     games = {}
     for s in seasons:
@@ -74,6 +88,8 @@ def _load_closing_odds(seasons, book, snapshot):
         for r in rows:
             if r.get("source") != snapshot:
                 continue
+            if _after_kickoff(r.get("captured_at"), r.get("commence_time")):
+                continue                  # post-kickoff quote — not pregame info
             eid = r.get("event_id")
             if not eid:
                 continue

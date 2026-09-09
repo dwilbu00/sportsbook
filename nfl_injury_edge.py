@@ -55,11 +55,15 @@ def _rmse(pred, y):
 
 
 def build_rows(seasons):
-    """[(base, qb, off_inj, def_inj, margin, season, game_id)]."""
+    """[(base, qb, off_inj, def_inj, margin, season, game_id)].
+
+    QB identity uses the PREGAME-KNOWN projected starter (recent-game starter +
+    injury/depth), NOT the majority passer in the game being predicted — the latter
+    is determined by in-game injuries/benchings, i.e. leakage. [review 2026-09-09]
+    """
     rows = []
     for season in seasons:
         plays = nfl_epa.load_plays(season)
-        starters = nfl_qb_asof.game_starters(season)
         games = {}
         for p in plays:
             if "home_score" in p:
@@ -71,9 +75,8 @@ def build_rows(seasons):
             if not rh or not ra or rh["off_plays"] <= 0 or ra["off_plays"] <= 0:
                 continue
             qb_r, _ = nfl_qb_asof.qb_ratings(season, d)
-            gs = starters.get(gid, {})
-            qb = (nfl_qb_asof.qb_edge_delta(season, d, h, gs.get(h), qb_r) -
-                  nfl_qb_asof.qb_edge_delta(season, d, a, gs.get(a), qb_r))
+            qb = (nfl_qb_asof.projected_qb_delta(season, d, h, qb_r) -
+                  nfl_qb_asof.projected_qb_delta(season, d, a, qb_r))
             week = int(gid.split("_")[1])
             off_e, _ol, def_e = inj.injury_edges(season, week, h, a)
             rows.append((rh["net_epa"] - ra["net_epa"], qb, off_e, def_e,

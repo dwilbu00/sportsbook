@@ -386,6 +386,25 @@ def build_matchup_features(home_team, away_team, date, season,
     if not ha or not aa:
         return result
 
+    # Canonicalize the game from the spine BEFORE any as-of computation. This
+    # supplies the game_id (so nfl_model.predict's rest term isn't silently zeroed
+    # in serving) and the correct LOCAL gameday + week (app.py passes a UTC-sliced
+    # date that drops a night game's week → lost injury/QB-backup lookup). The
+    # ordered (home,away) pair is unique within a season. Falls back to the passed
+    # date when the game isn't on the spine yet (a future game). [review 2026-09-09]
+    gid, week = None, None
+    try:
+        import nfl_schedule
+        for _g in nfl_schedule.load_games([str(season)]):
+            if _g.get("home_team") == ha and _g.get("away_team") == aa:
+                gid, week = _g.get("game_id"), _g.get("week")
+                _gd = _g.get("gameday")
+                if _gd:
+                    date = str(_gd)[:10]      # canonical local gameday, not the UTC slice
+                break
+    except Exception:
+        pass
+
     if team_ratings is None:
         team_ratings = team_epa(season, as_of_date=date)
 
@@ -428,7 +447,7 @@ def build_matchup_features(home_team, away_team, date, season,
         w = nfl_model.weights()
         if w:
             pm = nfl_model.predict(ha, aa, date, season, team_ratings=team_ratings,
-                                   starter_ids=starter_ids, w=w)
+                                   starter_ids=starter_ids, gid=gid, week=week, w=w)
             if pm:
                 result["nfl_pred_margin"], result["nfl_pred_std"] = pm
     except Exception:

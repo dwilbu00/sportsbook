@@ -460,10 +460,18 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
         # with no game_pk still drops via dup_dates below.
         idx = None
         row_pk = row.get("game_pk")
-        if row_pk is not None and row_pk in pk_idx:
-            idx = pk_idx[row_pk]
+        if row_pk is not None:
+            # An EXPLICIT game_pk is an identity assertion. If it's in this player's
+            # log, bind exactly. If it's NOT, the player didn't play that game (or a
+            # facts row is missing) — REJECT; do NOT fall through to a ±1-day date
+            # match that can borrow a NEIGHBOR game's box score. [review 2026-09-09]
+            if row_pk in pk_idx:
+                idx = pk_idx[row_pk]
+            else:
+                _drop("explicit_pk_no_match")
+                continue
         if idx is None:
-            # game_date is UTC-ish on both sides, so date-only match is usually
+            # No explicit identity → date match. game_date is UTC-ish on both sides,
             # accurate. Also try ±1 day for timezone slippage (stays within the
             # season's gamelog — MLB seasons don't cross a calendar-year boundary).
             d = row["game_date"]

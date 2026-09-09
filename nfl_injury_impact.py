@@ -152,6 +152,10 @@ def team_injury_burden(season, week, team):
     off_epa_out = 0.0
     oline_out = def_out = 0
     for gid, name, pos, _status in injuries:
+        if pos == "QB":
+            continue                      # QBs are handled by nfl_qb_asof — excluding
+                                          # here avoids double-counting them (and their
+                                          # passing EPA) in the injury burden. [review 2026-09-09]
         off_share, def_share = _prior_share(snap_idx, _norm(name), team, week)
         is_off_reg = off_share >= REGULAR_SHARE
         is_def_reg = def_share >= REGULAR_SHARE

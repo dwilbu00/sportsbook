@@ -92,9 +92,12 @@ def _load_props(seasons, snapshot, book):
                                         date_to=f"{s}-12-31", bookmaker=book)
         except Exception:
             rows = []
+        from nfl_market_scan import _after_kickoff
         for r in rows:
             if r.get("source") != snapshot:
                 continue
+            if _after_kickoff(r.get("captured_at"), r.get("commence_time")):
+                continue                  # post-kickoff quote — not pregame info [review 2026-09-09]
             pk = r.get("prop_key")
             if pk not in PROP_MAP:
                 continue
