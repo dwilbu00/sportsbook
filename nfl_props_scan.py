@@ -129,18 +129,44 @@ def _profit(price, outcome):
     return -1.0
 
 
+def _snap_presence(seasons):
+    """{(norm_name, season, week): True} for players with ANY recorded snap that week
+    (from snap_counts). Distinguishes a player who PLAYED but has no player_week stat
+    row (active-zero → a real 0 for the stat) from a true nonparticipant (VOID).
+    [review 2026-09-09]"""
+    out = {}
+    for s in seasons:
+        try:
+            sc = nfl_data.snap_counts([str(s)])
+        except Exception:
+            sc = None
+        if sc is None or not {"player", "week"} <= set(sc.columns):
+            continue
+        for r in sc.to_dict("records"):
+            snaps = (r.get("offense_snaps") or 0) or (r.get("defense_snaps") or 0) \
+                or (r.get("st_snaps") or 0)
+            if not snaps:
+                continue
+            try:
+                wk = str(int(r.get("week")))
+            except (TypeError, ValueError):
+                continue
+            out[(_norm(r.get("player")), str(s), wk)] = True
+    return out
+
+
 def scan(seasons, snapshot="closing", book="draftkings", drill=None):
     """drill = (prop_key, side, bucket) → also collect per-bet detail for that cell:
     list of (season, week, player, point, price, actual, outcome, profit)."""
     props = _load_props(seasons, snapshot, book)
     idx = nfl_schedule.game_index([str(s) for s in seasons])
     pw = _player_week_index(seasons)
+    snaps = _snap_presence([str(s) for s in seasons])
 
     rows = defaultdict(lambda: defaultdict(list))       # (prop_key,side)->season->[profit]
     rows_line = defaultdict(lambda: defaultdict(list))  # (prop_key,side,bucket)->season->[profit]
     drill_rows = []
-    meta_dnp = []       # DNP/name-miss drops in the drilled cell (survivorship probe)
-    n_props = n_graded = n_nogame = n_noplayer = 0
+    n_props = n_graded = n_nogame = n_void = n_played0 = 0
     for (eid, player, pk), d in props.items():
         n_props += 1
         gid, _ = nfl_schedule.resolve_event(d["home"], d["away"], d["commence"], index=idx)
@@ -152,16 +178,16 @@ def scan(seasons, snapshot="closing", book="draftkings", drill=None):
         stat = PROP_MAP[pk]
         actual = (pw.get((_norm(player), season, week)) or {}).get(stat)
         if actual is None:
-            n_noplayer += 1     # DNP / name mismatch → ungradable
-            if drill and pk == drill[0]:
-                pt_over = d.get("OVER", (None,))[0]
-                if _line_bucket(pk, pt_over) == drill[2]:
-                    # does this player appear in player_week in ANY week of this season?
-                    # yes → rostered but sat that week = SCRATCH (phantom OVER loss);
-                    # no  → deep/name-miss (more likely a neutral join failure).
-                    seen_season = any(k[0] == _norm(player) and k[1] == season for k in pw)
-                    meta_dnp.append((season, week, player, pt_over, seen_season))
-            continue
+            # No player_week stat row. Use snap_counts to decide: if the player took
+            # snaps, they PLAYED and simply recorded nothing → a genuine 0 for this
+            # stat (grade it). If no snaps, they're a nonparticipant → VOID (skip; do
+            # NOT invent an automatic OVER-loss/UNDER-win — DK voids non-participants).
+            if snaps.get((_norm(player), season, week)):
+                actual = 0.0
+                n_played0 += 1
+            else:
+                n_void += 1
+                continue
         n_graded += 1
         for side, over in (("OVER", True), ("UNDER", False)):
             if side not in d:
@@ -177,9 +203,10 @@ def scan(seasons, snapshot="closing", book="draftkings", drill=None):
                 if drill and (pk, side, b) == drill:
                     drill_rows.append((season, week, player, pt, px, actual, out, profit))
     return rows, rows_line, {"n_props": n_props, "n_graded": n_graded,
-                            "n_nogame": n_nogame, "n_noplayer": n_noplayer,
+                            "n_nogame": n_nogame, "n_void": n_void,
+                            "n_played0": n_played0,
                             "seasons": sorted({g.split('_')[0] for g in idx}),
-                            "drill_rows": drill_rows, "drill_dnp": meta_dnp}
+                            "drill_rows": drill_rows}
 
 
 def _stats(pl):
@@ -199,7 +226,8 @@ def _stats(pl):
 def report(rows, meta, min_n=150, min_season_n=40):
     print("=" * 88)
     print(f"  NFL PROPS flat-side scan (DK closing, {meta['seasons']})  "
-          f"graded={meta['n_graded']}  no-join={meta['n_nogame']}  DNP/name-miss={meta['n_noplayer']}")
+          f"graded={meta['n_graded']} (incl {meta.get('n_played0',0)} played-zero)  "
+          f"no-join={meta['n_nogame']}  VOID non-participants={meta.get('n_void',0)}")
     print("  flat ROI at DK price (vig in); per-season replication = honesty gate; "
           "candidate = n>=%d + +ROI pooled + every season +." % min_n)
     print("=" * 88)
@@ -280,7 +308,7 @@ def _american_of(px):
         return None
 
 
-def report_drill(drill, drill_rows, drill_dnp=None):
+def report_drill(drill, drill_rows):
     pk, side, b = drill
     print("\n" + "=" * 88)
     print(f"  DRILL: {pk} {side} line-bucket {b}  (is this actually bettable +EV, or a juiced trap?)")
@@ -322,34 +350,9 @@ def report_drill(drill, drill_rows, drill_dnp=None):
         s, wk, player, pt, px, actual, out, profit = r
         print(f"    {s} w{wk:<2} {str(player)[:22]:<22} {pt} @ {_american_of(px):+5d}  "
               f"actual={actual} → {out}")
-    # ── survivorship probe: DNP/scratch drops in this cell ──
-    if drill_dnp is not None:
-        n_g, n_d = len(drill_rows), len(drill_dnp)
-        tot = n_g + n_d
-        print("  --- SURVIVORSHIP PROBE (DNP/name-miss drops in this cell) ---")
-        print(f"    graded={n_g}  dropped(no player_week row)={n_d}  "
-              f"drop-rate={ (n_d/tot*100 if tot else 0):.1f}%")
-        if side == "OVER" and n_d:
-            # split drops: rostered-that-season (=scratch, phantom OVER loss) vs
-            # never-seen (=likely name-miss/deep, neutral).
-            scratch = [r for r in drill_dnp if len(r) > 4 and r[4]]
-            namemiss = [r for r in drill_dnp if not (len(r) > 4 and r[4])]
-            prof = [r[7] for r in drill_rows]
-            roi_now = sum(prof) / max(1, len(prof))
-            # correction: count the SCRATCHES as OVER losses (they truly resolved under);
-            # leave name-misses out (genuinely ungradable).
-            roi_corr = (sum(prof) + len(scratch) * (-1.0)) / (len(prof) + len(scratch))
-            roi_wc = (sum(prof) + n_d * (-1.0)) / (len(prof) + n_d)
-            print(f"    drop split: SCRATCH (rostered that season, sat that week) = {len(scratch)}"
-                  f"  |  name-miss/deep (never in player_week) = {len(namemiss)}")
-            print(f"    a scratched 0.5-line player = automatic OVER LOSS, silently dropped.")
-            print(f"      ROI as-graded          = {roi_now*100:+.2f}%")
-            print(f"      ROI + scratches=losses = {roi_corr*100:+.2f}%   <-- the honest number")
-            print(f"      ROI + ALL drops=losses = {roi_wc*100:+.2f}%   (worst case)")
-            if scratch:
-                print("    sample scratches (phantom OVER losses excluded by the join):")
-                for r in scratch[:8]:
-                    print(f"      {r[0]} w{r[1]:<2} {str(r[2])[:24]:<24} line {r[3]}")
+    print("  (grading note: players who took snaps but have no player_week stat row are")
+    print("   now graded as a real 0 for the stat; true non-participants are VOID — so this")
+    print("   cell no longer has a scratch-survivorship bias. [review 2026-09-09])")
     print("=" * 88)
     print("  READ: if the +ROI concentrates in plus-money / light-juice bands with real n,")
     print("        it's a bettable pattern; if it lives only in heavy-juice cells or a")
@@ -384,7 +387,7 @@ def main():
     if args.by_line:
         report_by_line(rows_line, meta, min_bucket_n=args.min_bucket_n)
     if drill:
-        report_drill(drill, meta["drill_rows"], meta.get("drill_dnp"))
+        report_drill(drill, meta["drill_rows"])
 
 
 if __name__ == "__main__":
