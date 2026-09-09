@@ -25,7 +25,7 @@ import math
 from collections import defaultdict
 
 import nfl_schedule
-from nfl_injury_edge import build_rows, _solve, _rmse, MODELS
+from nfl_injury_edge import build_rows
 from nfl_market_scan import (_load_closing_odds, _spread_outcome, _total_outcome,
                              _ml_outcome, _profit)
 from odds_client import american_to_decimal
@@ -33,7 +33,6 @@ from r2_sharp import fair_two_way
 
 # EV buckets (fraction). A bet is assigned to the highest bucket its EV clears.
 EV_EDGES = [0.0, 0.02, 0.05, 0.08, 0.12, 0.20, 1.0]
-FEATURE = MODELS["base+QB+inj"]
 
 
 def _norm_cdf(x):
@@ -47,29 +46,36 @@ def _bucket(ev):
     return None
 
 
-def _oos_fit(rows, test):
-    """Full-model weights + residual sigma fit on all seasons except `test`."""
-    tr = [r for r in rows if r[5] != test]
-    b = _solve([FEATURE(r) for r in tr], [r[4] for r in tr])
-    resid = [r[4] - sum(bi * xi for bi, xi in zip(b, FEATURE(r))) for r in tr]
-    sigma = (sum(e * e for e in resid) / len(resid)) ** 0.5 if resid else 13.5
-    return b, sigma
+def _shrink(p, k):
+    """Pull a win/cover prob toward 0.5 by the serving prob_shrink factor k (the app
+    applies this before pricing). k=0 → unchanged; k=1 → 0.5."""
+    return 0.5 + (1.0 - k) * (p - 0.5)
 
 
 def run(seasons, book="draftkings", snapshots=("early_12h", "early_4h", "closing")):
+    # FAITHFUL to the shipped pipeline (review #11): use the FROZEN serving margin
+    # model (nfl_model live weights: HFA+net+QB) + the serving prob_shrink, not an
+    # ad-hoc re-fit with raw Normal probs. Odds are already quote-time filtered
+    # (post-kickoff captures rejected in _load_closing_odds). [review 2026-09-09]
+    import nfl_model
+    from calibration_loader import load_prob_shrink
+    w = nfl_model.weights()
+    if not w:
+        print("no shipped nfl_margin_model — nothing to evaluate"); return
+    shrink = load_prob_shrink("americanfootball_nfl") or {}
+    sm, mm = float(shrink.get("spreads", 0.0)), float(shrink.get("moneyline", 0.0))
+    sigma = float(w.get("sigma", 13.2))
+    print(f"  [faithful] frozen serving model {dict((k,w[k]) for k in ('hfa','w_epa','w_qb'))} "
+          f"sigma={sigma}; shrink spreads={sm} moneyline={mm}")
+
     rows = build_rows(seasons)
     by_gid = {r[6]: r for r in rows}
     idx = nfl_schedule.game_index([str(s) for s in seasons])
     scores = nfl_schedule.team_scores_index([str(s) for s in seasons])
 
-    # OOS model prediction + sigma per game
-    pred, sig = {}, {}
-    for test in seasons:
-        b, sigma = _oos_fit(rows, test)
-        for r in rows:
-            if r[5] == test:
-                pred[r[6]] = sum(bi * xi for bi, xi in zip(b, FEATURE(r)))
-                sig[r[6]] = sigma
+    # shipped-model margin per game (HFA + net + QB; inj/rest weights are 0 live)
+    pred = {r[6]: w["hfa"] + w["w_epa"] * r[0] + w["w_qb"] * r[1] for r in rows}
+    sig = {gid: sigma for gid in pred}
 
     # cells[(snapshot, market, bucket)][season] -> [profit]
     cells = defaultdict(lambda: defaultdict(list))
@@ -109,18 +115,18 @@ def run(seasons, book="draftkings", snapshots=("early_12h", "early_4h", "closing
                         cells[(snap, market, bk)][season].append(
                             _profit(best[1], best[2]()))
 
-            # ── spread: cover prob for home = P(margin + home_pt > 0) ──
+            # ── spread: cover prob for home = P(margin + home_pt > 0), then shrink ──
             sph, spa = o["spread"].get("home"), o["spread"].get("away")
             if sph and spa:
-                p_home_cover = _norm_cdf((pm + sph[0]) / sg)
+                p_home_cover = _shrink(_norm_cdf((pm + sph[0]) / sg), sm)
                 consider("spread", p_home_cover, [
                     (True, sph[0], sph[1], lambda: _spread_outcome(True, sph[0], hs, as_)),
                     (False, spa[0], spa[1], lambda: _spread_outcome(False, spa[0], hs, as_)),
                 ])
-            # ── moneyline: win prob for home = P(margin > 0) ──
+            # ── moneyline: win prob for home = P(margin > 0), then shrink ──
             mlh, mla = o["ml"].get("home"), o["ml"].get("away")
             if mlh is not None and mla is not None:
-                p_home_win = _norm_cdf(pm / sg)
+                p_home_win = _shrink(_norm_cdf(pm / sg), mm)
                 consider("moneyline", p_home_win, [
                     (True, None, mlh, lambda: _ml_outcome(True, hs, as_)),
                     (False, None, mla, lambda: _ml_outcome(False, hs, as_)),
@@ -142,7 +148,8 @@ def _stats(pl):
 def _report(cells, seasons):
     print("=" * 100)
     print("  NFL REQUIRED-EDGE calibration — realized ROI by app-computed edge (EV%) bucket")
-    print("  full EPA+QB+injury model, OOS; graded at each snapshot's OWN DK price.")
+    print("  FROZEN serving model (HFA+net+QB) + serving prob_shrink; quote-time-filtered")
+    print("  DK odds, graded at each snapshot's OWN price.")
     print("  X* = the edge bucket where ROI turns reliably positive = the runtime fire-threshold.")
     print("=" * 100)
     snaps = sorted({k[0] for k in cells}, key=lambda s: {"early_12h": 0, "early_4h": 1, "closing": 2}.get(s, 9))
