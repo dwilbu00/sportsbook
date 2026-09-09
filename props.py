@@ -33,6 +33,7 @@ from prop_filter import filter_player_gamelog
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from recalibration import (
     apply_platt,
+    apply_isotonic,
     load_recalibration,
     log_prediction,
     log_prediction_rows,
@@ -1695,6 +1696,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 recalibration, prop_key, line, prop_calib_cfg)
 
             def _apply_final_recalibration(probability, cfg):
+                # SINGLE calibration slot (never stacked). A committed per-line-bucket
+                # ISOTONIC map takes precedence when present — it was the OOS winner
+                # over Platt/raw for this bucket (e.g. batter_hits method-D low-end
+                # miscalibration a sigmoid can't fix). Else fall to the online Platt.
+                # [2026-09-09]
+                _, _bucket = _resolve_line_bucket(prop_calib_cfg, line)
+                iso = (_bucket or {}).get("recal_iso")
+                if iso and iso.get("kx") and iso.get("ky"):
+                    adj = apply_isotonic(probability, iso["kx"], iso["ky"])
+                    return (max(0.0, min(1.0, adj)) if adj is not None else probability)
                 if not cfg or cfg.get("a") is None:
                     return probability
                 adjusted = apply_platt(

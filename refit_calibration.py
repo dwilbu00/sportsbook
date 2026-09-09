@@ -3355,7 +3355,7 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
         print(f"     winner (OOS log-loss): raw — no map beats raw "
               f"(logloss {m_raw['logloss']:.4f}, ECE {m_raw['ece']:.4f}); "
               f"leave this bucket as-is")
-        return
+        return {"method": method, "winner": "raw"}
     print(f"     winner (OOS log-loss): {win_lbl} — improves raw "
           f"({m_raw['logloss']:.4f} -> {win_m['logloss']:.4f}, "
           f"ECE {m_raw['ece']:.4f} -> {win_m['ece']:.4f})")
@@ -3399,11 +3399,32 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
                 lbl, e["absmean"], e["c05"], e["c10"], e["c20"], e["max"],
                 roi_s))
 
+    # DEPLOYABLE map = the winning transform RE-FIT on ALL bucket rows (train+test).
+    # The split above only VALIDATED that the winner beats raw OOS; the shipped map
+    # uses every obs. Returned for --save-recal to stage into the calibration.
+    all_rows = train + test
+    if win_lbl == "isotonic":
+        kx, ky = _rc_fit_isotonic([r["p_raw"] for r in all_rows],
+                                  [r["o"] for r in all_rows])
+        return {"method": method, "winner": "isotonic",
+                "iso": {"kx": kx, "ky": ky, "n": len(all_rows)}}
+    if win_lbl == "platt":
+        aa, bb = _rc_fit_platt([r["p_raw"] for r in all_rows],
+                               [r["o"] for r in all_rows])
+        return {"method": method, "winner": "platt", "platt": {"a": aa, "b": bb}}
+    return {"method": method, "winner": win_lbl}
 
-def diagnose_recalibration(sport, store_label="", min_cell_n=50):
+
+def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False):
     """Fit a post-hoc recalibration map (Platt shrinkage + isotonic) on the
     SHIPPED per-line-bucket batter_hits probability, evaluate it OUT-OF-SAMPLE,
-    and show the reliability curve flatten and the fake edges collapse (NO WRITE).
+    and show the reliability curve flatten and the fake edges collapse.
+
+    With ``save`` (--save-recal): for every method-group whose OOS winner is
+    ISOTONIC, re-fit the map on ALL obs and STAGE it into the matching batter_hits
+    line_methods bucket(s) as ``recal_iso`` (candidate; live untouched). Serving
+    applies it as the single calibration slot (props._apply_final_recalibration),
+    taking precedence over Platt. Default (no save) = diagnostic only, NO WRITE.
 
     The raw probability reconstructs exactly what production emits per line bucket
     (method A: as-of empirical over-rate; method C: residual-ECDF tail on an older
@@ -3433,15 +3454,38 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50):
     for r in rows:
         m = _rc_method_for_line(r["line"], line_methods, default_method)
         groups.setdefault(m, []).append(r)      # subset preserves chronology
+    iso_by_method = {}
     for m in sorted(groups, key=lambda k: (k != "A", k)):  # dominant A first
         brows = groups[m]
         lines = sorted(set(r["line"] for r in brows))
         band = ("line 0.5" if lines == [0.5]
                 else f"lines {min(lines):g}-{max(lines):g}")
-        _rc_run_bucket(band, m, brows, blc, min_cell_n)
+        res = _rc_run_bucket(band, m, brows, blc, min_cell_n)
+        if res and res.get("winner") == "isotonic":
+            iso_by_method[res["method"]] = res["iso"]
 
-    print("\n  (Diagnostic only — nothing written. To deploy: store the winning "
-          "map per line-bucket and apply g(p) after calibrate_prob.)")
+    if not save:
+        print("\n  (Diagnostic only — nothing written. Re-run with --save-recal to "
+              "STAGE the winning isotonic map(s) into the candidate.)")
+        return
+
+    if not iso_by_method or not line_methods:
+        print("\n  (--save-recal: no isotonic winner to stage — nothing written.)")
+        return
+    # Attach each method-group's isotonic map to the matching line_methods bucket(s).
+    staged = []
+    for bk in line_methods:
+        mp = iso_by_method.get(bk.get("method"))
+        if mp:
+            bk["recal_iso"] = {"kx": [round(x, 6) for x in mp["kx"]],
+                               "ky": [round(y, 6) for y in mp["ky"]]}
+            staged.append(f"{bk.get('max_line')}:{bk.get('method')}({mp.get('n')})")
+    cfg["line_methods"] = line_methods
+    save_calibration(sport_key, {"batter_hits": cfg},
+                     meta={"batter_hits_recal_iso": f"diagnose_recalibration --save-recal "
+                           f"[{', '.join(staged)}]"}, merge_props=True)
+    print(f"\n  [save] staged isotonic recal into batter_hits buckets: "
+          f"{', '.join(staged)}  (candidate — review --diff, then --promote)")
 
 
 def _print_calibration_diff(sport):
@@ -3665,6 +3709,11 @@ def main():
                         "isotonic) on the SHIPPED per-line-bucket batter_hits "
                         "probability and show, OUT-OF-SAMPLE, the reliability curve "
                         "flatten and the fake edges collapse (no write).")
+    p.add_argument("--save-recal", action="store_true",
+                   help="With --recalibrate: STAGE the winning ISOTONIC map(s) into "
+                        "the matching batter_hits line_methods bucket(s) as recal_iso "
+                        "(candidate; review --diff, then --promote). Serving applies "
+                        "it as the single calibration slot, precedence over Platt.")
     # ── candidate-file staging (default-safe calibration writes) ──
     # A refit writes to calibration/<sport>.candidate.json, NEVER the live file
     # the app serves — so an accidental/experimental run can't clobber a carefully
@@ -3793,8 +3842,14 @@ def main():
         return
 
     if args.recalibrate:
+        if args.save_recal:
+            # stage into the candidate (unless --live) so review/promote applies
+            _, _, _sk = SPORT_MAP[args.sport]
+            set_candidate_mode(not args.live)
         diagnose_recalibration(args.sport, store_label=args.store_label,
-                               min_cell_n=args.min_cell_n)
+                               min_cell_n=args.min_cell_n, save=args.save_recal)
+        if args.save_recal:
+            _report_staging(args.sport, not args.live, wrote=True)
         return
 
     # Default-safe: a refit stages a candidate; --live writes the live file.

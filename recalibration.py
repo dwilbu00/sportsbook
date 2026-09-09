@@ -1757,6 +1757,30 @@ def apply_platt(raw_prob, a, b):
     return _sigmoid(a * _logit(raw_prob) + b)
 
 
+def apply_isotonic(raw_prob, kx, ky):
+    """Apply a fitted isotonic recal map (monotone linear interpolation between the
+    (kx, ky) knots from a pool-adjacent-violators fit). Serving-side counterpart of
+    refit_calibration._rc_apply_isotonic — used when a per-line-bucket isotonic map
+    is the OOS-chosen calibration slot (e.g. batter_hits method-D, whose low-end
+    miscalibration a Platt sigmoid can't fix). Returns raw_prob if the map is empty.
+    [2026-09-09]"""
+    if raw_prob is None or not kx or not ky:
+        return raw_prob
+    if raw_prob <= kx[0]:
+        return ky[0]
+    if raw_prob >= kx[-1]:
+        return ky[-1]
+    import bisect
+    j = bisect.bisect_right(kx, raw_prob)   # kx[j-1] <= p < kx[j]
+    i = j - 1
+    if i + 1 >= len(kx):
+        return ky[-1]
+    x0, x1, y0, y1 = kx[i], kx[i + 1], ky[i], ky[i + 1]
+    if x1 <= x0:
+        return y1
+    return y0 + (raw_prob - x0) / (x1 - x0) * (y1 - y0)
+
+
 def _probability_scores(probabilities, outcomes):
     """Return (Brier, log loss) for binary probability forecasts."""
     if not probabilities:

@@ -46,6 +46,25 @@ Validation: same OOS real-line Brier gate vs incumbent A.
   trim (schema bump + re-ingest). NOT needed to start (xwOBA/barrels carry power).
 - EXCLUDED: BA-RISP (base-state on_2b/on_3b not trimmed AND it's a non-repeatable clutch split).
 
+## Build 3 — PITCHER opportunity models (same principle, pitcher side)
+Pitchers have the identical structure; current methods (K=C, outs=A, ER=E) ignore it.
+  opportunity  = expected BATTERS FACED (≈ expected innings/outs; the pitcher analog of
+                 expected AB) — from workload history (pitcher_asof) + leash/game-state.
+  conditional  = per-BF outcome rate (K% for pitcher_strikeouts; run rate for ER; outs).
+  P(K >= line) = expected_BF × per-BF K distribution (method-D-style).
+Caveat: expected BF is NOISIER than batter AB (manager leash / pitch count / blowout →
+pulled early). Test pitcher_K first (BF × K%).
+
+## Build 4 (CAPSTONE) — bottom-up team-runs / totals from the player primitives
+If every batter is (AB × per-AB outcomes) and every pitcher is (BF × per-BF outcomes), a
+game = the lineup's expected outcomes vs the opposing starter+bullpen, aggregated → a
+TEAM-RUNS distribution. Team totals then fall out of the SAME primitives (coherent, not a
+separate top-down team model). This is the "REPLACE-the-offense-term bottom-up runs model"
+[[modeling-and-calibration]] flagged as the one team-side build worth doing (the ADDITIVE
+lineup layer was refuted; a full bottom-up REPLACEMENT was left open). ⚠ team totals are
+EFFICIENT for us — value is better totals CALIBRATION + props coherence, NOT a betting edge.
+Big build; the capstone, not the next step.
+
 ## Sequence + gate
 TB first (no lineup dep → validates the opportunity×conditional-distribution machinery cheaply),
 THEN RBIs (adds preceding-OBP on proven code). Each ships OFF, activated per-prop only if it
