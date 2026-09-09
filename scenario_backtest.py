@@ -872,11 +872,17 @@ def _report(title, rows, cov=None, cov_keys=()):
         sm = per[s]
         p(f"    {s}: n={sm.n:,} ROI={sm.roi:+.2%} hit={sm.hit_rate:.1%} "
           f"t={sm.t_stat:+.2f}")
-    ok = bool(per) and all(sm.roi > 0 for sm in per.values() if sm.n >= 30)
     judged = [s for s, sm in per.items() if sm.n >= 30]
+    # replication requires >=2 adequately-populated seasons (a single season passes
+    # all() vacuously — the bug that mis-tagged batter_K as replicating). [review 2026-09-09]
+    ok = len(judged) >= 2 and all(per[s].roi > 0 for s in judged)
     if judged:
-        p(f"  per-season replication (n>=30): "
-          f"{'PASS — positive every season' if ok else 'FAIL — not every season +'}")
+        if len(judged) < 2:
+            p(f"  per-season replication (n>=30): N/A — only {len(judged)} "
+              f"populated season ({judged[0]}); exploratory, NOT replicated")
+        else:
+            p(f"  per-season replication (n>=30): "
+              f"{'PASS — positive every season' if ok else 'FAIL — not every season +'}")
     p("")
     print("\n".join(out))
     return pooled
@@ -914,7 +920,11 @@ def _report_prop_roi(rows, cov, min_n=100):
             per = r2_grade.by_key([r for r in pr if r["side"] == side and r["line"] == line],
                                   lambda r: r["season"])
             judged = [s for s, x in per.items() if x.n >= 30]
-            repl = bool(judged) and all(per[s].roi > 0 for s in judged)
+            # require >=2 adequately-populated seasons: "replicates" must mean across
+            # multiple independent periods, not one season passing all() vacuously.
+            # (This is what falsely tagged batter_K UNDER 1.5 as replicating on a
+            # single 2024 season.) [review 2026-09-09]
+            repl = len(judged) >= 2 and all(per[s].roi > 0 for s in judged)
             thin = "" if sm.n >= min_n else "  (thin)"
             hit = f"{sm.hit_rate:.1%}" if sm.decided else "n/a"
             star = "  <== +ROI, replicates" if (sm.n >= min_n and sm.roi > 0 and repl) else ""
