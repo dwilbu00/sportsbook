@@ -1277,6 +1277,12 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             dk_under_price = odds_info.get("dk_under_price")
             dk_over_book = odds_info.get("dk_over_book")
             dk_under_book = odds_info.get("dk_under_book")
+            # FanDuel executable prices — Doug bets DK AND FD, so staking uses the
+            # BETTER of the two per side (line-shopping the executable books). [study §2.2]
+            fd_over_price = odds_info.get("fd_over_price")
+            fd_under_price = odds_info.get("fd_under_price")
+            fd_over_book = odds_info.get("fd_over_book")
+            fd_under_book = odds_info.get("fd_under_book")
 
             history = player_histories.get(player_name, {}).get(prop_key)
             if not history or not history.get("found") or not history.get("values"):
@@ -1926,25 +1932,31 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             under_rate = 1 - over_rate
             under_edge = under_rate - under_implied
 
+            def _best_exec(*price_book_pairs):
+                """Best (highest American) executable price among {DK, FD} for a side,
+                with the book to bet it at. American odds rank monotonically as ints
+                (higher = better payout). Returns (None, None) if neither posts it."""
+                cands = [(p, b) for p, b in price_book_pairs if p is not None]
+                return max(cands, key=lambda pb: pb[0]) if cands else (None, None)
+
             if over_edge > under_edge:
                 direction = "OVER"
                 edge = over_edge
-                dk_price = dk_over_price
-                dk_book = dk_over_book
+                dk_price, dk_book = _best_exec((dk_over_price, dk_over_book),
+                                               (fd_over_price, fd_over_book))
             else:
                 direction = "UNDER"
                 edge = under_edge
-                dk_price = dk_under_price
-                dk_book = dk_under_book
+                dk_price, dk_book = _best_exec((dk_under_price, dk_under_book),
+                                               (fd_under_price, fd_under_book))
 
-            # The user bets exclusively at DraftKings (2026-07-21). Multi-book
-            # odds feed ONLY the de-vigged consensus (over_implied) the edge is
-            # measured against — market analysis, not execution. Price, EV,
-            # staking, and display all use the DK price. `best_price` is retained
-            # as the executable (DK) price for downstream compatibility. When DK
-            # doesn't post this prop/line, dk_price is None → expected_roi is None
-            # → the bet is NOT flagged as value (never recommend an un-bettable
-            # line). (P1.1b, DK-only per user.)
+            # Doug bets at DraftKings AND FanDuel (2026-09-09). Multi-book odds feed
+            # ONLY the de-vigged consensus (over_implied) the edge is measured against
+            # — analysis-only books (Pinnacle etc.) are NOT executable. Execution
+            # price/EV/staking/display use the BETTER of {DK, FD} (dk_price/dk_book,
+            # now the best executable offer + the book to place it at). When neither
+            # DK nor FD posts this prop/line, dk_price is None → expected_roi None →
+            # the bet is NOT flagged (never recommend an un-bettable line). [study §2.2]
             best_price = dk_price
             expected_roi = _expected_roi(
                 over_rate if direction == "OVER" else under_rate,

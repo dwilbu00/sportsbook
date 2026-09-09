@@ -1239,6 +1239,11 @@ def parse_player_props(game_data):
             # to the best price.
             dk_over = _dk_offer(executable["Over"])
             dk_under = _dk_offer(executable["Under"])
+            # FanDuel too — Doug bets DK AND FD, so the executable price for staking
+            # is the BETTER of the two, not DK alone. (Best-across-all-books above
+            # includes analysis-only books like Pinnacle we can't bet.) [study §2.2]
+            fd_over = _dk_offer(executable["Over"], book_key="fanduel")
+            fd_under = _dk_offer(executable["Under"], book_key="fanduel")
             # Independent market check at the CHOSEN line = the non-DK books quoting
             # it. When DK is the anchor but NEITHER enough peers NOR a sharp book
             # (Pinnacle/Circa) also quotes DK's line, over_implied degrades toward
@@ -1273,6 +1278,10 @@ def parse_player_props(game_data):
                 "dk_under_price": dk_under["price"] if dk_under else None,
                 "dk_over_book": dk_over["book"] if dk_over else None,
                 "dk_under_book": dk_under["book"] if dk_under else None,
+                "fd_over_price": fd_over["price"] if fd_over else None,
+                "fd_under_price": fd_under["price"] if fd_under else None,
+                "fd_over_book": fd_over["book"] if fd_over else None,
+                "fd_under_book": fd_under["book"] if fd_under else None,
                 # Edge is measured against the consensus fair probability;
                 # expected ROI still uses the best executable side price.
                 "over_implied": fair_over,
