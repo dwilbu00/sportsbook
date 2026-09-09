@@ -2373,6 +2373,185 @@ def diagnose_spike_prediction(sport, store_label="", props_filter=None, seasons=
           "wire recent-HH% into serving as a bounded projection nudge.)")
 
 
+def diagnose_rbi_context(sport, store_label="", seasons=None, result_games=15):
+    """RBI opportunity-context PROBE (NO WRITE): does the RUNNERS-ON signal (the one
+    variable methods A-E all ignore) add incremental prediction value for batter_rbis?
+
+    RBIs decompose as self (HR) + runners-driven-in, and the runners-on count depends
+    on the LINEUP (teammates' on-base ability), which no batter-only method models —
+    the likely reason method A (raw over-rate) still beats B/C/E for RBIs. This probes
+    three candidate features, each as a SOLE logit augmentation of the incumbent A
+    (candidate = sigmoid(logit(A) + β·z_feat), β grid-fit on train, 2-fold confirmed):
+      • lineup_obp  = mean as-of OBP of the batter's game-lineup teammates (runners-on
+                      proxy; leakage-safe via asof_batter_ops, actual-participants
+                      lineup ≈ the pre-game confirmed lineup),
+      • hr_rate     = trailing HR/AB (self-RBI driver),
+      • exp_ab      = trailing mean AB (opportunity count).
+    A confirmed positive Δ on lineup_obp is the go-signal to build the full method-G
+    distributional RBI model (self HR + runners × drive-in). OFFLINE + FREE. Writes
+    nothing. This is the cheap probe BEFORE the heavy build (the HH%-spike lesson)."""
+    import math
+    import book_line_calibration as blc
+    import mlb_warehouse
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    existing = load_calibration(sport_key) or {}
+    cfg = existing.get("batter_rbis")
+    if not cfg:
+        print("No batter_rbis calibration; run refit first.")
+        return
+    incumbent = cfg.get("method")
+    print(f"\n=== RBI runners-on context PROBE: {sport_key} batter_rbis "
+          f"(incumbent={incumbent}) ===")
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, ["batter_rbis"], store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+    print(f"  {len(book_lines):,} real book lines ({n_store:,} store + {n_pred:,} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league) if o.get("prop_key") == "batter_rbis"]
+    if not enriched:
+        print("  No batter_rbis observations joined to actuals.")
+        return
+
+    params = {
+        "half_life": cfg.get("half_life"),
+        "venue_strength": cfg.get("venue_strength", 0.0),
+        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+        "use_minutes": cfg.get("use_minutes", False),
+    }
+    defense_by_season = None
+    if (cfg.get("opp_defense_strength") or 0.0) > 0:
+        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
+
+    _obp_memo = {}
+
+    def _obp(aid, cutoff):
+        k = (aid, cutoff)
+        if k not in _obp_memo:
+            r = mlb_warehouse.asof_batter_ops(aid, cutoff)
+            _obp_memo[k] = r.get("obp") if r else None
+        return _obp_memo[k]
+
+    rows = []
+    n_no_lineup = 0
+    for obs in enriched:
+        gd = obs.get("game_date")
+        bid = obs.get("player_mlb_id")
+        gpk = (obs.get("test_game") or {}).get("game_pk")
+        if not gd or not bid or not gpk or obs["actual"] == obs["line"]:
+            continue
+        season = int(str(gd)[:4])
+        lineup = mlb_warehouse._game_lineup_index(season).get(gpk)
+        if not lineup:
+            n_no_lineup += 1
+            continue
+        bid = str(bid)
+        mates = None
+        for _tid, aids in lineup.items():
+            if bid in aids:
+                mates = [a for a in aids if a != bid]
+                break
+        if not mates:
+            n_no_lineup += 1
+            continue
+        obps = [_obp(a, gd) for a in mates]
+        obps = [o for o in obps if o is not None]
+        if len(obps) < 4:                    # need a real lineup sample
+            continue
+        lineup_obp = sum(obps) / len(obps)
+        proj, emp = blc.project_and_empirical(
+            obs, params, sport_key, defense_by_season=defense_by_season)
+        if emp is None:
+            continue
+        pg = obs["prior_games"][:result_games]
+        ab = sum((g.get("AB") or 0) for g in pg)
+        if ab < 15:
+            continue
+        hr = sum((g.get("HR") or 0) for g in pg)
+        rows.append({
+            "game_date": gd, "season": season,
+            "lineup_obp": lineup_obp,
+            "hr_rate": hr / ab,
+            "exp_ab": ab / len(pg),
+            "a": max(1e-6, min(1.0 - 1e-6, emp)),   # incumbent A prob
+            "over": 1 if obs["actual"] > obs["line"] else 0,
+        })
+    print(f"  built {len(rows):,} usable obs (dropped {n_no_lineup:,} with no "
+          f"reconstructable lineup)")
+    if len(rows) < 200:
+        print(f"  Only {len(rows)} usable obs (<200) — too thin to judge.")
+        return
+    rows.sort(key=lambda r: r["game_date"])
+
+    def _logit(p):
+        return math.log(p / (1.0 - p))
+
+    def _sig(x):
+        if x >= 0:
+            return 1.0 / (1.0 + math.exp(-x))
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    B_GRID = [i * 0.05 for i in range(-12, 13)]
+
+    def _brier(sub, fn):
+        return sum((fn(r) - r["over"]) ** 2 for r in sub) / len(sub)
+
+    def _gate(feat, train, test):
+        mu = sum(r[feat] for r in train) / len(train)
+        var = sum((r[feat] - mu) ** 2 for r in train) / len(train)
+        sd = math.sqrt(var) if var > 0 else 1e-9
+        z = lambda r: (r[feat] - mu) / sd
+        base_tr = _brier(train, lambda r: r["a"])
+        best_b, best_tr = 0.0, base_tr
+        for b in B_GRID:
+            tr = _brier(train, lambda r: _sig(_logit(r["a"]) + b * z(r)))
+            if tr < best_tr:
+                best_b, best_tr = b, tr
+        base_te = _brier(test, lambda r: r["a"])
+        cand_te = _brier(test, lambda r: _sig(_logit(r["a"]) + best_b * z(r)))
+        return best_b, base_te, cand_te
+
+    split = len(rows) // 2
+    folds = blc._real_line_folds(rows)
+    print(f"\n  incremental prediction gate vs incumbent A (n={len(rows)}, "
+          f"single split + {len(folds)}-fold):")
+    print("    {:<14}{:>8}{:>12}{:>12}{:>10}{:>22}".format(
+        "feature", "beta", "A_brier", "+feat", "delta", "2-fold delta"))
+    for feat in ("lineup_obp", "hr_rate", "exp_ab"):
+        best_b, base_te, cand_te = _gate(feat, rows[:split], rows[split:])
+        delta = base_te - cand_te
+        fds = [(_gate(feat, tr, te)) for tr, te in folds]
+        fdeltas = [b1 - c1 for (_b, b1, c1) in fds]
+        confirmed = (delta >= MIN_CALIB_BRIER_GAIN and folds
+                     and all(d > 0 for d in fdeltas))
+        print("    {:<14}{:>8}{:>12}{:>12}{:>10}{:>22}  {}".format(
+            feat, f"{best_b:+.2f}", f"{base_te:.4f}", f"{cand_te:.4f}",
+            f"{delta:+.4f}", str(['%+.4f' % d for d in fdeltas]),
+            "SHIP" if confirmed else "no"))
+
+    # Residual by lineup-OBP quartile (interpretation).
+    rr = sorted(rows, key=lambda r: r["lineup_obp"])
+    qn = len(rr) // 4
+    print("\n  residual (realized OVER − incumbent A) by lineup-OBP quartile:")
+    for lo, hi, lbl in [(0, qn, "Q1 low OBP"), (qn, 2 * qn, "Q2"),
+                        (2 * qn, 3 * qn, "Q3"), (3 * qn, len(rr), "Q4 high OBP")]:
+        sub = rr[lo:hi]
+        if sub:
+            resid = sum(r["over"] - r["a"] for r in sub) / len(sub)
+            print(f"    {lbl:<12} n={len(sub):<6} mean_obp={sum(r['lineup_obp'] for r in sub)/len(sub):.3f}"
+                  f"  mean_resid={resid:+.4f}")
+    print("\n  (Diagnostic only — nothing written. A confirmed lineup_obp Δ is the "
+          "go-signal for the full method-G distributional RBI model.)")
+
+
 def diagnose_center(sport, prop_filter=None, store_label=""):
     """Mean-vs-median central-tendency diagnostic (NO WRITE).
 
@@ -4260,6 +4439,11 @@ def main():
                    help="Keep-if-better PREDICTION gate for the recent-HH%-spike "
                         "feature: does sigmoid(logit(incumbent)+β·z_spike) beat the "
                         "shipped method OOS (2-fold confirmed)? (no write).")
+    p.add_argument("--rbi-diag", action="store_true",
+                   help="RBI runners-on context PROBE: does lineup-OBP (+ HR-rate, "
+                        "exp-AB) add incremental prediction value over the incumbent "
+                        "A for batter_rbis? Go/no-go for the method-G RBI model "
+                        "(no write).")
     p.add_argument("--center-diag", action="store_true",
                    help="Mean-vs-median: re-score each calibrated prop's incumbent "
                         "method on the real-line holdout with a recency-weighted "
@@ -4445,6 +4629,13 @@ def main():
             args.sport, store_label=args.store_label,
             props_filter=([p.strip() for p in args.div_props.split(",") if p.strip()]
                           if args.div_props else None),
+            seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+                     if args.seasons else None))
+        return
+
+    if args.rbi_diag:
+        diagnose_rbi_context(
+            args.sport, store_label=args.store_label,
             seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
                      if args.seasons else None))
         return
