@@ -85,7 +85,11 @@ def _adjust(pairs, n_iter=N_ITER):
         for t in off_n:
             corr = sum(w[(t, d)] * def_adj.get(d, 0.0)
                        for d in def_n if (t, d) in w) / off_n[t]
-            new_off[t] = raw_off[t] + corr        # + because def_adj>0 = tough D suppressed us
+            # off[t] = raw_off[t] - avg(def-permissiveness faced). def_adj derives
+            # from raw_def = EPA ALLOWED (weak D = HIGH), so facing weak defenses
+            # (def_adj>0) INFLATES raw_off → subtract. (Was erroneously '+', which
+            # inverted the whole opponent adjustment.) [review-driven fix 2026-09-09]
+            new_off[t] = raw_off[t] - corr
         new_def = {}
         for d in def_n:
             corr = sum(w[(t, d)] * new_off.get(t, 0.0)
