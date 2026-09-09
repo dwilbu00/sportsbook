@@ -349,6 +349,20 @@ class BatterQualityIndex:
             return None
         return {"hard_hit_pct": hh, "barrel_pct": brl}
 
+    def asof_window(self, batter, as_of, window, min_count=1):
+        """ROLLING hard-hit% / barrel% over the LAST ``window`` batted balls
+        strictly before ``as_of`` — the LEADING-indicator (fast-stabilizing)
+        counterpart to ``asof``'s season-to-date rate. Hard-hit% stabilizes in
+        ~40 BBE, so a short rolling window is a trustworthy "current form" signal.
+        Returns {"hard_hit_pct", "barrel_pct"} or None when fewer than
+        ``min_count`` batted balls fall in the window."""
+        key = str(batter)
+        hh = self._hh.asof_window_mean(key, as_of, window, min_count=min_count)
+        brl = self._brl.asof_window_mean(key, as_of, window, min_count=min_count)
+        if hh is None and brl is None:
+            return None
+        return {"hard_hit_pct": hh, "barrel_pct": brl}
+
 
 def build_batter_quality_index(rows):
     """As-of hard-hit% / barrel% a BATTER produced (keyed by batter MLBAM id).

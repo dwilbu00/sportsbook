@@ -1923,6 +1923,226 @@ def diagnose_tb_distributional(sport, store_label="", seasons=None):
           "per-bucket gate adopt F for a batter_total_bases line bucket.)")
 
 
+def diagnose_divergence(sport, store_label="", props_filter=None, seasons=None,
+                        hh_window=50, hh_min=25, result_games=10, min_recent_ab=15):
+    """Edge-first test of the LEADING/LAGGING contact-divergence thesis (NO WRITE).
+
+    Hard-hit% stabilizes fast (~40 BBE) — a LEADING indicator of the physical tool;
+    outcomes (SLG/hits) and even xBA lag. The thesis: when a hitter's ROLLING recent
+    hard-hit% is high but recent RESULTS are low, DK/FD price the prop off the poor
+    visible results, so OVER is underpriced — the tool is firing and results catch up.
+
+    Per real-line obs computes a leakage-safe divergence = pctile(rolling HH% over the
+    last ``hh_window`` BBE) − pctile(trailing SLG over the last ``result_games``),
+    both ranked WITHIN season (self-normalizing, era-robust). Buckets obs by
+    divergence quartile and reports, per bucket (and per season for the top bucket):
+      • realized OVER rate,
+      • de-vigged CONSENSUS market-implied OVER,
+      • EDGE = realized − implied  (price-ROBUST mispricing signal — the headline),
+      • directional OVER ROI at the best consensus price (optimistic; DK/FD is the
+        real execution gate — consensus best-price overstates it).
+    The thesis PASSES only if the top-divergence bucket shows a positive edge that
+    REPLICATES across seasons (not one-season, per the batter-K lesson). OFFLINE +
+    FREE (store + free ESPN gamelogs + cached raw Statcast). Writes nothing."""
+    import book_line_calibration as blc
+    from odds_client import (american_to_implied_prob, devig_two_way,
+                             american_to_decimal)
+    import savant_history as sh
+    import backtest_props
+    import mlb_starters
+
+    espn_sport, espn_league, sport_key = SPORT_MAP[sport]
+    target = props_filter or ["batter_total_bases", "batter_hits"]
+    print(f"\n=== leading/lagging contact-divergence EDGE diagnostic: {sport_key} "
+          f"{target} ===")
+    print(f"  windows: HH% rolling last {hh_window} BBE (min {hh_min}); trailing SLG "
+          f"last {result_games} games (min {min_recent_ab} AB)")
+    book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
+        sport_key, target, store_label)
+    if seasons:
+        _yset = {str(s) for s in seasons}
+        book_lines = [r for r in book_lines
+                      if str(r.get("game_date") or "")[:4] in _yset]
+    print(f"  {len(book_lines):,} real book lines ({n_store:,} store + {n_pred:,} "
+          f"prediction log)")
+    if not book_lines:
+        print("  No real book lines; nothing to diagnose.")
+        return
+    enriched = [o for o in blc.join_book_lines_to_actuals(
+        book_lines, espn_sport, espn_league) if o.get("prop_key") in target]
+    if not enriched:
+        print("  No observations joined to actuals.")
+        return
+
+    years = sorted({str(o["game_date"])[:4] for o in enriched if o.get("game_date")})
+    raw = []
+    for y in years:
+        try:
+            raw.extend(sh.load_days(f"{y}-03-01", f"{y}-11-30"))
+        except Exception:
+            pass
+    if not raw:
+        print(f"  [warn] no raw Statcast days cached for {years} — no HH% signal, "
+              f"aborting.")
+        return
+    quality_index = backtest_props.build_batter_quality_index(raw)
+
+    pid_cache = {}
+
+    def _pid(player, season):
+        k = (player, season)
+        if k in pid_cache:
+            return pid_cache[k]
+        pid = None
+        try:
+            info = mlb_starters.find_player_id(player, season)
+            if info and info[0] and not info[1]:      # batter only
+                pid = str(info[0])
+        except Exception:
+            pid = None
+        pid_cache[k] = pid
+        return pid
+
+    rows = []
+    for obs in enriched:
+        gd = obs.get("game_date")
+        if not gd or obs["actual"] == obs["line"]:      # need date; drop pushes
+            continue
+        season = int(str(gd)[:4])
+        pid = _pid(obs["player"], season)
+        if not pid:
+            continue
+        qw = quality_index.asof_window(pid, gd, hh_window, min_count=hh_min)
+        if not qw or qw.get("hard_hit_pct") is None:
+            continue
+        # Season-to-date HH% (the player's OWN baseline) — the within-player SPIKE
+        # (recent − season) is the faithful "HH% spikes significantly" signal, vs
+        # the cross-population level of recent HH%.
+        qs = quality_index.asof(pid, gd)
+        hh_season = qs.get("hard_hit_pct") if qs else None
+        pg = obs["prior_games"][:result_games]           # most-recent-first
+        ab = sum((g.get("AB") or 0) for g in pg)
+        tb = sum((g.get("TB") or 0) for g in pg)
+        if ab < min_recent_ab:
+            continue
+        op, up = obs.get("over_price"), obs.get("under_price")
+        imp_over = None
+        if op is not None and up is not None:
+            try:
+                imp_over = devig_two_way(american_to_implied_prob(op),
+                                         american_to_implied_prob(up))[0]
+            except Exception:
+                imp_over = None
+        rows.append({
+            "season": season,
+            "hh_recent": qw["hard_hit_pct"],
+            "hh_spike": (qw["hard_hit_pct"] - hh_season
+                         if hh_season is not None else None),
+            "slg_recent": tb / ab,
+            "over": 1 if obs["actual"] > obs["line"] else 0,
+            "imp_over": imp_over,
+            "over_price": op,
+        })
+    if len(rows) < 200:
+        print(f"  Only {len(rows)} usable obs (<200) — too thin to judge.")
+        return
+
+    # Within-season percentile ranks (self-normalizing) → divergence.
+    from collections import defaultdict
+    by_season = defaultdict(list)
+    for r in rows:
+        by_season[r["season"]].append(r)
+
+    def _pctile_ranks(vals):
+        order = sorted(range(len(vals)), key=lambda i: vals[i])
+        ranks = [0.0] * len(vals)
+        n = len(vals)
+        for rank, i in enumerate(order):
+            ranks[i] = rank / (n - 1) if n > 1 else 0.5
+        return ranks
+
+    # Rows with a season baseline (for the within-player spike variant).
+    spike_rows = [r for r in rows if r.get("hh_spike") is not None]
+    for _season, grp in by_season.items():
+        hh_r = _pctile_ranks([r["hh_recent"] for r in grp])
+        slg_r = _pctile_ranks([r["slg_recent"] for r in grp])
+        for r, h, s in zip(grp, hh_r, slg_r):
+            r["div"] = h - s          # +1 = HH% high (level), results low
+    # Within-player SPIKE divergence: pctile(recent HH% − season HH%) − pctile(SLG).
+    sp_by_season = defaultdict(list)
+    for r in spike_rows:
+        sp_by_season[r["season"]].append(r)
+    for _season, grp in sp_by_season.items():
+        sp_r = _pctile_ranks([r["hh_spike"] for r in grp])
+        slg_r = _pctile_ranks([r["slg_recent"] for r in grp])
+        for r, sp, s in zip(grp, sp_r, slg_r):
+            r["div_spike"] = sp - s   # +1 = HH% spiking vs own baseline, results low
+
+    def _report(subset, label):
+        n = len(subset)
+        if not n:
+            print(f"    {label:<16} (empty)")
+            return
+        over_rate = sum(r["over"] for r in subset) / n
+        priced = [r for r in subset if r["imp_over"] is not None]
+        imp = sum(r["imp_over"] for r in priced) / len(priced) if priced else None
+        edge = (over_rate - imp) if imp is not None else None
+        # directional OVER ROI at best consensus price
+        roi_rows = [r for r in subset if r["over_price"] is not None]
+        roi = None
+        if roi_rows:
+            tot = 0.0
+            for r in roi_rows:
+                dec = american_to_decimal(r["over_price"])
+                tot += (dec - 1.0) if r["over"] else -1.0
+            roi = tot / len(roi_rows)
+        print("    {:<16}{:>7}{:>11}{:>11}{:>10}{:>10}".format(
+            label, n,
+            f"{over_rate:.3f}",
+            f"{imp:.3f}" if imp is not None else "-",
+            f"{edge:+.3f}" if edge is not None else "-",
+            f"{roi:+.3f}" if roi is not None else "-"))
+
+    def _quartile_report(data, key, title):
+        data = [r for r in data if r.get(key) is not None]
+        if len(data) < 200:
+            print(f"\n  {title}: only {len(data)} obs — skipped.")
+            return None
+        data.sort(key=lambda r: r[key])
+        qn = len(data) // 4
+        quartiles = [("Q1 (low div)", data[:qn]),
+                     ("Q2", data[qn:2 * qn]),
+                     ("Q3", data[2 * qn:3 * qn]),
+                     ("Q4 (high div)", data[3 * qn:])]
+        print(f"\n  {title}  (n={len(data)}; Q4 = HH% {'spiking' if key=='div_spike' else 'high'}, "
+              f"lagging results = the thesis target cell)")
+        print("    {:<16}{:>7}{:>11}{:>11}{:>10}{:>10}".format(
+            "bucket", "n", "over_rate", "impl_over", "edge", "roi@best"))
+        for label, sub in quartiles:
+            _report(sub, label)
+        return quartiles[-1][1]
+
+    print("    (edge = realized OVER − market-implied OVER; price-robust. roi@best "
+          "= directional only, consensus best price overstates DK/FD.)")
+    q4_level = _quartile_report(rows, "div", "A) LEVEL divergence "
+                                "(recent HH% pctile − recent SLG pctile)")
+    q4_spike = _quartile_report(spike_rows, "div_spike", "B) SPIKE divergence "
+                                "(recent−season HH% pctile − recent SLG pctile)")
+
+    for q4, tag in ((q4_level, "LEVEL"), (q4_spike, "SPIKE")):
+        if not q4:
+            continue
+        print(f"\n  Top-quartile (Q4) EDGE by season — {tag} (replication: a real "
+              f"signal holds sign across seasons):")
+        print("    {:<16}{:>7}{:>11}{:>11}{:>10}{:>10}".format(
+            "season", "n", "over_rate", "impl_over", "edge", "roi@best"))
+        for s in sorted({r["season"] for r in q4}):
+            _report([r for r in q4 if r["season"] == s], str(s))
+
+    print("\n  (Diagnostic only — nothing written. A positive Q4 edge that REPLICATES "
+          "across seasons is the go-signal to validate at true DK/FD execution prices.)")
+
+
 def diagnose_center(sport, prop_filter=None, store_label=""):
     """Mean-vs-median central-tendency diagnostic (NO WRITE).
 
@@ -3798,6 +4018,14 @@ def main():
                         "model (method F) vs A/B/C/E on the batter_total_bases real-"
                         "line holdout, and report whether F beats the incumbent E "
                         "(no write).")
+    p.add_argument("--div-diag", action="store_true",
+                   help="Leading/lagging contact-divergence EDGE test: bucket real-"
+                        "line batter obs by (rolling HH% pctile − trailing SLG "
+                        "pctile) and report realized-minus-implied OVER edge + ROI "
+                        "per bucket and per season (no write).")
+    p.add_argument("--div-props", default=None,
+                   help="Comma-separated props for --div-diag (default "
+                        "batter_total_bases,batter_hits).")
     p.add_argument("--center-diag", action="store_true",
                    help="Mean-vs-median: re-score each calibrated prop's incumbent "
                         "method on the real-line holdout with a recency-weighted "
@@ -3965,6 +4193,15 @@ def main():
     if args.tb_diag:
         diagnose_tb_distributional(
             args.sport, store_label=args.store_label,
+            seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+                     if args.seasons else None))
+        return
+
+    if args.div_diag:
+        diagnose_divergence(
+            args.sport, store_label=args.store_label,
+            props_filter=([p.strip() for p in args.div_props.split(",") if p.strip()]
+                          if args.div_props else None),
             seasons=([int(s.strip()) for s in args.seasons.split(",") if s.strip()]
                      if args.seasons else None))
         return
