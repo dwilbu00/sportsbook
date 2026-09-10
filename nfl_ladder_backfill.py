@@ -6,14 +6,19 @@ negative because −4h is already near the market consensus. To test the OPENER 
 a fair fight) we capture a dense time ladder from the opener down to the close, for all
 three books, and later measure how our model's edge/CLV decays as kickoff approaches.
 
-CAPTURE (one combined historical call per snapshot = 10 × #markets × 1 region):
+CAPTURE (one historical call per snapshot = 10 × #markets × 1 region):
   * books   : draftkings, fanduel (EXECUTABLE) + pinnacle (SHARP REFERENCE, analysis-only
               per the standing rule — never sized off / recommended; used only to gauge how
               soft a DK/FD number is vs the sharp consensus).
-  * markets : team h2h/spreads/totals + 8 player-prop markets (all in one call).
+  * PROPS   : 8 player-prop markets at EVERY rung (80 credits) — props are where the edge
+              lives, so they get the full dense ladder.
+  * TEAM    : h2h/spreads/totals only at the OPENER rung (the earliest offset) — team
+              markets have less edge and we already hold their late snapshots (early_12h,
+              early_4h, close) in the mirror, so teams only need the opener. (+30 credits
+              at that one rung.)
   * offsets : 6h ladder from −114h → −6h, plus close (−10min), ordered NEAREST-KICKOFF
               FIRST so a --max-credits stop only drops the earliest dead-zone snaps (where
-              props barely exist and team lines have moved little).
+              props barely exist).
   * regions : 'us' — the probe confirmed all three books (incl. pinnacle) return here at
               single-region cost (no eu doubling).
 
@@ -36,14 +41,22 @@ TEAM_MARKETS = ["h2h", "spreads", "totals"]
 PROP_MARKETS = ["player_pass_yds", "player_pass_tds", "player_pass_attempts",
                 "player_pass_completions", "player_rush_yds", "player_rush_attempts",
                 "player_receptions", "player_reception_yds"]
-ALL_MARKETS = ",".join(TEAM_MARKETS + PROP_MARKETS)
+PROP_ONLY = ",".join(PROP_MARKETS)
+TEAM_PLUS = ",".join(TEAM_MARKETS + PROP_MARKETS)
 BOOKS = ["draftkings", "fanduel", "pinnacle"]        # pinnacle = analysis-only reference
 STORE_DIR = "nfl_ladder_data"
 WORKERS = 10
-EST_CALL_COST = 10 * (len(TEAM_MARKETS) + len(PROP_MARKETS)) * 1   # 110
+COST_PROPS = 10 * len(PROP_MARKETS) * 1                       # 80
+COST_TEAMPLUS = 10 * (len(TEAM_MARKETS) + len(PROP_MARKETS))  # 110
 
 # 6h ladder + close, NEAREST-KICKOFF FIRST.
 OFFSETS_H = [10.0 / 60.0] + list(range(6, 115, 6))   # close, −6h, −12h, … −114h
+TEAM_OPENER_H = 114                                  # pull team markets only at this rung
+
+
+def _markets_for(offset_h):
+    """Team markets ride along only at the opener rung; every other rung is props-only."""
+    return TEAM_PLUS if int(round(offset_h)) == TEAM_OPENER_H else PROP_ONLY
 
 
 def _load_key():
@@ -98,13 +111,13 @@ def _rows_from_snapshot(data, snap_ts, game, offset_h):
     return out
 
 
-def _fetch(key, game, offset_h):
+def _fetch(key, game, offset_h, markets):
     c0 = dt.datetime.fromisoformat(game["commence"].replace("Z", "+00:00"))
     date = (c0 - dt.timedelta(hours=offset_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         data, snap_ts = get_historical_event_odds(
             key, SPORT, game["event_id"], date, regions="us",
-            markets=ALL_MARKETS, bookmakers=BOOKS)
+            markets=markets, bookmakers=BOOKS)
     except Exception:
         return []
     return _rows_from_snapshot(data, snap_ts, game, offset_h)
@@ -113,12 +126,13 @@ def _fetch(key, game, offset_h):
 def run(seasons, max_credits, dry_run):
     games = enumerate_games(seasons)
     n_calls = len(games) * len(OFFSETS_H)
+    ceiling = len(games) * ((len(OFFSETS_H) - 1) * COST_PROPS + COST_TEAMPLUS)
     print("=" * 96)
     print(f"  NFL LADDER BACKFILL — {len(games)} games × {len(OFFSETS_H)} offsets "
           f"= {n_calls:,} calls")
-    print(f"  books={BOOKS}  markets={len(TEAM_MARKETS)+len(PROP_MARKETS)} "
-          f"(~{EST_CALL_COST}/call)  ceiling ≈ {n_calls*EST_CALL_COST:,} credits  "
-          f"cap={max_credits:,}")
+    print(f"  books={BOOKS}  props={COST_PROPS}/call every rung, "
+          f"team+props={COST_TEAMPLUS} only at −{TEAM_OPENER_H}h opener")
+    print(f"  ceiling ≈ {ceiling:,} credits   cap={max_credits:,}")
     print(f"  offsets (nearest-first): {[round(o,1) for o in OFFSETS_H]}")
     print("=" * 96)
     if dry_run:
@@ -134,8 +148,10 @@ def run(seasons, max_credits, dry_run):
     print(f"  start credits: {start_rem}")
 
     for offset in OFFSETS_H:
+        markets = _markets_for(offset)
+        est = len(games) * (COST_TEAMPLUS if markets == TEAM_PLUS else COST_PROPS)
         spent = (start_rem - get_remaining_credits()) if start_rem else 0
-        if spent + len(games) * EST_CALL_COST > max_credits:
+        if spent + est > max_credits:
             print(f"  [cap] stopping before −{offset:.1f}h "
                   f"(spent {spent:,}, next offset would exceed {max_credits:,})")
             break
@@ -146,7 +162,7 @@ def run(seasons, max_credits, dry_run):
             continue
         rows = []
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = [ex.submit(_fetch, key, g, offset) for g in games]
+            futs = [ex.submit(_fetch, key, g, offset, markets) for g in games]
             for f in as_completed(futs):
                 rows.extend(f.result())
         if rows:
