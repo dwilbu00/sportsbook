@@ -1,38 +1,46 @@
-"""nfl_ladder_backfill.py — dense 6h opener→close ladder for NFL team + prop markets.
+"""nfl_ladder_backfill.py — dense 6h opener ladder for NFL props (+ team opener),
+persisted DIRECTLY to the Azure warehouse as it fetches.
 
 The opener probe proved NFL props post ~4-5 days out, and the −4h→close CLV test was
 negative because −4h is already near the market consensus. To test the OPENER thesis
-(the early line ≈ the book's own model, before sharp money corrects it → model-vs-model,
-a fair fight) we capture a dense time ladder from the opener down to the close, for all
-three books, and later measure how our model's edge/CLV decays as kickoff approaches.
+(the early line ≈ the book's own model, before sharp money corrects it → model-vs-model)
+we capture a dense time ladder from the opener down toward kickoff, for all three books.
+
+DURABILITY (Doug's rule): NOTHING local is durable — Azure SQL is the only system of
+record. So every rung is written to the warehouse the instant it's fetched, via the same
+write-once path the rest of the odds warehouse uses (db_store.capture_odds_snapshot with
+ingest_multibook_cache._per_book_lines). No local-only parquet.
 
 CAPTURE (one historical call per snapshot = 10 × #markets × 1 region):
   * books   : draftkings, fanduel (EXECUTABLE) + pinnacle (SHARP REFERENCE, analysis-only
-              per the standing rule — never sized off / recommended; used only to gauge how
-              soft a DK/FD number is vs the sharp consensus).
-  * PROPS   : 8 player-prop markets at EVERY rung (80 credits) — props are where the edge
-              lives, so they get the full dense ladder.
-  * TEAM    : h2h/spreads/totals only at the OPENER rung (the earliest offset) — team
-              markets have less edge and we already hold their late snapshots (early_12h,
-              early_4h, close) in the mirror, so teams only need the opener. (+30 credits
-              at that one rung.)
-  * offsets : 6h ladder from −114h → −6h, plus close (−10min), ordered NEAREST-KICKOFF
-              FIRST so a --max-credits stop only drops the earliest dead-zone snaps (where
-              props barely exist).
-  * regions : 'us' — the probe confirmed all three books (incl. pinnacle) return here at
-              single-region cost (no eu doubling).
+              per the standing rule — stored like any book; the analysis-only convention is
+              enforced at READ time as bookmaker=='pinnacle', not by a DB flag).
+  * PROPS   : 8 player-prop markets at EVERY rung (80 credits) — kind='props'.
+  * TEAM    : h2h/spreads/totals only at the −114h opener rung (+30) — kind='team'. We
+              already hold the LATE team snapshots (early_12h/early_4h/close) in Azure, so
+              teams only need the opener.
+  * offsets : 6h ladder −6h → −114h. The CLOSE and −4h are NOT re-fetched — the warehouse
+              already holds `closing` and `early_4h` for all three books (verified), so the
+              CLV analysis uses those as the late endpoints. Ordered nearest-kickoff first.
+  * source  : per-rung tag 'ladder_006h' … 'ladder_114h' (the write-once uq key already
+              keeps rungs distinct via snapshot_hour; the tag is for WHERE-filtering).
 
-SAFETY: get_historical_event_odds caches permanently, so re-runs re-read for 0 credits
-(fully resumable). --max-credits is a hard cap checked between offsets. --dry-run prints
-the plan and spends nothing. Writes per-offset parquet to nfl_ladder_data/.
+RESUME/IDEMPOTENT: at start we load the set of (event_id, kind, snapshot_hour) already in
+the warehouse under ladder sources; those rungs are SKIPPED with no fetch (0 credits), so a
+resume after any interruption re-does only what's missing. capture_odds_snapshot is
+write-once (duplicate → skipped). Fetch runs parallel; the SQL write runs serially in the
+main thread (the 20-DTU tier throttles concurrent prop-heavy writes). --dry-run spends and
+writes nothing. Recommend SQL_DRIVER=pyodbc for the bulk line insert (fast_executemany).
 """
 import argparse
 import datetime as dt
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
+from sqlalchemy import text
 
+import db_store
+import ingest_multibook_cache as im
+import warehouse as wh
 import warehouse_mirror as wm
 from odds_client import get_historical_event_odds, get_remaining_credits
 
@@ -41,22 +49,34 @@ TEAM_MARKETS = ["h2h", "spreads", "totals"]
 PROP_MARKETS = ["player_pass_yds", "player_pass_tds", "player_pass_attempts",
                 "player_pass_completions", "player_rush_yds", "player_rush_attempts",
                 "player_receptions", "player_reception_yds"]
+TEAM_CSV = ",".join(TEAM_MARKETS)
 PROP_ONLY = ",".join(PROP_MARKETS)
 TEAM_PLUS = ",".join(TEAM_MARKETS + PROP_MARKETS)
 BOOKS = ["draftkings", "fanduel", "pinnacle"]        # pinnacle = analysis-only reference
-STORE_DIR = "nfl_ladder_data"
-WORKERS = 10
+WORKERS = 10                                          # FETCH concurrency (writes stay serial)
 COST_PROPS = 10 * len(PROP_MARKETS) * 1                       # 80
 COST_TEAMPLUS = 10 * (len(TEAM_MARKETS) + len(PROP_MARKETS))  # 110
 
-# 6h ladder + close, NEAREST-KICKOFF FIRST.
-OFFSETS_H = [10.0 / 60.0] + list(range(6, 115, 6))   # close, −6h, −12h, … −114h
-TEAM_OPENER_H = 114                                  # pull team markets only at this rung
+OFFSETS_H = list(range(6, 115, 6))    # −6h … −114h, nearest-kickoff first (NO close/−4h)
+TEAM_OPENER_H = 114                   # team markets ride along only at this opener rung
+
+
+def _src(offset_h):
+    return f"ladder_{int(round(offset_h)):03d}h"
+
+
+def _kinds_for(offset_h):
+    return ["props", "team"] if int(round(offset_h)) == TEAM_OPENER_H else ["props"]
 
 
 def _markets_for(offset_h):
-    """Team markets ride along only at the opener rung; every other rung is props-only."""
     return TEAM_PLUS if int(round(offset_h)) == TEAM_OPENER_H else PROP_ONLY
+
+
+def _rung_ts_sh(commence, offset_h):
+    c0 = dt.datetime.fromisoformat(commence.replace("Z", "+00:00"))
+    ts = (c0 - dt.timedelta(hours=offset_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ts, wh._hour_bucket(ts)
 
 
 def _load_key():
@@ -69,11 +89,12 @@ def _load_key():
                     return k
         except Exception:
             pass
+    import os
     return os.environ.get("ODDS_API_KEY", "")
 
 
 def enumerate_games(seasons):
-    """Distinct (event_id, commence, home, away, season) for NFL games in the mirror."""
+    """Distinct (event_id, commence, home, away, season) for NFL games in the warehouse."""
     games = {}
     for y in seasons:
         rows = wm.player_prop_lines(SPORT, date_from=f"{y}-01-01",
@@ -83,100 +104,128 @@ def enumerate_games(seasons):
             if eid and eid not in games:
                 games[eid] = {"event_id": eid, "commence": r.get("commence_time"),
                               "home": r.get("home"), "away": r.get("away"), "season": y}
-    return list(games.values())
+    return [g for g in games.values() if g["commence"]]
 
 
-def _rows_from_snapshot(data, snap_ts, game, offset_h):
-    """Flatten bookmakers→markets→outcomes into research rows."""
-    if not data:
-        return []
-    out = []
-    for bk in data.get("bookmakers", []):
-        book = bk.get("key")
-        if book not in BOOKS:
-            continue
-        for mk in bk.get("markets", []):
-            m = mk.get("key")
-            is_prop = m.startswith("player_")
-            for oc in mk.get("outcomes", []):
-                out.append({
-                    "event_id": game["event_id"], "season": game["season"],
-                    "commence": game["commence"], "home": game["home"],
-                    "away": game["away"], "offset_h": round(offset_h, 3),
-                    "snapshot_ts": snap_ts, "book": book, "market": m,
-                    "player": oc.get("description") if is_prop else None,
-                    "name": oc.get("name"), "point": oc.get("point"),
-                    "price": oc.get("price"),
-                })
-    return out
+def _preload_done():
+    """{(event_id, kind, snapshot_hour)} already persisted under ladder_* sources — so a
+    resume re-fetches nothing already durable in Azure."""
+    eng = db_store.get_engine()
+    done = set()
+    with eng.connect() as c:
+        for r in c.execute(text(
+                "SELECT event_id, kind, snapshot_hour FROM odds_snapshot "
+                "WHERE sport=:sp AND source LIKE 'ladder_%'"), {"sp": SPORT}):
+            done.add((r[0], r[1], r[2]))
+    return done
 
 
-def _fetch(key, game, offset_h, markets):
-    c0 = dt.datetime.fromisoformat(game["commence"].replace("Z", "+00:00"))
-    date = (c0 - dt.timedelta(hours=offset_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _fetch_raw(key, game, offset_h, markets):
+    ts, sh = _rung_ts_sh(game["commence"], offset_h)
     try:
-        data, snap_ts = get_historical_event_odds(
-            key, SPORT, game["event_id"], date, regions="us",
+        data, snap = get_historical_event_odds(
+            key, SPORT, game["event_id"], ts, regions="us",
             markets=markets, bookmakers=BOOKS)
     except Exception:
-        return []
-    return _rows_from_snapshot(data, snap_ts, game, offset_h)
+        data, snap = None, None
+    return game, data, snap, ts, sh
+
+
+def _persist(game, data, snap, sh, offset_h, kinds, done):
+    """Write the not-yet-durable kinds for one game/rung to Azure. Returns (written, skipped)."""
+    written = skipped = 0
+    commence = data.get("commence_time") or game["commence"]
+    for kind in kinds:
+        if (game["event_id"], kind, sh) in done:
+            continue
+        lines = im._per_book_lines(data, kind)
+        if not lines:
+            continue
+        meta = {
+            "sport": SPORT, "game_date": commence[:10], "event_id": game["event_id"],
+            "kind": kind, "snapshot_hour": sh, "captured_at": snap,
+            "commence_time": commence,
+            "home": data.get("home_team") or game["home"],
+            "away": data.get("away_team") or game["away"],
+            "regions": "us", "markets": TEAM_CSV if kind == "team" else PROP_ONLY,
+            "bookmakers": ",".join(BOOKS), "source": _src(offset_h),
+        }
+        ok = db_store.capture_odds_snapshot(meta, lines)
+        if ok:
+            written += 1
+            done.add((game["event_id"], kind, sh))
+        else:
+            skipped += 1
+    return written, skipped
 
 
 def run(seasons, max_credits, dry_run):
+    db_store.promote_secrets_from_toml()
+    if not db_store.enabled():
+        print("  Azure SQL is NOT configured — refusing to fetch without a durable sink "
+              "(nothing local is durable). Set SQL_* secrets. Aborting, nothing spent.")
+        return
     games = enumerate_games(seasons)
-    n_calls = len(games) * len(OFFSETS_H)
     ceiling = len(games) * ((len(OFFSETS_H) - 1) * COST_PROPS + COST_TEAMPLUS)
     print("=" * 96)
-    print(f"  NFL LADDER BACKFILL — {len(games)} games × {len(OFFSETS_H)} offsets "
-          f"= {n_calls:,} calls")
-    print(f"  books={BOOKS}  props={COST_PROPS}/call every rung, "
-          f"team+props={COST_TEAMPLUS} only at −{TEAM_OPENER_H}h opener")
+    print(f"  NFL LADDER BACKFILL → Azure — {len(games)} games × {len(OFFSETS_H)} rungs")
+    print(f"  books={BOOKS}  props={COST_PROPS}/rung, team+props={COST_TEAMPLUS} at "
+          f"−{TEAM_OPENER_H}h  (close/−4h already in warehouse — not re-fetched)")
     print(f"  ceiling ≈ {ceiling:,} credits   cap={max_credits:,}")
-    print(f"  offsets (nearest-first): {[round(o,1) for o in OFFSETS_H]}")
+    print(f"  offsets (nearest-first): {OFFSETS_H}")
     print("=" * 96)
-    if dry_run:
-        print("  (dry-run — no credits spent)")
-        return
 
+    done = _preload_done()
+    print(f"  already-durable ladder snapshots in Azure: {len(done):,}")
+    if dry_run:
+        print("  (dry-run — no credits spent, nothing written)")
+        return
     key = _load_key()
     if not key:
         print("  NO API KEY (app.load_config / ODDS_API_KEY). Aborting — nothing spent.")
         return
-    os.makedirs(STORE_DIR, exist_ok=True)
-    # NOTE: get_remaining_credits() is None until the first live call in this process, and
-    # cached calls cost 0 — so the cap is driven by a CONSERVATIVE running estimate (full
-    # market cost counted for every offset we actually fetch). That never under-counts real
-    # spend, so the cap is a safe upper bound; the real remaining is shown when available.
+
     spent_est = 0
     for offset in OFFSETS_H:
+        kinds = _kinds_for(offset)
         markets = _markets_for(offset)
-        est = len(games) * (COST_TEAMPLUS if markets == TEAM_PLUS else COST_PROPS)
-        tag = "close" if offset < 1 else f"{int(offset):03d}h"
-        path = os.path.join(STORE_DIR, f"ladder__{tag}.parquet")
-        if os.path.exists(path):
-            print(f"  −{offset:>6.1f}h  already stored ({path}) — skipping (0 credits)")
+        per_call = COST_TEAMPLUS if "team" in kinds else COST_PROPS
+        todo = []
+        for g in games:
+            _, sh = _rung_ts_sh(g["commence"], offset)
+            if any((g["event_id"], k, sh) not in done for k in kinds):
+                todo.append(g)
+        if not todo:
+            print(f"  −{offset:>3}h  fully durable already — skipping (0 credits)")
             continue
+        est = len(todo) * per_call
         if spent_est + est > max_credits:
-            print(f"  [cap] stopping before −{offset:.1f}h (est spent {spent_est:,}, "
-                  f"next offset ~{est:,} would exceed cap {max_credits:,})")
+            print(f"  [cap] stopping before −{offset}h (est spent {spent_est:,}, "
+                  f"next rung ~{est:,} would exceed cap {max_credits:,})")
             break
-        rows = []
+        written = skipped = empty = 0
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = [ex.submit(_fetch, key, g, offset, markets) for g in games]
+            futs = [ex.submit(_fetch_raw, key, g, offset, markets) for g in todo]
             for f in as_completed(futs):
-                rows.extend(f.result())
-        if rows:
-            pd.DataFrame(rows).to_parquet(path, index=False)
+                game, data, snap, ts, sh = f.result()
+                if not data:
+                    empty += 1
+                    continue
+                w, s = _persist(game, data, snap, sh, offset, kinds, done)
+                written += w
+                skipped += s
         spent_est += est
         rem = get_remaining_credits()
-        rem_s = f"{rem:,}" if rem is not None else "?"
-        print(f"  −{offset:>6.1f}h  rows={len(rows):>7,}  → {path}   "
-              f"(est spent ≤ {spent_est:,}, remaining {rem_s})")
+        print(f"  −{offset:>3}h  todo={len(todo):>4}  written={written:>4}  "
+              f"skipped={skipped:>3}  empty={empty:>3}  (est spent ≤ {spent_est:,}, "
+              f"remaining {f'{rem:,}' if rem is not None else '?'})")
     rem = get_remaining_credits()
     print("=" * 96)
     print(f"  DONE. est spent ≤ {spent_est:,} credits; "
           f"remaining {f'{rem:,}' if rem is not None else '?'}.")
+    print("  Next: refresh the local mirror so analysis sees the new rungs —")
+    print("    python warehouse_mirror.py --sync --sport americanfootball_nfl "
+          f"--seasons {','.join(seasons)} --refresh")
 
 
 def main():
