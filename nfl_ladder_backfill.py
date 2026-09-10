@@ -144,22 +144,23 @@ def run(seasons, max_credits, dry_run):
         print("  NO API KEY (app.load_config / ODDS_API_KEY). Aborting — nothing spent.")
         return
     os.makedirs(STORE_DIR, exist_ok=True)
-    start_rem = get_remaining_credits()
-    print(f"  start credits: {start_rem}")
-
+    # NOTE: get_remaining_credits() is None until the first live call in this process, and
+    # cached calls cost 0 — so the cap is driven by a CONSERVATIVE running estimate (full
+    # market cost counted for every offset we actually fetch). That never under-counts real
+    # spend, so the cap is a safe upper bound; the real remaining is shown when available.
+    spent_est = 0
     for offset in OFFSETS_H:
         markets = _markets_for(offset)
         est = len(games) * (COST_TEAMPLUS if markets == TEAM_PLUS else COST_PROPS)
-        spent = (start_rem - get_remaining_credits()) if start_rem else 0
-        if spent + est > max_credits:
-            print(f"  [cap] stopping before −{offset:.1f}h "
-                  f"(spent {spent:,}, next offset would exceed {max_credits:,})")
-            break
         tag = "close" if offset < 1 else f"{int(offset):03d}h"
         path = os.path.join(STORE_DIR, f"ladder__{tag}.parquet")
         if os.path.exists(path):
-            print(f"  −{offset:>6.1f}h  already stored ({path}) — skipping")
+            print(f"  −{offset:>6.1f}h  already stored ({path}) — skipping (0 credits)")
             continue
+        if spent_est + est > max_credits:
+            print(f"  [cap] stopping before −{offset:.1f}h (est spent {spent_est:,}, "
+                  f"next offset ~{est:,} would exceed cap {max_credits:,})")
+            break
         rows = []
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             futs = [ex.submit(_fetch, key, g, offset, markets) for g in games]
@@ -167,11 +168,15 @@ def run(seasons, max_credits, dry_run):
                 rows.extend(f.result())
         if rows:
             pd.DataFrame(rows).to_parquet(path, index=False)
+        spent_est += est
         rem = get_remaining_credits()
+        rem_s = f"{rem:,}" if rem is not None else "?"
         print(f"  −{offset:>6.1f}h  rows={len(rows):>7,}  → {path}   "
-              f"(remaining {rem:,}, spent {start_rem-rem:,})")
+              f"(est spent ≤ {spent_est:,}, remaining {rem_s})")
+    rem = get_remaining_credits()
     print("=" * 96)
-    print(f"  DONE. total spent ≈ {start_rem - get_remaining_credits():,} credits.")
+    print(f"  DONE. est spent ≤ {spent_est:,} credits; "
+          f"remaining {f'{rem:,}' if rem is not None else '?'}.")
 
 
 def main():
