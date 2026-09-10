@@ -63,18 +63,21 @@ CONV_BOUNDS = {"count_conv": (0.20, 0.95), "yards": (1.5, 25.0)}
 SHRINK_K = 12.0
 SD_FLOOR = 6.0
 
-# Winners from the 2012-2020 fit / 2021-2022 validation sweep (HALF_LIFE, MIN_PRIOR, K).
-# HALF_LIFE 999 == flat (no recency decay). Applied with --use-swept for the frozen
-# 2023-2025 holdout confirmation.
+# Final config (HALF_LIFE, MIN_PRIOR, K), from the nested-CV sweep INSIDE the odds era
+# (--sweep-modern: select on 2 modern seasons, test on the 3rd, rotate; components frozen
+# on 2012-2022). Cross-checked against the 2012-2020/2021-2022 forward sweep. The QB-volume
+# HL=2 win reproduced rock-stable across all folds in BOTH schemes (+0.16..+0.26 logscore).
+# recv_yds & receptions tuning was negligible/negative → kept at/near default (no forced
+# knob). pass_tds wants LONG memory (rare/noisy). HALF_LIFE 999 == flat. Apply: --use-swept.
 SWEPT = {
-    "player_receptions":      (6, 3, 20),
-    "player_rush_yds":        (3, 4, 40),
-    "player_reception_yds":   (8, 4, 40),
-    "player_pass_yds":        (2, 4, 40),
+    "player_receptions":      (4, 3, 20),   # ~default; sweep negligible
+    "player_rush_yds":        (6, 4, 40),
+    "player_reception_yds":   (4, 3, 12),   # default — sweep did not beat it
+    "player_pass_yds":        (2, 4, 40),   # QB: short half-life (confirmed both schemes)
     "player_rush_attempts":   (4, 4, 12),
-    "player_pass_attempts":   (2, 4, 12),
-    "player_pass_completions": (2, 4, 12),
-    "player_pass_tds":        (999, 4, 12),
+    "player_pass_attempts":   (2, 4, 12),   # QB: short half-life (confirmed both schemes)
+    "player_pass_completions": (2, 4, 12),  # QB: short half-life (confirmed both schemes)
+    "player_pass_tds":        (8, 4, 12),   # rare/noisy → long memory
 }
 
 
