@@ -32,6 +32,37 @@ write-once (duplicate → skipped). Fetch runs parallel; the SQL write runs seri
 main thread (the 20-DTU tier throttles concurrent prop-heavy writes). --dry-run spends and
 writes nothing. Recommend SQL_DRIVER=pyodbc for the bulk line insert (fast_executemany).
 """
+import os as _os
+import sys as _sys
+# This is a bare CLI, not a `streamlit run` app, so Streamlit floods STDERR (one line per
+# worker thread) with 'missing ScriptRunContext' / 'No runtime found' / cache-storage noise
+# that drowns real progress. It bypasses Python logging levels (own handler), so we filter
+# stderr in-process: drop ONLY those known-benign lines, pass everything else (real
+# tracebacks etc.) through untouched. Installed before anything imports streamlit.
+_os.environ.setdefault("STREAMLIT_LOGGER_LEVEL", "error")
+
+_NOISE = ("missing ScriptRunContext", "No runtime found",
+          "MemoryCacheStorageManager", "Session state does not function")
+
+
+class _StderrFilter:
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, s):
+        if any(tok in s for tok in _NOISE):
+            return
+        self._real.write(s)
+
+    def flush(self):
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+_sys.stderr = _StderrFilter(_sys.stderr)
+
 import argparse
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +74,7 @@ import ingest_multibook_cache as im
 import warehouse as wh
 import warehouse_mirror as wm
 from odds_client import get_historical_event_odds, get_remaining_credits
+
 
 SPORT = "americanfootball_nfl"
 TEAM_MARKETS = ["h2h", "spreads", "totals"]
