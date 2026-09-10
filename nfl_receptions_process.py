@@ -70,21 +70,25 @@ def _recency_weights(n, half_life):
 
 def _player_series(seasons):
     """{(norm_name, season): [(week, targets, receptions, air_yards, target_share,
-    team), ...] most-recent-first} and {(team, season, week): team_total_targets}."""
+    team), ...] most-recent-first}, {(team, season, week): team_total_targets}, and
+    {(team, season, week): attempt-weighted team passing CPOE} (QB accuracy context)."""
     pw = nfl_data.player_week([str(s) for s in seasons])
     if pw is None:
-        return {}, {}
+        return {}, {}, {}
     cols = set(pw.columns)
     namecol = "player_display_name" if "player_display_name" in cols else "player_name"
 
     def num(v):
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
             return None
+        return None if math.isnan(f) else f
 
     series = defaultdict(list)
     team_tgts = defaultdict(float)      # (team, season, week) -> sum targets
+    cpoe_num = defaultdict(float)       # (team, season, week) -> sum(cpoe*attempts)
+    cpoe_den = defaultdict(float)       # (team, season, week) -> sum attempts
     for r in pw.to_dict("records"):
         try:
             wk = int(r.get("week"))
@@ -95,6 +99,11 @@ def _player_series(seasons):
         tg = num(r.get("targets"))
         if team and tg:
             team_tgts[(team, season, str(wk))] += tg
+        att = num(r.get("attempts"))
+        cpoe = num(r.get("passing_cpoe"))
+        if team and att and att > 0 and cpoe is not None:
+            cpoe_num[(team, season, str(wk))] += cpoe * att
+            cpoe_den[(team, season, str(wk))] += att
         nm = scan._norm(r.get(namecol))
         if not nm:
             continue
@@ -103,7 +112,8 @@ def _player_series(seasons):
              num(r.get("target_share")), team))
     for k in series:
         series[k].sort(key=lambda x: -x[0])
-    return series, team_tgts
+    team_cpoe = {k: cpoe_num[k] / cpoe_den[k] for k in cpoe_den if cpoe_den[k] > 0}
+    return series, team_tgts, team_cpoe
 
 
 def build_corpus(seasons, snapshot="closing", book="draftkings"):
@@ -111,7 +121,7 @@ def build_corpus(seasons, snapshot="closing", book="draftkings"):
     idx = nfl_schedule.game_index([str(s) for s in seasons])
     pw_stat = scan._player_week_index(seasons)
     snaps = scan._snap_presence([str(s) for s in seasons])
-    series, team_tgts = _player_series(seasons)
+    series, team_tgts, team_cpoe = _player_series(seasons)
 
     obs = []
     n_props = n_nogame = n_void = n_played0 = n_thin = n_notargets = 0
@@ -168,6 +178,15 @@ def build_corpus(seasons, snapshot="closing", book="draftkings"):
         adot = (ay / tw) if tw > 0 else None
         if adot is not None:
             adot = max(ADOT_BOUNDS[0], min(ADOT_BOUNDS[1], adot))
+        # ── L2: QB accuracy context (recency-weighted team CPOE over prior weeks) ──
+        cpoe_prior = [(wk, team_cpoe[(team, season, str(wk))])
+                      for wk in range(1, week) if (team, season, str(wk)) in team_cpoe]
+        if cpoe_prior:
+            cpoe_prior.sort(key=lambda x: -x[0])
+            cw = _recency_weights(len(cpoe_prior), HALF_LIFE)
+            exp_cpoe = sum(wi * v for (_wk, v), wi in zip(cpoe_prior, cw)) / (sum(cw) or 1.0)
+        else:
+            exp_cpoe = None
         # ── L3: own catch rate ──
         catch = rw / tw if tw > 0 else 0.0
         catch = max(CATCH_BOUNDS[0], min(CATCH_BOUNDS[1], catch))
@@ -184,8 +203,8 @@ def build_corpus(seasons, snapshot="closing", book="draftkings"):
             "under_price": under[1] if under else None,
             "actual": float(actual),
             "exp_tg_raw": exp_tg_raw, "exp_tg_decomp": exp_tg_decomp,
-            "catch": catch, "adot": adot, "tw": tw, "emp_over": emp_over,
-            "n_prior": len(prior),
+            "catch": catch, "adot": adot, "cpoe": exp_cpoe, "tw": tw,
+            "emp_over": emp_over, "n_prior": len(prior),
         })
     meta = {"n_props": n_props, "n_obs": len(obs), "n_nogame": n_nogame,
             "n_void": n_void, "n_played0": n_played0, "n_thin": n_thin,
@@ -231,33 +250,102 @@ def _depth_catch(o, curve):
     return max(CATCH_BOUNDS[0], min(CATCH_BOUNDS[1], c))
 
 
+def _solve(A, b):
+    """Gaussian elimination with partial pivot for a small dense system A x = b."""
+    n = len(b)
+    M = [list(row) + [b[i]] for i, row in enumerate(A)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[p][c]) < 1e-12:
+            return None
+        M[c], M[p] = M[p], M[c]
+        piv = M[c][c]
+        for r in range(n):
+            if r == c:
+                continue
+            f = M[r][c] / piv
+            for k in range(c, n + 1):
+                M[r][k] -= f * M[c][k]
+    return [M[i][n] / M[i][i] for i in range(n)]
+
+
+def _fit_catch_model_mv(train):
+    """Target-weighted OLS  catch_own ~ a + b_adot*aDOT + b_cpoe*teamCPOE  on train.
+    Models the conversion rate from FUNDAMENTALS (depth + QB accuracy) instead of the
+    player's own catch history — the 'something underneath' the stat. Returns
+    {'coefs':(a,b_adot,b_cpoe), 'cpoe_mean':float} or None (falls back to the aDOT curve)."""
+    pts = [(o["adot"], o["cpoe"], o["catch"], o["tw"]) for o in train
+           if o["adot"] is not None and o["cpoe"] is not None and o["tw"] > 0]
+    if len(pts) < 100:
+        return None
+    sw = sum(w for *_, w in pts)
+    cpoe_mean = sum(w * cp for _ad, cp, _y, w in pts) / sw
+    # weighted normal equations for design [1, aDOT, cpoe]
+    X = [[1.0, ad, cp] for ad, cp, _y, _w in pts]
+    ys = [y for *_, y, _w in pts]
+    ws = [w for *_, w in pts]
+    A = [[0.0] * 3 for _ in range(3)]
+    bvec = [0.0] * 3
+    for xi, yi, wi in zip(X, ys, ws):
+        for i in range(3):
+            bvec[i] += wi * xi[i] * yi
+            for j in range(3):
+                A[i][j] += wi * xi[i] * xi[j]
+    coefs = _solve(A, bvec)
+    if coefs is None:
+        return None
+    return {"coefs": tuple(coefs), "cpoe_mean": cpoe_mean}
+
+
+def _fund_catch(o, mv, curve):
+    """Predicted catch rate purely from fundamentals (aDOT + QB CPOE). Substitutes the
+    train-mean CPOE when a game's QB context is missing; falls back to the aDOT curve
+    (then own catch) when the mv model is unavailable."""
+    if mv is None or o["adot"] is None:
+        if curve is not None and o["adot"] is not None:
+            a, b = curve
+            return max(CATCH_BOUNDS[0], min(CATCH_BOUNDS[1], a + b * o["adot"]))
+        return o["catch"]
+    a, b_ad, b_cp = mv["coefs"]
+    cp = o["cpoe"] if o["cpoe"] is not None else mv["cpoe_mean"]
+    pred = a + b_ad * o["adot"] + b_cp * cp
+    return max(CATCH_BOUNDS[0], min(CATCH_BOUNDS[1], pred))
+
+
+def _blend_fund_catch(o, mv, curve):
+    """M5b: shrink the player's own catch toward the multivariate fundamentals prior."""
+    fund = _fund_catch(o, mv, curve)
+    wt = o["tw"] / (o["tw"] + CATCH_SHRINK_K)
+    c = wt * o["catch"] + (1 - wt) * fund
+    return max(CATCH_BOUNDS[0], min(CATCH_BOUNDS[1], c))
+
+
 def _k(line):
     return int(line) + 1
 
 
-def _predict(o, model, phi, curve):
+def _predict(o, model, phi, curve, mv=None):
     line = o["line"]
     k = _k(line)
     if model == "M0":
         return max(0.0, min(1.0, o["emp_over"]))
     if model == "M1":                       # fixed-n binomial, raw targets (old probe)
         return max(0.0, min(1.0, _adjacent_binom(k, o["exp_tg_raw"], o["catch"])))
+    mean = _mean_for(o, model, curve, mv)
+    return negbin_at_least(k, mean, phi)
+
+
+def _mean_for(o, model, curve, mv=None):
     if model == "M2":                       # NegBin, raw-target mean
-        return negbin_at_least(k, o["exp_tg_raw"] * o["catch"], phi)
-    if model == "M3":                       # NegBin, decomposed volume
-        return negbin_at_least(k, o["exp_tg_decomp"] * o["catch"], phi)
-    if model == "M4":                       # NegBin, decomposed volume + depth catch
-        return negbin_at_least(k, o["exp_tg_decomp"] * _depth_catch(o, curve), phi)
-    raise ValueError(model)
-
-
-def _mean_for(o, model, curve):
-    if model == "M2":
         return o["exp_tg_raw"] * o["catch"]
-    if model == "M3":
+    if model == "M3":                       # NegBin, decomposed volume
         return o["exp_tg_decomp"] * o["catch"]
-    if model == "M4":
+    if model == "M4":                       # decomposed volume + aDOT depth catch
         return o["exp_tg_decomp"] * _depth_catch(o, curve)
+    if model == "M5f":                      # catch PURELY from fundamentals (de-anchored)
+        return o["exp_tg_decomp"] * _fund_catch(o, mv, curve)
+    if model == "M5b":                      # fundamentals prior + light own shrink
+        return o["exp_tg_decomp"] * _blend_fund_catch(o, mv, curve)
     return None
 
 
@@ -266,18 +354,21 @@ def _brier(sub, fn):
 
 
 def _fit_fold(train):
-    """Fit the depth curve, then the NegBin phi per model on the train fold."""
+    """Fit the aDOT curve + multivariate fundamentals catch model, then the NegBin phi
+    per model on the train fold."""
     curve = _fit_adot_catch_curve(train)
+    mv = _fit_catch_model_mv(train)
     phis = {}
-    for model in ("M2", "M3", "M4"):
-        pairs = [(_mean_for(o, model, curve), o["actual"]) for o in train]
+    for model in ("M2", "M3", "M4", "M5f", "M5b"):
+        pairs = [(_mean_for(o, model, curve, mv), o["actual"]) for o in train]
         phis[model] = fit_negbin_dispersion(pairs, cap=2.0)
-    return curve, phis
+    return curve, mv, phis
 
 
-MODELS = ["M0", "M1", "M2", "M3", "M4"]
+MODELS = ["M0", "M1", "M2", "M3", "M4", "M5f", "M5b"]
 LABELS = {"M0": "incumbent A", "M1": "raw binomial", "M2": "raw NegBin",
-          "M3": "decomp NegBin", "M4": "+depth NegBin"}
+          "M3": "decomp NegBin", "M4": "+depth NegBin", "M5f": "fund catch (pure)",
+          "M5b": "fund catch (blend)"}
 
 
 def probe(seasons, snapshot="closing", book="draftkings"):
@@ -316,14 +407,15 @@ def probe(seasons, snapshot="closing", book="draftkings"):
     agg = {m: [0.0, 0] for m in MODELS}      # sum sq err, n  (pooled over folds' tests)
     mkt_agg = [0.0, 0]
     for name, tr, te in folds:
-        curve, phis = _fit_fold(tr)
-        phi_str = " ".join(f"{m}φ={phis[m]:.2f}" for m in ("M2", "M3", "M4"))
+        curve, mv, phis = _fit_fold(tr)
         cstr = (f"catch(aDOT)={curve[0]:.3f}{curve[1]:+.4f}·aDOT" if curve else "curve=NA")
-        print(f"     {name}:  {phi_str}   {cstr}")
+        mvstr = (f"catch~{mv['coefs'][0]:.3f}{mv['coefs'][1]:+.4f}·aDOT"
+                 f"{mv['coefs'][2]:+.4f}·CPOE" if mv else "mv=NA")
+        print(f"     {name}:  {cstr}   {mvstr}")
         line = "        "
         for m in MODELS:
-            b = _brier(te, lambda o, mm=m, cc=curve, pp=phis: _predict(
-                o, mm, pp.get(mm, 0.0), cc))
+            b = _brier(te, lambda o, mm=m, cc=curve, mvv=mv, pp=phis: _predict(
+                o, mm, pp.get(mm, 0.0), cc, mvv))
             agg[m][0] += b * len(te)
             agg[m][1] += len(te)
             line += f"{LABELS[m]}={b:.4f}  "
@@ -336,12 +428,13 @@ def probe(seasons, snapshot="closing", book="draftkings"):
         print(line)
     print("\n     pooled 2-fold OOS Brier:")
     base = agg["M0"][0] / agg["M0"][1]
+    pooled = {m: agg[m][0] / agg[m][1] for m in MODELS}
     for m in MODELS:
-        b = agg[m][0] / agg[m][1]
-        tag = "" if m == "M0" else f"   Δ vs A = {base - b:+.4f}"
-        print(f"        {LABELS[m]:<16} {b:.4f}{tag}")
+        tag = "" if m == "M0" else f"   Δ vs A = {base - pooled[m]:+.4f}"
+        print(f"        {LABELS[m]:<18} {pooled[m]:.4f}{tag}")
     if mkt_agg[1]:
-        print(f"        {'market':<16} {mkt_agg[0] / mkt_agg[1]:.4f}   (sharp reference)")
+        print(f"        {'market':<18} {mkt_agg[0] / mkt_agg[1]:.4f}   (sharp reference)")
+    best = min(("M2", "M3", "M4", "M5f", "M5b"), key=lambda m: pooled[m])
 
     # ── 2) per-season Brier (all obs, fit on the OTHER seasons) ──
     print("\n  2) PREDICTION per season (fit phi+curve on the other seasons):")
@@ -350,11 +443,11 @@ def probe(seasons, snapshot="closing", book="draftkings"):
         tr = [o for o in rows if o["season"] != s]
         if len(te) < 50 or len(tr) < 200:
             continue
-        curve, phis = _fit_fold(tr)
+        curve, mv, phis = _fit_fold(tr)
         parts = []
         for m in MODELS:
-            b = _brier(te, lambda o, mm=m, cc=curve, pp=phis: _predict(
-                o, mm, pp.get(mm, 0.0), cc))
+            b = _brier(te, lambda o, mm=m, cc=curve, mvv=mv, pp=phis: _predict(
+                o, mm, pp.get(mm, 0.0), cc, mvv))
             parts.append(f"{m}={b:.4f}")
         mk = [o for o in te if o["mkt_over"] is not None]
         mb = _brier(mk, lambda o: o["mkt_over"])
@@ -362,12 +455,15 @@ def probe(seasons, snapshot="closing", book="draftkings"):
         print(f"        {s}: n={len(te):>5}  " + "  ".join(parts))
 
     # ── 3) EDGE context (NOT a gate — informs the live logger's detection band) ──
-    curve, phis = _fit_fold(rows[:split])
+    curve, mv, phis = _fit_fold(rows[:split])
     priced = [o for o in rows[split:] if o["mkt_over"] is not None]
-    print(f"\n  3) EDGE context — best model (M4) vs market on the held-out half "
-          f"({len(priced)} priced).")
+    print(f"\n  3) EDGE context — best model ({LABELS[best]}) vs market on the held-out "
+          f"half ({len(priced)} priced).")
     print("     NOT a ship gate (edge is realized live); shows how often an accurate")
     print("     model would disagree with the close and whether those disagreements win.")
+
+    def _predict_best(o):
+        return _predict(o, best, phis[best], curve, mv)
 
     def _edge_report(sub, label):
         if not sub:
@@ -375,7 +471,7 @@ def probe(seasons, snapshot="closing", book="draftkings"):
             return
         roi, realized, implied = [], [], []
         for o in sub:
-            p = _predict(o, "M4", phis["M4"], curve)
+            p = _predict_best(o)
             if p >= o["mkt_over"]:
                 win = o["y"] == 1
                 px = o["over_price"]
@@ -394,13 +490,14 @@ def probe(seasons, snapshot="closing", book="draftkings"):
     for lo, hi, lbl in [(0.0, 0.03, "|edge| 0-3%"), (0.03, 0.06, "|edge| 3-6%"),
                         (0.06, 0.10, "|edge| 6-10%"), (0.10, 1.0, "|edge| >=10%")]:
         _edge_report([o for o in priced
-                      if lo <= abs(_predict(o, "M4", phis["M4"], curve) - o["mkt_over"]) < hi],
-                     lbl)
+                      if lo <= abs(_predict_best(o) - o["mkt_over"]) < hi], lbl)
     print("=" * 100)
     print("  READ: any Mi below incumbent A ⇒ that layer improves the model → SHIP it")
     print("  (governing principle: better prediction ships regardless of the close).")
-    print("  Compare M1→M2 (count-variance fix), M2→M3 (volume decomp), M3→M4 (depth).")
-    print("  Market Brier is the accuracy ceiling; closing the gap to it is the goal.")
+    print("  Layers: M1→M2 count-variance fix; M2→M3 volume decomp; M3→M4 aDOT depth;")
+    print("  M4→M5f/M5b conversion from FUNDAMENTALS (aDOT+QB CPOE). M5f≈M4 ⇒ we can")
+    print("  DE-ANCHOR from the player's own catch history with no loss (the video's")
+    print("  'something underneath' the stat). Market Brier is the accuracy ceiling.")
 
 
 def main():
