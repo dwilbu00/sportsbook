@@ -21,10 +21,15 @@ Reads the warehouse mirror (all sources at once). Bets are DK/FD only; Pinnacle 
 sharp reference (never sized/recommended). Diagnostic — writes nothing, spends nothing.
 """
 import argparse
+import os
+os.environ.setdefault("SQL_TIMEOUT", "900")   # 20-DTU tier: big analytical reads need >60s
 from collections import defaultdict
 
+import pandas as pd
+from sqlalchemy import text, bindparam
+
+import db_store
 import nfl_schedule
-import warehouse_mirror as wm
 import nfl_props_scan as scan
 import nfl_props_accuracy as acc
 from odds_client import american_to_decimal, american_to_implied_prob, devig_two_way
@@ -32,31 +37,77 @@ from odds_client import american_to_decimal, american_to_implied_prob, devig_two
 SPORT = "americanfootball_nfl"
 EXEC_BOOKS = ["draftkings", "fanduel"]
 SHARP_BOOK = "pinnacle"
+BOOKS = EXEC_BOOKS + [SHARP_BOOK]
+STORE = "nfl_ladder_data"
 # rung label → nominal hours-to-kickoff (for the decay axis), earliest→latest
 RUNGS = ([(f"ladder_{h:03d}h", float(h)) for h in range(114, 5, -6)]
          + [("early_4h", 4.0), ("closing", 0.17)])
 
 
-def _load_all(prop, seasons, books):
-    """{(event_id, player): {book: {source: {'OVER':(pt,px),'UNDER':(pt,px)}}}} + game meta."""
+# index-friendly: sport + game_date range hits the uq_odds_snapshot prefix (sport,game_date,
+# ...), kind='props' skips team snapshots, then the snapshot→line join uses ix_odds_line_snapshot.
+_EXTRACT_Q = text(
+    "SELECT s.event_id, l.player, s.source, l.bookmaker, l.direction, "
+    "       l.point, l.price, s.commence_time, s.home, s.away, l.prop_key "
+    "FROM odds_snapshot s JOIN odds_line l ON l.snapshot_id = s.id "
+    "WHERE s.sport = :sp AND s.kind = 'props' "
+    "  AND s.game_date >= :d0 AND s.game_date <= :d1 "
+    "  AND l.bookmaker IN :books "
+    "  AND (s.source LIKE 'ladder_%' OR s.source IN ('early_4h', 'closing'))"
+).bindparams(bindparam("books", expanding=True))
+
+
+def _store_path(season):
+    return os.path.join(STORE, f"ladder_lines__{season}.parquet")
+
+
+def extract(seasons):
+    """ONE-TIME targeted pull Azure→local parquet (per season): all ladder + early_4h/closing
+    prop lines for DK/FD/Pinnacle. Azure stays the durable source; this is a re-creatable
+    work cache so the analysis reads locally instead of hammering the 20-DTU tier per prop."""
+    db_store.promote_secrets_from_toml()
+    if not db_store.enabled():
+        print("  Azure SQL not configured — cannot extract. Aborting.")
+        return
+    os.makedirs(STORE, exist_ok=True)
+    eng = db_store.get_engine()
+    for s in seasons:
+        path = _store_path(s)
+        if os.path.exists(path):
+            print(f"  {s}: already extracted ({path}) — skipping")
+            continue
+        print(f"  {s}: querying Azure (this is the slow one-time read)...", flush=True)
+        rows = []
+        with eng.connect() as c:
+            res = c.execute(_EXTRACT_Q, {"sp": SPORT, "d0": f"{s}-01-01",
+                                         "d1": f"{s}-12-31", "books": BOOKS})
+            for r in res:
+                rows.append({"event_id": r[0], "player": r[1], "source": r[2],
+                             "book": r[3], "direction": str(r[4]).upper(),
+                             "point": r[5], "price": r[6], "commence": r[7],
+                             "home": r[8], "away": r[9], "prop_key": r[10]})
+        pd.DataFrame(rows).to_parquet(path, index=False)
+        print(f"  {s}: wrote {len(rows):,} lines → {path}")
+
+
+def _load_local(prop, seasons):
+    """{(event_id, player): {book: {source: {'OVER':(pt,px),'UNDER':(pt,px)}}}}, meta —
+    read the extracted local parquet(s) and filter to this prop."""
     out = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     meta = {}
-    for book in books:
-        for y in seasons:
-            rows = wm.player_prop_lines(SPORT, date_from=f"{y}-01-01",
-                                        date_to=f"{y}-12-31", bookmaker=book) or []
-            for r in rows:
-                if r.get("prop_key") != prop:
-                    continue
-                src = r.get("source")
-                direction = str(r.get("direction") or "").upper()
-                pt, px = r.get("point"), r.get("price")
-                if direction not in ("OVER", "UNDER") or pt is None or px is None:
-                    continue
-                key = (r.get("event_id"), r.get("player"))
-                out[key][book][src][direction] = (pt, px)
-                meta.setdefault(key, {"commence": r.get("commence_time"),
-                                      "home": r.get("home"), "away": r.get("away")})
+    for s in seasons:
+        path = _store_path(s)
+        if not os.path.exists(path):
+            print(f"    [warn] no extract for {s} ({path}) — run --extract first")
+            continue
+        df = pd.read_parquet(path)
+        df = df[df["prop_key"] == prop]
+        for r in df.itertuples(index=False):
+            if r.direction not in ("OVER", "UNDER") or r.point is None or r.price is None:
+                continue
+            out[(r.event_id, r.player)][r.book][r.source][r.direction] = (r.point, r.price)
+            meta.setdefault((r.event_id, r.player),
+                            {"commence": r.commence, "home": r.home, "away": r.away})
     return out, meta
 
 
@@ -83,7 +134,7 @@ def run(prop, cfg, train_seasons, test_seasons):
             for o in acc._obs_from_series(acc._series(test_seasons), cfg)}
     idx = nfl_schedule.game_index([str(s) for s in test_seasons])
 
-    lines, meta = _load_all(prop, test_seasons, EXEC_BOOKS + [SHARP_BOOK])
+    lines, meta = _load_local(prop, test_seasons)
     # per-rung accumulators
     agg = {src: {"n": 0, "real": 0.0, "impl": 0.0, "roi": 0.0, "clv": 0.0, "nclv": 0,
                  "vsharp": 0.0, "nsharp": 0} for src, _ in RUNGS}
@@ -165,10 +216,18 @@ def main():
     ap.add_argument("--train", default="2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022")
     ap.add_argument("--test", default="2023,2024,2025")
     ap.add_argument("--prop", default="all")
+    ap.add_argument("--extract", action="store_true",
+                    help="one-time targeted pull Azure→local parquet, then exit")
     args = ap.parse_args()
     train_seasons = [s.strip() for s in args.train.split(",") if s.strip()]
     test_seasons = [s.strip() for s in args.test.split(",") if s.strip()]
     props = list(acc.PROPS) if args.prop == "all" else [args.prop]
+    if args.extract:
+        print("=" * 92)
+        print(f"  EXTRACT ladder lines Azure→local parquet, seasons {test_seasons}")
+        print("=" * 92)
+        extract(test_seasons)
+        return
     print("=" * 92)
     print(f"  NFL LADDER CLV — frozen model (train {train_seasons[0]}-{train_seasons[-1]}) "
           f"edge/CLV by rung, DK/FD executable, test {test_seasons}")
