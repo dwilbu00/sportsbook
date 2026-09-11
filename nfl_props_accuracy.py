@@ -140,7 +140,12 @@ def _obs_from_series(series, cfg):
             def wsum_of(col):
                 return sum(wi * (r.get(col) or 0.0) for r, wi in zip(prior, w))
 
-            o = {"name": nm, "season": season, "week": wk, "actual": float(actual)}
+            _pv = [r.get(stat) for r in prior if r.get(stat) is not None]
+            _pm = (sum(_pv) / len(_pv)) if _pv else 0.0
+            _cv = ((sum((v - _pm) ** 2 for v in _pv) / len(_pv)) ** 0.5 / _pm
+                   if _pm > 0 and len(_pv) > 1 else 0.0)   # boom/bust = high CV
+            o = {"name": nm, "season": season, "week": wk, "actual": float(actual),
+                 "n_prior": len(prior), "cv": _cv}
             if cfg["fam"] == "count":
                 o["mean_base"] = wsum_of(stat) / wsum
                 if o["mean_base"] <= 0:
@@ -317,6 +322,16 @@ def logscore(o, cfg, comp):
     if cfg["var"] == "negbin":
         return _negbin_logpmf(int(round(o["actual"])), m, comp["phi"])
     return _normal_logpdf(o["actual"], m, _sd_of(o, cfg, comp))
+
+
+def proj_mean_sd(o, cfg, comp):
+    """Projected mean and SD — for a confidence z-score (line distance in SDs)."""
+    m = _mean_of(o, cfg, comp)
+    if cfg["var"] == "negbin":
+        phi = comp.get("phi", 0.0)
+        var = m + phi * m * m
+        return m, math.sqrt(var if var > 0 else max(m, 1e-9))
+    return m, _sd_of(o, cfg, comp)
 
 
 def evaluate(prop, cfg, train_seasons, test_seasons, snapshot, book):
