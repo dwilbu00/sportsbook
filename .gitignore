@@ -44,3 +44,6 @@ backtest_cache/
 
 # Precise-backfill outputs (raw cache is under cache/hist_event_odds/; these are compiled artifacts + audit)
 odds_backfill/
+
+# NFL ladder research work-cache (re-creatable from Azure via nfl_ladder_clv --extract; not durable-source)
+nfl_ladder_data/
