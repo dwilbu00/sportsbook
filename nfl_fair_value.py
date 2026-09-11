@@ -59,6 +59,9 @@ def run(season, week, snapshot, book):
         if prop not in models:
             continue
         cfg, comp, feat = models[prop]
+        # per-prop knobs must be active at PREDICT time too (SHRINK_K drives _mean_of's
+        # conversion shrink); _models() left the globals at the last prop's values.
+        acc.HALF_LIFE, acc.MIN_PRIOR, acc.SHRINK_K = acc.SWEPT.get(prop, (4, 3, 12))
         for (eid, player, pk), d in scan._load_props([str(season)], snapshot, book).items():
             if pk != prop:
                 continue
