@@ -461,6 +461,70 @@ def doug_rule(props, seasons, rung_pref):
             print(f"      FAIR-price ROI={fair[1]/fair[0]*100:+.2f}% (n={fair[0]})")
 
 
+def gap_scaling(props, seasons, rung_pref):
+    """Does the fade edge (UNDER @ higher/shaded line) grow with the SIZE of the DK/FD
+    disagreement? Bucket by normalized gap (|Δline| / mean line, scale-free across props).
+    Answers: (1) do big disagreements exist + how often, (2) is there a gap threshold where
+    ROI clears the vig — a concrete 'only bet if gap ≥ X' rule. Cross-season guarded."""
+    idx = nfl_schedule.game_index([str(s) for s in seasons])
+    actuals = scan._player_week_index(seasons)
+    buckets = [(0.0, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 0.40), (0.40, 9.0)]
+    agg = {b: defaultdict(lambda: [0, 0.0, 0.0, 0.0]) for b in buckets}  # b->season->[n,w,impl,roi]
+    fairagg = {b: [0, 0.0] for b in buckets}
+    maxgap = 0.0
+    for prop in props:
+        stat = acc.PROPS[prop]["stat"]
+        lines, meta = clv._load_local(prop, seasons)
+        for (eid, player), bybook in lines.items():
+            dk = bybook.get("draftkings", {}); fd = bybook.get("fanduel", {})
+            src = (next((s for s in RUNG_ORDER if s in dk and s in fd), None)
+                   if rung_pref == "opener" else rung_pref)
+            if src is None or src not in dk or src not in fd:
+                continue
+            m = meta[(eid, player)]
+            gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+            if gid is None:
+                continue
+            ps = gid.split("_")
+            av = (actuals.get((scan._norm(player), ps[0], str(int(ps[1])))) or {}).get(stat)
+            if av is None:
+                continue
+            dl = _line_px(dk[src], "OVER")[0] or _line_px(dk[src], "UNDER")[0]
+            fl = _line_px(fd[src], "OVER")[0] or _line_px(fd[src], "UNDER")[0]
+            if dl is None or fl is None or abs(dl - fl) < 1e-9:
+                continue
+            mean_line = (dl + fl) / 2.0
+            gap = abs(dl - fl) / mean_line if mean_line > 0 else 0.0
+            maxgap = max(maxgap, gap)
+            high = dk[src] if dl > fl else fd[src]     # fade the higher (shaded) line
+            pt, px = _line_px(high, "UNDER")
+            if pt is None or px is None or abs(av - pt) < 1e-9:
+                continue
+            won = av < pt
+            frov = clv._fair_over(high); impl = (1 - frov) if frov is not None else 0.5
+            roi = (american_to_decimal(px) - 1.0) if won else -1.0
+            for b in buckets:
+                if b[0] <= gap < b[1]:
+                    r = agg[b][ps[0]]
+                    r[0] += 1; r[1] += 1 if won else 0; r[2] += impl; r[3] += roi
+                    if -110 <= px < 100:
+                        fairagg[b][0] += 1; fairagg[b][1] += roi
+                    break
+    print(f"\n  GAP SCALING — UNDER @ higher line, by disagreement size (rung={rung_pref}):")
+    print(f"    (normalized gap = |Δline|/mean line; max gap seen = {maxgap*100:.0f}%)")
+    print(f"    {'gap band':<12} {'2023':>13} {'2024':>13} {'2025':>13} {'fair ROI':>14}")
+    for b in buckets:
+        row = agg[b]
+        cells = []
+        for s in ("2023", "2024", "2025"):
+            n, w, im, roi = row[s]
+            cells.append(f"{roi/n*100:+.1f}%(n={n})" if n >= 25 else f"na(n={n})")
+        fp = fairagg[b]
+        fair = f"{fp[1]/fp[0]*100:+.1f}%(n={fp[0]})" if fp[0] >= 25 else f"na(n={fp[0]})"
+        lbl = f"{int(b[0]*100)}-{int(b[1]*100) if b[1]<9 else '+'}%"
+        print(f"    {lbl:<12} {cells[0]:>13} {cells[1]:>13} {cells[2]:>13} {fair:>14}")
+
+
 def main():
     try:
         from cli_encoding import configure_stdio
@@ -480,7 +544,7 @@ def main():
     print("=" * 100)
     print(f"  DK vs FD BOOK SHOP — test {test_seasons}, rung={args.rung}")
     print("=" * 100)
-    doug_rule(props, test_seasons, args.rung)
+    gap_scaling(props, test_seasons, args.rung)
     print("=" * 100)
 
 
