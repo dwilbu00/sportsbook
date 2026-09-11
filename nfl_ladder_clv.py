@@ -122,7 +122,7 @@ def _fair_over(d):
         return None
 
 
-def run(prop, cfg, train_seasons, test_seasons):
+def run(prop, cfg, train_seasons, test_seasons, min_edge=0.0):
     hl, mp, k = acc.SWEPT.get(prop, (4, 3, 12))
     acc.HALF_LIFE, acc.MIN_PRIOR, acc.SHRINK_K = hl, mp, k
     train = acc._obs_from_series(acc._series(train_seasons), cfg)
@@ -165,6 +165,8 @@ def run(prop, cfg, train_seasons, test_seasons):
                 if fair is None:
                     continue
                 p = acc.p_over(o, line, cfg, comp)
+                if abs(p - fair) < min_edge:      # only bet meaningful disagreements
+                    continue
                 over_side = p >= fair
                 win = (actual > line) if over_side else (actual < line)
                 px = (d.get("OVER") if over_side else d.get("UNDER"))[1]
@@ -187,6 +189,114 @@ def run(prop, cfg, train_seasons, test_seasons):
                     a["vsharp"] += our_sharp - our_book   # +: sharp likes our side more
                     a["nsharp"] += 1
     return agg
+
+
+def collect_bets(prop, cfg, train_seasons, test_seasons, min_edge=0.0):
+    """One OPENER bet per (game, player): earliest available DK line, our model's side,
+    win/loss, and a-priori features (direction, edge, sharp confluence). For the bottom-up
+    'where do we win, and why' search — kept to sensible dimensions + a season split."""
+    hl, mp, k = acc.SWEPT.get(prop, (4, 3, 12))
+    acc.HALF_LIFE, acc.MIN_PRIOR, acc.SHRINK_K = hl, mp, k
+    train = acc._obs_from_series(acc._series(train_seasons), cfg)
+    if len(train) < 200:
+        return []
+    comp = acc.fit_components(train, cfg)
+    feat = {(o["name"], o["season"], o["week"]): o
+            for o in acc._obs_from_series(acc._series(test_seasons), cfg)}
+    idx = nfl_schedule.game_index([str(s) for s in test_seasons])
+    lines, meta = _load_local(prop, test_seasons)
+    bets = []
+    for (eid, player), bybook in lines.items():
+        m = meta[(eid, player)]
+        gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+        if gid is None:
+            continue
+        ps = gid.split("_"); season, week = ps[0], int(ps[1])
+        o = feat.get((scan._norm(player), season, week))
+        if o is None:
+            continue
+        actual = o["actual"]
+        dk = bybook.get("draftkings", {})
+        pinn = bybook.get("pinnacle", {})
+        opener = next((s for s, _h in RUNGS if s in dk), None)   # earliest available DK rung
+        if opener is None:
+            continue
+        d = dk[opener]
+        line = d.get("OVER", d.get("UNDER", (None, None)))[0]
+        if line is None or abs(actual - line) < 1e-9:
+            continue
+        fair = _fair_over(d)
+        if fair is None:
+            continue
+        p = acc.p_over(o, line, cfg, comp)
+        if abs(p - fair) < min_edge:
+            continue
+        over_side = p >= fair
+        win = (actual > line) if over_side else (actual < line)
+        px = (d.get("OVER") if over_side else d.get("UNDER"))[1]
+        pf = _fair_over(pinn.get(opener)) if pinn.get(opener) else None
+        sharp = None
+        if pf is not None:
+            sharp = (pf > fair) == over_side       # sharp leans our way vs DK
+        bets.append({"season": season, "prop": prop, "over": over_side,
+                     "edge": abs(p - fair), "win": 1 if win else 0,
+                     "implied": fair if over_side else 1 - fair,
+                     "roi": (american_to_decimal(px) - 1.0) if win else -1.0,
+                     "sharp": sharp, "price": px, "line": line})
+    return bets
+
+
+def drill(all_bets, props):
+    """Skeptical drill on a candidate prop set: direction, price band, and per-season —
+    the same cuts that exposed the earlier rush_yds juiced-band artifact."""
+    b = [x for x in all_bets if x["prop"] in props]
+    print(f"\n  DRILL {props}  (n={len(b)})")
+    print(_cut(b, "ALL"))
+    print(_cut([x for x in b if x["over"]], "OVER"))
+    print(_cut([x for x in b if not x["over"]], "UNDER"))
+    print("   price bands (is it real at FAIR prices, not just juice?):")
+    for lo, hi, lbl in [(-100000, -150, "≤ −150 (juiced)"), (-150, -110, "−150..−110"),
+                        (-110, 100, "−110..+100 (fair)"), (100, 100000, "≥ +100 (plus)")]:
+        print(_cut([x for x in b if lo <= x["price"] < hi], f"  {lbl}"))
+    print("   per season (one-year fluke check):")
+    for s in ("2023", "2024", "2025"):
+        print(_cut([x for x in b if x["season"] == s], f"  {s}"))
+    print(_cut([x for x in b if x["sharp"] is True], "sharp confirms"))
+
+
+def _cut(bets, label):
+    n = len(bets)
+    if n < 40:
+        return f"    {label:<26} n={n:>5}  (thin)"
+    ri = (sum(b["win"] for b in bets) / n - sum(b["implied"] for b in bets) / n) * 100
+    roi = sum(b["roi"] for b in bets) / n * 100
+    wr = sum(b["win"] for b in bets) / n * 100
+    return f"    {label:<26} n={n:>5}  win={wr:4.1f}%  real-impl={ri:+5.2f}%  ROI={roi:+6.2f}%"
+
+
+def bottom_up(all_bets):
+    disc = [b for b in all_bets if b["season"] in ("2023", "2024")]
+    val = [b for b in all_bets if b["season"] == "2025"]
+
+    def report(bets, tag):
+        print(f"\n  ── {tag} (n={len(bets)}) ──")
+        print(_cut(bets, "ALL opener bets"))
+        print(_cut([b for b in bets if b["over"]], "OVER only"))
+        print(_cut([b for b in bets if not b["over"]], "UNDER only"))
+        print(_cut([b for b in bets if b["sharp"] is True], "sharp CONFIRMS our side"))
+        print(_cut([b for b in bets if b["sharp"] is False], "sharp OPPOSES our side"))
+        print(_cut([b for b in bets if b["sharp"] is True and not b["over"]],
+                   "UNDER + sharp confirms"))
+        print(_cut([b for b in bets if b["edge"] >= 0.10 and b["sharp"] is True],
+                   "|edge|>=10% + sharp conf"))
+        by = defaultdict(list)
+        for b in bets:
+            by[b["prop"]].append(b)
+        for pk in sorted(by):
+            print(_cut(by[pk], f"prop: {pk.replace('player_','')}"))
+
+    report(disc, "DISCOVERY 2023-2024")
+    report(val, "VALIDATION 2025 (held out)")
 
 
 def _print(prop, agg):
@@ -218,6 +328,10 @@ def main():
     ap.add_argument("--prop", default="all")
     ap.add_argument("--extract", action="store_true",
                     help="one-time targeted pull Azure→local parquet, then exit")
+    ap.add_argument("--min-edge", type=float, default=0.0,
+                    help="only bet obs where |model P − market fair| >= this (e.g. 0.08)")
+    ap.add_argument("--bottom-up", dest="bottom_up", action="store_true",
+                    help="opener-bet win/loss search by direction/sharp/prop, discovery vs 2025")
     args = ap.parse_args()
     train_seasons = [s.strip() for s in args.train.split(",") if s.strip()]
     test_seasons = [s.strip() for s in args.test.split(",") if s.strip()]
@@ -228,6 +342,19 @@ def main():
         print("=" * 92)
         extract(test_seasons)
         return
+    if args.bottom_up:
+        print("=" * 92)
+        print("  BOTTOM-UP: opener-bet win/loss search (discovery 2023-24 → validate 2025)")
+        print(f"  min_edge={args.min_edge}. A cut is real ONLY if it survives 2025 held-out.")
+        print("=" * 92)
+        allb = []
+        for prop in props:
+            allb.extend(collect_bets(prop, acc.PROPS[prop], train_seasons,
+                                     test_seasons, args.min_edge))
+        bottom_up(allb)
+        drill(allb, ("player_rush_attempts", "player_rush_yds"))
+        print("=" * 92)
+        return
     print("=" * 92)
     print(f"  NFL LADDER CLV — frozen model (train {train_seasons[0]}-{train_seasons[-1]}) "
           f"edge/CLV by rung, DK/FD executable, test {test_seasons}")
@@ -236,7 +363,7 @@ def main():
     pooled = {src: {"n": 0, "real": 0.0, "impl": 0.0, "roi": 0.0, "clv": 0.0,
                     "nclv": 0, "vsharp": 0.0, "nsharp": 0} for src, _ in RUNGS}
     for prop in props:
-        agg = run(prop, acc.PROPS[prop], train_seasons, test_seasons)
+        agg = run(prop, acc.PROPS[prop], train_seasons, test_seasons, args.min_edge)
         if not agg:
             continue
         _print(prop, agg)
