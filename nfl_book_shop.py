@@ -199,6 +199,122 @@ def exploit(props, train_seasons, test_seasons, rung_pref):
               f"{roi(row['best']):>+8.2f}%  {ri(row['best']):>+14.2f}% {len(row['best']):>6}")
 
 
+def _leg_pnl(win, push, price):
+    if push:
+        return 0.0
+    return (american_to_decimal(price) - 1.0) if win else -1.0
+
+
+def middle(props, seasons, rung_pref):
+    """Bet OVER@low-line + UNDER@high-line when DK/FD diverge. NOT a hedge: net -vig when the
+    result lands outside the gap, big win inside. Measures combined ROI, gap-hit rate, and
+    flags 'free/dead' middles (both legs plus-money => a miss breaks even)."""
+    idx = nfl_schedule.game_index([str(s) for s in seasons])
+    actuals = scan._player_week_index(seasons)
+    print(f"\n  MIDDLE test (over@low + under@high on DK/FD divergence, rung={rung_pref}):")
+    print(f"    {'prop':<22} {'n':>6} {'gap-hit':>8} {'ROI/pair':>9} {'free-mid':>8} {'freeROI':>8}")
+    tot_n = tot_pnl = 0.0
+    for prop in props:
+        stat = acc.PROPS[prop]["stat"]
+        lines, meta = clv._load_local(prop, seasons)
+        n = hits = free = 0
+        pnl = free_pnl = 0.0
+        for (eid, player), bybook in lines.items():
+            dk = bybook.get("draftkings", {})
+            fd = bybook.get("fanduel", {})
+            src = (next((s for s in RUNG_ORDER if s in dk or s in fd), None)
+                   if rung_pref == "opener" else rung_pref)
+            if src is None or src not in dk or src not in fd:
+                continue
+            m = meta[(eid, player)]
+            gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+            if gid is None:
+                continue
+            ps = gid.split("_")
+            av = (actuals.get((scan._norm(player), ps[0], str(int(ps[1])))) or {}).get(stat)
+            if av is None:
+                continue
+            dl = _line_px(dk[src], "OVER")[0] or _line_px(dk[src], "UNDER")[0]
+            fl = _line_px(fd[src], "OVER")[0] or _line_px(fd[src], "UNDER")[0]
+            if dl is None or fl is None or abs(dl - fl) < 1e-9:
+                continue
+            low, high = (dk[src], fd[src]) if dl < fl else (fd[src], dk[src])
+            lo_line, lo_over = _line_px(low, "OVER")
+            hi_line, hi_under = _line_px(high, "UNDER")
+            if lo_over is None or hi_under is None:
+                continue
+            over_win = av > lo_line; over_push = abs(av - lo_line) < 1e-9
+            under_win = av < hi_line; under_push = abs(av - hi_line) < 1e-9
+            pair = _leg_pnl(over_win, over_push, lo_over) + _leg_pnl(under_win, under_push, hi_under)
+            n += 1
+            pnl += pair
+            if over_win and under_win:
+                hits += 1
+            if lo_over > 0 and hi_under > 0:            # both plus-money = free/dead middle
+                free += 1
+                free_pnl += pair
+        if n >= 30:
+            print(f"    {prop.replace('player_',''):<22} {n:>6} {hits/n*100:>7.1f}% "
+                  f"{pnl/n/2*100:>+8.2f}% {free:>8} "
+                  f"{(free_pnl/free/2*100 if free else float('nan')):>+7.2f}%")
+            tot_n += n; tot_pnl += pnl
+    if tot_n:
+        print(f"    {'POOLED':<22} {int(tot_n):>6} {'':>8} {tot_pnl/tot_n/2*100:>+8.2f}%")
+
+
+def fade_laggard(props, seasons, rung_pref):
+    """When DK≠FD, treat one book as leader and bet the OTHER (laggard)'s stale side:
+    laggard_line < leader_line ⇒ laggard's OVER is too easy ⇒ bet OVER at laggard.
+    Model-free. Primary: leader=FD (FD leads per the lag data); control: leader=DK."""
+    idx = nfl_schedule.game_index([str(s) for s in seasons])
+    actuals = scan._player_week_index(seasons)
+    print(f"\n  FADE-THE-LAGGARD (bet stale book's favorable side, rung={rung_pref}):")
+    for leader, laggard in (("fanduel", "draftkings"), ("draftkings", "fanduel")):
+        by = defaultdict(lambda: [0, 0.0, 0.0, 0.0])   # season -> [n, wins, impl, roi]
+        fair_pl = [0, 0.0]
+        for prop in props:
+            stat = acc.PROPS[prop]["stat"]
+            lines, meta = clv._load_local(prop, seasons)
+            for (eid, player), bybook in lines.items():
+                lead = bybook.get(leader, {}); lag = bybook.get(laggard, {})
+                src = (next((s for s in RUNG_ORDER if s in lead and s in lag), None)
+                       if rung_pref == "opener" else rung_pref)
+                if src is None or src not in lead or src not in lag:
+                    continue
+                m = meta[(eid, player)]
+                gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+                if gid is None:
+                    continue
+                ps = gid.split("_")
+                av = (actuals.get((scan._norm(player), ps[0], str(int(ps[1])))) or {}).get(stat)
+                if av is None:
+                    continue
+                ll = _line_px(lag[src], "OVER")[0] or _line_px(lag[src], "UNDER")[0]
+                el = _line_px(lead[src], "OVER")[0] or _line_px(lead[src], "UNDER")[0]
+                if ll is None or el is None or abs(ll - el) < 1e-9:
+                    continue
+                over = ll < el                            # laggard line low ⇒ bet its OVER
+                pt, px = _line_px(lag[src], "OVER" if over else "UNDER")
+                if pt is None or abs(av - pt) < 1e-9:
+                    continue
+                won = (av > pt) if over else (av < pt)
+                fair = clv._fair_over(lag[src])
+                impl = (fair if over else 1 - fair) if fair is not None else 0.5
+                roi = (american_to_decimal(px) - 1.0) if won else -1.0
+                r = by[ps[0]]
+                r[0] += 1; r[1] += 1 if won else 0; r[2] += impl; r[3] += roi
+                if -110 <= px < 100:
+                    fair_pl[0] += 1; fair_pl[1] += roi
+        print(f"    leader={leader}, bet {laggard} stale side:")
+        for s in sorted(by):
+            n, w, im, roi = by[s]
+            if n < 30:
+                continue
+            print(f"      {s}: n={n:>5}  real-impl={(w-im)/n*100:+5.2f}%  ROI={roi/n*100:+6.2f}%")
+        if fair_pl[0]:
+            print(f"      FAIR-price ROI={fair_pl[1]/fair_pl[0]*100:+.2f}% (n={fair_pl[0]})")
+
+
 def main():
     try:
         from cli_encoding import configure_stdio
@@ -219,7 +335,8 @@ def main():
     print(f"  DK vs FD BOOK SHOP — test {test_seasons}, rung={args.rung}")
     print("=" * 100)
     divergence_and_lag(props, test_seasons)
-    exploit(props, train_seasons, test_seasons, args.rung)
+    middle(props, test_seasons, args.rung)
+    fade_laggard(props, test_seasons, args.rung)
     print("=" * 100)
 
 
