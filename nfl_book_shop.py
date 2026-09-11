@@ -315,6 +315,152 @@ def fade_laggard(props, seasons, rung_pref):
             print(f"      FAIR-price ROI={fair_pl[1]/fair_pl[0]*100:+.2f}% (n={fair_pl[0]})")
 
 
+def best_ev(props, train_seasons, test_seasons, rung_pref, diverge_only=False):
+    """Doug's exact rule: for the model's side, pick the DK/FD offer that MAXIMIZES model EV
+    (P(side@that line) × decimal_odds − 1), at each offer's own line+price. Then bucket by
+    that best EV (the 'required-price' reframe): does betting only EV≥X select winners?"""
+    buckets = [(-9, 0.0, "any"), (0.0, 0.03, "EV 0-3%"), (0.03, 0.06, "EV 3-6%"),
+               (0.06, 9, "EV≥6%")]
+    agg = {lbl: defaultdict(lambda: [0, 0.0, 0.0]) for *_a, lbl in buckets}  # lbl->season->[n,wins,roi]
+    fairagg = {lbl: [0, 0.0] for *_a, lbl in buckets}
+    for prop in props:
+        cfg = acc.PROPS[prop]
+        hl, mp, k = acc.SWEPT.get(prop, (4, 3, 12))
+        acc.HALF_LIFE, acc.MIN_PRIOR, acc.SHRINK_K = hl, mp, k
+        train = acc._obs_from_series(acc._series(train_seasons), cfg)
+        if len(train) < 200:
+            continue
+        comp = acc.fit_components(train, cfg)
+        feat = {(o["name"], o["season"], o["week"]): o
+                for o in acc._obs_from_series(acc._series(test_seasons), cfg)}
+        idx = nfl_schedule.game_index([str(s) for s in test_seasons])
+        lines, meta = clv._load_local(prop, test_seasons)
+        for (eid, player), bybook in lines.items():
+            m = meta[(eid, player)]
+            gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+            if gid is None:
+                continue
+            ps = gid.split("_"); season, week = ps[0], int(ps[1])
+            o = feat.get((scan._norm(player), season, week))
+            if o is None:
+                continue
+            actual = o["actual"]
+            src = (next((s for s in RUNG_ORDER if s in bybook.get("draftkings", {})
+                         or s in bybook.get("fanduel", {})), None)
+                   if rung_pref == "opener" else rung_pref)
+            at = {b: bybook[b][src] for b in ("draftkings", "fanduel")
+                  if b in bybook and src in bybook.get(b, {})} if src else {}
+            if not at:
+                continue
+            if diverge_only:                          # abstain when books agree
+                if len(at) < 2:
+                    continue
+                dl = _line_px(at["draftkings"], "OVER")[0] or _line_px(at["draftkings"], "UNDER")[0]
+                fl = _line_px(at["fanduel"], "OVER")[0] or _line_px(at["fanduel"], "UNDER")[0]
+                if dl is None or fl is None or abs(dl - fl) < 1e-9:
+                    continue
+            ref = at.get("draftkings") or at.get("fanduel")
+            fair = clv._fair_over(ref)
+            if fair is None:
+                continue
+            l0 = _line_px(ref, "OVER")[0] or _line_px(ref, "UNDER")[0]
+            over = acc.p_over(o, l0, cfg, comp) >= fair
+            # best-EV offer for our side across the books
+            best = None
+            for d in at.values():
+                pt, px = _line_px(d, "OVER" if over else "UNDER")
+                if pt is None:
+                    continue
+                pw = acc.p_over(o, pt, cfg, comp)
+                psd = pw if over else 1 - pw
+                ev = psd * american_to_decimal(px) - 1.0
+                if best is None or ev > best[0]:
+                    best = (ev, pt, px)
+            if best is None or abs(actual - best[1]) < 1e-9:
+                continue
+            ev, pt, px = best
+            won = (actual > pt) if over else (actual < pt)
+            roi = (american_to_decimal(px) - 1.0) if won else -1.0
+            for lo, hi, lbl in buckets:
+                if lo <= ev < hi:
+                    r = agg[lbl][season]
+                    r[0] += 1; r[1] += 1 if won else 0; r[2] += roi
+                    if -110 <= px < 100:
+                        fairagg[lbl][0] += 1; fairagg[lbl][1] += roi
+    tag = "DIVERGENT-ONLY (abstain when books agree)" if diverge_only else "ALL cases"
+    print(f"\n  BEST-EV OFFER [{tag}] (max-EV DK/FD offer for model's side, rung={rung_pref}):")
+    print("    (EV bucket = the 'required-price' reframe — only bet if best EV clears the bar)")
+    for *_a, lbl in buckets:
+        row = agg[lbl]
+        cells = []
+        for s in sorted(row):
+            n, w, roi = row[s]
+            if n >= 30:
+                cells.append(f"{s}:{roi/n*100:+.1f}%(n={n})")
+        fp = fairagg[lbl]
+        fair = f"FAIR {fp[1]/fp[0]*100:+.1f}%(n={fp[0]})" if fp[0] else "FAIR:na"
+        print(f"    {lbl:<9} " + "  ".join(cells) + f"  | {fair}")
+
+
+def doug_rule(props, seasons, rung_pref):
+    """Doug's model-free rule: when DK/FD lines differ, the higher-line book 'knows' the total
+    is high → bet OVER at the LOWER-line book. Tests both that AND its mirror (UNDER at the
+    higher-line book = trust the lower book) to see which book is actually the informed one.
+    real-impl = did the side win MORE than the chosen book's own price implied (mispriced?)."""
+    idx = nfl_schedule.game_index([str(s) for s in seasons])
+    actuals = scan._player_week_index(seasons)
+    print(f"\n  DOUG'S RULE (divergent lines, model-free; rung={rung_pref}):")
+    for label, side in (("OVER @ lower-line book (trust higher book)", "over_low"),
+                        ("UNDER @ higher-line book (trust lower book)", "under_high")):
+        by = defaultdict(lambda: [0, 0.0, 0.0, 0.0])   # season->[n,wins,impl,roi]
+        fair = [0, 0.0]
+        for prop in props:
+            stat = acc.PROPS[prop]["stat"]
+            lines, meta = clv._load_local(prop, seasons)
+            for (eid, player), bybook in lines.items():
+                dk = bybook.get("draftkings", {}); fd = bybook.get("fanduel", {})
+                src = (next((s for s in RUNG_ORDER if s in dk and s in fd), None)
+                       if rung_pref == "opener" else rung_pref)
+                if src is None or src not in dk or src not in fd:
+                    continue
+                m = meta[(eid, player)]
+                gid, _ = nfl_schedule.resolve_event(m["home"], m["away"], m["commence"], index=idx)
+                if gid is None:
+                    continue
+                ps = gid.split("_")
+                av = (actuals.get((scan._norm(player), ps[0], str(int(ps[1])))) or {}).get(stat)
+                if av is None:
+                    continue
+                dl = _line_px(dk[src], "OVER")[0] or _line_px(dk[src], "UNDER")[0]
+                fl = _line_px(fd[src], "OVER")[0] or _line_px(fd[src], "UNDER")[0]
+                if dl is None or fl is None or abs(dl - fl) < 1e-9:
+                    continue
+                low, high = (dk[src], fd[src]) if dl < fl else (fd[src], dk[src])
+                if side == "over_low":
+                    pt, px = _line_px(low, "OVER"); over = True
+                    fr = clv._fair_over(low)
+                else:
+                    pt, px = _line_px(high, "UNDER"); over = False
+                    frov = clv._fair_over(high); fr = (1 - frov) if frov is not None else None
+                if pt is None or px is None or abs(av - pt) < 1e-9:
+                    continue
+                won = (av > pt) if over else (av < pt)
+                roi = (american_to_decimal(px) - 1.0) if won else -1.0
+                r = by[ps[0]]
+                r[0] += 1; r[1] += 1 if won else 0
+                r[2] += fr if fr is not None else 0.5; r[3] += roi
+                if -110 <= px < 100:
+                    fair[0] += 1; fair[1] += roi
+        print(f"    {label}:")
+        for s in sorted(by):
+            n, w, im, roi = by[s]
+            if n >= 30:
+                print(f"      {s}: n={n:>5}  win={w/n*100:4.1f}%  real-impl={(w-im)/n*100:+5.2f}%  "
+                      f"ROI={roi/n*100:+6.2f}%")
+        if fair[0]:
+            print(f"      FAIR-price ROI={fair[1]/fair[0]*100:+.2f}% (n={fair[0]})")
+
+
 def main():
     try:
         from cli_encoding import configure_stdio
@@ -334,9 +480,7 @@ def main():
     print("=" * 100)
     print(f"  DK vs FD BOOK SHOP — test {test_seasons}, rung={args.rung}")
     print("=" * 100)
-    divergence_and_lag(props, test_seasons)
-    middle(props, test_seasons, args.rung)
-    fade_laggard(props, test_seasons, args.rung)
+    doug_rule(props, test_seasons, args.rung)
     print("=" * 100)
 
 
