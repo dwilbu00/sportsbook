@@ -3347,8 +3347,12 @@ if analyze_clicked and selected_game_labels:
         events_by_id = {e["id"]: e for e in selected_events}
         # Stash the parsed board for the 💰 Bonuses page (the bonus optimizer reuses this
         # already-fetched slate → zero marginal credits). Reset per run; filled below.
-        st.session_state["bonus_board"] = {
-            "sport_key": sport["key"], "parsed": [], "ts": time.time()}
+        # Defensive: never let this bookkeeping affect the analysis itself.
+        try:
+            st.session_state["bonus_board"] = {
+                "sport_key": sport["key"], "parsed": [], "ts": time.time()}
+        except Exception:
+            pass
 
         # P6/F3: pre-warm the StatsAPI season player index on the MAIN thread so the
         # Phase-2 pool workers (resolve_mlbam_id -> _player_index) hit the populated
@@ -3365,7 +3369,10 @@ if analyze_clicked and selected_game_labels:
         for eid, raw_data in prop_odds_results.items():
             parsed = parse_player_props(raw_data)
             parsed_props[eid] = parsed
-            st.session_state["bonus_board"]["parsed"].append(parsed)   # for 💰 Bonuses
+            try:
+                st.session_state["bonus_board"]["parsed"].append(parsed)   # for 💰 Bonuses
+            except Exception:
+                pass
             # ESPN team ids for THIS matchup disambiguate same-name players so
             # the correct athlete's history is fetched (see search_athlete
             # team_ids). NON-MLB sports dedup the future GLOBALLY by (player, prop):
