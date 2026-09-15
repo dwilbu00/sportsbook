@@ -47,22 +47,30 @@ can't read local parquet).**
 - **Table**: `nfl_player_week(player_norm, season, week, targets, carries, attempts, receptions,
   ...)` — the volume columns from `nfl_data.player_week`. Backfill 2012–2025 once from the parquet
   we already have (LFS `nfl_ladder_data`/player_week); this is FREE (nflreadpy, no credits).
-- **Weekly refresh**: a small idempotent job that upserts the current season's latest weeks from
-  nflreadpy into the table (free; run on a cron or manual weekly). Live season only — historical
-  rows are immutable.
-- **Serving helper** (`nfl_opportunity_serving.py`): `expected_volume(player_norm, season, week,
-  prop)` → recency-weighted mean over that player's prior weeks in the table, using the SAME
-  SWEPT half-life the backtest used per prop. Returns the value the gate thresholds on. Cached
-  per-slate in session.
+- **Refresh — LAZY / SELF-HEALING in the app (Doug 2026-09-15):** no cron, no manual command. On
+  entering the Bonuses section, the app checks whether Azure `nfl_player_week` already has the
+  current season through the **most recent COMPLETED week**; if it's missing/stale, the app pulls
+  that from nflreadpy and upserts it, then proceeds. Idempotent; the staleness check is cached per
+  session so it fires at most once per app load. Historical rows are immutable.
+  - Note on timing: for a live slate (games not yet played) the gate projects from PRIOR weeks, so
+    "current data" = through the last completed week — which exists before kickoff. No dependency
+    on same-day results.
+- **Serving helper** (`nfl_opportunity_serving.py`): `ensure_current(season)` (the lazy refresh)
+  + `expected_volume(player_norm, season, week, prop)` → recency-weighted mean over that player's
+  prior weeks in the table, using the SAME SWEPT half-life the backtest used per prop. Returns the
+  value the gate thresholds on. Cached per-slate in session.
 - The gate in `legs_from_board` then = `expected_volume(...) >= TRUSTWORTHY[prop]`.
 
 Honesty note: we validated *market-devig calibration* specifically on these 3 count props above
 threshold — the serving feed keeps the live gate identical to that validated universe. (Expanding
 to yardage/other props later would need its own market-calibration check first.)
 
-⚠ New dependency to confirm: the weekly refresh needs `nflreadpy` (or equivalent nflverse pull)
-reachable from wherever the refresh runs. If the refresh runs on Doug's machine / a cron (not on
-Streamlit Cloud), the cloud app only ever READS the Azure table — clean and cloud-safe.
+⚠ DEPENDENCY TO CONFIRM (blocks this approach): the lazy refresh runs INSIDE the app, so the
+runtime (incl. **Streamlit Cloud**) must be able to (a) `import nflreadpy` and reach nflverse’s
+public data (free) and (b) WRITE to Azure. The app already writes to Azure (wagers/ledger), so (b)
+is fine; (a) means adding `nflreadpy` to the cloud requirements — needs a quick confirmation it
+installs/runs on Cloud. If Cloud can’t pull nflreadpy, fallback = the refresh runs on Doug’s
+machine and the app read-only (the earlier cron option). Recommend: try in-app first.
 
 ---
 
@@ -125,8 +133,9 @@ The Odds API does not return SGP *combined* prices, and we have no historical SG
 
 ## 7. Build order & test plan
 1. **Serving feed** (§2): create Azure `nfl_player_week` table; backfill 2012–2025 from parquet
-   (free); write `nfl_opportunity_serving.py` (`expected_volume`) + a weekly-refresh job. Verify
-   `expected_volume` matches the offline `acc._obs_from_series` exp_vol for spot-checked players.
+   (free); write `nfl_opportunity_serving.py` = `ensure_current()` (lazy self-healing refresh) +
+   `expected_volume()`. Verify `expected_volume` matches the offline `acc._obs_from_series`
+   exp_vol for spot-checked players; verify `ensure_current` no-ops when the table is fresh.
 2. Freeze rho → `calibration/nfl_sgp_correlations.json`; point `joint_prob` at it.
 3. Refactor optimizer: add `legs_from_board(board, book)` adapter (gate via §1 serving feed);
    keep pure play-gen. Unit-test adapter maps a sample parsed board → correct leg dicts + gate.
