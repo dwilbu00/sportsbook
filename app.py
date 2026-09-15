@@ -3235,7 +3235,11 @@ if analyze_clicked and selected_game_labels:
     # and cache it in session state so a re-analyze is free. If it can't be fit,
     # coherence is skipped entirely (better no flags than miscalibrated ones).
     coherence_offset = None
-    if sport["key"] == "baseball_mlb":
+    # Coherence is a RUN-LINE (team-market) flag — skip its 3-season SQL offset fit entirely
+    # when no team markets are selected (e.g. a props-only slate like pitcher_outs). That fit
+    # ran unconditionally for MLB and, on a cold serverless Azure DB, is what stalled a
+    # props-only analysis at "Loading team data…". Team-market slates still fit it (cached/slate).
+    if sport["key"] == "baseball_mlb" and markets_str:
         _coh_cache = st.session_state.get("_coherence_offset_cache") or {}
         if sport["key"] in _coh_cache:
             coherence_offset = _coh_cache[sport["key"]]
