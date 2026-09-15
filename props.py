@@ -1215,6 +1215,23 @@ def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
     return _prop_is_value(edge, eff_threshold, expected_roi)
 
 
+def _nfl_model_override(player_name, prop_key, line):
+    """Live NFL prop projection from OUR calibrated nflverse models (nfl_prop_serving), used to
+    replace the app's legacy ESPN-gamelog projection for the 8 modeled props. Returns a dict
+    {proj, sd, p_over, n_prior} or None (unknown prop / thin history / any error → ESPN fallback).
+    Lazy-imported + fail-open so it can never break the analysis path."""
+    try:
+        import nfl_prop_serving
+        import nfl_props_scan
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        season = now.year if now.month >= 3 else now.year - 1   # NFL season = start year
+        return nfl_prop_serving.project(
+            nfl_props_scan._norm(player_name), season, 99, prop_key, line)
+    except Exception:
+        return None
+
+
 def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                sport_key=None, team_defense=None, espn_teams=None,
                                safe_mode=False, safe_target=0.95,
@@ -1873,6 +1890,20 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         "blend_weight": round(blend_w, 3),
                         "empirical_over": round(empirical_over * 100, 2),
                     }
+
+            # ── NFL: replace the legacy ESPN-gamelog projection with OUR calibrated
+            # nflverse model for the 8 modeled props (the ESPN path mislabels QB/skill
+            # pass-vs-rush YDS). Falls back to the ESPN result above for anything we don't
+            # model (override returns None). Fail-open. Safe-mode alt-line spread still uses
+            # the ESPN history (a known v1 limitation; the standard projection is migrated). ──
+            if sport_key == "americanfootball_nfl":
+                _nfl = _nfl_model_override(player_name, prop_key, line)
+                if _nfl is not None and _nfl.get("p_over") is not None:
+                    avg_stat = _nfl["proj"]
+                    base_proj = avg_stat
+                    over_rate = max(0.0, min(1.0, _nfl["p_over"]))
+                    curr_games = _nfl["n_prior"]
+                    calibration_meta = {"method": "nfl_model", "curr_games": curr_games}
 
             # ── Platt recalibration (self-updating) ──
             # Apply the same final calibration layer before either standard or

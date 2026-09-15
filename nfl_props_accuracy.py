@@ -334,6 +334,31 @@ def proj_mean_sd(o, cfg, comp):
     return m, _sd_of(o, cfg, comp)
 
 
+def freeze_models(train_seasons, path="calibration/nfl_prop_models.json"):
+    """Fit every prop's components on the deep-history train seasons and dump them to a JSON
+    config the live app loads (Cloud can't read the mirror to fit). One entry per prop:
+    {swept:[hl,mp,k], comp:{...}}. Run offline; re-fit before each season."""
+    import json
+    import os
+    global HALF_LIFE, MIN_PRIOR, SHRINK_K
+    out = {}
+    for prop, cfg in PROPS.items():
+        hl, mp, k = SWEPT.get(prop, (4, 3, 12))
+        HALF_LIFE, MIN_PRIOR, SHRINK_K = hl, mp, k
+        train = _obs_from_series(_series(train_seasons), cfg)
+        if len(train) < 200:
+            print(f"  {prop}: thin train ({len(train)}) — skip")
+            continue
+        comp = fit_components(train, cfg)
+        out[prop] = {"swept": [hl, mp, k], "comp": comp, "n_train": len(train)}
+        print(f"  {prop:<24} n_train={len(train):>6} comp_keys={sorted(comp)}")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2, default=list)   # tuples (curve/varcoef) -> lists
+    print(f"FROZE {len(out)} prop models -> {path}")
+    return out
+
+
 def evaluate(prop, cfg, train_seasons, test_seasons, snapshot, book):
     tr_series = _series(train_seasons)
     te_series = _series(test_seasons)

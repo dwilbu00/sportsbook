@@ -28,7 +28,13 @@ VOL_STAT = {"player_receptions": "targets", "player_rush_attempts": "carries",
 NFLVERSE_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
                 "stats_player/stats_player_week_{season}.parquet")
 _KEEP = ["player_display_name", "season", "week", "team", "position",
-         "targets", "carries", "attempts", "receptions"]
+         "targets", "carries", "attempts", "receptions",
+         # full model feature set (nfl_prop_serving): conversion + yardage + aDOT
+         "receiving_yards", "receiving_air_yards", "rushing_yards",
+         "completions", "passing_yards", "passing_tds"]
+_NUM_COLS = ["targets", "carries", "attempts", "receptions", "receiving_yards",
+             "receiving_air_yards", "rushing_yards", "completions", "passing_yards",
+             "passing_tds"]
 CACHE_TTL = 6 * 3600         # 6h — a season's weekly data changes at most once/week
 _CACHE = {}                  # season(int) -> (fetch_ts, DataFrame|None)
 
@@ -45,7 +51,7 @@ def _load(season, ttl=CACHE_TTL):
         cols = [c for c in _KEEP if c in df.columns]
         df = df[cols].copy()
         df["player_norm"] = df["player_display_name"].map(scan._norm)
-        for c in ("targets", "carries", "attempts", "receptions"):
+        for c in _NUM_COLS:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
             else:
