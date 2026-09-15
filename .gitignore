@@ -47,3 +47,6 @@ odds_backfill/
 
 # NFL ladder research work-cache (re-creatable from Azure via nfl_ladder_clv --extract; not durable-source)
 nfl_ladder_data/
+
+# NFL alternate-line capture (local research cache; persist to a research table if it proves out, never operational odds_line)
+nfl_alt_data/
