@@ -720,8 +720,11 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
 
     games = []
 
-    # Top-level labels (used by MLB and sometimes shared across categories)
+    # Top-level labels (used by MLB and sometimes shared across categories) + the
+    # unambiguous machine `names` (passingYards/rushingYards/...) that disambiguate
+    # ESPN's duplicated display labels ('YDS'/'TD' reused across passing/rushing/receiving).
     top_labels = data.get("labels", [])
+    top_names = data.get("names", [])
 
     # Top-level events dict carries opponent metadata keyed by event id.
     top_events = data.get("events", {})
@@ -762,6 +765,7 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
         categories = st.get("categories", [])
         for cat in categories:
             labels = cat.get("labels", []) or top_labels
+            names = cat.get("names", []) or top_names
             if not labels:
                 continue
             events = cat.get("events", [])
@@ -769,7 +773,7 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
                 stats_list = event.get("stats", [])
                 if len(stats_list) != len(labels):
                     continue
-                game_stats = _parse_stat_row(labels, stats_list)
+                game_stats = _parse_stat_row(labels, stats_list, names)
                 eid_key = event.get("eventId") or event.get("id")
                 game_stats["opponent"] = _opponent_name(eid_key)
                 game_stats["is_home"] = _is_home(eid_key)
@@ -786,7 +790,7 @@ def get_athlete_gamelog(sport, league, athlete_id, season_year=None):
         for event_id, event in top_events.items():
             stats_list = event.get("stats", [])
             if len(stats_list) == len(top_labels):
-                game_stats = _parse_stat_row(top_labels, stats_list)
+                game_stats = _parse_stat_row(top_labels, stats_list, top_names)
                 game_stats["opponent"] = _opponent_name(event)
                 game_stats["is_home"] = _is_home(event)
                 game_stats["team_id"] = _team_id(event)
@@ -813,30 +817,36 @@ def ip_to_outs(ip):
     return whole * 3 + frac
 
 
-def _parse_stat_row(labels, stats_list):
-    """
-    Parse a row of stat values into a dict, converting strings to floats.
+def _parse_stat_val(val):
+    """One ESPN stat cell → float. Made-attempted ("11-22") → made count; ""/"-"/"--" → 0.0."""
+    try:
+        if isinstance(val, (int, float)):
+            return float(val)
+        if val in ("", "-", "--"):
+            return 0.0
+        if isinstance(val, str) and "-" in val and not val.startswith("-"):
+            made_part = val.split("-", 1)[0].strip()   # first hyphen = separator
+            return float(made_part) if made_part else 0.0
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
 
-    Handles ESPN's made-attempted format (e.g., "11-22" for FG made-attempted)
-    by extracting the made count (the left-hand number). Empty/DNP-like
-    markers ("", "-", "--") become 0.0.
+
+def _parse_stat_row(labels, stats_list, names=None):
+    """Parse a row of stat values into a dict, converting strings to floats.
+
+    Keys each value by its display LABEL and — when the machine ``names`` array is present —
+    ALSO by its unambiguous name (e.g. 'passingYards' / 'rushingYards'). ESPN's NFL gamelog
+    reuses display labels across categories ('YDS' = passing AND rushing), so label-only keying
+    silently collapses them (last write wins). The name keys disambiguate; PROP_STAT_MAP prefers
+    them. Empty/DNP markers become 0.0; made-attempted ('11-22') uses the made count.
     """
     game_stats = {}
     for label, val in zip(labels, stats_list):
-        try:
-            if isinstance(val, (int, float)):
-                game_stats[label] = float(val)
-            elif val in ("", "-", "--"):
-                game_stats[label] = 0.0
-            elif isinstance(val, str) and "-" in val and not val.startswith("-"):
-                # Made-attempted format like "11-22" → use the made count.
-                # Only the first hyphen is treated as a separator.
-                made_part = val.split("-", 1)[0].strip()
-                game_stats[label] = float(made_part) if made_part else 0.0
-            else:
-                game_stats[label] = float(val)
-        except (ValueError, TypeError):
-            game_stats[label] = 0.0
+        game_stats[label] = _parse_stat_val(val)
+    if names and len(names) == len(stats_list):
+        for name, val in zip(names, stats_list):
+            game_stats[name] = _parse_stat_val(val)
     return game_stats
 
 
@@ -847,8 +857,17 @@ PROP_STAT_MAP = {
     "player_assists": ["AST"],
     "player_rebounds": ["REB"],
     "player_anytime_td": ["TD"],
-    "player_rush_yds": ["RUSH YDS", "YDS"],
-    "player_pass_yds": ["PASS YDS", "YDS"],
+    # NFL: PREFER the unambiguous ESPN `names` keys (passingYards vs rushingYards) — the display
+    # labels 'YDS'/'TD' are reused across passing/rushing/receiving and collide. Display-label
+    # fallbacks kept for older or alternate payloads.
+    "player_rush_yds": ["rushingYards", "RUSH YDS", "YDS"],
+    "player_pass_yds": ["passingYards", "PASS YDS", "YDS"],
+    "player_reception_yds": ["receivingYards", "REC YDS", "YDS"],
+    "player_receptions": ["receptions", "REC"],
+    "player_pass_tds": ["passingTouchdowns", "PASS TD", "TD"],
+    "player_rush_attempts": ["rushingAttempts", "CAR", "ATT"],
+    "player_pass_attempts": ["passingAttempts", "ATT"],
+    "player_pass_completions": ["completions", "CMP"],
     "batter_hits": ["H"],
     "pitcher_strikeouts": ["K", "SO"],
     "pitcher_outs": ["IP"],  # innings pitched * 3 = outs
