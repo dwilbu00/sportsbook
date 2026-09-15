@@ -2196,6 +2196,31 @@ def render_bonuses():
         rho = opt.load_rho()
         results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll)
 
+    # ── eligibility diagnostics (so an empty result explains itself) ──
+    trust = list(opt.TRUSTWORTHY)                       # the only props that can be legs
+    board_markets = set()
+    for _b in board["parsed"]:
+        board_markets.update((_b.get("props") or {}).keys())
+    missing = [p for p in trust if p not in board_markets]
+    n_games = len(board["parsed"])
+    n_legs = max(len(v) for v in legs_by_book.values()) if legs_by_book else 0
+    _abbr = {"player_receptions": "Receptions", "player_rush_attempts": "Rush Attempts",
+             "player_pass_attempts": "Pass Attempts"}
+    st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible leg(s). Bonus legs come only from "
+               f"the validated count props: {', '.join(_abbr.values())}.")
+    if missing:
+        st.warning("⚠️ Your analyzed slate has no odds for "
+                   f"**{', '.join(_abbr[p] for p in missing)}** — the bonus optimizer can only "
+                   "build legs from those. Re-run the 🎯 Value Finder with those prop markets "
+                   "selected (the default NFL markets are yardage/anytime-TD, which aren't used "
+                   "here).")
+    elif n_legs == 0:
+        st.info("No players cleared the opportunity threshold on this slate yet (thin early-season "
+                "usage). More will qualify as the season progresses.")
+    elif n_games < 2:
+        st.info("Only one game analyzed — cross-game parlays need ≥2 games. Same-game (SGP) "
+                "stacks can still appear below; add more games for cross-game parlays.")
+
     pabbr = opt.PROP_ABBR
 
     def _leglabel(l):
