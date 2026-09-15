@@ -863,7 +863,9 @@ def consensus_odds(team_odds_list):
 
 PLAYER_PROPS_BY_SPORT = {
     "basketball_nba": ["player_points", "player_assists", "player_rebounds"],
-    "americanfootball_nfl": ["player_anytime_td", "player_rush_yds", "player_pass_yds"],
+    "americanfootball_nfl": ["player_pass_yds", "player_pass_tds", "player_pass_attempts",
+                             "player_pass_completions", "player_rush_yds", "player_rush_attempts",
+                             "player_reception_yds", "player_receptions", "player_anytime_td"],
     "baseball_mlb": ["batter_hits", "pitcher_strikeouts", "pitcher_outs", "batter_strikeouts", "pitcher_earned_runs", "batter_total_bases", "batter_rbis"],
 }
 
@@ -877,8 +879,13 @@ PLAYER_PROP_ALTS_BY_SPORT = {
         "player_rebounds": "player_rebounds_alternate",
     },
     "americanfootball_nfl": {
+        # Only markets The Odds API reliably offers an alt ladder for (safe-mode alt fetch
+        # bills per requested market, so don't request ones that don't exist).
         "player_rush_yds": "player_rush_yds_alternate",
         "player_pass_yds": "player_pass_yds_alternate",
+        "player_reception_yds": "player_reception_yds_alternate",
+        "player_receptions": "player_receptions_alternate",
+        "player_pass_tds": "player_pass_tds_alternate",
     },
     "baseball_mlb": {
         "batter_hits": "batter_hits_alternate",
