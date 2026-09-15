@@ -28,28 +28,41 @@ our A/C model prob blended to market) — the Bonuses section deliberately uses 
 
 ---
 
-## 2. The only real gap: the eligibility gate (and how we close it without new plumbing)
+## 2. The eligibility gate — DECISION: build the serving feed (Doug 2026-09-15)
 
 The optimizer restricts legs to **trustworthy props above an opportunity threshold**
 (`TRUSTWORTHY = {receptions:6.9 tgt, rush_attempts:8.5 car, pass_attempts:23.4 att}`). Offline
-that threshold uses `nfl_data.player_week` expected volume — which is **NOT served in the live
-app** (the app serves NFL props from ESPN gamelogs via `analyze_player_props_value`,
-`props.py:1218`; our `player_week` opportunity models are offline-only).
+that threshold uses `nfl_data.player_week` expected volume — **NOT served in the live app** (the
+app serves NFL props from ESPN gamelogs via `analyze_player_props_value`, `props.py:1218`; our
+`player_week` opportunity models are offline-only). The ESPN-gamelog proxy was rejected in favor
+of the higher-fidelity **serving feed** so the live gate is byte-for-byte the backtested gate.
 
-Two ways to close it (recommend **A**):
+**What the gate actually needs (scoped down):** only **expected volume per slate player** — a
+recency-weighted mean of the relevant VOLUME stat (targets / carries / attempts) — compared to
+the threshold. It does NOT need the full distributional model (leg P = market de-vig). So the
+serving feed can be lightweight: recent weekly volume per player, nothing more.
 
-- **(A) Compute the opportunity gate from the ESPN gamelog history the app already pulls.**
-  The app already fetches per-player gamelogs via `get_player_stat_history` (`app.py:3057`) — those
-  logs carry the same volume stats (targets/carries/attempts). A recency-weighted mean of the
-  relevant volume stat is a faithful proxy for the opportunity gate. **No new serving feed, no
-  Azure table, no credits.** Matches the gate's intent (workhorse, market-trustworthy).
-- (B) Stand up a live serving feed for `nfl_data.player_week` opportunity projections (new Azure
-  table + serving plumbing). Higher fidelity, but a big build for a gate that (A) approximates
-  well. Defer unless (A) proves inadequate.
+**Build = an Azure `nfl_player_week` table (Azure is the only system of record; Streamlit Cloud
+can't read local parquet).**
+- **Table**: `nfl_player_week(player_norm, season, week, targets, carries, attempts, receptions,
+  ...)` — the volume columns from `nfl_data.player_week`. Backfill 2012–2025 once from the parquet
+  we already have (LFS `nfl_ladder_data`/player_week); this is FREE (nflreadpy, no credits).
+- **Weekly refresh**: a small idempotent job that upserts the current season's latest weeks from
+  nflreadpy into the table (free; run on a cron or manual weekly). Live season only — historical
+  rows are immutable.
+- **Serving helper** (`nfl_opportunity_serving.py`): `expected_volume(player_norm, season, week,
+  prop)` → recency-weighted mean over that player's prior weeks in the table, using the SAME
+  SWEPT half-life the backtest used per prop. Returns the value the gate thresholds on. Cached
+  per-slate in session.
+- The gate in `legs_from_board` then = `expected_volume(...) >= TRUSTWORTHY[prop]`.
 
 Honesty note: we validated *market-devig calibration* specifically on these 3 count props above
-threshold. Staying inside that leg universe keeps Stage B within backtested territory. (Expanding
+threshold — the serving feed keeps the live gate identical to that validated universe. (Expanding
 to yardage/other props later would need its own market-calibration check first.)
+
+⚠ New dependency to confirm: the weekly refresh needs `nflreadpy` (or equivalent nflverse pull)
+reachable from wherever the refresh runs. If the refresh runs on Doug's machine / a cron (not on
+Streamlit Cloud), the cloud app only ever READS the Azure table — clean and cloud-safe.
 
 ---
 
@@ -103,27 +116,35 @@ importable and UI-agnostic:
 The Odds API does not return SGP *combined* prices, and we have no historical SGP prices, so:
 - Cross-game parlays/singles (bonuses 1 & 3): **fully priced and backtested +EV** → shown ready.
 - SGP stacks (bonus 2, or 1/3 used same-game): shown as correlation-vetted **suggestions** with a
-  `need ≥ <price>` threshold; Doug reads the actual SGP price from the DK/FD builder and bets only
-  if it clears `need`. (Optionally: a tiny input to type the builder's price → app computes exact
-  boosted EV + Kelly stake on the spot.)
+  `need ≥ <price>` threshold. **DECISION (Doug 2026-09-15): add a price input** — a small field per
+  stack to paste the DK/FD builder's combined SGP price → the app computes the exact boosted EV
+  (using our copula joint P) + fractional-Kelly stake on the spot, and flags BET / SKIP. `need ≥`
+  is still shown as the at-a-glance cutoff.
 
 ---
 
 ## 7. Build order & test plan
-1. Refactor optimizer: add `legs_from_board` adapter; keep pure play-gen. Unit-test the adapter
-   maps a sample parsed board → correct leg dicts + gate.
+1. **Serving feed** (§2): create Azure `nfl_player_week` table; backfill 2012–2025 from parquet
+   (free); write `nfl_opportunity_serving.py` (`expected_volume`) + a weekly-refresh job. Verify
+   `expected_volume` matches the offline `acc._obs_from_series` exp_vol for spot-checked players.
 2. Freeze rho → `calibration/nfl_sgp_correlations.json`; point `joint_prob` at it.
-3. `render_bonuses()` + nav entry; bonus-manager CRUD with session + json persistence.
-4. Wire plays off the cached board; render tables.
-5. Manual test on a live (cached) slate; confirm 0 credits; sanity-check outputs vs the CLI.
+3. Refactor optimizer: add `legs_from_board(board, book)` adapter (gate via §1 serving feed);
+   keep pure play-gen. Unit-test adapter maps a sample parsed board → correct leg dicts + gate.
+4. `render_bonuses()` + nav entry; bonus-manager CRUD (session + `active_bonuses.json`).
+5. Wire plays off the cached board; render cross-game portfolio + SGP tables; add the SGP price
+   input → exact boosted EV + Kelly.
+6. Manual test on a live (cached) slate; confirm 0 credits for the default flow; sanity-check
+   outputs vs the CLI; verify the gate matches backtested eligibility.
 
 ## 8. Explicitly OUT of scope for v1
-- Live serving feed for our opportunity models (§2B) — use the ESPN-gamelog gate instead.
 - Auto-refresh / auto-bet — surfacing only; Doug places bets manually at DK/FD.
 - Non-count props in the bonus leg universe (needs a market-calibration check first).
 - Round-robins (can add later; the engine already evaluates arbitrary leg sets).
+- Serving the full distributional model live — the gate needs only expected VOLUME (§2).
 
 ## 9. Rough size
-Small–medium: ~1 optimizer adapter + 1 freeze script + ~1 Streamlit function (~150–250 lines) +
-CRUD + 2 tables. No new heavy infra. The heaviest correctness risk (leg calibration, SGP joint)
-is already solved and frozen upstream.
+**Medium** (up from small–medium, due to the serving feed): Azure table + backfill + weekly
+refresh + `nfl_opportunity_serving.py` (§7.1) is the bulk of the new work; then the optimizer
+adapter + freeze + ~1 Streamlit function (~200–300 lines) + CRUD + tables + SGP price input. The
+heaviest correctness risk (leg calibration, SGP joint) is already solved and frozen upstream. One
+owner-run step (Azure DDL/backfill) + a decision on where the weekly refresh runs.
