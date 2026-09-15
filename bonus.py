@@ -1,0 +1,113 @@
+"""bonus.py — promo/bonus EV engine (the actual +EV mechanism).
+
+We can't beat the book on straights, but a profit-BOOST flips high-probability −EV bets to
++EV — because the boost pays on the PAYOUT, and it's biggest on parlays. The catch: the
+boosted EV is only real if the leg probabilities are genuinely calibrated (over-confident P
+=> fake +EV). So this engine consumes OUR calibrated P (trustworthy props only) + the book
+odds + a bonus spec, and returns honest boosted EV, qualification, and Kelly-safe sizing.
+
+Bonus schema (Doug's parameters):
+  bet_type       : 'single' | 'parlay' | 'sgp'
+  boost_pct      : profit boost as a fraction (0.30 = +30% on winnings)
+  min_odds_leg   : each leg's American odds must be >= this (not shorter than)
+  min_odds_overall: combined American odds must be >= this
+  max_wager      : $ cap
+  min_wager      : $ floor
+
+EV per $1 with a profit boost b on a bet of true prob P and decimal odds D:
+  win  -> +(D-1)*(1+b);  lose -> -1
+  EV   =  P*(D-1)*(1+b) - (1-P)
+Kelly fraction on the boosted payout: f* = P - (1-P)/((D-1)*(1+b)).
+"""
+from dataclasses import dataclass
+
+
+@dataclass
+class Bonus:
+    bet_type: str
+    boost_pct: float
+    min_odds_leg: float = -100000.0     # American; default = no floor
+    min_odds_overall: float = -100000.0
+    max_wager: float = 1e9
+    min_wager: float = 0.0
+
+
+def american_to_dec(a):
+    a = float(a)
+    return 1.0 + (a / 100.0 if a > 0 else 100.0 / -a)
+
+
+def dec_to_american(d):
+    d = float(d)
+    return (d - 1.0) * 100.0 if d >= 2.0 else -100.0 / (d - 1.0)
+
+
+def combined_decimal(legs_american):
+    prod = 1.0
+    for a in legs_american:
+        prod *= american_to_dec(a)
+    return prod
+
+
+def boosted_ev_per_dollar(P, dec_odds, boost):
+    """EV per $1 staked with a profit boost `boost` (fraction)."""
+    return P * (dec_odds - 1.0) * (1.0 + boost) - (1.0 - P)
+
+
+def kelly_fraction(P, dec_odds, boost):
+    """Full-Kelly fraction of bankroll for the boosted payout (0 if -EV)."""
+    b = (dec_odds - 1.0) * (1.0 + boost)          # net odds actually received
+    if b <= 0:
+        return 0.0
+    f = P - (1.0 - P) / b
+    return max(0.0, f)
+
+
+def _leg_ok(a, bonus):
+    return american_to_dec(a) >= american_to_dec(bonus.min_odds_leg) - 1e-9
+
+
+def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
+    """legs = [(P, american_odds), ...]. joint_prob overrides the independent product
+    (pass the correlation-adjusted joint for an SGP). Returns the full EV/sizing verdict."""
+    n = len(legs)
+    kind = "single" if n == 1 else "parlay"
+    dec = combined_decimal([a for _p, a in legs])
+    P = joint_prob if joint_prob is not None else _prod(p for p, _a in legs)
+    ev = boosted_ev_per_dollar(P, dec, bonus.boost_pct)
+    # constraints
+    legs_ok = all(_leg_ok(a, bonus) for _p, a in legs)
+    overall_ok = dec >= american_to_dec(bonus.min_odds_overall) - 1e-9
+    type_ok = (bonus.bet_type == "single" and n == 1) or \
+              (bonus.bet_type in ("parlay", "sgp") and n >= 2)
+    qualifies = legs_ok and overall_ok and type_ok
+    # sizing (fractional Kelly, clamped to wager bounds when +EV & qualifying)
+    f = kelly_fraction(P, dec, bonus.boost_pct) * kelly_frac
+    stake = 0.0
+    if qualifies and ev > 0:
+        stake = min(bonus.max_wager, max(bonus.min_wager, f * bankroll))
+    return {"n_legs": n, "kind": kind, "joint_P": P, "combined_dec": dec,
+            "combined_american": dec_to_american(dec),
+            "boosted_ev_pct": ev * 100.0, "qualifies": qualifies,
+            "legs_ok": legs_ok, "overall_ok": overall_ok, "type_ok": type_ok,
+            "kelly_stake": stake}
+
+
+def _prod(it):
+    p = 1.0
+    for x in it:
+        p *= x
+    return p
+
+
+if __name__ == "__main__":
+    # sanity checks — the numbers cited in discussion
+    b30 = Bonus(bet_type="single", boost_pct=0.30)
+    r = evaluate([(0.50, -110)], b30)
+    print(f"coin-flip -110 + 30% boost: EV = {r['boosted_ev_pct']:+.1f}%  (expect ~+9.1%)")
+    p3 = Bonus(bet_type="parlay", boost_pct=0.30, min_odds_overall=100)
+    r = evaluate([(0.52, -110)] * 3, p3)
+    print(f"3-leg 52% parlay -110 + 30% boost: EV = {r['boosted_ev_pct']:+.1f}%, "
+          f"combined={r['combined_american']:+.0f}, qualifies={r['qualifies']}  (expect ~+23%)")
+    r0 = evaluate([(0.52, -110)] * 3, Bonus(bet_type="parlay", boost_pct=0.0))
+    print(f"same parlay NO boost: EV = {r0['boosted_ev_pct']:+.1f}%  (expect ~-2%)")
