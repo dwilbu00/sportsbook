@@ -174,6 +174,44 @@ def settle_manual(parlay_id, status):
     return recalibration.mutate_ndjson_log(PARLAYS_FILE, up, where={"parlay_id": parlay_id})
 
 
+def update_stake(parlay_id, stake):
+    """Edit a ticket's wager. If already settled won/lost, recompute payout/profit (boosted)
+    from the new stake. Returns 1 on write."""
+    tickets = [t for t in load_parlays() if t.get("parlay_id") == parlay_id]
+    if not tickets:
+        return 0
+    t = tickets[0]
+    stake = float(stake)
+    upd = {"stake": stake}
+    if t.get("status") == "won":
+        dec = bonuslib.american_to_dec(t.get("combined_american") or 100)
+        profit = stake * (dec - 1.0) * (1.0 + float(t.get("boost_pct") or 0.0))
+        upd["profit"], upd["payout"] = profit, stake + profit
+    elif t.get("status") == "lost":
+        upd["profit"], upd["payout"] = -stake, 0.0
+
+    def up(rows):
+        for r in rows:
+            if r.get("parlay_id") == parlay_id:
+                r.update(upd)
+                return 1
+        return 0
+
+    return recalibration.mutate_ndjson_log(PARLAYS_FILE, up, where={"parlay_id": parlay_id})
+
+
+def delete_parlay(parlay_id):
+    """Remove a ticket and its legs (e.g. a mistaken log). Returns 1 if the ticket was found."""
+    def drop(rows):
+        keep = [r for r in rows if r.get("parlay_id") != parlay_id]
+        removed = len(rows) - len(keep)
+        rows[:] = keep
+        return removed
+
+    recalibration.mutate_ndjson_log(LEGS_FILE, drop, where={"parlay_id": parlay_id})
+    return recalibration.mutate_ndjson_log(PARLAYS_FILE, drop, where={"parlay_id": parlay_id})
+
+
 def grade_parlays():
     """Grade every pending parlay: resolve unresolved legs, settle the ticket. Returns the
     number of tickets newly settled. Best-effort; per-ticket failures are skipped."""

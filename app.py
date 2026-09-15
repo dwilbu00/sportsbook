@@ -2374,6 +2374,24 @@ def render_parlays():
                     parlay_store.settle_manual(pick["parlay_id"], new)
                     st.rerun()
 
+        # ── edit wager / delete a ticket ──
+        with st.expander("✏️ Edit a ticket (wager / delete)"):
+            ec = st.columns([3, 1, 1, 1])
+            et = ec[0].selectbox(
+                "Ticket", tickets,
+                format_func=lambda t: f"{(t.get('placed_at') or '')[:10]} "
+                f"{t.get('bet_type')} @{t.get('combined_american')} "
+                f"${t.get('stake')} ({t.get('status')})", key="edit_ticket_pick")
+            new_wager = ec[1].number_input(
+                "Wager $", min_value=0.0, value=float(et.get("stake") or 0.0), step=1.0,
+                key="edit_ticket_wager", help="Edits the stake; recomputes profit if settled.")
+            if ec[2].button("Save", width='stretch', key="edit_ticket_save"):
+                parlay_store.update_stake(et["parlay_id"], new_wager)
+                st.rerun()
+            if ec[3].button("🗑 Delete", width='stretch', key="edit_ticket_del"):
+                parlay_store.delete_parlay(et["parlay_id"])
+                st.rerun()
+
     # ── analytics ──
     settled = [t for t in tickets if t.get("status") in ("won", "lost")]
     if settled:
