@@ -21,10 +21,10 @@ from odds_client import american_to_implied_prob, devig_two_way
 
 OPP_PROPS = ["player_receptions", "player_reception_yds", "player_rush_yds",
              "player_pass_yds", "player_rush_attempts", "player_pass_attempts",
-             "player_pass_completions"]
+             "player_pass_completions", "player_pass_tds"]
 UNIT = {"player_receptions": "tgt", "player_reception_yds": "rec", "player_rush_yds": "car",
         "player_pass_yds": "att", "player_rush_attempts": "car", "player_pass_attempts": "att",
-        "player_pass_completions": "att"}
+        "player_pass_completions": "att", "player_pass_tds": "expTD"}
 
 
 def _opp(o):
