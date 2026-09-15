@@ -93,13 +93,19 @@ def project(player_norm, season, week, prop, line=None):
     if o is None:
         return None
     proj, sd = acc.proj_mean_sd(o, cfg, comp)
-    p_over = None
-    if line is not None:
+    k = entry.get("swept", [4, 3, 12])[2]
+
+    def p_at(L, _o=o, _cfg=cfg, _comp=comp, _k=k):
+        """P(over L) from the frozen model at an arbitrary line (for alt/safe-mode lines).
+        Re-pins SHRINK_K (the module global _mean_of reads) so a later call is order-safe."""
+        acc.SHRINK_K = _k
         try:
-            p_over = acc.p_over(o, float(line), cfg, comp)
+            return max(0.0, min(1.0, acc.p_over(_o, float(L), _cfg, _comp)))
         except Exception:
-            p_over = None
-    return {"proj": proj, "sd": sd, "p_over": p_over,
+            return None
+
+    p_over = p_at(line) if line is not None else None
+    return {"proj": proj, "sd": sd, "p_over": p_over, "p_at": p_at,
             "opportunity": o.get("exp_vol", o.get("mean_base")), "n_prior": o["n_prior"]}
 
 

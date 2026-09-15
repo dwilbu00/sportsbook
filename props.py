@@ -1896,6 +1896,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # pass-vs-rush YDS). Falls back to the ESPN result above for anything we don't
             # model (override returns None). Fail-open. Safe-mode alt-line spread still uses
             # the ESPN history (a known v1 limitation; the standard projection is migrated). ──
+            nfl_ctx = None
             if sport_key == "americanfootball_nfl":
                 _nfl = _nfl_model_override(player_name, prop_key, line)
                 if _nfl is not None and _nfl.get("p_over") is not None:
@@ -1903,7 +1904,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     base_proj = avg_stat
                     over_rate = max(0.0, min(1.0, _nfl["p_over"]))
                     curr_games = _nfl["n_prior"]
+                    combined_mult = 1.0   # our projection is final; neutralize matchup scaling
                     calibration_meta = {"method": "nfl_model", "curr_games": curr_games}
+                    nfl_ctx = _nfl   # {sd, p_at(line)} — drives the safe-mode alt-line math
 
             # ── Platt recalibration (self-updating) ──
             # Apply the same final calibration layer before either standard or
@@ -1967,10 +1970,15 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 if not values:
                     continue
                 proj_mean = avg_stat  # already shrunk + def-adjusted
-                wstd = _weighted_std(values, weights, mean=base_proj)
-                # Scale std by the same projection factor (output-defense ×
-                # MLB matchup) so the spread is in the projection's frame.
-                wstd_adj = wstd * (combined_mult if combined_mult else 1.0)
+                if nfl_ctx is not None and nfl_ctx.get("sd"):
+                    # NFL: use OUR model's SD (NegBin/Normal) for the alt-line spread instead of
+                    # the ESPN empirical std — the calibrated distribution, in the projection frame.
+                    wstd_adj = nfl_ctx["sd"]
+                else:
+                    wstd = _weighted_std(values, weights, mean=base_proj)
+                    # Scale std by the same projection factor (output-defense ×
+                    # MLB matchup) so the spread is in the projection's frame.
+                    wstd_adj = wstd * (combined_mult if combined_mult else 1.0)
                 z = _normal_inv_cdf(safe_target)
                 alt_q = proj_mean - z * wstd_adj
 
@@ -1995,6 +2003,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                         lambda v, t=effective_threshold_line: v > t,
                     )
                     raw_probability = empirical_adjusted
+                    # NFL: price the alt line from OUR calibrated model's distribution
+                    # (P(over threshold_line)) instead of the empirical/warmup stack. `historical`
+                    # stays the ESPN empirical rate as an INDEPENDENT sanity check below.
+                    if nfl_ctx is not None:
+                        p_model = nfl_ctx["p_at"](threshold_line)
+                        if p_model is not None:
+                            return historical, max(0.0, min(1.0, p_model))
                     # Resolve the line-conditional bucket by THIS threshold_line
                     # (not the book line) for parity with the standard path. A
                     # D-method bucket degrades to the empirical rate here — full
