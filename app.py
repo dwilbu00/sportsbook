@@ -2170,6 +2170,7 @@ def render_bonuses():
         return
 
     import nfl_bonus_optimizer as opt
+    import parlay_store
     try:
         import bankroll as _bk
         bankroll = float(_bk.current_balance())
@@ -2203,6 +2204,28 @@ def render_bonuses():
                 "selections": "   +   ".join(_leglabel(l) for l in combo)}
                 for ev, rr, combo in r["cross"]]),
                 hide_index=True, use_container_width=True)
+            # log a MULTI-leg cross-game parlay to the tracker (singles go through My Bets)
+            multi = [(j, ev, rr, combo) for j, (ev, rr, combo) in enumerate(r["cross"])
+                     if len(combo) >= 2]
+            if multi:
+                lc = st.columns([3, 1])
+                pick = lc[0].selectbox(
+                    "Log a cross-game parlay", multi,
+                    format_func=lambda m: f"{len(m[3])}-leg @{int(m[2]['combined_american']):+d}"
+                    f"  ({'  +  '.join(l['player'] for l in m[3])})",
+                    key=f"logx_{r['book']}_{r['label']}")
+                if lc[1].button("📝 Log parlay", key=f"logxbtn_{r['book']}_{r['label']}",
+                                use_container_width=True):
+                    _j, ev, rr, combo = pick
+                    parlay_store.save_parlay(
+                        {"book": r["book"], "bonus_label": r["label"], "bet_type": "parlay",
+                         "boost_pct": r["boost_pct"], "is_same_game": False,
+                         "combined_american": int(rr["combined_american"]),
+                         "stake": round(rr["kelly_stake"], 2),
+                         "our_joint_prob": rr["joint_P"], "our_boosted_ev_pct": ev,
+                         "max_corr": 0.0},
+                        [opt.leg_to_store(l, "cross_game") for l in combo])
+                    st.success("Logged → see 🎰 Parlays.")
         if r["sgp"]:
             st.caption("SGP stacks — build in the book's SGP builder, then enter its combined "
                        "price for the exact boosted EV (independence-vetted for correlation):")
@@ -2220,8 +2243,176 @@ def render_bonuses():
                     stake = min(r["max_wager"], max(0.0, kf * bankroll)) if ev > 0 else 0.0
                     st.write(f"{'✅ BET' if ev > 0 else '❌ skip'} — boosted EV **{ev:+.1f}%**, "
                              f"stake **${stake:.2f}** (¼-Kelly)")
+                    if st.button("📝 Log this SGP", key=f"logsgp_{r['book']}_{r['label']}_{i}"):
+                        parlay_store.save_parlay(
+                            {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
+                             "boost_pct": r["boost_pct"], "is_same_game": True,
+                             "combined_american": int(price), "stake": round(stake, 2),
+                             "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
+                            [opt.leg_to_store(l, "sgp") for l in combo])
+                        st.success("Logged → see 🎰 Parlays.")
     if not shown:
         st.info("No qualifying +EV plays for the active bonuses on this slate.")
+
+
+def render_parlays():
+    """🎰 Parlays — placed parlays/SGPs, auto-graded per leg, with the strategy analytics that
+    turn live results into forward learning (realized vs our joint P; ROI by bonus / leg count /
+    same-game vs cross-game / correlation; which leg breaks tickets)."""
+    import parlay_store
+
+    st.title("🎰 Parlays")
+    st.caption("Placed parlays/SGPs with our joint P + boosted EV at placement. Auto-graded per "
+               "leg (all legs win ⇒ ticket wins). The live dataset that validates the parlay + "
+               "SGP strategy — the SGP side can't be backtested, so this is how we learn.")
+
+    try:
+        n = parlay_store.grade_parlays()
+        if n:
+            st.success(f"Graded {n} newly-settled parlay(s).")
+    except Exception as exc:
+        st.caption(f"(auto-grading skipped: {exc})")
+
+    tickets = parlay_store.load_parlays()
+    if not tickets:
+        st.info("No parlays logged yet — log +EV plays from the 💰 Bonuses page "
+                "(or add one manually below).")
+
+    def _pct(x):
+        return None if x is None else round(float(x) * 100, 1)
+
+    # ── overview ──
+    if tickets:
+        st.subheader("Placed parlays")
+        st.dataframe(pd.DataFrame([{
+            "placed": (t.get("placed_at") or "")[:10], "book": t.get("book"),
+            "bonus": t.get("bonus_label"), "type": t.get("bet_type"),
+            "legs": t.get("n_legs"), "odds": t.get("combined_american"),
+            "stake $": t.get("stake"), "ourP%": _pct(t.get("our_joint_prob")),
+            "EV%": (round(t["our_boosted_ev_pct"], 1)
+                    if t.get("our_boosted_ev_pct") is not None else None),
+            "status": t.get("status"), "profit $": t.get("profit")}
+            for t in tickets]), hide_index=True, use_container_width=True)
+
+        with st.expander("Leg detail"):
+            for t in tickets:
+                st.markdown(f"**{(t.get('placed_at') or '')[:10]} · {t.get('book')} · "
+                            f"{t.get('bonus_label')} · {t.get('status')}**")
+                st.dataframe(pd.DataFrame([{
+                    "player": l.get("player"),
+                    "prop": (l.get("prop_key") or "").replace("player_", ""),
+                    "side": l.get("side"), "line": l.get("line"), "price": l.get("price"),
+                    "ourP%": _pct(l.get("our_leg_prob")), "corr": l.get("corr_category"),
+                    "actual": l.get("actual"),
+                    "result": ("win" if l.get("result") == 1 else
+                               "loss" if l.get("result") == 0 else "—")}
+                    for l in t.get("legs", [])]), hide_index=True, use_container_width=True)
+
+        # ── manual settle (pushes / overrides) ──
+        unsettled = [t for t in tickets if t.get("status") in ("pending", "void")]
+        if unsettled:
+            with st.expander("Settle a ticket manually (push / override)"):
+                sc = st.columns([3, 1, 1])
+                pick = sc[0].selectbox(
+                    "Ticket", unsettled,
+                    format_func=lambda t: f"{(t.get('placed_at') or '')[:10]} "
+                    f"{t.get('bet_type')} @{t.get('combined_american')} ({t.get('status')})")
+                new = sc[1].selectbox("Status", ["won", "lost", "void", "pending"])
+                if sc[2].button("Apply", use_container_width=True):
+                    parlay_store.settle_manual(pick["parlay_id"], new)
+                    st.rerun()
+
+    # ── analytics ──
+    settled = [t for t in tickets if t.get("status") in ("won", "lost")]
+    if settled:
+        st.divider()
+        st.subheader("Strategy analytics (settled tickets)")
+
+        def _stats(rows):
+            n = len(rows)
+            if not n:
+                return None
+            wins = sum(1 for t in rows if t.get("status") == "won")
+            stake = sum(float(t.get("stake") or 0) for t in rows)
+            profit = sum(float(t.get("profit") or 0) for t in rows)
+            exp = sum(float(t.get("our_joint_prob") or 0) for t in rows) / n
+            return {"n": n, "win%": round(wins / n * 100, 1),
+                    "our exp win%": round(exp * 100, 1),
+                    "ROI%": (round(profit / stake * 100, 1) if stake else None),
+                    "profit $": round(profit, 2)}
+
+        ov = _stats(settled)
+        st.write(f"**Overall:** {ov['n']} tickets · realized win {ov['win%']}% vs our "
+                 f"{ov['our exp win%']}% · ROI {ov['ROI%']}% · profit ${ov['profit $']}")
+        st.caption("Realized win% vs our expected win% = live calibration of our joint P "
+                   "(the SGP-copula check we can't do historically).")
+
+        def _by(keyfn, label):
+            groups = {}
+            for t in settled:
+                groups.setdefault(keyfn(t), []).append(t)
+            rows = []
+            for k, g in sorted(groups.items(), key=lambda kv: str(kv[0])):
+                s = _stats(g)
+                rows.append({label: k, "n": s["n"], "win%": s["win%"],
+                             "our exp%": s["our exp win%"], "ROI%": s["ROI%"],
+                             "profit $": s["profit $"]})
+            return pd.DataFrame(rows)
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.caption("By bonus")
+            st.dataframe(_by(lambda t: t.get("bonus_label") or "—", "bonus"),
+                         hide_index=True, use_container_width=True)
+            st.caption("By leg count")
+            st.dataframe(_by(lambda t: t.get("n_legs"), "legs"),
+                         hide_index=True, use_container_width=True)
+        with cols[1]:
+            st.caption("Same-game vs cross-game")
+            st.dataframe(_by(lambda t: "SGP" if t.get("is_same_game") else "cross-game", "kind"),
+                         hide_index=True, use_container_width=True)
+            st.caption("SGP by correlation content")
+            sgp_rows = [t for t in settled if t.get("is_same_game")]
+            if sgp_rows:
+                def _corr_band(t):
+                    c = t.get("max_corr") or 0.0
+                    return "pos-stack (+corr)" if c >= 0.10 else "weak/neg"
+                grp = {}
+                for t in sgp_rows:
+                    grp.setdefault(_corr_band(t), []).append(t)
+                st.dataframe(pd.DataFrame([{
+                    "content": k, **{kk: vv for kk, vv in _stats(g).items()}}
+                    for k, g in grp.items()]), hide_index=True, use_container_width=True)
+            else:
+                st.caption("(no settled SGPs yet)")
+
+        # leg-level: hit rate vs our P + which leg breaks tickets
+        legs = [l for t in settled for l in t.get("legs", []) if l.get("result") in (0, 1)]
+        if legs:
+            hit = sum(l["result"] for l in legs) / len(legs) * 100
+            exp = sum(float(l.get("our_leg_prob") or 0) for l in legs) / len(legs) * 100
+            st.write(f"**Legs:** {len(legs)} graded · hit {hit:.1f}% vs our {exp:.1f}% "
+                     "(live calibration of the market-devig leg probability).")
+            losers = {}
+            for t in settled:
+                if t.get("status") == "lost":
+                    for l in t.get("legs", []):
+                        if l.get("result") == 0:
+                            k = (l.get("prop_key") or "").replace("player_", "")
+                            losers[k] = losers.get(k, 0) + 1
+            if losers:
+                st.caption("Which leg broke tickets (losing legs on lost parlays, by prop):")
+                st.dataframe(pd.DataFrame(
+                    [{"prop": k, "losing legs": v} for k, v in
+                     sorted(losers.items(), key=lambda kv: -kv[1])]),
+                    hide_index=True, use_container_width=True)
+
+    # ── manual add (book-built tickets) ──
+    with st.expander("➕ Add a parlay manually"):
+        st.caption("For tickets you built in the book (e.g. an SGP). Log the combined price + "
+                   "stake; add legs to enable per-leg auto-grading.")
+        st.info("Manual multi-leg entry UI is minimal in v1 — the main path is one-click "
+                "logging from the 💰 Bonuses page, which captures our joint P + EV automatically.")
 
 
 def _wager_ids(df):
@@ -2421,7 +2612,8 @@ if _refit_threshold and _pending_refit >= _refit_threshold:
 with st.sidebar:
     app_page = st.radio(
         "Navigate",
-        ["🎯 Value Finder", "📘 Model Guide & Performance", "🧾 My Bets", "💰 Bonuses"],
+        ["🎯 Value Finder", "📘 Model Guide & Performance", "🧾 My Bets", "💰 Bonuses",
+         "🎰 Parlays"],
         key="app_page",
     )
 
@@ -2435,6 +2627,10 @@ if app_page == "🧾 My Bets":
 
 if app_page == "💰 Bonuses":
     render_bonuses()
+    st.stop()
+
+if app_page == "🎰 Parlays":
+    render_parlays()
     st.stop()
 
 if needs_setup(config):

@@ -116,7 +116,9 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
     for board in parsed_boards:
         gid = board.get("game_id")
         home, away = board.get("home_team"), board.get("away_team")
-        seas = season or _season_of(board.get("commence_time") or "")
+        commence = board.get("commence_time") or ""
+        gdate = commence[:10]
+        seas = season or _season_of(commence)
         if seas is None:
             continue
         for prop in TRUSTWORTHY:
@@ -138,8 +140,18 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
                     "gid": gid, "prop": prop, "player": player, "team": team, "opp": opp,
                     "line": line, "side": "OVER" if fav_over else "UNDER",
                     "P": fair if fav_over else 1.0 - fair, "fair_over": fav_over,
-                    "t_over": sgp._ppf(1.0 - fair), "odds": price})
+                    "t_over": sgp._ppf(1.0 - fair), "odds": price,
+                    "commence_time": commence, "game_date": gdate})
     return legs
+
+
+def leg_to_store(l, category="cross_game"):
+    """Map an optimizer leg dict → a parlay_legs row dict (for parlay_store.save_parlay)."""
+    return {"player": l["player"], "prop_key": l["prop"], "line": l["line"],
+            "side": l["side"], "price": int(l["odds"]), "our_leg_prob": l["P"],
+            "team": l.get("team"), "opp": l.get("opp"), "corr_category": category,
+            "event_id": l.get("gid"), "commence_time": l.get("commence_time"),
+            "game_date": l.get("game_date"), "sport_key": "americanfootball_nfl"}
 
 
 def _leg_ok(lg, bonus):

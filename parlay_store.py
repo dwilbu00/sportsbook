@@ -143,6 +143,37 @@ def _settle_fields(ticket):
     return "won", stake + profit, profit
 
 
+def settle_manual(parlay_id, status):
+    """Manually settle a ticket (won|lost|void|push|pending) — for pushes/overrides the
+    auto-grader can't resolve. Recomputes payout/profit (boosted). Returns 1 on write."""
+    tickets = [t for t in load_parlays() if t.get("parlay_id") == parlay_id]
+    if not tickets:
+        return 0
+    t = tickets[0]
+    stake = float(t.get("stake") or 0.0)
+    boost = float(t.get("boost_pct") or 0.0)
+    if status == "won":
+        dec = bonuslib.american_to_dec(t.get("combined_american") or 100)
+        profit = stake * (dec - 1.0) * (1.0 + boost)
+        payout = stake + profit
+    elif status == "lost":
+        profit, payout = -stake, 0.0
+    elif status == "pending":
+        profit, payout = None, None
+    else:                                              # void | push
+        profit, payout = 0.0, stake
+
+    def up(rows):
+        for r in rows:
+            if r.get("parlay_id") == parlay_id:
+                r.update({"status": status, "profit": profit, "payout": payout,
+                          "settled_at": (None if status == "pending" else _now())})
+                return 1
+        return 0
+
+    return recalibration.mutate_ndjson_log(PARLAYS_FILE, up, where={"parlay_id": parlay_id})
+
+
 def grade_parlays():
     """Grade every pending parlay: resolve unresolved legs, settle the ticket. Returns the
     number of tickets newly settled. Best-effort; per-ticket failures are skipped."""
