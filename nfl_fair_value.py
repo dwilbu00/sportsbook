@@ -22,6 +22,20 @@ from odds_client import american_to_implied_prob, devig_two_way
 
 BOOK = "draftkings"
 
+# Opportunity-abstain: only SPEAK where the model is trustworthy (Brier gap to market <=0.010,
+# validated on held-out 2025 by nfl_opportunity_threshold.py). Props omitted here — the yardage
+# props (rush/recv/pass_yds) and pass_completions — are NEVER trustworthy and are abstained
+# entirely. Tighten toward reliability (gap<=0.005) => keep only player_rush_attempts: 15.6.
+OPP_THRESHOLDS = {
+    "player_receptions": 6.9,       # expected targets
+    "player_rush_attempts": 8.5,    # expected carries
+    "player_pass_attempts": 23.4,   # expected attempts
+}
+
+
+def _opp(o):
+    return o.get("exp_vol", o.get("mean_base", 0.0))
+
 
 def _fair_over(d):
     o, u = d.get("OVER"), d.get("UNDER")
@@ -75,6 +89,9 @@ def run(season, week, snapshot, book):
             o = feat.get((scan._norm(player), ps[0], week))   # feat keys use int week
             if o is None:
                 continue
+            tmin = OPP_THRESHOLDS.get(pk)      # opportunity-abstain (validated trustworthiness)
+            if tmin is None or _opp(o) < tmin:
+                continue
             line = d.get("OVER", d.get("UNDER", (None,)))[0]
             if line is None:
                 continue
@@ -93,6 +110,9 @@ def run(season, week, snapshot, book):
     print("  Reference/DEFENSIVE only: our model is calibrated but has NO reliable +EV edge.")
     print("  'proj' = our projected value; big |Δ| = our model DISAGREES (historically our")
     print("  error, NOT a value bet). Use to sanity-check a number, not to fire bets.")
+    print(f"  OPPORTUNITY-ABSTAIN: only trustworthy high-opp count props shown "
+          f"({', '.join(k.replace('player_','')+'>='+str(v) for k,v in OPP_THRESHOLDS.items())}); "
+          "yardage + pass_completions abstained entirely (never validated).")
     print("=" * 104)
     print(f"  {'prop':<14} {'player':<24} {'line':>7} {'ourProj':>8} {'ourP(o)':>8} "
           f"{'mktP(o)':>8} {'Δ':>7}  note")
