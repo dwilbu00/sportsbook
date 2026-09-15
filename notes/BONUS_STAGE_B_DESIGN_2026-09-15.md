@@ -86,8 +86,8 @@ the nflverse release parquet DIRECTLY with pandas (pyarrow already present for m
 
 `nfl_sgp_correlation.fit_correlations` needs historical actuals (offline). The app must NOT refit
 live. Build step: run the fit once, **persist the rho-by-category table to
-`calibration/nfl_sgp_correlations.json`** (loaded like other calibration blobs via
-`calibration_loader`). `joint_prob()` then reads the frozen rho. Re-fit annually (offline).
+`calibration/nfl_sgp_correlations.json`** (a committed JSON config, like the other
+`calibration/*.json` files). `joint_prob()` then reads the frozen rho. Re-fit annually (offline).
 
 ---
 

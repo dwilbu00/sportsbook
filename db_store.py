@@ -227,6 +227,10 @@ wagers = Table(
     Column("home_code", String(16)),
     Column("away_code", String(16)),
     Column("game_pk", Integer),                           # P3: StatsAPI game (best-effort)
+    # Promo profit boost applied to this straight bet (fraction, e.g. 0.25). Nullable/
+    # best-effort: store the RAW market price + this boost so CLV/close stay honest and
+    # grading pays the boosted payout (profit = stake*(dec-1)*(1+boost) on a win).
+    Column("boost_pct", Float),
     UniqueConstraint("wager_id", name="uq_wager_id"),
     CheckConstraint(
         "status IN ('pending','won','lost','push','void')",
@@ -252,6 +256,65 @@ bankroll_ledger = Table(
     Column("created_at", String(40)),
     UniqueConstraint("txn_id", name="uq_bankroll_txn"),
     Index("ix_bankroll_txn_type", "txn_type"),
+)
+
+# Parlay tracker (Stage B follow-on) — one row per multi-leg TICKET; legs live in the
+# sibling parlay_legs table (normalized). Captures our joint P + boosted EV + correlation
+# at placement so the live record validates/refines the parlay+SGP thesis (which can't be
+# backtested — no historical SGP prices). Parlays are irreplaceable wagers → durable in Azure.
+parlays = Table(
+    "parlays", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("parlay_id", String(64), nullable=False),
+    Column("placed_at", String(40)),
+    Column("sport_key", String(64)),
+    Column("book", String(64)),
+    Column("bonus_label", String(128)),
+    Column("bet_type", String(16)),                      # parlay | sgp
+    Column("boost_pct", Float),
+    Column("is_same_game", Boolean),
+    Column("n_legs", Integer),
+    Column("combined_american", Integer),
+    Column("stake", Float),
+    Column("our_joint_prob", Float),                     # at placement (our estimate)
+    Column("our_boosted_ev_pct", Float),                # at placement
+    Column("max_corr", Float),                           # SGP: strongest pairwise rho
+    Column("status", String(16)),                        # pending|won|lost|push|void
+    Column("settled_at", String(40)),
+    Column("payout", Float),
+    Column("profit", Float),
+    Column("game_date", String(10)),
+    UniqueConstraint("parlay_id", name="uq_parlay_id"),
+    CheckConstraint("status IN ('pending','won','lost','push','void')",
+                    name="ck_parlay_status"),
+    CheckConstraint("stake IS NULL OR stake >= 0", name="ck_parlay_stake"),
+    Index("ix_parlay_status", "status"),
+)
+
+# Parlay legs — one row per leg, joined to parlays by parlay_id. Carries our per-leg
+# market-devig prob + correlation category + the graded result for "which leg broke it".
+parlay_legs = Table(
+    "parlay_legs", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("parlay_id", String(64), nullable=False),
+    Column("leg_index", Integer, nullable=False),
+    Column("sport_key", String(64)),
+    Column("player", String(160)),
+    Column("prop_key", String(64)),
+    Column("line", Float),
+    Column("side", String(8)),                           # OVER | UNDER
+    Column("price", Integer),
+    Column("our_leg_prob", Float),                       # market de-vig (calibrated)
+    Column("team", String(16)),
+    Column("opp", String(16)),
+    Column("corr_category", String(32)),
+    Column("event_id", String(128)),
+    Column("commence_time", String(40)),
+    Column("game_date", String(10)),
+    Column("actual", String(64)),
+    Column("result", Integer),                           # 1 win, 0 loss, NULL pending/push
+    UniqueConstraint("parlay_id", "leg_index", name="uq_parlay_leg"),
+    Index("ix_parlay_leg_parlay", "parlay_id"),
 )
 
 # Durable per-user app settings — a generic key/value store. Currently the Kelly
@@ -448,7 +511,22 @@ _WAGER_SPEC = [
     ("model_edge", _f), ("close_line", _f), ("clv_pct", _f), ("profit", _f),
     ("executed_price", _i), ("model_price", _i), ("close_price", _i),
     ("player_mlb_id", _s), ("team_code", _s), ("opponent_code", _s),
-    ("home_code", _s), ("away_code", _s), ("game_pk", _i),
+    ("home_code", _s), ("away_code", _s), ("game_pk", _i), ("boost_pct", _f),
+]
+
+_PARLAY_SPEC = [
+    ("parlay_id", _s), ("placed_at", _s), ("sport_key", _s), ("book", _s),
+    ("bonus_label", _s), ("bet_type", _s), ("boost_pct", _f), ("is_same_game", _b),
+    ("n_legs", _i), ("combined_american", _i), ("stake", _f), ("our_joint_prob", _f),
+    ("our_boosted_ev_pct", _f), ("max_corr", _f), ("status", _s), ("settled_at", _s),
+    ("payout", _f), ("profit", _f), ("game_date", _s),
+]
+
+_PARLAY_LEG_SPEC = [
+    ("parlay_id", _s), ("leg_index", _i), ("sport_key", _s), ("player", _s),
+    ("prop_key", _s), ("line", _f), ("side", _s), ("price", _i), ("our_leg_prob", _f),
+    ("team", _s), ("opp", _s), ("corr_category", _s), ("event_id", _s),
+    ("commence_time", _s), ("game_date", _s), ("actual", _s), ("result", _i),
 ]
 
 _BANKROLL_SPEC = [
@@ -544,6 +622,12 @@ _NDJSON_TABLES = {
     "app_settings": {"table": app_settings, "spec": _APP_SETTINGS_SPEC,
                      "derive": lambda row: {},
                      "identity": lambda row: {"setting_key": row.get("setting_key")}},
+    "parlays": {"table": parlays, "spec": _PARLAY_SPEC, "derive": lambda row: {},
+                "identity": lambda row: {"parlay_id": row.get("parlay_id")}},
+    "parlay_legs": {"table": parlay_legs, "spec": _PARLAY_LEG_SPEC,
+                    "derive": lambda row: {},
+                    "identity": lambda row: {"parlay_id": row.get("parlay_id"),
+                                             "leg_index": _i(row.get("leg_index"))}},
 }
 
 

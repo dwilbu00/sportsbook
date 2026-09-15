@@ -1,9 +1,9 @@
 """bonus_store.py — durable persistence for the user's active promos/boosts.
 
 Stores the active-bonus list as one entry in the same generic KV store the Kelly knobs use
-(``app_settings.jsonl`` → Azure/blob, durable across sessions and redeploys). One JSON blob under
-setting_key="active_bonuses". Seeds from bonus.LIVE_BONUSES the first time. Best-effort; the UI
-still works off session_state if the store is unavailable.
+(``app_settings`` table → AZURE SQL, the system of record; durable across sessions and redeploys).
+One JSON string under setting_key="active_bonuses". Seeds from bonus.LIVE_BONUSES the first time.
+Best-effort; the UI still works off session_state if the store is unavailable.
 """
 import json
 from dataclasses import asdict
