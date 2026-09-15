@@ -7,10 +7,11 @@ boosted EV is only real if the leg probabilities are genuinely calibrated (over-
 odds + a bonus spec, and returns honest boosted EV, qualification, and Kelly-safe sizing.
 
 Bonus schema (Doug's parameters):
-  bet_type       : 'single' | 'parlay' | 'sgp'
+  bet_type       : 'single' | 'parlay' | 'sgp' | 'any'
   boost_pct      : profit boost as a fraction (0.30 = +30% on winnings)
   min_odds_leg   : each leg's American odds must be >= this (not shorter than)
   min_odds_overall: combined American odds must be >= this
+  min_legs       : minimum number of legs (parlay boosts often require >=2 or >=3)
   max_wager      : $ cap
   min_wager      : $ floor
 
@@ -24,12 +25,15 @@ from dataclasses import dataclass
 
 @dataclass
 class Bonus:
-    bet_type: str
-    boost_pct: float
-    min_odds_leg: float = -100000.0     # American; default = no floor
-    min_odds_overall: float = -100000.0
+    bet_type: str                        # 'single' | 'parlay' | 'sgp' | 'any'
+    boost_pct: float                     # profit boost fraction (0.30 = +30% on winnings)
+    min_odds_leg: float = -100000.0      # American; each leg must be >= this (default = no floor)
+    min_odds_overall: float = -100000.0  # American; combined must be >= this
+    min_legs: int = 1                    # parlay boosts often require >=2 or >=3
     max_wager: float = 1e9
     min_wager: float = 0.0
+    book: str = "draftkings"             # DK bonuses use DK odds; FD bonuses use FD odds
+    label: str = ""                      # human tag for reporting
 
 
 def american_to_dec(a):
@@ -78,9 +82,14 @@ def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
     # constraints
     legs_ok = all(_leg_ok(a, bonus) for _p, a in legs)
     overall_ok = dec >= american_to_dec(bonus.min_odds_overall) - 1e-9
-    type_ok = (bonus.bet_type == "single" and n == 1) or \
-              (bonus.bet_type in ("parlay", "sgp") and n >= 2)
-    qualifies = legs_ok and overall_ok and type_ok
+    if bonus.bet_type == "any":
+        type_ok = True
+    elif bonus.bet_type == "single":
+        type_ok = n == 1
+    else:                                   # 'parlay' | 'sgp'
+        type_ok = n >= 2
+    legs_count_ok = n >= max(1, bonus.min_legs)
+    qualifies = legs_ok and overall_ok and type_ok and legs_count_ok
     # sizing (fractional Kelly, clamped to wager bounds when +EV & qualifying)
     f = kelly_fraction(P, dec, bonus.boost_pct) * kelly_frac
     stake = 0.0
@@ -90,7 +99,7 @@ def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
             "combined_american": dec_to_american(dec),
             "boosted_ev_pct": ev * 100.0, "qualifies": qualifies,
             "legs_ok": legs_ok, "overall_ok": overall_ok, "type_ok": type_ok,
-            "kelly_stake": stake}
+            "legs_count_ok": legs_count_ok, "kelly_stake": stake}
 
 
 def _prod(it):
@@ -98,6 +107,17 @@ def _prod(it):
     for x in it:
         p *= x
     return p
+
+
+# Doug's live scenarios (2026-09). book is set per-run (DK bonus => DK odds, FD bonus => FD odds).
+LIVE_BONUSES = [
+    Bonus(bet_type="any", boost_pct=0.25, min_odds_leg=-200, max_wager=10.0,
+          label="25% any-bet, max $10, min leg -200"),
+    Bonus(bet_type="sgp", boost_pct=0.30, min_odds_leg=-250, min_legs=3,
+          label="30% SGP, min leg -250, >=3 legs"),
+    Bonus(bet_type="parlay", boost_pct=0.50, min_odds_leg=-300, min_legs=2, max_wager=10.0,
+          label="50% parlay/SGP, max $10, min leg -300"),
+]
 
 
 if __name__ == "__main__":
@@ -111,3 +131,9 @@ if __name__ == "__main__":
           f"combined={r['combined_american']:+.0f}, qualifies={r['qualifies']}  (expect ~+23%)")
     r0 = evaluate([(0.52, -110)] * 3, Bonus(bet_type="parlay", boost_pct=0.0))
     print(f"same parlay NO boost: EV = {r0['boosted_ev_pct']:+.1f}%  (expect ~-2%)")
+    # min_legs gate: the 30% SGP bonus (>=3 legs) must REJECT a 2-leg ticket
+    sgp = LIVE_BONUSES[1]
+    r2 = evaluate([(0.70, -180)] * 2, sgp)
+    r3 = evaluate([(0.70, -180)] * 3, sgp)
+    print(f"30% SGP 2-leg qualifies={r2['qualifies']} (expect False, <3 legs); "
+          f"3-leg qualifies={r3['qualifies']} EV={r3['boosted_ev_pct']:+.1f}%")
