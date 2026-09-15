@@ -1125,6 +1125,42 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         if not gamelog:
             return result
 
+    # Early-season spillover: the current-season gamelog can be too thin to project
+    # (e.g. NFL week 1-2 → ~1 game), which the caller's games_sampled>=5 filter then
+    # drops, leaving "no results" for a whole slate. Extend with prior season(s) so a
+    # recency model still sees ~n recent games. No-op in-season (len>=n); anchored on the
+    # most recent game's year; up to 2 look-backs; dedup by game date. MLB never reaches
+    # here (warehouse-only above), so this only affects the football/basketball paths.
+    if 0 < len(gamelog) < n:
+        def _year_of(g):
+            try:
+                return int(str(g.get("game_date") or "")[:4])
+            except (TypeError, ValueError):
+                return None
+
+        def _fetch_season(yr):
+            if use_sql:
+                import gamelog_store
+                return gamelog_store.get_gamelog(sport, league, athlete["id"], season_year=yr)
+            return get_athlete_gamelog(sport, league, athlete["id"], season_year=yr)
+
+        seen_dates = {g.get("game_date") for g in gamelog}
+        anchor = next((_year_of(g) for g in gamelog if _year_of(g)), None)
+        if anchor is None:
+            from datetime import datetime, timezone
+            anchor = datetime.now(timezone.utc).year
+        back = 0
+        while len(gamelog) < n and back < 2:
+            back += 1
+            try:
+                extra = _fetch_season(anchor - back) or []
+            except Exception:
+                break
+            for g in extra:                    # prior-season games are older → keep desc order
+                if g.get("game_date") not in seen_dates:
+                    gamelog.append(g)
+                    seen_dates.add(g.get("game_date"))
+
     # Find the matching stat label
     stat_labels = PROP_STAT_MAP.get(prop_key, [])
     matched_label = None
