@@ -229,12 +229,45 @@ def fit_correlations(games):
     return fitted
 
 
+# ── freeze / load the fitted correlations (so the live app never refits) ──
+FROZEN_PATH = "calibration/nfl_sgp_correlations.json"
+
+
+def _rho_val(v, default=0.0):
+    """Accept either a fit tuple (rho, n, ctx) or a plain float (from the frozen JSON)."""
+    if isinstance(v, (tuple, list)):
+        return float(v[0])
+    if isinstance(v, (int, float)):
+        return float(v)
+    return default
+
+
+def freeze(fitted, path=FROZEN_PATH):
+    import json
+    import os
+    out = {cat: round(_rho_val(v), 3) for cat, v in fitted.items()}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"rho_by_category": out, "note": "tetrachoric fit, fit 2023-24"}, f, indent=2)
+    return out
+
+
+def load_frozen(path=FROZEN_PATH):
+    """{category: rho_float} from the frozen config, or None if absent."""
+    import json
+    try:
+        with open(path) as f:
+            return json.load(f).get("rho_by_category", {})
+    except Exception:
+        return None
+
+
 # ── joint probability of a ticket via the copula ──
 def _corr_matrix(legs, rho_by_cat, default=0.0):
     n = len(legs)
     R = np.eye(n)
     for i, j in combinations(range(n), 2):
-        r = rho_by_cat.get(category(legs[i], legs[j]), (default,))[0]
+        r = _rho_val(rho_by_cat.get(category(legs[i], legs[j])), default)
         R[i, j] = R[j, i] = r
     # nearest PD (clip eigenvalues)
     w, V = np.linalg.eigh(R)
@@ -316,6 +349,8 @@ def main():
     ap.add_argument("--fit", default="2023,2024", help="seasons to fit correlations on")
     ap.add_argument("--val", default="2025", help="held-out season to validate on")
     ap.add_argument("--legs", type=int, default=3)
+    ap.add_argument("--freeze", action="store_true",
+                    help="write the fitted correlations to calibration/nfl_sgp_correlations.json")
     args = ap.parse_args()
     train_seasons = [s.strip() for s in args.train.split(",") if s.strip()]
     fit_seasons = [s.strip() for s in args.fit.split(",") if s.strip()]
@@ -343,6 +378,10 @@ def main():
             print(f"    {cat:<16} {r:>+7.3f} {npairs:>7}  {ctx[0]*100:>7.1f}% {ctx[1]*100:>6.1f}%  {notes[cat]}")
         else:
             print(f"    {cat:<16} {'thin':>7} {npairs:>7}   (n<40 -> rho=0)   {notes[cat]}")
+
+    if args.freeze:
+        frozen = freeze(rho)
+        print(f"\n  FROZEN -> {FROZEN_PATH}: {frozen}")
 
     print(f"\n  VALIDATION on {val_seasons}: same-game {args.legs}-leg favorite tickets, "
           "realized vs predicted")

@@ -90,6 +90,19 @@ def expected_volume(player_norm, season, week, prop):
     return sum(wi * float(r.get(col) or 0.0) for r, wi in zip(prior, w)) / wsum
 
 
+def player_team(player_norm, season):
+    """Most recent team for a player this season (or prior season) — for SGP categorization.
+    Returns the team code or None."""
+    for s in (int(season), int(season) - 1):
+        df = _load(s)
+        if df is None:
+            continue
+        sub = df[df["player_norm"] == player_norm]
+        if len(sub):
+            return sub.sort_values("week")["team"].iloc[-1]
+    return None
+
+
 def passes_gate(player_norm, season, week, prop):
     """True iff prop is trustworthy AND the player's expected volume clears its threshold."""
     tmin = TRUSTWORTHY.get(prop)

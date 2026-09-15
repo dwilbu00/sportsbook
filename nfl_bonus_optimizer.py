@@ -29,9 +29,11 @@ import nfl_props_accuracy as acc
 import nfl_ladder_clv as clv
 import bonus as bonuslib
 import nfl_sgp_correlation as sgp
+import nfl_opportunity_serving as srv
 from odds_client import american_to_decimal, american_to_implied_prob, devig_two_way
 
 TRUSTWORTHY = sgp.TRUSTWORTHY               # {prop: opp_threshold}
+_CUR_SLATE_WEEK = 99                        # sentinel: "all completed weeks are prior" (upcoming)
 PROP_ABBR = sgp.PROP_ABBR
 MAX_PARLAY = 3       # cap ticket size we enumerate
 TOP_N = 12           # top legs (by P) per book to consider
@@ -90,6 +92,54 @@ def collect_week_legs(train_seasons, season, week, books):
                     "t_over": sgp._ppf(1.0 - fair),
                     "odds": (over_q if fav_over else under_q)[1]})
     return out
+
+
+def _season_of(commence_time):
+    """NFL season for an ISO commence time (season spans Sep→Feb → Jan/Feb belong to prior yr)."""
+    try:
+        y, m = int(commence_time[:4]), int(commence_time[5:7])
+        return y if m >= 8 else y - 1
+    except Exception:
+        return None
+
+
+def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
+    """LIVE leg source: map the app's parsed prop board(s) → optimizer leg dicts, applying the
+    opportunity gate (§serving feed) and using MARKET de-vig P + the book's own price.
+
+    parsed_boards: list of `odds_client.parse_player_props` results (one per event).
+    book: 'draftkings' | 'fanduel' (its bonus uses its price; leg P is book-agnostic de-vig).
+    Returns the same leg dict shape as the offline `collect_week_legs`.
+    """
+    pxkey = "dk" if book == "draftkings" else "fd"
+    legs = []
+    for board in parsed_boards:
+        gid = board.get("game_id")
+        home, away = board.get("home_team"), board.get("away_team")
+        seas = season or _season_of(board.get("commence_time") or "")
+        if seas is None:
+            continue
+        for prop in TRUSTWORTHY:
+            for player, p in board.get("props", {}).get(prop, {}).items():
+                pn = scan._norm(player)
+                if not srv.passes_gate(pn, seas, week, prop):
+                    continue
+                fair = p.get("over_implied")
+                line = p.get("line")
+                if fair is None or line is None:
+                    continue
+                fav_over = fair >= 0.5
+                price = p.get(f"{pxkey}_{'over' if fav_over else 'under'}_price")
+                if price is None:                      # this book doesn't post the fav side
+                    continue
+                team = srv.player_team(pn, seas)
+                opp = away if team == home else (home if team == away else None)
+                legs.append({
+                    "gid": gid, "prop": prop, "player": player, "team": team, "opp": opp,
+                    "line": line, "side": "OVER" if fav_over else "UNDER",
+                    "P": fair if fav_over else 1.0 - fair, "fair_over": fav_over,
+                    "t_over": sgp._ppf(1.0 - fair), "odds": price})
+    return legs
 
 
 def _leg_ok(lg, bonus):
@@ -154,7 +204,7 @@ def sgp_stacks(legs, bonus, rho, bankroll):
         best = None
         for combo in combinations(gl, need):
             # prefer positively-correlated same-side content; skip strong script-conflict stacks
-            rhos = [rho.get(sgp.category(a, b), (0.0,))[0] for a, b in combinations(combo, 2)]
+            rhos = [sgp._rho_val(rho.get(sgp.category(a, b))) for a, b in combinations(combo, 2)]
             if min(rhos) <= -0.30:            # avoid same-team RB-committee / pass-rush conflicts
                 continue
             jp = sgp.joint_prob(list(combo), rho, [l["fair_over"] for l in combo], rng)
@@ -172,10 +222,31 @@ def sgp_stacks(legs, bonus, rho, bankroll):
     return out
 
 
+def load_rho():
+    """Frozen SGP correlations (calibration/nfl_sgp_correlations.json); {} if absent."""
+    return sgp.load_frozen() or {}
+
+
+def evaluate_slate(legs_by_book, bonuses, rho, bankroll):
+    """Structured optimizer output for a slate — the shared core for the CLI and the app.
+    Returns [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
+    out = []
+    for base in bonuses:
+        for book, legs in legs_by_book.items():
+            bonus = bonuslib.Bonus(**{**base.__dict__, "book": book})
+            cross = [] if bonus.bet_type == "sgp" else _diversify(
+                cross_game_plays(legs, bonus, bankroll), TOP_K)
+            stacks = (sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
+                      if bonus.bet_type in ("sgp", "parlay", "any") else [])
+            out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
+                        "n_legs": len(legs), "cross": cross, "sgp": stacks})
+    return out
+
+
 def run(season, week, books, bankroll):
     train = ["2012", "2013", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022"]
     legs_by_book = collect_week_legs(train, str(season), week, books)
-    rho = sgp.fit_correlations(sgp.collect_game_legs(train, ["2023", "2024"]))
+    rho = load_rho() or sgp.fit_correlations(sgp.collect_game_legs(train, ["2023", "2024"]))
 
     print("=" * 100)
     print(f"  NFL BONUS OPTIMIZER — +EV plays for active promos, {season} week {week}")

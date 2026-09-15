@@ -1,0 +1,12 @@
+{
+  "rho_by_category": {
+    "team_rec_rec": -0.025,
+    "opposing": -0.275,
+    "team_other": -0.3,
+    "team_qb_rec": 0.175,
+    "team_pass_rush": -0.375,
+    "team_rush_rush": -0.55,
+    "same_player": 0.0
+  },
+  "note": "tetrachoric fit, fit 2023-24"
+}
