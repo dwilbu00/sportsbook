@@ -239,6 +239,7 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll):
             stacks = (sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
                       if bonus.bet_type in ("sgp", "parlay", "any") else [])
             out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
+                        "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
                         "n_legs": len(legs), "cross": cross, "sgp": stacks})
     return out
 

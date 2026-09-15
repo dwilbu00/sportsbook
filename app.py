@@ -2091,6 +2091,139 @@ def render_my_bets():
             _apply_wager_edits(settled_df, edited_settled, regradable=True)
 
 
+def render_bonuses():
+    """💰 Bonuses — input active promos; surface the +EV plays for the current slate.
+
+    Reuses the board the Value Finder already fetched (0 marginal credits). Leg probability =
+    the book's de-vigged (calibrated) price; our model only gates eligibility (trustworthy
+    high-opportunity count props). Cross-game/single plays are fully priced; SGP stacks are
+    correlation-vetted with a required price to check against the book's live SGP builder.
+    """
+    import bonus as bonuslib
+    import bonus_store
+
+    st.title("💰 Bonuses & Boosts")
+    st.caption("Input active promos → the optimizer surfaces +EV plays on your current slate. "
+               "Leg probabilities are the book's de-vigged (calibrated) price; a boost pays on the "
+               "payout, which is what flips high-probability legs to +EV.")
+
+    if "bonuses_list" not in st.session_state:
+        st.session_state["bonuses_list"] = bonus_store.load_bonuses()
+    bonuses = st.session_state["bonuses_list"]
+
+    # ── active-bonus manager ──
+    st.subheader("Active bonuses")
+    if bonuses:
+        st.dataframe(pd.DataFrame([{
+            "book": b.book, "type": b.bet_type, "boost%": round(b.boost_pct * 100),
+            "min leg": int(b.min_odds_leg) if b.min_odds_leg > -99999 else None,
+            "min legs": b.min_legs,
+            "max $": b.max_wager if b.max_wager < 1e8 else None,
+            "label": b.label} for b in bonuses]),
+            hide_index=True, use_container_width=True)
+        dc = st.columns([3, 1])
+        di = dc[0].selectbox("Remove a bonus", range(len(bonuses)),
+                             format_func=lambda i: bonuses[i].label
+                             or f"{bonuses[i].book} {bonuses[i].bet_type}", key="bonus_del_idx")
+        if dc[1].button("🗑 Remove", use_container_width=True):
+            bonuses.pop(di)
+            bonus_store.save_bonuses(bonuses)
+            st.rerun()
+    else:
+        st.info("No active bonuses yet — add one below.")
+
+    with st.expander("➕ Add a bonus", expanded=not bonuses):
+        with st.form("add_bonus"):
+            c = st.columns(4)
+            book = c[0].selectbox("Book", ["draftkings", "fanduel"])
+            bet_type = c[1].selectbox("Bet type", ["any", "parlay", "sgp", "single"],
+                                      help="'any' = applies to singles + parlays + SGPs")
+            boost = c[2].number_input("Boost %", 0.0, 100.0, 30.0, step=5.0)
+            min_legs = c[3].number_input("Min legs", 1, 12, 1, step=1)
+            c2 = st.columns(4)
+            min_leg = c2[0].number_input("Min odds/leg (American)", -100000, 100000, -300, step=10)
+            min_overall = c2[1].number_input("Min overall odds", -100000, 100000, -100000, step=10)
+            max_w = c2[2].number_input("Max wager $", 0.0, 100000.0, 10.0, step=5.0)
+            min_w = c2[3].number_input("Min wager $", 0.0, 100000.0, 0.0, step=1.0)
+            label = st.text_input("Label", value=f"{int(boost)}% {bet_type}")
+            if st.form_submit_button("Add bonus"):
+                bonuses.append(bonuslib.Bonus(
+                    bet_type=bet_type, boost_pct=boost / 100.0, min_odds_leg=float(min_leg),
+                    min_odds_overall=float(min_overall), min_legs=int(min_legs),
+                    max_wager=float(max_w), min_wager=float(min_w), book=book, label=label))
+                bonus_store.save_bonuses(bonuses)
+                st.rerun()
+
+    st.divider()
+    st.subheader("+EV plays on your current slate")
+    board = st.session_state.get("bonus_board")
+    if not board or not board.get("parsed"):
+        st.info("Run the 🎯 Value Finder for an NFL slate first (with player-prop markets "
+                "selected). This page reuses that already-fetched board — no extra API credits.")
+        return
+    if board.get("sport_key") != "americanfootball_nfl":
+        st.warning("The bonus optimizer currently supports NFL props. Load an NFL slate in the "
+                   "Value Finder, then return here.")
+        return
+    if not bonuses:
+        st.info("Add at least one active bonus above.")
+        return
+
+    import nfl_bonus_optimizer as opt
+    try:
+        import bankroll as _bk
+        bankroll = float(_bk.current_balance())
+    except Exception:
+        bankroll = 1000.0
+    bankroll = bankroll if bankroll and bankroll > 0 else 1000.0
+
+    with st.spinner("Scanning trustworthy legs + building +EV plays…"):
+        legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
+                        for bk in ("draftkings", "fanduel")}
+        rho = opt.load_rho()
+        results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll)
+
+    pabbr = opt.PROP_ABBR
+
+    def _leglabel(l):
+        return f"{l['player']} {pabbr[l['prop']]} {l['side'][0]} {l['line']} @{l['odds']:+.0f}"
+
+    shown = False
+    for r in results:
+        if not r["cross"] and not r["sgp"]:
+            continue
+        shown = True
+        st.markdown(f"**[{r['book']}] {r['label']}** — {r['n_legs']} eligible legs")
+        if r["cross"]:
+            st.caption("Cross-game / single (+EV, fully priced — ready to bet):")
+            st.dataframe(pd.DataFrame([{
+                "EV%": round(ev, 1), "stake $": round(rr["kelly_stake"], 2),
+                "legs": len(combo), "odds": int(rr["combined_american"]),
+                "P%": round(rr["joint_P"] * 100, 1),
+                "selections": "   +   ".join(_leglabel(l) for l in combo)}
+                for ev, rr, combo in r["cross"]]),
+                hide_index=True, use_container_width=True)
+        if r["sgp"]:
+            st.caption("SGP stacks — build in the book's SGP builder, then enter its combined "
+                       "price for the exact boosted EV (independence-vetted for correlation):")
+            for i, (jp, mx, combo, need) in enumerate(r["sgp"]):
+                with st.expander(f"jointP {jp * 100:.1f}%  ·  corr {mx:+.2f}  ·  "
+                                 f"need ≥ {int(need):+d}  ·  {combo[0]['gid']}"):
+                    for l in combo:
+                        st.write(f"• {_leglabel(l)}  ({l['team']})")
+                    price = st.number_input(
+                        "Book's SGP combined price (American)", -100000, 100000, int(need),
+                        step=10, key=f"sgp_{r['book']}_{r['label']}_{i}")
+                    dec = bonuslib.american_to_dec(price)
+                    ev = bonuslib.boosted_ev_per_dollar(jp, dec, r["boost_pct"]) * 100
+                    kf = bonuslib.kelly_fraction(jp, dec, r["boost_pct"]) * 0.25
+                    stake = min(r["max_wager"], max(0.0, kf * bankroll)) if ev > 0 else 0.0
+                    st.write(f"{'✅ BET' if ev > 0 else '❌ skip'} — boosted EV **{ev:+.1f}%**, "
+                             f"stake **${stake:.2f}** (¼-Kelly)")
+    if not shown:
+        st.info("No qualifying +EV plays for the active bonuses on this slate.")
+
+
 def _wager_ids(df):
     """Wager-id index values from a bets dataframe (drops any blank add-rows)."""
     return {i for i in df.index.tolist() if isinstance(i, str) and i}
@@ -2288,7 +2421,7 @@ if _refit_threshold and _pending_refit >= _refit_threshold:
 with st.sidebar:
     app_page = st.radio(
         "Navigate",
-        ["🎯 Value Finder", "📘 Model Guide & Performance", "🧾 My Bets"],
+        ["🎯 Value Finder", "📘 Model Guide & Performance", "🧾 My Bets", "💰 Bonuses"],
         key="app_page",
     )
 
@@ -2298,6 +2431,10 @@ if app_page == "📘 Model Guide & Performance":
 
 if app_page == "🧾 My Bets":
     render_my_bets()
+    st.stop()
+
+if app_page == "💰 Bonuses":
+    render_bonuses()
     st.stop()
 
 if needs_setup(config):
@@ -2993,6 +3130,10 @@ if analyze_clicked and selected_game_labels:
         prop_history_futures = {}  # history key -> future
         parsed_props = {}  # eid -> parsed prop data
         events_by_id = {e["id"]: e for e in selected_events}
+        # Stash the parsed board for the 💰 Bonuses page (the bonus optimizer reuses this
+        # already-fetched slate → zero marginal credits). Reset per run; filled below.
+        st.session_state["bonus_board"] = {
+            "sport_key": sport["key"], "parsed": [], "ts": time.time()}
 
         # P6/F3: pre-warm the StatsAPI season player index on the MAIN thread so the
         # Phase-2 pool workers (resolve_mlbam_id -> _player_index) hit the populated
@@ -3009,6 +3150,7 @@ if analyze_clicked and selected_game_labels:
         for eid, raw_data in prop_odds_results.items():
             parsed = parse_player_props(raw_data)
             parsed_props[eid] = parsed
+            st.session_state["bonus_board"]["parsed"].append(parsed)   # for 💰 Bonuses
             # ESPN team ids for THIS matchup disambiguate same-name players so
             # the correct athlete's history is fetched (see search_athlete
             # team_ids). NON-MLB sports dedup the future GLOBALLY by (player, prop):

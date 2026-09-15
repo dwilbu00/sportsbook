@@ -153,6 +153,33 @@ The Odds API does not return SGP *combined* prices, and we have no historical SG
 6. Manual test on a live (cached) slate; confirm 0 credits for the default flow; sanity-check
    outputs vs the CLI; verify the gate matches backtested eligibility.
 
+## 7b. FOLLOW-ON — dedicated Parlay tracker (Doug 2026-09-15; build AFTER the optimizer section)
+
+The `wagers` table is single-selection only — parlays aren't representable. Since SGP prices can't
+be backtested, LIVE tracking is the only way to validate/refine the parlay+SGP thesis. Build a
+dedicated **Parlays** section (separate from My Bets):
+- **Storage — TWO normalized Azure tables (Doug's call; parlays are irreplaceable wagers → Azure):**
+  - `parlays(parlay_id PK, placed_at, book, bonus_label, bet_type, boost_pct, is_same_game,
+    n_legs, combined_american, stake, our_joint_prob, our_boosted_ev_pct, max_corr, status,
+    settled_at, payout, profit)`
+  - `parlay_legs(id PK, parlay_id FK, player, prop, line, side, price, our_leg_prob, team, opp,
+    corr_category, actual, result)`
+  - Owner-run DDL (I write it) + SQLAlchemy Table defs in db_store mirroring it.
+- **Entry:** one-click "Log this parlay" from an optimizer-surfaced play (auto-fills our joint P,
+  boosted EV, corr, legs) + manual add for book-built SGPs.
+- **Grading:** reuse box-score per-leg grading → all legs win ⇒ ticket won; any lose ⇒ lost; voids
+  handled. Combine, set payout/profit.
+- **Analytics (the strategy payoff):** realized win rate vs our joint P (live copula calibration);
+  ROI by bonus / leg count / same-game vs cross-game / correlation content (pos vs neg stack);
+  leg hit rate vs market-devig P; "which leg broke it" attribution; boost value captured vs
+  predicted.
+- **STRAIGHT-bet boosts too (Doug 2026-09-15):** the 25% "any" bonus applies to singles, so add a
+  nullable `boost_pct` column to the existing `wagers` table (additive owner-run ALTER, never
+  drops). Store the RAW market price + boost_pct; compute boosted profit at grade time
+  (`stake·(dec−1)·(1+boost)` on a win) so CLV/close comparisons stay honest (the boost is a promo,
+  not a line move) and the boost is auditable. My Bets shows the boost; straight-bet analytics get
+  boost-captured value. Do this in the same tracker phase as the parlay tables.
+
 ## 8. Explicitly OUT of scope for v1
 - Auto-refresh / auto-bet — surfacing only; Doug places bets manually at DK/FD.
 - Non-count props in the bonus leg universe (needs a market-calibration check first).
