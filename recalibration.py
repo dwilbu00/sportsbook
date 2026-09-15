@@ -1561,6 +1561,30 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     if not by_player:
         return 0
 
+    # Parallel gamelog warm-up (speeds up the manual full-drain). The grading loop below
+    # resolves each player's actual from their ESPN/warehouse gamelog; for the ESPN sports
+    # (NBA/NFL) the FIRST fetch per player is a network / Azure round-trip, and doing
+    # hundreds sequentially is what makes "Resolve all pending now" crawl. Pre-warm the
+    # distinct players' gamelogs concurrently so the sequential loop hits a warm cache.
+    # MLB is warehouse-resolved (DB reads) and skips this. Best-effort; the loop is correct
+    # either way (a cold player just pays its fetch inline as before).
+    if sport_key != "baseball_mlb" and len(by_player) > 1:
+        espn_sport, espn_league = pair
+        _players = list(by_player.keys())[:max_to_resolve]
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _warm(p):
+                try:
+                    _load_player_gamelog(espn_sport, espn_league, p)
+                except Exception:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=min(12, len(_players))) as _ex:
+                list(_ex.map(_warm, _players))
+        except Exception:
+            pass   # fall back to the inline (sequential) fetches below
+
     resolved_count = 0     # genuine resolutions (a real outcome) — the return value
     void_count = 0         # stale scratch/DNP rows retired (no outcome)
     network_attempts = 0   # live fetches only — the P4 cap counts these, NOT the
