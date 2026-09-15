@@ -1477,7 +1477,20 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             fd_under_book = odds_info.get("fd_under_book")
 
             history = player_histories.get(player_name, {}).get(prop_key)
-            if not history or not history.get("found") or not history.get("values"):
+            _have_history = bool(history and history.get("found") and history.get("values"))
+            # NFL is served by OUR nflverse model (not ESPN). When ESPN has no history for a
+            # player (name it can't resolve), don't drop the prop — synthesize a 1-value history
+            # from our projection so the loop runs and the NFL override below fills the real
+            # avg_stat / over_rate. Only when our model can also project (else genuine no_history).
+            if not _have_history and sport_key == "americanfootball_nfl":
+                _pv = _nfl_model_override(player_name, prop_key, line)
+                if _pv is not None and _pv.get("p_over") is not None:
+                    history = {"found": True, "values": [_pv["proj"]], "opponents": [None],
+                               "home_aways": [None], "minutes": [None], "game_dates": [None],
+                               "plate_appearances": [None], "at_bats": [None],
+                               "lineup_status": None, "source": "nfl_model"}
+                    _have_history = True
+            if not _have_history:
                 candidates.append({
                     "type": "player_prop",
                     "matchup": matchup,
