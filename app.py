@@ -2111,6 +2111,18 @@ def render_bonuses():
         st.session_state["bonuses_list"] = bonus_store.load_bonuses()
     bonuses = st.session_state["bonuses_list"]
 
+    _msg = st.session_state.pop("_bonus_log_msg", None)
+    if _msg:
+        st.success(_msg)
+
+    def _consume_bonus(book, label, bet_type):
+        """A promo boost is single-use → drop the matching bonus from the active list once a
+        play using it is logged (durably persisted)."""
+        st.session_state["bonuses_list"] = [
+            b for b in st.session_state["bonuses_list"]
+            if not (b.book == book and b.label == label and b.bet_type == bet_type)]
+        bonus_store.save_bonuses(st.session_state["bonuses_list"])
+
     # ── active-bonus manager ──
     st.subheader("Active bonuses")
     if bonuses:
@@ -2225,7 +2237,11 @@ def render_bonuses():
                          "our_joint_prob": rr["joint_P"], "our_boosted_ev_pct": ev,
                          "max_corr": 0.0},
                         [opt.leg_to_store(l, "cross_game") for l in combo])
-                    st.success("Logged → see 🎰 Parlays.")
+                    _consume_bonus(r["book"], r["label"], r["bet_type"])
+                    st.session_state["_bonus_log_msg"] = (
+                        f"Logged {len(combo)}-leg parlay → 🎰 Parlays. "
+                        f"Bonus '{r['label']}' consumed & removed.")
+                    st.rerun()
         if r["sgp"]:
             st.caption("SGP stacks — build in the book's SGP builder, then enter its combined "
                        "price for the exact boosted EV (independence-vetted for correlation):")
@@ -2250,7 +2266,10 @@ def render_bonuses():
                              "combined_american": int(price), "stake": round(stake, 2),
                              "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
                             [opt.leg_to_store(l, "sgp") for l in combo])
-                        st.success("Logged → see 🎰 Parlays.")
+                        _consume_bonus(r["book"], r["label"], r["bet_type"])
+                        st.session_state["_bonus_log_msg"] = (
+                            f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
+                        st.rerun()
     if not shown:
         st.info("No qualifying +EV plays for the active bonuses on this slate.")
 
