@@ -2132,12 +2132,12 @@ def render_bonuses():
             "min legs": b.min_legs,
             "max $": b.max_wager if b.max_wager < 1e8 else None,
             "label": b.label} for b in bonuses]),
-            hide_index=True, use_container_width=True)
+            hide_index=True, width='stretch')
         dc = st.columns([3, 1])
         di = dc[0].selectbox("Remove a bonus", range(len(bonuses)),
                              format_func=lambda i: bonuses[i].label
                              or f"{bonuses[i].book} {bonuses[i].bet_type}", key="bonus_del_idx")
-        if dc[1].button("🗑 Remove", use_container_width=True):
+        if dc[1].button("🗑 Remove", width='stretch'):
             bonuses.pop(di)
             bonus_store.save_bonuses(bonuses)
             st.rerun()
@@ -2215,7 +2215,7 @@ def render_bonuses():
                 "P%": round(rr["joint_P"] * 100, 1),
                 "selections": "   +   ".join(_leglabel(l) for l in combo)}
                 for ev, rr, combo in r["cross"]]),
-                hide_index=True, use_container_width=True)
+                hide_index=True, width='stretch')
             # log a MULTI-leg cross-game parlay to the tracker (singles go through My Bets)
             multi = [(j, ev, rr, combo) for j, (ev, rr, combo) in enumerate(r["cross"])
                      if len(combo) >= 2]
@@ -2227,7 +2227,7 @@ def render_bonuses():
                     f"  ({'  +  '.join(l['player'] for l in m[3])})",
                     key=f"logx_{r['book']}_{r['label']}")
                 if lc[1].button("📝 Log parlay", key=f"logxbtn_{r['book']}_{r['label']}",
-                                use_container_width=True):
+                                width='stretch'):
                     _j, ev, rr, combo = pick
                     parlay_store.save_parlay(
                         {"book": r["book"], "bonus_label": r["label"], "bet_type": "parlay",
@@ -2311,7 +2311,7 @@ def render_parlays():
             "EV%": (round(t["our_boosted_ev_pct"], 1)
                     if t.get("our_boosted_ev_pct") is not None else None),
             "status": t.get("status"), "profit $": t.get("profit")}
-            for t in tickets]), hide_index=True, use_container_width=True)
+            for t in tickets]), hide_index=True, width='stretch')
 
         with st.expander("Leg detail"):
             for t in tickets:
@@ -2325,7 +2325,7 @@ def render_parlays():
                     "actual": l.get("actual"),
                     "result": ("win" if l.get("result") == 1 else
                                "loss" if l.get("result") == 0 else "—")}
-                    for l in t.get("legs", [])]), hide_index=True, use_container_width=True)
+                    for l in t.get("legs", [])]), hide_index=True, width='stretch')
 
         # ── manual settle (pushes / overrides) ──
         unsettled = [t for t in tickets if t.get("status") in ("pending", "void")]
@@ -2337,7 +2337,7 @@ def render_parlays():
                     format_func=lambda t: f"{(t.get('placed_at') or '')[:10]} "
                     f"{t.get('bet_type')} @{t.get('combined_american')} ({t.get('status')})")
                 new = sc[1].selectbox("Status", ["won", "lost", "void", "pending"])
-                if sc[2].button("Apply", use_container_width=True):
+                if sc[2].button("Apply", width='stretch'):
                     parlay_store.settle_manual(pick["parlay_id"], new)
                     st.rerun()
 
@@ -2382,14 +2382,14 @@ def render_parlays():
         with cols[0]:
             st.caption("By bonus")
             st.dataframe(_by(lambda t: t.get("bonus_label") or "—", "bonus"),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width='stretch')
             st.caption("By leg count")
             st.dataframe(_by(lambda t: t.get("n_legs"), "legs"),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width='stretch')
         with cols[1]:
             st.caption("Same-game vs cross-game")
             st.dataframe(_by(lambda t: "SGP" if t.get("is_same_game") else "cross-game", "kind"),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width='stretch')
             st.caption("SGP by correlation content")
             sgp_rows = [t for t in settled if t.get("is_same_game")]
             if sgp_rows:
@@ -2401,7 +2401,7 @@ def render_parlays():
                     grp.setdefault(_corr_band(t), []).append(t)
                 st.dataframe(pd.DataFrame([{
                     "content": k, **{kk: vv for kk, vv in _stats(g).items()}}
-                    for k, g in grp.items()]), hide_index=True, use_container_width=True)
+                    for k, g in grp.items()]), hide_index=True, width='stretch')
             else:
                 st.caption("(no settled SGPs yet)")
 
@@ -2424,7 +2424,7 @@ def render_parlays():
                 st.dataframe(pd.DataFrame(
                     [{"prop": k, "losing legs": v} for k, v in
                      sorted(losers.items(), key=lambda kv: -kv[1])]),
-                    hide_index=True, use_container_width=True)
+                    hide_index=True, width='stretch')
 
     # ── manual add (book-built tickets) ──
     with st.expander("➕ Add a parlay manually"):
