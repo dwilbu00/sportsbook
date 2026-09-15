@@ -65,12 +65,20 @@ Honesty note: we validated *market-devig calibration* specifically on these 3 co
 threshold — the serving feed keeps the live gate identical to that validated universe. (Expanding
 to yardage/other props later would need its own market-calibration check first.)
 
-⚠ DEPENDENCY TO CONFIRM (blocks this approach): the lazy refresh runs INSIDE the app, so the
-runtime (incl. **Streamlit Cloud**) must be able to (a) `import nflreadpy` and reach nflverse’s
-public data (free) and (b) WRITE to Azure. The app already writes to Azure (wagers/ledger), so (b)
-is fine; (a) means adding `nflreadpy` to the cloud requirements — needs a quick confirmation it
-installs/runs on Cloud. If Cloud can’t pull nflreadpy, fallback = the refresh runs on Doug’s
-machine and the app read-only (the earlier cron option). Recommend: try in-app first.
+**✅ DEPENDENCY RESOLVED — refresh via DIRECT nflverse URL fetch, no nflreadpy/polars.** The
+architecture rule is explicit (`nfl_ingest.py`: "Runtime NEVER imports nflreadpy/polars"), and
+nflreadpy drags in polars. So the in-app lazy refresh must NOT use nflreadpy. Instead it fetches
+the nflverse release parquet DIRECTLY with pandas (pyarrow already present for mirror reads):
+- URL: `https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{season}.parquet`
+- **Verified** (2026-09-15): loads via `pd.read_parquet(url)`, carries every gate column
+  (`targets, carries, attempts, receptions, week, season, player_display_name, team, position`).
+- `ensure_current(season)`: check Azure max(week) for the season; if behind the release's max
+  completed week, `pd.read_parquet` the release, select+rename to our `nfl_player_week` columns,
+  upsert new (season,week) rows to Azure. pandas + requests/pyarrow only — honors the no-nflreadpy
+  runtime rule AND Doug's self-healing-in-app intent. (b) Azure WRITE already works in the app
+  (wagers/ledger). No new heavy cloud dependency.
+- Backfill of 2012–2025 can use the SAME URL pattern per season (or the parquet we already have) —
+  free, no nflreadpy.
 
 ---
 
