@@ -2245,20 +2245,24 @@ def render_bonuses():
             multi = [(j, ev, rr, combo) for j, (ev, rr, combo) in enumerate(r["cross"])
                      if len(combo) >= 2]
             if multi:
-                lc = st.columns([3, 1])
+                lc = st.columns([3, 1, 1])
                 pick = lc[0].selectbox(
                     "Log a cross-game parlay", multi,
                     format_func=lambda m: f"{len(m[3])}-leg @{int(m[2]['combined_american']):+d}"
                     f"  ({'  +  '.join(l['player'] for l in m[3])})",
                     key=f"logx_{r['book']}_{r['label']}")
-                if lc[1].button("📝 Log parlay", key=f"logxbtn_{r['book']}_{r['label']}",
+                wager = lc[1].number_input(
+                    "Wager $", min_value=0.0, value=round(pick[2]["kelly_stake"], 2), step=1.0,
+                    key=f"wagerx_{r['book']}_{r['label']}",
+                    help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
+                if lc[2].button("📝 Log parlay", key=f"logxbtn_{r['book']}_{r['label']}",
                                 width='stretch'):
                     _j, ev, rr, combo = pick
                     parlay_store.save_parlay(
                         {"book": r["book"], "bonus_label": r["label"], "bet_type": "parlay",
                          "boost_pct": r["boost_pct"], "is_same_game": False,
                          "combined_american": int(rr["combined_american"]),
-                         "stake": round(rr["kelly_stake"], 2),
+                         "stake": round(float(wager), 2),
                          "our_joint_prob": rr["joint_P"], "our_boosted_ev_pct": ev,
                          "max_corr": 0.0},
                         [opt.leg_to_store(l, "cross_game") for l in combo])
@@ -2283,12 +2287,16 @@ def render_bonuses():
                     kf = bonuslib.kelly_fraction(jp, dec, r["boost_pct"]) * 0.25
                     stake = min(r["max_wager"], max(0.0, kf * bankroll)) if ev > 0 else 0.0
                     st.write(f"{'✅ BET' if ev > 0 else '❌ skip'} — boosted EV **{ev:+.1f}%**, "
-                             f"stake **${stake:.2f}** (¼-Kelly)")
+                             f"suggested stake **${stake:.2f}** (¼-Kelly)")
+                    wager = st.number_input(
+                        "Wager $", min_value=0.0, value=round(stake, 2), step=1.0,
+                        key=f"wagersgp_{r['book']}_{r['label']}_{i}",
+                        help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
                     if st.button("📝 Log this SGP", key=f"logsgp_{r['book']}_{r['label']}_{i}"):
                         parlay_store.save_parlay(
                             {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
                              "boost_pct": r["boost_pct"], "is_same_game": True,
-                             "combined_american": int(price), "stake": round(stake, 2),
+                             "combined_american": int(price), "stake": round(float(wager), 2),
                              "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
                             [opt.leg_to_store(l, "sgp") for l in combo])
                         _consume_bonus(r["book"], r["label"], r["bet_type"])
