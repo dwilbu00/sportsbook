@@ -3754,7 +3754,13 @@ if analyze_clicked and selected_game_labels:
             try:
                 _event_results[_eid] = _f.result()
             except Exception as e:
-                warnings.append(f"Analysis failed for event {_eid}: {e}")
+                import os as _os
+                import traceback as _tb
+                _fr = _tb.extract_tb(e.__traceback__)
+                _loc = (f" [{_os.path.basename(_fr[-1].filename)}:{_fr[-1].lineno} "
+                        f"in {_fr[-1].name}]" if _fr else "")
+                warnings.append(f"Analysis failed for event {_eid}: "
+                                f"{type(e).__name__}: {e}{_loc}")
     for event in selected_events:
         _r = _event_results.get(event["id"])
         if not _r:
