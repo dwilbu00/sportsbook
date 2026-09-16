@@ -2123,10 +2123,14 @@ def render_bonuses():
             if not (b.book == book and b.label == label and b.bet_type == bet_type)]
         bonus_store.save_bonuses(st.session_state["bonuses_list"])
 
+    _SPORT_LABELS = {"americanfootball_nfl": "NFL", "baseball_mlb": "MLB"}
+    _SPORT_KEYS = {v: k for k, v in _SPORT_LABELS.items()}
+
     # ── active-bonus manager ──
     st.subheader("Active bonuses")
     if bonuses:
         st.dataframe(pd.DataFrame([{
+            "sport": _SPORT_LABELS.get(getattr(b, "sport", ""), getattr(b, "sport", "")),
             "book": b.book, "type": b.bet_type, "boost%": round(b.boost_pct * 100),
             "min leg": int(b.min_odds_leg) if b.min_odds_leg > -99999 else None,
             "min legs": b.min_legs,
@@ -2147,22 +2151,25 @@ def render_bonuses():
     with st.expander("➕ Add a bonus", expanded=not bonuses):
         with st.form("add_bonus"):
             c = st.columns(4)
-            book = c[0].selectbox("Book", ["draftkings", "fanduel"])
-            bet_type = c[1].selectbox("Bet type", ["any", "parlay", "sgp", "single"],
+            sport_label = c[0].selectbox("Sport", list(_SPORT_KEYS))
+            book = c[1].selectbox("Book", ["draftkings", "fanduel"])
+            bet_type = c[2].selectbox("Bet type", ["any", "parlay", "sgp", "single"],
                                       help="'any' = applies to singles + parlays + SGPs")
-            boost = c[2].number_input("Boost %", 0.0, 100.0, 30.0, step=5.0)
-            min_legs = c[3].number_input("Min legs", 1, 12, 1, step=1)
+            boost = c[3].number_input("Boost %", 0.0, 100.0, 30.0, step=5.0)
             c2 = st.columns(4)
-            min_leg = c2[0].number_input("Min odds/leg (American)", -100000, 100000, -300, step=10)
-            min_overall = c2[1].number_input("Min overall odds", -100000, 100000, -100000, step=10)
-            max_w = c2[2].number_input("Max wager $", 0.0, 100000.0, 10.0, step=5.0)
-            min_w = c2[3].number_input("Min wager $", 0.0, 100000.0, 0.0, step=1.0)
-            label = st.text_input("Label", value=f"{int(boost)}% {bet_type}")
+            min_legs = c2[0].number_input("Min legs", 1, 12, 1, step=1)
+            min_leg = c2[1].number_input("Min odds/leg (American)", -100000, 100000, -300, step=10)
+            min_overall = c2[2].number_input("Min overall odds", -100000, 100000, -100000, step=10)
+            max_w = c2[3].number_input("Max wager $", 0.0, 100000.0, 10.0, step=5.0)
+            c3 = st.columns(2)
+            min_w = c3[0].number_input("Min wager $", 0.0, 100000.0, 0.0, step=1.0)
+            label = c3[1].text_input("Label", value=f"{int(boost)}% {bet_type}")
             if st.form_submit_button("Add bonus"):
                 bonuses.append(bonuslib.Bonus(
                     bet_type=bet_type, boost_pct=boost / 100.0, min_odds_leg=float(min_leg),
                     min_odds_overall=float(min_overall), min_legs=int(min_legs),
-                    max_wager=float(max_w), min_wager=float(min_w), book=book, label=label))
+                    max_wager=float(max_w), min_wager=float(min_w), book=book, label=label,
+                    sport=_SPORT_KEYS[sport_label]))
                 bonus_store.save_bonuses(bonuses)
                 st.rerun()
 
@@ -2170,15 +2177,23 @@ def render_bonuses():
     st.subheader("+EV plays on your current slate")
     board = st.session_state.get("bonus_board")
     if not board or not board.get("parsed"):
-        st.info("Run the 🎯 Value Finder for an NFL slate first (with player-prop markets "
-                "selected). This page reuses that already-fetched board — no extra API credits.")
+        st.info("Run the 🎯 Value Finder for a slate first (with player-prop markets selected). "
+                "This page reuses that already-fetched board — no extra API credits.")
         return
-    if board.get("sport_key") != "americanfootball_nfl":
-        st.warning("The bonus optimizer currently supports NFL props. Load an NFL slate in the "
-                   "Value Finder, then return here.")
-        return
+    board_sport = board.get("sport_key")
+    # Only evaluate bonuses whose sport matches the loaded slate.
+    bonuses = [b for b in bonuses if getattr(b, "sport", "americanfootball_nfl") == board_sport]
     if not bonuses:
-        st.info("Add at least one active bonus above.")
+        st.info(f"No active bonuses for the loaded {_SPORT_LABELS.get(board_sport, board_sport)} "
+                "slate — add one above (set its Sport to match).")
+        return
+    if board_sport not in ("americanfootball_nfl", "baseball_mlb"):
+        st.warning("The bonus optimizer supports NFL and MLB. Load one of those in the Value "
+                   "Finder, then return here.")
+        return
+    if board_sport == "baseball_mlb":
+        st.info("⚙️ MLB bonus legs are being wired up (opportunity gate from the lineup / "
+                "probable starters). Your MLB bonus is saved and will activate here shortly.")
         return
 
     import nfl_bonus_optimizer as opt

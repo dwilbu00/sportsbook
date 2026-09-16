@@ -34,6 +34,7 @@ class Bonus:
     min_wager: float = 0.0
     book: str = "draftkings"             # DK bonuses use DK odds; FD bonuses use FD odds
     label: str = ""                      # human tag for reporting
+    sport: str = "americanfootball_nfl"  # which sport's slate this boost applies to
 
 
 def american_to_dec(a):
