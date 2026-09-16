@@ -145,17 +145,86 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
     return legs
 
 
-def leg_to_store(l, category="cross_game"):
+def leg_to_store(l, category="cross_game", sport="americanfootball_nfl"):
     """Map an optimizer leg dict → a parlay_legs row dict (for parlay_store.save_parlay)."""
     return {"player": l["player"], "prop_key": l["prop"], "line": l["line"],
             "side": l["side"], "price": int(l["odds"]), "our_leg_prob": l["P"],
             "team": l.get("team"), "opp": l.get("opp"), "corr_category": category,
             "event_id": l.get("gid"), "commence_time": l.get("commence_time"),
-            "game_date": l.get("game_date"), "sport_key": "americanfootball_nfl"}
+            "game_date": l.get("game_date"), "sport_key": sport}
 
 
 def _leg_ok(lg, bonus):
     return american_to_decimal(lg["odds"]) >= bonuslib.american_to_dec(bonus.min_odds_leg) - 1e-9
+
+
+# ── MLB legs (from the app's analysis candidates; gate = lineup participation, since the MLB
+# market is calibrated at all opportunity levels — see mlb_opportunity_threshold results) ──
+MLB_TRUSTWORTHY = {"batter_hits", "batter_total_bases", "batter_rbis",
+                   "pitcher_strikeouts", "pitcher_earned_runs", "pitcher_outs"}
+MLB_ABBR = {"batter_hits": "H", "batter_total_bases": "TB", "batter_rbis": "RBI",
+            "pitcher_strikeouts": "K", "pitcher_earned_runs": "ER", "pitcher_outs": "outs"}
+
+
+def _mlb_gate_ok(c):
+    """Participation gate: batter in the lineup, top-6 order (high PA); pitcher = probable
+    starter (on the board, not scratched). lineup_status 'out' is always excluded."""
+    if c.get("lineup_status") == "out":
+        return False
+    if str(c.get("prop", "")).startswith("batter_"):
+        bo = c.get("batting_order")
+        return bo is not None and 1 <= int(bo) <= 6
+    return True
+
+
+def legs_from_candidates(candidates, book):
+    """MLB leg source: build legs from the app's analysis candidates (market de-vig P +
+    lineup gate). book-specific price (DK/FD). Favorite side."""
+    pxk = "dk" if book == "draftkings" else "fd"
+    legs = []
+    for c in candidates:
+        if c.get("type") != "player_prop" or c.get("no_history"):
+            continue
+        prop = c.get("prop")
+        if prop not in MLB_TRUSTWORTHY or not _mlb_gate_ok(c):
+            continue
+        fo = c.get("over_implied")
+        if fo is None:
+            continue
+        fo = float(fo) / 100.0                       # candidate stores it as a percent
+        fav_over = fo >= 0.5
+        price = c.get(f"{pxk}_{'over' if fav_over else 'under'}_price")
+        if price is None:
+            continue
+        legs.append({"gid": c.get("event_id"), "prop": prop, "player": c.get("player"),
+                     "team": c.get("team"), "opp": None, "line": c.get("line"),
+                     "side": "OVER" if fav_over else "UNDER",
+                     "P": fo if fav_over else 1.0 - fo, "fair_over": fav_over, "odds": price})
+    return legs
+
+
+def sgp_stacks_indep(legs, bonus, bankroll):
+    """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
+    weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
+    required combined price for +EV. Same return shape as sgp_stacks (mx=0, no correlation)."""
+    bygame = defaultdict(list)
+    for l in legs:
+        if _leg_ok(l, bonus):
+            bygame[l["gid"]].append(l)
+    need = max(2, bonus.min_legs)
+    out = []
+    for gid, gl in bygame.items():
+        if len(gl) < need:
+            continue
+        combo = tuple(sorted(gl, key=lambda x: -x["P"])[:need])
+        jp = 1.0
+        for l in combo:
+            jp *= l["P"]
+        b = bonus.boost_pct
+        req = 1.0 + (1.0 - jp) / (jp * (1.0 + b)) if jp > 0 else float("inf")
+        out.append((jp, 0.0, combo, bonuslib.dec_to_american(req)))
+    out.sort(key=lambda x: -x[0])
+    return out
 
 
 def _label(lg):
@@ -250,17 +319,21 @@ def _allows_sgp(bt):
     return bt in ("any", "any_parlay", "sgp", "sgp_sgpx")
 
 
-def evaluate_slate(legs_by_book, bonuses, rho, bankroll):
+def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None):
     """Structured optimizer output for a slate — the shared core for the CLI and the app.
-    Returns [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
+    sgp_fn(legs, bonus) -> stacks lets a sport pick its SGP joint (NFL copula vs MLB independence);
+    defaults to the NFL copula path. Returns
+    [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
+    if sgp_fn is None:
+        def sgp_fn(legs, bonus):
+            return sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
     out = []
     for base in bonuses:
         for book, legs in legs_by_book.items():
             bonus = bonuslib.Bonus(**{**base.__dict__, "book": book})
             cross = (_diversify(cross_game_plays(legs, bonus, bankroll), TOP_K)
                      if _allows_cross(bonus.bet_type) else [])
-            stacks = (sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
-                      if _allows_sgp(bonus.bet_type) else [])
+            stacks = sgp_fn(legs, bonus) if _allows_sgp(bonus.bet_type) else []
             out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
                         "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
                         "n_legs": len(legs), "cross": cross, "sgp": stacks})

@@ -2194,11 +2194,6 @@ def render_bonuses():
         st.warning("The bonus optimizer supports NFL and MLB. Load one of those in the Value "
                    "Finder, then return here.")
         return
-    if board_sport == "baseball_mlb":
-        st.info("⚙️ MLB bonus legs are being wired up (opportunity gate from the lineup / "
-                "probable starters). Your MLB bonus is saved and will activate here shortly.")
-        return
-
     import nfl_bonus_optimizer as opt
     import parlay_store
     try:
@@ -2208,41 +2203,64 @@ def render_bonuses():
         bankroll = 1000.0
     bankroll = bankroll if bankroll and bankroll > 0 else 1000.0
 
+    is_mlb = board_sport == "baseball_mlb"
     with st.spinner("Scanning trustworthy legs + building +EV plays…"):
-        legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
-                        for bk in ("draftkings", "fanduel")}
-        rho = opt.load_rho()
-        results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll)
+        if is_mlb:
+            # MLB legs come from the analyzed candidates (market de-vig P + lineup gate); SGP
+            # joint = INDEPENDENCE (step-3 verdict). Cross-game is independent either way.
+            cands = board.get("candidates") or []
+            legs_by_book = {bk: opt.legs_from_candidates(cands, bk)
+                            for bk in ("draftkings", "fanduel")}
+
+            def _mlb_sgp(legs, bonus):
+                return opt.sgp_stacks_indep(legs, bonus, bankroll)[:opt.TOP_K]
+            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll, sgp_fn=_mlb_sgp)
+            pabbr = opt.MLB_ABBR
+        else:
+            legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
+                            for bk in ("draftkings", "fanduel")}
+            rho = opt.load_rho()
+            results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll)
+            pabbr = opt.PROP_ABBR
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
-    trust = list(opt.TRUSTWORTHY)                       # the only props that can be legs
-    board_markets = set()
-    for _b in board["parsed"]:
-        board_markets.update((_b.get("props") or {}).keys())
-    missing = [p for p in trust if p not in board_markets]
     n_games = len(board["parsed"])
-    n_legs = max(len(v) for v in legs_by_book.values()) if legs_by_book else 0
-    _abbr = {"player_receptions": "Receptions", "player_rush_attempts": "Rush Attempts",
-             "player_pass_attempts": "Pass Attempts"}
-    st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible leg(s). Bonus legs come only from "
-               f"the validated count props: {', '.join(_abbr.values())}.")
-    if missing:
-        st.warning("⚠️ Your analyzed slate has no odds for "
-                   f"**{', '.join(_abbr[p] for p in missing)}** — the bonus optimizer can only "
-                   "build legs from those. Re-run the 🎯 Value Finder with those prop markets "
-                   "selected (the default NFL markets are yardage/anytime-TD, which aren't used "
-                   "here).")
-    elif n_legs == 0:
-        st.info("No players cleared the opportunity threshold on this slate yet (thin early-season "
-                "usage). More will qualify as the season progresses.")
-    elif n_games < 2:
-        st.info("Only one game analyzed — cross-game parlays need ≥2 games. Same-game (SGP) "
-                "stacks can still appear below; add more games for cross-game parlays.")
-
-    pabbr = opt.PROP_ABBR
+    n_legs = max((len(v) for v in legs_by_book.values()), default=0)
+    if is_mlb:
+        st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible MLB leg(s). Legs = top-6 batters "
+                   "in the confirmed lineup + probable starters, 6 validated props, market-devig P.")
+        if n_legs == 0:
+            st.info("No MLB legs yet — need the analyzed slate cached with batter/pitcher prop "
+                    "markets selected, and posted lineups (batters gate on batting order). "
+                    "Lineups post closer to game time.")
+        elif n_games < 2:
+            st.info("Only one game analyzed — cross-game parlays need ≥2 games; SGP stacks still "
+                    "appear below.")
+    else:
+        trust = list(opt.TRUSTWORTHY)
+        board_markets = set()
+        for _b in board["parsed"]:
+            board_markets.update((_b.get("props") or {}).keys())
+        missing = [p for p in trust if p not in board_markets]
+        _abbr = {"player_receptions": "Receptions", "player_rush_attempts": "Rush Attempts",
+                 "player_pass_attempts": "Pass Attempts"}
+        st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible leg(s). Bonus legs come only from "
+                   f"the validated count props: {', '.join(_abbr.values())}.")
+        if missing:
+            st.warning("⚠️ Your analyzed slate has no odds for "
+                       f"**{', '.join(_abbr[p] for p in missing)}** — the bonus optimizer can only "
+                       "build legs from those. Re-run the 🎯 Value Finder with those prop markets "
+                       "selected (the default NFL markets are yardage/anytime-TD, not used here).")
+        elif n_legs == 0:
+            st.info("No players cleared the opportunity threshold on this slate yet (thin "
+                    "early-season usage). More will qualify as the season progresses.")
+        elif n_games < 2:
+            st.info("Only one game analyzed — cross-game parlays need ≥2 games. Same-game (SGP) "
+                    "stacks can still appear below; add more games for cross-game parlays.")
 
     def _leglabel(l):
-        return f"{l['player']} {pabbr[l['prop']]} {l['side'][0]} {l['line']} @{l['odds']:+.0f}"
+        return (f"{l['player']} {pabbr.get(l['prop'], l['prop'])} {l['side'][0]} "
+                f"{l['line']} @{l['odds']:+.0f}")
 
     shown = False
     for r in results:
@@ -2280,10 +2298,10 @@ def render_bonuses():
                         {"book": r["book"], "bonus_label": r["label"], "bet_type": "parlay",
                          "boost_pct": r["boost_pct"], "is_same_game": False,
                          "combined_american": int(rr["combined_american"]),
-                         "stake": round(float(wager), 2),
+                         "stake": round(float(wager), 2), "sport_key": board_sport,
                          "our_joint_prob": rr["joint_P"], "our_boosted_ev_pct": ev,
                          "max_corr": 0.0},
-                        [opt.leg_to_store(l, "cross_game") for l in combo])
+                        [opt.leg_to_store(l, "cross_game", board_sport) for l in combo])
                     _consume_bonus(r["book"], r["label"], r["bet_type"])
                     st.session_state["_bonus_log_msg"] = (
                         f"Logged {len(combo)}-leg parlay → 🎰 Parlays. "
@@ -2315,8 +2333,9 @@ def render_bonuses():
                             {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
                              "boost_pct": r["boost_pct"], "is_same_game": True,
                              "combined_american": int(price), "stake": round(float(wager), 2),
+                             "sport_key": board_sport,
                              "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
-                            [opt.leg_to_store(l, "sgp") for l in combo])
+                            [opt.leg_to_store(l, "sgp", board_sport) for l in combo])
                         _consume_bonus(r["book"], r["label"], r["bet_type"])
                         st.session_state["_bonus_log_msg"] = (
                             f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
@@ -3826,6 +3845,14 @@ if analyze_clicked and selected_game_labels:
             for e in selected_events
         },
     }
+    # Stash the analyzed prop candidates for the 💰 Bonuses page (MLB legs are built from
+    # these — market de-vig + lineup gate — since MLB props aren't in the raw parsed board's
+    # trustworthy set the way NFL's are). Best-effort; keyed to the same slate as bonus_board.
+    try:
+        if isinstance(st.session_state.get("bonus_board"), dict):
+            st.session_state["bonus_board"]["candidates"] = all_props
+    except Exception:
+        pass
     # Forward-track the model's team-market picks (moneyline/spread/total),
     # mirroring per-prop forward logging. Best-effort: no-ops gracefully until the
     # market_prediction_log table exists, and never breaks analysis.

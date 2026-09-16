@@ -2337,6 +2337,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "best_price": best_price,
                 "dk_over_price": dk_over_price,
                 "dk_under_price": dk_under_price,
+                "fd_over_price": fd_over_price,
+                "fd_under_price": fd_under_price,
                 "dk_price": dk_price,
                 "dk_book": dk_book,
                 # Which line this was analyzed at: 'dk' (DK's own line) vs
