@@ -21,6 +21,35 @@ def _family(prop_key):
     return "batter" if prop_key.startswith("batter_") else "pitcher"
 
 
+def _ip_to_outs(ip):
+    try:
+        from espn_client import ip_to_outs
+        return ip_to_outs(ip)
+    except Exception:
+        return None
+
+
+def opportunity_from_rows(prior_rows, prop_key):
+    """Recency-weighted expected volume from a list of prior warehouse gamelog ROW DICTS
+    (most-recent-first) — the backtest path (book_line_calibration attaches `prior_games`).
+    Same formula as expected_opportunity: batters -> PA (AB+BB+HBP+SF+SH), pitchers -> OUTS
+    (ip_to_outs(IP)). None if too few priors."""
+    fam = _family(prop_key)
+    hl, min_prior = _RECENCY[fam]
+    rows = list(prior_rows or [])
+    if len(rows) < min_prior:
+        return None
+
+    def _vol(r):
+        if fam == "batter":
+            return sum(float(r.get(k) or 0.0) for k in ("AB", "BB", "HBP", "SF", "SH"))
+        return float(_ip_to_outs(r.get("IP")) or 0.0)
+
+    vals = [_vol(r) for r in rows]
+    w = [0.5 ** (i / hl) for i in range(len(vals))]
+    return sum(wi * v for v, wi in zip(vals, w)) / (sum(w) or 1.0)
+
+
 def expected_opportunity(mlb_player_id, prop_key, as_of_date=None, season=None):
     """Recency-weighted expected volume for the gate: PA for batters, OUTS for pitchers.
     None if the player has < min_prior prior games or the warehouse can't serve."""
