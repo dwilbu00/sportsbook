@@ -2153,8 +2153,11 @@ def render_bonuses():
             c = st.columns(4)
             sport_label = c[0].selectbox("Sport", list(_SPORT_KEYS))
             book = c[1].selectbox("Book", ["draftkings", "fanduel"])
-            bet_type = c[2].selectbox("Bet type", ["any", "parlay", "sgp", "single"],
-                                      help="'any' = applies to singles + parlays + SGPs")
+            bet_type = c[2].selectbox(
+                "Bet type", ["any", "any_parlay", "parlay", "sgp", "sgp_sgpx", "single"],
+                help="any = singles+parlays+SGPs · any_parlay = any multi-leg (no singles) · "
+                     "parlay = cross-game · sgp = same-game · sgp_sgpx = SGP or SGPx "
+                     "(same-game, or SGPs combined across games) · single = 1 leg")
             boost = c[3].number_input("Boost %", 0.0, 100.0, 30.0, step=5.0)
             c2 = st.columns(4)
             min_legs = c2[0].number_input("Min legs", 1, 12, 1, step=1)

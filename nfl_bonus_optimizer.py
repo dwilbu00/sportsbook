@@ -239,6 +239,17 @@ def load_rho():
     return sgp.load_frozen() or {}
 
 
+# Which ticket shapes each bet_type admits (composition, enforced here in the optimizer).
+#   cross-game/singles: any, any_parlay, parlay, single, sgp_sgpx (SGPx spans games)
+#   same-game (SGP)   : any, any_parlay, sgp, sgp_sgpx
+def _allows_cross(bt):
+    return bt in ("any", "any_parlay", "parlay", "single", "sgp_sgpx")
+
+
+def _allows_sgp(bt):
+    return bt in ("any", "any_parlay", "sgp", "sgp_sgpx")
+
+
 def evaluate_slate(legs_by_book, bonuses, rho, bankroll):
     """Structured optimizer output for a slate — the shared core for the CLI and the app.
     Returns [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
@@ -246,10 +257,10 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll):
     for base in bonuses:
         for book, legs in legs_by_book.items():
             bonus = bonuslib.Bonus(**{**base.__dict__, "book": book})
-            cross = [] if bonus.bet_type == "sgp" else _diversify(
-                cross_game_plays(legs, bonus, bankroll), TOP_K)
+            cross = (_diversify(cross_game_plays(legs, bonus, bankroll), TOP_K)
+                     if _allows_cross(bonus.bet_type) else [])
             stacks = (sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
-                      if bonus.bet_type in ("sgp", "parlay", "any") else [])
+                      if _allows_sgp(bonus.bet_type) else [])
             out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
                         "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
                         "n_legs": len(legs), "cross": cross, "sgp": stacks})

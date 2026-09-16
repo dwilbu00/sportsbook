@@ -83,11 +83,19 @@ def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
     # constraints
     legs_ok = all(_leg_ok(a, bonus) for _p, a in legs)
     overall_ok = dec >= american_to_dec(bonus.min_odds_overall) - 1e-9
+    # Ticket-type gate (leg-count only; the OPTIMIZER enforces cross-game vs same-game
+    # composition). bet_type vocabulary:
+    #   single       -> exactly 1 leg
+    #   any          -> anything (singles + parlays + SGPs)
+    #   any_parlay   -> any multi-leg (excludes singles) — cross-game OR same-game
+    #   parlay       -> cross-game multi-leg
+    #   sgp          -> same-game multi-leg
+    #   sgp_sgpx     -> SGP or SGPx (same-game, or multiple SGPs combined across games)
     if bonus.bet_type == "any":
         type_ok = True
     elif bonus.bet_type == "single":
         type_ok = n == 1
-    else:                                   # 'parlay' | 'sgp'
+    else:                                   # parlay | sgp | sgp_sgpx | any_parlay
         type_ok = n >= 2
     legs_count_ok = n >= max(1, bonus.min_legs)
     qualifies = legs_ok and overall_ok and type_ok and legs_count_ok
