@@ -37,7 +37,9 @@ def _fair_over(over_price, under_price):
 def collect(props, snapshot):
     """{prop: [record]} where record = {season, opp, y, fair} for each joinable real-line MLB
     prop bet (pushes dropped)."""
-    book_lines = blc.harvest_real_line_book_lines("baseball_mlb", props, snapshot=snapshot)
+    book_lines, _n_primary, _n_pred = blc.harvest_real_line_book_lines(
+        "baseball_mlb", props, snapshot=snapshot)
+    print(f"  harvested {len(book_lines)} real book line(s); joining to actuals…")
     enriched = blc.join_book_lines_to_actuals(book_lines, "baseball", "mlb")
     out = defaultdict(list)
     for r in enriched:
