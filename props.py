@@ -1957,10 +1957,13 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             over_rate = _apply_final_recalibration(over_rate, recal_cfg)
             recal_meta = None
             if over_rate != raw_over_rate:
+                # recal_cfg is None when an ISOTONIC bucket map (not Platt) did the
+                # adjustment — it applies independently of the Platt cfg. Guard the None.
+                _rc = recal_cfg or {}
                 recal_meta = {
-                    "a": recal_cfg.get("a"),
-                    "b": recal_cfg.get("b"),
-                    "n_fit": recal_cfg.get("n_fit"),
+                    "a": _rc.get("a"),
+                    "b": _rc.get("b"),
+                    "n_fit": _rc.get("n_fit"),
                     "raw_prob": round(raw_over_rate * 100, 2),
                 }
 
