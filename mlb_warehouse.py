@@ -1399,6 +1399,15 @@ def _game_log(table, stat_cols, athlete_id, season=None, as_of_date=None,
     ``as_of_date`` for a LEAKAGE-SAFE slice: only games whose ``official_date`` is
     STRICTLY BEFORE it (excludes the game being predicted). Dual-run — nothing
     app-facing consumes this until P4. Fail-open → []."""
+    # Live bulk-prime fast path: when the app has primed the season's bulk maps
+    # (2 season reads via set_bulk_history), serve this player from memory instead
+    # of a per-player round-trip — the whole point of the prime. Checked BEFORE
+    # enabled() so a primed cache serves without needing a live connection. Not
+    # primed → None, so we fall through to the per-player SQL below (offline callers,
+    # unaffected).
+    bulk = _bulk_game_log(table, athlete_id, season, as_of_date, limit)
+    if bulk is not None:
+        return bulk
     if not enabled():
         return []
     g = mlb_game
@@ -2340,6 +2349,81 @@ def _game_log_bulk(table, stat_cols, season, exclude_game_types=None):
         for c in stat_cols:
             rec[c] = m[c]
         out.setdefault(str(m["athlete_id"]), []).append(rec)
+    return out
+
+
+# ── live bulk-prime: collapse the per-player _game_log storm into 2 season reads ─
+# The live Value Finder analyzes a whole slate at once → without this it issues one
+# _game_log SELECT per (player, prop) (~240 on an 8-game slate) against 20-DTU Azure,
+# which times out phones (Doug's report). When the app primes the season's bulk maps
+# (2 season-level queries via _game_log_bulk, cached by the app), _game_log serves
+# each player from memory. Offline callers never prime, so they're unaffected. Keyed
+# by (table-role, season); a missing / empty prime → fall through to per-player SQL.
+_BULK_HIST_LOCK = threading.Lock()
+_BULK_HIST = {}                  # season(int) -> {"batter": {aid: [rec]}, "pitcher": …}
+
+
+def _role_for_table(table):
+    if table is mlb_batter_game:
+        return "batter"
+    if table is mlb_pitcher_game:
+        return "pitcher"
+    return None
+
+
+def bulk_history_maps(season):
+    """{'batter': {aid: [rec,…]}, 'pitcher': {…}} for a whole season in TWO queries
+    (one per table) via _game_log_bulk — same row shape as _game_log. The live app
+    caches this (st.cache_data) and hands it to set_bulk_history so _game_log serves
+    per-player from memory. Pure read; {} on SQL off / no season."""
+    if not enabled() or season is None:
+        return {}
+    return {
+        "batter": _game_log_bulk(mlb_batter_game, _BATTER_GAME_STATS, season,
+                                 exclude_game_types=_NON_REGULAR_GAME_TYPES),
+        "pitcher": _game_log_bulk(mlb_pitcher_game, _PITCHER_GAME_STATS, season,
+                                  exclude_game_types=_NON_REGULAR_GAME_TYPES),
+    }
+
+
+def set_bulk_history(season, maps):
+    """Prime the in-memory bulk maps for a season (from the app's cached fetch)."""
+    if not maps:
+        return
+    with _BULK_HIST_LOCK:
+        _BULK_HIST[int(season)] = maps
+
+
+def clear_bulk_history():
+    with _BULK_HIST_LOCK:
+        _BULK_HIST.clear()
+
+
+def _bulk_game_log(table, athlete_id, season, as_of_date, limit):
+    """Serve _game_log from the primed bulk maps, or None if not primed for this
+    (role, season). Replicates _game_log's filter/sort/limit in Python: the bulk
+    fetch already scoped the season + excluded non-regular game types, so here we
+    only filter by athlete, apply the strict as-of slice, sort most-recent-first
+    (game_date desc, game_pk desc), and limit."""
+    role = _role_for_table(table)
+    if role is None or season is None:
+        return None
+    with _BULK_HIST_LOCK:
+        maps = _BULK_HIST.get(int(season))
+    role_map = (maps or {}).get(role)
+    if not role_map:                      # not primed / empty (e.g. failed/early) → SQL
+        return None
+    rows = role_map.get(str(athlete_id))
+    if rows is None:
+        return []                          # primed season, athlete has no rows → empty
+    out = rows
+    if as_of_date is not None:
+        aod = str(as_of_date)
+        out = [r for r in out if str(r.get("official_date")) < aod]
+    out = sorted(out, key=lambda r: (str(r.get("game_date")), r.get("game_pk") or 0),
+                 reverse=True)
+    if limit:
+        out = out[:int(limit)]
     return out
 
 

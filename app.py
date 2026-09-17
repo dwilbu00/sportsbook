@@ -901,6 +901,30 @@ def _cached_calibration_blobs(sport_keys):
     return blobs
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlb_bulk_history_maps(season, day):
+    """Cached whole-season MLB gamelog maps (2 Azure reads) so a slate analysis
+    serves every player's history from memory instead of ~240 per-player round-trips
+    on 20-DTU Azure (the phone-timeout fix). `day` busts the cache daily; the 10-min
+    TTL folds in games that finish mid-slate. {} on SQL off → per-player fallback."""
+    try:
+        import mlb_warehouse
+        return mlb_warehouse.bulk_history_maps(season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlb_bulk_batter_rates(season, day):
+    """Cached whole-season batter xBA/statcast rates (1 Azure read) so batter_hits
+    projections don't issue one SELECT per batter. {} on SQL off → per-player SQL."""
+    try:
+        import statcast_asof
+        return statcast_asof.bulk_rates(season, "bat", split="all")
+    except Exception:
+        return {}
+
+
 def _served_method_label(cfg):
     """Display label for a prop's SERVED calibration method. A prop can carry a base
     `method` PLUS a per-line-bucket `line_methods` override (e.g. batter_hits ships
@@ -3455,6 +3479,25 @@ if analyze_clicked and selected_game_labels:
                 import mlb_starters
                 import mlb_warehouse
                 mlb_starters.warm_player_index(mlb_warehouse._current_season())
+            except Exception:
+                pass
+            # Bulk-prime the whole season's gamelogs + batter rates ONCE (3 cached
+            # Azure reads) so Phase-2/3 serve every player from memory instead of
+            # ~320 per-player round-trips on 20-DTU Azure — the fix for MLB analysis
+            # timing out phones. Gated on the warehouse-history flag (else history
+            # comes from ESPN HTTP, not these tables); fail-open to per-player SQL.
+            try:
+                import espn_client
+                import statcast_asof
+                import db_store
+                if espn_client._mlb_warehouse_hist_enabled() and db_store.enabled():
+                    _season = mlb_warehouse._current_season()
+                    _day = datetime.now().strftime("%Y-%m-%d")
+                    mlb_warehouse.set_bulk_history(
+                        _season, _mlb_bulk_history_maps(_season, _day))
+                    statcast_asof.set_bulk_rates(
+                        _season, "bat",
+                        _mlb_bulk_batter_rates(_season, _day), split="all")
             except Exception:
                 pass
 

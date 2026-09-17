@@ -80,12 +80,74 @@ def create_all():
     _META.create_all(db_store.get_engine())
 
 
+# ── live bulk-prime: one (season, role) read instead of one SELECT per batter ────
+# The live MLB Value Finder blends xBA into every batter_hits projection → without
+# this it issues one get_rates SELECT per batter (~80-100/slate) against 20-DTU
+# Azure. The table is tiny (one row per player/season), so the app primes the whole
+# (season, split, role) partition in ONE query and get_rates serves from memory.
+# Offline callers never prime → unaffected. Keyed (season, split, role); missing →
+# fall through to the per-player SQL below.
+_BULK_RATES_LOCK = threading.Lock()
+_BULK_RATES = {}                 # (season, split, role) -> {player_id: rates-dict}
+
+_RATE_COLS = ("xba", "xwoba", "n_ab", "n_bbe", "whiff_pct", "csw_pct",
+              "hard_hit_pct", "barrel_pct", "n_pitches", "n_bip")
+
+
+def bulk_rates(season, role, split="all"):
+    """{player_id: rates-dict} for a whole (season, split, role) partition in ONE
+    query. The live app caches this + primes set_bulk_rates so get_rates serves from
+    memory. {} on SQL off / error."""
+    if not enabled() or season is None:
+        return {}
+    try:
+        engine = db_store.get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(statcast_player_asof.c.player_id,
+                       *[statcast_player_asof.c[c] for c in _RATE_COLS])
+                .where((statcast_player_asof.c.season_bucket == int(season))
+                       & (statcast_player_asof.c.split == split)
+                       & (statcast_player_asof.c.role == role))
+            ).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    return {str(r[0]): dict(zip(_RATE_COLS, r[1:])) for r in rows}
+
+
+def set_bulk_rates(season, role, mapping, split="all"):
+    """Prime the in-memory bulk rates for a (season, split, role) partition."""
+    if mapping is None or season is None:
+        return
+    with _BULK_RATES_LOCK:
+        _BULK_RATES[(int(season), split, role)] = mapping
+
+
+def clear_bulk_rates():
+    with _BULK_RATES_LOCK:
+        _BULK_RATES.clear()
+
+
 # ── live read ──────────────────────────────────────────────────────────────
 def get_rates(player_id, season, role, split="all"):
     """Full as-of rate row (dict) for a player, or None. Fails open on anything
     (SQL off / no row / error). Keys: xba, xwoba, n_ab, n_bbe, whiff_pct, csw_pct,
     hard_hit_pct, barrel_pct, n_pitches, n_bip."""
-    if player_id is None or not enabled():
+    if player_id is None:
+        return None
+    # Bulk-prime fast path: whole partition preloaded → serve from memory (a miss
+    # is a real None, same as no row). Checked BEFORE enabled() so a primed cache
+    # serves without needing a live connection.
+    try:
+        _key = (int(season), split, role)
+    except (TypeError, ValueError):
+        _key = None
+    if _key is not None:
+        with _BULK_RATES_LOCK:
+            primed = _BULK_RATES.get(_key)
+        if primed is not None:
+            return primed.get(str(player_id))
+    if not enabled():
         return None
     cols = ("xba", "xwoba", "n_ab", "n_bbe", "whiff_pct", "csw_pct",
             "hard_hit_pct", "barrel_pct", "n_pitches", "n_bip")
