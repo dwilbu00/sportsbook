@@ -3861,7 +3861,7 @@ def _cc_report_lens(title, rowset, pkey, min_cell_n):
             _cc_reliability(f"line {lb}", sub, pkey, min_cell_n)
 
 
-def _cc_load_scored_rows(sport, store_label=""):
+def _cc_load_scored_rows(sport, store_label="", prop="batter_hits"):
     """Shared chronological loader for --reliability and --recalibrate.
 
     Harvests real book lines, joins to actuals, builds one leaner obs per row
@@ -3869,22 +3869,27 @@ def _cc_load_scored_rows(sport, store_label=""):
     no distributional/xBA machinery, so no AB-gate row loss -> maximal N), drops
     pushes, sorts chronologically, and stamps the binary outcome.
 
+    ``prop`` selects which prop to reconstruct (default batter_hits; e.g.
+    pitcher_strikeouts). The method-A/C raw-prob reconstruction (_rc_run_bucket) is
+    prop-agnostic; the method-D xBA path only activates when the prop actually ships
+    D (batter_hits), so a base-method prop just uses project_and_empirical.
+
     Prints the harvest/join diagnostics. Returns (sport_key, cfg, rows) where each
     row carries game_date / line / actual / projected / empirical_over / mkt_over /
     over_dec / under_dec / o. Returns rows=None (after printing the reason) on any
-    hard miss; cfg=None if there is no batter_hits calibration."""
+    hard miss; cfg=None if there is no calibration for ``prop``."""
     import book_line_calibration as blc
     from odds_client import (american_to_implied_prob, devig_two_way,
                              american_to_decimal)
 
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     existing = load_calibration(sport_key)
-    cfg = (existing or {}).get("batter_hits")
+    cfg = (existing or {}).get(prop)
     if not cfg:
-        print("No batter_hits calibration to compare against; run refit first.")
+        print(f"No {prop} calibration to compare against; run refit first.")
         return sport_key, None, None
     book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
-        sport_key, ["batter_hits"], store_label)
+        sport_key, [prop], store_label)
     print(f"  {len(book_lines)} book lines ({n_store} backfill store + {n_pred} "
           f"prediction log)")
     if not book_lines:
@@ -3892,9 +3897,9 @@ def _cc_load_scored_rows(sport, store_label=""):
         return sport_key, cfg, None
     enriched = [o for o in blc.join_book_lines_to_actuals(
         book_lines, espn_sport, espn_league)
-        if o.get("prop_key") == "batter_hits"]
+        if o.get("prop_key") == prop]
     if not enriched:
-        print("  No batter_hits observations joined to actuals.")
+        print(f"  No {prop} observations joined to actuals.")
         return sport_key, cfg, None
 
     # Weight-side opp-defense lookup only if the shipped variant uses it. PER SEASON
@@ -4380,16 +4385,19 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
     return {"method": method, "winner": win_lbl}
 
 
-def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False):
+def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
+                           prop="batter_hits"):
     """Fit a post-hoc recalibration map (Platt shrinkage + isotonic) on the
-    SHIPPED per-line-bucket batter_hits probability, evaluate it OUT-OF-SAMPLE,
+    SHIPPED per-line-bucket probability of ``prop``, evaluate it OUT-OF-SAMPLE,
     and show the reliability curve flatten and the fake edges collapse.
 
     With ``save`` (--save-recal): for every method-group whose OOS winner is
-    ISOTONIC, re-fit the map on ALL obs and STAGE it into the matching batter_hits
+    ISOTONIC, re-fit the map on ALL obs and STAGE it into the matching
     line_methods bucket(s) as ``recal_iso`` (candidate; live untouched). Serving
     applies it as the single calibration slot (props._apply_final_recalibration),
-    taking precedence over Platt. Default (no save) = diagnostic only, NO WRITE.
+    taking precedence over Platt. A base-method prop (no line_methods, e.g.
+    pitcher_strikeouts) is MEASURE-ONLY for now — the number is reported but staging
+    for base-method props is not yet wired. Default (no save) = diagnostic only.
 
     The raw probability reconstructs exactly what production emits per line bucket
     (method A: as-of empirical over-rate; method C: residual-ECDF tail on an older
@@ -4399,8 +4407,8 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False):
     import book_line_calibration as blc
 
     print(f"\n=== Recalibration (Platt shrinkage + isotonic): "
-          f"{SPORT_MAP[sport][2]} batter_hits ===")
-    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label)
+          f"{SPORT_MAP[sport][2]} {prop} ===")
+    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label, prop=prop)
     if not cfg or rows is None:
         return
     if len(rows) < 120:
@@ -4434,6 +4442,11 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False):
               "STAGE the winning isotonic map(s) into the candidate.)")
         return
 
+    if iso_by_method and not line_methods:
+        print(f"\n  (--save-recal: {prop} is a BASE-method prop (no line_methods); "
+              f"staging for base-method props is not yet wired — measure-only. The "
+              f"OOS winner(s) above show the gain; wiring the stage is the next step.)")
+        return
     if not iso_by_method or not line_methods:
         print("\n  (--save-recal: no isotonic winner to stage — nothing written.)")
         return
@@ -4446,10 +4459,10 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False):
                                "ky": [round(y, 6) for y in mp["ky"]]}
             staged.append(f"{bk.get('max_line')}:{bk.get('method')}({mp.get('n')})")
     cfg["line_methods"] = line_methods
-    save_calibration(sport_key, {"batter_hits": cfg},
-                     meta={"batter_hits_recal_iso": f"diagnose_recalibration --save-recal "
+    save_calibration(sport_key, {prop: cfg},
+                     meta={f"{prop}_recal_iso": f"diagnose_recalibration --save-recal "
                            f"[{', '.join(staged)}]"}, merge_props=True)
-    print(f"\n  [save] staged isotonic recal into batter_hits buckets: "
+    print(f"\n  [save] staged isotonic recal into {prop} buckets: "
           f"{', '.join(staged)}  (candidate — review --diff, then --promote)")
 
 
@@ -4698,14 +4711,18 @@ def main():
                         "[THIN].")
     p.add_argument("--recalibrate", action="store_true",
                    help="Fit a post-hoc recalibration map (Platt shrinkage + "
-                        "isotonic) on the SHIPPED per-line-bucket batter_hits "
-                        "probability and show, OUT-OF-SAMPLE, the reliability curve "
+                        "isotonic) on the SHIPPED per-line-bucket probability of "
+                        "--recal-prop and show, OUT-OF-SAMPLE, the reliability curve "
                         "flatten and the fake edges collapse (no write).")
+    p.add_argument("--recal-prop", default="batter_hits",
+                   help="Prop to recalibrate with --recalibrate (default batter_hits). "
+                        "e.g. pitcher_strikeouts (method C, over-confident).")
     p.add_argument("--save-recal", action="store_true",
                    help="With --recalibrate: STAGE the winning ISOTONIC map(s) into "
-                        "the matching batter_hits line_methods bucket(s) as recal_iso "
-                        "(candidate; review --diff, then --promote). Serving applies "
-                        "it as the single calibration slot, precedence over Platt.")
+                        "the matching line_methods bucket(s) as recal_iso (candidate; "
+                        "review --diff, then --promote). Serving applies it as the "
+                        "single calibration slot, precedence over Platt. (Base-method "
+                        "props with no line_methods are measure-only for now.)")
     # ── candidate-file staging (default-safe calibration writes) ──
     # A refit writes to calibration/<sport>.candidate.json, NEVER the live file
     # the app serves — so an accidental/experimental run can't clobber a carefully
@@ -4878,7 +4895,8 @@ def main():
             _, _, _sk = SPORT_MAP[args.sport]
             set_candidate_mode(not args.live)
         diagnose_recalibration(args.sport, store_label=args.store_label,
-                               min_cell_n=args.min_cell_n, save=args.save_recal)
+                               min_cell_n=args.min_cell_n, save=args.save_recal,
+                               prop=args.recal_prop)
         if args.save_recal:
             _report_staging(args.sport, not args.live, wrote=True)
         return
