@@ -26,20 +26,12 @@ USAGE
 """
 import argparse
 import datetime
-import json
-import os
 
 import coherence
 from odds_client import american_to_decimal, american_to_implied_prob
 from r2_sharp import fair_two_way
 
 DEFAULT_OFFSET_SEASONS = ["2024", "2025", "2026"]
-
-# Committed freeze of the calibration offset so the live app serves it WITHOUT a
-# 3-season Azure read (the offset is a mean over thousands of triads → drifts
-# negligibly day to day; refresh weekly / when a season completes). Mirrors
-# calibration/mlb_sgp_correlations.json.
-FROZEN_OFFSET_PATH = "calibration/coherence_offset.json"
 
 # App-integration defaults (mirror the CLI): the validated coherence run-line was
 # fit Poisson (dispersion 0), and forward-flagged at a 3% EV floor / 2% vig haircut.
@@ -124,66 +116,56 @@ def _fav_band_ok(ml_home_fair, fav_min, fav_max):
     return fav_min <= fav_imp < fav_max
 
 
+def _triad_offset_stats(triads, dispersion=0.0):
+    """(Σ(implied_home_cover − rl_fair), count) over triads that have all three fair
+    prices + a computable implied cover — the SUFFICIENT STATISTICS for the offset
+    mean. Shared by compute_offset (full) and the incremental refresh so the two can
+    never drift (see coherence_offset_store)."""
+    s, n = 0.0, 0
+    for t in triads:
+        mlf, _ = fair_two_way(t.ml_home, t.ml_away)
+        ovf, _ = fair_two_way(t.total_over, t.total_under)
+        rlf, _ = fair_two_way(t.rl_home, t.rl_away)
+        if None in (mlf, ovf, rlf):
+            continue
+        impl = coherence.implied_home_cover(mlf, t.total_line, ovf,
+                                            t.rl_home_point, dispersion)
+        if impl is not None:
+            s += impl - rlf
+            n += 1
+    return s, n
+
+
+def _max_game_date(triads):
+    """Latest game_date (YYYY-MM-DD) among triads, or None — the incremental
+    watermark."""
+    dates = [str(t.game_date)[:10] for t in triads if t.game_date]
+    return max(dates) if dates else None
+
+
 def compute_offset(sport, seasons, dispersion=0.0):
     """Calibration offset = mean (implied - DK RL fair) over completed-season triads
-    (the stable Poisson-shape bias). Fit on history, applied forward — no leakage."""
+    (the stable Poisson-shape bias). Fit on history, applied forward — no leakage.
+    Returns (offset, n_triads)."""
+    s, n, _ = compute_offset_stats(sport, seasons, dispersion)
+    return ((s / n) if n else 0.0), n
+
+
+def compute_offset_stats(sport, seasons, dispersion=0.0):
+    """Sufficient statistics (sum, n, through_date) for the offset over full seasons —
+    the baseline the incremental refresh extends. offset = sum / n; through_date is
+    the latest game_date seen (the incremental watermark)."""
     import r2_data
     triads_by_season, _ = r2_data.load_team_triad(sport, seasons)
-    vals = []
+    total_s, total_n, through = 0.0, 0, None
     for triads in triads_by_season.values():
-        for t in triads:
-            mlf, _ = fair_two_way(t.ml_home, t.ml_away)
-            ovf, _ = fair_two_way(t.total_over, t.total_under)
-            rlf, _ = fair_two_way(t.rl_home, t.rl_away)
-            if None in (mlf, ovf, rlf):
-                continue
-            impl = coherence.implied_home_cover(mlf, t.total_line, ovf,
-                                                t.rl_home_point, dispersion)
-            if impl is not None:
-                vals.append(impl - rlf)
-    return (sum(vals) / len(vals)) if vals else 0.0, len(vals)
-
-
-def freeze_offset(sport, seasons, dispersion=0.0, path=FROZEN_OFFSET_PATH):
-    """Compute the calibration offset ONCE (the 3-season Azure read) and write it to
-    the committed JSON so the live app serves it with no DB touch. Merges into any
-    existing file (one entry per sport). Returns (offset, n_triads)."""
-    offset, n = compute_offset(sport, seasons, dispersion)
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                data = json.load(f) or {}
-        except (OSError, ValueError):
-            data = {}
-    data[sport] = {
-        "offset": offset, "n_triads": n, "seasons": list(seasons),
-        "dispersion": dispersion,
-        "fit_at": datetime.datetime.now().isoformat(timespec="seconds"),
-    }
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    return offset, n
-
-
-def load_frozen_offset(sport, path=FROZEN_OFFSET_PATH):
-    """(offset, n_triads) from the committed freeze for ``sport``, or None when the
-    file / sport entry is absent (→ caller falls back to the live compute). A stored
-    n_triads == 0 is a genuine 'nothing to fit' → the caller skips coherence rather
-    than betting an uncalibrated 0.0 offset."""
-    try:
-        with open(path) as f:
-            data = json.load(f) or {}
-    except (OSError, ValueError):
-        return None
-    entry = data.get(sport)
-    if not isinstance(entry, dict) or "offset" not in entry:
-        return None
-    try:
-        return float(entry["offset"]), int(entry.get("n_triads") or 0)
-    except (TypeError, ValueError):
-        return None
+        ds, dn = _triad_offset_stats(triads, dispersion)
+        total_s += ds
+        total_n += dn
+        md = _max_game_date(triads)
+        if md and (through is None or md > through):
+            through = md
+    return total_s, total_n, through
 
 
 def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03,
@@ -436,9 +418,10 @@ def main():
     ap.add_argument("--date", default=None,
                     help="YYYY-MM-DD (default: today). Ignored with --live.")
     ap.add_argument("--freeze-offset", action="store_true",
-                    help="Compute the calibration offset from the warehouse and write "
-                         "it to calibration/coherence_offset.json (commit it; the live "
-                         "app then serves the offset with NO Azure read), then exit.")
+                    help="(Re)seed the durable coherence-offset baseline in Azure "
+                         "(app_settings) from a full-season warehouse read, then exit. "
+                         "Optional — the live app auto-bootstraps + self-maintains it "
+                         "incrementally; use this to pre-seed or re-baseline.")
     ap.add_argument("--offset-seasons", default=",".join(DEFAULT_OFFSET_SEASONS),
                     help="Completed seasons to fit the calibration offset on.")
     ap.add_argument("--dispersion", type=float, default=0.0)
@@ -466,9 +449,11 @@ def main():
     date = args.date or datetime.date.today().isoformat()
     offset_seasons = [s.strip() for s in args.offset_seasons.split(",") if s.strip()]
     if args.freeze_offset:
-        off, n = freeze_offset(args.sport, offset_seasons, args.dispersion)
-        print(f"  froze coherence offset for {args.sport}: {off:+.4f} "
-              f"from {n:,} triads -> {FROZEN_OFFSET_PATH}")
+        import coherence_offset_store
+        off, n, through = coherence_offset_store.seed_stats(
+            args.sport, offset_seasons, args.dispersion)
+        print(f"  seeded coherence offset for {args.sport}: {off:+.4f} "
+              f"from {n:,} triads through {through} -> app_settings (Azure)")
         return
     offset, n_off = compute_offset(args.sport, offset_seasons, args.dispersion)
     if args.live:

@@ -297,43 +297,43 @@ class TriadsFromUpcomingTests(unittest.TestCase):
         self.assertTrue(flags)
 
 
-class FrozenOffsetTests(unittest.TestCase):
-    """freeze_offset/load_frozen_offset: the committed-JSON path that lets the live
-    app serve the calibration offset with no Azure read."""
+class OffsetStatsTests(unittest.TestCase):
+    """compute_offset_stats / _triad_offset_stats — the sufficient statistics
+    (sum, n, watermark) the durable incremental offset is built from."""
 
-    def _path(self):
-        import os
-        import tempfile
-        return os.path.join(tempfile.mkdtemp(), "coherence_offset.json")
+    def test_stats_are_sufficient_for_the_mean(self):
+        # compute_offset must equal sum/n from compute_offset_stats, and the
+        # watermark = the latest game_date across seasons.
+        by_season = {
+            "2025": [_triad(), _triad()],
+            "2026": [_triad()],
+        }
+        # date the triads so the watermark is deterministic.
+        by_season["2025"][0] = by_season["2025"][0]._replace(game_date="2025-09-01")
+        by_season["2025"][1] = by_season["2025"][1]._replace(game_date="2025-09-15")
+        by_season["2026"][0] = by_season["2026"][0]._replace(game_date="2026-08-20")
+        with mock.patch("r2_data.load_team_triad", return_value=(by_season, {})):
+            s, n, through = cf.compute_offset_stats("baseball_mlb", ["2025", "2026"])
+            off, n2 = cf.compute_offset("baseball_mlb", ["2025", "2026"])
+        self.assertEqual(n, 3)                       # all three triads includable
+        self.assertEqual(n2, n)
+        self.assertAlmostEqual(off, s / n)
+        self.assertEqual(through, "2026-08-20")      # latest game_date
 
-    def test_missing_file_returns_none(self):
-        self.assertIsNone(cf.load_frozen_offset("baseball_mlb", self._path()))
+    def test_incomplete_triad_excluded_from_count(self):
+        # A triad missing a price can't be de-vigged → dropped from (sum, n), so the
+        # incremental fold and the full compute agree on inclusion.
+        good = _triad()
+        bad = _triad(ml_home=None)                   # no fair ML → excluded
+        s, n = cf._triad_offset_stats([good, bad])
+        self.assertEqual(n, 1)
+        s1, n1 = cf._triad_offset_stats([good])
+        self.assertEqual((s, n), (s1, n1))
 
-    def test_freeze_then_load_roundtrip(self):
-        p = self._path()
-        with mock.patch.object(cf, "compute_offset", return_value=(0.1234, 5000)):
-            off, n = cf.freeze_offset("baseball_mlb", ["2024", "2025", "2026"], path=p)
-        self.assertEqual((off, n), (0.1234, 5000))
-        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.1234, 5000))
-        # A sport not in the file → None (caller falls back to the live compute).
-        self.assertIsNone(cf.load_frozen_offset("basketball_nba", p))
-
-    def test_freeze_merges_and_preserves_other_sports(self):
-        p = self._path()
-        with mock.patch.object(cf, "compute_offset", return_value=(0.10, 4000)):
-            cf.freeze_offset("baseball_mlb", ["2026"], path=p)
-        with mock.patch.object(cf, "compute_offset", return_value=(-0.02, 3000)):
-            cf.freeze_offset("americanfootball_nfl", ["2025"], path=p)
-        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.10, 4000))
-        self.assertEqual(cf.load_frozen_offset("americanfootball_nfl", p), (-0.02, 3000))
-
-    def test_unfit_zero_triads_preserved(self):
-        # n_triads == 0 must survive the round-trip so the caller skips coherence
-        # rather than betting an uncalibrated 0.0 offset.
-        p = self._path()
-        with mock.patch.object(cf, "compute_offset", return_value=(0.0, 0)):
-            cf.freeze_offset("baseball_mlb", ["2027"], path=p)
-        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.0, 0))
+    def test_empty_is_zero_offset(self):
+        s, n, through = cf.compute_offset_stats("baseball_mlb", [])
+        self.assertEqual((s, n, through), (0.0, 0, None))
+        self.assertEqual(cf.compute_offset("baseball_mlb", []), (0.0, 0))
 
 
 if __name__ == "__main__":

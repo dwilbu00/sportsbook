@@ -431,6 +431,21 @@ def load_team_triad(sport, seasons, bookmaker="draftkings", snapshot_source=None
     return by_season, stats_by
 
 
+def load_team_triad_range(sport, date_from, date_to, bookmaker="draftkings",
+                          snapshot_source=None):
+    """Close-snapshot team triads for a DATE RANGE (inclusive game_date), one book —
+    the same read + selection as load_team_triad but scoped to [date_from, date_to]
+    instead of whole seasons. This is the cheap INCREMENTAL read for coherence-offset
+    maintenance (only games since the last watermark). Returns (triads, stats)."""
+    import db_store
+    db_store.promote_secrets_from_toml()
+    rows = _read_team_market_lines(
+        sport, date_from=date_from, date_to=date_to, bookmaker=bookmaker,
+        snapshot_source=snapshot_source)
+    rows = [dict(r, book=bookmaker) for r in rows if r.get("kind") == "team"]
+    return select_team_triad(rows)
+
+
 # ── First-five (F5) moneyline legs for the F5 sharp-vs-soft edge ───────────────
 # Pinnacle books NO F5 moneyline but books its F5 "spread" uniformly at 0.0 — a
 # pick'em, which IS the moneyline (home covers 0.0 iff it wins outright; a tie is a

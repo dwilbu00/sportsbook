@@ -953,25 +953,29 @@ def _mlb_bulk_team_games(season, day):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _mlb_coherence_offset(sport_key, day):
-    """Coherence run-line calibration offset. PREFERS the committed freeze
-    (calibration/coherence_offset.json) so the live app pays NO Azure read — the
-    offset is a mean over thousands of triads and drifts negligibly day to day, so a
-    weekly/seasonal refresh (coherence_flags.py --freeze-offset) is plenty. Only when
-    the freeze is absent does it fall back to the LIVE compute_offset, which reads 3
-    FULL seasons of DK team triads (r2_data.load_team_triad → 3 season-wide Azure
-    SELECTs) — the exact read that stalled a team-market slate at "Loading team data…"
-    on cold 20-DTU Azure. The @st.cache_data still caps the fallback at one read/day.
+    """Coherence run-line calibration offset — served from the DURABLE, self-
+    maintaining store (coherence_offset_store): a mean whose sufficient statistics
+    live in Azure app_settings and are extended each day by reading ONLY the triads
+    since the stored watermark (tiny), never the full 3 seasons that stalled a team-
+    market slate at "Loading team data…". First-ever call bootstraps once from a full
+    read, then writes the watermark back so every later read is small. @st.cache_data
+    caps it at one touch/day/process. On a store failure, falls back to the live full
+    compute (also cached daily) so coherence still works.
 
     Returns the float offset, or None when it can't be fit (no triads) — caller skips
     coherence entirely rather than forward-log UNCALIBRATED flags off a raw 0.0."""
     try:
+        import coherence_offset_store as _cos
+        res = _cos.current_offset(sport_key, today=day)
+        if res is not None:
+            offset, n_triads = res
+            return offset if n_triads else None
+    except Exception:
+        pass
+    try:                                            # store down → live full compute
         import coherence_flags as _coh
-        frozen = _coh.load_frozen_offset(sport_key)
-        if frozen is not None:                      # committed freeze → no Azure read
-            offset, n_triads = frozen
-        else:                                       # no freeze → live 3-season read
-            offset, n_triads = _coh.compute_offset(
-                sport_key, _coh.DEFAULT_OFFSET_SEASONS)
+        offset, n_triads = _coh.compute_offset(
+            sport_key, _coh.DEFAULT_OFFSET_SEASONS)
         return offset if n_triads else None
     except Exception:
         return None
