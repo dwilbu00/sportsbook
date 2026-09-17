@@ -925,6 +925,26 @@ def _mlb_bulk_batter_rates(season, day):
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mlb_coherence_offset(sport_key, day):
+    """Cached coherence run-line calibration offset. compute_offset reads 3 FULL
+    seasons of DK team triads (r2_data.load_team_triad → 3 season-wide Azure SELECTs)
+    — on cold 20-DTU Azure that's what stalled a team-market slate at "Loading team
+    data…". The offset is a stable historical constant, so cache it PROCESS-GLOBALLY
+    (not just per-session): the first slate of the day pays once and every later
+    session/reconnect (a phone screen-off drops the websocket → new session) gets it
+    free. `day` busts daily; 1h TTL folds in today's completed games.
+
+    Returns the float offset, or None when it can't be fit (no triads) — caller skips
+    coherence entirely rather than forward-log UNCALIBRATED flags off a raw 0.0."""
+    try:
+        import coherence_flags as _coh
+        offset, n_triads = _coh.compute_offset(sport_key, _coh.DEFAULT_OFFSET_SEASONS)
+        return offset if n_triads else None
+    except Exception:
+        return None
+
+
 def _served_method_label(cfg):
     """Display label for a prop's SERVED calibration method. A prop can carry a base
     `method` PLUS a per-line-bucket `line_methods` override (e.g. batter_hits ships
@@ -3327,24 +3347,12 @@ if analyze_clicked and selected_game_labels:
     # ran unconditionally for MLB and, on a cold serverless Azure DB, is what stalled a
     # props-only analysis at "Loading team data…". Team-market slates still fit it (cached/slate).
     if sport["key"] == "baseball_mlb" and markets_str:
-        _coh_cache = st.session_state.get("_coherence_offset_cache") or {}
-        if sport["key"] in _coh_cache:
-            coherence_offset = _coh_cache[sport["key"]]
-        else:
-            try:
-                import coherence_flags as _coh
-                coherence_offset, _n_triads = _coh.compute_offset(
-                    sport["key"], _coh.DEFAULT_OFFSET_SEASONS)
-                # compute_offset returns (0.0, 0) — not None, no raise — when NO
-                # historical triads were available to fit. Treat that as unfit (skip
-                # coherence) so we never run/forward-log UNCALIBRATED flags off a raw
-                # 0.0 offset; a genuine ~0.0 fit from real triads keeps a nonzero count.
-                if not _n_triads:
-                    coherence_offset = None
-                _coh_cache[sport["key"]] = coherence_offset
-                st.session_state["_coherence_offset_cache"] = _coh_cache
-            except Exception:
-                coherence_offset = None
+        # Process-global cache (see _mlb_coherence_offset): the 3-season triad read is
+        # the same for every session that day, so pay it once — not per session (a
+        # phone screen-off reconnect = new session). Returns None when unfit → skip
+        # coherence (never forward-log UNCALIBRATED flags off a raw 0.0 offset).
+        coherence_offset = _mlb_coherence_offset(
+            sport["key"], datetime.now().strftime("%Y-%m-%d"))
 
     progress.progress(10, text="Getting game odds...")
 
