@@ -953,19 +953,25 @@ def _mlb_bulk_team_games(season, day):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _mlb_coherence_offset(sport_key, day):
-    """Cached coherence run-line calibration offset. compute_offset reads 3 FULL
-    seasons of DK team triads (r2_data.load_team_triad → 3 season-wide Azure SELECTs)
-    — on cold 20-DTU Azure that's what stalled a team-market slate at "Loading team
-    data…". The offset is a stable historical constant, so cache it PROCESS-GLOBALLY
-    (not just per-session): the first slate of the day pays once and every later
-    session/reconnect (a phone screen-off drops the websocket → new session) gets it
-    free. `day` busts daily; 1h TTL folds in today's completed games.
+    """Coherence run-line calibration offset. PREFERS the committed freeze
+    (calibration/coherence_offset.json) so the live app pays NO Azure read — the
+    offset is a mean over thousands of triads and drifts negligibly day to day, so a
+    weekly/seasonal refresh (coherence_flags.py --freeze-offset) is plenty. Only when
+    the freeze is absent does it fall back to the LIVE compute_offset, which reads 3
+    FULL seasons of DK team triads (r2_data.load_team_triad → 3 season-wide Azure
+    SELECTs) — the exact read that stalled a team-market slate at "Loading team data…"
+    on cold 20-DTU Azure. The @st.cache_data still caps the fallback at one read/day.
 
     Returns the float offset, or None when it can't be fit (no triads) — caller skips
     coherence entirely rather than forward-log UNCALIBRATED flags off a raw 0.0."""
     try:
         import coherence_flags as _coh
-        offset, n_triads = _coh.compute_offset(sport_key, _coh.DEFAULT_OFFSET_SEASONS)
+        frozen = _coh.load_frozen_offset(sport_key)
+        if frozen is not None:                      # committed freeze → no Azure read
+            offset, n_triads = frozen
+        else:                                       # no freeze → live 3-season read
+            offset, n_triads = _coh.compute_offset(
+                sport_key, _coh.DEFAULT_OFFSET_SEASONS)
         return offset if n_triads else None
     except Exception:
         return None

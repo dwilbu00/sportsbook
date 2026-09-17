@@ -297,5 +297,44 @@ class TriadsFromUpcomingTests(unittest.TestCase):
         self.assertTrue(flags)
 
 
+class FrozenOffsetTests(unittest.TestCase):
+    """freeze_offset/load_frozen_offset: the committed-JSON path that lets the live
+    app serve the calibration offset with no Azure read."""
+
+    def _path(self):
+        import os
+        import tempfile
+        return os.path.join(tempfile.mkdtemp(), "coherence_offset.json")
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(cf.load_frozen_offset("baseball_mlb", self._path()))
+
+    def test_freeze_then_load_roundtrip(self):
+        p = self._path()
+        with mock.patch.object(cf, "compute_offset", return_value=(0.1234, 5000)):
+            off, n = cf.freeze_offset("baseball_mlb", ["2024", "2025", "2026"], path=p)
+        self.assertEqual((off, n), (0.1234, 5000))
+        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.1234, 5000))
+        # A sport not in the file → None (caller falls back to the live compute).
+        self.assertIsNone(cf.load_frozen_offset("basketball_nba", p))
+
+    def test_freeze_merges_and_preserves_other_sports(self):
+        p = self._path()
+        with mock.patch.object(cf, "compute_offset", return_value=(0.10, 4000)):
+            cf.freeze_offset("baseball_mlb", ["2026"], path=p)
+        with mock.patch.object(cf, "compute_offset", return_value=(-0.02, 3000)):
+            cf.freeze_offset("americanfootball_nfl", ["2025"], path=p)
+        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.10, 4000))
+        self.assertEqual(cf.load_frozen_offset("americanfootball_nfl", p), (-0.02, 3000))
+
+    def test_unfit_zero_triads_preserved(self):
+        # n_triads == 0 must survive the round-trip so the caller skips coherence
+        # rather than betting an uncalibrated 0.0 offset.
+        p = self._path()
+        with mock.patch.object(cf, "compute_offset", return_value=(0.0, 0)):
+            cf.freeze_offset("baseball_mlb", ["2027"], path=p)
+        self.assertEqual(cf.load_frozen_offset("baseball_mlb", p), (0.0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

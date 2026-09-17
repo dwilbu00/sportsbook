@@ -26,12 +26,20 @@ USAGE
 """
 import argparse
 import datetime
+import json
+import os
 
 import coherence
 from odds_client import american_to_decimal, american_to_implied_prob
 from r2_sharp import fair_two_way
 
 DEFAULT_OFFSET_SEASONS = ["2024", "2025", "2026"]
+
+# Committed freeze of the calibration offset so the live app serves it WITHOUT a
+# 3-season Azure read (the offset is a mean over thousands of triads → drifts
+# negligibly day to day; refresh weekly / when a season completes). Mirrors
+# calibration/mlb_sgp_correlations.json.
+FROZEN_OFFSET_PATH = "calibration/coherence_offset.json"
 
 # App-integration defaults (mirror the CLI): the validated coherence run-line was
 # fit Poisson (dispersion 0), and forward-flagged at a 3% EV floor / 2% vig haircut.
@@ -134,6 +142,48 @@ def compute_offset(sport, seasons, dispersion=0.0):
             if impl is not None:
                 vals.append(impl - rlf)
     return (sum(vals) / len(vals)) if vals else 0.0, len(vals)
+
+
+def freeze_offset(sport, seasons, dispersion=0.0, path=FROZEN_OFFSET_PATH):
+    """Compute the calibration offset ONCE (the 3-season Azure read) and write it to
+    the committed JSON so the live app serves it with no DB touch. Merges into any
+    existing file (one entry per sport). Returns (offset, n_triads)."""
+    offset, n = compute_offset(sport, seasons, dispersion)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError):
+            data = {}
+    data[sport] = {
+        "offset": offset, "n_triads": n, "seasons": list(seasons),
+        "dispersion": dispersion,
+        "fit_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return offset, n
+
+
+def load_frozen_offset(sport, path=FROZEN_OFFSET_PATH):
+    """(offset, n_triads) from the committed freeze for ``sport``, or None when the
+    file / sport entry is absent (→ caller falls back to the live compute). A stored
+    n_triads == 0 is a genuine 'nothing to fit' → the caller skips coherence rather
+    than betting an uncalibrated 0.0 offset."""
+    try:
+        with open(path) as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return None
+    entry = data.get(sport)
+    if not isinstance(entry, dict) or "offset" not in entry:
+        return None
+    try:
+        return float(entry["offset"]), int(entry.get("n_triads") or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def flag_games(triads, offset, dispersion=0.0, haircut=0.02, ev_floor=0.03,
@@ -385,6 +435,10 @@ def main():
                          "(~3 credits) instead of reading the warehouse.")
     ap.add_argument("--date", default=None,
                     help="YYYY-MM-DD (default: today). Ignored with --live.")
+    ap.add_argument("--freeze-offset", action="store_true",
+                    help="Compute the calibration offset from the warehouse and write "
+                         "it to calibration/coherence_offset.json (commit it; the live "
+                         "app then serves the offset with NO Azure read), then exit.")
     ap.add_argument("--offset-seasons", default=",".join(DEFAULT_OFFSET_SEASONS),
                     help="Completed seasons to fit the calibration offset on.")
     ap.add_argument("--dispersion", type=float, default=0.0)
@@ -411,6 +465,11 @@ def main():
 
     date = args.date or datetime.date.today().isoformat()
     offset_seasons = [s.strip() for s in args.offset_seasons.split(",") if s.strip()]
+    if args.freeze_offset:
+        off, n = freeze_offset(args.sport, offset_seasons, args.dispersion)
+        print(f"  froze coherence offset for {args.sport}: {off:+.4f} "
+              f"from {n:,} triads -> {FROZEN_OFFSET_PATH}")
+        return
     offset, n_off = compute_offset(args.sport, offset_seasons, args.dispersion)
     if args.live:
         triads, stats = load_triads_live(args.sport)
