@@ -1,0 +1,10 @@
+{
+  "rho_by_category": {
+    "team_batters": 0.1,
+    "opp_batters": -0.05,
+    "pitcher_own_bat": -0.05,
+    "pitcher_vs_opp_bat": -0.075,
+    "opp_pitchers": -0.15
+  },
+  "note": "MLB tetrachoric fit"
+}
