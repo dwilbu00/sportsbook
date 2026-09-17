@@ -4381,8 +4381,48 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
     if win_lbl == "platt":
         aa, bb = _rc_fit_platt([r["p_raw"] for r in all_rows],
                                [r["o"] for r in all_rows])
-        return {"method": method, "winner": "platt", "platt": {"a": aa, "b": bb}}
+        return {"method": method, "winner": "platt",
+                "platt": {"a": aa, "b": bb, "n": len(all_rows)}}
     return {"method": method, "winner": win_lbl}
+
+
+def _stage_base_recal(sport_key, prop, res_by_method):
+    """Stage a BASE-method prop's winning recal (no line_methods).
+
+    Platt winner -> merge {a, b, n_fit, validated} into the recalibration SEED
+    (recalibration_<sport>.json), which serving applies for a bare prop via
+    props._resolve_recal_cfg -> apply_platt. The seed is a committed file, so this
+    is reviewed with `git diff` + commit (NOT the calibration --diff/--promote
+    candidate). Isotonic winner -> not yet wired for base-method props (serving
+    reads recal_iso only from a line_methods bucket)."""
+    res = next(iter(res_by_method.values()), None)   # one group for a base-method prop
+    if not res or res.get("winner") == "raw":
+        print(f"\n  (--save-recal: {prop} winner is raw/none — nothing to stage.)")
+        return
+    if res.get("winner") == "isotonic":
+        print(f"\n  (--save-recal: {prop} winner is ISOTONIC on a base-method prop; "
+              f"serving reads recal_iso only from line_methods buckets, so base-method "
+              f"isotonic staging is not yet wired.)")
+        return
+    platt = res.get("platt") or {}
+    a, b = platt.get("a"), platt.get("b")
+    if a is None or b is None:
+        print(f"\n  (--save-recal: {prop} platt map incomplete — nothing staged.)")
+        return
+    import recalibration as rc
+    _, seed = rc._read_local_recal(sport_key)
+    props = dict(seed or {})
+    props[prop] = {"a": round(float(a), 6), "b": round(float(b), 6),
+                   "n_fit": int(platt.get("n") or 0), "validated": True,
+                   "source": "diagnose_recalibration --recal-prop"}
+    rc.save_recalibration(
+        sport_key, props,
+        meta={f"{prop}_recal": "diagnose_recalibration platt (base-method)"},
+        to_blob=False)
+    print(f"\n  [save] staged Platt recal for {prop} (a={a:.3f}, b={b:+.3f}, "
+          f"n={platt.get('n')}) into the recalibration seed "
+          f"calibration/recalibration_{sport_key}.json — review with `git diff`, "
+          f"then commit (this is a committed seed, not a --diff/--promote candidate).")
 
 
 def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
@@ -4427,27 +4467,31 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
     for r in rows:
         m = _rc_method_for_line(r["line"], line_methods, default_method)
         groups.setdefault(m, []).append(r)      # subset preserves chronology
-    iso_by_method = {}
+    res_by_method = {}
     for m in sorted(groups, key=lambda k: (k != "A", k)):  # dominant A first
         brows = groups[m]
         lines = sorted(set(r["line"] for r in brows))
         band = ("line 0.5" if lines == [0.5]
                 else f"lines {min(lines):g}-{max(lines):g}")
         res = _rc_run_bucket(band, m, brows, blc, min_cell_n)
-        if res and res.get("winner") == "isotonic":
-            iso_by_method[res["method"]] = res["iso"]
+        if res:
+            res_by_method[res["method"]] = res
+    iso_by_method = {m: r["iso"] for m, r in res_by_method.items()
+                     if r.get("winner") == "isotonic"}
 
     if not save:
         print("\n  (Diagnostic only — nothing written. Re-run with --save-recal to "
-              "STAGE the winning isotonic map(s) into the candidate.)")
+              "STAGE the winning map into the candidate/seed.)")
         return
 
-    if iso_by_method and not line_methods:
-        print(f"\n  (--save-recal: {prop} is a BASE-method prop (no line_methods); "
-              f"staging for base-method props is not yet wired — measure-only. The "
-              f"OOS winner(s) above show the gain; wiring the stage is the next step.)")
+    # Base-method prop (no line_methods, e.g. pitcher_strikeouts): stage the single
+    # method-group's winner. Platt -> the recalibration SEED (serving applies it via
+    # _resolve_recal_cfg); isotonic base-staging is not yet wired.
+    if not line_methods:
+        _stage_base_recal(sport_key, prop, res_by_method)
         return
-    if not iso_by_method or not line_methods:
+
+    if not iso_by_method:
         print("\n  (--save-recal: no isotonic winner to stage — nothing written.)")
         return
     # Attach each method-group's isotonic map to the matching line_methods bucket(s).
@@ -4718,11 +4762,11 @@ def main():
                    help="Prop to recalibrate with --recalibrate (default batter_hits). "
                         "e.g. pitcher_strikeouts (method C, over-confident).")
     p.add_argument("--save-recal", action="store_true",
-                   help="With --recalibrate: STAGE the winning ISOTONIC map(s) into "
-                        "the matching line_methods bucket(s) as recal_iso (candidate; "
-                        "review --diff, then --promote). Serving applies it as the "
-                        "single calibration slot, precedence over Platt. (Base-method "
-                        "props with no line_methods are measure-only for now.)")
+                   help="With --recalibrate: STAGE the winning map. line_methods props "
+                        "(batter_hits): winning ISOTONIC into the bucket(s) as recal_iso "
+                        "(calibration candidate; review --diff, then --promote). "
+                        "Base-method props (e.g. pitcher_strikeouts): winning PLATT into "
+                        "the recalibration SEED (review `git diff`, then commit).")
     # ── candidate-file staging (default-safe calibration writes) ──
     # A refit writes to calibration/<sport>.candidate.json, NEVER the live file
     # the app serves — so an accidental/experimental run can't clobber a carefully
