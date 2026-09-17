@@ -76,6 +76,12 @@ RECAL_LOAD_TTL_SECONDS = 300  # in-memory reuse before re-checking the recal sto
 
 _lock = threading.Lock()
 _last_auto_maintenance = {}  # sport_key -> attempt timestamp
+# Guards the check-and-set of the hourly gate + the in-flight set below. The live
+# app calls maybe_auto_refit from up to 16 concurrent event-worker threads on the
+# first Analyze, so the gate must be flipped atomically or every worker would spawn
+# its own maintenance run.
+_auto_maintenance_lock = threading.Lock()
+_auto_maintenance_running = set()  # sport_keys with a background maintenance thread
 
 # Short-TTL in-memory cache for read-only NDJSON reads (e.g. the wagers
 # ledger read on every My Bets rerun). Only the SQL path is cached; local
@@ -2407,21 +2413,50 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
 
 def maybe_auto_refit(sport_key):
     """
-    Called by analysis.py on first prop analysis per (process, sport).
-    Runs bounded outcome maintenance at most hourly per process. Refit remains
-    gated by calibration age and the number of newly resolved observations.
-    Best-effort; never raises.
+    Called by props.analyze_player_props_value on first prop analysis per
+    (process, sport). Runs bounded outcome maintenance at most hourly per process.
+    Refit remains gated by calibration age and the number of newly resolved
+    observations. Best-effort; never raises.
+
+    Maintenance runs in a BACKGROUND DAEMON THREAD so it never blocks the Analyze
+    request that triggers it. maintain_sport does ~900-1200 serial Azure round-trips
+    on a cold process (StatsAPI ingest + statcast freshness + per-row outcome
+    resolution, ~45s-2min on the 20-DTU tier); running it inline stalled the very
+    slate the user asked for. This IS still the de-facto scheduler — keep the
+    in-request call so the hourly cadence isn't lost (removing it without a real
+    scheduler would silently freeze calibration). The freshly-refit params land for
+    the NEXT Analyze; this request serves last cycle's params (already the case for
+    every non-first Analyze). The thread touches no Streamlit/session state.
     """
     now = time.time()
-    last_attempt = _last_auto_maintenance.get(sport_key, 0.0)
-    if now - last_attempt < AUTO_MAINTENANCE_INTERVAL_SECONDS:
-        return
-    _last_auto_maintenance[sport_key] = now
+    with _auto_maintenance_lock:
+        last_attempt = _last_auto_maintenance.get(sport_key, 0.0)
+        if now - last_attempt < AUTO_MAINTENANCE_INTERVAL_SECONDS:
+            return
+        if sport_key in _auto_maintenance_running:
+            return                       # a prior cycle's thread is still working
+        # Flip the gate BEFORE the work starts so a slow/failed run doesn't retry
+        # for an hour, and mark in-flight so overlapping runs can't stack.
+        _last_auto_maintenance[sport_key] = now
+        _auto_maintenance_running.add(sport_key)
+
+    def _run():
+        try:
+            maintain_sport(sport_key)
+        except Exception:
+            pass
+        finally:
+            with _auto_maintenance_lock:
+                _auto_maintenance_running.discard(sport_key)
 
     try:
-        maintain_sport(sport_key)
+        threading.Thread(
+            target=_run, name="auto-maintain-%s" % sport_key, daemon=True).start()
     except Exception:
-        pass
+        # If the thread can't start, clear the in-flight flag so a later Analyze
+        # (next hour) can try again. The gate timestamp stays set (best-effort).
+        with _auto_maintenance_lock:
+            _auto_maintenance_running.discard(sport_key)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
