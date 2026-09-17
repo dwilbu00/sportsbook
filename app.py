@@ -1184,11 +1184,18 @@ def _resolve_team_dim(sport_key, name, espn_teams):
 def _fetch_team_schedule(sport_key, team, espn_sport, espn_league):
     """Recent team games for the layoff/recent-form bridge. MLB: from the StatsAPI
     warehouse (get_team_games, by display name — no ESPN); other sports: ESPN
-    get_team_schedule. Returns a list of per-game dicts (each with a 'date')."""
+    get_team_schedule. Returns a list of per-game dicts (each with a 'date').
+
+    MLB is scoped to the CURRENT SEASON: (a) it hits the per-slate bulk-games prime
+    (season-keyed) instead of an unbounded all-history SQL scan on 20-DTU, and (b) it
+    aligns this ESPN-fallback path with the PRIMARY mlb_warehouse_team_stats path,
+    which already builds recent form from current-season games only."""
     if sport_key == "baseball_mlb":
         try:
             import mlb_warehouse
-            return mlb_warehouse.get_team_games(team["display_name"]) or []
+            return mlb_warehouse.get_team_games(
+                team["display_name"],
+                season=mlb_warehouse._current_season()) or []
         except Exception:
             return []
     return get_team_schedule(espn_sport, espn_league, team["id"])

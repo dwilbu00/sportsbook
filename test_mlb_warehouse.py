@@ -894,6 +894,7 @@ class P3SupportTests(_Backend, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        mlb_warehouse._GAME_PK_MEMO.clear()   # module memo persists across tests
         for tid, nm in (("147", "New York Yankees"), ("111", "Boston Red Sox")):
             with db_store.get_engine().begin() as conn:
                 conn.execute(insert(mlb_warehouse.mlb_team), {

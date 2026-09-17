@@ -1321,6 +1321,11 @@ def _score_commence_candidates(cands, commence, tol_hours=20):
     return best_pk
 
 
+_GAME_PK_MEMO_LOCK = threading.Lock()
+_GAME_PK_MEMO = {}               # (home,away,commence,tol) -> (game_pk, expiry_ts)
+_GAME_PK_MEMO_TTL = 300          # seconds
+
+
 def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20):
     """Resolve a game_pk for a matchup by the NEAREST game_date to the odds commence
     time — robust to a series (picks the right day) and a SPLIT doubleheader (picks
@@ -1333,6 +1338,17 @@ def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20)
     ts = _parse_ts(commence)
     if ts is None or ts.tzinfo is None:      # tz-naive can't be compared → fail-closed
         return None
+    # Per-slate memo: every prop-player in a game resolves the SAME (home, away,
+    # commence) → one SQL instead of ~30/game. Only real hits are cached — a None
+    # stays uncached so the resolver's same-day schedule gap-fill + retry can still
+    # find a game ingested after the first miss; a resolved game_pk is immutable, so
+    # the short TTL is just hygiene against unbounded growth.
+    key = (str(home_team_id), str(away_team_id), str(commence), tol_hours)
+    now = time.time()
+    with _GAME_PK_MEMO_LOCK:
+        hit = _GAME_PK_MEMO.get(key)
+        if hit is not None and hit[1] > now:
+            return hit[0]
     day = ts.date()
     cand_dates = {(day + datetime.timedelta(days=d)).isoformat() for d in (-1, 0, 1)}
     try:
@@ -1346,7 +1362,12 @@ def find_game_pk_by_commence(home_team_id, away_team_id, commence, tol_hours=20)
             ).fetchall()
     except (OperationalError, ValueError, TypeError):
         return None
-    return _score_commence_candidates({pk: gd for pk, gd in rows}, commence, tol_hours)
+    result = _score_commence_candidates(
+        {pk: gd for pk, gd in rows}, commence, tol_hours)
+    if result is not None:
+        with _GAME_PK_MEMO_LOCK:
+            _GAME_PK_MEMO[key] = (result, now + _GAME_PK_MEMO_TTL)
+    return result
 
 
 def record_player_alias(provider, provider_key, mlb_player_id,
