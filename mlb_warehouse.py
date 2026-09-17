@@ -1078,6 +1078,15 @@ def ingest_maintenance(days_back=2, days_forward=2, straggler_days=14):
         except Exception:
             continue
     summary["handedness_updated"] = populate_handedness()
+    # Standings snapshot (season records + cumulative runs) for the team-market path —
+    # get_team_standings / get_team_defense / get_team_offense all read the LATEST
+    # snapshot, so without this the team model serves stale records/run-environment.
+    # One idempotent snapshot/day (upsert scoped to season+as_of, 1h cached fetch);
+    # fail-open so a standings hiccup never blocks grading/schedule maintenance.
+    try:
+        summary["standings_rows"] = ingest_standings().get("rows", 0)
+    except Exception:               # pragma: no cover - never block maintenance
+        pass
     return summary
 
 
