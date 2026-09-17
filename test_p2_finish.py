@@ -62,9 +62,12 @@ def _fake_index(abbrs):
 class ExpectedRunsTeamKeyTests(unittest.TestCase):
     def _run(self, savant_teams, index_abbrs):
         # 3 CSV fetches: offense vs L, offense vs R, bullpen RP.
+        # Cutover complete: the warehouse-offense gate defaults ON, so explicitly
+        # disable it here to exercise the SAVANT path these tests target.
         rows = _savant_rows(savant_teams)
         stderr = io.StringIO()
-        with patch.object(mlb_starters, "_read_cache", return_value=None), \
+        with patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_OFFENSE": "0"}), \
+                patch.object(mlb_starters, "_read_cache", return_value=None), \
                 patch.object(mlb_starters, "_write_cache"), \
                 patch.object(mlb_starters, "_get_savant_csv",
                              side_effect=[rows, rows, rows]), \
@@ -336,8 +339,10 @@ class WarehouseTeamOffenseTests(unittest.TestCase):
 
     # ── the env flag ──
     def test_flag_env_truth_table(self):
+        # Cutover complete: default ON; only an explicit disable-word turns it OFF.
         for val, exp in [("1", True), ("true", True), ("on", True), ("YES", True),
-                         ("", False), ("0", False), ("off", False)]:
+                         ("", True), ("garbage", True),
+                         ("0", False), ("off", False), ("false", False), ("no", False)]:
             with patch.dict(os.environ, {"ODI_MLB_WAREHOUSE_OFFENSE": val}):
                 self.assertEqual(mlb_starters._mlb_warehouse_offense_enabled(), exp)
 

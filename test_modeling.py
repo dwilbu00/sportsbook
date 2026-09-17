@@ -521,7 +521,10 @@ class ExpectedRunsTests(unittest.TestCase):
             "home": {"id": 1, "name": "Home", "abbr": "HME"},
             "away": {"id": 2, "name": "Away", "abbr": "AWY"},
         }
-        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+        # Cutover complete: the warehouse-offense gate defaults ON, so explicitly
+        # disable it to exercise the SAVANT aggregate path this test targets.
+        with tempfile.TemporaryDirectory() as cache_dir, patch.dict(
+                os.environ, {"ODI_MLB_WAREHOUSE_OFFENSE": "0"}), patch.object(
                 mlb_starters, "CACHE_DIR", cache_dir), patch.object(
                 mlb_starters, "get_team_index", return_value=fake_index), \
                 patch.object(
@@ -932,12 +935,13 @@ class AdditiveTotalsTests(unittest.TestCase):
         self.assertEqual(over, baseline)
 
     def test_additive_totals_flag_helper_reads_env(self):
+        # Cutover complete: default ON; only an explicit disable-word turns it OFF.
         with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_TOTALS": "1"}):
             self.assertTrue(mlb_starters._mlb_additive_totals_enabled())
         with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_TOTALS": "off"}):
             self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
         with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(mlb_starters._mlb_additive_totals_enabled())
+            self.assertTrue(mlb_starters._mlb_additive_totals_enabled())
 
 
 class TeamMarketSuppressTests(unittest.TestCase):
@@ -1115,24 +1119,31 @@ class AdditiveMoneylineTests(unittest.TestCase):
         self.assertEqual(nba, nba_baseline)
 
     def test_additive_ml_flag_helper_reads_env(self):
+        # Cutover complete: default ON; only an explicit disable-word turns it OFF.
         with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_ML": "yes"}):
             self.assertTrue(mlb_starters._mlb_additive_ml_enabled())
         with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_ML": "0"}):
             self.assertFalse(mlb_starters._mlb_additive_ml_enabled())
         with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(mlb_starters._mlb_additive_ml_enabled())
+            self.assertTrue(mlb_starters._mlb_additive_ml_enabled())
 
     def test_any_additive_enabled_covers_each_flag(self):
         # build_matchup_features surfaces the live-additive keys under this gate; it must
         # trigger on ANY single additive flag, incl. ML alone (the fixed gap where an
         # ML-only run left live_additive_runs starved of ids -> silently inert).
+        # Cutover complete: each flag defaults ON, so _any_additive_enabled() is ON
+        # unless EVERY additive flag is explicitly disabled.
         for flag in ("ODI_MLB_ADDITIVE_RUNS", "ODI_MLB_ADDITIVE_TOTALS",
                      "ODI_MLB_ADDITIVE_ML"):
             with patch.dict(os.environ, {flag: "1"}, clear=True):
                 self.assertTrue(mlb_starters._any_additive_enabled(),
                                 f"{flag} alone must trigger surfacing")
         with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(mlb_starters._any_additive_enabled())
+            self.assertTrue(mlb_starters._any_additive_enabled())   # all default ON
+        with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_RUNS": "off",
+                                     "ODI_MLB_ADDITIVE_TOTALS": "off",
+                                     "ODI_MLB_ADDITIVE_ML": "off"}, clear=True):
+            self.assertFalse(mlb_starters._any_additive_enabled())  # all explicitly off
 
 
 class AsOfReliabilityTests(unittest.TestCase):

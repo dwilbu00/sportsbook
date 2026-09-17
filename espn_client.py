@@ -895,16 +895,16 @@ PROP_STAT_MAP = {
 WAREHOUSE_ONLY_PROPS = frozenset({"batter_total_bases", "batter_rbis"})
 
 
-# P4 model-input cutover flag. When ON (and SQL enabled), MLB player histories are
-# served from the StatsAPI warehouse facts (mlb_warehouse.get_player_history) with
-# ESPN as the fail-open fallback; OFF (default) keeps the pure ESPN path. Env-gated
-# so the cutover is flipped deliberately after --player-input parity is clean.
+# P4 model-input flag. MLB player histories are served from the StatsAPI warehouse
+# facts (mlb_warehouse.get_player_history) with ESPN as the fail-open fallback. The
+# cutover is COMPLETE → default ON (parity verified in prod); set the env var to a
+# disable word ("0"/"false"/"off"/"no") to force the legacy pure-ESPN path.
 _MLB_WAREHOUSE_HIST_ENV = "ODI_MLB_WAREHOUSE_HIST"
 
 
 def _mlb_warehouse_hist_enabled():
-    return os.environ.get(_MLB_WAREHOUSE_HIST_ENV, "").strip().lower() in (
-        "1", "true", "on", "yes")
+    return os.environ.get(_MLB_WAREHOUSE_HIST_ENV, "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None,
@@ -945,16 +945,16 @@ def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None,
         return None
 
 
-# P4 team-market cutover flag (independent of the player-history flag). When ON
-# (+ SQL enabled), MLB team-market inputs — season block, recent form, recent_games,
-# team defense — are served from the StatsAPI warehouse with ESPN as the fail-open
-# fallback; OFF (default) keeps the pure ESPN build.
+# P4 team-market flag (independent of the player-history flag). MLB team-market
+# inputs — season block, recent form, recent_games, team defense — are served from
+# the StatsAPI warehouse with ESPN as the fail-open fallback. Cutover COMPLETE →
+# default ON; set the env var to a disable word to force the pure-ESPN build.
 _MLB_WAREHOUSE_TEAM_ENV = "ODI_MLB_WAREHOUSE_TEAM"
 
 
 def _mlb_warehouse_team_enabled():
-    return os.environ.get(_MLB_WAREHOUSE_TEAM_ENV, "").strip().lower() in (
-        "1", "true", "on", "yes")
+    return os.environ.get(_MLB_WAREHOUSE_TEAM_ENV, "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def mlb_warehouse_gate_status():
@@ -963,12 +963,13 @@ def mlb_warehouse_gate_status():
     indicator so a flag flip's effect is VERIFIABLE (predictions don't record which
     source served them). Keys mirror the gate helpers in espn_client / props /
     book_line_calibration."""
+    # These gates now default ON (cutover complete); OFF only on an explicit disable
+    # word — the reporter mirrors that so the indicator reflects the real state.
     def _on(k):
-        return os.environ.get(k, "").strip().lower() in ("1", "true", "on", "yes")
+        return os.environ.get(k, "").strip().lower() not in ("0", "false", "off", "no")
     return {
         "history": _on(_MLB_WAREHOUSE_HIST_ENV),        # ODI_MLB_WAREHOUSE_HIST
         "team": _on(_MLB_WAREHOUSE_TEAM_ENV),           # ODI_MLB_WAREHOUSE_TEAM
-        "calib": _on("ODI_MLB_WAREHOUSE_CALIB"),        # book_line_calibration
         "enforce_identity": _on("ODI_MLB_ENFORCE_IDENTITY"),   # props
         "sql": bool(db_store is not None and db_store.enabled()),
     }

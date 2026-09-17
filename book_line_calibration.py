@@ -371,18 +371,11 @@ def _stat_label_for(prop_key, gamelog):
 # (their bucket TTL stays immutably long).
 CALIB_GAMELOG_TTL_HOURS = 6
 
-# P4 calibration cutover (default OFF): grade real-line fits off the StatsAPI
-# warehouse per-game facts instead of the ESPN cached_gamelog. Ships GATED OFF while
-# the warehouse backfill runs; fail-open to ESPN. Scope is the real-line join only —
-# the synthetic-sweep backtest engine stays on ESPN (its park/reliability/defense
-# apparatus is ESPN-team-id-keyed). ⚠ run a per-game-dict opponent-NAME parity check
-# before flipping (opp_defense + park key on the opponent name).
-_MLB_WAREHOUSE_CALIB_ENV = "ODI_MLB_WAREHOUSE_CALIB"
-
-
-def _warehouse_calib_enabled():
-    return os.environ.get(_MLB_WAREHOUSE_CALIB_ENV, "").strip().lower() in (
-        "1", "true", "on", "yes")
+# P4 calibration cutover COMPLETE: MLB real-line fits grade UNCONDITIONALLY off the
+# StatsAPI warehouse per-game facts (see join_book_lines_to_actuals, from_warehouse
+# path). The old ODI_MLB_WAREHOUSE_CALIB gate + its ESPN fallback are retired — the
+# synthetic-sweep backtest engine still stays on ESPN (its park/reliability/defense
+# apparatus is ESPN-team-id-keyed), but that is unconditional, not flag-gated.
 
 
 def _calib_role(rows):

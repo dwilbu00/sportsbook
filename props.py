@@ -52,12 +52,12 @@ from stats import (
 )
 
 
-# P4 fail-closed identity enforcement (default OFF). When on, an MLB player the
-# entity resolver can't UNIQUELY pin (unknown / namesake-ambiguous) gets NO
-# prediction — betting a mis-identified player is worse than skipping. OFF = the P3
-# shadow posture (the prediction still logs with a NULL id). Env-gated so the blast
-# radius (`prediction_log WHERE sport_key='baseball_mlb' AND player_mlb_id IS NULL`)
-# is understood + resolvable SFBB gaps fixed before flipping.
+# P4 fail-closed identity enforcement. When on, an MLB player the entity resolver
+# can't UNIQUELY pin (unknown / namesake-ambiguous) gets NO prediction — betting a
+# mis-identified player is worse than skipping. Cutover COMPLETE → default ON; set
+# the env var to a disable word ("0"/"false"/"off"/"no") to force the P3 shadow
+# posture (the prediction still logs with a NULL id). The circuit breaker below
+# still fails OPEN on a systemic resolver failure regardless of this gate.
 _MLB_ENFORCE_IDENTITY_ENV = "ODI_MLB_ENFORCE_IDENTITY"
 
 # Circuit breaker: enforcement drops UNPINNED players, but a SYSTEMIC failure (a SQL
@@ -68,8 +68,8 @@ _ENFORCE_FAILOPEN_FRACTION = 0.5
 
 
 def _identity_enforced():
-    return os.environ.get(_MLB_ENFORCE_IDENTITY_ENV, "").strip().lower() in (
-        "1", "true", "on", "yes")
+    return os.environ.get(_MLB_ENFORCE_IDENTITY_ENV, "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 # MLB league baselines used as log5-style denominators for the props matchup

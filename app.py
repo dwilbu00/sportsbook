@@ -36,12 +36,14 @@ except Exception:
 
 # P4/P5 MLB→StatsAPI warehouse feature gates. On Streamlit Cloud there are no
 # settable OS env vars — only st.secrets — and the gate helpers read os.environ, so
-# promote the gate flags here (boot) exactly like the SQL secrets above. Absent →
-# unset → the gate stays OFF (its default). Set e.g. ODI_MLB_WAREHOUSE_HIST = "1" in
-# the app's Secrets to flip a gate; str() handles a TOML boolean (true → "True").
+# promote the gate flags here (boot) exactly like the SQL secrets above. These gates
+# now default ON (cutover complete) — a secret is only needed to explicitly DISABLE a
+# path (set the key to "0"/"off"). Absent → unset → the gate stays ON; str() handles a
+# TOML boolean (true → "True"). Promotion is harmless either way and lets an escape
+# hatch (e.g. ODI_MLB_ADDITIVE_ML = "0") reach os.environ.
 try:
     for _gate_key in ("ODI_MLB_WAREHOUSE_HIST", "ODI_MLB_WAREHOUSE_TEAM",
-                      "ODI_MLB_WAREHOUSE_CALIB", "ODI_MLB_ENFORCE_IDENTITY",
+                      "ODI_MLB_ENFORCE_IDENTITY",
                       "ODI_MLB_ADDITIVE_RUNS", "ODI_MLB_WAREHOUSE_OFFENSE",
                       "ODI_MLB_ADDITIVE_TOTALS", "ODI_MLB_ADDITIVE_ML"):
         _gate_val = st.secrets.get(_gate_key)
@@ -1328,14 +1330,14 @@ def render_model_guide():
             st.caption(f"Prediction log storage: {storage_backend} (shared and durable).")
 
         # MLB→StatsAPI warehouse gates. Predictions don't record which source
-        # served them, so this is the only at-a-glance way to confirm a flag flip
-        # actually took effect on the running app (default OFF = ESPN path).
+        # served them, so this is the only at-a-glance way to confirm the gate state
+        # on the running app. These now default ON (cutover complete); a gate reads
+        # OFF only if its env var is explicitly set to a disable word.
         try:
             _wh = mlb_warehouse_gate_status()
             _on = [name for name, key in (
                 ("player-history", "history"),
                 ("team-markets", "team"),
-                ("calibration", "calib"),
                 ("identity-enforce", "enforce_identity"),
             ) if _wh.get(key)]
             if _wh.get("sql") and _on:

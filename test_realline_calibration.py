@@ -1134,9 +1134,9 @@ class RoiTiebreakSelectionTests(unittest.TestCase):
 
 
 class CalibWarehouseCutoverTests(unittest.TestCase):
-    """P4 calibration cutover: join_book_lines_to_actuals grades off the warehouse
-    per-game facts when ODI_MLB_WAREHOUSE_CALIB is on (MLB + mlb_id), else the ESPN
-    cached_gamelog path (flag OFF = byte-identical). The sweep engine is untouched."""
+    """P4 calibration cutover COMPLETE: join_book_lines_to_actuals grades MLB off the
+    warehouse per-game facts unconditionally (MLB + mlb_id) — the ODI_MLB_WAREHOUSE_CALIB
+    gate + its ESPN fallback are retired. The sweep engine is untouched."""
 
     def test_calib_role_majority(self):
         self.assertEqual(blc._calib_role(
@@ -1154,13 +1154,14 @@ class CalibWarehouseCutoverTests(unittest.TestCase):
                 "prop_key": "batter_hits", "line": 0.5,
                 "game_date": "2024-07-04T18:00:00Z"}
 
-    def _run(self, flag):
+    def _run(self):
         # warehouse log dated OFF the book line → row is skipped after the fetch,
-        # so we assert only the SOURCE routing (no downstream projection).
+        # so we assert only the SOURCE routing (no downstream projection). MLB
+        # calibration is now unconditionally warehouse (flag retired), so there is
+        # no env to patch — the source routing must not depend on any gate.
         wh_log = [{"game_date": "2024-06-01T18:00:00Z", "H": 1.0, "AB": 4.0,
                    "opponent": "Boston Red Sox", "is_home": True, "completed": True}]
-        with patch.dict(os.environ, {blc._MLB_WAREHOUSE_CALIB_ENV: flag}), \
-             patch.object(blc, "cached_athlete_id", return_value="e1"), \
+        with patch.object(blc, "cached_athlete_id", return_value="e1"), \
              patch("player_id_map.espn_id_for_mlb_id", return_value=None), \
              patch("mlb_warehouse.get_calib_gamelogs_bulk",
                    return_value={"592450": wh_log}) as wh, \
@@ -1168,16 +1169,11 @@ class CalibWarehouseCutoverTests(unittest.TestCase):
             blc.join_book_lines_to_actuals([self._book_line()], "baseball", "mlb")
         return wh, esp
 
-    def test_flag_on_uses_warehouse(self):
-        wh, esp = self._run("1")
-        # season-aware bulk join: the fetch carries the obs's role + season (year).
-        wh.assert_called_once_with("batter", 2024)
-        esp.assert_not_called()
-
-    def test_baseball_warehouse_only_ignores_flag(self):
-        # P6 cutover: MLB calibration is warehouse-only regardless of the (now
-        # retired) flag — it never falls open to ESPN.
-        wh, esp = self._run("")           # flag OFF
+    def test_baseball_warehouse_only_unconditional(self):
+        # P6 cutover COMPLETE: MLB calibration is warehouse-only, no flag, and
+        # never falls open to ESPN. season-aware bulk join: the fetch carries the
+        # obs's role + season (year).
+        wh, esp = self._run()
         wh.assert_called_once_with("batter", 2024)
         esp.assert_not_called()
 

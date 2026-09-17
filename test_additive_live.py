@@ -141,17 +141,20 @@ class GetOrFillSkipTests(unittest.TestCase):
 
 class FlagTests(unittest.TestCase):
     def test_flag_truth_table(self):
+        # Cutover complete: default ON. Only an explicit disable-word turns it OFF;
+        # anything else (incl. "" and unrecognized text) reads ON.
         for val, exp in [("1", True), ("true", True), ("on", True), ("yes", True),
-                         ("TRUE", True), (" 1 ", True), ("", False), ("0", False),
-                         ("off", False), ("garbage", False)]:
+                         ("TRUE", True), (" 1 ", True), ("", True), ("garbage", True),
+                         ("0", False), ("off", False), ("false", False),
+                         ("no", False), (" off ", False)]:
             with patch.dict(os.environ, {"ODI_MLB_ADDITIVE_RUNS": val}):
                 self.assertEqual(mlb_starters._mlb_additive_runs_enabled(), exp,
                                  f"value={val!r}")
 
-    def test_unset_is_off(self):
+    def test_unset_is_on(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ODI_MLB_ADDITIVE_RUNS", None)
-            self.assertFalse(mlb_starters._mlb_additive_runs_enabled())
+            self.assertTrue(mlb_starters._mlb_additive_runs_enabled())
 
     def test_import_chain_cycle_free(self):
         self.assertTrue(hasattr(mlb_starters, "live_additive_runs"))

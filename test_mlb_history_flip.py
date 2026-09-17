@@ -32,7 +32,9 @@ def _flag_on():
 
 
 def _flag_off():
-    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_HIST_ENV: ""})
+    # Cutover complete: the gate defaults ON, so "off" now means an explicit
+    # disable-word (not merely unset/empty, which reads ON).
+    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_HIST_ENV: "0"})
 
 
 class WarehouseHistGateTests(unittest.TestCase):
@@ -294,7 +296,8 @@ def _team_on():
 
 
 def _team_off():
-    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_TEAM_ENV: ""})
+    # Cutover complete: default ON → "off" is an explicit disable-word.
+    return mock.patch.dict(os.environ, {espn_client._MLB_WAREHOUSE_TEAM_ENV: "0"})
 
 
 class TeamMarketFlipTests(unittest.TestCase):
@@ -393,8 +396,9 @@ class TeamMarketFlipTests(unittest.TestCase):
 class EnforceIdentityTests(unittest.TestCase):
     """P4 fail-closed identity enforcement (env ODI_MLB_ENFORCE_IDENTITY): an MLB
     player the resolver can't uniquely pin gets NO candidate/prediction when on;
-    default OFF keeps the P3 shadow posture; a slate-level circuit breaker fails OPEN
-    on a systemic (all-unresolved) failure. entity_resolver + refit/log mocked."""
+    an explicit disable-word ("0") restores the P3 shadow posture; a slate-level
+    circuit breaker fails OPEN on a systemic (all-unresolved) failure. Cutover
+    complete: enforcement now defaults ON. entity_resolver + refit/log mocked."""
 
     def _prop_data(self, players):
         return {"commence_time": "2026-08-10T23:10:00Z",
@@ -412,7 +416,9 @@ class EnforceIdentityTests(unittest.TestCase):
             return ({"resolved": True, "mlb_player_id": "1", "game_pk": 700}
                     if resolved_map.get(name) else
                     {"resolved": False, "mlb_player_id": None, "game_pk": None})
-        env = {props._MLB_ENFORCE_IDENTITY_ENV: "1" if enforce else ""}
+        # Cutover complete: enforcement defaults ON, so the not-enforced case must
+        # EXPLICITLY disable with a disable-word ("0"), not just leave it unset.
+        env = {props._MLB_ENFORCE_IDENTITY_ENV: "1" if enforce else "0"}
         with mock.patch.dict(os.environ, env), \
              mock.patch("entity_resolver.resolve", side_effect=_resolve), \
              mock.patch.object(props, "maybe_auto_refit"), \
@@ -428,7 +434,7 @@ class EnforceIdentityTests(unittest.TestCase):
         self.assertEqual(
             self._run({"A": True, "B": True, "C": False}, enforce=True), {"A", "B"})
 
-    def test_kept_when_not_enforced(self):                    # P3 shadow (default)
+    def test_kept_when_not_enforced(self):            # P3 shadow (explicitly disabled)
         self.assertEqual(
             self._run({"A": True, "C": False}, enforce=False), {"A", "C"})
 
@@ -490,22 +496,27 @@ class GateStatusTests(unittest.TestCase):
                 mock.patch.object(espn_client.db_store, "enabled", return_value=sql):
             return espn_client.mlb_warehouse_gate_status()
 
-    def test_all_off_by_default(self):
+    def test_all_on_by_default(self):
+        # Cutover complete: gates default ON when unset (calib key retired —
+        # MLB calibration is now unconditionally warehouse).
         s = self._status({})
         self.assertEqual(
-            s, {"history": False, "team": False, "calib": False,
-                "enforce_identity": False, "sql": True})
+            s, {"history": True, "team": True,
+                "enforce_identity": True, "sql": True})
 
     def test_each_flag_reads_its_env_key(self):
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_HIST": "1"})["history"])
         self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_TEAM": "true"})["team"])
-        self.assertTrue(self._status({"ODI_MLB_WAREHOUSE_CALIB": "on"})["calib"])
         self.assertTrue(
             self._status({"ODI_MLB_ENFORCE_IDENTITY": "yes"})["enforce_identity"])
 
-    def test_falsey_values_stay_off(self):
+    def test_falsey_values_turn_off(self):
+        # Explicit disable-words are the escape hatch (default is ON).
         self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "0"})["history"])
         self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_HIST": "no"})["history"])
+        self.assertFalse(self._status({"ODI_MLB_WAREHOUSE_TEAM": "off"})["team"])
+        self.assertFalse(
+            self._status({"ODI_MLB_ENFORCE_IDENTITY": "false"})["enforce_identity"])
 
     def test_sql_disabled_reported(self):
         self.assertFalse(self._status({}, sql=False)["sql"])

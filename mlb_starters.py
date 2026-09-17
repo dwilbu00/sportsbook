@@ -236,10 +236,10 @@ def get_pitcher_expected_stats(season, min_bip=40):
 def _mlb_warehouse_offense_enabled():
     """ODI_MLB_WAREHOUSE_OFFENSE: derive the expected-runs challenger's team OFFENSE
     factors from the statcast_pitch warehouse instead of the live Savant HTTP endpoint.
-    OFF (default, unset) = byte-identical Savant path. Mirrors the other ODI_MLB_* env
-    gates; promoted from st.secrets at boot in app.py."""
-    return os.environ.get("ODI_MLB_WAREHOUSE_OFFENSE", "").strip().lower() in (
-        "1", "true", "on", "yes")
+    Cutover COMPLETE → default ON; set the env var to a disable word ("0"/"false"/
+    "off"/"no") to force the legacy Savant HTTP path. Mirrors the other ODI_MLB_* gates."""
+    return os.environ.get("ODI_MLB_WAREHOUSE_OFFENSE", "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def _finalize_offense(raw, statsapi_abbrs):
@@ -748,29 +748,29 @@ def expected_runs_additive(starter_rate9, bullpen_rate9, exp_ip,
 
 def _mlb_additive_runs_enabled():
     """ODI_MLB_ADDITIVE_RUNS gate for the live additive expected-runs model (Tier A
-    #1d, SPREADS). OFF (unset) = byte-identical multiplicative path. Mirrors the
-    espn_client ODI_MLB_* env→bool idiom; promoted from st.secrets at boot in app.py."""
-    return os.environ.get("ODI_MLB_ADDITIVE_RUNS", "").strip().lower() in (
-        "1", "true", "on", "yes")
+    #1d, SPREADS). Cutover COMPLETE → default ON; set the env var to a disable word
+    ("0"/"false"/"off"/"no") to force the legacy multiplicative path. Mirrors the
+    espn_client ODI_MLB_* env→bool idiom."""
+    return os.environ.get("ODI_MLB_ADDITIVE_RUNS", "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def _mlb_additive_totals_enabled():
     """ODI_MLB_ADDITIVE_TOTALS gate (Tier B): use the additive expected TOTAL runs as
-    the totals projection (runs-first) instead of the recency+starter-shift mean. OFF
-    (unset) = byte-identical current totals model. Separate flag from spreads so each
-    market's additive is an independent, evidence-gated A/B."""
-    return os.environ.get("ODI_MLB_ADDITIVE_TOTALS", "").strip().lower() in (
-        "1", "true", "on", "yes")
+    the totals projection (runs-first) instead of the recency+starter-shift mean.
+    Cutover COMPLETE → default ON; set the env var to a disable word to force the
+    legacy totals model. Independent per-market A/B flag."""
+    return os.environ.get("ODI_MLB_ADDITIVE_TOTALS", "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def _mlb_additive_ml_enabled():
     """ODI_MLB_ADDITIVE_ML gate (Tier B): derive the moneyline model win prob from the
     additive expected runs (runs-first, symmetric Poisson margin at 0) instead of the
-    recency margin Φ. OFF (unset) = byte-identical current moneyline model. Separate
-    flag from spreads/totals so each market's additive is an independent, evidence-
-    gated A/B."""
-    return os.environ.get("ODI_MLB_ADDITIVE_ML", "").strip().lower() in (
-        "1", "true", "on", "yes")
+    recency margin Φ. Cutover COMPLETE → default ON; set the env var to a disable word
+    to force the legacy moneyline model. Independent per-market A/B flag."""
+    return os.environ.get("ODI_MLB_ADDITIVE_ML", "").strip().lower() not in (
+        "0", "false", "off", "no")
 
 
 def _any_additive_enabled():
