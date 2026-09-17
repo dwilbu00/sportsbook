@@ -2725,6 +2725,15 @@ def _team_final_games(team_id, as_of_date=None, season=None, limit=None):
                     return r
         except Exception:
             pass
+    # Per-slate bulk prime (all current-season final games in ONE query) — the live
+    # team-market path reads recent games for home+away of every game (1 SELECT/team).
+    # Live path only (as_of_date=None); as-of/backtest reads fall through to SQL. The
+    # mirror check above wins when available (backtests); this covers Cloud, where the
+    # mirror can't be read. Returns FRESH dict copies (the caller rekeys team names).
+    if as_of_date is None:
+        bulk = _bulk_team_final_games(team_id, season, limit)
+        if bulk is not None:
+            return bulk
     if not enabled() or not team_id:
         return []
     g = mlb_game
@@ -2787,6 +2796,93 @@ def get_team_games(team_name, as_of_date=None, season=None, limit=None):
     spelling may differ; the OUTPUT names are canonical."""
     return _team_final_games(team_id_for_name(team_name),
                              as_of_date=as_of_date, season=season, limit=limit)
+
+
+_BULK_TEAM_GAMES_LOCK = threading.Lock()
+_BULK_TEAM_GAMES = {}            # season(int) -> {team_id(str): [game dict desc]}
+
+
+def bulk_team_games_map(season):
+    """{team_id(str): [game dict, most-recent-first]} for a whole season's FINAL
+    regular/postseason games in ONE query — same row shape + filters as
+    _team_final_games, each game bucketed under BOTH its home and away team_id. The
+    live app caches this and hands it to set_bulk_team_games so per-team
+    get_team_games serves from memory instead of a SELECT per team (2 per game).
+    Pure read; {} on SQL off / no season."""
+    if not enabled() or season is None:
+        return {}
+    season = int(season)
+    g = mlb_game
+    home = mlb_team.alias("home_t")
+    away = mlb_team.alias("away_t")
+    joined = (g.join(home, g.c.home_team_id == home.c.team_id, isouter=True)
+              .join(away, g.c.away_team_id == away.c.team_id, isouter=True))
+    det = g.c.detailed_state
+    genuine_final = or_(det.is_(None), and_(
+        *[not_(det.ilike(f"%{b}%")) for b in mlb_starters._NON_FINAL_DETAILED]))
+    stmt = (select(g.c.game_date, g.c.game_pk, g.c.home_score, g.c.away_score,
+                   g.c.home_team_id, g.c.away_team_id,
+                   home.c.name.label("home_name"), away.c.name.label("away_name"))
+            .select_from(joined)
+            .where(g.c.status == "Final")
+            .where(genuine_final)
+            .where(g.c.home_score.isnot(None))
+            .where(g.c.away_score.isnot(None))
+            .where(g.c.game_type.notin_(_NON_REGULAR_GAME_TYPES))
+            .where(g.c.season == season)
+            .order_by(g.c.game_date.desc(), g.c.game_pk.desc()))
+    try:
+        with db_store.get_engine().connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    by_team = {}
+    for r in rows:
+        m = r._mapping
+        try:
+            hs, as_ = int(m["home_score"]), int(m["away_score"])
+        except (TypeError, ValueError):
+            continue
+        game = {"date": m["game_date"], "home_team": m["home_name"],
+                "away_team": m["away_name"], "home_score": hs,
+                "away_score": as_, "total_score": hs + as_,
+                "game_pk": m["game_pk"]}
+        # Bucket under both teams (query order is already game_date/game_pk DESC).
+        for tid in (m["home_team_id"], m["away_team_id"]):
+            if tid is not None:
+                by_team.setdefault(str(tid), []).append(game)
+    return by_team
+
+
+def set_bulk_team_games(season, m):
+    """Prime the in-memory bulk team-games map for a season (from the app's cache)."""
+    if not m:
+        return
+    with _BULK_TEAM_GAMES_LOCK:
+        _BULK_TEAM_GAMES[int(season)] = m
+
+
+def clear_bulk_team_games():
+    with _BULK_TEAM_GAMES_LOCK:
+        _BULK_TEAM_GAMES.clear()
+
+
+def _bulk_team_final_games(team_id, season, limit):
+    """Serve _team_final_games from the primed bulk map (live/as_of_date=None path
+    only), or None if not primed for this season (→ SQL fallback). Returns FRESH dict
+    copies so the caller (mlb_warehouse_team_stats) can safely rekey team names —
+    each game is shared between its two teams' lists in the prime."""
+    if team_id is None or season is None:
+        return None
+    with _BULK_TEAM_GAMES_LOCK:
+        m = _BULK_TEAM_GAMES.get(int(season))
+    if not m:                              # not primed → SQL
+        return None
+    rows = m.get(str(team_id))
+    if rows is None:
+        return []                          # primed season, team has no games → empty
+    out = rows[:int(limit)] if limit else rows
+    return [dict(g) for g in out]          # fresh copies (caller mutates them)
 
 
 def team_name_canonical(team_name):

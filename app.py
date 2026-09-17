@@ -939,6 +939,18 @@ def _mlb_bulk_standings(season, day):
         return {}
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlb_bulk_team_games(season, day):
+    """Cached whole-season team final games (1 Azure read) so the team-market path
+    doesn't issue one recent-games SELECT per team (2 per game). {} on SQL off →
+    per-team SQL fallback."""
+    try:
+        import mlb_warehouse
+        return mlb_warehouse.bulk_team_games_map(season)
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _mlb_coherence_offset(sport_key, day):
     """Cached coherence run-line calibration offset. compute_offset reads 3 FULL
@@ -3534,6 +3546,8 @@ if analyze_clicked and selected_game_labels:
                     _day = datetime.now().strftime("%Y-%m-%d")
                     mlb_warehouse.set_bulk_standings(
                         _season, _mlb_bulk_standings(_season, _day))
+                    mlb_warehouse.set_bulk_team_games(
+                        _season, _mlb_bulk_team_games(_season, _day))
             except Exception:
                 pass
 

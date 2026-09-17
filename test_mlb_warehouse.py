@@ -1518,6 +1518,31 @@ class TeamMarketReaderTests(_Backend, unittest.TestCase):
         finally:
             mlb_warehouse.clear_bulk_standings()
 
+    def test_get_team_games_serves_from_bulk_prime(self):
+        import warehouse_mirror
+        # Two teams sharing one game (147 home vs 111 away) + an older 147 game.
+        g1 = {"date": "2024-07-04T18:00:00Z", "home_team": "New York Yankees",
+              "away_team": "Boston Red Sox", "home_score": 5, "away_score": 3,
+              "total_score": 8, "game_pk": 1}
+        g0 = {"date": "2024-07-01T18:00:00Z", "home_team": "New York Yankees",
+              "away_team": "Tampa Bay Rays", "home_score": 2, "away_score": 1,
+              "total_score": 3, "game_pk": 2}
+        mlb_warehouse.set_bulk_team_games(2024, {"147": [g1, g0], "111": [g1]})
+        try:
+            # Mirror wins over the prime when available (backtests); patch it off so
+            # this exercises the Cloud path (mirror unreadable → bulk prime → SQL).
+            with mock.patch.object(warehouse_mirror, "enabled", return_value=False):
+                games = mlb_warehouse.get_team_games(
+                    "New York Yankees", season=2024, limit=1)
+                self.assertEqual([g["game_pk"] for g in games], [1])   # limit + order
+                # Fresh copies: rekeying one team's dict must NOT corrupt the other
+                # team's view of the SAME shared game.
+                games[0]["home_team"] = "MUTATED"
+                other = mlb_warehouse.get_team_games("Boston Red Sox", season=2024)
+                self.assertEqual(other[0]["home_team"], "New York Yankees")
+        finally:
+            mlb_warehouse.clear_bulk_team_games()
+
     def test_get_team_defense_from_standings_runs(self):
         self._stand("147", 50, 50, 0.5, 500, 400)   # 100 g, 400 allowed → 4.0
         self._stand("111", 40, 40, 0.5, 360, 480)   #  80 g, 480 allowed → 6.0
