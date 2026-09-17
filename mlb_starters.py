@@ -1850,8 +1850,15 @@ def build_matchup_features(home_team, away_team, date, season, team_index=None,
     # as-of, zero network; None for live games (no batter facts yet) so it's
     # inert live until a confirmed-lineup path is wired. Weighted (inert by
     # default) in analysis._predict_margin.
-    result["lineup_edge"] = lineup_offense_edge(
-        home_team, away_team, as_of_date or date, team_index, season)
+    #
+    # LIVE short-circuit (as_of_date is None): the live result is ALWAYS None (a
+    # future game has no box-score lineup to key on), yet the call would still build
+    # the season-wide _game_lineup_index — a full-season box-score PA scan on 20-DTU
+    # — just to miss. Skip it live (byte-identical None); backtests (as_of_date set)
+    # still compute it.
+    result["lineup_edge"] = (
+        lineup_offense_edge(home_team, away_team, as_of_date, team_index, season)
+        if as_of_date else None)
 
     return result
 
