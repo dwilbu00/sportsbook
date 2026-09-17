@@ -927,6 +927,18 @@ def _mlb_bulk_batter_rates(season, day):
         return {}
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlb_bulk_standings(season, day):
+    """Cached latest-snapshot team standings for ALL teams (1 Azure read) so the
+    team-market path doesn't issue one single-row SELECT per team (2 per game).
+    {} on SQL off → per-team SQL fallback."""
+    try:
+        import mlb_warehouse
+        return mlb_warehouse.bulk_standings_map(season)
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _mlb_coherence_offset(sport_key, day):
     """Cached coherence run-line calibration offset. compute_offset reads 3 FULL
@@ -3508,6 +3520,20 @@ if analyze_clicked and selected_game_labels:
                     statcast_asof.set_bulk_rates(
                         _season, "bat",
                         _mlb_bulk_batter_rates(_season, _day), split="all")
+            except Exception:
+                pass
+            # Bulk-prime team standings ONCE (1 read, all teams' latest snapshot) so
+            # the team-market path serves home+away of every game from memory instead
+            # of 2 single-row SELECTs/game. Gated on the TEAM flag (its own path);
+            # fail-open to per-team SQL.
+            try:
+                import espn_client
+                import db_store
+                if espn_client._mlb_warehouse_team_enabled() and db_store.enabled():
+                    _season = mlb_warehouse._current_season()
+                    _day = datetime.now().strftime("%Y-%m-%d")
+                    mlb_warehouse.set_bulk_standings(
+                        _season, _mlb_bulk_standings(_season, _day))
             except Exception:
                 pass
 

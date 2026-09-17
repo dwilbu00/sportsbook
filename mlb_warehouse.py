@@ -2890,6 +2890,14 @@ def get_team_standings(team_name, season=None, as_of_date=None):
     if not tid:
         return None
     season = int(season) if season else _current_season()
+    # Serve from the per-slate bulk prime (latest snapshot, all teams in ONE query)
+    # when available — the live team-market path queries standings for home+away of
+    # every game (2 single-row SELECTs/game on 20-DTU). Latest-snapshot only, so only
+    # the as_of_date=None (live) path is primed; backtest/as-of falls through to SQL.
+    if as_of_date is None:
+        blk = _bulk_standings_get(season, tid)
+        if blk is not None:
+            return blk
     s = mlb_team_standings
     stmt = (select(s.c.wins, s.c.losses, s.c.win_pct,
                    s.c.runs_scored, s.c.runs_allowed)
@@ -2911,6 +2919,71 @@ def get_team_standings(team_name, season=None, as_of_date=None):
     return {"record": f"{w}-{losses}", "wins": w, "losses": losses, "win_pct": wp,
             "runs_scored": (int(r[3]) if r[3] is not None else None),
             "runs_allowed": (int(r[4]) if r[4] is not None else None)}
+
+
+_BULK_STANDINGS_LOCK = threading.Lock()
+_BULK_STANDINGS = {}             # season(int) -> {team_id(str): season block dict}
+
+
+def bulk_standings_map(season):
+    """{team_id(str): season block} for ALL teams from the LATEST /standings snapshot
+    in ONE query (same snapshot read as get_team_defense; same block shape
+    get_team_standings returns). The live app caches this and hands it to
+    set_bulk_standings so per-team get_team_standings serves from memory instead of a
+    single-row SELECT per team (2 per game). Latest snapshot only (the live path);
+    {} on SQL off / no snapshot."""
+    if not enabled() or season is None:
+        return {}
+    season = int(season)
+    s = mlb_team_standings
+    try:
+        with db_store.get_engine().connect() as conn:
+            asof = _latest_standings_asof(conn, season, None)
+            if asof is None:
+                return {}
+            rows = conn.execute(
+                select(s.c.team_id, s.c.wins, s.c.losses, s.c.win_pct,
+                       s.c.runs_scored, s.c.runs_allowed)
+                .where(s.c.season == season)
+                .where(s.c.as_of_date == asof)).fetchall()
+    except (OperationalError, ValueError, TypeError):
+        return {}
+    out = {}
+    for tid, w, losses, wp, rs, ra in rows:
+        w = int(w) if w is not None else 0
+        losses = int(losses) if losses is not None else 0
+        wpf = (float(wp) if wp is not None
+               else (w / (w + losses) if (w + losses) else 0.0))
+        out[str(tid)] = {
+            "record": f"{w}-{losses}", "wins": w, "losses": losses, "win_pct": wpf,
+            "runs_scored": (int(rs) if rs is not None else None),
+            "runs_allowed": (int(ra) if ra is not None else None)}
+    return out
+
+
+def set_bulk_standings(season, m):
+    """Prime the in-memory bulk standings map for a season (from the app's cache)."""
+    if not m:
+        return
+    with _BULK_STANDINGS_LOCK:
+        _BULK_STANDINGS[int(season)] = m
+
+
+def clear_bulk_standings():
+    with _BULK_STANDINGS_LOCK:
+        _BULK_STANDINGS.clear()
+
+
+def _bulk_standings_get(season, team_id):
+    """Serve get_team_standings' season block from the primed map, or None if not
+    primed for this season (→ per-team SELECT fallback). Latest-snapshot only."""
+    if season is None or team_id is None:
+        return None
+    with _BULK_STANDINGS_LOCK:
+        m = _BULK_STANDINGS.get(int(season))
+    if not m:
+        return None
+    return m.get(str(team_id))
 
 
 def get_team_defense(season=None, as_of_date=None):

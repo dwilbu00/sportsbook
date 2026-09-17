@@ -1489,6 +1489,35 @@ class TeamMarketReaderTests(_Backend, unittest.TestCase):
         self.assertEqual(mlb_warehouse.get_team_standings(
             "New York Yankees", season=2024, as_of_date="2024-06-15")["wins"], 40)
 
+    def test_bulk_standings_map_latest_snapshot(self):
+        # One query returns every team's LATEST-snapshot block, keyed by team_id.
+        self._stand("147", 40, 30, 0.571, 300, 280, as_of="2024-06-01")
+        self._stand("147", 55, 30, 0.647, 420, 330, as_of="2024-07-04")
+        self._stand("111", 45, 45, 0.5, 400, 400, as_of="2024-07-04")
+        m = mlb_warehouse.bulk_standings_map(2024)
+        self.assertEqual(m["147"]["wins"], 55)          # latest snapshot only
+        self.assertEqual(m["147"]["record"], "55-30")
+        self.assertEqual(m["111"]["wins"], 45)
+
+    def test_get_team_standings_serves_from_bulk_prime(self):
+        # A real SQL row (what the as-of path reads) + a DISTINCT primed block (what
+        # the live as_of=None path must serve, from memory, no per-team SELECT).
+        self._stand("147", 55, 30, 0.647, 420, 330, as_of="2024-07-04")
+        primed = {"record": "99-1", "wins": 99, "losses": 1, "win_pct": 0.99,
+                  "runs_scored": 900, "runs_allowed": 100}
+        mlb_warehouse.set_bulk_standings(2024, {"147": primed})
+        try:
+            self.assertEqual(
+                mlb_warehouse.get_team_standings("New York Yankees", season=2024),
+                primed)                                  # live path → primed block
+            self.assertEqual(mlb_warehouse.get_team_standings(
+                "New York Yankees", season=2024,
+                as_of_date="2024-07-05")["wins"], 55)    # as-of bypasses the prime
+            self.assertIsNone(mlb_warehouse.get_team_standings(
+                "Boston Red Sox", season=2024))          # unprimed team → SQL (none)
+        finally:
+            mlb_warehouse.clear_bulk_standings()
+
     def test_get_team_defense_from_standings_runs(self):
         self._stand("147", 50, 50, 0.5, 500, 400)   # 100 g, 400 allowed → 4.0
         self._stand("111", 40, 40, 0.5, 360, 480)   #  80 g, 480 allowed → 6.0
