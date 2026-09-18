@@ -2412,6 +2412,16 @@ def render_bonuses():
                  "optimizer choose the best size.")
         leg_count = int(_lc) or None
 
+    # "More likely to hit" control: drop any leg whose book-devig hit probability is
+    # below this. Higher = safer legs (fewer, higher-P) at the cost of payout/EV. 0.50
+    # = no filter beyond the type minimums. Applies to both cross-game and SGP.
+    min_leg_p = st.slider(
+        "Minimum leg win probability (higher = more likely to hit)",
+        min_value=0.50, max_value=0.85, value=0.50, step=0.01,
+        help="Only build plays from legs at least this likely to hit (book de-vig P). "
+             "Raise it for safer tickets that cash more often but pay less; 0.50 keeps "
+             "every qualifying leg.")
+
     is_mlb = board_sport == "baseball_mlb"
     with st.spinner("Scanning legs + building +EV plays…"):
         if scoped:
@@ -2439,9 +2449,11 @@ def render_bonuses():
         # validated "adequate, slightly conservative" base joint. (Frozen NFL rho stays
         # a research artifact; the copula is retired from the live bonus path.)
         def _sgp_indep(legs, bonus, leg_count=None):
-            return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
+            return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count,
+                                        min_leg_p=min_leg_p)[:opt.TOP_K]
         results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
-                                     sgp_fn=_sgp_indep, leg_count=leg_count)
+                                     sgp_fn=_sgp_indep, leg_count=leg_count,
+                                     min_leg_p=min_leg_p)
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
     n_games = len(board["parsed"])

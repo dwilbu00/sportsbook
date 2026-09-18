@@ -37,8 +37,13 @@ TRUSTWORTHY = sgp.TRUSTWORTHY               # {prop: opp_threshold}
 _CUR_SLATE_WEEK = 99                        # sentinel: "all completed weeks are prior" (upcoming)
 PROP_ABBR = sgp.PROP_ABBR
 MAX_PARLAY = 3       # cap ticket size we enumerate
-TOP_N = 12           # top legs (by P) per book to consider
+TOP_N = 18           # top legs (by P) per book to consider (feeds the non-overlapping portfolio)
 TOP_K = 8            # plays to surface per bonus
+
+# Occurrence markets: one-sided Yes/No props where you only ever bet the thing TO
+# HAPPEN (player scores / homers), never the "favorite" (usually the No side, since
+# most players are <50% to score). ALWAYS priced on the OVER regardless of side arg.
+_OCC = {"player_anytime_td", "batter_home_runs"}
 
 
 def collect_week_legs(train_seasons, season, week, books):
@@ -277,7 +282,10 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
                 if fair is None or line is None:
                     continue
                 fair = book_calibration.apply(sport_key, prop, fair, maps=bcmaps)
-                use_over = True if side == "over" else (fair >= 0.5)
+                # Occurrence markets (anytime TD / home runs) are ONLY ever bet to
+                # HAPPEN — force the over/yes side even in 'favorite' mode (the No
+                # side is usually the favorite but you never bet a player NOT to score).
+                use_over = True if (side == "over" or prop in _OCC) else (fair >= 0.5)
                 price = p.get(f"{pxkey}_{'over' if use_over else 'under'}_price")
                 if price is None:
                     continue
@@ -292,14 +300,15 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     return legs
 
 
-def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None):
+def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
     weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
     required combined price for +EV. Same return shape as sgp_stacks (mx=0, no correlation).
-    ``leg_count`` forces the stack size (>=2)."""
+    ``leg_count`` forces the stack size (>=2). ``min_leg_p`` drops any leg below that hit
+    probability ("more likely to hit" mode — safer, higher-P legs only)."""
     bygame = defaultdict(list)
     for l in legs:
-        if _leg_ok(l, bonus):
+        if _leg_ok(l, bonus) and l["P"] >= min_leg_p:
             bygame[l["gid"]].append(l)
     need = max(2, int(leg_count) if leg_count else max(2, bonus.min_legs))
     out = []
@@ -341,11 +350,13 @@ def _diversify(plays, k):
     return out
 
 
-def cross_game_plays(legs, bonus, bankroll, leg_count=None):
+def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     """Concrete +EV cross-game parlays/singles ranked by boosted EV (independence joint).
     ``leg_count`` (optional) forces EXACTLY that many legs (Doug's leg-count selector),
-    still subject to the bonus's type minimum + min_legs floor."""
-    elig = sorted([l for l in legs if _leg_ok(l, bonus)], key=lambda x: -x["P"])[:TOP_N]
+    still subject to the bonus's type minimum + min_legs floor. ``min_leg_p`` drops any leg
+    below that hit probability ("more likely to hit" mode — safer, higher-P legs only)."""
+    elig = sorted([l for l in legs if _leg_ok(l, bonus) and l["P"] >= min_leg_p],
+                  key=lambda x: -x["P"])[:TOP_N]
     floor = max(1, bonus.min_legs)
     type_min = 1 if bonus.bet_type in ("single", "any") else 2
     if leg_count:
@@ -418,11 +429,14 @@ def _allows_sgp(bt):
     return bt in ("any", "any_parlay", "sgp", "sgp_sgpx")
 
 
-def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=None):
+def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=None,
+                   min_leg_p=0.0):
     """Structured optimizer output for a slate — the shared core for the CLI and the app.
     sgp_fn(legs, bonus, leg_count) -> stacks lets a sport pick its SGP joint (NFL copula
     vs MLB independence); defaults to the NFL copula path. Each bonus's legs are scoped to
     its ``markets`` (empty = all). ``leg_count`` (optional) forces the parlay/SGP size.
+    ``min_leg_p`` drops legs below that hit probability ("more likely to hit" mode); the
+    sgp_fn closure is responsible for applying it to its own stacks.
     Returns [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
     if sgp_fn is None:
         def sgp_fn(legs, bonus, leg_count=None):
@@ -435,7 +449,8 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=
         if legs is None:
             continue
         scoped = _scope_legs(legs, getattr(bonus, "markets", ()))
-        cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count), TOP_K)
+        cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count,
+                                             min_leg_p=min_leg_p), TOP_K)
                  if _allows_cross(bonus.bet_type) else [])
         stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
         out.append({"book": bonus.book, "label": bonus.label, "bet_type": bonus.bet_type,
