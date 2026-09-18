@@ -2457,23 +2457,35 @@ def render_bonuses():
             st.info("Only one game analyzed — cross-game parlays need ≥2 games; SGP stacks still "
                     "appear below.")
     else:
-        trust = list(opt.TRUSTWORTHY)
+        # Which markets are on the board vs which actually BUILT legs — so a missing
+        # market (no odds fetched, or every leg dropped for no DK price / failed the
+        # opportunity gate) explains itself instead of just vanishing.
         board_markets = set()
         for _b in board["parsed"]:
             board_markets.update((_b.get("props") or {}).keys())
-        missing = [p for p in trust if p not in board_markets]
-        _abbr = {"player_receptions": "Receptions", "player_rush_attempts": "Rush Attempts",
-                 "player_pass_attempts": "Pass Attempts"}
-        st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible leg(s). Bonus legs come only from "
-                   f"the validated count props: {', '.join(_abbr.values())}.")
-        if missing:
-            st.warning("⚠️ Your analyzed slate has no odds for "
-                       f"**{', '.join(_abbr[p] for p in missing)}** — the bonus optimizer can only "
-                       "build legs from those. Re-run the 🎯 Value Finder with those prop markets "
-                       "selected (the default NFL markets are yardage/anytime-TD, not used here).")
-        elif n_legs == 0:
-            st.info("No players cleared the opportunity threshold on this slate yet (thin "
-                    "early-season usage). More will qualify as the season progresses.")
+        built = {}
+        for _legs in legs_by_book.values():
+            for _l in _legs:
+                built[_l["prop"]] = built.get(_l["prop"], 0) + 1
+        universe = list(opt.bonus_markets(board_sport))
+        st.caption(f"Slate: {n_games} game(s) · {n_legs} eligible leg(s). Bonus legs are priced "
+                   "off book de-vig across the full market universe (yardages/TDs incl.); modeled "
+                   "count props also pass an opportunity gate.")
+        # per-market breakdown: legs built | on board but 0 legs | not on board at all
+        _rows = []
+        for _m in universe:
+            _lab = pabbr.get(_m, _m)
+            if built.get(_m):
+                _rows.append(f"✅ {_lab}: {built[_m]}")
+            elif _m in board_markets:
+                _rows.append(f"⚪ {_lab}: on board, 0 legs (no DK price or gated)")
+            else:
+                _rows.append(f"✖ {_lab}: no odds fetched")
+        st.caption(" · ".join(_rows))
+        if n_legs == 0:
+            st.info("No legs built — either the analyzed slate has no odds for these markets "
+                    "(re-run the 🎯 Value Finder or use ▶ Run analysis for a bonus with the "
+                    "markets you want), or nothing cleared the opportunity gate yet.")
         elif n_games < 2:
             st.info("Only one game analyzed — cross-game parlays need ≥2 games. Same-game (SGP) "
                     "stacks can still appear below; add more games for cross-game parlays.")
