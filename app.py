@@ -2585,7 +2585,19 @@ def render_bonuses():
                             f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
                         st.rerun()
     if not shown:
-        st.info("No qualifying +EV plays for the active bonuses on this slate.")
+        # The most common "why nothing?" is a leg-count that the bonus TYPE forbids:
+        # a parlay/SGP promo requires >=2 legs, so leg_count=1 can never produce a
+        # single. Call that out explicitly instead of a generic empty message.
+        _parlay_only = [b for b in bonuses
+                        if b.bet_type in ("parlay", "sgp", "sgp_sgpx")]
+        if leg_count == 1 and _parlay_only:
+            st.info("You set **1 leg**, but "
+                    + ", ".join(f"'{b.label}'" for b in _parlay_only)
+                    + " is a **parlay/SGP** bonus — those require ≥2 legs (the book won't "
+                    "accept a 1-leg parlay). Set the leg count to ≥2, or change the bonus "
+                    "type to **single** or **any** to get single bets.")
+        else:
+            st.info("No qualifying +EV plays for the active bonuses on this slate.")
 
 
 def render_parlays():
