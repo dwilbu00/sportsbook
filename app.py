@@ -2212,22 +2212,33 @@ def render_bonuses():
 
     _SPORT_LABELS = {"americanfootball_nfl": "NFL", "baseball_mlb": "MLB"}
     _SPORT_KEYS = {v: k for k, v in _SPORT_LABELS.items()}
+    # Friendly label -> market/prop key for the bonus market-scope multiselect.
+    _BONUS_MARKET_OPTIONS = {
+        "MLB: Hits": "batter_hits", "MLB: Total Bases": "batter_total_bases",
+        "MLB: RBIs": "batter_rbis", "MLB: Home Runs": "batter_home_runs",
+        "MLB: Pitcher Ks": "pitcher_strikeouts", "MLB: Earned Runs": "pitcher_earned_runs",
+        "MLB: Outs": "pitcher_outs",
+        "NFL: Receptions": "player_receptions", "NFL: Rush Att": "player_rush_attempts",
+        "NFL: Pass Att": "player_pass_attempts", "NFL: Pass Yds": "player_pass_yds",
+        "NFL: Rush Yds": "player_rush_yds", "NFL: Rec Yds": "player_reception_yds",
+        "NFL: Pass TDs": "player_pass_tds", "NFL: Anytime TD": "anytime_td",
+        "Team markets (ML/spread/total)": "team"}
 
     # ── active-bonus manager ──
     st.subheader("Active bonuses")
     if bonuses:
         st.dataframe(pd.DataFrame([{
-            "sport": _SPORT_LABELS.get(getattr(b, "sport", ""), getattr(b, "sport", "")),
-            "book": b.book, "type": b.bet_type, "boost%": round(b.boost_pct * 100),
+            "name": bonuslib.display_name(b),
             "min leg": int(b.min_odds_leg) if b.min_odds_leg > -99999 else None,
             "min legs": b.min_legs,
             "max $": b.max_wager if b.max_wager < 1e8 else None,
-            "label": b.label} for b in bonuses]),
+            "scope": bonuslib._market_scope_tag(getattr(b, "markets", ())) or "all",
+            "note": b.label} for b in bonuses]),
             hide_index=True, width='stretch')
         dc = st.columns([3, 1])
         di = dc[0].selectbox("Remove a bonus", range(len(bonuses)),
-                             format_func=lambda i: bonuses[i].label
-                             or f"{bonuses[i].book} {bonuses[i].bet_type}", key="bonus_del_idx")
+                             format_func=lambda i: bonuslib.display_name(bonuses[i]),
+                             key="bonus_del_idx")
         if dc[1].button("🗑 Remove", width='stretch'):
             bonuses.pop(di)
             bonus_store.save_bonuses(bonuses)
@@ -2253,13 +2264,27 @@ def render_bonuses():
             max_w = c2[3].number_input("Max wager $", 0.0, 100000.0, 10.0, step=5.0)
             c3 = st.columns(2)
             min_w = c3[0].number_input("Min wager $", 0.0, 100000.0, 0.0, step=1.0)
-            label = c3[1].text_input("Label", value=f"{int(boost)}% {bet_type}")
+            label = c3[1].text_input("Note (optional)", value="",
+                                     help="Freeform note; the name is auto-generated "
+                                          "from book · sport · type · boost · scope.")
+            mkt_labels = st.multiselect(
+                "Market scope (blank = all eligible for the sport)",
+                list(_BONUS_MARKET_OPTIONS),
+                help="Limit this bonus to specific markets — e.g. a Home Runs boost or "
+                     "an Anytime TD boost. Blank = every eligible market. Non-modeled "
+                     "markets (HR / TD) are priced purely off the book's de-vigged odds.")
             if st.form_submit_button("Add bonus"):
-                bonuses.append(bonuslib.Bonus(
+                markets = tuple(_BONUS_MARKET_OPTIONS[l] for l in mkt_labels)
+                nb = bonuslib.Bonus(
                     bet_type=bet_type, boost_pct=boost / 100.0, min_odds_leg=float(min_leg),
                     min_odds_overall=float(min_overall), min_legs=int(min_legs),
                     max_wager=float(max_w), min_wager=float(min_w), book=book, label=label,
-                    sport=_SPORT_KEYS[sport_label]))
+                    sport=_SPORT_KEYS[sport_label], markets=markets)
+                # label is the consume-identity (book,label,bet_type) — never leave it
+                # blank (blank labels collide), so default it to the auto name.
+                if not nb.label.strip():
+                    nb.label = bonuslib.display_name(nb)
+                bonuses.append(nb)
                 bonus_store.save_bonuses(bonuses)
                 st.rerun()
 
@@ -2290,6 +2315,15 @@ def render_bonuses():
         bankroll = 1000.0
     bankroll = bankroll if bankroll and bankroll > 0 else 1000.0
 
+    # Leg-count control: 0 = auto (optimizer sweeps sizes); N = force exactly N legs
+    # in the generated parlays/SGP stacks (still subject to each bonus's min_legs/type).
+    _lc = st.number_input(
+        "Legs per generated parlay (0 = auto)", min_value=0,
+        max_value=int(opt.MAX_PARLAY), value=0, step=1,
+        help="Force the boosted parlay/SGP to exactly this many legs; 0 lets the "
+             "optimizer choose the best size.")
+    leg_count = int(_lc) or None
+
     is_mlb = board_sport == "baseball_mlb"
     with st.spinner("Scanning trustworthy legs + building +EV plays…"):
         if is_mlb:
@@ -2301,13 +2335,15 @@ def render_bonuses():
 
             def _mlb_sgp(legs, bonus, leg_count=None):
                 return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
-            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll, sgp_fn=_mlb_sgp)
+            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
+                                         sgp_fn=_mlb_sgp, leg_count=leg_count)
             pabbr = opt.MLB_ABBR
         else:
             legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
                             for bk in ("draftkings", "fanduel")}
             rho = opt.load_rho()
-            results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll)
+            results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll,
+                                         leg_count=leg_count)
             pabbr = opt.PROP_ABBR
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
