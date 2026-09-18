@@ -1111,7 +1111,8 @@ def _assemble_prop_entries(event_id, rows, sport_key):
     } for (player, prop_key), e in combined.items()]
 
 
-def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
+def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close",
+                    bookmaker="draftkings"):
     """Assemble player-prop line rows from the SQL warehouse for the offline
     real-line calibration refit + the props-odds backtest.
 
@@ -1131,6 +1132,12 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
     ``prop_keys`` (optional) filters the read to those prop markets IN SQL so a
     single-prop caller (e.g. the distributional diagnostic) doesn't transfer all
     seven props' lines.
+
+    ``bookmaker`` selects which book's per-book rows to read (default 'draftkings',
+    which also matches legacy NULL rows). Occurrence markets we don't post two-sided
+    at DK/FD (anytime TD, home runs) are captured two-sided ONLY at Pinnacle, so the
+    book-calibration reader passes 'pinnacle' to de-vig the sharp reference line
+    (analysis-only — we still bet the DK/FD price; Pinnacle just supplies the fair P).
 
     SCALE: the full prop table is ~1.5M rows; a single unscoped read times out the
     Azure round-trip AND materializes multiple GB. So this reads the CLOSING set
@@ -1168,7 +1175,8 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
         if dates:
             _assemble(_mirror_first_prop_lines(
                 sport_key, dates=dates, exclude_early=_excl_early,
-                only_early=_only_early, prop_keys=prop_keys, snapshot_source=_src))
+                only_early=_only_early, prop_keys=prop_keys, snapshot_source=_src,
+                bookmaker=bookmaker))
         else:
             # Per-season over the mirror's own files (0 DTU) when enabled, else the
             # legacy 2019..now range; empty years return fast either way.
@@ -1176,7 +1184,7 @@ def load_prop_lines(sport_key, dates=None, prop_keys=None, snapshot="close"):
                 _assemble(_mirror_first_prop_lines(
                     sport_key, date_from=f"{_s}-01-01", date_to=f"{_s}-12-31",
                     exclude_early=_excl_early, only_early=_only_early,
-                    prop_keys=prop_keys, snapshot_source=_src))
+                    prop_keys=prop_keys, snapshot_source=_src, bookmaker=bookmaker))
     except Exception as e:
         _ops.ops_event("database_failure", op="player_prop_lines",
                        sport=sport_key, error=type(e).__name__)

@@ -4533,6 +4533,20 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
           f"{', '.join(staged)}  (candidate — review --diff, then --promote)")
 
 
+def _book_calib_all_props(sport):
+    """Every bettable market for a sport's bonus legs, for --book-calib --recal-prop all.
+    Sourced from the bonus optimizer's universe (single source of truth); occurrence
+    markets are included and auto-route to Pinnacle inside the harvester."""
+    _, _, sport_key = SPORT_MAP[sport]
+    try:
+        import nfl_bonus_optimizer as _opt
+        if sport_key in ("americanfootball_nfl", "baseball_mlb"):
+            return list(_opt.bonus_markets(sport_key))
+    except Exception:
+        pass
+    return []
+
+
 def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter_hits",
                               save=False):
     """Measure the BOOK's OWN calibration for a market: is the sharp de-vigged price a
@@ -5016,9 +5030,18 @@ def main():
         return
 
     if args.book_calib:
-        diagnose_book_calibration(args.sport, store_label=args.store_label,
-                                  min_cell_n=args.min_cell_n, prop=args.recal_prop,
-                                  save=args.save_recal)
+        # --recal-prop all => book-calibrate EVERY bettable market for the sport in one
+        # pass (occurrence markets auto-route to Pinnacle's two-sided de-vig; a market
+        # with no captured lines just prints "0 book lines" and is skipped).
+        if str(args.recal_prop).lower() == "all":
+            for _p in _book_calib_all_props(args.sport):
+                diagnose_book_calibration(args.sport, store_label=args.store_label,
+                                          min_cell_n=args.min_cell_n, prop=_p,
+                                          save=args.save_recal)
+        else:
+            diagnose_book_calibration(args.sport, store_label=args.store_label,
+                                      min_cell_n=args.min_cell_n, prop=args.recal_prop,
+                                      save=args.save_recal)
         return
 
     if args.recalibrate:

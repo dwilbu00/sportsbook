@@ -210,10 +210,11 @@ class PropMarketStoreTests(unittest.TestCase):
 
         def _fake(sport, dates=None, date_from=None, date_to=None,
                   exclude_early=False, only_early=False, prop_keys=None,
-                  max_retries=3, snapshot_source=None):
+                  max_retries=3, snapshot_source=None, bookmaker="draftkings"):
             seen["exclude_early"] = exclude_early
             seen["only_early"] = only_early
             seen["snapshot_source"] = snapshot_source
+            seen["bookmaker"] = bookmaker
             return []
 
         import warehouse_mirror as _wm
@@ -230,6 +231,27 @@ class PropMarketStoreTests(unittest.TestCase):
         self.assertTrue(seen["exclude_early"])   # legacy default = closing set
         self.assertFalse(seen["only_early"])
         self.assertIsNone(seen["snapshot_source"])
+
+    def test_bookmaker_threads_through(self):
+        # Default reads DraftKings; an explicit bookmaker (e.g. Pinnacle for the
+        # one-sided occurrence-market book-calibration) reaches the per-book reader.
+        seen = self._capture_prop_filters("close")
+        self.assertEqual(seen["bookmaker"], "draftkings")
+
+        captured = {}
+
+        def _fake(sport, **kw):
+            captured["bookmaker"] = kw.get("bookmaker")
+            return []
+
+        import warehouse_mirror as _wm
+        with patch.object(warehouse, "_sql", return_value=True), \
+             patch.object(warehouse, "_ensure_durable"), \
+             patch.object(_wm, "enabled", return_value=False), \
+             patch.object(warehouse._db, "player_prop_lines", _fake):
+            warehouse.load_prop_lines("americanfootball_nfl", dates=["2024-09-08"],
+                                      snapshot="close", bookmaker="pinnacle")
+        self.assertEqual(captured["bookmaker"], "pinnacle")
 
     def test_bare_early_raises(self):
         # Ambiguous now that there are two early windows — must name one.

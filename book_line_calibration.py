@@ -43,6 +43,18 @@ from espn_client import PROP_STAT_MAP, WAREHOUSE_ONLY_PROPS, ip_to_outs
 from pricing_common import et_local_date  # UTC at rest, ET on read
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, ...)
 
+# Occurrence markets are posted ONE-SIDED (Yes-only) at DK/FD, so they can only be
+# de-vigged from Pinnacle's two-sided line (the sole two-sided source in the store).
+# The book-calibration reader routes these to bookmaker='pinnacle' to recover the
+# sharp fair P; every other market reads DraftKings. Pinnacle is analysis-only —
+# it supplies the fair probability, we still stake at the DK/FD price.
+OCCURRENCE_MARKETS = ("player_anytime_td", "batter_home_runs")
+
+
+def book_for_prop(prop):
+    """Which book's two-sided line to de-vig for this prop's calibration."""
+    return "pinnacle" if prop in OCCURRENCE_MARKETS else "draftkings"
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ODDS_CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
@@ -273,7 +285,8 @@ def _book_line_id_key(row):
 SNAPSHOT = "close"
 
 
-def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=None):
+def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=None,
+                                 bookmaker=None):
     """Union of real book lines for calibration, deduped by (player, prop,
     ET-date, line), preferring the primary (richer: prices/teams) on a collision.
 
@@ -285,9 +298,19 @@ def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=Non
     dropped from both sources by event_id (ambiguous box-score attribution).
     ``snapshot`` selects the precise window (default = module ``SNAPSHOT``); it only
     affects the warehouse primary (the mirror/db filter odds_snapshot.source).
+
+    ``bookmaker`` selects which book's per-book rows the warehouse primary reads.
+    None (default) AUTO-routes: occurrence markets (anytime TD / home runs), which
+    DK/FD post one-sided, read Pinnacle's two-sided line (the only de-viggable
+    source); everything else reads DraftKings. A mixed target set falls back to DK
+    unless EVERY prop is occurrence.
     Returns (book_lines, n_primary, n_pred)."""
     snapshot = snapshot if snapshot is not None else SNAPSHOT
     target = set(target_props or [])
+    if bookmaker is None:
+        bookmaker = ("pinnacle" if (target and all(p in OCCURRENCE_MARKETS
+                                                    for p in target))
+                     else "draftkings")
     try:
         import warehouse
     except Exception:
@@ -315,7 +338,7 @@ def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=Non
         # belt-and-suspenders on the assembled output.
         primary = [r for r in warehouse.load_prop_lines(
                        sport_key, prop_keys=(list(target) or None),
-                       snapshot=snapshot)
+                       snapshot=snapshot, bookmaker=bookmaker)
                    if r.get("prop_key") in target]
     else:
         primary = harvest_book_lines_from_store(sport_key, target_props, label)
