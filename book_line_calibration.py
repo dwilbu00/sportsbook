@@ -517,6 +517,94 @@ def _match_rows_to_gamelog(gamelog, rows, from_warehouse, espn_sport, enriched,
         })
 
 
+# NFL prop -> nfl_data.player_week stat column. anytime_td is derived (rush+rec TD).
+_NFL_PROP_COL = {
+    "player_receptions": "receptions", "player_reception_yds": "receiving_yards",
+    "player_rush_attempts": "carries", "player_rush_yds": "rushing_yards",
+    "player_pass_attempts": "attempts", "player_pass_completions": "completions",
+    "player_pass_yds": "passing_yards", "player_pass_tds": "passing_tds",
+}
+
+
+def _nfl_prop_actual(rec, prop):
+    """Actual result for an NFL prop from a player_week record (dict), or None."""
+    if prop == "player_anytime_td":
+        try:
+            return 1.0 if (float(rec.get("rushing_tds") or 0)
+                           + float(rec.get("receiving_tds") or 0)) >= 1 else 0.0
+        except (TypeError, ValueError):
+            return None
+    col = _NFL_PROP_COL.get(prop)
+    if col is None:
+        return None
+    v = rec.get(col)
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _nfl_grade_book_lines(book_lines):
+    """Grade NFL prop book lines against nfl_data.player_week (local parquet, fast +
+    leakage-free) instead of per-player ESPN gamelogs. Maps each line's game_date ->
+    (season, week) via the nflverse schedule, then (norm name, season, week) -> the
+    player's stat row. Returns enriched dicts with ``actual`` attached (NFL props use
+    the frozen models for projection, so prior_games isn't needed here). Fail-open."""
+    import db_store
+    try:
+        import nfl_data
+        import nfl_schedule
+    except Exception:
+        print("  NFL actuals: nfl_data/nfl_schedule unavailable — nothing graded.")
+        return []
+    yrs = {int((r.get("game_date") or "0000")[:4]) for r in book_lines
+           if (r.get("game_date") or "")[:4].isdigit()}
+    seasons = sorted({y for yr in yrs for y in (yr, yr - 1)})   # NFL season spans Jan
+    date2sw = {}
+    for s in seasons:
+        try:
+            for g in nfl_schedule.load_games([str(s)]):
+                d = str(g.get("gameday"))[:10]
+                if d and g.get("week") is not None:
+                    try:
+                        date2sw[d] = (int(g["season"]), int(g["week"]))
+                    except (TypeError, ValueError, KeyError):
+                        pass
+        except Exception:
+            continue
+    pw = nfl_data.player_week(seasons)
+    pw_idx = {}
+    if pw is not None:
+        for rec in pw.to_dict("records"):
+            nm = db_store.normalize_name(
+                rec.get("player_display_name") or rec.get("player_name") or "")
+            try:
+                pw_idx[(nm, int(rec["season"]), int(rec["week"]))] = rec
+            except (TypeError, ValueError, KeyError):
+                continue
+    enriched, n_no_date, n_no_player, n_no_stat = [], 0, 0, 0
+    for r in book_lines:
+        sw = date2sw.get((r.get("game_date") or "")[:10])
+        if not sw:
+            n_no_date += 1
+            continue
+        rec = pw_idx.get((db_store.normalize_name(r.get("player") or ""), sw[0], sw[1]))
+        if rec is None:
+            n_no_player += 1                 # bye / DNP / name mismatch
+            continue
+        actual = _nfl_prop_actual(rec, r.get("prop_key"))
+        if actual is None:
+            n_no_stat += 1
+            continue
+        r2 = dict(r)
+        r2["actual"] = actual
+        enriched.append(r2)
+    print(f"  Matched {len(enriched):,} NFL book lines to nfl_data.player_week "
+          f"actuals; dropped {n_no_date:,} (no schedule date), {n_no_player:,} "
+          f"(player not in week / DNP), {n_no_stat:,} (no stat).")
+    return enriched
+
+
 def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
     For each book line, resolve the player, pull their gamelog, locate the game on
@@ -533,7 +621,12 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     P6 MLB cutover — WAREHOUSE-ONLY (no ESPN for baseball): a valid MLBAM id is
     sufficient; a warehouse miss / missing MLBAM id drops the row (never falls
     open to ESPN).
+
+    NFL grades off nfl_data.player_week (local parquet, fast + our own data) instead
+    of the slow/flaky per-player ESPN gamelog path — see _nfl_grade_book_lines.
     """
+    if espn_sport == "football":
+        return _nfl_grade_book_lines(book_lines)
     # Group by canonical id (falling back to name) so spelling variants of one
     # player pool together.
     by_player = defaultdict(list)
