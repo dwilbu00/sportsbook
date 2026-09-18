@@ -111,27 +111,53 @@ def load_config():
         return json.load(f)
 
 
-def collect_completed_games(espn_sport, espn_league, season_year=None):
-    """Flatten all teams' schedules into a deduped list of completed games."""
+def collect_completed_games(espn_sport, espn_league, season_years=None):
+    """Flatten all teams' schedules into a deduped list of completed games.
+
+    ``season_years``: None = the CURRENT ESPN season only; a list of years = fetch
+    each and merge (so a multi-season --start/--end range enumerates history — ESPN's
+    per-team schedule returns one season at a time, so without this a 2023-2026 range
+    only ever saw the current season)."""
     teams = get_all_teams(espn_sport, espn_league)
+    if season_years is None:
+        years = [None]                                   # current season
+    elif isinstance(season_years, (list, tuple)):
+        years = list(season_years) or [None]
+    else:
+        years = [season_years]                           # a single year (int)
     seen = set()
     games = []
-    for info in teams.values():
-        tid = info.get("id")
-        if not tid:
-            continue
-        try:
-            sched = get_team_schedule(espn_sport, espn_league, tid, season_year)
-        except Exception:
-            continue
-        for g in sched:
-            key = (g.get("date"), g.get("home_team"), g.get("away_team"))
-            if key in seen:
+    for sy in years:
+        for info in teams.values():
+            tid = info.get("id")
+            if not tid:
                 continue
-            seen.add(key)
-            games.append(g)
+            try:
+                sched = get_team_schedule(espn_sport, espn_league, tid, sy)
+            except Exception:
+                continue
+            for g in sched:
+                key = (g.get("date"), g.get("home_team"), g.get("away_team"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                games.append(g)
     games.sort(key=lambda g: g.get("date") or "")
     return games
+
+
+def _season_years_for_range(args):
+    """Season years to enumerate: explicit --season wins; else the calendar years
+    spanned by --start/--end (dedup covers the NFL cross-year season boundary); else
+    None (current season) for the --days window."""
+    if args.season:
+        return [args.season]
+    if args.start or args.end:
+        import datetime
+        hi = int(args.end[:4]) if args.end else datetime.date.today().year
+        lo = int(args.start[:4]) if args.start else hi
+        return list(range(min(lo, hi), max(lo, hi) + 1))
+    return None
 
 
 def _names_match(a, b):
@@ -442,7 +468,10 @@ def main():
     print(f"  Budget cap: {args.max_credits} credits\n")
 
     print("=== Loading ESPN schedules to find game commence times ===")
-    games = collect_completed_games(espn_sport, espn_league, args.season)
+    _syears = _season_years_for_range(args)
+    if _syears:
+        print(f"  Enumerating ESPN seasons: {', '.join(str(y) for y in _syears)}")
+    games = collect_completed_games(espn_sport, espn_league, _syears)
     if not games:
         print("No completed games found. Nothing to backfill.")
         return

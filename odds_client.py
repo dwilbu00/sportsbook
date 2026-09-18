@@ -913,6 +913,7 @@ PROP_LABELS = {
     "pitcher_earned_runs": "Pitcher Earned Runs",
     "batter_total_bases": "Total Bases",
     "batter_rbis": "RBIs",
+    "batter_home_runs": "Home Runs",   # o/u 0.5, two-sided (bonus HR-boost corpus)
     # NFL/NBA broad-corpus backfill markets (backfill_historical_odds
     # BACKFILL_PROPS_BY_SPORT). Adding a key here ONLY lets parse_player_props
     # EMIT lines for it when a payload contains it (i.e. the historical backfill
