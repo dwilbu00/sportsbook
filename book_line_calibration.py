@@ -43,17 +43,18 @@ from espn_client import PROP_STAT_MAP, WAREHOUSE_ONLY_PROPS, ip_to_outs
 from pricing_common import et_local_date  # UTC at rest, ET on read
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, ...)
 
-# Occurrence markets are posted ONE-SIDED (Yes-only) at DK/FD, so they can only be
-# de-vigged from Pinnacle's two-sided line (the sole two-sided source in the store).
-# The book-calibration reader routes these to bookmaker='pinnacle' to recover the
-# sharp fair P; every other market reads DraftKings. Pinnacle is analysis-only —
-# it supplies the fair probability, we still stake at the DK/FD price.
-OCCURRENCE_MARKETS = ("player_anytime_td", "batter_home_runs")
+# Markets DK/FD post ONE-SIDED (Yes-only) can only be de-vigged from Pinnacle's
+# two-sided line (the sole two-sided source in the store); the book-calibration
+# reader routes these to bookmaker='pinnacle' to recover the sharp fair P (Pinnacle
+# is analysis-only — it supplies the probability, we still stake at DK/FD). This is
+# ONLY anytime TD: DraftKings posts home runs TWO-SIDED (Over/Under 0.5), so HR (and
+# every other market) reads DraftKings directly.
+PINNACLE_REF_MARKETS = ("player_anytime_td",)
 
 
 def book_for_prop(prop):
     """Which book's two-sided line to de-vig for this prop's calibration."""
-    return "pinnacle" if prop in OCCURRENCE_MARKETS else "draftkings"
+    return "pinnacle" if prop in PINNACLE_REF_MARKETS else "draftkings"
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -300,15 +301,15 @@ def harvest_real_line_book_lines(sport_key, target_props, label="", snapshot=Non
     affects the warehouse primary (the mirror/db filter odds_snapshot.source).
 
     ``bookmaker`` selects which book's per-book rows the warehouse primary reads.
-    None (default) AUTO-routes: occurrence markets (anytime TD / home runs), which
-    DK/FD post one-sided, read Pinnacle's two-sided line (the only de-viggable
-    source); everything else reads DraftKings. A mixed target set falls back to DK
-    unless EVERY prop is occurrence.
+    None (default) AUTO-routes: markets DK posts one-sided (anytime TD) read
+    Pinnacle's two-sided line (the only de-viggable source); everything else —
+    including home runs, which DK posts two-sided — reads DraftKings. A mixed target
+    set falls back to DK unless EVERY prop is Pinnacle-reference.
     Returns (book_lines, n_primary, n_pred)."""
     snapshot = snapshot if snapshot is not None else SNAPSHOT
     target = set(target_props or [])
     if bookmaker is None:
-        bookmaker = ("pinnacle" if (target and all(p in OCCURRENCE_MARKETS
+        bookmaker = ("pinnacle" if (target and all(p in PINNACLE_REF_MARKETS
                                                     for p in target))
                      else "draftkings")
     try:
