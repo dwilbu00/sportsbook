@@ -3861,7 +3861,7 @@ def _cc_report_lens(title, rowset, pkey, min_cell_n):
             _cc_reliability(f"line {lb}", sub, pkey, min_cell_n)
 
 
-def _cc_load_scored_rows(sport, store_label="", prop="batter_hits"):
+def _cc_load_scored_rows(sport, store_label="", prop="batter_hits", book_only=False):
     """Shared chronological loader for --reliability and --recalibrate.
 
     Harvests real book lines, joins to actuals, builds one leaner obs per row
@@ -3885,9 +3885,12 @@ def _cc_load_scored_rows(sport, store_label="", prop="batter_hits"):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     existing = load_calibration(sport_key)
     cfg = (existing or {}).get(prop)
-    if not cfg:
+    if not cfg and not book_only:
         print(f"No {prop} calibration to compare against; run refit first.")
         return sport_key, None, None
+    # book_only (--book-calib) needs NO model cfg — it uses only the book's de-vig +
+    # outcome, so a prop with a toy/absent calibration (e.g. NFL props) still works.
+    cfg = cfg or {}
     book_lines, n_store, n_pred = blc.harvest_real_line_book_lines(
         sport_key, [prop], store_label)
     print(f"  {len(book_lines)} book lines ({n_store} backfill store + {n_pred} "
@@ -3902,35 +3905,41 @@ def _cc_load_scored_rows(sport, store_label="", prop="batter_hits"):
         print(f"  No {prop} observations joined to actuals.")
         return sport_key, cfg, None
 
-    # Weight-side opp-defense lookup only if the shipped variant uses it. PER SEASON
-    # (leakage guard): each obs re-weights against its OWN season's pooled defense.
-    defense_by_season = None
-    if (cfg.get("opp_defense_strength") or 0.0) > 0:
-        defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
-    params = {
-        "half_life": cfg.get("half_life"),
-        "venue_strength": cfg.get("venue_strength", 0.0),
-        "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
-        "use_minutes": False,
-    }
-
-    # Method-D reconstruction: when a batter_hits line-bucket ships as D, build the
-    # as-of xBA index once + stamp each obs's distributional prob (p_dist) so
-    # _rc_run_bucket can recalibrate D like A/C. None (off) when no D bucket ships.
-    _lm = cfg.get("line_methods") or []
-    _d_buckets = [b for b in _lm if b.get("method") == "D"]
-    _default_m = cfg.get("method", "A")
-    _uses_d = bool(_d_buckets) or _default_m == "D"
-    xba_index = _diag_build_xba_index(enriched) if _uses_d else None
-    d_xstats = (_d_buckets[0].get("xstats_strength", 0.75) if _d_buckets
-                else cfg.get("xstats_strength", 0.75))
+    # book_only skips ALL the model machinery (projection / defense / xBA) — it needs
+    # only the book de-vig + outcome. Otherwise set up the model-reconstruction inputs.
+    defense_by_season = params = xba_index = None
+    _lm, _default_m, d_xstats = [], "A", 0.75
+    if not book_only:
+        # Weight-side opp-defense lookup only if the shipped variant uses it. PER SEASON
+        # (leakage guard): each obs re-weights against its OWN season's pooled defense.
+        if (cfg.get("opp_defense_strength") or 0.0) > 0:
+            defense_by_season = _defense_by_season(espn_sport, espn_league, enriched)
+        params = {
+            "half_life": cfg.get("half_life"),
+            "venue_strength": cfg.get("venue_strength", 0.0),
+            "opp_defense_strength": cfg.get("opp_defense_strength", 0.0),
+            "use_minutes": False,
+        }
+        # Method-D reconstruction: when a batter_hits line-bucket ships as D, build the
+        # as-of xBA index once + stamp each obs's distributional prob (p_dist) so
+        # _rc_run_bucket can recalibrate D like A/C. None (off) when no D bucket ships.
+        _lm = cfg.get("line_methods") or []
+        _d_buckets = [b for b in _lm if b.get("method") == "D"]
+        _default_m = cfg.get("method", "A")
+        _uses_d = bool(_d_buckets) or _default_m == "D"
+        xba_index = _diag_build_xba_index(enriched) if _uses_d else None
+        d_xstats = (_d_buckets[0].get("xstats_strength", 0.75) if _d_buckets
+                    else cfg.get("xstats_strength", 0.75))
 
     rows = []
     for obs in enriched:
-        projected, emp = blc.project_and_empirical(
-            obs, params, sport_key, defense_by_season=defense_by_season)
-        if projected is None or emp is None:
-            continue
+        if book_only:
+            projected, emp = None, None
+        else:
+            projected, emp = blc.project_and_empirical(
+                obs, params, sport_key, defense_by_season=defense_by_season)
+            if projected is None or emp is None:
+                continue
         op = _cc_num_or_none(obs.get("over_price"))
         up = _cc_num_or_none(obs.get("under_price"))
         mkt_over = over_dec = under_dec = None
@@ -3942,7 +3951,7 @@ def _cc_load_scored_rows(sport, store_label="", prop="batter_hits"):
         rowd = {
             "game_date": obs["game_date"], "line": obs["line"],
             "actual": obs["actual"], "projected": projected,
-            "empirical_over": max(0.0, min(1.0, emp)),
+            "empirical_over": (max(0.0, min(1.0, emp)) if emp is not None else None),
             "mkt_over": mkt_over, "over_dec": over_dec, "under_dec": under_dec,
         }
         if xba_index is not None and _rc_method_for_line(
@@ -4540,8 +4549,9 @@ def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter
     import book_line_calibration as blc
     print(f"\n=== BOOK calibration: {SPORT_MAP[sport][2]} {prop} "
           f"(de-vig P vs realized) ===")
-    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label, prop=prop)
-    if not cfg or rows is None:
+    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label, prop=prop,
+                                                book_only=True)
+    if rows is None:                       # book-calib needs no cfg, only priced rows
         return
     priced = [r for r in rows if r.get("mkt_over") is not None]
     print(f"  {len(priced)} priced obs of {len(rows)} total. Raw p = the book's "
