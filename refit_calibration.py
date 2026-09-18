@@ -4272,6 +4272,20 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
         print(f"     split: train={len(train)}  test={len(test)} (2-way, method-D "
               f"distributional prob w/ as-of xBA; {n - len(drows)} row(s) dropped "
               f"for missing AB/xBA)")
+    elif method == "book":
+        # THE BOOK's own de-vigged probability as the raw estimate — measures whether
+        # the sharp de-vig is itself miscalibrated (a shrink on the book, for the
+        # bonus system, which prices legs purely off book odds).
+        brows = [r for r in brows if r.get("mkt_over") is not None]
+        if len(brows) < 120:
+            print(f"     too thin (n={len(brows)} priced rows < 120); skipped.")
+            return
+        split = len(brows) // 2
+        train, test = brows[:split], brows[split:]
+        for r in train + test:
+            r["p_raw"] = r["mkt_over"]
+        print(f"     split: train={len(train)}  test={len(test)} (2-way, BOOK de-vig; "
+              f"{n - len(brows)} unpriced row(s) dropped)")
     else:
         print(f"     method {method} unsupported for recalibration; skipped.")
         return
@@ -4508,6 +4522,34 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
                            f"[{', '.join(staged)}]"}, merge_props=True)
     print(f"\n  [save] staged isotonic recal into {prop} buckets: "
           f"{', '.join(staged)}  (candidate — review --diff, then --promote)")
+
+
+def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter_hits"):
+    """Measure the BOOK's OWN calibration for a market: is the sharp de-vigged price a
+    calibrated probability, or is there systematic bias (e.g. public over-shading) that
+    a shrink could correct?
+
+    This is the bonus system's foundation — bonus legs price PURELY off book odds, so an
+    inaccurate book P is the only real risk to the boost edge (the edge is +EV only if P
+    is right). Fits Platt + isotonic on (book de-vig, outcome) OUT-OF-SAMPLE. Reading:
+      - winner = raw  -> the de-vig is already calibrated; trust the book P as-is.
+      - winner = platt/isotonic -> the de-vig is systematically off; the map is the
+        correction to apply to bonus leg P (improvement shows in Brier/log-loss/ECE).
+    Watch the reliability curve in the FAVORITE band (~0.6-0.9) — that's where boost
+    legs live. OFFLINE + free; writes nothing (measure-only for now)."""
+    import book_line_calibration as blc
+    print(f"\n=== BOOK calibration: {SPORT_MAP[sport][2]} {prop} "
+          f"(de-vig P vs realized) ===")
+    sport_key, cfg, rows = _cc_load_scored_rows(sport, store_label, prop=prop)
+    if not cfg or rows is None:
+        return
+    priced = [r for r in rows if r.get("mkt_over") is not None]
+    print(f"  {len(priced)} priced obs of {len(rows)} total. Raw p = the book's "
+          f"de-vigged price; the 'winner' line says whether recalibrating it beats the "
+          f"raw book OOS (a win = exploitable miscalibration to correct on bonus legs).")
+    _rc_run_bucket(f"{prop} BOOK", "book", rows, blc, min_cell_n)
+    print("\n  (Diagnostic only — nothing written. If a map beats raw in the 0.6-0.9 "
+          "favorite band, that's the shrink to wire into the bonus leg P.)")
 
 
 def _print_calibration_diff(sport):
@@ -4759,8 +4801,13 @@ def main():
                         "--recal-prop and show, OUT-OF-SAMPLE, the reliability curve "
                         "flatten and the fake edges collapse (no write).")
     p.add_argument("--recal-prop", default="batter_hits",
-                   help="Prop to recalibrate with --recalibrate (default batter_hits). "
-                        "e.g. pitcher_strikeouts (method C, over-confident).")
+                   help="Prop to recalibrate with --recalibrate / --book-calib "
+                        "(default batter_hits). e.g. pitcher_strikeouts, anytime_td.")
+    p.add_argument("--book-calib", action="store_true",
+                   help="Measure the BOOK's own calibration for --recal-prop (de-vig P "
+                        "vs realized, OOS) — the bonus system's foundation. Shows "
+                        "whether a shrink on the book's number would sharpen bonus leg "
+                        "P. Measure-only (no write).")
     p.add_argument("--save-recal", action="store_true",
                    help="With --recalibrate: STAGE the winning map. line_methods props "
                         "(batter_hits): winning ISOTONIC into the bucket(s) as recal_iso "
@@ -4931,6 +4978,11 @@ def main():
     if args.reliability:
         diagnose_conditional_calibration(args.sport, store_label=args.store_label,
                                          min_cell_n=args.min_cell_n)
+        return
+
+    if args.book_calib:
+        diagnose_book_calibration(args.sport, store_label=args.store_label,
+                                  min_cell_n=args.min_cell_n, prop=args.recal_prop)
         return
 
     if args.recalibrate:
