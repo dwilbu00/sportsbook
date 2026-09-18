@@ -45,6 +45,7 @@ Cost guide (1 US region):
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -313,6 +314,10 @@ def main():
                         "and --featured-cadence daily to capture before-noon lines.")
     p.add_argument("--max-credits", type=int, default=5000,
                    help="Hard cap on credits this run may spend. Default 5000.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel fetch workers for the per-game PROPS phase (network-"
+                        "bound). Writes + credit accounting stay serial; --max-credits "
+                        "is still the hard cap. Default 1 (serial). Try 8.")
     p.add_argument("--reserve", type=int, default=0,
                    help="Stop if remaining account credits would drop below this.")
     p.add_argument("--dry-run", action="store_true",
@@ -732,62 +737,87 @@ def main():
                         key = store_mod.game_key(g["date"], g["home_team"], g["away_team"])
                         event_ids[key] = ev.get("id")
 
-        # ── Phase 2: PROPS (per game) ──
+        # ── Phase 2: PROPS (per game) — parallel FETCH (network-bound), SERIAL write ──
         req_markets = [m.strip() for m in args.props.split(",") if m.strip()]
-        for i, g in enumerate(prop_games, 1):
+        # Pre-plan within budget: a cached re-fetch costs 0; an uncached game costs
+        # prop_cost. Stop once the plan would exceed --max-credits (the HARD cap), so
+        # parallel fetching can never overspend. --reserve trims the cap when the
+        # account balance is known.
+        eff_cap = args.max_credits
+        if args.reserve > 0:
+            _rem0 = get_remaining_credits()
+            if _rem0 is not None:
+                eff_cap = min(eff_cap, spent + max(0, _rem0 - args.reserve))
+        planned = []            # (g, key, eid, prop_date, cost)
+        proj = 0
+        for g in prop_games:
             key = store_mod.game_key(g["date"], g["home_team"], g["away_team"])
             entry = store["games"].get(key, {})
             eid = entry.get("event_id") or event_ids.get(key)
             if not eid:
-                continue  # no event id harvested for this game
+                continue        # no event id harvested for this game
             prop_date = (_snap_ts_for_date(g["date"], args.snapshot_time)
                          if args.snapshot_time else g["date"])
-            # spend-review #4: charge only a genuine (uncached) fetch — a cached
-            # event re-reads for 0 credits, so counting it would trip [stop] on a
-            # resume and drop genuinely-new games (or falsely "re-pay" on a warm cache).
-            this_cost = 0 if is_historical_event_cached(
+            c = 0 if is_historical_event_cached(
                 sport_key, eid, prop_date, regions=args.regions,
                 markets=args.props, bookmakers=[bookmaker]) else prop_cost
-            if not _budget_ok(this_cost):
-                print("  [stop] Budget/reserve reached during props phase.")
+            if c and spent + proj + c > eff_cap:
+                print("  [stop] Budget/reserve cap reached during props planning.")
                 break
-            try:
-                data, snap_ts = get_historical_event_odds(
-                    api_key, sport_key, eid, date=prop_date,
-                    regions=args.regions, markets=args.props, bookmakers=[bookmaker])
-            except requests.exceptions.HTTPError as e:
-                print(f"  [warn] props {key}: HTTP error ({e}); skipping.")
-                continue
-            if data is None:
-                continue
-            spent += this_cost
-            parsed = parse_player_props(data)
-            entry.setdefault("commence_time", g["date"])
-            entry.setdefault("home_team", data.get("home_team"))
-            entry.setdefault("away_team", data.get("away_team"))
-            entry["event_id"] = eid
-            entry["props_snapshot_timestamp"] = snap_ts
-            entry["props"] = parsed.get("props", {})
-            # spend-review #4: record the market SET we actually FETCHED (not just
-            # the keys the book posted two-sided) so a resume dedups on it — a
-            # requested-but-empty market must count as done, else the game is
-            # re-queued (and re-charged) forever.
-            entry["props_markets_fetched"] = sorted(
-                set(entry.get("props_markets_fetched") or []) | set(req_markets))
-            store["games"][key] = entry
-            prop_stored += 1
-            if args.warehouse:
+            planned.append((g, key, eid, prop_date, c))
+            proj += c
+
+        workers = max(1, int(args.workers))
+        print(f"  Props: fetching {len(planned)} game(s) with {workers} worker(s)…")
+
+        def _fetch_props(eid, prop_date):
+            return get_historical_event_odds(
+                api_key, sport_key, eid, date=prop_date, regions=args.regions,
+                markets=args.props, bookmakers=[bookmaker])
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_fetch_props, eid, prop_date): (g, key, eid, c)
+                    for (g, key, eid, prop_date, c) in planned}
+            for fut in as_completed(futs):
+                g, key, eid, c = futs[fut]
                 try:
-                    import warehouse
-                    warehouse.capture_event_odds(
-                        sport_key, eid, args.regions, args.props,
-                        [bookmaker], data, captured_at=snap_ts, source=bf_source)
-                except Exception:
-                    pass
-            if i % 25 == 0 or i == len(prop_games):
-                store_mod.save_store(sport_key, store, args.label)
-                print(f"  [props {i}/{len(prop_games)}] spent ~{spent}, "
-                      f"{prop_stored} games (remaining: {get_remaining_credits()})")
+                    data, snap_ts = fut.result()
+                except requests.exceptions.HTTPError as e:
+                    print(f"  [warn] props {key}: HTTP error ({e}); skipping.")
+                    continue
+                except Exception as e:
+                    print(f"  [warn] props {key}: {type(e).__name__}; skipping.")
+                    continue
+                if data is None:
+                    continue
+                spent += c                      # SERIAL: only planned (budgeted) games
+                entry = store["games"].get(key, {})
+                parsed = parse_player_props(data)
+                entry.setdefault("commence_time", g["date"])
+                entry.setdefault("home_team", data.get("home_team"))
+                entry.setdefault("away_team", data.get("away_team"))
+                entry["event_id"] = eid
+                entry["props_snapshot_timestamp"] = snap_ts
+                entry["props"] = parsed.get("props", {})
+                # record the market SET actually FETCHED so a resume dedups on it.
+                entry["props_markets_fetched"] = sorted(
+                    set(entry.get("props_markets_fetched") or []) | set(req_markets))
+                store["games"][key] = entry
+                prop_stored += 1
+                if args.warehouse:
+                    try:
+                        import warehouse
+                        warehouse.capture_event_odds(
+                            sport_key, eid, args.regions, args.props,
+                            [bookmaker], data, captured_at=snap_ts, source=bf_source)
+                    except Exception:
+                        pass
+                done += 1
+                if done % 25 == 0 or done == len(planned):
+                    store_mod.save_store(sport_key, store, args.label)
+                    print(f"  [props {done}/{len(planned)}] spent ~{spent}, "
+                          f"{prop_stored} games (remaining: {get_remaining_credits()})")
     except KeyboardInterrupt:
         print("\n  [interrupt] Saving progress before exit...")
     finally:
