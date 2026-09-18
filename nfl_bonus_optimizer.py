@@ -158,6 +158,17 @@ def _leg_ok(lg, bonus):
     return american_to_decimal(lg["odds"]) >= bonuslib.american_to_dec(bonus.min_odds_leg) - 1e-9
 
 
+def _scope_legs(legs, markets):
+    """Restrict legs to a bonus's MARKET SCOPE (bonus.markets). Empty scope = all legs
+    (unchanged). A market not present among the built legs (e.g. a non-modeled market
+    like anytime_td before its Phase-3 leg source exists, or 'team') simply matches
+    nothing — the caller then shows an empty result rather than off-scope plays."""
+    mset = {m for m in (markets or ()) if m}
+    if not mset:
+        return legs
+    return [l for l in legs if l.get("prop") in mset]
+
+
 # ── MLB legs (from the app's analysis candidates; gate = lineup participation, since the MLB
 # market is calibrated at all opportunity levels — see mlb_opportunity_threshold results) ──
 MLB_TRUSTWORTHY = {"batter_hits", "batter_total_bases", "batter_rbis",
@@ -203,15 +214,16 @@ def legs_from_candidates(candidates, book):
     return legs
 
 
-def sgp_stacks_indep(legs, bonus, bankroll):
+def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None):
     """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
     weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
-    required combined price for +EV. Same return shape as sgp_stacks (mx=0, no correlation)."""
+    required combined price for +EV. Same return shape as sgp_stacks (mx=0, no correlation).
+    ``leg_count`` forces the stack size (>=2)."""
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus):
             bygame[l["gid"]].append(l)
-    need = max(2, bonus.min_legs)
+    need = max(2, int(leg_count) if leg_count else max(2, bonus.min_legs))
     out = []
     for gid, gl in bygame.items():
         if len(gl) < need:
@@ -251,11 +263,19 @@ def _diversify(plays, k):
     return out
 
 
-def cross_game_plays(legs, bonus, bankroll):
-    """Concrete +EV cross-game parlays/singles ranked by boosted EV (independence joint)."""
+def cross_game_plays(legs, bonus, bankroll, leg_count=None):
+    """Concrete +EV cross-game parlays/singles ranked by boosted EV (independence joint).
+    ``leg_count`` (optional) forces EXACTLY that many legs (Doug's leg-count selector),
+    still subject to the bonus's type minimum + min_legs floor."""
     elig = sorted([l for l in legs if _leg_ok(l, bonus)], key=lambda x: -x["P"])[:TOP_N]
-    sizes = range(1, MAX_PARLAY + 1) if bonus.bet_type in ("single", "any") else range(2, MAX_PARLAY + 1)
-    sizes = [s for s in sizes if s >= max(1, bonus.min_legs)]
+    floor = max(1, bonus.min_legs)
+    type_min = 1 if bonus.bet_type in ("single", "any") else 2
+    if leg_count:
+        lc = int(leg_count)
+        sizes = [lc] if lc >= max(floor, type_min) else []
+    else:
+        sizes = range(1, MAX_PARLAY + 1) if bonus.bet_type in ("single", "any") else range(2, MAX_PARLAY + 1)
+        sizes = [s for s in sizes if s >= floor]
     plays = []
     for K in sizes:
         for combo in combinations(elig, K):
@@ -268,16 +288,17 @@ def cross_game_plays(legs, bonus, bankroll):
     return plays
 
 
-def sgp_stacks(legs, bonus, rho, bankroll):
+def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
     """Per-game same-side +corr STACKS for an SGP bonus: copula joint P + REQUIRED combined price.
-    (The book prices the SGP as one number; compare its builder price to 'need >=' live.)"""
+    (The book prices the SGP as one number; compare its builder price to 'need >=' live.)
+    ``leg_count`` forces the stack size (>=2)."""
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus):
             bygame[l["gid"]].append(l)
     rng = np.random.default_rng(0)
     out = []
-    need = max(2, bonus.min_legs)
+    need = max(2, int(leg_count) if leg_count else max(2, bonus.min_legs))
     for gid, gl in bygame.items():
         if len(gl) < need:
             continue
@@ -319,24 +340,26 @@ def _allows_sgp(bt):
     return bt in ("any", "any_parlay", "sgp", "sgp_sgpx")
 
 
-def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None):
+def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=None):
     """Structured optimizer output for a slate — the shared core for the CLI and the app.
-    sgp_fn(legs, bonus) -> stacks lets a sport pick its SGP joint (NFL copula vs MLB independence);
-    defaults to the NFL copula path. Returns
-    [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
+    sgp_fn(legs, bonus, leg_count) -> stacks lets a sport pick its SGP joint (NFL copula
+    vs MLB independence); defaults to the NFL copula path. Each bonus's legs are scoped to
+    its ``markets`` (empty = all). ``leg_count`` (optional) forces the parlay/SGP size.
+    Returns [{book, label, bet_type, n_legs, cross:[(ev,r,combo)], sgp:[(jp,mx,combo,need)]}]."""
     if sgp_fn is None:
-        def sgp_fn(legs, bonus):
-            return sgp_stacks(legs, bonus, rho, bankroll)[:TOP_K]
+        def sgp_fn(legs, bonus, leg_count=None):
+            return sgp_stacks(legs, bonus, rho, bankroll, leg_count)[:TOP_K]
     out = []
     for base in bonuses:
         for book, legs in legs_by_book.items():
             bonus = bonuslib.Bonus(**{**base.__dict__, "book": book})
-            cross = (_diversify(cross_game_plays(legs, bonus, bankroll), TOP_K)
+            scoped = _scope_legs(legs, getattr(base, "markets", ()))
+            cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count), TOP_K)
                      if _allows_cross(bonus.bet_type) else [])
-            stacks = sgp_fn(legs, bonus) if _allows_sgp(bonus.bet_type) else []
+            stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
             out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
                         "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
-                        "n_legs": len(legs), "cross": cross, "sgp": stacks})
+                        "n_legs": len(scoped), "cross": cross, "sgp": stacks})
     return out
 
 

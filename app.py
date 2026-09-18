@@ -2299,8 +2299,8 @@ def render_bonuses():
             legs_by_book = {bk: opt.legs_from_candidates(cands, bk)
                             for bk in ("draftkings", "fanduel")}
 
-            def _mlb_sgp(legs, bonus):
-                return opt.sgp_stacks_indep(legs, bonus, bankroll)[:opt.TOP_K]
+            def _mlb_sgp(legs, bonus, leg_count=None):
+                return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
             results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll, sgp_fn=_mlb_sgp)
             pabbr = opt.MLB_ABBR
         else:
