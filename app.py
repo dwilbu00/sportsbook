@@ -2333,8 +2333,12 @@ def render_bonuses():
                     key="brun_side",
                     help="auto: TD/HR → over (bet players TO score/homer); else favorite "
                          "(higher-P). +EV filter still drops legs the boost can't flip.")
-                rlegs = cc[1].number_input("Legs per parlay (0=auto)", 0,
-                                           int(_opt.MAX_PARLAY), 0, key="brun_legs")
+                rlegs = cc[1].number_input(
+                    "Legs per parlay (0=auto)", 0, int(_opt.MAX_FORCED_LEGS), 0,
+                    key="brun_legs",
+                    help="0 = optimizer picks the best size (≤3). Force up to "
+                         f"{int(_opt.MAX_FORCED_LEGS)} for a 'lottery' hail-mary parlay "
+                         "(enable Lottery mode below to build it even if −EV).")
                 est = len(picked) * len(fetch_markets)      # 1 region (us)
                 if st.button(f"Fetch odds & build (~{est} credits)",
                              disabled=not picked, key="brun_go"):
@@ -2404,12 +2408,14 @@ def render_bonuses():
                    f"`{', '.join(board.get('markets') or ())}` · side "
                    f"**{board.get('side')}** · book de-vig only (no value filter).")
     else:
-        # Leg-count control: 0 = auto (optimizer sweeps sizes); N = force exactly N legs.
+        # Leg-count control: 0 = auto (optimizer sweeps sizes); N = force exactly N legs
+        # (up to MAX_FORCED_LEGS for a lottery parlay).
         _lc = st.number_input(
             "Legs per generated parlay (0 = auto)", min_value=0,
-            max_value=int(opt.MAX_PARLAY), value=0, step=1,
+            max_value=int(opt.MAX_FORCED_LEGS), value=0, step=1,
             help="Force the boosted parlay/SGP to exactly this many legs; 0 lets the "
-                 "optimizer choose the best size.")
+                 f"optimizer choose the best size (≤3). Up to {int(opt.MAX_FORCED_LEGS)} "
+                 "for a lottery hail-mary (enable Lottery mode below).")
         leg_count = int(_lc) or None
 
     # "More likely to hit" control: drop any leg whose book-devig hit probability is
@@ -2421,6 +2427,17 @@ def render_bonuses():
         help="Only build plays from legs at least this likely to hit (book de-vig P). "
              "Raise it for safer tickets that cash more often but pay less; 0.50 keeps "
              "every qualifying leg.")
+
+    # Lottery mode: a big parlay compounds the vig faster than any boost can offset
+    # (break-even is ~8-9 legs even at 50%), so long tickets are almost always −EV.
+    # Off (default) = only +EV tickets show (the disciplined product). On = build the
+    # highest-EV ticket anyway — a deliberate hail-mary you know is −EV.
+    lottery = st.checkbox(
+        "🎰 Lottery mode — build long-shot parlays even if −EV",
+        value=False,
+        help="A boost can't make a 10-leg parlay +EV (vig compounds). Turn this on to "
+             "build the ticket anyway as a hail-mary; leave off for the +EV-only product.")
+    require_positive_ev = not lottery
 
     is_mlb = board_sport == "baseball_mlb"
     with st.spinner("Scanning legs + building +EV plays…"):
@@ -2453,7 +2470,8 @@ def render_bonuses():
                                         min_leg_p=min_leg_p)[:opt.TOP_K]
         results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
                                      sgp_fn=_sgp_indep, leg_count=leg_count,
-                                     min_leg_p=min_leg_p)
+                                     min_leg_p=min_leg_p,
+                                     require_positive_ev=require_positive_ev)
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
     n_games = len(board["parsed"])
@@ -2513,7 +2531,11 @@ def render_bonuses():
         shown = True
         st.markdown(f"**[{r['book']}] {r['label']}** — {r['n_legs']} eligible legs")
         if r["cross"]:
-            st.caption("Cross-game / single (+EV, fully priced — ready to bet):")
+            if lottery and any(ev <= 0 for ev, _, _ in r["cross"]):
+                st.caption("🎰 Lottery / cross-game (fully priced — includes **−EV "
+                           "hail-mary** tickets; check the EV% column before you bet):")
+            else:
+                st.caption("Cross-game / single (+EV, fully priced — ready to bet):")
             st.dataframe(pd.DataFrame([{
                 "EV%": round(ev, 1), "stake $": round(rr["kelly_stake"], 2),
                 "legs": len(combo), "odds": int(rr["combined_american"]),
@@ -2596,8 +2618,18 @@ def render_bonuses():
                     + " is a **parlay/SGP** bonus — those require ≥2 legs (the book won't "
                     "accept a 1-leg parlay). Set the leg count to ≥2, or change the bonus "
                     "type to **single** or **any** to get single bets.")
+        elif leg_count and leg_count > n_games:
+            st.info(f"You forced **{leg_count} legs**, but only **{n_games} game(s)** are "
+                    "on this slate — a cross-game parlay needs one game per leg. Add more "
+                    "games (▶ Run analysis for a bonus), or a same-game (SGP) stack needs "
+                    f"one game with ≥{leg_count} eligible legs.")
+        elif not require_positive_ev:
+            st.info("Lottery mode is on but no ticket could be built at this leg count — "
+                    "raise the slate size or lower the minimum leg probability.")
         else:
-            st.info("No qualifying +EV plays for the active bonuses on this slate.")
+            st.info("No qualifying +EV plays for the active bonuses on this slate. "
+                    "For a long-shot ticket, turn on 🎰 Lottery mode (builds −EV "
+                    "hail-marys) and/or force a higher leg count.")
 
 
 def render_parlays():

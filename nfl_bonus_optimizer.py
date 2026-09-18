@@ -36,7 +36,8 @@ from odds_client import american_to_decimal, american_to_implied_prob, devig_two
 TRUSTWORTHY = sgp.TRUSTWORTHY               # {prop: opp_threshold}
 _CUR_SLATE_WEEK = 99                        # sentinel: "all completed weeks are prior" (upcoming)
 PROP_ABBR = sgp.PROP_ABBR
-MAX_PARLAY = 3       # cap ticket size we enumerate
+MAX_PARLAY = 3       # cap ticket size the AUTO sweep enumerates (perf: sum of C(TOP_N,k))
+MAX_FORCED_LEGS = 10 # cap when the user FORCES an exact leg count ("lottery" hail-mary parlay)
 TOP_N = 18           # top legs (by P) per book to consider (feeds the non-overlapping portfolio)
 TOP_K = 8            # plays to surface per bonus
 
@@ -350,17 +351,21 @@ def _diversify(plays, k):
     return out
 
 
-def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
-    """Concrete +EV cross-game parlays/singles ranked by boosted EV (independence joint).
-    ``leg_count`` (optional) forces EXACTLY that many legs (Doug's leg-count selector),
-    still subject to the bonus's type minimum + min_legs floor. ``min_leg_p`` drops any leg
-    below that hit probability ("more likely to hit" mode — safer, higher-P legs only)."""
+def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0,
+                     require_positive_ev=True):
+    """Concrete cross-game parlays/singles ranked by boosted EV (independence joint).
+    ``leg_count`` (optional) forces EXACTLY that many legs (Doug's leg-count selector,
+    up to MAX_FORCED_LEGS for a "lottery" parlay), still subject to the bonus's type
+    minimum + min_legs floor. ``min_leg_p`` drops any leg below that hit probability
+    ("more likely to hit" mode). ``require_positive_ev`` (default True) keeps only +EV
+    tickets; set False for LOTTERY mode — build the highest-EV ticket even when the
+    compounding vig leaves it −EV (a deliberate hail-mary; still ranked by EV)."""
     elig = sorted([l for l in legs if _leg_ok(l, bonus) and l["P"] >= min_leg_p],
                   key=lambda x: -x["P"])[:TOP_N]
     floor = max(1, bonus.min_legs)
     type_min = 1 if bonus.bet_type in ("single", "any") else 2
     if leg_count:
-        lc = int(leg_count)
+        lc = min(int(leg_count), MAX_FORCED_LEGS)
         sizes = [lc] if lc >= max(floor, type_min) else []
     else:
         sizes = range(1, MAX_PARLAY + 1) if bonus.bet_type in ("single", "any") else range(2, MAX_PARLAY + 1)
@@ -371,7 +376,7 @@ def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
             if len({l["gid"] for l in combo}) != K:        # cross-game only
                 continue
             r = bonuslib.evaluate([(l["P"], l["odds"]) for l in combo], bonus, bankroll=bankroll)
-            if r["qualifies"] and r["boosted_ev_pct"] > 0:
+            if r["qualifies"] and (not require_positive_ev or r["boosted_ev_pct"] > 0):
                 plays.append((r["boosted_ev_pct"], r, combo))
     plays.sort(key=lambda x: -x[0])
     return plays
@@ -430,7 +435,7 @@ def _allows_sgp(bt):
 
 
 def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=None,
-                   min_leg_p=0.0):
+                   min_leg_p=0.0, require_positive_ev=True):
     """Structured optimizer output for a slate — the shared core for the CLI and the app.
     sgp_fn(legs, bonus, leg_count) -> stacks lets a sport pick its SGP joint (NFL copula
     vs MLB independence); defaults to the NFL copula path. Each bonus's legs are scoped to
@@ -450,7 +455,8 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=
             continue
         scoped = _scope_legs(legs, getattr(bonus, "markets", ()))
         cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count,
-                                             min_leg_p=min_leg_p), TOP_K)
+                                             min_leg_p=min_leg_p,
+                                             require_positive_ev=require_positive_ev), TOP_K)
                  if _allows_cross(bonus.bet_type) else [])
         stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
         out.append({"book": bonus.book, "label": bonus.label, "bet_type": bonus.bet_type,
