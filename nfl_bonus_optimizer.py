@@ -220,6 +220,60 @@ def legs_from_candidates(candidates, book):
     return legs
 
 
+def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
+                           season=None, week=_CUR_SLATE_WEEK, side="favorite"):
+    """Bonus legs from a freshly-fetched parsed board, scoped to a bonus's MARKETS —
+    the Phase-3 bonus-driven-analysis leg source (works for markets we DON'T model,
+    e.g. home runs / anytime TD). Leg P = book de-vig (+ book_calibration shrink). NFL
+    modeled count props keep the nflverse opportunity gate; everything else (non-
+    modeled markets, and MLB props whose lineup gate needs analysis data absent from a
+    raw board) is book-de-vig-only — a benched player's still-posted line is the user's
+    build-time check (books pull most inactive players). ``markets`` empty => the
+    sport's modeled set. Same leg dict shape as legs_from_board.
+
+    ``side``: 'favorite' (default) takes each leg's higher-P side; 'over' FORCES the
+    over/yes side — for occurrence boosts (anytime TD / home runs), where the whole
+    point is betting players TO score/homer even though that's the longshot side (the
+    +EV filter downstream still drops any that the boost can't flip)."""
+    pxkey = "dk" if book == "draftkings" else "fd"
+    is_nfl = sport_key == "americanfootball_nfl"
+    modeled = set(TRUSTWORTHY) if is_nfl else set(MLB_TRUSTWORTHY)
+    scope = set(m for m in (markets or ()) if m) or set(modeled)
+    scope.discard("team")                     # team-market legs = a separate builder
+    bcmaps = book_calibration.load_maps(sport_key)
+    legs = []
+    for board in parsed_boards:
+        gid = board.get("game_id")
+        home, away = board.get("home_team"), board.get("away_team")
+        commence = board.get("commence_time") or ""
+        gdate = commence[:10]
+        seas = season or _season_of(commence)
+        for prop in scope:
+            for player, p in board.get("props", {}).get(prop, {}).items():
+                gate_nfl = is_nfl and prop in modeled
+                if gate_nfl and seas is not None and not srv.passes_gate(
+                        scan._norm(player), seas, week, prop):
+                    continue
+                fair = p.get("over_implied")
+                line = p.get("line")
+                if fair is None or line is None:
+                    continue
+                fair = book_calibration.apply(sport_key, prop, fair, maps=bcmaps)
+                use_over = True if side == "over" else (fair >= 0.5)
+                price = p.get(f"{pxkey}_{'over' if use_over else 'under'}_price")
+                if price is None:
+                    continue
+                team = srv.player_team(scan._norm(player), seas) if gate_nfl else None
+                opp = away if team == home else (home if team == away else None)
+                legs.append({
+                    "gid": gid, "prop": prop, "player": player, "team": team, "opp": opp,
+                    "line": line, "side": "OVER" if use_over else "UNDER",
+                    "P": fair if use_over else 1.0 - fair, "fair_over": use_over,
+                    "t_over": sgp._ppf(1.0 - fair), "odds": price,
+                    "commence_time": commence, "game_date": gdate})
+    return legs
+
+
 def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None):
     """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
     weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
