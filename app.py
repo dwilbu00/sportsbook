@@ -2288,6 +2288,80 @@ def render_bonuses():
                 bonus_store.save_bonuses(bonuses)
                 st.rerun()
 
+    # ── Run analysis FOR a bonus: fetch ONLY its markets for the games you pick
+    #    (Phase 3). Pure book de-vig — no value filtering — so it works for markets we
+    #    don't model (HR / anytime-TD). Costs credits, shown + confirmed before firing.
+    if bonuses:
+        import nfl_bonus_optimizer as _opt
+        _OCC = {"anytime_td", "player_anytime_td", "batter_home_runs"}
+        with st.expander("▶ Run analysis for a bonus (fetch its markets)"):
+            names = [bonuslib.display_name(b) for b in bonuses]
+            bi = st.selectbox("Bonus", range(len(bonuses)),
+                              format_func=lambda i: names[i], key="brun_bonus")
+            rb = bonuses[bi]
+            rb_sport = getattr(rb, "sport", "americanfootball_nfl")
+            _modeled = (list(_opt.TRUSTWORTHY) if rb_sport == "americanfootball_nfl"
+                        else list(_opt.MLB_TRUSTWORTHY))
+            fetch_markets = [m for m in (getattr(rb, "markets", ()) or ())
+                             if m and m != "team"] or _modeled
+            st.caption(f"Fetches **{', '.join(fetch_markets)}** "
+                       f"({_SPORT_LABELS.get(rb_sport, rb_sport)}) for the games you pick "
+                       f"— book de-vig only, no value filter. Costs credits (shown below).")
+            if "team" in (getattr(rb, "markets", ()) or ()):
+                st.caption("⚠ Team markets are skipped in v1 (props only).")
+            _cfg = load_config()
+            _key = _cfg.get("odds_api_key", "")
+            try:
+                events = get_upcoming_events(_key, rb_sport) if _key else []
+            except Exception as e:
+                events, _ = [], st.warning(f"Couldn't load games: {e}")
+            if not events:
+                st.info("No upcoming games for this sport (or no API key set).")
+            else:
+                ev_by_id = {ev["id"]: ev for ev in events}
+
+                def _evlabel(i):
+                    ev = ev_by_id[i]
+                    return (f"{ev.get('away_team')} @ {ev.get('home_team')} · "
+                            f"{(ev.get('commence_time') or '')[:16].replace('T', ' ')}")
+
+                picked = st.multiselect("Games", list(ev_by_id),
+                                        format_func=_evlabel, key="brun_games")
+                cc = st.columns(2)
+                side_choice = cc[0].radio(
+                    "Leg side", ["auto", "over", "favorite"], horizontal=True,
+                    key="brun_side",
+                    help="auto: TD/HR → over (bet players TO score/homer); else favorite "
+                         "(higher-P). +EV filter still drops legs the boost can't flip.")
+                rlegs = cc[1].number_input("Legs per parlay (0=auto)", 0,
+                                           int(_opt.MAX_PARLAY), 0, key="brun_legs")
+                est = len(picked) * len(fetch_markets)      # 1 region (us)
+                if st.button(f"Fetch odds & build (~{est} credits)",
+                             disabled=not picked, key="brun_go"):
+                    boards, prog = [], st.progress(0.0)
+                    for j, eid in enumerate(picked, 1):
+                        try:
+                            raw = get_event_odds(_key, rb_sport, eid,
+                                                 markets=",".join(fetch_markets),
+                                                 bookmakers=None)
+                            boards.append(parse_player_props(raw))
+                        except Exception as e:
+                            st.warning(f"{_evlabel(eid)}: {e}")
+                        prog.progress(j / len(picked))
+                    if side_choice == "auto":
+                        side = "over" if set(fetch_markets) <= _OCC else "favorite"
+                    else:
+                        side = side_choice
+                    st.session_state["bonus_board"] = {
+                        "sport_key": rb_sport, "parsed": boards, "scoped": True,
+                        "markets": tuple(fetch_markets), "side": side,
+                        "bonus_label": rb.label, "candidates": [],
+                        "leg_count": int(rlegs) or None, "ts": time.time()}
+                    st.session_state["_bonus_log_msg"] = (
+                        f"Fetched {len(boards)} game(s) for {names[bi]} (side={side}) "
+                        "— plays below.")
+                    st.rerun()
+
     st.divider()
     st.subheader("+EV plays on your current slate")
     board = st.session_state.get("bonus_board")
@@ -2296,8 +2370,15 @@ def render_bonuses():
                 "This page reuses that already-fetched board — no extra API credits.")
         return
     board_sport = board.get("sport_key")
-    # Only evaluate bonuses whose sport matches the loaded slate.
+    scoped = bool(board.get("scoped"))       # Phase-3 bonus-run fetch (raw scoped board)
+    import nfl_bonus_optimizer as opt
+    # Only evaluate bonuses whose sport matches the loaded slate; a scoped run
+    # evaluates JUST the bonus it was run for.
     bonuses = [b for b in bonuses if getattr(b, "sport", "americanfootball_nfl") == board_sport]
+    if scoped and board.get("bonus_label"):
+        _rbz = [b for b in bonuses if b.label == board["bonus_label"]]
+        if _rbz:
+            bonuses = _rbz
     if not bonuses:
         st.info(f"No active bonuses for the loaded {_SPORT_LABELS.get(board_sport, board_sport)} "
                 "slate — add one above (set its Sport to match).")
@@ -2306,7 +2387,6 @@ def render_bonuses():
         st.warning("The bonus optimizer supports NFL and MLB. Load one of those in the Value "
                    "Finder, then return here.")
         return
-    import nfl_bonus_optimizer as opt
     import parlay_store
     try:
         import bankroll as _bk
@@ -2314,37 +2394,51 @@ def render_bonuses():
     except Exception:
         bankroll = 1000.0
     bankroll = bankroll if bankroll and bankroll > 0 else 1000.0
+    # leg labels: modeled abbrevs + fall back to the market key for non-modeled (HR/TD)
+    pabbr = dict(opt.PROP_ABBR)
+    pabbr.update(opt.MLB_ABBR)
 
-    # Leg-count control: 0 = auto (optimizer sweeps sizes); N = force exactly N legs
-    # in the generated parlays/SGP stacks (still subject to each bonus's min_legs/type).
-    _lc = st.number_input(
-        "Legs per generated parlay (0 = auto)", min_value=0,
-        max_value=int(opt.MAX_PARLAY), value=0, step=1,
-        help="Force the boosted parlay/SGP to exactly this many legs; 0 lets the "
-             "optimizer choose the best size.")
-    leg_count = int(_lc) or None
+    if scoped:
+        leg_count = board.get("leg_count")
+        st.caption(f"Scoped run for **{board.get('bonus_label')}** · markets "
+                   f"`{', '.join(board.get('markets') or ())}` · side "
+                   f"**{board.get('side')}** · book de-vig only (no value filter).")
+    else:
+        # Leg-count control: 0 = auto (optimizer sweeps sizes); N = force exactly N legs.
+        _lc = st.number_input(
+            "Legs per generated parlay (0 = auto)", min_value=0,
+            max_value=int(opt.MAX_PARLAY), value=0, step=1,
+            help="Force the boosted parlay/SGP to exactly this many legs; 0 lets the "
+                 "optimizer choose the best size.")
+        leg_count = int(_lc) or None
 
     is_mlb = board_sport == "baseball_mlb"
-    with st.spinner("Scanning trustworthy legs + building +EV plays…"):
-        if is_mlb:
-            # MLB legs come from the analyzed candidates (market de-vig P + lineup gate); SGP
-            # joint = INDEPENDENCE (step-3 verdict). Cross-game is independent either way.
+    with st.spinner("Scanning legs + building +EV plays…"):
+        if scoped:
+            # Scoped fetch: legs for the bonus's markets (incl. non-modeled HR/TD) from
+            # the raw board, chosen side. SGP = INDEPENDENCE (no rho for these markets).
+            legs_by_book = {bk: opt.legs_from_scoped_board(
+                                board["parsed"], bk, board.get("markets"), board_sport,
+                                side=board.get("side", "favorite"))
+                            for bk in ("draftkings", "fanduel")}
+        elif is_mlb:
+            # MLB legs from the analyzed candidates (market de-vig P + lineup gate).
             cands = board.get("candidates") or []
             legs_by_book = {bk: opt.legs_from_candidates(cands, bk)
                             for bk in ("draftkings", "fanduel")}
-
-            def _mlb_sgp(legs, bonus, leg_count=None):
-                return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
-            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
-                                         sgp_fn=_mlb_sgp, leg_count=leg_count)
-            pabbr = opt.MLB_ABBR
         else:
             legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
                             for bk in ("draftkings", "fanduel")}
+
+        if is_mlb or scoped:
+            def _sgp_indep(legs, bonus, leg_count=None):
+                return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
+            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
+                                         sgp_fn=_sgp_indep, leg_count=leg_count)
+        else:
             rho = opt.load_rho()
             results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll,
                                          leg_count=leg_count)
-            pabbr = opt.PROP_ABBR
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
     n_games = len(board["parsed"])
