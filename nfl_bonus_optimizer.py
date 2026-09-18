@@ -180,6 +180,23 @@ MLB_TRUSTWORTHY = {"batter_hits", "batter_total_bases", "batter_rbis",
 MLB_ABBR = {"batter_hits": "H", "batter_total_bases": "TB", "batter_rbis": "RBI",
             "pitcher_strikeouts": "K", "pitcher_earned_runs": "ER", "pitcher_outs": "outs"}
 
+# BROAD bonus leg universe: bonuses price off book de-vig, so ANY captured market is
+# eligible — not just the model-gated count props (TRUSTWORTHY). This is the default
+# scope when a bonus sets no markets (yardages/TDs/HR included). Gate is applied only
+# where we have one (the NFL count props via passes_gate); the rest are book-de-vig.
+NFL_BONUS_MARKETS = ("player_receptions", "player_rush_attempts", "player_pass_attempts",
+                     "player_pass_completions", "player_pass_yds", "player_rush_yds",
+                     "player_reception_yds", "player_pass_tds", "player_anytime_td")
+MLB_BONUS_MARKETS = ("batter_hits", "batter_total_bases", "batter_rbis",
+                     "pitcher_strikeouts", "pitcher_earned_runs", "pitcher_outs",
+                     "batter_home_runs")
+
+
+def bonus_markets(sport_key):
+    """Default broad bonus market scope for a sport (used when a bonus sets none)."""
+    return (NFL_BONUS_MARKETS if sport_key == "americanfootball_nfl"
+            else MLB_BONUS_MARKETS)
+
 
 def _mlb_gate_ok(c):
     """Participation gate: batter in the lineup, top-6 order (high PA); pitcher = probable
@@ -238,7 +255,8 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     pxkey = "dk" if book == "draftkings" else "fd"
     is_nfl = sport_key == "americanfootball_nfl"
     modeled = set(TRUSTWORTHY) if is_nfl else set(MLB_TRUSTWORTHY)
-    scope = set(m for m in (markets or ()) if m) or set(modeled)
+    # empty scope => the BROAD bonus universe (yardages/TDs/HR), not just modeled props
+    scope = set(m for m in (markets or ()) if m) or set(bonus_markets(sport_key))
     scope.discard("team")                     # team-market legs = a separate builder
     bcmaps = book_calibration.load_maps(sport_key)
     legs = []
@@ -410,16 +428,19 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=
         def sgp_fn(legs, bonus, leg_count=None):
             return sgp_stacks(legs, bonus, rho, bankroll, leg_count)[:TOP_K]
     out = []
-    for base in bonuses:
-        for book, legs in legs_by_book.items():
-            bonus = bonuslib.Bonus(**{**base.__dict__, "book": book})
-            scoped = _scope_legs(legs, getattr(base, "markets", ()))
-            cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count), TOP_K)
-                     if _allows_cross(bonus.bet_type) else [])
-            stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
-            out.append({"book": book, "label": base.label, "bet_type": bonus.bet_type,
-                        "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
-                        "n_legs": len(scoped), "cross": cross, "sgp": stacks})
+    for bonus in bonuses:
+        # A promo is for ONE book — only build plays from that book's legs (the DK+FD
+        # legs_by_book has both; a DK bonus must not surface FanDuel tickets).
+        legs = legs_by_book.get(bonus.book)
+        if legs is None:
+            continue
+        scoped = _scope_legs(legs, getattr(bonus, "markets", ()))
+        cross = (_diversify(cross_game_plays(scoped, bonus, bankroll, leg_count), TOP_K)
+                 if _allows_cross(bonus.bet_type) else [])
+        stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
+        out.append({"book": bonus.book, "label": bonus.label, "bet_type": bonus.bet_type,
+                    "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
+                    "n_legs": len(scoped), "cross": cross, "sgp": stacks})
     return out
 
 

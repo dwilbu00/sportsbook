@@ -2221,7 +2221,7 @@ def render_bonuses():
         "NFL: Receptions": "player_receptions", "NFL: Rush Att": "player_rush_attempts",
         "NFL: Pass Att": "player_pass_attempts", "NFL: Pass Yds": "player_pass_yds",
         "NFL: Rush Yds": "player_rush_yds", "NFL: Rec Yds": "player_reception_yds",
-        "NFL: Pass TDs": "player_pass_tds", "NFL: Anytime TD": "anytime_td",
+        "NFL: Pass TDs": "player_pass_tds", "NFL: Anytime TD": "player_anytime_td",
         "Team markets (ML/spread/total)": "team"}
 
     # ── active-bonus manager ──
@@ -2293,17 +2293,17 @@ def render_bonuses():
     #    don't model (HR / anytime-TD). Costs credits, shown + confirmed before firing.
     if bonuses:
         import nfl_bonus_optimizer as _opt
-        _OCC = {"anytime_td", "player_anytime_td", "batter_home_runs"}
+        _OCC = {"player_anytime_td", "batter_home_runs"}   # occurrence markets → over
         with st.expander("▶ Run analysis for a bonus (fetch its markets)"):
             names = [bonuslib.display_name(b) for b in bonuses]
             bi = st.selectbox("Bonus", range(len(bonuses)),
                               format_func=lambda i: names[i], key="brun_bonus")
             rb = bonuses[bi]
             rb_sport = getattr(rb, "sport", "americanfootball_nfl")
-            _modeled = (list(_opt.TRUSTWORTHY) if rb_sport == "americanfootball_nfl"
-                        else list(_opt.MLB_TRUSTWORTHY))
+            # default (no scope) = the BROAD bonus universe for the sport (yardages/
+            # TDs/HR), so a general bonus fetches everything, not just the count props.
             fetch_markets = [m for m in (getattr(rb, "markets", ()) or ())
-                             if m and m != "team"] or _modeled
+                             if m and m != "team"] or list(_opt.bonus_markets(rb_sport))
             st.caption(f"Fetches **{', '.join(fetch_markets)}** "
                        f"({_SPORT_LABELS.get(rb_sport, rb_sport)}) for the games you pick "
                        f"— book de-vig only, no value filter. Costs credits (shown below).")
@@ -2427,18 +2427,21 @@ def render_bonuses():
             legs_by_book = {bk: opt.legs_from_candidates(cands, bk)
                             for bk in ("draftkings", "fanduel")}
         else:
-            legs_by_book = {bk: opt.legs_from_board(board["parsed"], bk)
+            # NFL reuse: build from the BROAD bonus universe (yardages/TDs incl.), not
+            # just the 3 modeled count props — bonuses price off book de-vig. Favorite
+            # side; per-bonus market scope is applied inside evaluate_slate.
+            legs_by_book = {bk: opt.legs_from_scoped_board(
+                                board["parsed"], bk, None, board_sport, side="favorite")
                             for bk in ("draftkings", "fanduel")}
 
-        if is_mlb or scoped:
-            def _sgp_indep(legs, bonus, leg_count=None):
-                return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
-            results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
-                                         sgp_fn=_sgp_indep, leg_count=leg_count)
-        else:
-            rho = opt.load_rho()
-            results = opt.evaluate_slate(legs_by_book, bonuses, rho, bankroll,
-                                         leg_count=leg_count)
+        # INDEPENDENCE joint for every SGP: the leg universe is now broad (yardages/
+        # TDs/HR), which the copula has no rho for, and independence was already the
+        # validated "adequate, slightly conservative" base joint. (Frozen NFL rho stays
+        # a research artifact; the copula is retired from the live bonus path.)
+        def _sgp_indep(legs, bonus, leg_count=None):
+            return opt.sgp_stacks_indep(legs, bonus, bankroll, leg_count)[:opt.TOP_K]
+        results = opt.evaluate_slate(legs_by_book, bonuses, None, bankroll,
+                                     sgp_fn=_sgp_indep, leg_count=leg_count)
 
     # ── eligibility diagnostics (so an empty result explains itself) ──
     n_games = len(board["parsed"])
