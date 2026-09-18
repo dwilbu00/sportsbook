@@ -30,6 +30,7 @@ import nfl_ladder_clv as clv
 import bonus as bonuslib
 import nfl_sgp_correlation as sgp
 import nfl_opportunity_serving as srv
+import book_calibration
 from odds_client import american_to_decimal, american_to_implied_prob, devig_two_way
 
 TRUSTWORTHY = sgp.TRUSTWORTHY               # {prop: opp_threshold}
@@ -112,6 +113,7 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
     Returns the same leg dict shape as the offline `collect_week_legs`.
     """
     pxkey = "dk" if book == "draftkings" else "fd"
+    _bcmaps = book_calibration.load_maps("americanfootball_nfl")   # shrink book P if any
     legs = []
     for board in parsed_boards:
         gid = board.get("game_id")
@@ -130,6 +132,8 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
                 line = p.get("line")
                 if fair is None or line is None:
                     continue
+                fair = book_calibration.apply("americanfootball_nfl", prop, fair,
+                                              maps=_bcmaps)
                 fav_over = fair >= 0.5
                 price = p.get(f"{pxkey}_{'over' if fav_over else 'under'}_price")
                 if price is None:                      # this book doesn't post the fav side
@@ -192,6 +196,7 @@ def legs_from_candidates(candidates, book):
     """MLB leg source: build legs from the app's analysis candidates (market de-vig P +
     lineup gate). book-specific price (DK/FD). Favorite side."""
     pxk = "dk" if book == "draftkings" else "fd"
+    _bcmaps = book_calibration.load_maps("baseball_mlb")          # shrink book P if any
     legs = []
     for c in candidates:
         if c.get("type") != "player_prop" or c.get("no_history"):
@@ -202,7 +207,8 @@ def legs_from_candidates(candidates, book):
         fo = c.get("over_implied")
         if fo is None:
             continue
-        fo = float(fo) / 100.0                       # candidate stores it as a percent
+        # candidate stores over_implied as a percent; apply any book-calibration shrink
+        fo = book_calibration.apply("baseball_mlb", prop, float(fo) / 100.0, maps=_bcmaps)
         fav_over = fo >= 0.5
         price = c.get(f"{pxk}_{'over' if fav_over else 'under'}_price")
         if price is None:

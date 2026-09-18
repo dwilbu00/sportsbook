@@ -4533,7 +4533,8 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
           f"{', '.join(staged)}  (candidate — review --diff, then --promote)")
 
 
-def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter_hits"):
+def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter_hits",
+                              save=False):
     """Measure the BOOK's OWN calibration for a market: is the sharp de-vigged price a
     calibrated probability, or is there systematic bias (e.g. public over-shading) that
     a shrink could correct?
@@ -4545,7 +4546,12 @@ def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter
       - winner = platt/isotonic -> the de-vig is systematically off; the map is the
         correction to apply to bonus leg P (improvement shows in Brier/log-loss/ECE).
     Watch the reliability curve in the FAVORITE band (~0.6-0.9) — that's where boost
-    legs live. OFFLINE + free; writes nothing (measure-only for now)."""
+    legs live.
+
+    With ``save`` (--save-recal): when a shrink wins OOS, STAGE the winning map into
+    calibration/book_calibration_<sport>.json (per market), which the bonus optimizer
+    applies to every leg's P. A committed file -> review `git diff`, then commit.
+    OFFLINE + free."""
     import book_line_calibration as blc
     print(f"\n=== BOOK calibration: {SPORT_MAP[sport][2]} {prop} "
           f"(de-vig P vs realized) ===")
@@ -4557,9 +4563,28 @@ def diagnose_book_calibration(sport, store_label="", min_cell_n=50, prop="batter
     print(f"  {len(priced)} priced obs of {len(rows)} total. Raw p = the book's "
           f"de-vigged price; the 'winner' line says whether recalibrating it beats the "
           f"raw book OOS (a win = exploitable miscalibration to correct on bonus legs).")
-    _rc_run_bucket(f"{prop} BOOK", "book", rows, blc, min_cell_n)
-    print("\n  (Diagnostic only — nothing written. If a map beats raw in the 0.6-0.9 "
-          "favorite band, that's the shrink to wire into the bonus leg P.)")
+    res = _rc_run_bucket(f"{prop} BOOK", "book", rows, blc, min_cell_n)
+    if not save:
+        print("\n  (Diagnostic only — nothing written. Re-run with --save-recal to "
+              "STAGE the winning shrink into the bonus leg P.)")
+        return
+    if not res or res.get("winner") == "raw":
+        print(f"\n  (--save-recal: {prop} book is calibrated (winner=raw) — nothing "
+              f"to stage; the bonus optimizer trusts the book P as-is.)")
+        return
+    import book_calibration as bc
+    if res["winner"] == "platt":
+        pl = res["platt"]
+        entry = {"kind": "platt", "a": round(pl["a"], 6), "b": round(pl["b"], 6),
+                 "n": pl.get("n")}
+    else:                                   # isotonic
+        mp = res["iso"]
+        entry = {"kind": "isotonic", "kx": [round(x, 6) for x in mp["kx"]],
+                 "ky": [round(y, 6) for y in mp["ky"]], "n": mp.get("n")}
+    path = bc.save_map(sport_key, prop, entry)
+    print(f"\n  [save] staged book-calibration for {prop} ({res['winner']}) -> {path} "
+          f"— the bonus optimizer applies it to every {prop} leg's P. Review `git "
+          f"diff`, then commit.")
 
 
 def _print_calibration_diff(sport):
@@ -4992,7 +5017,8 @@ def main():
 
     if args.book_calib:
         diagnose_book_calibration(args.sport, store_label=args.store_label,
-                                  min_cell_n=args.min_cell_n, prop=args.recal_prop)
+                                  min_cell_n=args.min_cell_n, prop=args.recal_prop,
+                                  save=args.save_recal)
         return
 
     if args.recalibrate:
