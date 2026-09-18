@@ -7,13 +7,17 @@ boosted EV is only real if the leg probabilities are genuinely calibrated (over-
 odds + a bonus spec, and returns honest boosted EV, qualification, and Kelly-safe sizing.
 
 Bonus schema (Doug's parameters):
-  bet_type       : 'single' | 'parlay' | 'sgp' | 'any'
+  bet_type       : 'single' | 'parlay' | 'sgp' | 'any' | 'any_parlay' | 'sgp_sgpx'
   boost_pct      : profit boost as a fraction (0.30 = +30% on winnings)
   min_odds_leg   : each leg's American odds must be >= this (not shorter than)
   min_odds_overall: combined American odds must be >= this
   min_legs       : minimum number of legs (parlay boosts often require >=2 or >=3)
   max_wager      : $ cap
   min_wager      : $ floor
+  markets        : MARKET SCOPE — the market/prop keys this bonus applies to (e.g.
+                   ("batter_home_runs",) or ("anytime_td",) or ("team",)). Empty = all
+                   eligible markets for the sport. Drives the bonus-scoped analysis +
+                   which legs the optimizer builds.
 
 EV per $1 with a profit boost b on a bet of true prob P and decimal odds D:
   win  -> +(D-1)*(1+b);  lose -> -1
@@ -33,8 +37,48 @@ class Bonus:
     max_wager: float = 1e9
     min_wager: float = 0.0
     book: str = "draftkings"             # DK bonuses use DK odds; FD bonuses use FD odds
-    label: str = ""                      # human tag for reporting
+    label: str = ""                      # human tag for reporting (blank -> display_name)
     sport: str = "americanfootball_nfl"  # which sport's slate this boost applies to
+    markets: tuple = ()                  # market scope (see module docstring); () = all
+
+
+# ── Human-readable auto-naming (book · sport · type · boost · scope) ────────────
+_BOOK_TAGS = {"draftkings": "DK", "fanduel": "FD", "pinnacle": "Pin"}
+_SPORT_TAGS = {"baseball_mlb": "MLB", "americanfootball_nfl": "NFL",
+               "basketball_nba": "NBA", "icehockey_nhl": "NHL"}
+_MARKET_TAGS = {
+    "team": "team", "batter_home_runs": "HR", "anytime_td": "TD",
+    "player_anytime_td": "TD", "batter_hits": "hits", "batter_total_bases": "TB",
+    "batter_rbis": "RBI", "batter_strikeouts": "bat-K", "pitcher_strikeouts": "P-K",
+    "pitcher_outs": "outs", "pitcher_earned_runs": "ER", "player_receptions": "rec",
+    "player_rush_attempts": "rush-att", "player_pass_attempts": "pass-att",
+    "player_pass_yds": "pass-yds", "player_rush_yds": "rush-yds",
+    "player_reception_yds": "rec-yds", "player_pass_tds": "pass-TD",
+}
+
+
+def _market_scope_tag(markets):
+    """Short human tag for a bonus's market scope, or '' when it spans all markets."""
+    mkts = [m for m in (markets or ()) if m]
+    if not mkts:
+        return ""
+    tags = [_MARKET_TAGS.get(m, m.replace("player_", "").replace("batter_", "")
+                             .replace("pitcher_", "")) for m in mkts]
+    return "+".join(tags[:3]) + ("+…" if len(tags) > 3 else "")
+
+
+def display_name(bonus):
+    """Auto-generated readable name: 'DK · MLB · SGP 50% · HR'. Used in the manager UI
+    and as the ticket label fallback when the freeform `label` is blank."""
+    book = _BOOK_TAGS.get(bonus.book, (bonus.book or "?")[:3].upper())
+    sport = _SPORT_TAGS.get(bonus.sport, (bonus.sport or "?").upper())
+    typ = (bonus.bet_type or "?").upper().replace("_", "-")
+    boost = f"{bonus.boost_pct * 100:.0f}%"
+    scope = _market_scope_tag(getattr(bonus, "markets", ()))
+    parts = [book, sport, f"{typ} {boost}"]
+    if scope:
+        parts.append(scope)
+    return " · ".join(parts)
 
 
 def american_to_dec(a):

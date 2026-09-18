@@ -13,7 +13,8 @@ import bonus as bonuslib
 _SETTINGS_FILE = "app_settings.jsonl"
 _KEY = "active_bonuses"
 _FIELDS = ("bet_type", "boost_pct", "min_odds_leg", "min_odds_overall",
-           "min_legs", "max_wager", "min_wager", "book", "label", "sport")
+           "min_legs", "max_wager", "min_wager", "book", "label", "sport",
+           "markets")
 
 
 def _clean(d):
@@ -27,6 +28,8 @@ def _clean(d):
             out[k] = str(v)
         elif k == "min_legs":
             out[k] = int(v)
+        elif k == "markets":
+            out[k] = tuple(str(m) for m in (v or ()) if m)   # scope; () = all
         else:
             out[k] = float(v)
     return out
