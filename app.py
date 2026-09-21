@@ -2597,28 +2597,34 @@ def render_bonuses():
                     price = st.number_input(
                         "Book's SGP combined price (American)", -100000, 100000, int(need),
                         step=10, key=f"sgp_{r['book']}_{r['label']}_{i}")
-                    dec = bonuslib.american_to_dec(price)
-                    ev = bonuslib.boosted_ev_per_dollar(jp, dec, r["boost_pct"]) * 100
-                    kf = bonuslib.kelly_fraction(jp, dec, r["boost_pct"]) * 0.25
-                    stake = min(r["max_wager"], max(0.0, kf * bankroll)) if ev > 0 else 0.0
-                    st.write(f"{'✅ BET' if ev > 0 else '❌ skip'} — boosted EV **{ev:+.1f}%**, "
-                             f"suggested stake **${stake:.2f}** (¼-Kelly)")
-                    wager = st.number_input(
-                        "Wager $", min_value=0.0, value=round(stake, 2), step=1.0,
-                        key=f"wagersgp_{r['book']}_{r['label']}_{i}",
-                        help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
-                    if st.button("📝 Log this SGP", key=f"logsgp_{r['book']}_{r['label']}_{i}"):
-                        parlay_store.save_parlay(
-                            {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
-                             "boost_pct": r["boost_pct"], "is_same_game": True,
-                             "combined_american": int(price), "stake": round(float(wager), 2),
-                             "sport_key": board_sport,
-                             "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
-                            [opt.leg_to_store(l, "sgp", board_sport) for l in combo])
-                        _consume_bonus(r["book"], r["label"], r["bet_type"])
-                        st.session_state["_bonus_log_msg"] = (
-                            f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
-                        st.rerun()
+                    if not bonuslib.is_valid_american(price):
+                        # F15: reject zero / ±1..99 instead of crashing the pricer with a
+                        # ZeroDivisionError; the user re-enters a real American price.
+                        st.error("Enter a valid American price (≤ -100 or ≥ +100) to "
+                                 "price this SGP.")
+                    else:
+                        dec = bonuslib.american_to_dec(price)
+                        ev = bonuslib.boosted_ev_per_dollar(jp, dec, r["boost_pct"]) * 100
+                        kf = bonuslib.kelly_fraction(jp, dec, r["boost_pct"]) * 0.25
+                        stake = min(r["max_wager"], max(0.0, kf * bankroll)) if ev > 0 else 0.0
+                        st.write(f"{'✅ BET' if ev > 0 else '❌ skip'} — boosted EV **{ev:+.1f}%**, "
+                                 f"suggested stake **${stake:.2f}** (¼-Kelly)")
+                        wager = st.number_input(
+                            "Wager $", min_value=0.0, value=round(stake, 2), step=1.0,
+                            key=f"wagersgp_{r['book']}_{r['label']}_{i}",
+                            help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
+                        if st.button("📝 Log this SGP", key=f"logsgp_{r['book']}_{r['label']}_{i}"):
+                            parlay_store.save_parlay(
+                                {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
+                                 "boost_pct": r["boost_pct"], "is_same_game": True,
+                                 "combined_american": int(price), "stake": round(float(wager), 2),
+                                 "sport_key": board_sport,
+                                 "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
+                                [opt.leg_to_store(l, "sgp", board_sport) for l in combo])
+                            _consume_bonus(r["book"], r["label"], r["bet_type"])
+                            st.session_state["_bonus_log_msg"] = (
+                                f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
+                            st.rerun()
     if not shown:
         # The most common "why nothing?" is a leg-count that the bonus TYPE forbids:
         # a parlay/SGP promo requires >=2 legs, so leg_count=1 can never produce a

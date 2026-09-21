@@ -90,6 +90,32 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(Bonus(bet_type="any", boost_pct=0.25).markets, ())
 
 
+class F15OddsValidationTests(unittest.TestCase):
+    def test_is_valid_american(self):
+        for bad in (0, 50, -99, 99, float("nan"), float("inf"), float("-inf"), None):
+            self.assertFalse(bonus.is_valid_american(bad), bad)
+        for good in (-110, 100, -100, 250, -100000):
+            self.assertTrue(bonus.is_valid_american(good), good)
+
+    def test_american_to_dec_rejects_invalid_instead_of_zerodiv(self):
+        with self.assertRaises(ValueError):
+            bonus.american_to_dec(0)      # was ZeroDivisionError -> page crash [F15]
+        with self.assertRaises(ValueError):
+            bonus.american_to_dec(50)
+
+    def test_evaluate_survives_invalid_stored_min_odds(self):
+        b = Bonus(bet_type="single", boost_pct=.5, min_odds_leg=0.,
+                  min_odds_overall=0., min_wager=1., max_wager=10.)
+        r = bonus.evaluate([(.6, -110)], b, bankroll=100.)
+        self.assertTrue(r["qualifies"])   # invalid min_odds = no constraint, not a crash
+
+    def test_evaluate_survives_invalid_leg_odds(self):
+        b = Bonus(bet_type="single", boost_pct=.5, min_wager=1., max_wager=10.)
+        r = bonus.evaluate([(.6, 0)], b, bankroll=100.)
+        self.assertFalse(r["qualifies"])
+        self.assertEqual(r["kelly_stake"], 0.)
+
+
 class F11SizingBoundsTests(unittest.TestCase):
     def test_zero_bankroll_yields_no_stake(self):
         # F11: min_wager must not override a zero bankroll.

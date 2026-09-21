@@ -81,8 +81,23 @@ def display_name(bonus):
     return " · ".join(parts)
 
 
+def is_valid_american(a):
+    """American odds are valid only at |a| >= 100 (a <= -100 or a >= +100). 0, ±1..99,
+    NaN and infinities are invalid — rejecting them stops a zero/garbage price from
+    crashing the pricer with a ZeroDivisionError or producing nonsense EV. [F15]"""
+    try:
+        a = float(a)
+    except (TypeError, ValueError):
+        return False
+    if a != a or a in (float("inf"), float("-inf")):
+        return False
+    return abs(a) >= 100.0
+
+
 def american_to_dec(a):
     a = float(a)
+    if not is_valid_american(a):
+        raise ValueError(f"invalid American odds {a!r}: must be <= -100 or >= +100")
     return 1.0 + (a / 100.0 if a > 0 else 100.0 / -a)
 
 
@@ -112,8 +127,20 @@ def kelly_fraction(P, dec_odds, boost):
     return max(0.0, f)
 
 
+def _min_dec(min_odds):
+    """Decimal floor for a promo min-odds constraint; an invalid/absent value means NO
+    constraint (floor 1.0) rather than a crash on a malformed stored promo. [F15]"""
+    try:
+        return american_to_dec(min_odds)
+    except (ValueError, TypeError):
+        return 1.0
+
+
 def _leg_ok(a, bonus):
-    return american_to_dec(a) >= american_to_dec(bonus.min_odds_leg) - 1e-9
+    try:
+        return american_to_dec(a) >= _min_dec(bonus.min_odds_leg) - 1e-9
+    except (ValueError, TypeError):
+        return False                      # a leg with invalid odds can't qualify
 
 
 def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
@@ -121,12 +148,20 @@ def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
     (pass the correlation-adjusted joint for an SGP). Returns the full EV/sizing verdict."""
     n = len(legs)
     kind = "single" if n == 1 else "parlay"
-    dec = combined_decimal([a for _p, a in legs])
+    # A leg with invalid American odds can't be priced -> not a qualifying ticket
+    # (rather than crashing the whole page). [F15]
+    try:
+        dec = combined_decimal([a for _p, a in legs])
+    except (ValueError, TypeError):
+        return {"n_legs": n, "kind": kind, "joint_P": None, "combined_dec": None,
+                "combined_american": None, "boosted_ev_pct": 0.0, "qualifies": False,
+                "legs_ok": False, "overall_ok": False, "type_ok": False,
+                "legs_count_ok": False, "kelly_stake": 0.0}
     P = joint_prob if joint_prob is not None else _prod(p for p, _a in legs)
     ev = boosted_ev_per_dollar(P, dec, bonus.boost_pct)
     # constraints
     legs_ok = all(_leg_ok(a, bonus) for _p, a in legs)
-    overall_ok = dec >= american_to_dec(bonus.min_odds_overall) - 1e-9
+    overall_ok = dec >= _min_dec(bonus.min_odds_overall) - 1e-9
     # Ticket-type gate (leg-count only; the OPTIMIZER enforces cross-game vs same-game
     # composition). bet_type vocabulary:
     #   single       -> exactly 1 leg
