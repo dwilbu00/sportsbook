@@ -125,6 +125,45 @@ class BuildWagerRowTests(unittest.TestCase):
         self.assertEqual(row["direction"], "OVER")
         self.assertAlmostEqual(row["model_prob"], 0.80)
 
+    def test_F01_prop_records_selected_execution_offer_and_book(self):
+        # props._best_exec picks the better {DK,FD} price for the chosen side and
+        # stores it as dk_price/dk_book. The ledger must record THAT offer (price
+        # AND book), not a raw single-book quote. Here FanDuel +120 is selected over
+        # DK -150; the wager must be +120 at FanDuel, never -150 with no book. [F01]
+        cand = {"player": "Fixture", "prop": "player_receptions",
+                "prop_label": "Receptions", "line": 4.5, "direction": "OVER",
+                "over_rate": 65.0, "edge_pct": 10.0,
+                "dk_over_price": -150, "fd_over_price": 120, "over_price": 130,
+                "dk_price": 120, "dk_book": "FanDuel", "best_price": 120,
+                "team": "A", "event_id": "E1"}
+        row = wagers.build_wager_row("player_prop", None, cand, _meta())
+        self.assertEqual(row["executed_price"], 120)
+        self.assertEqual(row["book"], "FanDuel")
+
+    def test_F01_prop_book_unknown_when_no_selected_offer(self):
+        # Legacy candidate with no dk_price/dk_book: fall back to the raw side price
+        # but leave book unset rather than inferring a sportsbook without evidence.
+        cand = {"player": "Fixture", "prop": "batter_hits", "prop_label": "Hits",
+                "line": 0.5, "direction": "OVER", "over_rate": 70.0,
+                "dk_over_price": -150, "event_id": "E1"}
+        row = wagers.build_wager_row("player_prop", None, cand, _meta())
+        self.assertEqual(row["executed_price"], -150)
+        self.assertIsNone(row["book"])
+
+    def test_F01_spread_preserves_selected_book(self):
+        cand = {"team": "A", "opponent": "B", "home_away": "HOME", "price": -110,
+                "book": "FanDuel", "spread": -3.5, "cover_rate": 60.0,
+                "edge_pct": 7.0, "event_id": "E1"}
+        row = wagers.build_wager_row("spread", None, cand, _meta())
+        self.assertEqual(row["book"], "FanDuel")
+
+    def test_F01_total_preserves_selected_book(self):
+        cand = {"matchup": "B @ A", "line": 8.5, "over_price": -105,
+                "under_price": -115, "over_hit_rate": 57.0, "over_edge_pct": 5.0,
+                "best_book": "DraftKings", "event_id": "E1"}
+        row = wagers.build_wager_row("total", "OVER", cand, _meta())
+        self.assertEqual(row["book"], "DraftKings")
+
     def test_blank_row_derives_et_local_game_date(self):
         # 02:30 UTC on 7/21 is 10:30 PM ET on 7/20 -> official game date is 7/20,
         # NOT the raw UTC 7/21. Meta omits game_date so the fallback is exercised.

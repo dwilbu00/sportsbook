@@ -201,6 +201,7 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "side": "home" if (home_away or "").upper() == "HOME" else "away",
                 "point": spread, "line": spread,
                 "executed_price": price, "model_price": price,
+                "book": candidate.get("book") or candidate.get("best_book"),  # [F01]
                 "model_prob": _pct(candidate.get("cover_rate")),
                 "model_edge": candidate.get("edge_pct"),
             })
@@ -220,10 +221,16 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "side": sd.lower(), "direction": sd,
                 "point": line, "line": line,
                 "executed_price": price, "model_price": price,
+                "book": candidate.get("book") or candidate.get("best_book"),  # [F01]
                 "model_prob": model_prob, "model_edge": edge,
             })
         elif bet_type == "player_prop":
             direction = (candidate.get("direction") or "OVER").upper()
+            # Execution offer = the SELECTED best {DK,FD} price and the book to place
+            # it at (props._best_exec stores it as dk_price/dk_book for the chosen
+            # side). Record THAT so the logged price + book match the recommendation,
+            # not a raw single-book quote. [F01]
+            exec_book = candidate.get("dk_book")
             if candidate.get("safe_mode"):
                 line = candidate.get("safe_alt_line")
                 price = candidate.get("safe_alt_price")
@@ -231,14 +238,17 @@ def build_wager_row(bet_type, side, candidate, meta):
                 direction = "OVER"
             else:
                 line = candidate.get("line")
-                # Stake at the DraftKings price the user actually bets (P1.1b).
-                # over/under_price is the best-across-books price used only for
-                # the value/EV decision; fall back to it when DK is absent.
-                best_side = (candidate.get("over_price") if direction == "OVER"
-                             else candidate.get("under_price"))
-                dk_side = (candidate.get("dk_over_price") if direction == "OVER"
-                           else candidate.get("dk_under_price"))
-                price = dk_side if dk_side is not None else best_side
+                # dk_price is the chosen executable {DK,FD} offer (best of the two, at
+                # dk_book). Fall back to the raw per-side price only for legacy
+                # candidates that predate dk_price — book then stays unknown rather
+                # than inferring a sportsbook without evidence.
+                price = candidate.get("dk_price")
+                if price is None:
+                    best_side = (candidate.get("over_price") if direction == "OVER"
+                                 else candidate.get("under_price"))
+                    dk_side = (candidate.get("dk_over_price") if direction == "OVER"
+                               else candidate.get("dk_under_price"))
+                    price = dk_side if dk_side is not None else best_side
                 over_rate = candidate.get("over_rate")
                 model_prob = (_pct(over_rate) if direction == "OVER"
                               else (None if over_rate is None
@@ -252,6 +262,7 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "direction": direction,
                 "line": line, "point": line,
                 "executed_price": price, "model_price": price,
+                "book": exec_book,
                 "model_prob": model_prob,
                 "model_edge": candidate.get("edge_pct"),
             })
