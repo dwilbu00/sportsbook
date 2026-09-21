@@ -37,6 +37,10 @@ def save_parlay(ticket, legs):
     trow.setdefault("sport_key", "americanfootball_nfl")
     trow["n_legs"] = len(legs)
 
+    norm = [{**lg, "parlay_id": pid, "leg_index": i,
+             "sport_key": lg.get("sport_key") or trow["sport_key"]}
+            for i, lg in enumerate(legs)]
+
     def up_ticket(rows):
         for r in rows:
             if r.get("parlay_id") == pid:
@@ -45,23 +49,24 @@ def save_parlay(ticket, legs):
         rows.append(trow)
         return 1
 
-    recalibration.mutate_ndjson_log(PARLAYS_FILE, up_ticket, where={"parlay_id": pid})
-
-    norm = [{**lg, "parlay_id": pid, "leg_index": i,
-             "sport_key": lg.get("sport_key") or trow["sport_key"]}
-            for i, lg in enumerate(legs)]
-
     def up_legs(rows):
-        by = {(r.get("parlay_id"), r.get("leg_index")): r for r in rows}
-        for lg in norm:
-            k = (pid, lg["leg_index"])
-            if k in by:
-                by[k].update(lg)
-            else:
-                rows.append(lg)
+        # Replace this ticket's COMPLETE leg set: drop all of pid's existing legs
+        # (so shrinking 3->2 legs leaves no ghost index-2 leg) then insert the new
+        # ones. Self-filters, so it is correct on the local path (mutator sees all
+        # rows) and the SQL path (rows scoped to pid). [F04]
+        kept = [r for r in rows if r.get("parlay_id") != pid]
+        kept.extend(norm)
+        rows[:] = kept
         return len(norm)
 
+    # Legs FIRST, ticket LAST. The ticket is what load_parlays surfaces, so writing
+    # it last makes it the commit point: a failed leg write raises before any ticket
+    # exists (no orphan ticket-with-no-legs), and a surfaced ticket always carries
+    # its legs. True cross-table atomicity (one transaction spanning both tables +
+    # promo consumption) is the deferred T04 unit-of-work — the local NDJSON fallback
+    # cannot do multi-file atomicity. [F04]
     recalibration.mutate_ndjson_log(LEGS_FILE, up_legs, where={"parlay_id": pid})
+    recalibration.mutate_ndjson_log(PARLAYS_FILE, up_ticket, where={"parlay_id": pid})
     return pid
 
 
