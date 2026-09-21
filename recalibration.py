@@ -1699,18 +1699,15 @@ def _logit(p):
     return math.log(p / (1.0 - p))
 
 
-def fit_platt(raw_probs, outcomes, max_iter=100, tol=1e-7):
-    """
-    Fit Platt sigmoid: p_cal = sigmoid(a * logit(p_raw) + b).
-    Returns (a, b) or None if not fittable.
-
-    Uses Newton-Raphson on cross-entropy loss with mild L2 regularization
-    on (a-1, b) to keep parameters from blowing up on small samples.
-    """
+def _platt_fit_with_reason(raw_probs, outcomes, max_iter=100, tol=1e-7):
+    """Core Platt fit that returns ((a, b) or None, reason). ``reason`` distinguishes
+    WHY there is no usable map so a no-signal model is not conflated with a failed
+    optimizer (audit F25): 'ok' | 'insufficient_sample' | 'no_class_variation' |
+    'optimizer_failure' | 'low_slope_weak_signal' | 'diverged'."""
     pairs = [(rp, o) for rp, o in zip(raw_probs, outcomes)
              if rp is not None and o is not None and o in (0, 1)]
     if len(pairs) < MIN_FIT_SAMPLES:
-        return None
+        return None, "insufficient_sample"
 
     xs = [_logit(rp) for rp, _ in pairs]
     ys = [o for _, o in pairs]
@@ -1720,7 +1717,7 @@ def fit_platt(raw_probs, outcomes, max_iter=100, tol=1e-7):
     n_pos = sum(ys)
     n_neg = n - n_pos
     if n_pos == 0 or n_neg == 0:
-        return None
+        return None, "no_class_variation"
     hi = (n_pos + 1.0) / (n_pos + 2.0)
     lo = 1.0 / (n_neg + 2.0)
     targets = [hi if y == 1 else lo for y in ys]
@@ -1765,17 +1762,45 @@ def fit_platt(raw_probs, outcomes, max_iter=100, tol=1e-7):
 
     # Sanity: clamp wild fits
     if not (math.isfinite(a) and math.isfinite(b)):
-        return None
+        return None, "optimizer_failure"
     if a <= 0.2:
         # a≈0 means "raw prob has ~no signal vs outcomes" — applying it would
-        # squash every prediction to a constant ~base-rate. Treat as no fit
-        # and let the raw probability pass through unchanged. (User keeps
-        # whatever edge the underlying model had; doesn't get artificially
-        # zeroed by Platt.)
-        return None
+        # squash every prediction to a constant ~base-rate. Serving keeps the raw
+        # probability (no map). This is a DISTINCT state from a failed optimizer:
+        # whether a low-slope fit SHOULD instead shrink toward the base rate is a
+        # decision for a chronological-holdout evaluation, not this fit call (T25).
+        return None, "low_slope_weak_signal"
     if abs(a) > 10 or abs(b) > 10:
-        return None
-    return (a, b)
+        return None, "diverged"
+    return (a, b), "ok"
+
+
+def platt_fit_reason(raw_probs, outcomes, max_iter=100, tol=1e-7):
+    """Why fit_platt did (not) produce a map — a no-signal model ('low_slope_weak_
+    signal') is no longer indistinguishable from a failed optimizer or a thin sample.
+    For diagnostics / a future holdout-based serving-policy study (audit F25)."""
+    return _platt_fit_with_reason(raw_probs, outcomes, max_iter, tol)[1]
+
+
+def fit_platt(raw_probs, outcomes, max_iter=100, tol=1e-7):
+    """
+    Fit Platt sigmoid: p_cal = sigmoid(a * logit(p_raw) + b).
+    Returns (a, b) or None if not fittable. Serving behavior is unchanged; the
+    distinct no-map REASON is recorded to telemetry (see platt_fit_reason). [F25]
+
+    Uses Newton-Raphson on cross-entropy loss with mild L2 regularization
+    on (a-1, b) to keep parameters from blowing up on small samples.
+    """
+    fit, reason = _platt_fit_with_reason(raw_probs, outcomes, max_iter, tol)
+    if fit is None and reason != "ok":
+        try:
+            import logging
+            import ops_telemetry
+            ops_telemetry.ops_event("platt_fit_no_map", level=logging.INFO,
+                                    reason=reason)
+        except Exception:
+            pass
+    return fit
 
 
 def apply_platt(raw_prob, a, b):
