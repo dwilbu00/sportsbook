@@ -29,7 +29,17 @@ def _corr(xs, ys):
 
 
 def _have_pbp():
-    return bool(nfl_epa.load_plays(SEASON))
+    # Check the MIRROR only (no network): nfl_epa.load_plays falls back to a live
+    # ~19MB pbp download when the mirror is absent, which would make these tests hit
+    # the network in a clean/CI checkout instead of skipping. nfl_data.pbp is
+    # mirror-only, so an absent mirror -> clean skip; a present mirror -> the tests
+    # then run off that same mirror (load_plays is mirror-first, no download). [F26]
+    try:
+        import nfl_data
+        df = nfl_data.pbp([SEASON])
+        return df is not None and len(df) > 0
+    except Exception:
+        return False
 
 
 class NflSignTests(unittest.TestCase):

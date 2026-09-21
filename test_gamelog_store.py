@@ -266,10 +266,15 @@ class DispatchTests(_Backend, unittest.TestCase):
                           return_value=rows) as gl:
             hist = espn_client.get_player_stat_history(
                 "basketball", "nba", "Star", "player_points", n=20)
-            # Second call serves from SQL (no second ESPN gamelog fetch).
+            after_first = gl.call_count
+            # Second call serves from SQL — it must add NO new ESPN gamelog fetch.
+            # (The first call may fetch >1 season under prior-season spill; the
+            # contract this pins is caching, not the absolute first-call count.) [F26]
             espn_client.get_player_stat_history(
                 "basketball", "nba", "Star", "player_points", n=20)
-            self.assertEqual(gl.call_count, 1)
+            self.assertGreaterEqual(after_first, 1)
+            self.assertEqual(gl.call_count, after_first,
+                             "second call must serve from SQL (no new gamelog fetch)")
         self.assertTrue(hist["found"])
         self.assertEqual(hist["values"], [25.0, 18.0])
         self.assertEqual(hist["team_id"], "10")

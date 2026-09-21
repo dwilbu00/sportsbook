@@ -109,9 +109,12 @@ class PitcherRealLineJoinTests(unittest.TestCase):
 
     def _join(self, book_rows, gamelog):
         import book_line_calibration as blc
-        # MLB calibration is warehouse-only (no ESPN): source the per-game log from
-        # get_calib_gamelog.
-        with patch("mlb_warehouse.get_calib_gamelog", return_value=gamelog):
+        # MLB calibration is warehouse-only and now reads a per-(role, season) BULK
+        # gamelog index keyed by MLBAM id (was the singular get_calib_gamelog). Disable
+        # the mirror so the join falls through to the (patched) warehouse bulk. [F26]
+        with patch("warehouse_mirror.enabled", return_value=False), \
+             patch("mlb_warehouse.get_calib_gamelogs_bulk",
+                   return_value={"123": gamelog}):
             return blc.join_book_lines_to_actuals(book_rows, "baseball", "mlb")
 
     def test_dated_pitcher_log_joins(self):
