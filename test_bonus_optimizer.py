@@ -86,6 +86,22 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F09SgpxCompositionTests(unittest.TestCase):
+    def _slate(self, bt):
+        b = Bonus(bt, .5, min_legs=2)
+        legs = {"draftkings": [_leg("g1", "batter_hits", "A", .7, -150),
+                               _leg("g2", "batter_hits", "B", .7, -150)]}
+        return opt.evaluate_slate(legs, [b], None, 1000., sgp_fn=lambda *a: [])
+
+    def test_sgpx_does_not_emit_plain_cross_game(self):
+        # F09: an SGP+ promo must not surface plain cross-game tickets (no same-game
+        # component) — those aren't valid SGP+ construction.
+        self.assertEqual(self._slate("sgp_sgpx")[0]["cross"], [])
+
+    def test_plain_parlay_still_builds_cross_game(self):
+        self.assertTrue(self._slate("parlay")[0]["cross"])
+
+
 class F08SgpEligibilityTests(unittest.TestCase):
     def test_forced_leg_count_below_min_legs_is_rejected(self):
         # F08: an SGP promo requiring 3 legs must not yield a 2-leg ticket, even when

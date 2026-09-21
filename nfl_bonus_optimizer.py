@@ -449,7 +449,12 @@ def load_rho():
 #   cross-game/singles: any, any_parlay, parlay, single, sgp_sgpx (SGPx spans games)
 #   same-game (SGP)   : any, any_parlay, sgp, sgp_sgpx
 def _allows_cross(bt):
-    return bt in ("any", "any_parlay", "parlay", "single", "sgp_sgpx")
+    # sgp_sgpx (SGP+) is intentionally EXCLUDED from the cross-game builder: a valid
+    # SGP+ needs at least one same-game component, so the plain cross-game builder
+    # (one leg per game) would emit tickets the promo rejects. SGP+ is served as
+    # same-game SGP stacks (_allows_sgp) until full SGP+ composition is modeled
+    # (deferred T09). [F09]
+    return bt in ("any", "any_parlay", "parlay", "single")
 
 
 def _allows_sgp(bt):
