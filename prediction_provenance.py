@@ -22,7 +22,7 @@ unknown provenance.
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Frozen model artifacts whose CONTENT is hashed into model_schema (stable across
 # machines, unlike mtime). Add files here as more sports freeze artifacts.
@@ -84,9 +84,15 @@ def event_season_week(sport_key, commence_time):
     season = _nfl_season_of(dt)
     try:
         import nfl_schedule
-        d = dt.date().isoformat()
+        # The schedule's gameday is US-Eastern local; an evening kickoff (SNF/MNF/TNF,
+        # ~8pm ET) rolls to the NEXT calendar day in UTC, so commence_time's UTC date
+        # can be one day AHEAD of gameday. Match the UTC date OR the day before — games
+        # on two adjacent days are always the same NFL week, so this never picks a
+        # wrong week, and it fixes every primetime game (was silently week=None).
+        cands = {dt.date().isoformat(),
+                 (dt.date() - timedelta(days=1)).isoformat()}
         for r in nfl_schedule.load_games([season]):
-            if str(r.get("gameday"))[:10] == d and r.get("week"):
+            if str(r.get("gameday"))[:10] in cands and r.get("week"):
                 return season, int(r["week"])
     except Exception:
         pass

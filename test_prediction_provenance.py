@@ -37,6 +37,21 @@ class ContextBuildTests(unittest.TestCase):
         self.assertEqual(pp.event_season_week(
             "americanfootball_nfl", "2025-01-05T18:00:00Z")[0], 2024)
 
+    def test_nfl_evening_game_utc_rollover_maps_to_week(self):
+        # An ~8pm-ET kickoff (SNF/MNF/TNF) is the NEXT calendar day in UTC, so the
+        # commence UTC date is one day ahead of the schedule's ET gameday. The lookup
+        # must still resolve the week (regression: was silently week=None for every
+        # primetime game, defeating the F28 event-week fix).
+        fake = [{"gameday": "2026-09-21", "week": 2},   # Sun/Mon-night ET
+                {"gameday": "2026-09-24", "week": 3}]    # Thu-night ET
+        with patch("nfl_schedule.load_games", return_value=fake):
+            self.assertEqual(pp.event_season_week(          # 00:15Z 22nd == 8:15pm ET 21st
+                "americanfootball_nfl", "2026-09-22T00:15:00Z"), (2026, 2))
+            self.assertEqual(pp.event_season_week(          # afternoon, same UTC date
+                "americanfootball_nfl", "2026-09-21T17:00:00Z"), (2026, 2))
+            self.assertEqual(pp.event_season_week(          # TNF, UTC Friday
+                "americanfootball_nfl", "2026-09-25T00:15:00Z"), (2026, 3))
+
     def test_artifact_hash_line_ending_independent(self):
         # The SAME committed artifact must hash identically regardless of checkout
         # line endings — else replay on a Windows dev box (CRLF) reports every
