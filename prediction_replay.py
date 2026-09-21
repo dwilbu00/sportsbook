@@ -120,6 +120,7 @@ def replay_log(sport_key=None, limit=None, tol=_TOL):
 if __name__ == "__main__":                                  # pragma: no cover
     import argparse
     import json as _json
+    import sys as _sys
     ap = argparse.ArgumentParser(
         description="F28 P2 replay harness — verify stored predictions reproduce "
                     "from their recorded provenance (read-only).")
@@ -129,5 +130,19 @@ if __name__ == "__main__":                                  # pragma: no cover
                     help="cap to the N most-recent rows")
     ap.add_argument("--tol", type=float, default=_TOL)
     a = ap.parse_args()
+    # Connect to the DURABLE corpus (Azure SQL) the way every CLI tool does: the app
+    # promotes st.secrets->env at boot, but a CLI must promote_secrets_from_toml()
+    # explicitly or db_store stays disabled and read_prediction_log() falls back to
+    # the local prediction_log.jsonl (usually empty on a dev machine) -> total: 0.
+    try:
+        import db_store
+        db_store.promote_secrets_from_toml()
+        if not db_store.enabled():
+            print("WARN: SQL backend not configured (no SQL_* keys in "
+                  ".streamlit/secrets.toml) — reading the LOCAL prediction_log.jsonl "
+                  "fallback, usually empty. Run where the Azure SQL_* secrets live.",
+                  file=_sys.stderr)
+    except Exception as _e:
+        print(f"WARN: could not initialize the SQL backend: {_e}", file=_sys.stderr)
     print(_json.dumps(replay_log(sport_key=a.sport, limit=a.limit, tol=a.tol),
                       indent=2, default=str))
