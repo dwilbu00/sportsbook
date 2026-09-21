@@ -1162,6 +1162,10 @@ def parse_player_props(game_data):
                     player, {}).setdefault(line, {}).setdefault(side, []).append({
                         "book": book_title,
                         "price": price,
+                        # Carry freshness so the EXECUTABLE price selection can drop a
+                        # stale quote too, not just the fair-reference de-vig. [F02]
+                        "last_update": (market.get("last_update")
+                                        or bookmaker.get("last_update")),
                     })
                 players.setdefault((player, line), {})[side] = outcome
 
@@ -1236,22 +1240,26 @@ def parse_player_props(game_data):
             fair_over = weighted_sum / weight_total if weight_total else 0.5
             fair_under = 1.0 - fair_over
             executable = side_prices[market_key][player][line]
-            best_over = max(
-                executable["Over"], key=lambda offer: offer["price"])
-            best_under = max(
-                executable["Under"], key=lambda offer: offer["price"])
+            # Apply the SAME staleness trim to the executable prices as to the fair
+            # reference: a quote too old to feed the de-vig must not remain bettable
+            # (relative trim — >MAX_STALE_SECONDS behind the freshest side quote).
+            # Absolute all-books-stale + start-time gating is out of scope here. [F02]
+            exec_over = _trim_stale_offers(executable["Over"])
+            exec_under = _trim_stale_offers(executable["Under"])
+            best_over = max(exec_over, key=lambda offer: offer["price"])
+            best_under = max(exec_under, key=lambda offer: offer["price"])
             # Best-price line-shopping (P1.1b, hybrid): edge/EV are measured at
             # the BEST executable price across all US books, but staking/display
             # use the DraftKings price (the user bets at DK). dk_* is None when
-            # DK doesn't post this prop at the consensus line — callers fall back
-            # to the best price.
-            dk_over = _dk_offer(executable["Over"])
-            dk_under = _dk_offer(executable["Under"])
+            # DK doesn't post this prop at the consensus line (or its quote is
+            # stale) — callers fall back to the best price.
+            dk_over = _dk_offer(exec_over)
+            dk_under = _dk_offer(exec_under)
             # FanDuel too — Doug bets DK AND FD, so the executable price for staking
             # is the BETTER of the two, not DK alone. (Best-across-all-books above
             # includes analysis-only books like Pinnacle we can't bet.) [study §2.2]
-            fd_over = _dk_offer(executable["Over"], book_key="fanduel")
-            fd_under = _dk_offer(executable["Under"], book_key="fanduel")
+            fd_over = _dk_offer(exec_over, book_key="fanduel")
+            fd_under = _dk_offer(exec_under, book_key="fanduel")
             # Independent market check at the CHOSEN line = the non-DK books quoting
             # it. When DK is the anchor but NEITHER enough peers NOR a sharp book
             # (Pinnacle/Circa) also quotes DK's line, over_implied degrades toward

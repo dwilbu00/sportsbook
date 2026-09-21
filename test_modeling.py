@@ -1908,6 +1908,26 @@ class SharpWeightedConsensusTests(unittest.TestCase):
         # Stale quote (>600s behind) is excluded; only the fresh 0.5 survives.
         self.assertAlmostEqual(info["over_implied"], 0.5, places=3)
 
+    def test_F02_stale_dk_executable_price_dropped(self):
+        # F02: a DK quote too stale for the fair reference must ALSO be dropped from
+        # the EXECUTABLE price — it cannot remain bettable as dk_over/under_price.
+        game = self._game([
+            self._book("DraftKings", 150, -180, last_update="2026-07-20T17:00:00Z"),
+            self._book("Pinnacle", -110, -110, last_update="2026-07-20T18:00:00Z"),
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["P"]
+        self.assertIsNone(info["dk_over_price"])
+        self.assertIsNone(info["dk_under_price"])
+
+    def test_F02_fresh_dk_executable_price_kept(self):
+        # A DK quote within the freshness window still stakes normally.
+        game = self._game([
+            self._book("DraftKings", 150, -180, last_update="2026-07-20T18:00:20Z"),
+            self._book("Pinnacle", -110, -110, last_update="2026-07-20T18:00:00Z"),
+        ])
+        info = parse_player_props(game)["props"]["batter_hits"]["P"]
+        self.assertEqual(info["dk_over_price"], 150)
+
     def test_no_sharp_no_timestamp_matches_plain_mean(self):
         game = self._game([
             self._book("Book A", -110, -110),     # fair_over 0.5000
