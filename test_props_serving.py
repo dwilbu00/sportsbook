@@ -45,5 +45,25 @@ class F17NflModelHistoryGateTests(_PropsServingTest):
         self.assertEqual(r["games_sampled"], 20)   # the model cohort, not the synthetic 1
 
 
+class F18ProbabilityParityTests(_PropsServingTest):
+    def test_nfl_safe_probability_matches_standard_final_calibration(self):
+        # F18: Safe Mode returned the RAW model prob (0.80) while Standard showed the
+        # recalibrated 66.67% at the same line. Both must now report the same final
+        # calibrated probability at a given line.
+        model = dict(proj=5.5, sd=1., p_over=.8,
+                     p_at=lambda line: .8 if line <= 4.5 else .4, n_prior=20)
+        hist = {"Fixture": {"player_receptions": dict(found=True, values=[8.] * 20)}}
+        with patch.object(props, "_nfl_model_override", return_value=model), \
+             patch.object(props, "load_recalibration",
+                          return_value={"player_receptions": {"a": .5, "b": 0.}}):
+            standard = props.analyze_player_props_value(
+                self.board(), hist, sport_key="americanfootball_nfl")[0]
+            safe = props.analyze_player_props_value(
+                self.board(), hist, sport_key="americanfootball_nfl",
+                safe_mode=True, safe_target=.75)[0]
+        self.assertEqual(safe["safe_threshold"], 5)
+        self.assertAlmostEqual(safe["model_hit_at_safe"], standard["over_rate"], places=2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

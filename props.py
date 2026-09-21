@@ -2032,6 +2032,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     if nfl_ctx is not None:
                         p_model = nfl_ctx["p_at"](threshold_line)
                         if p_model is not None:
+                            # The SEARCH picks the safe line from the model's RAW
+                            # distribution; the displayed/priced prob is recalibrated
+                            # AFTER the search (see below) for parity with Standard. [F18]
                             return historical, max(0.0, min(1.0, p_model))
                     # Resolve the line-conditional bucket by THIS threshold_line
                     # (not the book line) for parity with the standard path. A
@@ -2121,6 +2124,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 SAFE_MIN_RATIO = 0.5
                 if line > 0 and safe_threshold < line * SAFE_MIN_RATIO:
                     continue
+
+                # F18: the search/guards above used the RAW model distribution to pick
+                # the safe line; DISPLAY and price it with the SAME final recalibration
+                # as the standard card, so both views report the same calibrated
+                # probability at a given line (was showing the raw model prob).
+                if nfl_ctx is not None:
+                    _safe_recal = _resolve_recal_cfg(
+                        recalibration, prop_key, safe_threshold - 0.5, prop_calib_cfg)
+                    p_at_safe = _apply_final_recalibration(
+                        max(0.0, min(1.0, p_at_safe)), _safe_recal)
 
                 # Our model's final calibrated confidence at the standard line.
                 model_hit_at_line = over_rate
