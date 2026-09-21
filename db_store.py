@@ -965,6 +965,30 @@ def count_rows(table_name, where=None, max_retries=3):
     raise last_exc
 
 
+class _LostUpdate(Exception):
+    """A CAS UPDATE matched 0 rows → the row changed since we read it (an optimistic-
+    concurrency conflict). Retried by mutate() (re-read + re-apply the mutator). [F23]"""
+
+
+def _cas_enabled():
+    return os.getenv("ODI_DISABLE_MUTATE_CAS", "").strip().lower() not in (
+        "1", "true", "yes", "on")
+
+
+def _cas_where(cfg, prior):
+    """Compare-and-set predicate: the row still holds EXACTLY the values we read (every
+    stored column). Matched values are the exact ones just read from this DB, so an
+    unchanged row never trips; a concurrent change → 0 rows → _LostUpdate. [F23]"""
+    table = cfg["table"]
+    live = _live_columns(table)
+    conds = []
+    for name, _fn in cfg["spec"]:
+        if name not in table.c or (live is not None and name not in live):
+            continue
+        conds.append(table.c[name] == prior.get(name))
+    return and_(*conds) if conds else _identity_where(cfg, prior)
+
+
 def mutate(table_name, mutator, where=None, max_retries=3):
     """Transactionally read → mutate → write only the DELTA for an NDJSON store.
 
@@ -984,21 +1008,16 @@ def mutate(table_name, mutator, where=None, max_retries=3):
     append a row whose identity could collide with an unread row, nor depend on
     rows outside the filter.
 
-    CONCURRENCY CONTRACT (audit F23 — PARTIAL; full fix is T23):
-    This read→mutate→write runs in ONE transaction but at the engine's DEFAULT
-    isolation (READ COMMITTED on SQL Server), and UPDATEs match on identity only —
-    they do NOT compare a row version or prior value. Two sessions can therefore
-    read the same ``before`` and the second silently overwrite the first (a lost
-    update). Only ``OperationalError`` (transient cold-resume/lock/timeout) is
-    retried; a lost update is NOT detected. Money-sensitive callers today:
-    whole-list bonus settings (bonus_store.save_bonuses) and absolute-target
-    bankroll corrections (bankroll.record_adjustment). The intended fix is an
-    OPTIMISTIC compare-and-set (add the prior values / a rowversion to the UPDATE
-    WHERE; a 0-row result → re-read + re-apply via the retry loop) or a narrowly
-    scoped serializable transaction — it must be validated against a STAGING SQL
-    SERVER (SQLite's StaticPool cannot reproduce SQL Server isolation/deadlock
-    behavior), so it is intentionally NOT implemented here without that environment.
-    Single-writer use (the current single-user app) is unaffected."""
+    CONCURRENCY (audit F23): each UPDATE uses an OPTIMISTIC compare-and-set — its
+    WHERE requires the row to still hold EXACTLY the values we read, so if another
+    writer (e.g. a desktop CLI vs the deployed app) changed it since our read, the
+    UPDATE matches 0 rows and we raise _LostUpdate → the retry loop re-reads fresh and
+    re-applies the mutator on the winner's state (no silent lost update). The CAS
+    value is the exact value just read from this DB, so an unchanged row never trips.
+    Set ODI_DISABLE_MUTATE_CAS=1 to fall back to identity-only UPDATEs (kill switch).
+    NOTE: SQLite (StaticPool) can't reproduce SQL Server isolation/DEADLOCK-under-load,
+    so the retry-under-contention behavior should still be smoke-tested on staging; the
+    CAS logic itself is backend-independent (row-count based)."""
     cfg = _resolve(table_name)
     table = cfg["table"]
     engine = get_engine()
@@ -1030,9 +1049,17 @@ def mutate(table_name, mutator, where=None, max_retries=3):
                     if prior is None:
                         inserts.append(new_params)
                     elif new_params != _row_to_params(cfg, prior):
-                        conn.execute(update(table)
-                                     .where(_identity_where(cfg, prior))
-                                     .values(**new_params))
+                        cas = _cas_enabled()
+                        where_ = (_cas_where(cfg, prior) if cas
+                                  else _identity_where(cfg, prior))
+                        res = conn.execute(
+                            update(table).where(where_).values(**new_params))
+                        # 0 rows under the CAS = a concurrent writer changed this row
+                        # since our read → conflict; re-read + re-apply. (rowcount<0 =
+                        # driver didn't report it → don't treat as a conflict.)
+                        if cas and res.rowcount == 0:
+                            raise _LostUpdate(
+                                f"{table_name}: concurrent modification of {k}")
                 if inserts:
                     conn.execute(insert(table), inserts)
                 for k, row in before_by_key.items():
@@ -1040,6 +1067,10 @@ def mutate(table_name, mutator, where=None, max_retries=3):
                         conn.execute(delete(table)
                                      .where(_identity_where(cfg, row)))
                 return result
+        except _LostUpdate as exc:       # optimistic conflict → re-read + re-apply (short backoff)
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(0.1 * (attempt + 1))
         except OperationalError as exc:  # transient (cold resume/lock/timeout)
             last_exc = exc
             if attempt < max_retries - 1:

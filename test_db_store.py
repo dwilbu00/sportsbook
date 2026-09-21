@@ -1362,5 +1362,58 @@ class PromoteSecretsTests(unittest.TestCase):
         self.assertIsNone(os.environ.get("SOME_OTHER_KEY"))
 
 
+class F23OptimisticConcurrencyTests(_SqliteBackend, unittest.TestCase):
+    """Optimistic compare-and-set on mutate() UPDATEs (audit F23)."""
+
+    def _seed(self, val="v0"):
+        db_store.mutate("app_settings", lambda rows: rows.append(
+            {"setting_key": "k", "setting_value": val, "updated_at": "t"}) or 1)
+
+    def _val(self):
+        return [r["setting_value"] for r in db_store.read_rows("app_settings")
+                if r["setting_key"] == "k"][0]
+
+    def test_normal_update_not_falsely_blocked_by_cas(self):
+        # An unchanged row's CAS matches (exact values just read) → the update applies.
+        self._seed("v0")
+        db_store.mutate("app_settings", lambda rows: [
+            r.__setitem__("setting_value", "v1") for r in rows
+            if r["setting_key"] == "k"] and 1)
+        self.assertEqual(self._val(), "v1")
+
+    def test_cas_conflict_retries_and_reapplies(self):
+        # Force the first UPDATE's CAS to match nothing (simulating a concurrent change)
+        # → _LostUpdate → the loop re-reads + re-applies the mutator and succeeds.
+        self._seed("v0")
+        real_cas = db_store._cas_where
+        state = {"n": 0}
+
+        def flaky(cfg, prior):
+            state["n"] += 1
+            if state["n"] == 1:
+                return db_store.and_(cfg["table"].c.setting_key == "__nomatch__")
+            return real_cas(cfg, prior)
+
+        def up(rows):
+            for r in rows:
+                if r["setting_key"] == "k":
+                    r["setting_value"] = "v1"
+            return 1
+
+        with patch.object(db_store, "_cas_where", side_effect=flaky):
+            db_store.mutate("app_settings", up)
+        self.assertEqual(self._val(), "v1")     # re-applied after the conflict
+        self.assertGreaterEqual(state["n"], 2)  # CAS rebuilt on the retry
+
+    def test_kill_switch_disables_cas(self):
+        self._seed("v0")
+        with patch.dict(os.environ, {"ODI_DISABLE_MUTATE_CAS": "1"}):
+            self.assertFalse(db_store._cas_enabled())
+            db_store.mutate("app_settings", lambda rows: [
+                r.__setitem__("setting_value", "v2") for r in rows
+                if r["setting_key"] == "k"] and 1)
+        self.assertEqual(self._val(), "v2")
+
+
 if __name__ == "__main__":
     unittest.main()
