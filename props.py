@@ -2222,7 +2222,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
 
             # Compare historical over rate vs book implied over probability
             over_edge = over_rate - over_implied
-            under_rate = 1 - over_rate
+            # INTEGER lines can PUSH (actual == line): that mass is neither over nor
+            # under, so under_rate must NOT be 1 - over_rate (which counts a push as an
+            # under win — e.g. 20 games all == an integer line would show UNDER as a
+            # certain winner). Subtract the empirical push mass on integer lines. Half-
+            # point lines can't push, so under = 1 - over unchanged. NFL model props use
+            # the model distribution (push handling is the deferred T19 refinement).
+            push_rate = 0.0
+            if nfl_ctx is None and float(line) == int(float(line)):
+                push_rate = _weighted_rate(
+                    values, weights, lambda v, t=float(line): v == t)
+            under_rate = max(0.0, 1.0 - over_rate - push_rate)
             under_edge = under_rate - under_implied
 
             def _best_exec(*price_book_pairs):

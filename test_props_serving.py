@@ -65,5 +65,27 @@ class F18ProbabilityParityTests(_PropsServingTest):
         self.assertAlmostEqual(safe["model_hit_at_safe"], standard["over_rate"], places=2)
 
 
+class F19IntegerLinePushTests(_PropsServingTest):
+    def test_all_push_integer_line_is_not_an_under_win(self):
+        # F19: 20 outcomes all exactly == an integer line of 5 -> every result PUSHES,
+        # so UNDER must not be recommended as value (was 1 - over_rate = 1.0).
+        hist = {"Fixture": {"player_points": dict(found=True, values=[5.] * 20)}}
+        with patch.object(props, "load_calibration", return_value={"player_points": {
+                "method": "A", "shrinkage_k": 0, "half_life": None}}):
+            r = props.analyze_player_props_value(
+                self.board("player_points", 5.), hist, sport_key="basketball_nba")[0]
+        self.assertFalse(r["is_value"],
+                         "all-push integer line should not recommend UNDER as value")
+
+    def test_half_point_line_unaffected(self):
+        # Half-point lines can't push: a clear over must still evaluate normally.
+        hist = {"Fixture": {"player_points": dict(found=True, values=[6.] * 20)}}
+        with patch.object(props, "load_calibration", return_value={"player_points": {
+                "method": "A", "shrinkage_k": 0, "half_life": None}}):
+            r = props.analyze_player_props_value(
+                self.board("player_points", 4.5), hist, sport_key="basketball_nba")[0]
+        self.assertEqual(r["over_rate"], 100.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
