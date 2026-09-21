@@ -740,6 +740,7 @@ def configure_engine(url):
             pass
     _OVERRIDE_URL = url
     _ENGINE = None
+    _LIVE_COLS.clear()   # re-reflect live columns against the new engine
 
 
 def _connection_url():
@@ -843,9 +844,35 @@ def _resolve(table_name):
     return cfg
 
 
+# Live-schema reflection cache: lets an ADDITIVE migration ship in CODE before the
+# owner runs the ADD COLUMN DDL. Columns declared in the spec but NOT yet present in
+# the live table are skipped by reads/writes (instead of erroring) until the DDL runs.
+_LIVE_COLS = {}
+
+
+def _live_columns(table):
+    """Set of column names that actually exist in the live DB table (reflected once,
+    cached), or None (= don't filter) when reflection is unavailable/fails."""
+    name = table.name
+    if name not in _LIVE_COLS:
+        cols = None
+        try:
+            from sqlalchemy import inspect as _sa_inspect
+            eng = get_engine()
+            if eng is not None:
+                cols = {c["name"] for c in _sa_inspect(eng).get_columns(name)}
+        except Exception:
+            cols = None
+        _LIVE_COLS[name] = cols
+    return _LIVE_COLS[name]
+
+
 def _row_to_params(cfg, row):
     params = {name: fn(row.get(name)) for name, fn in cfg["spec"]}
     params.update(cfg["derive"](row))
+    live = _live_columns(cfg["table"])
+    if live is not None:
+        params = {k: v for k, v in params.items() if k in live}
     return params
 
 
@@ -877,7 +904,14 @@ def _select_rows(conn, cfg, where=None):
     """Ordered row-dict list (only the store's declared fields), optionally
     filtered by an equality/IN ``where`` map."""
     names = [name for name, _ in cfg["spec"]]
-    stmt = select(cfg["table"]).order_by(cfg["table"].c.id)
+    live = _live_columns(cfg["table"])
+    if live is not None:
+        names = [n for n in names if n in live]            # skip not-yet-migrated columns
+        cols = [cfg["table"].c[n] for n in names if n in cfg["table"].c]
+        stmt = (select(*cols) if cols else select(cfg["table"])).order_by(
+            cfg["table"].c.id)
+    else:
+        stmt = select(cfg["table"]).order_by(cfg["table"].c.id)
     clause = _where_clause(cfg["table"], where)
     if clause is not None:
         stmt = stmt.where(clause)

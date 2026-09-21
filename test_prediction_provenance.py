@@ -66,6 +66,24 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(r["context_fingerprint"], ctx["context_fingerprint"])
         self.assertTrue(r["as_of"])
 
+    def test_pre_ddl_schema_tolerated(self):
+        # The code can ship before the owner runs the ADD COLUMN DDL: simulate a live
+        # table WITHOUT the provenance columns; logging must still succeed (provenance
+        # skipped) rather than erroring the write.
+        prov = {"event_season", "event_week", "as_of", "calibration_hash",
+                "model_schema", "method", "reference_book_policy", "context_fingerprint"}
+        db_store._LIVE_COLS["prediction_log"] = {
+            c.name for c in db_store.prediction_log.columns} - prov
+        ctx = pp.build_context("baseball_mlb", "2026-07-16T18:00:00Z", method="C")
+        recalibration.log_prediction(
+            "baseball_mlb", "batter_hits", "PreDDL", "2026-07-16", 1.5, 0.6,
+            final_prob=0.58, commence_time="2026-07-16T18:00:00Z", event_id="e9",
+            context=ctx, write=True)
+        r = [x for x in db_store.read_rows("prediction_log")
+             if x["player"] == "PreDDL"][0]
+        self.assertEqual(r["final_prob"], 0.58)        # core write succeeded
+        self.assertIsNone(r.get("event_season"))       # provenance skipped, no crash
+
     def test_legacy_row_without_context_is_null_provenance(self):
         recalibration.log_prediction(
             "baseball_mlb", "batter_hits", "NoCtx", "2026-07-16", 1.5, 0.6,
