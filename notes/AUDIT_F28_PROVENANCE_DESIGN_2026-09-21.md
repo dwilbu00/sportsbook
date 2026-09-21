@@ -69,12 +69,15 @@ market / fallback-status, and flag early-season prior-season spillover explicitl
 1. **Schema:** nullable columns on `prediction_log` (proposed) vs a separate
    `prediction_context` table joined by a fingerprint. Columns are simpler; a table
    de-dupes identical contexts. **Recommend: columns.**
+      Columns confirmed.
 2. **Model-artifact version:** is `FEATURE_SCHEMA_VERSION` + `serving_fingerprint`
    enough, or add an explicit frozen-artifact build id (e.g. hash of
    `nfl_prop_models.json`)? **Recommend: add the artifact hash — cheap, precise.**
+      artifact hash confirmed.
 3. **Scope now:** ship **P1 only** (the safe additive stamp + week=99 fix) and defer
    P2/P3, or commit to all three? **Recommend: P1 now, P2/P3 as follow-ups.**
+      P1 now, follow up on P2/P3 confirmed.
 4. **Owner DDL:** OK to add an idempotent `sql/prediction_provenance.sql` you run on
    Azure (same pattern as `sql/parlay_tracker.sql`)?
-
+    Yes, prediction_provenance.sql confirmed.
 Nothing is implemented pending your answers to 1–4.

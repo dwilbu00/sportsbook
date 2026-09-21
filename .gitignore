@@ -54,3 +54,6 @@ nfl_alt_data/
 # Warehouse mirror parquets — re-generatable from Azure (system of record);
 # managed per-machine via warehouse_mirror.py --sync, not tracked in git.
 warehouse_mirror_data/
+
+# External audit deliverables (reports + git bundle) — reference only, kept per-machine.
+audits/

@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent
 
 def _extract():
     names = {"_apply_wager_edits", "_wager_ids", "_coerce_int", "_coerce_float"}
-    src = io.open(ROOT / "app.py", encoding="utf-8").read()
+    with io.open(ROOT / "app.py", encoding="utf-8") as _f:
+        src = _f.read()
     parsed = ast.parse(src)
     mod = ast.Module(
         body=[n for n in parsed.body
