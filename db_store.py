@@ -177,6 +177,19 @@ prediction_log = Table(
     # effect auditable per prediction (NULL for pre-column rows / unknown source),
     # the durable signal for "prove the gate is carrying the load" before ESPN removal.
     Column("source", String(16)),
+    # F28 P1: prediction PROVENANCE (all nullable → legacy rows = unknown provenance,
+    # kept). Lets a stored prediction be attributed/replayed: event-derived season/week
+    # (NOT wall-clock), the serve/quote as-of cutoff, hashes of the serving calibration
+    # + model artifact, the method actually used, the de-vig reference-book policy, and a
+    # single context fingerprint that changes iff any of these inputs change.
+    Column("event_season", Integer),
+    Column("event_week", Integer),
+    Column("as_of", String(40)),
+    Column("calibration_hash", String(32)),
+    Column("model_schema", String(64)),
+    Column("method", String(32)),
+    Column("reference_book_policy", String(64)),
+    Column("context_fingerprint", String(32)),
     UniqueConstraint("sport_key", "event_key", "prop_key", "player_key", "line",
                      name="uq_prediction_identity_v2"),
     Index("ix_prediction_sport_resolved", "sport_key", "resolved"),
@@ -497,6 +510,10 @@ _PREDICTION_SPEC = [
     ("price", _i), ("outcome", _i), ("batting_order", _i), ("game_pk", _i),
     ("team", _s), ("player_mlb_id", _s), ("team_code", _s), ("player_key", _s),
     ("source", _s),
+    # F28 P1 provenance (nullable; legacy rows → NULL = unknown provenance)
+    ("event_season", _i), ("event_week", _i), ("as_of", _s),
+    ("calibration_hash", _s), ("model_schema", _s), ("method", _s),
+    ("reference_book_policy", _s), ("context_fingerprint", _s),
     ("is_value", _b), ("resolved", _bexact), ("refit_performed", _bexact),
 ]
 

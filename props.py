@@ -1215,19 +1215,34 @@ def _prop_gate_is_value(edge, expected_roi, prop_key, ev_floor, edge_floor,
     return _prop_is_value(edge, eff_threshold, expected_roi)
 
 
-def _nfl_model_override(player_name, prop_key, line):
+def _nfl_model_override(player_name, prop_key, line, commence_time=None):
     """Live NFL prop projection from OUR calibrated nflverse models (nfl_prop_serving), used to
     replace the app's legacy ESPN-gamelog projection for the 8 modeled props. Returns a dict
     {proj, sd, p_over, n_prior} or None (unknown prop / thin history / any error → ESPN fallback).
-    Lazy-imported + fail-open so it can never break the analysis path."""
+    Lazy-imported + fail-open so it can never break the analysis path.
+
+    F28 P1: derive season/week from the EVENT's commence_time (not the wall clock), so the
+    prior-games cohort is event-relative and replay-safe. For an upcoming game the event
+    week == the next week, so week<event_week is all completed weeks — identical to the old
+    week=99 default; the fix only differs (correctly) for a past/replayed event. Falls back
+    to wall-clock season + week=99 when commence_time is absent or the week can't be resolved."""
     try:
         import nfl_prop_serving
         import nfl_props_scan
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        season = now.year if now.month >= 3 else now.year - 1   # NFL season = start year
+        season = week = None
+        if commence_time:
+            try:
+                import prediction_provenance
+                season, week = prediction_provenance.event_season_week(
+                    "americanfootball_nfl", commence_time)
+            except Exception:
+                season = week = None
+        if season is None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            season = now.year if now.month >= 3 else now.year - 1   # NFL season = start year
         return nfl_prop_serving.project(
-            nfl_props_scan._norm(player_name), season, 99, prop_key, line)
+            nfl_props_scan._norm(player_name), season, (week or 99), prop_key, line)
     except Exception:
         return None
 
@@ -1484,7 +1499,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # avg_stat / over_rate. Only when our model can also project (else genuine no_history).
             _nfl_model_backed = False
             if not _have_history and sport_key == "americanfootball_nfl":
-                _pv = _nfl_model_override(player_name, prop_key, line)
+                _pv = _nfl_model_override(player_name, prop_key, line,
+                                          commence_time=commence_iso)
                 if _pv is not None and _pv.get("p_over") is not None:
                     history = {"found": True, "values": [_pv["proj"]], "opponents": [None],
                                "home_aways": [None], "minutes": [None], "game_dates": [None],
@@ -1918,7 +1934,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # the ESPN history (a known v1 limitation; the standard projection is migrated). ──
             nfl_ctx = None
             if sport_key == "americanfootball_nfl":
-                _nfl = _nfl_model_override(player_name, prop_key, line)
+                _nfl = _nfl_model_override(player_name, prop_key, line,
+                                           commence_time=commence_iso)
                 if _nfl is not None and _nfl.get("p_over") is not None:
                     avg_stat = _nfl["proj"]
                     base_proj = avg_stat
@@ -2312,6 +2329,17 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # was fit against and what subsequent refits should map.
             if log_game_date and sport_key and not lineup_out:
                 _ident = _resolve_ident(player_name, prop_key)
+                # F28 P1: stamp provenance (event-derived season/week, calibration +
+                # artifact hashes, method, de-vig reference policy) so this prediction
+                # can be attributed/replayed. Best-effort; never blocks logging.
+                try:
+                    import prediction_provenance
+                    _prov = prediction_provenance.build_context(
+                        sport_key, commence_iso,
+                        method=(calibration_meta or {}).get("method"),
+                        reference_book_policy=odds_info.get("market_implied_method"))
+                except Exception:
+                    _prov = None
                 prediction_row = log_prediction(
                     sport_key=sport_key,
                     event_id=prop_data.get("game_id"),
@@ -2333,6 +2361,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                     game_pk=(_ident.get("game_pk") if _ident else None),
                     ids_resolved=bool(_ident),
                     source=history.get("source"),   # "warehouse" | "espn" (audit the flip)
+                    context=_prov,                  # F28 P1 provenance
                     write=False,
                 )
                 if prediction_row:

@@ -425,8 +425,14 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
                    final_prob=None, event_id=None, commence_time=None,
                    is_value=None, team=None, batting_order=None,
                    mlb_player_id=None, game_pk=None, ids_resolved=False,
-                   source=None, write=True):
+                   source=None, context=None, write=True):
     """Build and optionally append one prediction row. Best-effort, never raises.
+
+    ``context`` (F28 P1): an optional provenance dict from
+    prediction_provenance.build_context (event_season/week, as_of, calibration_hash,
+    model_schema, method, reference_book_policy, context_fingerprint). Merged onto the
+    row so a stored prediction can be attributed/replayed. Absent → those columns stay
+    NULL (legacy = unknown provenance).
 
     ``team`` and ``batting_order`` are the rule inputs the pick-rules ROI lens
     (pickrules_roi.py) re-derives the recommended slate from — they are not used
@@ -484,6 +490,12 @@ def log_prediction(sport_key, prop_key, player, game_date, line, raw_prob,
     }
     row["game_pk"] = game_pk
     row["source"] = source       # data path that served the model-input history
+    if context:                  # F28 P1: stamp provenance (only set fields present)
+        for _pk in ("event_season", "event_week", "as_of", "calibration_hash",
+                    "model_schema", "method", "reference_book_policy",
+                    "context_fingerprint"):
+            if context.get(_pk) is not None:
+                row[_pk] = context[_pk]
     if ids_resolved:
         row["player_mlb_id"] = mlb_player_id     # resolver-authoritative (may be None)
     _enrich_prediction_ids(row, trust_ids=ids_resolved)
