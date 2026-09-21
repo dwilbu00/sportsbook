@@ -194,6 +194,11 @@ def update_stake(parlay_id, stake):
         upd["profit"], upd["payout"] = profit, stake + profit
     elif t.get("status") == "lost":
         upd["profit"], upd["payout"] = -stake, 0.0
+    elif t.get("status") in ("void", "push"):
+        # A fully void/push ticket refunds the stake in full — recompute the refund
+        # from the NEW stake (was left at the old refund). [F06] Matches
+        # settle_manual's void handling (profit 0, payout = stake).
+        upd["profit"], upd["payout"] = 0.0, stake
 
     def up(rows):
         for r in rows:

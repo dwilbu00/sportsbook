@@ -112,5 +112,30 @@ class F05BankrollContributionTests(_ParlayStoreTest):
         self.assertEqual(bankroll.current_balance(), 90.)
 
 
+class F06StakeEditSettlementTests(_ParlayStoreTest):
+    def test_void_stake_edit_recomputes_full_refund(self):
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "void")
+        parlay_store.update_stake(pid, 20.)
+        self.assertEqual(parlay_store.load_parlays()[0]["payout"], 20.)
+
+    def test_lost_stake_edit_recomputes_loss(self):
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "lost")
+        parlay_store.update_stake(pid, 25.)
+        t = parlay_store.load_parlays()[0]
+        self.assertEqual(t["payout"], 0.0)
+        self.assertEqual(t["profit"], -25.)
+
+    def test_won_stake_edit_recomputes_boosted_payout(self):
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "won")
+        parlay_store.update_stake(pid, 20.)
+        t = parlay_store.load_parlays()[0]
+        # +200 -> dec 3.0; profit = 20*(dec-1)*(1+boost) = 20*2.0*1.5 = 60; payout 80.
+        self.assertEqual(t["profit"], 60.)
+        self.assertEqual(t["payout"], 80.)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
