@@ -50,3 +50,7 @@ nfl_ladder_data/
 
 # NFL alternate-line capture (local research cache; persist to a research table if it proves out, never operational odds_line)
 nfl_alt_data/
+
+# Warehouse mirror parquets — re-generatable from Azure (system of record);
+# managed per-machine via warehouse_mirror.py --sync, not tracked in git.
+warehouse_mirror_data/
