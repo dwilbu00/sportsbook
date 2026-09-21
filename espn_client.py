@@ -880,6 +880,9 @@ PROP_STAT_MAP = {
     # props are warehouse-served; ESPN is a no_history fall-open for them.
     "batter_total_bases": ["TB"],
     "batter_rbis": ["RBI"],
+    # HR resolves against the warehouse calib-gamelog 'HR' column (get_calib_gamelog
+    # emits it). Warehouse-only like TB/RBI — never grade off an ESPN gamelog.
+    "batter_home_runs": ["HR"],
 }
 
 
@@ -892,7 +895,8 @@ PROP_STAT_MAP = {
 # three ESPN read paths guard on this set: get_player_stat_history (history, below),
 # recalibration.resolve_one_prop (grading fallback), and
 # book_line_calibration.join_book_lines_to_actuals (calibration ESPN fall-open).
-WAREHOUSE_ONLY_PROPS = frozenset({"batter_total_bases", "batter_rbis"})
+WAREHOUSE_ONLY_PROPS = frozenset({"batter_total_bases", "batter_rbis",
+                                  "batter_home_runs"})
 
 
 # P4 model-input flag. MLB player histories are served from the StatsAPI warehouse
