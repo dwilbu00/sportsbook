@@ -1,4 +1,10 @@
 {
+  "batter_home_runs": {
+    "a": 0.714149,
+    "b": -0.379609,
+    "kind": "platt",
+    "n": 3378
+  },
   "pitcher_earned_runs": {
     "a": 0.950026,
     "b": -0.099054,
