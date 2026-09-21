@@ -3341,5 +3341,28 @@ class PortfolioSimTests(unittest.TestCase):
         self.assertAlmostEqual(r["avg_per_day"], 2.0)
 
 
+class F21SecretRedactionTests(unittest.TestCase):
+    def test_api_key_in_error_url_is_masked(self):
+        # F21: requests.HTTPError str() carries ?apiKey=... — must never reach the UI.
+        url = ("401 Client Error for url: https://api.the-odds-api.com/v4/sports/x/"
+               "odds?apiKey=AUDIT_FAKE_KEY&regions=us&markets=h2h")
+        red = odds_client.redact_secrets(url)
+        self.assertNotIn("AUDIT_FAKE_KEY", red)
+        self.assertIn("apiKey=***", red)
+
+    def test_masks_token_password_connstring(self):
+        self.assertNotIn("abc123", odds_client.redact_secrets("token=abc123 x"))
+        self.assertNotIn("hunter2",
+                         odds_client.redact_secrets("Server=x;Password=hunter2;Db=y"))
+
+    def test_non_secret_text_unchanged(self):
+        self.assertEqual(odds_client.redact_secrets("regions=us&markets=h2h"),
+                         "regions=us&markets=h2h")
+
+    def test_never_raises(self):
+        self.assertIsInstance(odds_client.redact_secrets(None), str)
+        self.assertIsInstance(odds_client.redact_secrets(ValueError("apiKey=x")), str)
+
+
 if __name__ == "__main__":
     unittest.main()

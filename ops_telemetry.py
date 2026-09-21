@@ -40,7 +40,14 @@ def ops_event(kind, level=logging.WARNING, **fields):
         with _lock:
             _counters[kind] += 1
         if fields:
-            detail = " ".join(f"{k}={v!r}" for k, v in sorted(fields.items()))
+            # F21: scrub credential values (apiKey=..., token=..., Password=...) from
+            # any field before it hits the log. Lazy import avoids an import cycle.
+            try:
+                from odds_client import redact_secrets as _rs
+            except Exception:
+                def _rs(x):
+                    return x
+            detail = _rs(" ".join(f"{k}={v!r}" for k, v in sorted(fields.items())))
             logger.log(level, "ops_event kind=%s %s", kind, detail)
         else:
             logger.log(level, "ops_event kind=%s", kind)

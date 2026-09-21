@@ -18,6 +18,22 @@ import requests
 
 
 BASE_URL = "https://api.the-odds-api.com/v4"
+
+# F21: strip credential values (apiKey=..., token=..., connection-string Password=...)
+# from any string before it reaches the UI, logs or telemetry. requests.HTTPError
+# str() includes the request URL, which carries ?apiKey=..., so an unredacted vendor
+# error would print the key on screen.
+_SECRET_RE = re.compile(
+    r"(?i)(apikey|api_key|api-key|token|password|pwd|secret|authorization)"
+    r"(['\"]?\s*[:=]\s*['\"]?)([^\s'\"&;)]+)")
+
+
+def redact_secrets(text):
+    """Mask credential values in an arbitrary string (best-effort, never raises)."""
+    try:
+        return _SECRET_RE.sub(r"\1\2***", str(text))
+    except Exception:
+        return "<redaction error>"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 CACHE_MAX_AGE = 300  # 5 minutes — short TTL for FRESH live lines (lines move
 # intraday); was 3600 (1h) to conserve the old tiny credit cap. With the 20K/mo

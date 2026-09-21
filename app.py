@@ -72,6 +72,7 @@ if _sql_misconfigured:
     st.stop()
 
 from odds_client import (
+    redact_secrets,
     get_upcoming_events,
     get_event_odds,
     parse_game_odds,
@@ -2318,7 +2319,7 @@ def render_bonuses():
             try:
                 events = get_upcoming_events(_key, rb_sport) if _key else []
             except Exception as e:
-                events, _ = [], st.warning(f"Couldn't load games: {e}")
+                events, _ = [], st.warning(f"Couldn't load games: {redact_secrets(e)}")
             if not events:
                 st.info("No upcoming games for this sport (or no API key set).")
             else:
@@ -2354,7 +2355,7 @@ def render_bonuses():
                                                  bookmakers=None)
                             boards.append(parse_player_props(raw))
                         except Exception as e:
-                            st.warning(f"{_evlabel(eid)}: {e}")
+                            st.warning(f"{_evlabel(eid)}: {redact_secrets(e)}")
                         prog.progress(j / len(picked))
                     if side_choice == "auto":
                         side = "over" if set(fetch_markets) <= _OCC else "favorite"
@@ -3639,7 +3640,7 @@ if analyze_clicked and selected_game_labels:
         try:
             espn_teams = fetch_espn_teams(sport["espn_sport"], sport["espn_league"])
         except Exception as e:
-            st.error(f"Failed to fetch ESPN data: {e}")
+            st.error(f"Failed to fetch ESPN data: {redact_secrets(e)}")
             st.stop()
 
     selected_events = [game_options[l] for l in selected_game_labels]
