@@ -86,6 +86,23 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F14OccurrenceReachableTests(unittest.TestCase):
+    def _hr(self, g):
+        return {"gid": g, "player": "H" + g, "P": 0.20, "odds": 400,
+                "prop": "batter_home_runs", "team": "A", "opp": "B",
+                "line": 0.5, "side": "OVER", "fair_over": True}
+
+    def test_sub_50pct_occurrence_legs_reachable_without_probability_floor(self):
+        # F14: HR/anytime-TD legs are sub-50% by nature. The default min_leg_p (0.0)
+        # must keep them; the old 0.50 floor blocked every one at any setting.
+        b = Bonus("parlay", .5, min_legs=2, min_odds_leg=-1000)
+        legs = [self._hr("g1"), self._hr("g2")]
+        self.assertTrue(opt.cross_game_plays(legs, b, 1000., leg_count=2,
+                                             min_leg_p=0.0, require_positive_ev=False))
+        self.assertEqual(opt.cross_game_plays(legs, b, 1000., leg_count=2,
+                                              min_leg_p=0.50, require_positive_ev=False), [])
+
+
 class F12DeterministicConflictTests(unittest.TestCase):
     @staticmethod
     def _mk(prop, player, P, side, line):

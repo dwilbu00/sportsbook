@@ -2428,14 +2428,18 @@ def render_bonuses():
         leg_count = int(_lc) or None
 
     # "More likely to hit" control: drop any leg whose book-devig hit probability is
-    # below this. Higher = safer legs (fewer, higher-P) at the cost of payout/EV. 0.50
-    # = no filter beyond the type minimums. Applies to both cross-game and SGP.
+    # below this. Higher = safer, higher-P legs (cash more, pay less). Default 0.0 =
+    # NO probability floor, so long-shot OCCURRENCE legs (anytime TD / home runs, which
+    # are <50% by nature and forced to the over side) are reachable; raise it to tighten
+    # toward favorites. [F14: a 0.50 floor made every HR/TD play unreachable at any
+    # setting.] Applies to both cross-game and SGP.
     min_leg_p = st.slider(
-        "Minimum leg win probability (higher = more likely to hit)",
-        min_value=0.50, max_value=0.85, value=0.50, step=0.01,
+        "Minimum leg win probability (0 = no floor; higher = more likely to hit)",
+        min_value=0.0, max_value=0.85, value=0.0, step=0.01,
         help="Only build plays from legs at least this likely to hit (book de-vig P). "
-             "Raise it for safer tickets that cash more often but pay less; 0.50 keeps "
-             "every qualifying leg.")
+             "0.00 keeps every qualifying leg — including sub-50% long shots like "
+             "anytime TD / home runs; raise it for safer favorite-only tickets that "
+             "cash more often but pay less.")
 
     # Lottery mode: a big parlay compounds the vig faster than any boost can offset
     # (break-even is ~8-9 legs even at 50%), so long tickets are almost always −EV.
