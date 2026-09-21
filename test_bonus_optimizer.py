@@ -86,6 +86,20 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F10FrontierTests(unittest.TestCase):
+    def test_game_diversity_survives_top_probability_prefilter(self):
+        # F10: 18 legs from one game + 1 from another. A plain top-N-by-P prefilter
+        # fills the budget with the single game and returns no cross-game ticket; the
+        # game-diverse frontier keeps the second game feasible.
+        b = Bonus("parlay", .5, min_legs=2)
+        legs = [_leg("g1", "batter_hits", str(i), .80, -150) for i in range(18)]
+        legs.append(_leg("g2", "batter_hits", "Other", .79, -150))
+        out = opt.cross_game_plays(legs, b, 1000., leg_count=2)
+        self.assertTrue(out)
+        self.assertTrue(any(len({l["gid"] for l in combo}) == 2
+                            for _ev, _r, combo in out))
+
+
 class F09SgpxCompositionTests(unittest.TestCase):
     def _slate(self, bt):
         b = Bonus(bt, .5, min_legs=2)

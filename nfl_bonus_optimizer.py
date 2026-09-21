@@ -380,8 +380,27 @@ def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0,
     ("more likely to hit" mode). ``require_positive_ev`` (default True) keeps only +EV
     tickets; set False for LOTTERY mode — build the highest-EV ticket even when the
     compounding vig leaves it −EV (a deliberate hail-mary; still ranked by EV)."""
-    elig = sorted([l for l in legs if _leg_ok(l, bonus) and l["P"] >= min_leg_p],
-                  key=lambda x: -x["P"])[:TOP_N]
+    filtered = sorted([l for l in legs if _leg_ok(l, bonus) and l["P"] >= min_leg_p],
+                      key=lambda x: -x["P"])
+    # Build a GAME-DIVERSE frontier before the bounded search: take the best leg per
+    # game first, so the distinct-game constraint stays feasible, THEN fill the TOP_N
+    # budget with the next-best legs overall (multiple per game — needed for singles
+    # and EV flexibility). A plain top-N-by-P prefilter could fill every slot with one
+    # game's legs and return no cross-game ticket though a valid one exists. [F10]
+    elig, games_seen, picked = [], set(), set()
+    for i, l in enumerate(filtered):                 # 1) best leg per game (P-desc)
+        if len(elig) >= TOP_N:
+            break
+        if l["gid"] not in games_seen:
+            elig.append(l)
+            games_seen.add(l["gid"])
+            picked.add(i)
+    for i, l in enumerate(filtered):                 # 2) fill remaining budget
+        if len(elig) >= TOP_N:
+            break
+        if i not in picked:
+            elig.append(l)
+    elig.sort(key=lambda x: -x["P"])
     floor = max(1, bonus.min_legs)
     type_min = 1 if bonus.bet_type in ("single", "any") else 2
     if leg_count:
