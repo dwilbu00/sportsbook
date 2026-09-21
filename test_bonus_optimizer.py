@@ -86,6 +86,29 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F08SgpEligibilityTests(unittest.TestCase):
+    def test_forced_leg_count_below_min_legs_is_rejected(self):
+        # F08: an SGP promo requiring 3 legs must not yield a 2-leg ticket, even when
+        # the leg count is forced to 2.
+        b = Bonus("sgp", .5, min_legs=3)
+        legs = [_leg("g", "batter_hits", "A", .7, -150),
+                _leg("g", "batter_hits", "B", .7, -150)]
+        self.assertEqual(opt.sgp_stacks_indep(legs, b, 1000., leg_count=2), [])
+
+    def test_valid_forced_count_at_min_legs_builds(self):
+        b = Bonus("sgp", .5, min_legs=3)
+        legs = [_leg("g", "batter_hits", p, .7, -150) for p in ("A", "B", "C")]
+        out = opt.sgp_stacks_indep(legs, b, 1000., leg_count=3)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0][2]), 3)
+
+    def test_copula_sgp_also_honors_min_legs(self):
+        b = Bonus("sgp", .5, min_legs=3)
+        legs = [_leg("g", "batter_hits", "A", .7, -150),
+                _leg("g", "batter_hits", "B", .7, -150)]
+        self.assertEqual(opt.sgp_stacks(legs, b, None, 1000., leg_count=2), [])
+
+
 class F07LegIdentityTests(unittest.TestCase):
     def test_mlb_reuse_preserves_settlement_time_and_date(self):
         # F07: the MLB candidate-reuse path must carry commence_time/game_date onto

@@ -307,17 +307,31 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     return legs
 
 
+def _sgp_need(bonus, leg_count):
+    """Stack size for an SGP promo, or None when the request is INELIGIBLE. Honors the
+    promo's leg minimum (an SGP is >=2 legs): a forced leg_count BELOW max(2, min_legs)
+    is rejected outright rather than silently shrunk, so an SGP requiring 3 legs never
+    yields a 2-leg ticket. [F08]"""
+    floor = max(2, bonus.min_legs)
+    if leg_count:
+        need = int(leg_count)
+        return need if need >= floor else None
+    return floor
+
+
 def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
     weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
     required combined price for +EV. Same return shape as sgp_stacks (mx=0, no correlation).
-    ``leg_count`` forces the stack size (>=2). ``min_leg_p`` drops any leg below that hit
-    probability ("more likely to hit" mode — safer, higher-P legs only)."""
+    ``leg_count`` forces the stack size (>=2, and >= the promo's min_legs). ``min_leg_p`` drops
+    any leg below that hit probability ("more likely to hit" mode — safer, higher-P legs only)."""
+    need = _sgp_need(bonus, leg_count)
+    if need is None:
+        return []                              # forced size violates the promo minimum
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus) and l["P"] >= min_leg_p:
             bygame[l["gid"]].append(l)
-    need = max(2, int(leg_count) if leg_count else max(2, bonus.min_legs))
     out = []
     for gid, gl in bygame.items():
         if len(gl) < need:
@@ -391,14 +405,16 @@ def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0,
 def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
     """Per-game same-side +corr STACKS for an SGP bonus: copula joint P + REQUIRED combined price.
     (The book prices the SGP as one number; compare its builder price to 'need >=' live.)
-    ``leg_count`` forces the stack size (>=2)."""
+    ``leg_count`` forces the stack size (>=2, and >= the promo's min_legs). [F08]"""
+    need = _sgp_need(bonus, leg_count)
+    if need is None:
+        return []                              # forced size violates the promo minimum
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus):
             bygame[l["gid"]].append(l)
     rng = np.random.default_rng(0)
     out = []
-    need = max(2, int(leg_count) if leg_count else max(2, bonus.min_legs))
     for gid, gl in bygame.items():
         if len(gl) < need:
             continue
