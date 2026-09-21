@@ -1482,6 +1482,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # player (name it can't resolve), don't drop the prop — synthesize a 1-value history
             # from our projection so the loop runs and the NFL override below fills the real
             # avg_stat / over_rate. Only when our model can also project (else genuine no_history).
+            _nfl_model_backed = False
             if not _have_history and sport_key == "americanfootball_nfl":
                 _pv = _nfl_model_override(player_name, prop_key, line)
                 if _pv is not None and _pv.get("p_over") is not None:
@@ -1490,6 +1491,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                                "plate_appearances": [None], "at_bats": [None],
                                "lineup_status": None, "source": "nfl_model"}
                     _have_history = True
+                    _nfl_model_backed = True
             if not _have_history:
                 candidates.append({
                     "type": "player_prop",
@@ -1579,7 +1581,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 synthetic, team_schedule, sport_key, half_life=half_life,
                 min_streak=reliability_min_streak)
 
-            if filt["skip_prediction"]:
+            # A model-backed NFL candidate is validated by its own n_prior cohort, so a
+            # legacy short-history skip on the 1-value synthetic must NOT discard it —
+            # the NFL override below fills the real avg_stat/over_rate/n_prior. [F17]
+            if filt["skip_prediction"] and not _nfl_model_backed:
                 candidates.append({
                     "type": "player_prop",
                     "matchup": matchup,
@@ -1602,7 +1607,9 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 })
                 continue
 
-            eligible = filt["eligible_games"]
+            # Fall back to the synthetic gamelog when a model-backed candidate's filter
+            # emptied it, so downstream math has an input; the override replaces it. [F17]
+            eligible = filt["eligible_games"] or (synthetic if _nfl_model_backed else [])
             values = [g["_value"] for g in eligible]
             opponents = [g["_opp"] for g in eligible]
             past_home_aways = [g["_ha"] for g in eligible]
@@ -2331,7 +2338,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "under_implied": round(under_implied * 100, 2),
                 "avg_stat": round(avg_stat, 2),
                 "over_rate": round(over_rate * 100, 2),
-                "games_sampled": len(values),
+                # NFL model-backed candidates report the model's own cohort (n_prior),
+                # not the 1-value synthetic history, so the displayed sample size matches
+                # the serving path. [F17]
+                "games_sampled": (curr_games if nfl_ctx else len(values)),
                 "edge_pct": round(edge * 100, 2),
                 "direction": direction,
                 "best_price": best_price,
