@@ -11,6 +11,20 @@ Use the live application here: **https://sbvaluefinder.streamlit.app/**
 
 This is **not** a simple “last 5 games average” app. The model now uses a full stack of statistical tools to estimate outcomes, correct its own bias, reject bad samples, and understand when legs in a parlay are mathematically connected.
 
+## Current serving paths (capability map)
+
+The sections below describe the full toolkit; **this table is the authoritative map of what actually serves each sport/market today.** Some older prose in this README predates these paths — trust this table where they differ.
+
+| Sport / market | History & grading source | Model | Parlay / SGP joint |
+|---|---|---|---|
+| MLB props | **StatsAPI warehouse** (not ESPN) | per-prop calibrated methods + isotonic/Platt recal | **independence** |
+| NFL props | **nflverse** player-week (not ESPN) | 8 frozen distributional models (NegBin / Gaussian + aDOT / CPOE) | **independence** |
+| NBA / NHL props | ESPN gamelogs | recency + residual calibration | independence |
+| Team markets (ML / spread / total) | warehouse (MLB) / nflverse EPA (NFL) | shared margin / EPA model + market blend | n/a |
+| Bonus / boost parlays + SGPs | — | leg P = the book's **de-vigged price** (calibrated); the model is the **eligibility gate only** | **independence** |
+
+**The live app prices every parlay/SGP with an INDEPENDENCE joint.** The Gaussian-copula correlation engine described later is a *validated research artifact*, not the live pricing path: on aggregate favorite tickets independence was the adequate, slightly-conservative base, and the copula's actionable value is composition guidance (prefer positively-correlated same-side stacks; avoid same-team script conflicts). It is **not** validated outside its tested (NFL volume-prop) domain. MLB props and NFL props are graded against the **warehouse** and **nflverse** respectively; only NBA/NHL grade against ESPN box scores.
+
 ```text
 Live odds + ESPN history + sport-specific advanced metrics
         │
@@ -49,8 +63,8 @@ Value bets, safe alt-lines, and correlation-aware parlays
 | Brier-optimized probability shrink | Pulls team-market probabilities toward 50/50 when backtests show overconfidence | Makes confident outputs harder to earn |
 | Model-market blending | Blends the internal model with de-vigged market probability using fitted weights | Respects the wisdom of the market while still surfacing edges |
 | Platt scaling | Fits `sigmoid(a * logit(p_raw) + b)` on resolved predictions | Recalibrates raw model probabilities so “70%” means closer to 70% in practice |
-| Gaussian copula parlays | Estimates joint parlay hit probability with correlated Bernoulli legs | Avoids pretending related legs are independent |
-| Cholesky simulation | Builds positive-definite correlation matrices and Monte Carlo samples joint outcomes | Lets the parlay engine price interaction risk instead of ignoring it |
+| Gaussian copula parlays *(research artifact — the live parlay path uses independence; see the capability map)* | Estimates joint parlay hit probability with correlated Bernoulli legs | Composition guidance (prefer +correlated same-side stacks; avoid script conflicts), validated only on NFL volume props |
+| Cholesky simulation *(research)* | Builds positive-definite correlation matrices and Monte Carlo samples joint outcomes | Lets the correlation study price interaction risk instead of ignoring it |
 | Chronological holdout backtests | Fits and scores using time-ordered historical observations | Reduces leakage and makes validation closer to live use |
 
 ## How predictions are built
@@ -305,6 +319,14 @@ Open **Model Guide & Performance** from the app sidebar to see the production de
 The MLB prop-matchup test is deliberately conservative. In the leakage-safe 2024 fit, starter K rate improved batter-strikeout MAE on the main holdout and both rolling folds, enabling a `0.5` weight. Starter xBA slightly improved the aggregate batter-hit holdout but regressed in one rolling fold, so batter hits remain at `0.0`. Pitcher strikeouts, outs, and earned runs also remain at `0.0` until their exact live signals pass the same gates.
 
 ## Parlays use joint probability instead of naïve multiplication
+
+> **Live-path note:** the bonus/boost parlay + SGP builder in the app prices tickets
+> with an **independence** joint (validated as the adequate, slightly-conservative
+> base). The Gaussian-copula engine described in this section is a **research
+> artifact** used for composition guidance and validation, not the live pricing path —
+> see the [capability map](#current-serving-paths-capability-map). Leg probabilities
+> there are the book's **de-vigged price** (calibrated), with the model acting only as
+> the eligibility gate.
 
 Most simple parlay calculators multiply leg probabilities:
 
