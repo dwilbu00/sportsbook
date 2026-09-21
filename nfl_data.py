@@ -41,10 +41,14 @@ _CACHE = {}
 
 def _read_layer(layer, season):
     """Return a pandas DataFrame for one per-season layer parquet, or None if the
-    file is absent / an LFS stub. Cached in-process."""
+    file is absent / an LFS stub. A successfully-read layer is cached in-process;
+    ABSENCE is NOT cached, so a layer that becomes available later (e.g. an LFS pull
+    or a fresh mirror sync during a long-lived process) is picked up on a later call
+    instead of staying invisible for the process lifetime. [F24]"""
     key = (layer, str(season))
-    if key in _CACHE:
-        return _CACHE[key]
+    cached = _CACHE.get(key)
+    if cached is not None:
+        return cached
     path = os.path.join(_mirror_dir(), f"{layer}__{_SPORT}__{season}.parquet")
     df = None
     if _is_real(path):
@@ -53,7 +57,8 @@ def _read_layer(layer, season):
             df = pd.read_parquet(path)
         except Exception:
             df = None
-    _CACHE[key] = df
+    if df is not None:
+        _CACHE[key] = df
     return df
 
 
