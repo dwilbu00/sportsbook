@@ -2202,12 +2202,15 @@ def render_bonuses():
     if _msg:
         st.success(_msg)
 
-    def _consume_bonus(book, label, bet_type):
-        """A promo boost is single-use → drop the matching bonus from the active list once a
-        play using it is logged (durably persisted)."""
+    def _consume_bonus(bonus_id):
+        """A promo boost is single-use → drop EXACTLY the logged promo (by its stable
+        bonus_id, not its label) from the active list once a play using it is logged.
+        Consuming by id means two same-label promos no longer collide. [F16]"""
+        if not bonus_id:
+            return
         st.session_state["bonuses_list"] = [
             b for b in st.session_state["bonuses_list"]
-            if not (b.book == book and b.label == label and b.bet_type == bet_type)]
+            if getattr(b, "bonus_id", "") != bonus_id]
         bonus_store.save_bonuses(st.session_state["bonuses_list"])
 
     _SPORT_LABELS = {"americanfootball_nfl": "NFL", "baseball_mlb": "MLB"}
@@ -2279,9 +2282,10 @@ def render_bonuses():
                     bet_type=bet_type, boost_pct=boost / 100.0, min_odds_leg=float(min_leg),
                     min_odds_overall=float(min_overall), min_legs=int(min_legs),
                     max_wager=float(max_w), min_wager=float(min_w), book=book, label=label,
-                    sport=_SPORT_KEYS[sport_label], markets=markets)
-                # label is the consume-identity (book,label,bet_type) — never leave it
-                # blank (blank labels collide), so default it to the auto name.
+                    sport=_SPORT_KEYS[sport_label], markets=markets,
+                    bonus_id=bonuslib.new_bonus_id())          # stable identity [F16]
+                # The label is just a human note now (consume is by bonus_id); default a
+                # blank one to the auto name for readable reporting.
                 if not nb.label.strip():
                     nb.label = bonuslib.display_name(nb)
                 bonuses.append(nb)
@@ -2359,8 +2363,10 @@ def render_bonuses():
                     st.session_state["bonus_board"] = {
                         "sport_key": rb_sport, "parsed": boards, "scoped": True,
                         "markets": tuple(fetch_markets), "side": side,
-                        "bonus_label": rb.label, "candidates": [],
-                        "leg_count": int(rlegs) or None, "ts": time.time()}
+                        "bonus_label": rb.label,
+                        "bonus_id": getattr(rb, "bonus_id", ""),   # match by stable id [F16]
+                        "candidates": [], "leg_count": int(rlegs) or None,
+                        "ts": time.time()}
                     st.session_state["_bonus_log_msg"] = (
                         f"Fetched {len(boards)} game(s) for {names[bi]} (side={side}) "
                         "— plays below.")
@@ -2379,8 +2385,11 @@ def render_bonuses():
     # Only evaluate bonuses whose sport matches the loaded slate; a scoped run
     # evaluates JUST the bonus it was run for.
     bonuses = [b for b in bonuses if getattr(b, "sport", "americanfootball_nfl") == board_sport]
-    if scoped and board.get("bonus_label"):
-        _rbz = [b for b in bonuses if b.label == board["bonus_label"]]
+    if scoped and (board.get("bonus_id") or board.get("bonus_label")):
+        # Match the run's bonus by stable id (fall back to label for a legacy stash). [F16]
+        _bid = board.get("bonus_id")
+        _rbz = ([b for b in bonuses if getattr(b, "bonus_id", "") == _bid] if _bid
+                else [b for b in bonuses if b.label == board.get("bonus_label")])
         if _rbz:
             bonuses = _rbz
     if not bonuses:
@@ -2565,12 +2574,12 @@ def render_bonuses():
                     "Log a cross-game parlay", multi,
                     format_func=lambda m: f"{len(m[3])}-leg @{int(m[2]['combined_american']):+d}"
                     f"  ({'  +  '.join(l['player'] for l in m[3])})",
-                    key=f"logx_{r['book']}_{r['label']}")
+                    key=f"logx_{r['bonus_id']}")
                 wager = lc[1].number_input(
                     "Wager $", min_value=0.0, value=round(pick[2]["kelly_stake"], 2), step=1.0,
-                    key=f"wagerx_{r['book']}_{r['label']}",
+                    key=f"wagerx_{r['bonus_id']}",
                     help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
-                if lc[2].button("📝 Log parlay", key=f"logxbtn_{r['book']}_{r['label']}",
+                if lc[2].button("📝 Log parlay", key=f"logxbtn_{r['bonus_id']}",
                                 width='stretch'):
                     _j, ev, rr, combo = pick
                     parlay_store.save_parlay(
@@ -2581,7 +2590,7 @@ def render_bonuses():
                          "our_joint_prob": rr["joint_P"], "our_boosted_ev_pct": ev,
                          "max_corr": 0.0},
                         [opt.leg_to_store(l, "cross_game", board_sport) for l in combo])
-                    _consume_bonus(r["book"], r["label"], r["bet_type"])
+                    _consume_bonus(r["bonus_id"])
                     st.session_state["_bonus_log_msg"] = (
                         f"Logged {len(combo)}-leg parlay → 🎰 Parlays. "
                         f"Bonus '{r['label']}' consumed & removed.")
@@ -2596,7 +2605,7 @@ def render_bonuses():
                         st.write(f"• {_leglabel(l)}  ({l['team']})")
                     price = st.number_input(
                         "Book's SGP combined price (American)", -100000, 100000, int(need),
-                        step=10, key=f"sgp_{r['book']}_{r['label']}_{i}")
+                        step=10, key=f"sgp_{r['bonus_id']}_{i}")
                     if not bonuslib.is_valid_american(price):
                         # F15: reject zero / ±1..99 instead of crashing the pricer with a
                         # ZeroDivisionError; the user re-enters a real American price.
@@ -2611,9 +2620,9 @@ def render_bonuses():
                                  f"suggested stake **${stake:.2f}** (¼-Kelly)")
                         wager = st.number_input(
                             "Wager $", min_value=0.0, value=round(stake, 2), step=1.0,
-                            key=f"wagersgp_{r['book']}_{r['label']}_{i}",
+                            key=f"wagersgp_{r['bonus_id']}_{i}",
                             help="Your actual stake (defaults to the suggested ¼-Kelly amount).")
-                        if st.button("📝 Log this SGP", key=f"logsgp_{r['book']}_{r['label']}_{i}"):
+                        if st.button("📝 Log this SGP", key=f"logsgp_{r['bonus_id']}_{i}"):
                             parlay_store.save_parlay(
                                 {"book": r["book"], "bonus_label": r["label"], "bet_type": "sgp",
                                  "boost_pct": r["boost_pct"], "is_same_game": True,
@@ -2621,7 +2630,7 @@ def render_bonuses():
                                  "sport_key": board_sport,
                                  "our_joint_prob": jp, "our_boosted_ev_pct": ev, "max_corr": mx},
                                 [opt.leg_to_store(l, "sgp", board_sport) for l in combo])
-                            _consume_bonus(r["book"], r["label"], r["bet_type"])
+                            _consume_bonus(r["bonus_id"])
                             st.session_state["_bonus_log_msg"] = (
                                 f"Logged SGP → 🎰 Parlays. Bonus '{r['label']}' consumed & removed.")
                             st.rerun()

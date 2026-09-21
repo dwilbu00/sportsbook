@@ -6,7 +6,7 @@ One JSON string under setting_key="active_bonuses". Seeds from bonus.LIVE_BONUSE
 Best-effort; the UI still works off session_state if the store is unavailable.
 """
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import bonus as bonuslib
 
@@ -14,7 +14,7 @@ _SETTINGS_FILE = "app_settings.jsonl"
 _KEY = "active_bonuses"
 _FIELDS = ("bet_type", "boost_pct", "min_odds_leg", "min_odds_overall",
            "min_legs", "max_wager", "min_wager", "book", "label", "sport",
-           "markets")
+           "markets", "bonus_id")
 
 
 def _clean(d):
@@ -24,7 +24,7 @@ def _clean(d):
         if k not in d:
             continue
         v = d[k]
-        if k in ("bet_type", "book", "label", "sport"):
+        if k in ("bet_type", "book", "label", "sport", "bonus_id"):
             out[k] = str(v)
         elif k == "min_legs":
             out[k] = int(v)
@@ -35,18 +35,54 @@ def _clean(d):
     return out
 
 
+def _with_ids(bonuses):
+    """Ensure every bonus has a stable bonus_id (assigns one to any that lack it).
+    Returns (bonuses, changed) so the caller can persist a migration once. [F16]"""
+    changed = False
+    for b in bonuses:
+        if not getattr(b, "bonus_id", ""):
+            b.bonus_id = bonuslib.new_bonus_id()
+            changed = True
+    return bonuses, changed
+
+
+def _ephemeral_seed():
+    """LIVE_BONUSES with fresh ids, NOT persisted — used only when the store can't be
+    read (transient outage / malformed row), so an unreadable state never overwrites the
+    real durable promos with example ones. [F16]"""
+    return [replace(b, bonus_id=bonuslib.new_bonus_id()) for b in bonuslib.LIVE_BONUSES]
+
+
 def load_bonuses():
-    """List[Bonus] from the KV store; seed with bonus.LIVE_BONUSES if nothing stored."""
+    """List[Bonus] from the KV store; seed with bonus.LIVE_BONUSES only on a genuine
+    empty first run. A FAILED read returns ephemeral seeds WITHOUT persisting, so a
+    transient outage can't clobber real promos or resurrect consumed examples. Any
+    stored entry lacking a stable bonus_id is assigned one and the migration is
+    persisted once (never drops or rekeys existing promo data). [F16]"""
     try:
         import recalibration
         rows, _ = recalibration._read_ndjson_blob(_SETTINGS_FILE, use_cache=False)
-        for r in (rows or []):
-            if r.get("setting_key") == _KEY:
+    except Exception:
+        return list(bonuslib.LIVE_BONUSES)          # read FAILED — ephemeral, don't persist
+    for r in (rows or []):
+        if r.get("setting_key") == _KEY:
+            try:
                 data = json.loads(r.get("setting_value") or "[]")
-                return [bonuslib.Bonus(**_clean(d)) for d in data]
+                bonuses = [bonuslib.Bonus(**_clean(d)) for d in data]
+            except Exception:
+                # malformed stored value — preserve it for repair, don't overwrite
+                return _ephemeral_seed()
+            bonuses, changed = _with_ids(bonuses)
+            if changed:
+                save_bonuses(bonuses)               # persist the id migration once
+            return bonuses
+    # Read SUCCEEDED but the key is absent => genuine first run: seed + persist.
+    seeded = _ephemeral_seed()
+    try:
+        save_bonuses(seeded)
     except Exception:
         pass
-    return list(bonuslib.LIVE_BONUSES)
+    return seeded
 
 
 def save_bonuses(bonuses):

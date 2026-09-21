@@ -572,6 +572,7 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=
                  if _allows_cross(bonus.bet_type) else [])
         stacks = sgp_fn(scoped, bonus, leg_count) if _allows_sgp(bonus.bet_type) else []
         out.append({"book": bonus.book, "label": bonus.label, "bet_type": bonus.bet_type,
+                    "bonus_id": getattr(bonus, "bonus_id", ""),   # stable consume identity [F16]
                     "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
                     "n_legs": len(scoped), "cross": cross, "sgp": stacks})
     return out

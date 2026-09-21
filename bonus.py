@@ -24,7 +24,14 @@ EV per $1 with a profit boost b on a bet of true prob P and decimal odds D:
   EV   =  P*(D-1)*(1+b) - (1-P)
 Kelly fraction on the boosted payout: f* = P - (1-P)/((D-1)*(1+b)).
 """
+import uuid
 from dataclasses import dataclass
+
+
+def new_bonus_id():
+    """A stable, opaque promo id — independent of the (mutable) display label, so two
+    same-label promos stay distinct and consuming one removes EXACTLY that promo. [F16]"""
+    return "bn_" + uuid.uuid4().hex[:12]
 
 
 @dataclass
@@ -40,6 +47,7 @@ class Bonus:
     label: str = ""                      # human tag for reporting (blank -> display_name)
     sport: str = "americanfootball_nfl"  # which sport's slate this boost applies to
     markets: tuple = ()                  # market scope (see module docstring); () = all
+    bonus_id: str = ""                   # stable identity (F16); assigned on create/load
 
 
 # ── Human-readable auto-naming (book · sport · type · boost · scope) ────────────
