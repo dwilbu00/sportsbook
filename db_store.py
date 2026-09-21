@@ -931,7 +931,23 @@ def mutate(table_name, mutator, where=None, max_retries=3):
     only status='pending') to avoid pulling the whole table out of the DB. A
     ``where``-filtered mutate MUST only update rows within that subset: it must not
     append a row whose identity could collide with an unread row, nor depend on
-    rows outside the filter."""
+    rows outside the filter.
+
+    CONCURRENCY CONTRACT (audit F23 — PARTIAL; full fix is T23):
+    This read→mutate→write runs in ONE transaction but at the engine's DEFAULT
+    isolation (READ COMMITTED on SQL Server), and UPDATEs match on identity only —
+    they do NOT compare a row version or prior value. Two sessions can therefore
+    read the same ``before`` and the second silently overwrite the first (a lost
+    update). Only ``OperationalError`` (transient cold-resume/lock/timeout) is
+    retried; a lost update is NOT detected. Money-sensitive callers today:
+    whole-list bonus settings (bonus_store.save_bonuses) and absolute-target
+    bankroll corrections (bankroll.record_adjustment). The intended fix is an
+    OPTIMISTIC compare-and-set (add the prior values / a rowversion to the UPDATE
+    WHERE; a 0-row result → re-read + re-apply via the retry loop) or a narrowly
+    scoped serializable transaction — it must be validated against a STAGING SQL
+    SERVER (SQLite's StaticPool cannot reproduce SQL Server isolation/deadlock
+    behavior), so it is intentionally NOT implemented here without that environment.
+    Single-writer use (the current single-user app) is unaffected."""
     cfg = _resolve(table_name)
     table = cfg["table"]
     engine = get_engine()
