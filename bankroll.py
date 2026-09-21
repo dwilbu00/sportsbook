@@ -216,6 +216,10 @@ def reconcile_bet_txns(wager_rows=None):
         except Exception:
             return 0
 
+    # Singles were either passed in (caller already read them) or lazily read above
+    # with the failure guard, so reaching here means the singles source is authoritative.
+    singles_ok = True
+
     desired = {}   # txn_id -> {amount, wager_id, status, resolved_at}
     for w in (wager_rows or []):
         wid = w.get("wager_id")
@@ -230,6 +234,35 @@ def reconcile_bet_txns(wager_rows=None):
             "wager_id": wid,
             "status": w.get("status"),
             "resolved_at": w.get("resolved_at"),
+        }
+
+    # F05: settled PARLAYS contribute their realized profit to the same ledger, under
+    # a distinct bet:parlay:<id> namespace. Read the ticket file directly (not
+    # load_parlays, which swallows errors) so a FAILED read is distinguishable from an
+    # empty one — parlays_ok gates the stale-drop below so an outage never erases
+    # parlay bet txns (same protection as F03 for singles).
+    parlays_ok = False
+    parlay_rows = []
+    try:
+        import parlay_store
+        parlay_rows, _ = recalibration._read_ndjson_blob(
+            parlay_store.PARLAYS_FILE, use_cache=True)
+        parlays_ok = True
+    except Exception:
+        parlays_ok = False
+    for p in (parlay_rows or []):
+        pid = p.get("parlay_id")
+        if not pid or p.get("status") not in _SETTLED or p.get("profit") is None:
+            continue
+        try:
+            amt = round(float(p.get("profit") or 0.0), 2)
+        except (TypeError, ValueError):
+            amt = 0.0
+        desired["bet:parlay:%s" % pid] = {
+            "amount": amt,
+            "wager_id": pid,
+            "status": p.get("status"),
+            "resolved_at": p.get("settled_at"),
         }
 
     def sync(rows):
@@ -259,8 +292,16 @@ def reconcile_bet_txns(wager_rows=None):
                 existing["txn_type"] = "bet"
                 existing["wager_id"] = d["wager_id"]
                 changed += 1
-        # Drop bet txns whose wager is no longer settled (or gone).
-        stale = [t for t in by_txn if t not in desired]
+        # Drop bet txns whose source says they're gone — but ONLY within a namespace
+        # whose source was read successfully. Never drop bet:parlay:* when the parlay
+        # store was unavailable, nor single bet:* when wagers were unavailable. [F03/F05]
+        def _droppable(t):
+            if t in desired:
+                return False
+            if t.startswith("bet:parlay:"):
+                return parlays_ok
+            return singles_ok
+        stale = [t for t in by_txn if _droppable(t)]
         if stale:
             drop = set(stale)
             rows[:] = [r for r in rows if r.get("txn_id") not in drop]

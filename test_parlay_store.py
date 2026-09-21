@@ -68,5 +68,49 @@ class F04AtomicityTests(_ParlayStoreTest):
         self.assertEqual(len(t["legs"]), t["n_legs"])
 
 
+class F05BankrollContributionTests(_ParlayStoreTest):
+    def test_settled_parlay_loss_contributes_to_bankroll(self):
+        bankroll.record_adjustment(100.)
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "lost")
+        bankroll.reconcile_bet_txns()
+        self.assertEqual(bankroll.current_balance(), 90.)
+
+    def test_settled_parlay_win_contributes_boosted_profit(self):
+        bankroll.record_adjustment(100.)
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "won")
+        bankroll.reconcile_bet_txns()
+        # +200 -> dec 3.0; profit = stake*(dec-1)*(1+boost) = 10*2.0*1.5 = 30.
+        self.assertEqual(bankroll.current_balance(), 130.)
+
+    def test_reconcile_is_idempotent_for_parlays(self):
+        bankroll.record_adjustment(100.)
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "lost")
+        bankroll.reconcile_bet_txns()
+        self.assertEqual(bankroll.reconcile_bet_txns(), 0)  # second call writes nothing
+        self.assertEqual(bankroll.current_balance(), 90.)
+
+    def test_failed_parlay_read_does_not_erase_parlay_bet_txns(self):
+        # F03-class protection extended to parlays: an unavailable parlay store must
+        # not delete existing bet:parlay:* txns as stale.
+        bankroll.record_adjustment(100.)
+        pid = parlay_store.save_parlay(self._ticket(), self._legs())
+        parlay_store.settle_manual(pid, "lost")
+        bankroll.reconcile_bet_txns()
+        self.assertEqual(bankroll.current_balance(), 90.)
+        real = recalibration._read_ndjson_blob
+
+        def fail_parlays(filename, *a, **k):
+            if filename == parlay_store.PARLAYS_FILE:
+                raise OSError("synthetic parlay read failure")
+            return real(filename, *a, **k)
+
+        with patch.object(recalibration, "_read_ndjson_blob", side_effect=fail_parlays):
+            bankroll.reconcile_bet_txns()
+        self.assertEqual(bankroll.current_balance(), 90.)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
