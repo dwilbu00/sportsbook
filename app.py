@@ -2904,13 +2904,30 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
     if not deleted and not edits and not regrades:
         st.info("No changes to save.")
         return
+    # Apply NON-DESTRUCTIVE edits/regrades FIRST and the destructive DELETE LAST, so an
+    # early failure leaves the ledger unchanged instead of half-applied. On a mid-batch
+    # failure, report the EXACT committed state rather than falsely claiming rollback
+    # (true single-transaction atomicity + an idempotency key are the deferred T22). [F22]
+    n_edit = n_regrade = n_del = 0
+    committed = []
     try:
-        n_del = wagers.delete_wagers(deleted) if deleted else 0
-        n_edit = wagers.update_wagers(edits) if edits else 0
-        n_regrade = wagers.regrade_wagers(regrades) if regrades else 0
+        if edits:
+            n_edit = wagers.update_wagers(edits)
+            committed.append(f"{n_edit} edited")
+        if regrades:
+            n_regrade = wagers.regrade_wagers(regrades)
+            committed.append(f"{n_regrade} reset to pending")
+        if deleted:
+            n_del = wagers.delete_wagers(deleted)
+            committed.append(f"{n_del} deleted")
     except Exception as exc:
-        st.error(f"Could not save changes ({type(exc).__name__}). "
-                 "Your ledger is unchanged — please try again.")
+        if committed:
+            st.error(f"Partially saved before an error ({type(exc).__name__}): "
+                     + ", ".join(committed) + " committed; the rest was NOT saved. "
+                     "Refresh before retrying so changes aren't double-applied.")
+        else:
+            st.error(f"Could not save changes ({type(exc).__name__}). "
+                     "Your ledger is unchanged — please try again.")
         return
     if not n_del and not n_edit and not n_regrade:
         st.info("No changes to save.")
