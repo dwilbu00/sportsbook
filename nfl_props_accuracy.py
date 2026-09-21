@@ -247,7 +247,10 @@ def _fit_negbin_phi(pairs, cap=2.0):
     return best_phi
 
 
-def _mean_of(o, cfg, comp):
+def _mean_of(o, cfg, comp, shrink_k=None):
+    # shrink_k defaults to the module global (offline sweeps set it single-threaded);
+    # LIVE serving passes it EXPLICITLY so parallel projections never race on the
+    # global (F13). This is the only request-specific model parameter read here.
     if cfg["fam"] == "count":
         return o["mean_base"]
     conv = o["conv_own"]
@@ -257,7 +260,8 @@ def _mean_of(o, cfg, comp):
         prior = max(lo, min(hi, a + b * o["adot"]))
     else:
         prior = comp["league_conv"]
-    wt = o["vw"] / (o["vw"] + SHRINK_K)
+    k = SHRINK_K if shrink_k is None else shrink_k
+    wt = o["vw"] / (o["vw"] + k)
     conv_adj = max(lo, min(hi, wt * conv + (1 - wt) * prior))
     return o["exp_vol"] * conv_adj
 
@@ -310,23 +314,23 @@ def _sd_of(o, cfg, comp):
     return max(SD_FLOOR, math.sqrt(v)) if v > 0 else comp.get("sd_const", SD_FLOOR)
 
 
-def p_over(o, line, cfg, comp):
-    m = _mean_of(o, cfg, comp)
+def p_over(o, line, cfg, comp, shrink_k=None):
+    m = _mean_of(o, cfg, comp, shrink_k)
     if cfg["var"] == "negbin":
         return _negbin_sf(int(line) + 1, m, comp["phi"])
     return max(0.0, min(1.0, _normal_sf(line, m, _sd_of(o, cfg, comp))))
 
 
-def logscore(o, cfg, comp):
-    m = _mean_of(o, cfg, comp)
+def logscore(o, cfg, comp, shrink_k=None):
+    m = _mean_of(o, cfg, comp, shrink_k)
     if cfg["var"] == "negbin":
         return _negbin_logpmf(int(round(o["actual"])), m, comp["phi"])
     return _normal_logpdf(o["actual"], m, _sd_of(o, cfg, comp))
 
 
-def proj_mean_sd(o, cfg, comp):
+def proj_mean_sd(o, cfg, comp, shrink_k=None):
     """Projected mean and SD — for a confidence z-score (line distance in SDs)."""
-    m = _mean_of(o, cfg, comp)
+    m = _mean_of(o, cfg, comp, shrink_k)
     if cfg["var"] == "negbin":
         phi = comp.get("phi", 0.0)
         var = m + phi * m * m

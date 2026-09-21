@@ -87,20 +87,20 @@ def project(player_norm, season, week, prop, line=None):
     if entry is None or cfg is None:
         return None
     comp = entry["comp"]
-    # _mean_of reads the module-global SHRINK_K (the conversion self-shrink strength).
-    acc.SHRINK_K = entry.get("swept", [4, 3, 12])[2]
+    # F13: pass the conversion self-shrink strength EXPLICITLY through the model math
+    # instead of mutating acc.SHRINK_K (a module global the 16-worker analysis pool
+    # would race on). Nothing here mutates shared model state.
+    k = entry.get("swept", [4, 3, 12])[2]
     o = build_obs(player_norm, season, week, prop)
     if o is None:
         return None
-    proj, sd = acc.proj_mean_sd(o, cfg, comp)
-    k = entry.get("swept", [4, 3, 12])[2]
+    proj, sd = acc.proj_mean_sd(o, cfg, comp, shrink_k=k)
 
     def p_at(L, _o=o, _cfg=cfg, _comp=comp, _k=k):
         """P(over L) from the frozen model at an arbitrary line (for alt/safe-mode lines).
-        Re-pins SHRINK_K (the module global _mean_of reads) so a later call is order-safe."""
-        acc.SHRINK_K = _k
+        The shrink strength is passed per-call, so this is order-/thread-safe."""
         try:
-            return max(0.0, min(1.0, acc.p_over(_o, float(L), _cfg, _comp)))
+            return max(0.0, min(1.0, acc.p_over(_o, float(L), _cfg, _comp, shrink_k=_k)))
         except Exception:
             return None
 
