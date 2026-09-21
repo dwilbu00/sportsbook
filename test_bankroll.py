@@ -238,6 +238,28 @@ class ReconcileReadsWagersLedgerTests(unittest.TestCase):
             self.assertEqual(bankroll.reconcile_bet_txns(), 1)
             self.assertEqual(bankroll.current_balance(), -10.0)
 
+    def test_F03_failed_wager_read_does_not_erase_bet_txns(self):
+        # F03: a FAILED lazy wager read must not be treated as an empty ledger and
+        # delete every derived bet txn as stale. Seed a bet txn, force the wager
+        # read to raise, reconcile, and confirm the ledger is left intact.
+        import wagers
+        with _SqlBankroll():
+            db_store.mutate("bankroll_ledger", lambda rows: rows.append(dict(
+                txn_id="bet:w1", txn_type="bet", wager_id="w1", amount=25.,
+                note="won")) or 1)
+            real_read = recalibration._read_ndjson_blob
+
+            def intermittent(filename, *a, **k):
+                if filename == wagers.WAGERS_FILE:
+                    raise OSError("synthetic transient wager read failure")
+                return real_read(filename, *a, **k)
+
+            with patch.object(recalibration, "_read_ndjson_blob",
+                              side_effect=intermittent):
+                changed = bankroll.reconcile_bet_txns()
+            self.assertEqual(changed, 0)
+            self.assertEqual(len(db_store.read_rows("bankroll_ledger")), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -204,7 +204,15 @@ def reconcile_bet_txns(wager_rows=None):
     if wager_rows is None:
         try:
             import wagers
-            wager_rows = wagers.read_wagers()
+            # F03: reconcile ONLY from a successful authoritative snapshot. A failed
+            # wager read returns [] via read_wagers(), which this sweep would treat
+            # as "no settled wagers" and DELETE every derived bet txn as stale. Use
+            # the status-bearing API and ABORT on read error — never mutate the
+            # ledger off an unavailable source. (A genuinely empty, healthy read
+            # still reconciles: err is None.)
+            wager_rows, read_error = wagers.read_wagers_with_status()
+            if read_error is not None:
+                return 0
         except Exception:
             return 0
 
