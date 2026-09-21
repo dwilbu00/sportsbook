@@ -90,5 +90,28 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(Bonus(bet_type="any", boost_pct=0.25).markets, ())
 
 
+class F11SizingBoundsTests(unittest.TestCase):
+    def test_zero_bankroll_yields_no_stake(self):
+        # F11: min_wager must not override a zero bankroll.
+        b = Bonus(bet_type="single", boost_pct=0.5, min_wager=10., max_wager=100.)
+        self.assertEqual(bonus.evaluate([(.6, 100)], b, bankroll=0.)["kelly_stake"], 0.)
+
+    def test_unavailable_or_nonfinite_bankroll_yields_no_stake(self):
+        b = Bonus(bet_type="single", boost_pct=0.5, min_wager=10., max_wager=100.)
+        for bad in (None, float("nan"), float("inf"), -50.):
+            self.assertEqual(
+                bonus.evaluate([(.6, 100)], b, bankroll=bad)["kelly_stake"], 0.)
+
+    def test_bankroll_below_min_wager_cannot_afford_ticket(self):
+        b = Bonus(bet_type="single", boost_pct=0.5, min_wager=10., max_wager=100.)
+        self.assertEqual(bonus.evaluate([(.6, 100)], b, bankroll=5.)["kelly_stake"], 0.)
+
+    def test_sufficient_bankroll_sizes_within_bounds(self):
+        b = Bonus(bet_type="single", boost_pct=0.5, min_wager=10., max_wager=100.)
+        stake = bonus.evaluate([(.6, 100)], b, bankroll=1000.)["kelly_stake"]
+        self.assertGreaterEqual(stake, 10.)
+        self.assertLessEqual(stake, 100.)
+
+
 if __name__ == "__main__":
     unittest.main()

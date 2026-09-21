@@ -147,7 +147,19 @@ def evaluate(legs, bonus, joint_prob=None, bankroll=1000.0, kelly_frac=0.25):
     f = kelly_fraction(P, dec, bonus.boost_pct) * kelly_frac
     stake = 0.0
     if qualifies and ev > 0:
-        stake = min(bonus.max_wager, max(bonus.min_wager, f * bankroll))
+        # The promo min/max are ticket CONSTRAINTS, not permission to stake beyond the
+        # bankroll. Coerce an unavailable/negative/non-finite bankroll to 0, and only
+        # size a ticket the bankroll can AFFORD: if it can't cover the promo minimum
+        # there is no eligible sized stake (0) rather than a phantom min-wager bet
+        # against money the app has no evidence exists. [F11]
+        try:
+            bk = float(bankroll)
+        except (TypeError, ValueError):
+            bk = 0.0
+        if bk != bk or bk in (float("inf"), float("-inf")) or bk < 0:
+            bk = 0.0
+        if bk >= bonus.min_wager:
+            stake = min(bonus.max_wager, bk, max(bonus.min_wager, f * bk))
     return {"n_legs": n, "kind": kind, "joint_P": P, "combined_dec": dec,
             "combined_american": dec_to_american(dec),
             "boosted_ev_pct": ev * 100.0, "qualifies": qualifies,

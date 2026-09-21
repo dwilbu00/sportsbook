@@ -2392,12 +2392,21 @@ def render_bonuses():
                    "Finder, then return here.")
         return
     import parlay_store
+    # F11: never substitute a hidden $1,000 default. An unavailable / zero / negative
+    # bankroll becomes an explicit 0 (evaluate then recommends no sized stake) with a
+    # visible note, so sizing never spends money the app has no evidence exists.
     try:
         import bankroll as _bk
-        bankroll = float(_bk.current_balance())
+        _bal = float(_bk.current_balance())
     except Exception:
-        bankroll = 1000.0
-    bankroll = bankroll if bankroll and bankroll > 0 else 1000.0
+        _bal = None
+    if _bal is not None and _bal > 0:
+        bankroll, bankroll_available = _bal, True
+    else:
+        bankroll, bankroll_available = 0.0, False
+        st.info("💰 Bankroll is $0 or unavailable — showing plays without sized stakes. "
+                "Set your bankroll on 🎰 Parlays / 💵 My Bets to get Kelly-sized "
+                "recommendations. You can still enter a manual wager per ticket.")
     # leg labels: modeled abbrevs + fall back to the market key for non-modeled (HR/TD)
     pabbr = dict(opt.PROP_ABBR)
     pabbr.update(opt.MLB_ABBR)
