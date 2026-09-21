@@ -2938,6 +2938,50 @@ def _safe_float(value):
 
 st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layout="wide")
 
+
+# ──────────────────────────────────────────────────────────
+#  F20: lightweight single-user access gate
+# ──────────────────────────────────────────────────────────
+# The app has no per-user login before the shared SQL-backed bet / bankroll / promo
+# workflows. A shared secret (st.secrets['app_password']) must be entered before ANY
+# data read, mutation or boot maintenance runs — this gate sits ABOVE the boot
+# prefetch/reconcile below. Defense-in-depth on top of the host's own sharing
+# setting. When no secret is configured (local dev) the gate is OPEN, with a visible
+# warning so a deployment is never SILENTLY unprotected.
+def _app_password():
+    try:
+        return st.secrets.get("app_password")
+    except Exception:
+        return None
+
+
+def _password_ok(entered, secret):
+    """Constant-time comparison (avoids a timing side-channel on the shared secret)."""
+    import hmac
+    return bool(secret) and hmac.compare_digest(str(entered), str(secret))
+
+
+def _require_app_auth():
+    secret = _app_password()
+    if not secret:
+        st.warning("⚠️ No `app_password` set — this app is UNPROTECTED. Add one to "
+                   "Streamlit secrets to require sign-in before bets/bankroll load.")
+        return
+    if st.session_state.get("_authed"):
+        return
+    st.title("🔒 Sportsbook — sign in")
+    pw = st.text_input("Password", type="password", key="_auth_pw")
+    if st.button("Sign in", key="_auth_btn"):
+        if _password_ok(pw, secret):
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()   # halt before any data read / mutation / boot maintenance
+
+
+_require_app_auth()
+
 # ──────────────────────────────────────────────────────────
 #  First-run setup check
 # ──────────────────────────────────────────────────────────
