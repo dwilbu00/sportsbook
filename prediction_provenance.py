@@ -52,9 +52,15 @@ def artifact_hash():
     for rel in _ARTIFACT_FILES:
         try:
             with open(os.path.join(_base_dir(), rel), "rb") as f:
-                h.update(rel.encode("utf-8"))
-                h.update(f.read())
-                found = True
+                data = f.read()
+            # Normalize line endings (CRLF/CR -> LF) so the SAME committed text
+            # artifact hashes identically on Windows (git checks out CRLF) and the
+            # Cloud's Linux (LF). Without this, replay on a Windows dev box reports
+            # every server-stamped row as artifacts_changed on a pure EOL diff.
+            data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            h.update(rel.encode("utf-8"))
+            h.update(data)
+            found = True
         except Exception:
             continue
     _ARTIFACT_HASH = h.hexdigest()[:12] if found else ""

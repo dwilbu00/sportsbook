@@ -59,7 +59,11 @@ def replay(row, tol=_TOL):
             or cur.get("model_schema") != row.get("model_schema")):
         return {"status": "artifacts_changed",
                 "stored_fingerprint": row.get("context_fingerprint"),
-                "current_fingerprint": cur.get("context_fingerprint")}
+                "current_fingerprint": cur.get("context_fingerprint"),
+                "stored_calibration_hash": row.get("calibration_hash"),
+                "current_calibration_hash": cur.get("calibration_hash"),
+                "stored_model_schema": row.get("model_schema"),
+                "current_model_schema": cur.get("model_schema")}
 
     sport, method = row.get("sport_key"), row.get("method")
     if sport == "americanfootball_nfl" and method == "nfl_model":
@@ -81,7 +85,7 @@ def replay_many(rows, tol=_TOL):
     'matched'/'mismatched' split the 'ok' rows by whether recompute == stored."""
     summary = {"total": 0, "ok": 0, "matched": 0, "mismatched": 0,
                "artifacts_changed": 0, "no_provenance": 0, "unsupported": 0,
-               "mismatches": []}
+               "mismatches": [], "artifact_diffs": []}
     for row in rows or []:
         out = replay(row, tol=tol)
         st = out.get("status")
@@ -98,6 +102,12 @@ def replay_many(rows, tol=_TOL):
                     "stored": out.get("stored"), "recomputed": out.get("recomputed")})
         elif st in summary:
             summary[st] += 1
+            if st == "artifacts_changed" and len(summary["artifact_diffs"]) < 3:
+                summary["artifact_diffs"].append({
+                    "calibration_hash": [out.get("stored_calibration_hash"),
+                                         out.get("current_calibration_hash")],
+                    "model_schema": [out.get("stored_model_schema"),
+                                     out.get("current_model_schema")]})
     return summary
 
 

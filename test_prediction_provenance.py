@@ -3,6 +3,7 @@
 Run: PYTHONIOENCODING=utf-8 python -m unittest test_prediction_provenance -v
 """
 import os
+import tempfile
 from contextlib import ExitStack
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,27 @@ class ContextBuildTests(unittest.TestCase):
         # A January game belongs to the prior NFL season.
         self.assertEqual(pp.event_season_week(
             "americanfootball_nfl", "2025-01-05T18:00:00Z")[0], 2024)
+
+    def test_artifact_hash_line_ending_independent(self):
+        # The SAME committed artifact must hash identically regardless of checkout
+        # line endings — else replay on a Windows dev box (CRLF) reports every
+        # Cloud-stamped row (LF) as artifacts_changed on a pure EOL diff.
+        content = b'{\n  "prop": {"phi": 0.14},\n  "v": 2\n}\n'
+
+        def _hash_with(data_bytes):
+            with tempfile.TemporaryDirectory() as d:
+                os.makedirs(os.path.join(d, "calibration"))
+                with open(os.path.join(d, "calibration", "m.json"), "wb") as f:
+                    f.write(data_bytes)
+                with patch.object(pp, "_base_dir", lambda: d), \
+                        patch.object(pp, "_ARTIFACT_FILES", ("calibration/m.json",)), \
+                        patch.object(pp, "_ARTIFACT_HASH", None):
+                    return pp.artifact_hash()
+
+        lf = _hash_with(content)
+        crlf = _hash_with(content.replace(b"\n", b"\r\n"))
+        self.assertNotEqual(lf, "")
+        self.assertEqual(lf, crlf)
 
 
 class PersistenceTests(unittest.TestCase):
