@@ -86,6 +86,39 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F12DeterministicConflictTests(unittest.TestCase):
+    @staticmethod
+    def _mk(prop, player, P, side, line):
+        return {"gid": "g", "prop": prop, "player": player, "team": "A", "opp": "B",
+                "line": line, "side": side, "P": P, "fair_over": side == "OVER",
+                "odds": -110}
+
+    def test_hits_over_and_total_bases_under_same_player_rejected(self):
+        # >=2 hits forces >=2 total bases, so UNDER 0.5 TB is impossible. [F12]
+        b = Bonus("sgp", .5, min_legs=2)
+        legs = [self._mk("batter_hits", "A", .7, "OVER", 1.5),
+                self._mk("batter_total_bases", "A", .6, "UNDER", 0.5)]
+        self.assertEqual(opt.sgp_stacks_indep(legs, b, 1000.), [])
+
+    def test_same_stat_opposite_sides_rejected(self):
+        b = Bonus("sgp", .5, min_legs=2)
+        legs = [self._mk("batter_hits", "A", .7, "OVER", 1.5),
+                self._mk("batter_hits", "A", .6, "UNDER", 0.5)]
+        self.assertEqual(opt.sgp_stacks_indep(legs, b, 1000.), [])
+
+    def test_compatible_same_player_combo_builds(self):
+        b = Bonus("sgp", .5, min_legs=2)
+        legs = [self._mk("batter_hits", "A", .7, "OVER", 0.5),
+                self._mk("batter_total_bases", "A", .6, "OVER", 1.5)]
+        self.assertEqual(len(opt.sgp_stacks_indep(legs, b, 1000.)), 1)
+
+    def test_different_players_never_conflict(self):
+        b = Bonus("sgp", .5, min_legs=2)
+        legs = [self._mk("batter_hits", "A", .7, "OVER", 1.5),
+                self._mk("batter_total_bases", "B", .6, "UNDER", 0.5)]
+        self.assertEqual(len(opt.sgp_stacks_indep(legs, b, 1000.)), 1)
+
+
 class F10FrontierTests(unittest.TestCase):
     def test_game_diversity_survives_top_probability_prefilter(self):
         # F10: 18 legs from one game + 1 from another. A plain top-N-by-P prefilter

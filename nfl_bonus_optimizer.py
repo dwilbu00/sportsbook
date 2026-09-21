@@ -18,6 +18,7 @@ and sanity-check the output. Live: swap the line source to the Odds API board (s
 Diagnostic — spends nothing.
 """
 import argparse
+import math
 from collections import defaultdict
 from itertools import combinations
 
@@ -307,6 +308,63 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     return legs
 
 
+# ── Deterministic SGP leg-conflict detection (F12) ─────────────────────────────
+# Independence pricing multiplies marginals, which assigns a nonzero joint P to a
+# LOGICALLY IMPOSSIBLE same-player combination (e.g. OVER 1.5 hits AND UNDER 0.5
+# total bases — >=2 hits forces >=2 total bases). Reject provable contradictions
+# before pricing. Conservative: only rejects pairs proven impossible; never a valid
+# combo. Full nested-implication / validated-joint-domain handling is deferred T12.
+_STAT_LE = {   # same player: this stat can NEVER exceed the listed stats
+    "batter_home_runs": ("batter_hits", "batter_total_bases"),
+    "batter_hits": ("batter_total_bases",),
+}
+
+
+def _leg_bounds(l):
+    """Integer bounds a leg imposes on its stat: (stat, min_or_None, max_or_None).
+    OVER line -> stat >= floor(line)+1 ; UNDER line -> stat <= ceil(line)-1."""
+    line = float(l["line"])
+    if (l.get("side") or "OVER").upper() == "OVER":
+        return l["prop"], math.floor(line) + 1, None
+    return l["prop"], None, math.ceil(line) - 1
+
+
+def _pair_impossible(a, b):
+    """True if two SAME-PLAYER legs are deterministically contradictory."""
+    if not a.get("player") or a.get("player") != b.get("player"):
+        return False
+    sa, amin, amax = _leg_bounds(a)
+    sb, bmin, bmax = _leg_bounds(b)
+    if sa == sb:                                   # same stat: min > max is impossible
+        lo = amin if amin is not None else bmin
+        hi = amax if amax is not None else bmax
+        return lo is not None and hi is not None and lo > hi
+    # cross-stat implication low <= high: high >= low, so a lower-stat OVER floor that
+    # exceeds a higher-stat UNDER ceiling is impossible.
+    if amin is not None and bmax is not None and sb in _STAT_LE.get(sa, ()) and amin > bmax:
+        return True
+    if bmin is not None and amax is not None and sa in _STAT_LE.get(sb, ()) and bmin > amax:
+        return True
+    return False
+
+
+def _combo_has_conflict(combo):
+    return any(_pair_impossible(combo[i], combo[j])
+               for i in range(len(combo)) for j in range(i + 1, len(combo)))
+
+
+def _pick_conflict_free(legs_sorted, need):
+    """Greedily take the top-P legs that don't deterministically conflict with those
+    already chosen, up to ``need``. Returns the combo (may be < need)."""
+    combo = []
+    for l in legs_sorted:
+        if not any(_pair_impossible(l, c) for c in combo):
+            combo.append(l)
+            if len(combo) == need:
+                break
+    return combo
+
+
 def _sgp_need(bonus, leg_count):
     """Stack size for an SGP promo, or None when the request is INELIGIBLE. Honors the
     promo's leg minimum (an SGP is >=2 legs): a forced leg_count BELOW max(2, min_legs)
@@ -336,7 +394,13 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     for gid, gl in bygame.items():
         if len(gl) < need:
             continue
-        combo = tuple(sorted(gl, key=lambda x: -x["P"])[:need])
+        # Skip deterministically impossible combinations (F12) — greedily take the
+        # top-P legs that don't contradict each other; skip the game if a conflict-free
+        # stack of the required size can't be assembled.
+        combo = _pick_conflict_free(sorted(gl, key=lambda x: -x["P"]), need)
+        if len(combo) < need:
+            continue
+        combo = tuple(combo)
         jp = 1.0
         for l in combo:
             jp *= l["P"]
@@ -440,6 +504,8 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
         gl = sorted(gl, key=lambda x: -x["P"])[:TOP_N]
         best = None
         for combo in combinations(gl, need):
+            if _combo_has_conflict(combo):    # reject deterministically impossible legs [F12]
+                continue
             # prefer positively-correlated same-side content; skip strong script-conflict stacks
             rhos = [sgp._rho_val(rho.get(sgp.category(a, b))) for a, b in combinations(combo, 2)]
             if min(rhos) <= -0.30:            # avoid same-team RB-committee / pass-rush conflicts
