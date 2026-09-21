@@ -86,5 +86,23 @@ class EvaluateSlateScopeTests(unittest.TestCase):
             self.assertEqual(len(combo), 2)
 
 
+class F07LegIdentityTests(unittest.TestCase):
+    def test_mlb_reuse_preserves_settlement_time_and_date(self):
+        # F07: the MLB candidate-reuse path must carry commence_time/game_date onto
+        # the leg so a logged parlay leg is gradable (leg_to_store persists them).
+        from unittest.mock import patch
+        c = dict(type="player_prop", prop="batter_hits", player="Fixture",
+                 event_id="e", line=.5, batting_order=1, lineup_status="in",
+                 over_implied=70., dk_over_price=-150,
+                 commence_time="2026-09-20T00:10:00Z", game_date="2026-09-19",
+                 team="A")
+        with patch("book_calibration.load_maps", return_value={}):
+            legs = opt.legs_from_candidates([c], "draftkings")
+        self.assertTrue(legs)
+        row = opt.leg_to_store(legs[0], sport="baseball_mlb")
+        self.assertEqual(row["commence_time"], c["commence_time"])
+        self.assertEqual(row["game_date"], c["game_date"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -239,7 +239,13 @@ def legs_from_candidates(candidates, book):
         legs.append({"gid": c.get("event_id"), "prop": prop, "player": c.get("player"),
                      "team": c.get("team"), "opp": None, "line": c.get("line"),
                      "side": "OVER" if fav_over else "UNDER",
-                     "P": fo if fav_over else 1.0 - fo, "fair_over": fav_over, "odds": price})
+                     "P": fo if fav_over else 1.0 - fo, "fair_over": fav_over, "odds": price,
+                     # Carry settlement identity so a logged MLB parlay leg is gradable
+                     # (leg_to_store persists these; the grader keys on player + date +
+                     # commence). The fuller immutable envelope (game_pk, canonical
+                     # player id) is the deferred T07 identity hardening. [F07]
+                     "commence_time": c.get("commence_time"),
+                     "game_date": c.get("game_date")})
     return legs
 
 
