@@ -598,8 +598,10 @@ def resolve_pending_wagers(max_to_resolve=200, now=None):
             continue
         status, actual = graded
         won = None if status == "push" else (status == "won")
-        realized = pricing_common.profit(
-            row.get("executed_price"), row.get("stake"), won)
+        # Boosted straight: a profit-boost token pays on the WIN payout only —
+        # stake·(dec−1)·(1+boost). None/0 boost grades exactly as an unboosted bet.
+        realized = pricing_common.boosted_profit(
+            row.get("executed_price"), row.get("stake"), won, row.get("boost_pct"))
         update = {
             "status": status,
             "actual": actual,

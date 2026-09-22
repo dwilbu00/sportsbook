@@ -17,7 +17,7 @@ import wagers
 from odds_client import american_to_decimal, american_to_implied_prob
 from pricing_common import (kelly_fraction, kelly_stake, scale_to_slate_cap,
                             prob_interval_low, kelly_fraction_uncertain,
-                            kelly_stake_uncertain)
+                            kelly_stake_uncertain, profit, boosted_profit)
 from recalibration import apply_platt
 
 
@@ -210,6 +210,30 @@ class ApplyPlattTests(unittest.TestCase):
             v = apply_platt(p, 1.0, 0.0)
             self.assertTrue(math.isfinite(v))
             self.assertTrue(0.0 < v < 1.0)
+
+
+class BoostedProfitTests(unittest.TestCase):
+    """pricing_common.boosted_profit — boosted straights grade like the parlay tracker:
+    the boost pays on the winnings only."""
+
+    def test_win_applies_boost_to_payout(self):
+        # +100 -> dec 2.0; win profit = stake*(dec-1) = 10; 30% boost -> 13.
+        self.assertAlmostEqual(boosted_profit(100, 10.0, True, 0.30), 13.0)
+
+    def test_loss_ignores_boost(self):
+        self.assertAlmostEqual(boosted_profit(100, 10.0, False, 0.30), -10.0)
+
+    def test_push_ignores_boost(self):
+        self.assertAlmostEqual(boosted_profit(100, 10.0, None, 0.30), 0.0)
+
+    def test_zero_or_none_boost_equals_plain_profit(self):
+        for b in (None, 0, 0.0):
+            self.assertAlmostEqual(boosted_profit(-110, 25.0, True, b),
+                                   profit(-110, 25.0, True))
+
+    def test_bad_boost_falls_back_to_unboosted(self):
+        self.assertAlmostEqual(boosted_profit(100, 10.0, True, "oops"),
+                               profit(100, 10.0, True))
 
 
 class KellySizingTests(unittest.TestCase):

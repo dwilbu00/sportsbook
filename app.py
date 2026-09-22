@@ -2100,6 +2100,7 @@ def render_my_bets():
                 "Price": r.get("executed_price"),
                 "Line": r.get("line"),
                 "Stake": _safe_float(r.get("stake")),
+                "Boost %": (_safe_float(r.get("boost_pct")) or 0.0) * 100,
             } for r in sorted(pending, key=lambda r: r.get("game_date") or "")
         ]).set_index("wager_id")
         # A form batches all edits: cell changes and Delete ticks do NOT rerun
@@ -2124,6 +2125,11 @@ def render_my_bets():
                     "Stake": st.column_config.NumberColumn(
                         "Stake", help="Dollar stake", min_value=0.0, step=0.01,
                         format="$%.2f"),
+                    "Boost %": st.column_config.NumberColumn(
+                        "Boost %", help="Profit-boost token on this bet, % (0 = none). "
+                        "Set it before the bet settles; the win payout then grades "
+                        "stake·(dec−1)·(1+boost).", min_value=0.0, max_value=100.0,
+                        step=5.0, format="%.0f"),
                 },
             )
             submit_pending = st.form_submit_button("💾 Save changes")
@@ -2919,6 +2925,12 @@ def _coerce_float(value):
         return None
 
 
+def _coerce_pct_fraction(value):
+    """A percent cell (e.g. 30) → the stored fraction (0.30); blank/NaN → None."""
+    v = _coerce_float(value)
+    return None if v is None else v / 100.0
+
+
 def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False):
     """Read an edited bets table and persist the requested changes.
 
@@ -2953,6 +2965,16 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
                     patch[field] = new
             if patch:
                 edits[wid] = patch
+
+    # Boost % is editable (pending table): mark a bet boosted BEFORE it settles and the
+    # grader pays stake·(dec−1)·(1+boost) on a win. Stored as a fraction. Merge onto any
+    # existing patch for the row; gated on the column so tables without it are unaffected.
+    if "Boost %" in edited_df.columns:
+        for wid in survivors:
+            new = _coerce_pct_fraction(edited_df.loc[wid].get("Boost %"))
+            old = _coerce_pct_fraction(original_df.loc[wid].get("Boost %"))
+            if new is not None and new != old:
+                edits.setdefault(wid, {})["boost_pct"] = new
 
     regrades = []
     if regradable:

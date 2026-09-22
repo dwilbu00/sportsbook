@@ -118,6 +118,21 @@ def profit(american_price, stake, won):
     return (american_to_decimal(american_price) - 1.0) * stake
 
 
+def boosted_profit(american_price, stake, won, boost_pct=None):
+    """profit() with a profit-boost token applied. A boost pays on the WINNINGS only:
+    on a win the return is ``stake·(decimal_odds−1)·(1+boost_pct)``; a loss (−stake) or
+    push (0) is unaffected. ``boost_pct`` is a fraction (0.30 = 30%); None/0 makes this
+    identical to profit(), so unboosted bets are unchanged. Mirrors the parlay tracker's
+    boosted-payout formula so straights and parlays grade a boost the same way."""
+    base = profit(american_price, stake, won)
+    if won and boost_pct:
+        try:
+            return base * (1.0 + float(boost_pct))
+        except (TypeError, ValueError):
+            return base
+    return base
+
+
 def kelly_fraction(prob, american_price, fraction=0.5, cap=0.05):
     """Fractional-Kelly stake as a fraction of bankroll, in [0, cap].
 
