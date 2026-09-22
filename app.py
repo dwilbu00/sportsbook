@@ -2833,10 +2833,67 @@ def render_parlays():
 
     # ── manual add (book-built tickets) ──
     with st.expander("➕ Add a parlay manually"):
-        st.caption("For tickets you built in the book (e.g. an SGP). Log the combined price + "
-                   "stake; add legs to enable per-leg auto-grading.")
-        st.info("Manual multi-leg entry UI is minimal in v1 — the main path is one-click "
-                "logging from the 💰 Bonuses page, which captures our joint P + EV automatically.")
+        st.caption("For tickets you built in the book (an SGP or a parlay the optimizer didn't "
+                   "surface) — captures it into the tracker + analytics. Give each leg's game "
+                   "date so per-leg auto-grading can resolve it; ourP% is optional (fill it to "
+                   "get the joint-P / EV analytics, else the ticket still tracks realized ROI).")
+        mc = st.columns(4)
+        m_book = mc[0].selectbox("Book", ["DraftKings", "FanDuel"], key="madd_book")
+        m_type = mc[1].selectbox("Type", ["parlay", "sgp"], key="madd_type",
+                                 help="sgp = same-game parlay (correlated legs).")
+        m_sport = mc[2].selectbox("Sport", ["NFL", "MLB", "NBA"], key="madd_sport")
+        m_boost = mc[3].number_input("Boost %", 0, 100, 0, step=5, key="madd_boost",
+                                     help="Profit-boost token on this ticket (0 = none).")
+        mc2 = st.columns(3)
+        m_combined = mc2[0].number_input(
+            "Combined price (American)", -100000, 100000, 100, step=10, key="madd_combined",
+            help="The ticket's total odds as shown in the book (boosted price if applicable).")
+        m_stake = mc2[1].number_input("Stake $", min_value=0.0, value=0.0, step=1.0,
+                                      key="madd_stake")
+        m_label = mc2[2].text_input("Bonus label (optional)", key="madd_label",
+                                    help="e.g. '50% parlay boost' — powers the by-bonus analytics.")
+        _SPORT = {"NFL": "americanfootball_nfl", "MLB": "baseball_mlb", "NBA": "basketball_nba"}
+        _PROPS = ["player_reception_yds", "player_receptions", "player_rush_yds",
+                  "player_rush_attempts", "player_pass_yds", "player_pass_tds",
+                  "player_pass_completions", "player_pass_attempts", "player_anytime_td",
+                  "batter_hits", "batter_total_bases", "batter_home_runs", "batter_rbis",
+                  "pitcher_strikeouts", "player_points", "player_rebounds", "player_assists",
+                  "player_threes", "player_points_rebounds_assists"]
+        st.caption("Legs (≥2). Anytime TD → prop `player_anytime_td`, line 0.5, side OVER. "
+                   "game_date = YYYY-MM-DD (required for auto-grading).")
+        m_legs = st.data_editor(
+            pd.DataFrame([{"player": "", "prop_key": "player_reception_yds", "side": "OVER",
+                           "line": 0.0, "price": -110, "game_date": "", "ourP%": None}]),
+            num_rows="dynamic", hide_index=True, width='stretch', key="madd_legs",
+            column_config={
+                "prop_key": st.column_config.SelectboxColumn("prop_key", options=_PROPS),
+                "side": st.column_config.SelectboxColumn("side", options=["OVER", "UNDER"]),
+                "ourP%": st.column_config.NumberColumn(
+                    "ourP%", min_value=0.0, max_value=100.0,
+                    help="Optional: your market-devig leg probability, %."),
+            })
+        if st.button("📝 Log manual parlay", key="madd_btn"):
+            import parlay_store as _ps
+            leg_rows = []
+            for _, row in m_legs.iterrows():
+                op = row.get("ourP%")
+                leg_rows.append({
+                    "player": row.get("player"), "prop_key": row.get("prop_key"),
+                    "side": row.get("side"), "line": row.get("line"),
+                    "price": row.get("price"), "game_date": row.get("game_date"),
+                    "our_p": (float(op) / 100.0
+                              if op not in (None, "") and not pd.isna(op) else None)})
+            try:
+                ticket, legs = _ps.build_manual_ticket(
+                    m_book, m_type, _SPORT[m_sport], m_boost / 100.0, int(m_combined),
+                    m_stake, m_label, leg_rows)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                _ps.save_parlay(ticket, legs)
+                st.success(f"Logged {len(legs)}-leg {m_type} → tracker. "
+                           "Auto-grades per leg as games settle.")
+                st.rerun()
 
 
 def _wager_ids(df):

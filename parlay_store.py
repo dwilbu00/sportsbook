@@ -70,6 +70,58 @@ def save_parlay(ticket, legs):
     return pid
 
 
+def build_manual_ticket(book, bet_type, sport_key, boost_pct, combined_american,
+                        stake, bonus_label, leg_rows):
+    """Assemble a (ticket, legs) pair for a MANUALLY-entered parlay/SGP from raw form
+    rows — the book-built tickets the optimizer never surfaced, so the tracker + analytics
+    see the whole betting slate, not just one-click logs.
+
+    ``leg_rows`` = dicts with player/prop_key/side/line/price[/game_date/our_p]; our_p is a
+    FRACTION (0-1) or None. Rows without a player are skipped (blank data-editor rows). The
+    independence joint P + boosted EV are computed ONLY when EVERY leg carries our_p (a
+    manual entry usually won't) — otherwise both stay None and the ticket still tracks
+    realized ROI. is_same_game is derived from bet_type. Raises ValueError with a
+    user-facing message on invalid input. Pure/testable — the app form just calls this."""
+    legs = []
+    for row in leg_rows or []:
+        player = str(row.get("player") or "").strip()
+        if not player:
+            continue                                   # blank data-editor row
+        try:
+            line = float(row.get("line"))
+            price = int(row.get("price"))
+        except (TypeError, ValueError):
+            continue                                   # incomplete row → skip, don't crash
+        op = row.get("our_p")
+        our_p = float(op) if op not in (None, "") else None
+        gd = str(row.get("game_date") or "").strip() or None
+        legs.append({
+            "player": player, "prop_key": str(row.get("prop_key") or "").strip(),
+            "side": str(row.get("side") or "OVER").upper(), "line": line, "price": price,
+            "our_leg_prob": our_p,
+            "corr_category": "sgp" if bet_type == "sgp" else "cross_game",
+            "game_date": gd, "commence_time": None, "sport_key": sport_key})
+    if len(legs) < 2:
+        raise ValueError("Enter at least 2 legs (each needs a player, line, and price).")
+    if not bonuslib.is_valid_american(combined_american):
+        raise ValueError("Enter a valid combined American price (<= -100 or >= +100).")
+    probs = [lg["our_leg_prob"] for lg in legs]
+    joint = None
+    if all(p is not None for p in probs):
+        joint = 1.0
+        for p in probs:
+            joint *= p
+    ev = (bonuslib.boosted_ev_per_dollar(
+            joint, bonuslib.american_to_dec(int(combined_american)), boost_pct) * 100.0
+          if joint is not None else None)
+    ticket = {"book": book, "bonus_label": (bonus_label or None), "bet_type": bet_type,
+              "boost_pct": boost_pct, "is_same_game": bet_type == "sgp",
+              "combined_american": int(combined_american), "stake": round(float(stake), 2),
+              "sport_key": sport_key, "our_joint_prob": joint,
+              "our_boosted_ev_pct": ev, "max_corr": 0.0}
+    return ticket, legs
+
+
 def _cols(spec_name):
     try:
         import db_store

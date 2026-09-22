@@ -137,5 +137,77 @@ class F06StakeEditSettlementTests(_ParlayStoreTest):
         self.assertEqual(t["payout"], 80.)
 
 
+class ManualTicketBuildTests(unittest.TestCase):
+    """parlay_store.build_manual_ticket — the pure assembly behind the manual-add form
+    (book-built tickets the optimizer never surfaced, so analytics see the whole slate)."""
+
+    def _rows(self, n=2, our_p=None):
+        return [{"player": f"P{i}", "prop_key": "player_receptions", "side": "over",
+                 "line": 4.5, "price": -110, "game_date": "2026-09-18", "our_p": our_p}
+                for i in range(n)]
+
+    def test_two_legs_with_probs_compute_joint_and_ev(self):
+        ticket, legs = parlay_store.build_manual_ticket(
+            "DraftKings", "parlay", "americanfootball_nfl", 0.5, 200, 10.0, "50% boost",
+            self._rows(2, our_p=0.6))
+        self.assertEqual(len(legs), 2)
+        self.assertAlmostEqual(ticket["our_joint_prob"], 0.36)      # 0.6 * 0.6
+        self.assertIsNotNone(ticket["our_boosted_ev_pct"])
+        self.assertFalse(ticket["is_same_game"])
+        self.assertEqual(legs[0]["side"], "OVER")                   # normalized upper
+        self.assertEqual(legs[0]["corr_category"], "cross_game")
+        self.assertEqual(ticket["combined_american"], 200)
+
+    def test_missing_one_prob_leaves_joint_and_ev_none(self):
+        rows = self._rows(2, our_p=0.6)
+        rows[1]["our_p"] = None
+        ticket, _ = parlay_store.build_manual_ticket(
+            "DraftKings", "parlay", "americanfootball_nfl", 0.5, 200, 10.0, "", rows)
+        self.assertIsNone(ticket["our_joint_prob"])
+        self.assertIsNone(ticket["our_boosted_ev_pct"])
+        self.assertIsNone(ticket["bonus_label"])                   # "" -> None
+
+    def test_blank_rows_skipped_and_min_two_enforced(self):
+        rows = self._rows(1, our_p=0.6) + [{"player": "  ", "prop_key": "x",
+                                            "side": "OVER", "line": 1.5, "price": -110}]
+        with self.assertRaises(ValueError):
+            parlay_store.build_manual_ticket(
+                "DraftKings", "parlay", "americanfootball_nfl", 0.0, 200, 10.0, "", rows)
+
+    def test_invalid_combined_price_rejected(self):
+        with self.assertRaises(ValueError):
+            parlay_store.build_manual_ticket(
+                "DraftKings", "parlay", "americanfootball_nfl", 0.0, 50, 10.0, "",
+                self._rows(2))
+
+    def test_sgp_sets_same_game_and_corr(self):
+        ticket, legs = parlay_store.build_manual_ticket(
+            "FanDuel", "sgp", "americanfootball_nfl", 0.3, -120, 5.0, "", self._rows(2))
+        self.assertTrue(ticket["is_same_game"])
+        self.assertEqual(legs[0]["corr_category"], "sgp")
+
+
+class ManualTicketRoundTripTests(_ParlayStoreTest):
+    def test_build_save_load_round_trip(self):
+        rows = [{"player": "Amon-Ra St. Brown", "prop_key": "player_receptions",
+                 "side": "OVER", "line": 5.5, "price": -115, "game_date": "2026-09-20",
+                 "our_p": 0.62},
+                {"player": "Jahmyr Gibbs", "prop_key": "player_rush_yds", "side": "OVER",
+                 "line": 60.5, "price": -110, "game_date": "2026-09-20", "our_p": 0.55}]
+        ticket, legs = parlay_store.build_manual_ticket(
+            "DraftKings", "parlay", "americanfootball_nfl", 0.5, 264, 8.0, "50% boost", rows)
+        pid = parlay_store.save_parlay(ticket, legs)
+        loaded = parlay_store.load_parlays()
+        self.assertEqual(len(loaded), 1)
+        t = loaded[0]
+        self.assertEqual(t["parlay_id"], pid)
+        self.assertEqual(t["n_legs"], 2)
+        self.assertEqual(len(t["legs"]), 2)
+        self.assertEqual(t["book"], "DraftKings")
+        self.assertAlmostEqual(t["our_joint_prob"], 0.62 * 0.55)
+        self.assertEqual({l["player"] for l in t["legs"]},
+                         {"Amon-Ra St. Brown", "Jahmyr Gibbs"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
