@@ -1264,6 +1264,22 @@ def _stat_label(prop_key, gamelog):
     return None
 
 
+def _anytime_td_actual(row):
+    """Anytime-TD actual = touchdowns the player SCORED = rushing + receiving TDs,
+    NEVER passing (a QB throwing a TD is not an 'anytime TD scorer' result). Uses ESPN's
+    unambiguous machine names; falls back to the shared 'TD' label only when neither
+    split name is present (older/alternate payloads). Returns a float count, or None when
+    the row carries no touchdown field at all (leaves the bet pending, never a false 0)."""
+    rush = row.get("rushingTouchdowns")
+    rec = row.get("receivingTouchdowns")
+    if rush is not None or rec is not None:
+        try:
+            return float(rush or 0) + float(rec or 0)
+        except (TypeError, ValueError):
+            return None
+    return row.get("TD")                    # shared label; caller coerces to float
+
+
 def _parse_dt(value):
     """Parse an ISO timestamp as tz-aware UTC (coercing naive -> UTC), or None."""
     if not value:
@@ -1533,7 +1549,12 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
         # partial line. Grade only confirmed-final games; stay pending otherwise.
         if not _espn_row_final(gamelog[idx]):
             return None
-        actual = gamelog[idx].get(stat_label)
+        # Anytime-TD grades on TDs the player SCORED (rush + reception); the shared 'TD'
+        # label collides with passingTouchdowns for a QB, so resolve it precisely.
+        if prop_key == "player_anytime_td":
+            actual = _anytime_td_actual(gamelog[idx])
+        else:
+            actual = gamelog[idx].get(stat_label)
         # (The MLB-only pitcher_outs IP->outs conversion lived here; MLB no longer
         # reaches this ESPN branch — see the baseball_mlb return above — so it's gone.
         # This branch is now NBA/NFL/NHL-only, whose stats need no such conversion.)

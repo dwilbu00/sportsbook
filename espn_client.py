@@ -856,7 +856,10 @@ PROP_STAT_MAP = {
     "player_points": ["PTS"],
     "player_assists": ["AST"],
     "player_rebounds": ["REB"],
-    "player_anytime_td": ["TD"],
+    # Anytime-TD = SCORED a TD (rush or reception). Prefer the unambiguous split names
+    # (recalibration._anytime_td_actual sums rush+rec, excluding passingTouchdowns); the
+    # shared 'TD' label is the last-resort fallback for older payloads.
+    "player_anytime_td": ["rushingTouchdowns", "receivingTouchdowns", "TD"],
     # NFL: PREFER the unambiguous ESPN `names` keys (passingYards vs rushingYards) — the display
     # labels 'YDS'/'TD' are reused across passing/rushing/receiving and collide. Display-label
     # fallbacks kept for older or alternate payloads.

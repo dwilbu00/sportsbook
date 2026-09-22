@@ -106,5 +106,38 @@ class DkPropLinesAnytimeTests(unittest.TestCase):
                                 "over_price": -120, "under_price": None}])
 
 
+class AnytimeTdGradingTests(unittest.TestCase):
+    """recalibration._anytime_td_actual — grades on TDs the player SCORED (rush +
+    reception), never the ambiguous shared 'TD' label that collides with a QB's
+    passing TDs."""
+
+    def setUp(self):
+        import recalibration
+        self.rc = recalibration
+
+    def test_sums_rush_and_receiving_excludes_passing(self):
+        row = {"rushingTouchdowns": 1.0, "receivingTouchdowns": 1.0,
+               "passingTouchdowns": 3.0, "TD": 3.0}
+        self.assertEqual(self.rc._anytime_td_actual(row), 2.0)
+
+    def test_scored_via_reception_only(self):
+        row = {"rushingTouchdowns": 0.0, "receivingTouchdowns": 1.0,
+               "passingTouchdowns": 0.0}
+        self.assertEqual(self.rc._anytime_td_actual(row), 1.0)
+
+    def test_qb_passing_tds_are_not_an_anytime_td(self):
+        # The bug this fixes: a QB with 3 passing TDs but no rush/rec TD must grade
+        # 0 (an anytime-TD OVER 0.5 LOSES), not 3 off the shared 'TD' label.
+        row = {"rushingTouchdowns": 0.0, "receivingTouchdowns": 0.0,
+               "passingTouchdowns": 3.0, "TD": 3.0}
+        self.assertEqual(self.rc._anytime_td_actual(row), 0.0)
+
+    def test_falls_back_to_shared_td_when_no_split_names(self):
+        self.assertEqual(self.rc._anytime_td_actual({"TD": 1.0}), 1.0)
+
+    def test_none_when_no_touchdown_field(self):
+        self.assertIsNone(self.rc._anytime_td_actual({"YDS": 55.0}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
