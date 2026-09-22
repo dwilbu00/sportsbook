@@ -38,6 +38,11 @@ class _EnvSandbox(unittest.TestCase):
             os.environ.pop(k, None)
         self.addCleanup(self._restore_env)
         self.addCleanup(db_store.configure_engine, None)
+        # A dev box has a real parquet mirror; the SQL-off guards assume none (CI). Force
+        # it off so "reads are inert with SQL off" isn't served by the mirror instead.
+        _m = patch("warehouse_mirror.enabled", return_value=False)
+        _m.start()
+        self.addCleanup(_m.stop)
 
     def _restore_env(self):
         for k, v in self._saved.items():

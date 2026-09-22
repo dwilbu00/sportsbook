@@ -4,11 +4,37 @@ Most tests disable the moderate-favorite band (fav_min=0.0, fav_max=1.0) so they
 exercise the underlying EV / offset / shape mechanics independent of the sharpening
 gate; SharpeningGateTests covers the band + dog-only gate itself.
 """
+import os
 import unittest
 from unittest import mock
 
 import coherence_flags as cf
+import db_store
 import r2_data
+
+# favorite_sp_er_cv() reaches mlb_warehouse, which calls db_store.promote_secrets_from_toml
+# — that setdefaults the REAL secrets.toml SQL_* keys into os.environ (and can cache a real
+# engine), which then poisons every later "SQL-off" test file in a full `unittest discover`
+# run. Snapshot the SQL env before this module's tests and restore it (+ drop the engine)
+# after, so the module can't leak SQL state. [test hygiene — hermetic suite]
+_SQL_ENV = ("SQL_SERVER", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD", "SQL_DRIVER",
+            "SPORTSBOOK_REQUIRE_SQL")
+_saved_sql_env = {}
+
+
+def setUpModule():
+    global _saved_sql_env
+    _saved_sql_env = {k: os.environ.get(k) for k in _SQL_ENV}
+
+
+def tearDownModule():
+    for k in _SQL_ENV:
+        v = _saved_sql_env.get(k)
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    db_store.configure_engine(None)
 
 # Disable the favorite band so a flag appears regardless of the fixture's ML.
 _NO_BAND = dict(fav_min=0.0, fav_max=1.0)

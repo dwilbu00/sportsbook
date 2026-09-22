@@ -27,6 +27,12 @@ def _row(day="2024-07-03", pitcher="657006", batter="592450", xwoba=0.35,
 
 class _Backend:
     def setUp(self):
+        # Force the parquet mirror OFF: savant_history.load_days is mirror-FIRST, so on a
+        # dev box with a real statcast mirror it returns thousands of rows instead of the
+        # test's ingested ones (CI has no mirror). Match the hermetic convention.
+        self._mirror = mock.patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror.start()
+        self.addCleanup(self._mirror.stop)
         db_store.configure_engine("sqlite://")
         sh.create_all()
 
@@ -88,6 +94,11 @@ class IngestLoadTests(_Backend, unittest.TestCase):
 
 class SqlOffTests(unittest.TestCase):
     def setUp(self):
+        # Mirror OFF too: "SQL off is a no-op" means load_days returns [], but the
+        # mirror-first path would serve the dev box's real statcast parquet otherwise.
+        self._mirror = mock.patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror.start()
+        self.addCleanup(self._mirror.stop)
         db_store.configure_engine(None)
 
     def test_sql_off_is_a_noop(self):

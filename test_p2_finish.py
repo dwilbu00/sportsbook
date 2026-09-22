@@ -215,6 +215,11 @@ class WarehouseTeamOffenseTests(unittest.TestCase):
     instead of the live Savant HTTP endpoint (works on a Savant-unreachable box)."""
 
     def setUp(self):
+        # Mirror OFF: _warehouse_team_factors reads statcast_pitch mirror-first, so a dev
+        # box's real statcast mirror shadows the test's ingested pitches (CI has none).
+        self._mirror = patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror.start()
+        self.addCleanup(self._mirror.stop)
         db_store.configure_engine("sqlite://")
         db_store.create_all()
         sh.create_all()

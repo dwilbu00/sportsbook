@@ -143,6 +143,12 @@ def _count(table):
 
 class _Backend:
     def setUp(self):
+        # Default the parquet mirror OFF (a dev box has one, CI doesn't): the warehouse
+        # readers are mirror-first, so the real mirror would shadow each test's SQL rows.
+        # A test that needs the mirror ON re-patches it after super().setUp().
+        self._mirror = mock.patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror.start()
+        self.addCleanup(self._mirror.stop)
         db_store.configure_engine("sqlite://")
         mlb_warehouse.create_all()
         mlb_warehouse._TEAMS_ENSURED.clear()

@@ -66,9 +66,14 @@ class OpsEventHelperTests(unittest.TestCase):
 
 
 class _SqlEnv:
-    """In-memory SQLite engine so _sql() is True; counters reset each use."""
+    """In-memory SQLite engine so _sql() is True; the parquet mirror is forced OFF so
+    mirror-first warehouse reads (load_prop_lines / load_team_market_store) take the SQL
+    path and hit the patched db_store method — a dev box has a real mirror, CI doesn't.
+    Counters reset each use."""
 
     def __enter__(self):
+        self._mirror = patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror.start()
         recalibration._LOAD_CACHE.clear()
         db_store.configure_engine("sqlite://")
         db_store.create_all()
@@ -79,6 +84,7 @@ class _SqlEnv:
         db_store.configure_engine(None)
         recalibration._LOAD_CACHE.clear()
         ops_telemetry.reset_counters()
+        self._mirror.stop()
 
 
 class DbFailureWiringTests(unittest.TestCase):
