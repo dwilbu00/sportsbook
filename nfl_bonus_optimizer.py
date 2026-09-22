@@ -406,6 +406,9 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
             jp *= l["P"]
         b = bonus.boost_pct
         req = 1.0 + (1.0 - jp) / (jp * (1.0 + b)) if jp > 0 else float("inf")
+        # Floor the required price at the promo's min TOTAL odds — the boost won't apply
+        # below it, so a shorter stack isn't placeable as a boosted bet. [bugfix]
+        req = max(req, bonuslib._min_dec(bonus.min_odds_overall))
         out.append((jp, 0.0, combo, bonuslib.dec_to_american(req)))
     out.sort(key=lambda x: -x[0])
     return out
@@ -520,6 +523,11 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
         # required combined decimal for +EV under the boost: jp*(D-1)*(1+b) > (1-jp)
         b = bonus.boost_pct
         req_dec = 1.0 + (1.0 - jp) / (jp * (1.0 + b)) if jp > 0 else float("inf")
+        # The boost only pays if the book prices the SGP at >= the promo's min TOTAL odds
+        # (min_odds_overall), so the actionable required price is the LONGER of the +EV
+        # break-even and that floor — otherwise we'd surface a stack the book won't boost
+        # and Doug can't place. Default min (-100000) -> ~1.0 dec, i.e. no change. [bugfix]
+        req_dec = max(req_dec, bonuslib._min_dec(bonus.min_odds_overall))
         out.append((jp, mx, combo, bonuslib.dec_to_american(req_dec)))
     out.sort(key=lambda x: -x[0])
     return out
@@ -574,6 +582,7 @@ def evaluate_slate(legs_by_book, bonuses, rho, bankroll, sgp_fn=None, leg_count=
         out.append({"book": bonus.book, "label": bonus.label, "bet_type": bonus.bet_type,
                     "bonus_id": getattr(bonus, "bonus_id", ""),   # stable consume identity [F16]
                     "boost_pct": bonus.boost_pct, "max_wager": bonus.max_wager,
+                    "min_odds_overall": bonus.min_odds_overall,   # SGP entry gate [bugfix]
                     "n_legs": len(scoped), "cross": cross, "sgp": stacks})
     return out
 

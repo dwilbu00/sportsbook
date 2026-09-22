@@ -207,5 +207,32 @@ class F07LegIdentityTests(unittest.TestCase):
         self.assertEqual(row["game_date"], c["game_date"])
 
 
+class MinOddsOverallSgpTests(unittest.TestCase):
+    """SGP required price must respect the promo's min TOTAL odds (min_odds_overall): the
+    boost won't apply below it, so a shorter stack isn't placeable as a boosted bet —
+    surfacing one is the bug Doug hit. Default (-100000) leaves the natural price. [bugfix]"""
+
+    def _legs(self):
+        # two short-odds favorites in ONE game -> high joint -> naturally SHORT combined
+        return [_leg("g", "player_receptions", "A", 0.75, -200),
+                _leg("g", "player_receptions", "B", 0.72, -200)]
+
+    def test_indep_floors_required_price_at_min_overall(self):
+        # sgp_stacks (copula) applies the identical floor one-liner on the same req_dec.
+        legs = self._legs()
+        base = opt.sgp_stacks_indep(legs, Bonus("sgp", 0.5, min_legs=2), 1000., leg_count=2)
+        floored = opt.sgp_stacks_indep(
+            legs, Bonus("sgp", 0.5, min_legs=2, min_odds_overall=400), 1000., leg_count=2)
+        self.assertLess(base[0][3], 400)               # natural required price is short
+        self.assertGreaterEqual(floored[0][3], 400)    # floored up to the promo min total
+
+    def test_default_min_overall_leaves_price_unchanged(self):
+        legs = self._legs()
+        base = opt.sgp_stacks_indep(legs, Bonus("sgp", 0.5, min_legs=2), 1000., leg_count=2)
+        deflt = opt.sgp_stacks_indep(          # explicit default floor == no floor
+            legs, Bonus("sgp", 0.5, min_legs=2, min_odds_overall=-100000), 1000., leg_count=2)
+        self.assertEqual(base[0][3], deflt[0][3])
+
+
 if __name__ == "__main__":
     unittest.main()
