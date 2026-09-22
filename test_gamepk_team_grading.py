@@ -472,6 +472,13 @@ class LoadTeamMarketStoreDHTests(unittest.TestCase):
     """#2b: load_team_market_store splits a same-commence DH by game_pk (was collapsing
     last-write-wins on the game_key); NULL game_pk collapses exactly as before."""
     def setUp(self):
+        # Isolation: load_team_market_store is mirror-FIRST (_mirror_first_team_lines),
+        # so on a dev box with a real parquet mirror it reads thousands of games instead
+        # of THIS test's captured snapshots. Force the SQL path (mirror off) so the
+        # DH-split assertions see only the two snapshots below.
+        self._mirror_off = patch("warehouse_mirror.enabled", return_value=False)
+        self._mirror_off.start()
+        self.addCleanup(self._mirror_off.stop)
         db_store.configure_engine("sqlite://")
         db_store.create_all()
 
