@@ -29,9 +29,10 @@ import re
 from collections import defaultdict
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# (?!'s) skips possessives like "today's lineup" — a noun phrase, not a stale relative date.
 REL_DATE_RE = re.compile(
     r"\b(yesterday|today|tomorrow|last week|next week|this week|last month|next month|"
-    r"this month|as of (?:now|today)|right now)\b", re.I)
+    r"this month|as of (?:now|today)|right now)\b(?!['’]s)", re.I)
 WIKILINK_RE = re.compile(r"\[\[([A-Za-z0-9][A-Za-z0-9_-]*)\]\]")
 # Path segments have no interior dots, so "a.py/b.py" yields two matches, not one span.
 PYREF_RE = re.compile(r"((?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.(?:py|sql))")
@@ -39,7 +40,8 @@ FLAG_RE = re.compile(r"\bODI_[A-Z0-9_]+\b")
 MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+\.md)\)")
 _STOP_SENT = 60          # min chars for a sentence to be a dup candidate
 _BIG_FILE = 200          # lines
-_BIG_LINE = 2000         # chars (a single blockquote paragraph over this = fold it)
+_BIG_LINE = 3000         # chars — targets true mega-lines (ACTIVE's old 34k blockquotes);
+                         # dense domain paragraphs (~2-2.7k) are acceptable knowledge density
 
 
 def parse_frontmatter(text):

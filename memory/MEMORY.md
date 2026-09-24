@@ -2,7 +2,7 @@
 
 Auto-memory for the MLB (+NBA/NFL) sportsbook betting model. Owner = Doug; assistant = Cal.
 
-**Structure (consolidated 2026-08-28):** 4 domain files hold durable knowledge, `ACTIVE.md` holds in-flight work, `wishlist.md` is the parking lot. Read the domain(s) relevant to the task; read `ACTIVE.md` to resume.
+**Structure (consolidated 2026-08-28; +bonus-strategy 2026-09-24):** domain files hold durable knowledge, `ACTIVE.md` holds in-flight work, `wishlist.md` is the parking lot. Read the domain(s) relevant to the task; read `ACTIVE.md` to resume. (`memory_lint.py` in the repo root runs the mechanical hygiene checks + prints a follow-up prompt for a semantic pass.)
 
 **Maintenance discipline:**
 - One fact, one place. When a **result supersedes an idea** ("test X" vs "tested X → Y"), delete the idea, keep the result — so it's never revisited.
@@ -15,6 +15,7 @@ Auto-memory for the MLB (+NBA/NFL) sportsbook betting model. Owner = Doug; assis
 - [effort-and-cost](effort-and-cost.md) — Save cost: flag lower-effort prompts, delegate mechanical subtasks to Haiku/Sonnet-4-6; effort rubric (LOW/MED/HIGH).
 - [ACTIVE](ACTIVE.md) — in-flight work only; read this to resume. Links each item to its domain.
 - [edges-and-backtests](edges-and-backtests.md) — What the edge hunt found: on the CLEAN corpus MLB is efficient — coherence RL + under/f5 DEAD (dirty-data artifacts), cv_floor unre-validated; one thin survivor (batter_K UNDER 1.5); the exhausted nulls; backtest tooling. MLB parked → pivoted to NFL.
-- [data-and-architecture](data-and-architecture.md) — THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion, MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV. Precise 5M-credit odds backfill + full reload = DONE (warehouse now = uniform −12h/−4h/close, source=role, all 3 sports) + the parquet mirror all backtests read 0-DTU. **NFL (now active) has its own clean-slate nflverse foundation → see [[ACTIVE]] NFL BUILD.**
-- [modeling-and-calibration](modeling-and-calibration.md) — The model itself: live calibration state, refit/candidate workflow, method A-E bake-off outcomes, Kelly sizing, online Platt, team-market audit verdict, cross-sport parity, and why forward Brier lagged backtest.
+- [data-and-architecture](data-and-architecture.md) — THE SYSTEM: Azure SQL warehouse + MLB StatsAPI medallion, MLBAM/game_pk identity, as-of feature stores, additive runs model, CLV. Precise 5M-credit odds backfill + full reload = DONE (warehouse now = uniform −12h/−4h/close, source=role, all 3 sports) + the parquet mirror all backtests read 0-DTU. **NFL has its own clean-slate nflverse foundation → see the NFL sections here + [[modeling-and-calibration]].**
+- [modeling-and-calibration](modeling-and-calibration.md) — The model itself: live calibration state, refit/candidate workflow, method A-E bake-off outcomes, NFL team + props models, Kelly sizing, online Platt, team-market audit verdict, cross-sport parity, and why forward Brier lagged backtest.
+- [bonus-strategy](bonus-strategy.md) — the bonus/promo +EV engine (the project's ONE real edge): the thesis (a boost flips high-P bets +EV on market-devig legs), the validating backtest, SGP correlation, the shipped system (engine/optimizer/tracker + app pages), the schema, and the harvest/bugfixes.
 - [wishlist](wishlist.md) — parked owner ideas; append/transfer-only (never expanded per-item as work is done).
