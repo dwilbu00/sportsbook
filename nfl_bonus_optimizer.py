@@ -386,6 +386,7 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     need = _sgp_need(bonus, leg_count)
     if need is None:
         return []                              # forced size violates the promo minimum
+    min_overall_dec = bonuslib._min_dec(bonus.min_odds_overall)   # achievability floor
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus) and l["P"] >= min_leg_p:
@@ -401,6 +402,10 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
         if len(combo) < need:
             continue
         combo = tuple(combo)
+        # ACHIEVABILITY: this top-P (favorite) stack's independent combined can't reach the
+        # promo's min TOTAL odds → it can never qualify for the boost, so don't suggest it.
+        if bonuslib.combined_decimal([l["odds"] for l in combo]) < min_overall_dec:
+            continue
         jp = 1.0
         for l in combo:
             jp *= l["P"]
@@ -495,6 +500,7 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
     need = _sgp_need(bonus, leg_count)
     if need is None:
         return []                              # forced size violates the promo minimum
+    min_overall_dec = bonuslib._min_dec(bonus.min_odds_overall)   # achievability floor
     bygame = defaultdict(list)
     for l in legs:
         if _leg_ok(l, bonus):
@@ -508,6 +514,12 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
         best = None
         for combo in combinations(gl, need):
             if _combo_has_conflict(combo):    # reject deterministically impossible legs [F12]
+                continue
+            # ACHIEVABILITY: the book prices a +corr SGP SHORTER than the independent leg
+            # product, so if even that product is below the promo's min TOTAL odds this stack
+            # can NEVER qualify for the boost — skip it (don't suggest a favorite pair whose
+            # real combined ~+124 sits under a +1000 floor). [bugfix — filter, not just display]
+            if bonuslib.combined_decimal([l["odds"] for l in combo]) < min_overall_dec:
                 continue
             # prefer positively-correlated same-side content; skip strong script-conflict stacks
             rhos = [sgp._rho_val(rho.get(sgp.category(a, b))) for a, b in combinations(combo, 2)]

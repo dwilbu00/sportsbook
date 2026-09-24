@@ -208,26 +208,39 @@ class F07LegIdentityTests(unittest.TestCase):
 
 
 class MinOddsOverallSgpTests(unittest.TestCase):
-    """SGP required price must respect the promo's min TOTAL odds (min_odds_overall): the
-    boost won't apply below it, so a shorter stack isn't placeable as a boosted bet —
-    surfacing one is the bug Doug hit. Default (-100000) leaves the natural price. [bugfix]"""
+    """SGP must respect the promo's min TOTAL odds (min_odds_overall): (a) do NOT suggest a
+    stack whose achievable combined can't reach it — the bug Doug hit (min_overall +1000
+    but two favorites suggested at a real ~+124), and (b) floor the displayed required price
+    at it. Default (-100000) = no constraint. [bugfix]"""
 
-    def _legs(self):
-        # two short-odds favorites in ONE game -> high joint -> naturally SHORT combined
+    def _favorites(self):   # two -200 favorites: independent combined ~+125 (can't reach +1000)
         return [_leg("g", "player_receptions", "A", 0.75, -200),
                 _leg("g", "player_receptions", "B", 0.72, -200)]
 
-    def test_indep_floors_required_price_at_min_overall(self):
-        # sgp_stacks (copula) applies the identical floor one-liner on the same req_dec.
-        legs = self._legs()
-        base = opt.sgp_stacks_indep(legs, Bonus("sgp", 0.5, min_legs=2), 1000., leg_count=2)
-        floored = opt.sgp_stacks_indep(
-            legs, Bonus("sgp", 0.5, min_legs=2, min_odds_overall=400), 1000., leg_count=2)
-        self.assertLess(base[0][3], 400)               # natural required price is short
-        self.assertGreaterEqual(floored[0][3], 400)    # floored up to the promo min total
+    def _longshots(self):   # two +250 legs: independent combined ~+1125 (clears +1000)
+        return [_leg("g", "player_receptions", "A", 0.30, 250),
+                _leg("g", "player_receptions", "B", 0.28, 250)]
+
+    def test_favorite_stack_below_min_overall_not_suggested(self):
+        self.assertEqual(
+            opt.sgp_stacks_indep(self._favorites(),
+                                 Bonus("sgp", 0.5, min_legs=2, min_odds_overall=1000),
+                                 1000., leg_count=2), [])
+
+    def test_favorites_suggested_with_no_floor(self):
+        self.assertTrue(
+            opt.sgp_stacks_indep(self._favorites(), Bonus("sgp", 0.5, min_legs=2),
+                                 1000., leg_count=2))
+
+    def test_longshot_stack_meeting_floor_is_suggested_and_floored(self):
+        out = opt.sgp_stacks_indep(self._longshots(),
+                                   Bonus("sgp", 0.5, min_legs=2, min_odds_overall=1000),
+                                   1000., leg_count=2)
+        self.assertTrue(out)                            # achievable → suggested
+        self.assertGreaterEqual(out[0][3], 1000)        # required price floored to min total
 
     def test_default_min_overall_leaves_price_unchanged(self):
-        legs = self._legs()
+        legs = self._favorites()
         base = opt.sgp_stacks_indep(legs, Bonus("sgp", 0.5, min_legs=2), 1000., leg_count=2)
         deflt = opt.sgp_stacks_indep(          # explicit default floor == no floor
             legs, Bonus("sgp", 0.5, min_legs=2, min_odds_overall=-100000), 1000., leg_count=2)
