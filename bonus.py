@@ -38,7 +38,7 @@ def new_bonus_id():
 class Bonus:
     bet_type: str                        # 'single' | 'parlay' | 'sgp' | 'any'
     boost_pct: float                     # profit boost fraction (0.30 = +30% on winnings)
-    min_odds_leg: float = -100000.0      # American; each leg must be >= this (default = no floor)
+    min_odds_leg: float = -300.0         # American; each leg must be >= this (default -300)
     min_odds_overall: float = -100000.0  # American; combined must be >= this
     min_legs: int = 1                    # parlay boosts often require >=2 or >=3
     max_wager: float = 1e9
