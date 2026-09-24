@@ -377,6 +377,44 @@ def _sgp_need(bonus, leg_count):
     return floor
 
 
+def _greedy_reach(elig, need_legs, min_overall_dec, cap):
+    """Smallest highest-P DISTINCT-GAME parlay with >= need_legs legs whose INDEPENDENT
+    combined decimal reaches min_overall_dec — grow the stack (P-desc) until it does, capped
+    at `cap` legs. None if the available games can't get there. The auto-search for bonuses
+    the bounded sweep can't satisfy (min_legs > MAX_PARLAY, or a min_odds_overall floor too
+    long for <=3 favorites); 'best case' = the fewest, most-likely legs that clear the floor."""
+    combo, games, dec = [], set(), 1.0
+    for l in elig:                             # elig is P-desc
+        if l["gid"] in games:                  # cross-game: one leg per game
+            continue
+        combo.append(l)
+        games.add(l["gid"])
+        dec *= american_to_decimal(l["odds"])
+        if len(combo) >= need_legs and dec >= min_overall_dec:
+            return combo
+        if len(combo) >= cap:
+            break
+    return None
+
+
+def _sgp_reach(gl_sorted, need, min_overall_dec, cap):
+    """Top-P conflict-free SAME-GAME stack of >= need legs whose independent combined
+    reaches min_overall_dec — grow until it does (capped). None if unreachable. When no
+    floor is set (min_overall_dec ~1.0) this returns the first `need` conflict-free legs,
+    matching the old _pick_conflict_free behavior."""
+    combo, dec = [], 1.0
+    for l in gl_sorted:                        # P-desc
+        if _combo_has_conflict(tuple(combo) + (l,)):
+            continue
+        combo.append(l)
+        dec *= american_to_decimal(l["odds"])
+        if len(combo) >= need and dec >= min_overall_dec:
+            return tuple(combo)
+        if len(combo) >= cap:
+            break
+    return None
+
+
 def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     """MLB SGP stacks with an INDEPENDENCE joint (step-3 verdict: MLB same-game correlations are
     weak and the copula doesn't beat independence). Per game: top-P favorites, product joint,
@@ -395,16 +433,12 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     for gid, gl in bygame.items():
         if len(gl) < need:
             continue
-        # Skip deterministically impossible combinations (F12) — greedily take the
-        # top-P legs that don't contradict each other; skip the game if a conflict-free
-        # stack of the required size can't be assembled.
-        combo = _pick_conflict_free(sorted(gl, key=lambda x: -x["P"]), need)
-        if len(combo) < need:
-            continue
-        combo = tuple(combo)
-        # ACHIEVABILITY: this top-P (favorite) stack's independent combined can't reach the
-        # promo's min TOTAL odds → it can never qualify for the boost, so don't suggest it.
-        if bonuslib.combined_decimal([l["odds"] for l in combo]) < min_overall_dec:
+        # Greedily take the top-P conflict-free legs (F12), GROWING past `need` if a
+        # min_odds_overall floor needs more legs to be reachable; skip the game if no
+        # conflict-free stack reaches the floor (or the required size).
+        combo = _sgp_reach(sorted(gl, key=lambda x: -x["P"]), need, min_overall_dec,
+                           min(len(gl), MAX_FORCED_LEGS))
+        if combo is None:
             continue
         jp = 1.0
         for l in combo:
@@ -489,6 +523,22 @@ def cross_game_plays(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0,
             r = bonuslib.evaluate([(l["P"], l["odds"]) for l in combo], bonus, bankroll=bankroll)
             if r["qualifies"] and (not require_positive_ev or r["boosted_ev_pct"] > 0):
                 plays.append((r["boosted_ev_pct"], r, combo))
+    # AUTO-SEARCH (no forced count): the bounded sweep only enumerates up to MAX_PARLAY legs,
+    # so a bonus needing MORE — min_legs > MAX_PARLAY, or a min_odds_overall floor too long
+    # for <=3 favorites — would otherwise surface NOTHING. Greedily build the smallest
+    # highest-P distinct-game parlay meeting BOTH (min_legs AND the floor), up to
+    # MAX_FORCED_LEGS. [fix: min_legs>=4 and high-min-overall bonuses generated no plays]
+    if not leg_count:
+        need_legs = max(type_min, floor)
+        min_overall_dec = bonuslib._min_dec(bonus.min_odds_overall)
+        floor_set = bonus.min_odds_overall > -99999
+        if need_legs > MAX_PARLAY or (floor_set and not plays):
+            greedy = _greedy_reach(elig, need_legs, min_overall_dec, MAX_FORCED_LEGS)
+            if greedy:
+                r = bonuslib.evaluate([(l["P"], l["odds"]) for l in greedy], bonus,
+                                      bankroll=bankroll)
+                if r["qualifies"] and (not require_positive_ev or r["boosted_ev_pct"] > 0):
+                    plays.append((r["boosted_ev_pct"], r, tuple(greedy)))
     plays.sort(key=lambda x: -x[0])
     return plays
 
@@ -530,7 +580,14 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
             if best is None or score > best[0]:
                 best = (score, jp, combo, max(rhos))
         if best is None:
-            continue
+            # No size-`need` combo reaches the min-total floor — grow a top-P conflict-free
+            # stack until it does (best-case = most-likely legs) and score it with the copula.
+            grown = _sgp_reach(sorted(gl, key=lambda x: -x["P"]), need, min_overall_dec,
+                               min(len(gl), MAX_FORCED_LEGS))
+            if grown is None:
+                continue
+            gjp = sgp.joint_prob(list(grown), rho, [l["fair_over"] for l in grown], rng)
+            best = (gjp, gjp, grown, 0.0)
         _s, jp, combo, mx = best
         # required combined decimal for +EV under the boost: jp*(D-1)*(1+b) > (1-jp)
         b = bonus.boost_pct

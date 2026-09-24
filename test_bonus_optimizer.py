@@ -247,5 +247,33 @@ class MinOddsOverallSgpTests(unittest.TestCase):
         self.assertEqual(base[0][3], deflt[0][3])
 
 
+class AutoSearchTests(unittest.TestCase):
+    """The optimizer auto-searches beyond the MAX_PARLAY=3 sweep when a bonus needs more
+    legs: min_legs>3 (was: no suggestion at all) or a min_odds_overall floor that >3
+    favorites can't reach (Doug's +1000). Builds the fewest highest-P legs that clear it."""
+
+    def test_min_legs_4_now_generates_a_parlay(self):
+        legs = [_leg(f"g{i}", "player_receptions", f"P{i}", 0.65, -150) for i in range(5)]
+        b = Bonus("parlay", 0.5, min_legs=4)          # 4 > MAX_PARLAY=3
+        plays = opt.cross_game_plays(legs, b, 1000., require_positive_ev=False)
+        self.assertTrue(plays)                        # was EMPTY before the auto-search
+        self.assertGreaterEqual(len(plays[0][2]), 4)
+
+    def test_cross_game_grows_legs_to_reach_min_overall(self):
+        from bonus import combined_decimal
+        legs = [_leg(f"g{i}", "player_receptions", f"P{i}", 0.65, -150) for i in range(8)]
+        b = Bonus("parlay", 0.5, min_legs=2, min_odds_overall=1000)   # needs ~5 -150 legs
+        plays = opt.cross_game_plays(legs, b, 1000., require_positive_ev=False)
+        self.assertTrue(plays)
+        self.assertGreaterEqual(combined_decimal([l["odds"] for l in plays[0][2]]), 11.0)
+
+    def test_sgp_indep_grows_legs_to_reach_min_overall(self):
+        legs = [_leg("g", "player_receptions", f"P{i}", 0.65, -150) for i in range(6)]
+        b = Bonus("sgp", 0.5, min_legs=2, min_odds_overall=1000)
+        out = opt.sgp_stacks_indep(legs, b, 1000.)
+        self.assertTrue(out)
+        self.assertGreaterEqual(len(out[0][2]), 5)    # grew past min_legs=2 to clear +1000
+
+
 if __name__ == "__main__":
     unittest.main()
