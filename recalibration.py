@@ -50,7 +50,12 @@ MIN_FIT_SAMPLES = 50          # below this, skip Platt fit for a prop
 MIN_VALIDATION_SAMPLES = 20   # later chronological observations held out
 MIN_NEW_FOR_REFIT = 25        # need this many new resolved obs to bother refitting
 MIN_REFIT_INTERVAL_HOURS = 12 # don't re-resolve+refit more than this often
-MAX_RESOLVE_PER_LAUNCH = 80   # cap ESPN calls per auto-refit cycle
+MAX_RESOLVE_PER_LAUNCH = 250  # rows/players drained per auto-refit cycle. Raised
+# 80->250 once _load_player_gamelog memoization made the resolve loop ~free (the
+# 113s->0.1s fix): the per-player pre-warm still costs a few parallel network
+# fetches, but an hourly in-app pass can now clear a full NFL slate in one go, so
+# the backlog stays current during active sessions without an external scheduler.
+# (The manual "Resolve all pending" button passes an explicit 5000 and is unaffected.)
 # A self-learned (loop) fit may override a *seeded* prop only after clearing this
 # obs floor and beating the seed out-of-sample (the "wait longer" gate). Well
 # above the base fit gate (MIN_FIT_SAMPLES + 2*MIN_VALIDATION_SAMPLES = 90).
