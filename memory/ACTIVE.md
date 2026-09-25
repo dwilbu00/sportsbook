@@ -28,4 +28,6 @@ One line per open item. When an item ships, delete it here and fold the durable 
 - **MLB spring-2027 loose end** — recalibrate over-confident live `pitcher_strikeouts` (cv 0.266 > 0.25; `refit --recalibrate`, ~+0.0126 Brier) + audit other un-recalibrated props → [[edges-and-backtests]], [[modeling-and-calibration]].
 
 ## Owner action items
-- None blocking (app_password set, Cloud rebooted for provenance stamping, all SQL DDL applied). Optional: run `python memory_lint.py` periodically for memory hygiene.
+- **▶ NFL forward-grading fix (2026-09-25, `61a7510` pushed) — 2 steps PENDING:** (1) run `sql/nfl_gamelog_disambiguate.sql` on Azure (AFTER the Cloud redeploys — drops+recreates the `nfl_gamelog` cache with disambiguated stat columns, clears the NFL `gamelog_fetch_meta` gate, resets already-resolved NFL prediction rows); (2) `python forward_tracker.py --resolve --max-resolve 5000` to re-grade. Root cause: the gamelog cache stored only YDS+TD → 50 count props stuck ungradable + the ambiguous single YDS mis-graded yardage/TD (poisoned calibration). → [[data-and-architecture]] gamelog note.
+- **▶ Forward-grading secondary (open, not yet built):** the "Resolve all pending" button is inline/slow; the backlog doesn't drain when Community Cloud sleeps (no scheduler — daemon only runs during active sessions). Fix = an external scheduled `forward_tracker --resolve` (e.g. a GitHub Action cron).
+- None else blocking (app_password set, Cloud rebooted, SQL DDL applied). Optional: `python memory_lint.py` periodically for memory hygiene.
