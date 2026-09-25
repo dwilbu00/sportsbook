@@ -1418,21 +1418,37 @@ def _is_stale_dnp(sport_key, prop_key, player, game_date, commence):
         return False
 
 
+_GAMELOG_MEMO = {}          # (espn_sport, espn_league, player) -> (ts, gamelog, by_date)
+_GAMELOG_MEMO_TTL = 90.0    # seconds
+
+
 def _load_player_gamelog(espn_sport, espn_league, player):
     """(gamelog, {date: [(full_datetime, idx), ...]}) from ESPN, or (None, {}).
+
+    IN-PROCESS MEMOIZED (short TTL): the resolve loop calls this ONCE PER ROW, and each
+    call was a fresh Azure/ESPN read of the player's whole gamelog — a player with N
+    predictions paid N reads (~0.7s each = the grading bottleneck). The memo makes it one
+    read per player per pass; the SQL/ESPN cache underneath stays authoritative (the TTL
+    is short enough that a live-app read never serves a stale settled result).
 
     Keeps EVERY game per date (a first-wins index would drop the 2nd game of a
     doubleheader). Never raises; a missing player/gamelog degrades to (None, {}).
     """
+    key = (espn_sport, espn_league, player)
+    ent = _GAMELOG_MEMO.get(key)
+    if ent is not None and (time.time() - ent[0]) < _GAMELOG_MEMO_TTL:
+        return ent[1], ent[2]
     try:
         from espn_cache import cached_athlete_id, cached_gamelog
         aid = cached_athlete_id(espn_sport, espn_league, player)
         if not aid:
+            _GAMELOG_MEMO[key] = (time.time(), None, {})   # memo the miss too (per-row)
             return None, {}
         # Outcome maintenance needs yesterday's result; the cache helper's
         # 30-day historical default is too stale for forward tracking.
         gamelog = cached_gamelog(espn_sport, espn_league, aid, ttl_hours=6)
         if not gamelog:
+            _GAMELOG_MEMO[key] = (time.time(), None, {})
             return None, {}
     except Exception:
         return None, {}
@@ -1442,6 +1458,7 @@ def _load_player_gamelog(espn_sport, espn_league, player):
         d = full[:10]
         if d:
             by_date[d].append((full, i))
+    _GAMELOG_MEMO[key] = (time.time(), gamelog, by_date)
     return gamelog, by_date
 
 
@@ -1577,6 +1594,8 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     pair = SPORT_ESPN_MAP.get(sport_key)
     if not pair:
         return 0
+    _GAMELOG_MEMO.clear()   # fresh per pass; the resolve loop then reads each player's
+                            # gamelog ONCE (memo hit) instead of once per row
     # Pull only this sport's UNRESOLVED rows out of the DB (settled rows are the
     # bulk and are discarded anyway); the game_date<today refinement stays in
     # Python below. The local path ignores the filter and self-filters.
