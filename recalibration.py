@@ -1482,13 +1482,13 @@ _NFLVERSE_PROP_COL = {
     "player_anytime_td": ("rushing_tds", "receiving_tds", "special_teams_tds"),
 }
 
-# Rollout gate for the nflverse NFL grading cutover. OFF by default so the live path
-# stays ESPN-primary until the owner parity run confirms the swap (phase 1 ships the
-# code dormant). Flip the default to True to make nflverse primary; the env var
-# ODI_NFL_GRADE_NFLVERSE (1/0) overrides either way and is a live kill-switch — set it
-# to 0 to instantly revert to ESPN even after the flip. See
-# notes/NFL_GRADING_NFLVERSE_CUTOVER_2026-09-25.md.
-_NFL_GRADE_FROM_NFLVERSE_DEFAULT = False
+# Rollout gate for the nflverse NFL grading cutover. ON as of 2026-09-25: the owner
+# parity run (nfl_grading_parity.py) diffed all 165 already-graded NFL prop rows with
+# 0 mismatches (159 match, 6 nflverse-pending → ESPN fallback), so nflverse is now the
+# PRIMARY NFL grader and ESPN is the fallback-on-miss. The env var ODI_NFL_GRADE_NFLVERSE
+# (1/0) overrides and is a live kill-switch — set it to 0 to revert to ESPN-primary.
+# See notes/NFL_GRADING_NFLVERSE_CUTOVER_2026-09-25.md.
+_NFL_GRADE_FROM_NFLVERSE_DEFAULT = True
 
 
 def _nfl_grade_from_nflverse():

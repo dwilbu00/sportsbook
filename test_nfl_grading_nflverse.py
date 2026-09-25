@@ -110,15 +110,27 @@ class ResolveOnePropWiringTests(unittest.TestCase):
             "americanfootball_nfl", "Player", "player_receptions", 5.5,
             "2026-09-21", "2026-09-21T17:00:00Z")
 
-    def test_gate_off_by_default_skips_nflverse_uses_espn(self):
-        # Phase 1 ships dormant: default gate OFF -> nflverse never consulted.
-        self.assertFalse(rc._nfl_grade_from_nflverse())     # documents the default
+    def test_default_on_prefers_nflverse(self):
+        # Post-flip (2026-09-25, parity clean): default gate ON -> nflverse is primary.
+        self.assertTrue(rc._nfl_grade_from_nflverse())      # documents the default
         with patch("recalibration._resolve_mlb_actual", return_value=None), \
+                patch("recalibration._resolve_nfl_actual", return_value=42.0) as nfl, \
+                patch("recalibration._load_player_gamelog") as espn:
+            out = self._resolve()
+        self.assertEqual(out, 42.0)
+        nfl.assert_called_once()
+        espn.assert_not_called()          # nflverse primary -> ESPN not touched on a hit
+
+    def test_kill_switch_env_forces_espn(self):
+        # ODI_NFL_GRADE_NFLVERSE=0 reverts to ESPN-primary even with the default ON.
+        import os
+        with patch.dict(os.environ, {"ODI_NFL_GRADE_NFLVERSE": "0"}), \
+                patch("recalibration._resolve_mlb_actual", return_value=None), \
                 patch("recalibration._resolve_nfl_actual", return_value=42.0) as nfl, \
                 patch("recalibration._load_player_gamelog", return_value=(None, {})) as espn:
             out = self._resolve()
         self.assertIsNone(out)            # ESPN path (empty) -> pending
-        nfl.assert_not_called()           # gate off -> nflverse skipped entirely
+        nfl.assert_not_called()           # kill-switch -> nflverse skipped entirely
         espn.assert_called_once()
 
     def test_gate_on_prefers_nflverse_and_skips_espn_on_hit(self):
