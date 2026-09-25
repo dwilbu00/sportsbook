@@ -89,12 +89,19 @@ _META = MetaData()
 _BATTER_STATS = ("AB", "H", "SO", "BB", "HBP", "SF", "SH")
 _PITCHER_STATS = ("IP", "K", "ER")
 _NBA_STATS = ("MIN", "PTS", "REB", "AST")
-# NFL gamelogs are ONE position-dependent row per game; across all three NFL props
-# the app reads only two labels -- pass/rush yds both resolve to "YDS" (passing
-# for a QB, rushing for a RB, receiving for a WR) and anytime-TD to "TD" -- so,
-# like _NBA_STATS, this keeps only what's read (verified against the live ESPN
-# NFL gamelog contract), not the full ~18-label row.
-_NFL_STATS = ("YDS", "TD")
+# NFL gamelogs are ONE position-dependent row per game. We store the UNAMBIGUOUS ESPN
+# machine-name stats every modeled/graded prop needs — NOT the display labels "YDS"/"TD",
+# which collide across passing/rushing/receiving (a QB row's "YDS" is his RUSHING yards,
+# not passingYards; "TD" is the last category's, not passing) and silently mis-graded every
+# yardage/TD prop + left every COUNT prop ungradable. These keys are present in the raw
+# get_athlete_gamelog row (verified live 2026-09-25: Stafford passingYards/passingAttempts/
+# completions; Nabers receptions/receivingYards). A position that lacks a stat stores None
+# (omitted on read). PROP_STAT_MAP prefers exactly these names.
+_NFL_STATS = (
+    "passingYards", "rushingYards", "receivingYards",                    # disambiguated yardage
+    "receptions", "rushingAttempts", "passingAttempts", "completions",   # count props
+    "passingTouchdowns", "rushingTouchdowns", "receivingTouchdowns",     # pass_tds + anytime_td
+)
 # Metadata keys re-emitted on every reconstructed row.
 _META_KEYS = ("opponent", "is_home", "team_id", "game_date", "completed")
 

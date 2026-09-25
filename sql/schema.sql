@@ -614,9 +614,12 @@ CREATE INDEX ix_nba_gamelog_athlete
 GO
 
 --------------------------------------------------------------------- nfl_gamelog
--- ONE position-dependent row per game; the app reads only two labels (pass/rush
--- yds both -> [YDS]; anytime TD -> [TD]). [YDS] is passing yds for a QB, rushing
--- for a RB, receiving for a WR (see gamelog_store._NFL_STATS).
+-- ONE position-dependent row per game. Stores the UNAMBIGUOUS ESPN machine-name stats
+-- every graded prop needs (NOT the collision-prone display labels YDS/TD). A position
+-- that lacks a stat stores NULL. Re-fetchable cache — safe to DROP + recreate + clear its
+-- gamelog_fetch_meta rows to re-populate. See gamelog_store._NFL_STATS. (Cols expanded
+-- 2026-09-25: the old [YDS],[TD]-only schema left count props ungradable + mis-graded
+-- yardage; migration in sql/migrations/2026-09-25_nfl_gamelog_disambiguate.sql.)
 IF OBJECT_ID('dbo.nfl_gamelog', 'U') IS NULL
 CREATE TABLE dbo.nfl_gamelog (
     id            INT IDENTITY(1,1) PRIMARY KEY,
@@ -628,7 +631,9 @@ CREATE TABLE dbo.nfl_gamelog (
     is_home       BIT,
     team_id       NVARCHAR(32),
     completed     BIT,
-    [YDS] FLOAT, [TD] FLOAT
+    passingYards FLOAT, rushingYards FLOAT, receivingYards FLOAT,
+    receptions FLOAT, rushingAttempts FLOAT, passingAttempts FLOAT, completions FLOAT,
+    passingTouchdowns FLOAT, rushingTouchdowns FLOAT, receivingTouchdowns FLOAT
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes

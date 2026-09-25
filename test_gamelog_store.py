@@ -23,11 +23,16 @@ def _nba_row(game_date, pts=25.0, reb=8.0, ast=6.0, minutes=34.0):
 
 def _nfl_row(game_date, yds=88.0, td=1.0, opp="Bears", home=True, team="3",
              completed=True):
-    """A realistic ESPN NFL gamelog row: ONE position-dependent row per game with
-    ~18 labels; the store keeps only the two the app reads (YDS, TD)."""
+    """A realistic ESPN NFL gamelog row (QB): both the collision-prone display labels
+    (CMP/ATT/YDS/TD/CAR) AND the unambiguous machine names — the store keeps the latter,
+    the exact keys the props read (see gamelog_store._NFL_STATS)."""
     return {"CMP": 22.0, "ATT": 33.0, "YDS": yds, "CMP%": 66.7, "AVG": 4.0,
             "TD": td, "INT": 0.0, "LNG": 40.0, "SACK": 1.0, "RTG": 105.0,
-            "QBR": 70.0, "CAR": 3.0, "opponent": opp, "is_home": home,
+            "QBR": 70.0, "CAR": 3.0,
+            "passingYards": yds, "passingAttempts": 33.0, "completions": 22.0,
+            "passingTouchdowns": td, "rushingAttempts": 3.0, "rushingYards": 12.0,
+            "rushingTouchdowns": 0.0,
+            "opponent": opp, "is_home": home,
             "team_id": team, "game_date": game_date, "completed": completed}
 
 
@@ -68,12 +73,17 @@ class RoundTripTests(_Backend, unittest.TestCase):
             served = gamelog_store.get_gamelog("football", "nfl", "n1")
             mock.assert_not_called()                  # 2nd served from SQL
         self.assertEqual(len(served), 2)
-        # Only the two consumer-read labels survive; the ~16 others are dropped.
-        self.assertEqual(set(served[0]),
-                         {"YDS", "TD", "opponent", "is_home", "team_id",
-                          "game_date", "completed"})
-        self.assertEqual(served[0]["YDS"], 305.0)
-        self.assertEqual(served[0]["TD"], 2.0)
+        # The unambiguous machine-name stats survive; the collision-prone YDS/TD are gone,
+        # so count props (completions/attempts) and disambiguated yardage now grade right.
+        s0 = served[0]
+        self.assertNotIn("YDS", s0)
+        self.assertNotIn("TD", s0)
+        self.assertEqual(s0["passingYards"], 305.0)
+        self.assertEqual(s0["completions"], 22.0)
+        self.assertEqual(s0["passingAttempts"], 33.0)
+        self.assertEqual(s0["passingTouchdowns"], 2.0)
+        self.assertEqual(s0["rushingAttempts"], 3.0)
+        self.assertNotIn("receptions", s0)      # QB row has no receiving stats -> omitted
 
 
 class TtlGateTests(_Backend, unittest.TestCase):
