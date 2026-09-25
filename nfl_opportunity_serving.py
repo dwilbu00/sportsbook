@@ -31,10 +31,13 @@ _KEEP = ["player_display_name", "season", "week", "team", "position",
          "targets", "carries", "attempts", "receptions",
          # full model feature set (nfl_prop_serving): conversion + yardage + aDOT
          "receiving_yards", "receiving_air_yards", "rushing_yards",
-         "completions", "passing_yards", "passing_tds"]
+         "completions", "passing_yards", "passing_tds",
+         # TD columns for forward-grading (recalibration._resolve_nfl_actual):
+         # anytime-TD = rush + rec + return; also the single-market TD props.
+         "rushing_tds", "receiving_tds", "special_teams_tds"]
 _NUM_COLS = ["targets", "carries", "attempts", "receptions", "receiving_yards",
              "receiving_air_yards", "rushing_yards", "completions", "passing_yards",
-             "passing_tds"]
+             "passing_tds", "rushing_tds", "receiving_tds", "special_teams_tds"]
 CACHE_TTL = 6 * 3600         # 6h — a season's weekly data changes at most once/week
 _CACHE = {}                  # season(int) -> (fetch_ts, DataFrame|None)
 

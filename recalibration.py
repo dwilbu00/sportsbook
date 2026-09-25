@@ -1467,6 +1467,73 @@ def _load_player_gamelog(espn_sport, espn_league, player):
     return gamelog, by_date
 
 
+# prop_key -> nflverse stats_player_week column(s); a tuple is SUMMED (composite
+# props like anytime-TD). Every column here is kept by nfl_opportunity_serving._load.
+_NFLVERSE_PROP_COL = {
+    "player_pass_yds": "passing_yards",
+    "player_rush_yds": "rushing_yards",
+    "player_reception_yds": "receiving_yards",
+    "player_receptions": "receptions",
+    "player_pass_attempts": "attempts",
+    "player_rush_attempts": "carries",
+    "player_pass_completions": "completions",
+    "player_pass_tds": "passing_tds",
+    # DK/FD "anytime TD scorer" pays rushing + receiving + return TDs.
+    "player_anytime_td": ("rushing_tds", "receiving_tds", "special_teams_tds"),
+}
+
+# Rollout gate for the nflverse NFL grading cutover. OFF by default so the live path
+# stays ESPN-primary until the owner parity run confirms the swap (phase 1 ships the
+# code dormant). Flip the default to True to make nflverse primary; the env var
+# ODI_NFL_GRADE_NFLVERSE (1/0) overrides either way and is a live kill-switch — set it
+# to 0 to instantly revert to ESPN even after the flip. See
+# notes/NFL_GRADING_NFLVERSE_CUTOVER_2026-09-25.md.
+_NFL_GRADE_FROM_NFLVERSE_DEFAULT = False
+
+
+def _nfl_grade_from_nflverse():
+    v = os.environ.get("ODI_NFL_GRADE_NFLVERSE")
+    if v is not None:
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return _NFL_GRADE_FROM_NFLVERSE_DEFAULT
+
+
+def _resolve_nfl_actual(prop_key, player, game_date, commence=None):
+    """NFL player-prop actual from the LIVE nflverse player-week feed
+    (nfl_opportunity_serving._load) — one bulk, dep-free, credit-free fetch for the
+    whole slate, keyed by (normalized name, week). A player's week row existing ==
+    official final (nflverse posts weekly, post-game). Returns a float, or None
+    (leave PENDING) when the prop is unmapped, the game's (season, week) can't be
+    resolved yet, or the player has no row for that week (DNP / not yet posted).
+    Never raises -- a miss falls through to the ESPN gamelog path in resolve_one_prop."""
+    spec = _NFLVERSE_PROP_COL.get(prop_key)
+    if spec is None:
+        return None
+    try:
+        import nfl_schedule
+        import nfl_opportunity_serving as _nos
+        import nfl_props_scan as _scan
+        sw = nfl_schedule.season_week_for_date(game_date)
+        if sw is None:
+            return None
+        season, week = sw
+        df = _nos._load(season)
+        if df is None or "player_norm" not in df.columns:
+            return None
+        sub = df[(df["player_norm"] == _scan._norm(player))
+                 & (df["week"] == int(week))]
+        if sub is None or len(sub) == 0:
+            return None
+        row = sub.iloc[0]
+        cols = spec if isinstance(spec, tuple) else (spec,)
+        present = [c for c in cols if c in sub.columns]
+        if not present:
+            return None            # column absent from feed -> pending, never a wrong 0
+        return float(sum(float(row.get(c) or 0.0) for c in present))
+    except Exception:
+        return None
+
+
 def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
                      game_pk=None, mlb_player_id=None, _use_warehouse=True):
     """Resolve one player's actual stat for a single forecast game.
@@ -1518,9 +1585,20 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
         # stay pending (return None). _ENFORCE_IDENTITY keeps new unpinnable rows
         # from ever being logged, so the only rows this leaves pending are legacy
         # id-less prospects ESPN couldn't reliably grade anyway (aged out
-        # separately). NBA/NFL/NHL keep the ESPN gamelog path below unchanged.
+        # separately). NBA/NHL keep the ESPN gamelog path below unchanged; NFL now
+        # prefers the nflverse player-week feed first (just below).
         if sport_key == "baseball_mlb":
             return None
+        # NFL: one bulk dep-free nflverse fetch grades the whole slate -- no per-player
+        # ESPN call, no YDS/TD label collisions. GATED OFF by default (_nfl_grade_from_
+        # nflverse) so the live path stays ESPN-primary until the owner parity run; once
+        # flipped on, any miss (unmapped prop, week not yet resolvable, DNP / not yet
+        # posted) still falls through to the ESPN gamelog path below.
+        # See notes/NFL_GRADING_NFLVERSE_CUTOVER_2026-09-25.md.
+        if sport_key == "americanfootball_nfl" and _nfl_grade_from_nflverse():
+            v = _resolve_nfl_actual(prop_key, player, game_date, commence)
+            if v is not None:
+                return float(v)
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
             return None

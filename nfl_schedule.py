@@ -208,6 +208,41 @@ def _gameday_date(gameday):
         return None
 
 
+def season_week_for_date(game_date, max_day_gap=1):
+    """``(season:str, week:int)`` for the NFL game on ``game_date`` (YYYY-MM-DD),
+    from the games spine (mirror-first, live games.csv fallback — cloud-safe). Matches
+    an EXACT gameday first, then within ``max_day_gap`` days (UTC/ET slippage). Returns
+    None when no scheduled game sits on/near that date (a bye, or a date the schedule
+    doesn't cover yet). Never raises.
+
+    Forward-grading uses this to key the nflverse player-week feed, which carries
+    (season, week) but no per-game date."""
+    d = _gameday_date(game_date)
+    if d is None:
+        return None
+    try:
+        base = nfl_epa.season_for_date(str(game_date)[:10])
+    except Exception:
+        base = d.year if d.month >= 8 else d.year - 1
+    best = None                                   # (gap, season_str, week_int)
+    for s in (base, base - 1, base + 1):          # tolerate season boundary/labeling
+        for r in load_games([str(s)]):
+            gd = _gameday_date(r.get("gameday"))
+            if gd is None:
+                continue
+            gap = abs((gd - d).days)
+            if gap > max_day_gap:
+                continue
+            wk = _to_int(r.get("week"))
+            if wk is None:
+                continue
+            if gap == 0:
+                return (str(r.get("season")), wk)
+            if best is None or gap < best[0]:
+                best = (gap, str(r.get("season")), wk)
+    return (best[1], best[2]) if best else None
+
+
 def resolve_event(home_name, away_name, commence_time, index=None,
                   max_day_gap=1):
     """Resolve one odds event to a nflverse ``game_id``. Returns
