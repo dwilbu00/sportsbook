@@ -441,40 +441,34 @@ def _render_bet_links(candidate, bet_type=None, side=None):
 
 
 def _render_parlay_bet_links(legs):
-    """'Add this parlay to a slip' — one-tap combined DK link (+ FD best-effort) + QR that
-    stacks every captured leg (betslip.dk_parlay_link over the legs' sids). If ANY leg's
-    line has moved since Analyze its sid expires and DK rejects the whole combined link
-    ("pick no longer available"), so the 'Per-leg links' expander is kept as the resilient
-    fallback — single links accumulate on the slip (owner-verified). Only pre-fills; the
-    user taps Submit in the book."""
+    """Add a parlay to a slip, split by what each surface supports:
+      • DESKTOP/WEB — the combined DK/FD buttons stack every leg in one tap (the sportsbook
+        WEBSITE accepts multi-selection URLs).
+      • MOBILE — the DK app honors only ONE selection per deep link (comma → 'unavailable';
+        repeated → first leg only), so on a phone scan the PER-LEG QRs one by one; each adds
+        its pick and they accumulate on the slip (owner-verified).
+    Only pre-fills the slip — the user taps Submit in the book."""
     if not legs:
         return
     import betslip
     dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
     fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
-    dk_all = betslip.dk_parlay_link(dk_sids)               # comma: works on the DK WEBSITE
-    dk_all_qr = betslip.dk_parlay_link_repeated(dk_sids)   # repeated: testing the DK APP (QR)
+    dk_all = betslip.dk_parlay_link(dk_sids)
     fd_all = betslip.fd_parlay_link(fd_links)
     if not dk_all and not fd_all:
         return
     n = len(legs)
-    st.markdown(f"**🎟️ Add this parlay to a slip** — one tap stacks {len(dk_sids)}/{n} legs:")
-    cols = st.columns([1, 1, 1, 2])
+    st.markdown(f"**🎟️ Add this parlay to a slip** ({len(dk_sids)}/{n} legs deep-linkable):")
+    cols = st.columns([2, 2, 3])
     if dk_all:
-        cols[0].link_button("🟢 DK", dk_all, help="Desktop: adds all legs to the DraftKings site in one tap")
+        cols[0].link_button("🟢 DK — all legs (web)", dk_all,
+                            help="Desktop/web: one tap adds every leg to the DraftKings slip.")
     if fd_all:
-        cols[1].link_button("🔵 FD", fd_all, help="FanDuel multi-add (best-effort)")
-    with cols[2].popover("📱 QR"):
-        st.caption("Scan on your phone → opens the app slip, then tap Submit. ⚗️ Testing the "
-                   "mobile multi-add format — if the DK QR still says a pick is unavailable, "
-                   "use the per-leg QRs below (those stack reliably in the app).")
-        for label, link in (("DraftKings", dk_all_qr), ("FanDuel", fd_all)):
-            if link:
-                png = _qr_png_cached(link)
-                if png:
-                    st.caption(label)
-                    st.image(png, width=180)
-    with st.expander("Per-leg links (tap each — they stack)"):
+        cols[1].link_button("🔵 FD — all legs (web)", fd_all,
+                            help="FanDuel website multi-add (best-effort).")
+    st.caption("📱 On your **phone** the DK app adds only one pick per link — scan the "
+               "**per-leg QRs** below one at a time; they stack on the slip.")
+    with st.expander("Per-leg links + QR (mobile: scan each — they stack)"):
         for i, leg in enumerate(legs, 1):
             lc = st.columns([4, 1, 1, 1])
             lc[0].caption(f"{i}. {leg.get('label', '')}")
