@@ -1098,7 +1098,8 @@ def resolve_pending_market_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LA
     if not rows:
         return 0
 
-    today = datetime.now(timezone.utc).date().isoformat()
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date().isoformat()
     resolved_updates = {}
     resolved_count = 0
     for r in rows:
@@ -1107,8 +1108,19 @@ def resolve_pending_market_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LA
         if r.get("sport_key") != sport_key or r.get("resolved"):
             continue
         game_date = (r.get("game_date") or "")[:10]
-        if not game_date or game_date >= today:
-            continue  # game hasn't happened yet
+        # Gate "not started yet" on the precise commence INSTANT (timezone-robust), not a
+        # date compare: the old `game_date >= today` matched an ET game_date against a UTC
+        # today, so an afternoon game that already FINISHED sat pending until UTC rolled
+        # over that evening. A kicked-off game is attempted the same moment -- final_score
+        # returns None until the game is actually completed (verified: ESPN slate filters
+        # to status.completed), so a still-live game stays pending (mirrors the wager
+        # resolver). Fall back to the coarse UTC-date check only when commence is missing.
+        commence_dt = _parse_dt(r.get("commence_time"))
+        if commence_dt is not None:
+            if commence_dt > now_utc:
+                continue  # hasn't started yet
+        elif not game_date or game_date >= today:
+            continue  # no commence -> coarse date fallback
         score = game_results.final_score(
             sport_key, game_date, r.get("home_team"), r.get("away_team"),
             r.get("commence_time"))

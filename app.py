@@ -2339,7 +2339,7 @@ def render_bonuses():
                 def _evlabel(i):
                     ev = ev_by_id[i]
                     return (f"{ev.get('away_team')} @ {ev.get('home_team')} · "
-                            f"{(ev.get('commence_time') or '')[:16].replace('T', ' ')}")
+                            f"{format_time(ev.get('commence_time'))}")
 
                 picked = st.multiselect("Games", list(ev_by_id),
                                         format_func=_evlabel, key="brun_games")

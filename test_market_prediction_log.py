@@ -249,7 +249,11 @@ class ResolverTests(unittest.TestCase):
 
     def test_skips_future_games(self):
         import game_results
-        rows = [_row("moneyline", "away", game_date="2999-01-01")]
+        # A genuinely-future game: the gate is the commence INSTANT (timezone-robust),
+        # not the date -- so a future game needs a future commence_time. final_score must
+        # never be fetched for a game that hasn't started.
+        rows = [_row("moneyline", "away", game_date="2999-01-01",
+                     commence_time="2999-01-01T23:00:00Z")]
         called = {"n": 0}
 
         def _fs(*a, **k):
@@ -264,6 +268,29 @@ class ResolverTests(unittest.TestCase):
             n = recalibration.resolve_pending_market_outcomes("baseball_mlb")
         self.assertEqual(n, 0)
         self.assertEqual(called["n"], 0)       # never fetched a future game
+
+    def test_started_game_resolves_on_commence_not_date(self):
+        # Regression: a game whose commence is in the PAST is attempted the same moment,
+        # even if its stored (ET) game_date looks future vs UTC today. The old
+        # `game_date >= today` compared an ET date to a UTC today and wrongly delayed /
+        # skipped same-day-finished games. commence gates; final_score gates completion.
+        import game_results
+        rows = [_row("moneyline", "away", game_date="2999-01-01",
+                     commence_time="2020-05-01T23:00:00Z")]
+        fetched = []
+
+        def _fs(sport, gd, *a, **k):
+            fetched.append(gd)
+            return (5.0, 3.0)
+
+        with patch.object(recalibration, "_read_market_log",
+                          return_value=[dict(r) for r in rows]), \
+             patch.object(recalibration, "mutate_market_prediction_log",
+                          side_effect=_InMemoryLog(rows)), \
+             patch.object(game_results, "final_score", side_effect=_fs):
+            n = recalibration.resolve_pending_market_outcomes("baseball_mlb")
+        self.assertEqual(fetched, ["2999-01-01"])   # started (past commence) -> fetched
+        self.assertEqual(n, 1)                       # and resolved
 
 
 class SummaryTests(unittest.TestCase):
