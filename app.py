@@ -453,23 +453,26 @@ def _render_parlay_bet_links(legs):
     import betslip
     dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
     fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
-    dk_all = betslip.dk_parlay_link(dk_sids)          # /?outcomes= comma: DK WEBSITE multi
+    dk_all = betslip.dk_parlay_link(dk_sids)                 # /?outcomes= comma: DK WEBSITE multi
+    dk_addbet_q = betslip.dk_addbet_link(dk_sids, "query")   # /?addbet= : mobile re-test
     fd_all = betslip.fd_parlay_link(fd_links)
     if not dk_all and not fd_all:
         return
     n = len(legs)
     st.markdown(f"**🎟️ Add this parlay to a slip** ({len(dk_sids)}/{n} legs deep-linkable):")
-    cols = st.columns([2, 2])
+    cols = st.columns(3)
     if dk_all:
-        cols[0].link_button("🟢 DK — all legs (desktop)", dk_all,
-                            help="On DESKTOP/web this one tap adds every leg. On mobile the "
-                                 "DK app takes only one pick per link — use the per-leg QRs below.")
+        cols[0].link_button("🟢 DK all (desktop)", dk_all,
+                            help="Desktop/web: one tap adds every leg to the DraftKings slip.")
+    if dk_addbet_q:
+        cols[1].link_button("🟢 DK all (mobile?)", dk_addbet_q,
+                            help="Tap on your PHONE, then check the app's betslip tab — does "
+                                 "it show all legs? (?addbet= form)")
     if fd_all:
-        cols[1].link_button("🔵 FD — all legs (desktop)", fd_all,
+        cols[2].link_button("🔵 FD all (desktop)", fd_all,
                             help="FanDuel website multi-add (best-effort).")
-    st.caption("📱 On your **phone**: open the per-leg links below and scan/tap each one — "
-               "every pick adds to the SAME slip and they stack (DK's app only accepts one "
-               "selection per link, so there's no single mobile link for the whole parlay).")
+    st.caption("📱 If the mobile button doesn't populate all legs, use the per-leg links "
+               "below — scan/tap each one and they stack on the SAME slip.")
     with st.expander("Per-leg links + QR (mobile: scan/tap each — they stack)"):
         for i, leg in enumerate(legs, 1):
             lc = st.columns([4, 1, 1, 1])
