@@ -269,6 +269,11 @@ def get_event_odds(api_key, sport, event_id, regions="us", markets="h2h",
         "regions": regions,
         "markets": markets,
         "oddsFormat": "american",
+        # FREE enrichment (cost is still markets x regions): includeLinks returns DK/FD
+        # betslip links per outcome, includeSids the source ids. Powers the one-tap "Bet
+        # on DK/FD" deep links. See odds_links_probe.py.
+        "includeLinks": "true",
+        "includeSids": "true",
     }
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
@@ -346,6 +351,10 @@ def get_upcoming_odds(api_key, sport, regions="us", markets="h2h,spreads,totals"
         "regions": regions,
         "markets": markets,
         "oddsFormat": "american",
+        # FREE enrichment (see get_event_odds): DK/FD betslip links + source ids per
+        # outcome, for the one-tap "Bet on DK/FD" deep links.
+        "includeLinks": "true",
+        "includeSids": "true",
     }
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
