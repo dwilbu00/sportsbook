@@ -288,6 +288,10 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
             "hist_prob": hp,
             "implied_prob": ip,
             "_rec": rec,
+            # One-tap betslip: the recommended side's DK/FD deep link + source id, for
+            # per-leg links AND combined parlay stacking (betslip.dk_parlay_link on sids).
+            "dk_link": c.get("dk_link"), "fd_link": c.get("fd_link"),
+            "dk_sid": c.get("dk_sid"), "fd_sid": c.get("fd_sid"),
         }
         if c.get("safe_mode"):
             # Extra fields used by the "value parlays in safe mode" ranker / UI.

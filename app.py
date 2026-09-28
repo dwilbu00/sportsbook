@@ -440,6 +440,43 @@ def _render_bet_links(candidate, bet_type=None, side=None):
                     st.image(png, width=170)
 
 
+def _render_parlay_bet_links(legs):
+    """'Add this parlay to a slip' — a combined DK/FD betslip link + QR that stacks every
+    captured leg in one tap (betslip.dk_parlay_link on the legs' sids). Legs without a
+    link (team markets, not yet threaded) can't be stacked; a caption notes it, and since
+    single links accumulate, scanning each remaining leg's own QR also works. Only
+    pre-fills the slip — the user taps Submit in the book."""
+    if not legs:
+        return
+    import betslip
+    dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
+    fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
+    dk_all = betslip.dk_parlay_link(dk_sids)
+    fd_all = betslip.fd_parlay_link(fd_links)
+    if not dk_all and not fd_all:
+        return
+    n = len(legs)
+    st.markdown("**🎟️ Add this parlay to a slip** — one tap stacks every captured leg:")
+    cols = st.columns([1, 1, 1, 2])
+    if dk_all:
+        cols[0].link_button(f"🟢 DK · {len(dk_sids)}/{n}", dk_all,
+                            help="Adds all captured legs to your DraftKings slip in one tap")
+    if fd_all:
+        cols[1].link_button(f"🔵 FD · {len(fd_links)}/{n}", fd_all,
+                            help="Adds captured legs to FanDuel (multi-add is best-effort)")
+    with cols[2].popover("📱 QR"):
+        st.caption("Scan to build the parlay on your phone (tap Submit in the app).")
+        for label, link in (("DraftKings", dk_all), ("FanDuel", fd_all)):
+            if link:
+                png = _qr_png_cached(link)
+                if png:
+                    st.caption(label)
+                    st.image(png, width=180)
+    if len(dk_sids) < n:
+        st.caption(f"⚠️ {n - len(dk_sids)} leg(s) aren't deep-linkable yet (team markets) — "
+                   "add those manually, or scan each remaining leg's QR (they accumulate).")
+
+
 def _select_bet_checkbox(candidate, bet_type, side=None):
     entry = make_bet_checklist_entry(candidate, bet_type, side=side)
     st.checkbox(
@@ -3830,6 +3867,7 @@ if "parlay_results" in st.session_state:
                         "ℹ️ One or more spread/total legs had no captured price; "
                         "payout assumes -110 for those legs."
                     )
+                _render_parlay_bet_links(p.get("legs", []))
     else:
         st.info("Not enough positive-edge bets to build parlays. Try selecting more games or markets.")
 
