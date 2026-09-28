@@ -1490,6 +1490,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             fd_under_price = odds_info.get("fd_under_price")
             fd_over_book = odds_info.get("fd_over_book")
             fd_under_book = odds_info.get("fd_under_book")
+            # One-tap betslip deep links + source ids per side (DK/FD); the direction-
+            # specific pair is attached to the recommendation below (see "dk_link").
+            dk_over_link = odds_info.get("dk_over_link")
+            dk_under_link = odds_info.get("dk_under_link")
+            dk_over_sid = odds_info.get("dk_over_sid")
+            dk_under_sid = odds_info.get("dk_under_sid")
+            fd_over_link = odds_info.get("fd_over_link")
+            fd_under_link = odds_info.get("fd_under_link")
+            fd_over_sid = odds_info.get("fd_over_sid")
+            fd_under_sid = odds_info.get("fd_under_sid")
 
             history = player_histories.get(player_name, {}).get(prop_key)
             _have_history = bool(history and history.get("found") and history.get("values"))
@@ -2403,6 +2413,16 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 "fd_under_price": fd_under_price,
                 "dk_price": dk_price,
                 "dk_book": dk_book,
+                # One-tap DK/FD betslip deep links + source ids for the RECOMMENDED side.
+                # Singles use the link verbatim; parlay leg-stacking uses the sid.
+                "dk_link": (dk_over_link if direction == "OVER"
+                            else dk_under_link if direction == "UNDER" else None),
+                "dk_sid": (dk_over_sid if direction == "OVER"
+                           else dk_under_sid if direction == "UNDER" else None),
+                "fd_link": (fd_over_link if direction == "OVER"
+                            else fd_under_link if direction == "UNDER" else None),
+                "fd_sid": (fd_over_sid if direction == "OVER"
+                           else fd_under_sid if direction == "UNDER" else None),
                 # Which line this was analyzed at: 'dk' (DK's own line) vs
                 # 'consensus' (DK didn't offer the player); peer_count = independent
                 # books at that line. Surfaced for the UI + audit of the DK anchor.

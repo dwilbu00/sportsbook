@@ -1191,6 +1191,11 @@ def parse_player_props(game_data):
                         # stale quote too, not just the fair-reference de-vig. [F02]
                         "last_update": (market.get("last_update")
                                         or bookmaker.get("last_update")),
+                        # DK/FD one-tap betslip deep link + source id (includeLinks/
+                        # includeSids). Rides WITH the executable quote so the chosen
+                        # book's link reaches the recommendation. None for books without.
+                        "link": outcome.get("link"),
+                        "sid": outcome.get("sid"),
                     })
                 players.setdefault((player, line), {})[side] = outcome
 
@@ -1323,6 +1328,17 @@ def parse_player_props(game_data):
                 "fd_under_price": fd_under["price"] if fd_under else None,
                 "fd_over_book": fd_over["book"] if fd_over else None,
                 "fd_under_book": fd_under["book"] if fd_under else None,
+                # One-tap betslip deep links + source ids for the EXECUTABLE books
+                # (DK/FD only — never the analysis-only best-price book). Singles use
+                # `link` verbatim; parlays stack `sid`s (betslip.dk_parlay_link).
+                "dk_over_link": dk_over.get("link") if dk_over else None,
+                "dk_over_sid": dk_over.get("sid") if dk_over else None,
+                "dk_under_link": dk_under.get("link") if dk_under else None,
+                "dk_under_sid": dk_under.get("sid") if dk_under else None,
+                "fd_over_link": fd_over.get("link") if fd_over else None,
+                "fd_over_sid": fd_over.get("sid") if fd_over else None,
+                "fd_under_link": fd_under.get("link") if fd_under else None,
+                "fd_under_sid": fd_under.get("sid") if fd_under else None,
                 # Edge is measured against the consensus fair probability;
                 # expected ROI still uses the best executable side price.
                 "over_implied": fair_over,

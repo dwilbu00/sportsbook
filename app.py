@@ -408,6 +408,38 @@ def _value_bet_checklist_entries(
     ))
 
 
+@st.cache_data(show_spinner=False)
+def _qr_png_cached(url):
+    """QR PNG for a betslip URL, cached by URL so it isn't regenerated every rerun."""
+    import betslip
+    return betslip.qr_png(url)
+
+
+def _render_bet_links(candidate, bet_type=None, side=None):
+    """One-tap 'Bet on DK/FD' link buttons + a QR (desktop→phone) for a value bet, built
+    from the pick's ready-made betslip links (Odds API includeLinks). No-op when the pick
+    carries no DK/FD link (e.g. team markets, not yet threaded, or a book that omitted
+    one). The link only PRE-FILLS the slip — you tap Submit inside DK/FD; nothing is
+    auto-placed."""
+    dk = candidate.get("dk_link")
+    fd = candidate.get("fd_link")
+    if not dk and not fd:
+        return
+    cols = st.columns([1, 1, 1, 3])
+    if dk:
+        cols[0].link_button("🟢 DK", dk, help="Open the pre-filled DraftKings betslip")
+    if fd:
+        cols[1].link_button("🔵 FD", fd, help="Open the pre-filled FanDuel betslip")
+    with cols[2].popover("📱 QR"):
+        st.caption("Scan to open the slip on your phone (tap Submit in the app).")
+        for label, link in (("DraftKings", dk), ("FanDuel", fd)):
+            if link:
+                png = _qr_png_cached(link)
+                if png:
+                    st.caption(label)
+                    st.image(png, width=170)
+
+
 def _select_bet_checkbox(candidate, bet_type, side=None):
     entry = make_bet_checklist_entry(candidate, bet_type, side=side)
     st.checkbox(
@@ -418,6 +450,7 @@ def _select_bet_checkbox(candidate, bet_type, side=None):
             "consolidated list."
         ),
     )
+    _render_bet_links(candidate, bet_type, side)
 
 
 def _iter_wager_candidates(ar):
