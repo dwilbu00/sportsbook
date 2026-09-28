@@ -1518,10 +1518,10 @@ def _resolve_nfl_actual(prop_key, player, game_date, commence=None):
             return None
         season, week = sw
         df = _nos._load(season)
-        if df is None or "player_norm" not in df.columns:
+        canon = _nos._canonical_norm(df, _scan._norm(player))   # exact, else nickname fallback
+        if canon is None:
             return None
-        sub = df[(df["player_norm"] == _scan._norm(player))
-                 & (df["week"] == int(week))]
+        sub = df[(df["player_norm"] == canon) & (df["week"] == int(week))]
         if sub is None or len(sub) == 0:
             return None
         row = sub.iloc[0]

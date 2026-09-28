@@ -14,6 +14,7 @@ import pandas as pd
 import recalibration as rc
 import nfl_schedule
 import nfl_props_scan as scan
+import nfl_opportunity_serving as nos
 
 
 def _df(rows):
@@ -68,6 +69,49 @@ class ResolveNflActualTests(unittest.TestCase):
         with patch("nfl_schedule.season_week_for_date", return_value=("2026", 3)), \
                 patch("nfl_opportunity_serving._load", return_value=None):
             self.assertIsNone(rc._resolve_nfl_actual("player_receptions", "X", "2026-09-21"))
+
+    def test_nickname_resolves_in_grading(self):
+        # odds feed "Joshua Palmer" grades against nflverse "Josh Palmer".
+        df = _df([{"player_norm": scan._norm("Josh Palmer"), "week": 3,
+                   "receiving_yards": 43.0}])
+        self.assertEqual(self._run("player_reception_yds", "Joshua Palmer", df), 43.0)
+
+
+class CanonicalNormTests(unittest.TestCase):
+    """nfl_opportunity_serving._canonical_norm — the shared exact-then-nickname resolver
+    used by BOTH serving and grading."""
+
+    def _df(self, norms):
+        return pd.DataFrame({"player_norm": norms, "week": [1] * len(norms)})
+
+    def test_exact_match(self):
+        self.assertEqual(nos._canonical_norm(self._df(["josh allen", "jared goff"]),
+                                             "josh allen"), "josh allen")
+
+    def test_nickname_truncation_forward(self):
+        self.assertEqual(nos._canonical_norm(self._df(["josh palmer", "davante adams"]),
+                                             "joshua palmer"), "josh palmer")
+
+    def test_nickname_truncation_reverse(self):
+        self.assertEqual(nos._canonical_norm(self._df(["joshua palmer"]),
+                                             "josh palmer"), "joshua palmer")
+
+    def test_non_prefix_decoy_rejected(self):
+        # "mike williams" must NOT bind "marvin williams" (neither first name a prefix).
+        self.assertIsNone(nos._canonical_norm(self._df(["marvin williams"]), "mike williams"))
+
+    def test_ambiguous_abstains(self):
+        self.assertIsNone(nos._canonical_norm(self._df(["josh allen", "jordan allen"]),
+                                              "jo allen"))
+
+    def test_absent_returns_none(self):
+        self.assertIsNone(nos._canonical_norm(self._df(["josh allen"]), "davante adams"))
+
+    def test_single_token_returns_none(self):
+        self.assertIsNone(nos._canonical_norm(self._df(["josh allen"]), "cher"))
+
+    def test_none_df_returns_none(self):
+        self.assertIsNone(nos._canonical_norm(None, "josh allen"))
 
 
 class SeasonWeekForDateTests(unittest.TestCase):

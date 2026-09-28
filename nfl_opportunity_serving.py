@@ -65,6 +65,34 @@ def _load(season, ttl=CACHE_TTL):
         return hit[1] if hit is not None else None   # serve stale on transient fetch failure
 
 
+def _canonical_norm(df, player_norm):
+    """Map an input normalized name to the nflverse ``player_norm`` actually present in
+    ``df`` (from _load). Exact match first; else a UNIQUE fallback on same last name +
+    first-name TRUNCATION (Joshua↔Josh, Cameron↔Cam, William↔Will — one first name a
+    prefix of the other). Returns the canonical norm, or None when the player is absent
+    OR the fallback is ambiguous (>=2 candidates → abstain, never guess). Closes the
+    odds-feed↔nflverse first-name/nickname gap for BOTH serving and grading; only fires
+    on an exact miss, so exact-matched players are byte-for-byte unchanged."""
+    if df is None or not player_norm or "player_norm" not in df.columns:
+        return None
+    names = df["player_norm"]
+    try:
+        if bool((names == player_norm).any()):
+            return player_norm
+    except Exception:
+        return None
+    parts = player_norm.split()
+    if len(parts) < 2:
+        return None                                  # single token -> too weak to fallback
+    first, last = parts[0], parts[-1]
+    cand = set()
+    for n in names.dropna().unique():
+        p = str(n).split()
+        if len(p) >= 2 and p[-1] == last and (p[0].startswith(first) or first.startswith(p[0])):
+            cand.add(n)
+    return cand.pop() if len(cand) == 1 else None    # unique -> match; else abstain
+
+
 def _prior_games(player_norm, season, week, min_prior):
     """That player's prior games, most-recent first. SAME-SEASON prior weeks only when there are
     already >= min_prior of them (byte-for-byte the offline/backtest gate); otherwise spill into
@@ -73,14 +101,18 @@ def _prior_games(player_norm, season, week, min_prior):
     cur = _load(s)
     same = []
     if cur is not None:
-        sub = cur[(cur["player_norm"] == player_norm) & (cur["week"] < int(week))]
-        same = sub.sort_values("week", ascending=False).to_dict("records")
+        canon = _canonical_norm(cur, player_norm)   # exact, else unique nickname fallback
+        if canon is not None:
+            sub = cur[(cur["player_norm"] == canon) & (cur["week"] < int(week))]
+            same = sub.sort_values("week", ascending=False).to_dict("records")
     if len(same) >= min_prior:
-        return same                                 # matches offline exactly (same-season only)
+        return same                                 # exact-match players unchanged vs offline
     prev = _load(s - 1)                              # early-season fallback only
     if prev is not None:
-        sub = prev[prev["player_norm"] == player_norm]
-        same += sub.sort_values("week", ascending=False).to_dict("records")
+        canon = _canonical_norm(prev, player_norm)
+        if canon is not None:
+            sub = prev[prev["player_norm"] == canon]
+            same += sub.sort_values("week", ascending=False).to_dict("records")
     return same
 
 
@@ -106,7 +138,10 @@ def player_team(player_norm, season):
         df = _load(s)
         if df is None:
             continue
-        sub = df[df["player_norm"] == player_norm]
+        canon = _canonical_norm(df, player_norm)
+        if canon is None:
+            continue
+        sub = df[df["player_norm"] == canon]
         if len(sub):
             return sub.sort_values("week")["team"].iloc[-1]
     return None
