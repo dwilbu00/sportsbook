@@ -453,33 +453,24 @@ def _render_parlay_bet_links(legs):
     import betslip
     dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
     fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
-    dk_out = betslip.dk_parlay_link(dk_sids)                # /?outcomes= (works on the web)
-    dk_addbet_p = betslip.dk_addbet_link(dk_sids, "path")   # /sb/addbet/  (mobile test)
-    dk_addbet_q = betslip.dk_addbet_link(dk_sids, "query")  # /?addbet=    (mobile test)
-    dk_app = betslip.dk_app_parlay_link(dk_sids)            # dksb:// app scheme (QR)
+    dk_all = betslip.dk_parlay_link(dk_sids)          # /?outcomes= comma: DK WEBSITE multi
     fd_all = betslip.fd_parlay_link(fd_links)
-    if not dk_out and not fd_all:
+    if not dk_all and not fd_all:
         return
     n = len(legs)
     st.markdown(f"**🎟️ Add this parlay to a slip** ({len(dk_sids)}/{n} legs deep-linkable):")
-    st.caption("⚗️ Testing mobile-tappable DK formats — on your phone, tap each and tell me "
-               "which one adds ALL legs (via the app or mobile web).")
-    r = st.columns(4)
-    if dk_out:
-        r[0].link_button("DK ?outcomes", dk_out, help="known: works on the desktop website")
-    if dk_addbet_p:
-        r[1].link_button("DK /addbet/…", dk_addbet_p, help="https path mirroring the app scheme")
-    if dk_addbet_q:
-        r[2].link_button("DK ?addbet=", dk_addbet_q, help="https query form")
+    cols = st.columns([2, 2])
+    if dk_all:
+        cols[0].link_button("🟢 DK — all legs (desktop)", dk_all,
+                            help="On DESKTOP/web this one tap adds every leg. On mobile the "
+                                 "DK app takes only one pick per link — use the per-leg QRs below.")
     if fd_all:
-        r[3].link_button("🔵 FD", fd_all, help="FanDuel website multi-add (best-effort)")
-    if dk_app:
-        with st.popover("📱 DK QR — all legs (dksb app scheme)"):
-            st.caption("Scan on your phone → DK app opens with ALL legs, then tap Submit.")
-            png = _qr_png_cached(dk_app)
-            if png:
-                st.image(png, width=200)
-    with st.expander("Per-leg links + QR (each stacks on the slip)"):
+        cols[1].link_button("🔵 FD — all legs (desktop)", fd_all,
+                            help="FanDuel website multi-add (best-effort).")
+    st.caption("📱 On your **phone**: open the per-leg links below and scan/tap each one — "
+               "every pick adds to the SAME slip and they stack (DK's app only accepts one "
+               "selection per link, so there's no single mobile link for the whole parlay).")
+    with st.expander("Per-leg links + QR (mobile: scan/tap each — they stack)"):
         for i, leg in enumerate(legs, 1):
             lc = st.columns([4, 1, 1, 1])
             lc[0].caption(f"{i}. {leg.get('label', '')}")
