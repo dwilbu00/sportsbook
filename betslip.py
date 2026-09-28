@@ -26,6 +26,16 @@ def dk_parlay_link(sids):
     return f"{DK_BASE}/?outcomes=" + _url.quote(",".join(clean), safe=",")
 
 
+def dk_parlay_link_repeated(sids):
+    """DK multi-selection via REPEATED params: ``/?outcomes=s1&outcomes=s2&...`` — a
+    candidate one-tap-stack format to A/B against dk_parlay_link (comma-joined), since
+    comma-joined was rejected. None if no sids."""
+    clean = [str(s) for s in (sids or []) if s]
+    if not clean:
+        return None
+    return f"{DK_BASE}/?" + "&".join("outcomes=" + _url.quote(s) for s in clean)
+
+
 def _fd_pair_from_link(link):
     """(marketId, selectionId) parsed from an FD addToBetslip link, or None."""
     try:

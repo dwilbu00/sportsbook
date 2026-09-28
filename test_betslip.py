@@ -25,6 +25,13 @@ class DkParlayTests(unittest.TestCase):
         self.assertIsNone(betslip.dk_parlay_link(None))
         self.assertIsNone(betslip.dk_parlay_link([None, ""]))
 
+    def test_repeated_variant(self):
+        url = betslip.dk_parlay_link_repeated(["a_1", "b#2"])
+        self.assertEqual(url.count("outcomes="), 2)   # one param per leg
+        self.assertIn("outcomes=a_1", url)
+        self.assertIn("outcomes=b%232", url)          # '#' encoded per leg
+        self.assertIsNone(betslip.dk_parlay_link_repeated([]))
+
 
 class FdParlayTests(unittest.TestCase):
     L1 = "https://sportsbook.fanduel.com/addToBetslip?marketId=42.608420704&selectionId=50194"
