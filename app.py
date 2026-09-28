@@ -441,33 +441,39 @@ def _render_bet_links(candidate, bet_type=None, side=None):
 
 
 def _render_parlay_bet_links(legs):
-    """'Add this parlay to a slip' one-tap links. The DK combined format is still being
-    pinned down (comma-joined was rejected), so this A/B-tests two DK URL shapes; the one
-    that stacks ALL legs wins and the other gets removed. FanDuel multi-add is best-effort.
-    Per-leg single links reliably accumulate on the slip as the fallback. Only pre-fills;
-    the user taps Submit in the book."""
+    """'Add this parlay to a slip' — one-tap combined DK link (+ FD best-effort) + QR that
+    stacks every captured leg (betslip.dk_parlay_link over the legs' sids). If ANY leg's
+    line has moved since Analyze its sid expires and DK rejects the whole combined link
+    ("pick no longer available"), so the 'Per-leg links' expander is kept as the resilient
+    fallback — single links accumulate on the slip (owner-verified). Only pre-fills; the
+    user taps Submit in the book."""
     if not legs:
         return
     import betslip
     dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
     fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
-    dk_comma = betslip.dk_parlay_link(dk_sids)
-    dk_rep = betslip.dk_parlay_link_repeated(dk_sids)
+    dk_all = betslip.dk_parlay_link(dk_sids)
     fd_all = betslip.fd_parlay_link(fd_links)
-    if not dk_comma and not fd_all:
+    if not dk_all and not fd_all:
         return
     n = len(legs)
-    st.markdown(f"**🎟️ Add this parlay to a slip** ({len(dk_sids)}/{n} legs deep-linkable):")
-    st.caption("⚗️ Testing one-tap DK formats — tap each and tell me which adds ALL legs. "
-               "The per-leg links always work (they accumulate on the slip).")
-    cols = st.columns(4)
-    if dk_comma:
-        cols[0].link_button("🟢 DK-A", dk_comma, help="one-tap · comma-joined format")
-    if dk_rep:
-        cols[1].link_button("🟢 DK-B", dk_rep, help="one-tap · repeated-param format")
+    st.markdown(f"**🎟️ Add this parlay to a slip** — one tap stacks {len(dk_sids)}/{n} legs:")
+    cols = st.columns([1, 1, 1, 2])
+    if dk_all:
+        cols[0].link_button("🟢 DK", dk_all, help="Adds all captured legs to DraftKings in one tap")
     if fd_all:
-        cols[2].link_button("🔵 FD", fd_all, help="FanDuel multi-add (best-effort)")
-    with st.expander("Per-leg links (tap each — they stack) + QR"):
+        cols[1].link_button("🔵 FD", fd_all, help="FanDuel multi-add (best-effort)")
+    with cols[2].popover("📱 QR"):
+        st.caption("Scan to build the parlay on your phone, then tap Submit. If it says a "
+                   "pick is unavailable, a line moved since Analyze — re-Analyze or use the "
+                   "per-leg links below.")
+        for label, link in (("DraftKings", dk_all), ("FanDuel", fd_all)):
+            if link:
+                png = _qr_png_cached(link)
+                if png:
+                    st.caption(label)
+                    st.image(png, width=180)
+    with st.expander("Per-leg links (tap each — they stack)"):
         for i, leg in enumerate(legs, 1):
             lc = st.columns([4, 1, 1, 1])
             lc[0].caption(f"{i}. {leg.get('label', '')}")
@@ -475,10 +481,10 @@ def _render_parlay_bet_links(legs):
                 lc[1].link_button("DK", leg["dk_link"])
             if leg.get("fd_link"):
                 lc[2].link_button("FD", leg["fd_link"])
-            _dklink = leg.get("dk_link") or leg.get("fd_link")
-            if _dklink:
+            _leg_link = leg.get("dk_link") or leg.get("fd_link")
+            if _leg_link:
                 with lc[3].popover("📱"):
-                    png = _qr_png_cached(_dklink)
+                    png = _qr_png_cached(_leg_link)
                     if png:
                         st.image(png, width=160)
     if len(dk_sids) < n:
