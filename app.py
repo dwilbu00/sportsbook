@@ -3117,16 +3117,11 @@ def _password_ok(entered, secret):
     return bool(secret) and hmac.compare_digest(str(entered), str(secret))
 
 
-@st.cache_resource
 def _cookie_manager():
-    """One shared CookieManager (cache_resource singleton) so the auth gate and the
-    sidebar Log-out button never instantiate duplicate component keys. None if the
-    component is unavailable — auth then just falls back to the password each session."""
-    try:
-        import extra_streamlit_components as stx
-        return stx.CookieManager(key="odi_cookies")
-    except Exception:
-        return None
+    """This run's shared CookieManager (instantiated once as ``_COOKIE_MGR`` just before
+    the gate runs, so the gate and the sidebar Log-out button reuse the same instance —
+    no duplicate component keys). None if the component/dependency is unavailable."""
+    return globals().get("_COOKIE_MGR")
 
 
 def _read_auth_cookie():
@@ -3188,6 +3183,17 @@ def _require_app_auth():
             st.error("Incorrect password.")
     st.stop()   # halt before any data read / mutation / boot maintenance
 
+
+# ONE CookieManager per script run: a bare module statement runs once per rerun, so the
+# instance is fresh (re-reads current cookies) and is shared by the gate + the sidebar
+# logout. NOT cached — CookieManager.__init__ renders a getAll widget, and caching a
+# widget trips Streamlit's CachedWidgetWarning. None if the dependency is unavailable →
+# the gate falls back to the password each session.
+try:
+    import extra_streamlit_components as _stx
+    _COOKIE_MGR = _stx.CookieManager(key="odi_cookies")
+except Exception:
+    _COOKIE_MGR = None
 
 _require_app_auth()
 
