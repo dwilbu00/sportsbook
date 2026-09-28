@@ -14,6 +14,7 @@ One line per open item. When an item ships, delete it here and fold the durable 
 - **NFL in-season** (Week 3, 2026). Team margin model + 8 frozen props models shipped, both calibrated fair-value + opportunity-abstain tools — **no straight-bet edge** (efficient at the close) → [[modeling-and-calibration]], [[edges-and-backtests]].
 - **MLB parked → spring 2027** (efficient-for-us on the clean corpus; Doug doesn't bet the tail) → [[edges-and-backtests]].
 - **Infra healthy:** Azure SQL system-of-record; provenance stamping live (F28); full test suite runs order-independently green (`python -m unittest discover`); `memory_lint.py` for memory hygiene → [[data-and-architecture]].
+- **▶ IN FLIGHT — DK/FD one-tap betslip integration (2026-09-28):** SANCTIONED via The Odds API `includeLinks`+`includeSids` (FREE; NOT DK scraping — that was investigated + rejected as ToS-gray/opaque). Probe confirmed outcome-level betslip links for BOTH books, team markets AND props (DK `/?outcomes=<sid>`, FD `addToBetslip?marketId&selectionId`). DONE: odds_client sends the flags (`4fd4e87`); `betslip.py` link+QR helpers incl. DK parlay-stacking (`94ce531`); `odds_links_probe.py` diagnostic; `segno` dep. REMAINING: thread outcome `link`/`sid` into recommendations (Value Finder singles + bonus/parlay legs) + render Bet buttons + QR in app.py. Owner chose QR+link and singles+parlay-now. FD multi-leg URL is EXPERIMENTAL (per-leg fallback). All UNPUSHED. Nothing auto-bets — links only pre-fill; user taps Submit.
 
 ## Recently shipped (outcomes folded to domain files; pointers only)
 - **Astra audit F01–F28 COMPLETE + live-verified** (origin/main): concurrency CAS (F23, verified under 12-way Azure load), prediction provenance + replay (F28 P1/P2, 49/49 on the live corpus), auth gate (F20). F28 P3 deferred by design. → [[data-and-architecture]] + git + notes/AUDIT_F28_PROVENANCE_DESIGN_2026-09-21.md.
@@ -27,6 +28,11 @@ One line per open item. When an item ships, delete it here and fold the durable 
 - **Bonus polish** — boosted-straight capture at Value-Finder submit time; retroactive boost on settled bets → [[bonus-strategy]].
 - **F28 P3** — validation-domain partitioned replay reports (deferred).
 - **MLB spring-2027 loose end** — recalibrate over-confident live `pitcher_strikeouts` (cv 0.266 > 0.25; `refit --recalibrate`, ~+0.0126 Brier) + audit other un-recalibrated props → [[edges-and-backtests]], [[modeling-and-calibration]].
+
+## Reported bugs — to investigate (owner, 2026-09-28)
+1. **Bonus-page game-selector dates are wrong (UTC→ET display):** tonight's Bears game shows `9/29/2026 00:15` (UTC) instead of the ET evening of 9/28. Likely a raw-UTC render where ET-local formatting is needed (cf. `pricing_common.et_local_date` used in the wager tables). Check the bonus/parlay game-selector date formatting.
+2. **Team markets not resolving in prediction tracking** — may be a downstream effect of #1 (a date off by a day mis-keys the game/`game_date >= today` skip). Verify after #1: are NFL team-market predictions stuck pending because their `game_date` is a day ahead? (grader = `resolve_pending_market_outcomes`.)
+3. **Bonuses don't survive an app reload** — they should persist until deleted or used. Bonus definitions are apparently in session state, not durable storage. Find where bonuses are stored (`bonus.py` / app.py) and persist them (Azure SQL / the durable store) like wagers.
 
 ## Owner action items
 - ✅ **NFL forward-grading fix DONE + VERIFIED (2026-09-25, `61a7510`):** migration ran + `forward_tracker --resolve` re-graded **165/165 NFL rows, 0 stuck**; spot-checks confirm CORRECT actuals (Goff pass_yds 327 not the old ambiguous −1; Stafford pass_attempts 31 / completions 22; Nabers receptions 1 — all match the live gamelog). Count props (receptions/attempts/completions) now gradable; yardage/TD no longer mis-graded. Root cause: the `nfl_gamelog` cache stored only YDS+TD. → [[data-and-architecture]] gamelog note.
