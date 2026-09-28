@@ -39,7 +39,7 @@ import unicodedata
 
 from sqlalchemy import (
     Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
-    MetaData, PrimaryKeyConstraint, String, Table, UniqueConstraint, and_,
+    MetaData, PrimaryKeyConstraint, String, Table, Text, UniqueConstraint, and_,
     bindparam, create_engine, delete, event, func, insert, select, true, update,
 )
 from sqlalchemy.engine import URL
@@ -330,14 +330,17 @@ parlay_legs = Table(
     Index("ix_parlay_leg_parlay", "parlay_id"),
 )
 
-# Durable per-user app settings — a generic key/value store. Currently the Kelly
-# sizing knobs (fraction / per-bet cap % / slate-total cap %) so they persist
-# across sessions, not just page switches.
+# Durable per-user app settings — a generic key/value store: the Kelly sizing knobs
+# (small floats) AND the active-bonus list (bonus_store.py stores the whole list as one
+# JSON string under setting_key='active_bonuses'). setting_value is TEXT (NVARCHAR(max)),
+# NOT a bounded String: the old String(256) silently rejected the bonus JSON once it
+# exceeded 256 chars, so bonuses never persisted (reverted to seeds on reload). Widening
+# existing DBs: sql/widen_app_settings_value.sql.
 app_settings = Table(
     "app_settings", _META,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("setting_key", String(64), nullable=False),
-    Column("setting_value", String(256)),
+    Column("setting_value", Text),
     Column("updated_at", String(40)),
     UniqueConstraint("setting_key", name="uq_app_setting_key"),
 )

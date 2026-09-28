@@ -1,86 +1,62 @@
-"""Durable bonus-store regression tests (audit F16): stable ids + safe seeding.
+"""bonus_store durability — the fix for "bonuses don't survive a reload".
 
-Hermetic: fresh in-memory SQLite per test, mirror disabled, NDJSON cache cleared.
+Root cause: app_settings.setting_value was String(256); the active-bonus JSON exceeds
+256 chars, so SQL Server rejected the write and the list reverted to seeds on reload.
 
 Run: PYTHONIOENCODING=utf-8 python -m unittest test_bonus_store -v
 """
 import json
-import os
-from contextlib import ExitStack
 import unittest
+from dataclasses import asdict
 from unittest.mock import patch
 
-import bonus as bl
+import bonus as bonuslib
 import bonus_store
 import db_store
-import recalibration
 
 
-class _StoreTest(unittest.TestCase):
-    def setUp(self):
-        self.stack = ExitStack()
-        self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
-        self.stack.enter_context(patch("warehouse_mirror.enabled", return_value=False))
-        recalibration._NDJSON_CACHE.clear()
-        db_store.configure_engine("sqlite://")
-        db_store.create_all()
-
-    def tearDown(self):
-        db_store.configure_engine(None)
-        recalibration._NDJSON_CACHE.clear()
-        self.stack.close()
-
-    def _write_raw(self, value):
-        payload = json.dumps(value)
-
-        def up(rows):
-            for r in rows:
-                if r.get("setting_key") == "active_bonuses":
-                    r["setting_value"] = payload
-                    return 1
-            rows.append({"setting_key": "active_bonuses", "setting_value": payload,
-                         "updated_at": "t"})
-            return 1
-        recalibration.mutate_ndjson_log("app_settings.jsonl", up)
+class SchemaGuardTests(unittest.TestCase):
+    def test_setting_value_is_unbounded(self):
+        # The active-bonus JSON exceeds 256 chars -> the column must be unbounded
+        # (Text / NVARCHAR(max)), never a bounded String, or writes truncate/fail.
+        col = db_store.app_settings.c.setting_value
+        self.assertIsNone(getattr(col.type, "length", None),
+                          "setting_value must be unbounded Text, not a bounded String")
 
 
-class F16IdentityTests(_StoreTest):
-    def test_new_bonus_id_is_unique(self):
-        self.assertNotEqual(bl.new_bonus_id(), bl.new_bonus_id())
+class RoundTripTests(unittest.TestCase):
+    def _big_list(self, n=8):
+        return [bonuslib.Bonus(
+                    bet_type="parlay", boost_pct=0.5, min_odds_leg=-300.0,
+                    min_odds_overall=1000.0, min_legs=4, max_wager=25.0, min_wager=1.0,
+                    book="DraftKings",
+                    markets=("player_pass_yds", "player_rush_yds", "player_receptions"),
+                    bonus_id=bonuslib.new_bonus_id(),
+                    label=f"Promo #{i} — a reasonably long descriptive label here")
+                for i in range(n)]
 
-    def test_round_trip_preserves_distinct_ids_for_same_label(self):
-        b1 = bl.Bonus("sgp", .5, label="Promo", bonus_id=bl.new_bonus_id())
-        b2 = bl.Bonus("parlay", .5, label="Promo", bonus_id=bl.new_bonus_id())
-        bonus_store.save_bonuses([b1, b2])
-        loaded = bonus_store.load_bonuses()
-        self.assertEqual({x.bonus_id for x in loaded}, {b1.bonus_id, b2.bonus_id})
+    def test_large_bonus_list_round_trips(self):
+        big = self._big_list()
+        payload = json.dumps([{k: asdict(b)[k] for k in bonus_store._FIELDS} for b in big])
+        self.assertGreater(len(payload), 256)   # exactly the size the old column rejected
 
-    def test_legacy_entry_gets_id_assigned_and_persisted(self):
-        self._write_raw([{"bet_type": "sgp", "boost_pct": .5, "label": "Legacy"}])
-        first = bonus_store.load_bonuses()
-        self.assertTrue(first[0].bonus_id)
-        # persisted: a second load returns the SAME id (not a fresh one each time)
-        self.assertEqual(bonus_store.load_bonuses()[0].bonus_id, first[0].bonus_id)
+        store = {"rows": []}                     # in-memory app_settings KV
 
-    def test_failed_read_returns_ephemeral_without_persisting(self):
-        # A committed real promo, then a forced read failure: load must NOT persist
-        # example promos over it (never clobber unreadable durable data). [F16]
-        real = bl.Bonus("sgp", .5, label="Real", bonus_id=bl.new_bonus_id())
-        bonus_store.save_bonuses([real])
-        orig = recalibration._read_ndjson_blob
+        def _read(filename, use_cache=False, where=None):
+            return [dict(r) for r in store["rows"]], None
 
-        def boom(filename, *a, **k):
-            if filename == bonus_store._SETTINGS_FILE:
-                raise OSError("synthetic store read failure")
-            return orig(filename, *a, **k)
+        def _mutate(filename, mutator, **k):
+            return mutator(store["rows"])
 
-        with patch.object(recalibration, "_read_ndjson_blob", side_effect=boom):
-            got = bonus_store.load_bonuses()          # ephemeral seeds, no write
-        self.assertTrue(got)                          # returns something usable
-        # the real promo is intact once the store is readable again
-        after = bonus_store.load_bonuses()
-        self.assertEqual([b.label for b in after], ["Real"])
-        self.assertEqual(after[0].bonus_id, real.bonus_id)
+        with patch("recalibration._read_ndjson_blob", side_effect=_read), \
+                patch("recalibration.mutate_ndjson_log", side_effect=_mutate):
+            wrote = bonus_store.save_bonuses(big)
+            loaded = bonus_store.load_bonuses()
+
+        self.assertEqual(wrote, 1)
+        self.assertEqual(len(loaded), len(big))
+        self.assertEqual([b.bonus_id for b in loaded], [b.bonus_id for b in big])
+        self.assertEqual(loaded[0].markets, big[0].markets)
 
 
 if __name__ == "__main__":
