@@ -371,6 +371,31 @@ def delete_wagers(wager_ids):
         WAGERS_FILE, prune, where={"wager_id": list(ids)})
 
 
+def void_wagers(wager_ids):
+    """Mark bets VOID (stake refunded, ROI-neutral) -- e.g. a book injury-protection
+    refund the auto-grader can't see. Sets status='void', actual=None, profit=0.0,
+    resolved_at=now on the given rows (any status except already-void), so they leave
+    the pending bucket without being scored won/lost. A void is in ``_SETTLED``, so it
+    is REVERSIBLE via regrade_wagers (Re-grade resets it to pending). Returns the count
+    voided. Raises on a storage failure so the caller can surface it."""
+    ids = {wid for wid in (wager_ids or []) if wid}
+    if not ids:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def apply(existing):
+        changed = 0
+        for row in existing:
+            if row.get("wager_id") in ids and row.get("status") != "void":
+                row.update({"status": "void", "actual": None,
+                            "profit": 0.0, "resolved_at": now_iso})
+                changed += 1
+        return changed
+
+    return recalibration.mutate_ndjson_log(
+        WAGERS_FILE, apply, where={"wager_id": list(ids)})
+
+
 def update_wagers(edits):
     """Apply field corrections to PENDING rows. Returns the count changed.
 

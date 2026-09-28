@@ -597,6 +597,44 @@ class DeleteAndEditTests(unittest.TestCase):
             self.assertEqual(wagers.delete_wagers([]), 0)
             self.assertEqual(len(wagers.read_wagers()), 2)
 
+    def test_void_marks_void_roi_neutral(self):
+        prop, ml = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop, ml])
+            self.assertEqual(wagers.void_wagers([prop["wager_id"]]), 1)
+            row = next(r for r in wagers.read_wagers()
+                       if r["wager_id"] == prop["wager_id"])
+            self.assertEqual(row["status"], "void")
+            self.assertEqual(row["profit"], 0.0)      # stake refunded, ROI-neutral
+            self.assertIsNone(row["actual"])
+            self.assertIsNotNone(row["resolved_at"])
+            other = next(r for r in wagers.read_wagers()
+                         if r["wager_id"] == ml["wager_id"])
+            self.assertEqual(other["status"], "pending")   # the other bet is untouched
+
+    def test_void_is_idempotent(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            self.assertEqual(wagers.void_wagers([prop["wager_id"]]), 1)
+            self.assertEqual(wagers.void_wagers([prop["wager_id"]]), 0)  # already void
+
+    def test_void_empty_is_noop(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            self.assertEqual(wagers.void_wagers([]), 0)
+
+    def test_void_is_reversible_via_regrade(self):
+        prop, _ = self._seed()
+        with _LocalLedger():
+            wagers.submit_wagers([prop])
+            wagers.void_wagers([prop["wager_id"]])
+            self.assertEqual(wagers.regrade_wagers([prop["wager_id"]]), 1)
+            row = wagers.read_wagers()[0]
+            self.assertEqual(row["status"], "pending")
+            self.assertIsNone(row["profit"])
+
     def test_edit_price_line_stake_and_point_sync(self):
         prop, _ = self._seed()
         with _LocalLedger():

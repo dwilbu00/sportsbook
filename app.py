@@ -2090,6 +2090,7 @@ def render_my_bets():
             {
                 "wager_id": r.get("wager_id"),
                 "Delete": False,
+                "Void": False,
                 # ET, not raw UTC: a bet placed after ~8pm ET has a UTC date one
                 # day ahead, which would display tomorrow's date on tonight's bet.
                 "Placed": pricing_common.et_local_date(r.get("placed_at")) or "",
@@ -2116,6 +2117,10 @@ def render_my_bets():
                 column_config={
                     "Delete": st.column_config.CheckboxColumn(
                         "Delete", default=False, help="Remove this bet on Save"),
+                    "Void": st.column_config.CheckboxColumn(
+                        "Void", default=False, help="Mark VOID on Save — stake refunded, "
+                        "ROI-neutral (e.g. a book injury-protection refund the grader "
+                        "can't see). Reversible: Re-grade it from the Settled table to undo."),
                     "Price": st.column_config.NumberColumn(
                         "Price", help="American odds you actually got", step=1,
                         format="%d"),
@@ -2990,14 +2995,18 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
     if regradable:
         regrades = [wid for wid in survivors if _checked(wid, "Re-grade")]
 
-    if not deleted and not edits and not regrades:
+    voided = []
+    if editable:
+        voided = [wid for wid in survivors if _checked(wid, "Void")]
+
+    if not deleted and not edits and not regrades and not voided:
         st.info("No changes to save.")
         return
     # Apply NON-DESTRUCTIVE edits/regrades FIRST and the destructive DELETE LAST, so an
     # early failure leaves the ledger unchanged instead of half-applied. On a mid-batch
     # failure, report the EXACT committed state rather than falsely claiming rollback
     # (true single-transaction atomicity + an idempotency key are the deferred T22). [F22]
-    n_edit = n_regrade = n_del = 0
+    n_edit = n_regrade = n_void = n_del = 0
     committed = []
     try:
         if edits:
@@ -3006,6 +3015,9 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
         if regrades:
             n_regrade = wagers.regrade_wagers(regrades)
             committed.append(f"{n_regrade} reset to pending")
+        if voided:
+            n_void = wagers.void_wagers(voided)
+            committed.append(f"{n_void} voided")
         if deleted:
             n_del = wagers.delete_wagers(deleted)
             committed.append(f"{n_del} deleted")
@@ -3018,11 +3030,12 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
             st.error(f"Could not save changes ({type(exc).__name__}). "
                      "Your ledger is unchanged — please try again.")
         return
-    if not n_del and not n_edit and not n_regrade:
+    if not n_del and not n_edit and not n_regrade and not n_void:
         st.info("No changes to save.")
         return
     parts = ([f"{n_edit} edited"] if n_edit else []) + \
             ([f"{n_regrade} reset to pending"] if n_regrade else []) + \
+            ([f"{n_void} voided"] if n_void else []) + \
             ([f"{n_del} deleted"] if n_del else [])
     st.session_state["_wagers_flash"] = "Saved: " + ", ".join(parts) + "."
     # A re-grade must trigger a fresh grading pass on the rerun below.
