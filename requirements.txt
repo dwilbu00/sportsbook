@@ -15,3 +15,7 @@ pymssql>=2.3,<2.4
 
 # offline backtest parquet mirror (warehouse_mirror.py)
 pyarrow
+
+# QR codes for one-tap DK/FD betslip deep links (betslip.py). Pure-Python, no binary
+# deps — safe on Streamlit Cloud.
+segno
