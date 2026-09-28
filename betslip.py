@@ -29,6 +29,21 @@ def dk_parlay_link(sids):
 DK_APP_SCHEME = "dksb://sb/addbet/"
 
 
+def dk_addbet_link(sids, form="path"):
+    """https 'addbet' candidates mirroring the dksb://sb/addbet APP scheme, as a plain
+    tappable link that may hand off to the DK app (universal link) on mobile OR load the
+    site on desktop -- with ALL legs. ``form='path'`` → /sb/addbet/s1,s2 ; ``form='query'``
+    → /?addbet=s1,s2. A/B these against /?outcomes= to find the mobile-clickable multi-add.
+    None if no sids."""
+    clean = [str(s) for s in (sids or []) if s]
+    if not clean:
+        return None
+    ids = _url.quote(",".join(clean), safe=",")
+    if form == "query":
+        return f"{DK_BASE}/?addbet={ids}"
+    return f"{DK_BASE}/sb/addbet/{ids}"
+
+
 def dk_app_parlay_link(sids):
     """DraftKings MOBILE APP deep link that stacks ALL legs: ``dksb://sb/addbet/s1,s2,...``
     (the app's custom scheme). Unlike the https ``?outcomes=`` form -- which the app honors

@@ -25,6 +25,14 @@ class DkParlayTests(unittest.TestCase):
         self.assertIsNone(betslip.dk_parlay_link(None))
         self.assertIsNone(betslip.dk_parlay_link([None, ""]))
 
+    def test_addbet_links(self):
+        p = betslip.dk_addbet_link(["a_1", "b#2"], "path")
+        self.assertTrue(p.startswith("https://sportsbook.draftkings.com/sb/addbet/"))
+        self.assertIn("a_1,b%232", p)                 # comma-joined, '#' encoded
+        q = betslip.dk_addbet_link(["a_1", "b#2"], "query")
+        self.assertTrue(q.startswith("https://sportsbook.draftkings.com/?addbet="))
+        self.assertIsNone(betslip.dk_addbet_link([]))
+
     def test_app_scheme_link(self):
         url = betslip.dk_app_parlay_link(["0ML84695463_1", "0QA#tok_Q20"])
         self.assertTrue(url.startswith("dksb://sb/addbet/"))
