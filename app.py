@@ -3068,6 +3068,9 @@ st.set_page_config(page_title="Sportsbook Value Finder", page_icon="🎯", layou
 # prefetch/reconcile below. Defense-in-depth on top of the host's own sharing
 # setting. When no secret is configured (local dev) the gate is OPEN, with a visible
 # warning so a deployment is never SILENTLY unprotected.
+import app_auth
+
+
 def _app_password():
     try:
         return st.secrets.get("app_password")
@@ -3081,6 +3084,38 @@ def _password_ok(entered, secret):
     return bool(secret) and hmac.compare_digest(str(entered), str(secret))
 
 
+@st.cache_resource
+def _cookie_manager():
+    """One shared CookieManager (cache_resource singleton) so the auth gate and the
+    sidebar Log-out button never instantiate duplicate component keys. None if the
+    component is unavailable — auth then just falls back to the password each session."""
+    try:
+        import extra_streamlit_components as stx
+        return stx.CookieManager(key="odi_cookies")
+    except Exception:
+        return None
+
+
+def _read_auth_cookie():
+    """The signed auth token from the browser cookie, or None. Never raises."""
+    cm = _cookie_manager()
+    if cm is None:
+        return None
+    try:
+        return cm.get(app_auth.COOKIE_NAME)
+    except Exception:
+        return None
+
+
+def _clear_auth_cookie():
+    cm = _cookie_manager()
+    if cm is not None:
+        try:
+            cm.delete(app_auth.COOKIE_NAME, key="_auth_cookie_del")
+        except Exception:
+            pass
+
+
 def _require_app_auth():
     secret = _app_password()
     if not secret:
@@ -3089,11 +3124,32 @@ def _require_app_auth():
         return
     if st.session_state.get("_authed"):
         return
+    # A valid "remember this browser" cookie (14-day signed token) skips the password.
+    # The component can return None on the very first render of a cold load and then
+    # rerun with the cookie present, so a remembered browser may see a brief prompt flash.
+    if app_auth.token_valid(_read_auth_cookie(), secret):
+        st.session_state["_authed"] = True
+        return
     st.title("🔒 Sportsbook — sign in")
     pw = st.text_input("Password", type="password", key="_auth_pw")
+    remember = st.checkbox(
+        f"Remember this browser for {app_auth.DEFAULT_TTL_DAYS} days",
+        value=True, key="_auth_remember")
     if st.button("Sign in", key="_auth_btn"):
         if _password_ok(pw, secret):
             st.session_state["_authed"] = True
+            if remember:
+                cm = _cookie_manager()
+                if cm is not None:
+                    try:
+                        import datetime as _dt
+                        cm.set(app_auth.COOKIE_NAME,
+                               app_auth.make_token(secret, app_auth.DEFAULT_TTL_DAYS),
+                               expires_at=(_dt.datetime.now(_dt.timezone.utc)
+                                           + _dt.timedelta(days=app_auth.DEFAULT_TTL_DAYS)),
+                               key="_auth_cookie_set")
+                    except Exception:
+                        pass
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -3203,6 +3259,14 @@ with st.sidebar:
          "🎰 Parlays"],
         key="app_page",
     )
+    # Log out: forget this browser (clears the remember-me cookie) + require the password
+    # again next load. Only shown when a password gate is actually configured.
+    if st.session_state.get("_authed") and _app_password():
+        if st.button("🔓 Log out", key="_logout_btn",
+                     help="Forget this browser and require the password next time"):
+            _clear_auth_cookie()
+            st.session_state["_authed"] = False
+            st.rerun()
 
 if app_page == "📘 Model Guide & Performance":
     render_model_guide()

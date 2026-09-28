@@ -19,3 +19,7 @@ pyarrow
 # QR codes for one-tap DK/FD betslip deep links (betslip.py). Pure-Python, no binary
 # deps — safe on Streamlit Cloud.
 segno
+
+# Browser cookies for the "remember this browser" persistent-login token (app_auth.py +
+# the F20 gate). CookieManager component; Streamlit can read cookies but not set them.
+extra-streamlit-components
