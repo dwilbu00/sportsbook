@@ -27,6 +27,10 @@ VOL_STAT = {"player_receptions": "targets", "player_rush_attempts": "carries",
             "player_pass_attempts": "attempts"}
 NFLVERSE_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
                 "stats_player/stats_player_week_{season}.parquet")
+# Snap counts = the DNP/void signal. A player with a snap row PLAYED (a 0 stat is a
+# real zero); NO row in a posted week == did not play (a bet should VOID, not lose).
+SNAP_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
+            "snap_counts/snap_counts_{season}.parquet")
 _KEEP = ["player_display_name", "season", "week", "team", "position",
          "targets", "carries", "attempts", "receptions",
          # full model feature set (nfl_prop_serving): conversion + yardage + aDOT
@@ -40,6 +44,7 @@ _NUM_COLS = ["targets", "carries", "attempts", "receptions", "receiving_yards",
              "passing_tds", "rushing_tds", "receiving_tds", "special_teams_tds"]
 CACHE_TTL = 6 * 3600         # 6h — a season's weekly data changes at most once/week
 _CACHE = {}                  # season(int) -> (fetch_ts, DataFrame|None)
+_SNAP_CACHE = {}             # season(int) -> (fetch_ts, snap-counts DataFrame|None)
 
 
 def _load(season, ttl=CACHE_TTL):
@@ -91,6 +96,49 @@ def _canonical_norm(df, player_norm):
         if len(p) >= 2 and p[-1] == last and (p[0].startswith(first) or first.startswith(p[0])):
             cand.add(n)
     return cand.pop() if len(cand) == 1 else None    # unique -> match; else abstain
+
+
+def _load_snaps(season, ttl=CACHE_TTL):
+    """Fetch one nflverse season's snap-counts parquet (cached, TTL; self-healing,
+    serves stale on transient failure). Adds player_norm. Returns a DataFrame with
+    week + player_norm (+ raw snap columns) or None. Presence of a player's week row
+    == they took the field; absence in a posted week == did not play."""
+    s = int(season)
+    hit = _SNAP_CACHE.get(s)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    try:
+        df = pd.read_parquet(SNAP_URL.format(season=s))
+        namecol = next((c for c in ("player", "player_name", "pfr_player_name",
+                                    "player_display_name") if c in df.columns), None)
+        if namecol is None or "week" not in df.columns:
+            _SNAP_CACHE[s] = (time.time(), None)
+            return None
+        df = df.copy()
+        df["player_norm"] = df[namecol].map(scan._norm)
+        _SNAP_CACHE[s] = (time.time(), df)
+        return df
+    except Exception:
+        return hit[1] if hit is not None else None   # serve stale on transient failure
+
+
+def did_play(player_norm, season, week):
+    """Tri-state 'did this player take a snap that week', from nflverse snap counts:
+      True  -> a snap row exists (PLAYED; a 0 stat is a real zero),
+      False -> the week's snap slate IS posted but this player has NO row (confirmed
+               DNP/inactive -> a bet should VOID, not grade a loss),
+      None  -> snap data unavailable / week not posted yet (unknown -> stay pending).
+    Uses the same exact-then-nickname resolver as everything else. Never raises."""
+    df = _load_snaps(season)
+    if df is None:
+        return None
+    try:
+        wk = df[df["week"] == int(week)]
+        if len(wk) == 0:
+            return None                              # week not posted -> unknown
+        return _canonical_norm(wk, player_norm) is not None
+    except Exception:
+        return None
 
 
 def _prior_games(player_norm, season, week, min_prior):

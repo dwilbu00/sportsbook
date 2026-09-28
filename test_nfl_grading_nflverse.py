@@ -7,6 +7,7 @@ notes/NFL_GRADING_NFLVERSE_CUTOVER_2026-09-25.md.
 Run: PYTHONIOENCODING=utf-8 python -m unittest test_nfl_grading_nflverse -v
 """
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -112,6 +113,83 @@ class CanonicalNormTests(unittest.TestCase):
 
     def test_none_df_returns_none(self):
         self.assertIsNone(nos._canonical_norm(None, "josh allen"))
+
+
+class DidPlayTests(unittest.TestCase):
+    """nfl_opportunity_serving.did_play — the snap-count DNP signal."""
+
+    def _snaps(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_snap_row_present_is_true(self):
+        df = self._snaps([{"player_norm": scan._norm("Bijan Robinson"), "week": 4,
+                           "offense_snaps": 55}])
+        with patch("nfl_opportunity_serving._load_snaps", return_value=df):
+            self.assertIs(nos.did_play(scan._norm("Bijan Robinson"), 2026, 4), True)
+
+    def test_week_posted_player_absent_is_false(self):
+        df = self._snaps([{"player_norm": scan._norm("Someone Else"), "week": 4,
+                           "offense_snaps": 10}])
+        with patch("nfl_opportunity_serving._load_snaps", return_value=df):
+            self.assertIs(nos.did_play(scan._norm("Tyler Higbee"), 2026, 4), False)
+
+    def test_week_not_posted_is_none(self):
+        df = self._snaps([{"player_norm": scan._norm("X"), "week": 3, "offense_snaps": 5}])
+        with patch("nfl_opportunity_serving._load_snaps", return_value=df):
+            self.assertIsNone(nos.did_play(scan._norm("X"), 2026, 4))   # week 4 not present
+
+    def test_feed_unavailable_is_none(self):
+        with patch("nfl_opportunity_serving._load_snaps", return_value=None):
+            self.assertIsNone(nos.did_play(scan._norm("X"), 2026, 4))
+
+    def test_nickname_counts_as_played(self):
+        df = self._snaps([{"player_norm": scan._norm("Josh Palmer"), "week": 4,
+                           "offense_snaps": 40}])
+        with patch("nfl_opportunity_serving._load_snaps", return_value=df):
+            self.assertIs(nos.did_play(scan._norm("Joshua Palmer"), 2026, 4), True)
+
+
+class NflDnpVoidTests(unittest.TestCase):
+    """recalibration._nfl_is_dnp: void a graded NFL prop only when the game is >=24h old
+    AND snap counts confirm the player took no snap that (regular-season) week."""
+
+    OLD = "2020-09-20T17:00:00Z"          # far past -> age >> STALE_DNP_HOURS
+
+    def _void(self, did_play_val, prop="player_receptions", commence=OLD, sw=("2026", 4)):
+        with patch("nfl_schedule.season_week_for_date", return_value=sw), \
+                patch("nfl_opportunity_serving.did_play", return_value=did_play_val):
+            return rc._nfl_is_dnp(prop, "Tyler Higbee", "2026-09-28", commence)
+
+    def test_confirmed_dnp_voids(self):
+        self.assertTrue(self._void(False))
+
+    def test_played_does_not_void(self):
+        self.assertFalse(self._void(True))
+
+    def test_unknown_does_not_void(self):
+        self.assertFalse(self._void(None))
+
+    def test_unmapped_prop_does_not_void(self):
+        self.assertFalse(self._void(False, prop="player_kicking_points"))
+
+    def test_recent_game_does_not_void(self):
+        recent = datetime.now(timezone.utc).isoformat()
+        self.assertFalse(self._void(False, commence=recent))
+
+    def test_playoff_week_does_not_void(self):
+        self.assertFalse(self._void(False, sw=("2026", 20)))
+
+    def test_routes_through_is_stale_dnp(self):
+        with patch("nfl_schedule.season_week_for_date", return_value=("2026", 4)), \
+                patch("nfl_opportunity_serving.did_play", return_value=False):
+            self.assertTrue(rc._is_stale_dnp("americanfootball_nfl", "player_receptions",
+                                             "Tyler Higbee", "2026-09-28", self.OLD))
+
+    def test_mlb_path_unaffected(self):
+        # NFL branch must not disturb the MLB stale-DNP routing.
+        with patch("recalibration._nfl_is_dnp") as nfl:
+            rc._is_stale_dnp("baseball_mlb", "batter_hits", "X", "2026-08-09", self.OLD)
+        nfl.assert_not_called()
 
 
 class SeasonWeekForDateTests(unittest.TestCase):

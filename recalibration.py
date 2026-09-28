@@ -1396,12 +1396,44 @@ def _resolve_mlb_actual(sport_key, prop_key, player, game_date, commence):
         return None
 
 
+def _nfl_is_dnp(prop_key, player, game_date, commence):
+    """NFL confirmed-DNP for the stale-void path: True iff this is a graded player prop,
+    its game is >= STALE_DNP_HOURS old, and nflverse snap counts show the player took NO
+    snap in that POSTED regular-season week (inactive/didn't dress) -- so the bet voids
+    instead of grading a phantom 0-loss. Regular season only (weeks 1-18, where snap-count
+    week numbering is unambiguous); playoffs fall through. Never raises."""
+    if prop_key not in _NFLVERSE_PROP_COL:
+        return False
+    try:
+        commence_dt = _parse_dt(commence)
+        if commence_dt is None:
+            return False
+        age_hours = (datetime.now(timezone.utc) - commence_dt).total_seconds() / 3600.0
+        if age_hours < STALE_DNP_HOURS:
+            return False
+        import nfl_schedule
+        import nfl_opportunity_serving as _nos
+        import nfl_props_scan as _scan
+        sw = nfl_schedule.season_week_for_date(game_date)
+        if sw is None:
+            return False
+        season, week = sw
+        if int(week) > 18:                       # regular season only (unambiguous week #)
+            return False
+        return _nos.did_play(_scan._norm(player), season, week) is False
+    except Exception:
+        return False
+
+
 def _is_stale_dnp(sport_key, prop_key, player, game_date, commence):
     """True when an unresolved MLB prop is a confirmed scratch/DNP whose game is
     at least STALE_DNP_HOURS old — permanently unresolvable, so it's safe to void
     (clears it from pending + stops re-attempting every tick). Gated on age so a
     same-day data lag isn't voided; gated on is_confirmed_dnp so a genuine data
-    outage (missing log) keeps retrying. Never raises."""
+    outage (missing log) keeps retrying. NFL uses nflverse snap counts (no snap row in a
+    posted regular-season week == did not play). Never raises."""
+    if sport_key == "americanfootball_nfl":
+        return _nfl_is_dnp(prop_key, player, game_date, commence)
     if sport_key != "baseball_mlb":
         return False
     spec = _mlb_stat_spec(prop_key)
