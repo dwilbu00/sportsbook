@@ -111,3 +111,30 @@ same-day/next-morning refresh is fine. **Verify the live cadence once** before f
 Small-to-medium; reuses the whole live fetch/cache/normalize stack. ~1 function + a column map
 + 3 added columns + a week helper + tests + a parity run. Risk low: every failure mode degrades
 to "pending", and ESPN remains the fallback until parity proves the swap.
+
+---
+
+## SHIPPED (2026-09-25 → 09-28)
+
+All phases landed on `origin/main` (final commit `a4571b1`):
+
+1. **Phase 1 + flip** — `_resolve_nfl_actual` + `nfl_schedule.season_week_for_date` + TD columns
+   + `nfl_grading_parity.py`. Parity diffed all 165 already-ESPN-graded rows: 159 match / 0
+   mismatch / 6 nflverse-pending → flipped `_NFL_GRADE_FROM_NFLVERSE_DEFAULT = True` (`83e19ed`).
+   nflverse is primary; ESPN is fallback-on-miss; `ODI_NFL_GRADE_NFLVERSE=0` is the kill-switch.
+2. **Nickname resolver** (`37b00c1`) — `nfl_opportunity_serving._canonical_norm`: exact match,
+   else a UNIQUE-gated first-name-truncation fallback (Joshua↔Josh, Cam↔Cameron; abstains on
+   non-prefix decoys + ambiguity). Routed through by BOTH serving (`_prior_games`,`player_team`)
+   AND grading (`_resolve_nfl_actual`). Re-parity: 161 match / 0 mismatch / 4 pending.
+3. **Snap-count DNP-void** (`a4571b1`) — `_load_snaps` + `did_play` (tri-state) + `_nfl_is_dnp`
+   extending `_is_stale_dnp`, so BOTH prediction and wager grading VOID (not loss) a prop whose
+   player took no snap in a posted reg-season week (game ≥24h old). Regular season only (wk 1-18).
+
+**Key finding from the snap check:** the remaining 4 pending (Tyler Higbee, Odell Beckham Jr.)
+are **played-zero, NOT DNP** — `did_play` returned True (they took snaps) but they had 0 targets,
+so nflverse `stats_player_week` omits them and ESPN's stored 0 is the correct label. Snap counts
+cleanly separate "played, caught nothing" (grade 0) from "inactive" (void). The void therefore
+fires only for a genuine zero-snap scratch — none present in this corpus.
+
+**Remaining optional:** move NFL **team** markets to nflverse `games.csv` scores and drop ESPN
+for NFL entirely (the MLB-ESPN-teardown parallel).
