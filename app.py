@@ -452,7 +452,8 @@ def _render_parlay_bet_links(legs):
     import betslip
     dk_sids = [l.get("dk_sid") for l in legs if l.get("dk_sid")]
     fd_links = [l.get("fd_link") for l in legs if l.get("fd_link")]
-    dk_all = betslip.dk_parlay_link(dk_sids)
+    dk_all = betslip.dk_parlay_link(dk_sids)               # comma: works on the DK WEBSITE
+    dk_all_qr = betslip.dk_parlay_link_repeated(dk_sids)   # repeated: testing the DK APP (QR)
     fd_all = betslip.fd_parlay_link(fd_links)
     if not dk_all and not fd_all:
         return
@@ -460,14 +461,14 @@ def _render_parlay_bet_links(legs):
     st.markdown(f"**🎟️ Add this parlay to a slip** — one tap stacks {len(dk_sids)}/{n} legs:")
     cols = st.columns([1, 1, 1, 2])
     if dk_all:
-        cols[0].link_button("🟢 DK", dk_all, help="Adds all captured legs to DraftKings in one tap")
+        cols[0].link_button("🟢 DK", dk_all, help="Desktop: adds all legs to the DraftKings site in one tap")
     if fd_all:
         cols[1].link_button("🔵 FD", fd_all, help="FanDuel multi-add (best-effort)")
     with cols[2].popover("📱 QR"):
-        st.caption("Scan to build the parlay on your phone, then tap Submit. If it says a "
-                   "pick is unavailable, a line moved since Analyze — re-Analyze or use the "
-                   "per-leg links below.")
-        for label, link in (("DraftKings", dk_all), ("FanDuel", fd_all)):
+        st.caption("Scan on your phone → opens the app slip, then tap Submit. ⚗️ Testing the "
+                   "mobile multi-add format — if the DK QR still says a pick is unavailable, "
+                   "use the per-leg QRs below (those stack reliably in the app).")
+        for label, link in (("DraftKings", dk_all_qr), ("FanDuel", fd_all)):
             if link:
                 png = _qr_png_cached(link)
                 if png:
