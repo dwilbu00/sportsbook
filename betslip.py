@@ -26,6 +26,20 @@ def dk_parlay_link(sids):
     return f"{DK_BASE}/?outcomes=" + _url.quote(",".join(clean), safe=",")
 
 
+DK_APP_SCHEME = "dksb://sb/addbet/"
+
+
+def dk_app_parlay_link(sids):
+    """DraftKings MOBILE APP deep link that stacks ALL legs: ``dksb://sb/addbet/s1,s2,...``
+    (the app's custom scheme). Unlike the https ``?outcomes=`` form -- which the app honors
+    for only the first leg -- this multi-adds in the app. Meant for a QR scanned on a phone
+    (a desktop browser can't open a dksb:// URL). None if no sids."""
+    clean = [str(s) for s in (sids or []) if s]
+    if not clean:
+        return None
+    return DK_APP_SCHEME + _url.quote(",".join(clean), safe=",")
+
+
 def dk_parlay_link_repeated(sids):
     """DK multi-selection via REPEATED params: ``/?outcomes=s1&outcomes=s2&...`` — a
     candidate one-tap-stack format to A/B against dk_parlay_link (comma-joined), since

@@ -25,6 +25,14 @@ class DkParlayTests(unittest.TestCase):
         self.assertIsNone(betslip.dk_parlay_link(None))
         self.assertIsNone(betslip.dk_parlay_link([None, ""]))
 
+    def test_app_scheme_link(self):
+        url = betslip.dk_app_parlay_link(["0ML84695463_1", "0QA#tok_Q20"])
+        self.assertTrue(url.startswith("dksb://sb/addbet/"))
+        self.assertIn("0ML84695463_1", url)
+        self.assertIn("%23", url)        # '#' encoded in the app-scheme path too
+        self.assertIn(",", url)          # legs comma-separated
+        self.assertIsNone(betslip.dk_app_parlay_link([]))
+
     def test_repeated_variant(self):
         url = betslip.dk_parlay_link_repeated(["a_1", "b#2"])
         self.assertEqual(url.count("outcomes="), 2)   # one param per leg
