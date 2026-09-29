@@ -1814,20 +1814,19 @@ class DkLineAnchorTests(unittest.TestCase):
         self.assertEqual(info["line_source"], "consensus")
         self.assertIsNone(info["dk_over_price"])          # not bettable
         self.assertEqual(info["market_implied_method"],
-                         "two_way_devig_sharpweighted_consensus")
+                         "two_way_devig_equalweight_consensus")
 
-    def test_sharp_peer_lifts_selfdevig_fallback(self):
-        # DK + a single SHARP book (Pinnacle) at DK's line: peer_count is only 1, but
-        # a sharp book is a real independent check, so it is NOT the self-devig
-        # fallback — the raised-edge guard must not fire.
+    def test_lone_peer_does_not_lift_selfdevig_fallback(self):
+        # DK + a single other book at DK's line: peer_count is only 1. We no longer treat
+        # any book as "sharp", so a lone peer does NOT lift the self-devig fallback — the
+        # raised-edge guard still applies (dk_selfdevig_fallback).
         info = self._info([
             self._book("BetMGM", 0.5), self._book("Caesars", 0.5),
             self._book("DraftKings", 1.5), self._book("Pinnacle", 1.5)])
         self.assertEqual(info["line"], 1.5)
         self.assertEqual(info["line_source"], "dk")
         self.assertEqual(info["peer_count"], 1)
-        self.assertEqual(info["market_implied_method"],
-                         "two_way_devig_peerconsensus_at_dk_line")
+        self.assertEqual(info["market_implied_method"], "dk_selfdevig_fallback")
 
 
 class NewBatterMarketParsingTests(unittest.TestCase):
@@ -1862,10 +1861,9 @@ class NewBatterMarketParsingTests(unittest.TestCase):
         self.assertEqual(out["batter_rbis"]["Slugger Sam"]["line"], 0.5)
 
 
-class SharpWeightedConsensusTests(unittest.TestCase):
-    """P1.1c: the prop de-vig consensus up-weights sharp books (Pinnacle/Circa)
-    and drops stale quotes, reducing to the plain arithmetic mean when neither
-    a sharp book nor timestamps are present."""
+class ConsensusDevigTests(unittest.TestCase):
+    """P1.1c: the prop de-vig consensus is an EQUAL-WEIGHTED mean of the books' fair
+    OVER probs and drops stale quotes (no book up-weighted as 'sharp')."""
 
     def _game(self, books):
         return {
@@ -1883,21 +1881,20 @@ class SharpWeightedConsensusTests(unittest.TestCase):
             market["last_update"] = last_update
         return {"title": title, "markets": [market]}
 
-    def test_sharp_book_pulls_consensus_toward_it(self):
+    def test_consensus_is_equal_weighted(self):
         game = self._game([
             self._book("Book A", -110, -110),      # fair_over 0.500
             self._book("Book B", -110, -110),      # fair_over 0.500
             self._book("Pinnacle", 200, -250),     # fair_over ~0.318
         ])
         info = parse_player_props(game)["props"]["batter_hits"]["P"]
-        # Pinnacle weighted x3 pulls the consensus toward the sharp book, below the
-        # plain mean (~0.439). Method-agnostic: recompute the sharp fair via the live
-        # devig so this pins the WEIGHTING behavior, not a devig-method constant.
+        # No book is privileged — the consensus is the PLAIN mean of the three fair overs
+        # (Pinnacle is just another book now). Recompute its fair via the live devig so
+        # this pins the equal-weighting, not a devig-method constant.
         from odds_client import american_to_implied_prob as _imp, devig_two_way as _dv
         pin_over = _dv(_imp(200), _imp(-250))[0]
-        expected = (0.5 + 0.5 + 3 * pin_over) / 5
+        expected = (0.5 + 0.5 + pin_over) / 3
         self.assertAlmostEqual(info["over_implied"], expected, places=3)
-        self.assertLess(info["over_implied"], 0.439)
 
     def test_stale_book_dropped(self):
         game = self._game([

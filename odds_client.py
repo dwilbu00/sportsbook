@@ -1082,26 +1082,15 @@ def dk_game_lines(game_data, book_key="draftkings"):
 
 
 # ── De-vig consensus quality (P1.1c) ──
-# Sharp books whose de-vigged prices are up-weighted when averaging the prop
-# consensus. Keys are lowercased substrings matched against the book title.
-# NOTE: Pinnacle is usually an EU-region book, so it rarely appears in a
-# regions=us payload — the weight is inert then, but kept for when it does /
-# if the fetch region widens. Circa is US (Nevada). Weights are conservative
-# judgment values (this methodology change is NOT backtestable against existing
-# captures, whose warehoused consensus is unweighted).
-SHARP_BOOK_WEIGHTS = {"pinnacle": 3.0, "circa": 2.0}
-# Drop a book's quote from the consensus when its last_update is this many
-# seconds staler than the freshest quote (best-effort; only when timestamps
-# parse; never trims below one surviving offer).
+# The prop-consensus de-vig is an EQUAL-WEIGHTED mean of the US books (DraftKings is
+# carved out separately as an independent check). We deliberately do NOT privilege any
+# book as "sharper": testing found DraftKings' de-vigged probs are as accurate as
+# Pinnacle's, and Pinnacle is an EU book absent from the regions=us fetch anyway. The old
+# pinnacle/circa up-weighting (SHARP_BOOK_WEIGHTS / _book_weight) was removed as a dead
+# sharp-reference that no longer reflected how we price.
+# Drop a book's quote from the consensus when its last_update is this many seconds staler
+# than the freshest quote (best-effort; only when timestamps parse; never below one offer).
 MAX_STALE_SECONDS = 600
-
-
-def _book_weight(book_title):
-    t = str(book_title).lower()
-    for key, weight in SHARP_BOOK_WEIGHTS.items():
-        if key in t:
-            return weight
-    return 1.0
 
 
 def _parse_ts(value):
@@ -1253,21 +1242,18 @@ def parse_player_props(game_data):
                 line = consensus_line
                 line_source = "consensus"
             offers = by_line[line]
-            # De-vig each book first, drop stale quotes, then take a sharp-book-
-            # weighted mean of the fair OVER probs (P1.1c). Reduces to the plain
-            # arithmetic mean when no sharp book and no timestamps are present.
+            # De-vig each book first, drop stale quotes, then take the EQUAL-WEIGHTED
+            # mean of the fair OVER probs (P1.1c). No book is up-weighted as "sharp"
+            # (validated: DK's de-vig is as accurate as Pinnacle's).
             survivors = _trim_stale_offers(offers)
-            weighted_sum = 0.0
-            weight_total = 0.0
+            fair_vals = []
             for offer in survivors:
                 raw_over = american_to_implied_prob(offer["over_price"])
                 raw_under = american_to_implied_prob(offer["under_price"])
                 fo, _ = devig_two_way(raw_over, raw_under)
-                w = _book_weight(offer.get("book"))
-                weighted_sum += fo * w
-                weight_total += w
+                fair_vals.append(fo)
 
-            fair_over = weighted_sum / weight_total if weight_total else 0.5
+            fair_over = sum(fair_vals) / len(fair_vals) if fair_vals else 0.5
             fair_under = 1.0 - fair_over
             executable = side_prices[market_key][player][line]
             # Apply the SAME staleness trim to the executable prices as to the fair
@@ -1301,16 +1287,13 @@ def parse_player_props(game_data):
             # and excludes the DK offer itself.
             dk_in = _dk_offer(survivors)
             peer_count = len(survivors) - (1 if dk_in else 0)
-            has_sharp_peer = any(o is not dk_in
-                                 and _book_weight(o.get("book")) > 1.0
-                                 for o in survivors)
             if line_source == "dk":
                 implied_method = (
                     "two_way_devig_peerconsensus_at_dk_line"
-                    if (peer_count >= _DK_LINE_MIN_PEERS or has_sharp_peer)
+                    if peer_count >= _DK_LINE_MIN_PEERS
                     else "dk_selfdevig_fallback")
             else:
-                implied_method = "two_way_devig_sharpweighted_consensus"
+                implied_method = "two_way_devig_equalweight_consensus"
             result["props"][market_key][player] = {
                 "line": line,
                 "line_source": line_source,          # 'dk' | 'consensus' (audit)
