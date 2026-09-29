@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Covers THE MODEL: what calibration is live, how refits work, the A-E method bake-off outcomes per prop, Kelly staking, online Platt, the team-market audit verdict, cross-sport parity, and the forward-vs-backtest-Brier diagnosis. All work here was tracked in `IMPROVEMENT_PROGRESS.md` (repo root) + the (now-historical) accuracy-improvement-roadmap. Phase 0/1 foundation and Phase 2 feature evals are all COMPLETE. Commit rule: Cal commits to main, never pushes (owner runs `git push`).
+Covers THE MODEL: what calibration is live, how refits work, the A-E method bake-off outcomes per prop, Kelly staking, online Platt, the team-market audit verdict, cross-sport parity, and the forward-vs-backtest-Brier diagnosis. All work here was tracked in `IMPROVEMENT_PROGRESS.md` (repo root) + the (now-historical) accuracy-improvement-roadmap. Phase 0/1 foundation and Phase 2 feature evals are all COMPLETE. Commit/push discipline → [[preferences]] (commit proactively to main; push only on Doug's explicit authorization).
 
 ## Current live calibration state (MLB — the source of truth)
 `calibration/baseball_mlb.json` + `calibration/recalibration_baseball_mlb.json`. Two layers: (1) residual method A/B/C/D/E + warmup per prop; (2) online Platt sigmoid overlay (SQL, keyed `"<prop>@<bucket>"`).
