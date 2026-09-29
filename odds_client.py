@@ -695,8 +695,13 @@ def parse_game_odds(game):
                         result["moneyline"][team] = []
                     result["moneyline"][team].append({
                         "book": book_title,
+                        "book_key": book_key,
                         "price": price,
                         "implied_prob": american_to_implied_prob(price),
+                        # Odds API includeLinks/includeSids: outcome-level betslip
+                        # deep link + source id (present for DK/FD; None otherwise).
+                        "link": outcome.get("link"),
+                        "sid": outcome.get("sid"),
                     })
 
             elif market_key == "spreads":
@@ -708,8 +713,11 @@ def parse_game_odds(game):
                         result["spreads"][team] = []
                     result["spreads"][team].append({
                         "book": book_title,
+                        "book_key": book_key,
                         "spread": point,
                         "price": price,
+                        "link": outcome.get("link"),
+                        "sid": outcome.get("sid"),
                     })
 
             elif market_key == "totals":
@@ -721,8 +729,11 @@ def parse_game_odds(game):
                         result["totals"][label] = []
                     result["totals"][label].append({
                         "book": book_title,
+                        "book_key": book_key,
                         "line": point,
                         "price": price,
+                        "link": outcome.get("link"),
+                        "sid": outcome.get("sid"),
                     })
 
     return result

@@ -420,11 +420,21 @@ def _render_bet_links(candidate, bet_type=None, side=None):
     so the button matches that book (`dk_book` = the best-executable book) rather than
     showing both. Built from the pick's ready-made betslip link (Odds API includeLinks);
     no-op when the pick carries no DK/FD link. Only PRE-FILLS the slip — you tap Submit."""
-    dk = candidate.get("dk_link")
-    fd = candidate.get("fd_link")
+    # Team totals carry side-specific links (dk_over_link / dk_under_link + over_book /
+    # under_book); resolve by `side`. Everything else (props, ML, spread) has a single
+    # recommended-side dk_link/fd_link + dk_book.
+    s = str(side or "").lower()
+    if s in ("over", "under") and (candidate.get(f"dk_{s}_link")
+                                   or candidate.get(f"fd_{s}_link")):
+        dk = candidate.get(f"dk_{s}_link")
+        fd = candidate.get(f"fd_{s}_link")
+        book = str(candidate.get(f"{s}_book") or candidate.get("dk_book") or "").lower()
+    else:
+        dk = candidate.get("dk_link")
+        fd = candidate.get("fd_link")
+        book = str(candidate.get("dk_book") or "").lower()   # best-executable book (DK or FD)
     if not dk and not fd:
         return
-    book = str(candidate.get("dk_book") or "").lower()   # best-executable book (DK or FD)
     if "fan" in book and fd:
         link, label = fd, "🔵 Bet FanDuel"
     elif "draft" in book and dk:

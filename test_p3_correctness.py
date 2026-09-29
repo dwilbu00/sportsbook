@@ -13,9 +13,58 @@
 
 import unittest
 
+import analysis
 import parlay
 import pricing_common
 import props
+
+
+class ExecBookFieldsTests(unittest.TestCase):
+    """analysis._exec_book_fields extracts the EXECUTABLE (DK/FD only) price + betslip
+    link/sid per side, restricted to a line — analysis-only books are ignored."""
+
+    def _ml_items(self):
+        return [
+            {"book": "DraftKings", "book_key": "draftkings", "price": -110,
+             "link": "DKML", "sid": "dk1"},
+            {"book": "FanDuel", "book_key": "fanduel", "price": -120,
+             "link": "FDML", "sid": "fd1"},
+            {"book": "Pinnacle", "book_key": "pinnacle", "price": -105,
+             "link": None, "sid": None},   # sharper price, analysis-only → ignored
+        ]
+
+    def test_ml_picks_dk_fd_only_and_best_exec(self):
+        f = analysis._exec_book_fields(self._ml_items())
+        self.assertEqual(f["dk_price"], -110)
+        self.assertEqual(f["fd_price"], -120)
+        self.assertEqual(f["dk_link"], "DKML")
+        self.assertEqual(f["fd_sid"], "fd1")
+        # best executable = higher American among DK/FD (Pinnacle's -105 ignored).
+        self.assertEqual(f["best_exec_price"], -110)
+        self.assertEqual(f["best_exec_book"], "DraftKings")
+
+    def test_line_restriction(self):
+        items = [
+            {"book": "DraftKings", "book_key": "draftkings", "spread": -3.5,
+             "price": -110, "link": "A", "sid": "a"},
+            {"book": "DraftKings", "book_key": "draftkings", "spread": -3.0,
+             "price": +100, "link": "B", "sid": "b"},   # different line
+            {"book": "FanDuel", "book_key": "fanduel", "spread": -3.0,
+             "price": -108, "link": "C", "sid": "c"},
+        ]
+        f = analysis._exec_book_fields(items, line=-3.5, line_key="spread")
+        self.assertEqual(f["dk_price"], -110)          # only DK's -3.5 offer
+        self.assertIsNone(f["fd_price"])               # FD has no -3.5 line
+        self.assertEqual(f["best_exec_book"], "DraftKings")
+
+    def test_no_executable_book_all_none(self):
+        items = [{"book": "Pinnacle", "book_key": "pinnacle", "price": -105,
+                  "link": None, "sid": None}]
+        f = analysis._exec_book_fields(items)
+        self.assertIsNone(f["dk_price"])
+        self.assertIsNone(f["fd_price"])
+        self.assertIsNone(f["best_exec_price"])
+        self.assertIsNone(f["best_exec_book"])
 
 
 class TolerantTeamDefenseLookupTests(unittest.TestCase):
@@ -204,10 +253,61 @@ def _prop_bk(player, event_id, dk=-110, fd=-120):
     }
 
 
+def _ml_bk(team, opp, event_id, dk=-110, fd=-120, edge=8.0):
+    """Moneyline value candidate WITH per-book DK/FD prices + links/sids."""
+    return {
+        "is_value": True, "edge_pct": edge, "home_away": "HOME",
+        "team": team, "opponent": opp, "event_id": event_id,
+        "best_edge_pct": edge, "best_price": max(dk, fd),
+        "blended_prob": 70.0, "hist_prob": 70.0,
+        "best_book_implied_prob": 50.0, "book_implied_prob": 50.0,
+        "dk_price": dk, "fd_price": fd, "dk_book": "DraftKings" if dk >= fd else "FanDuel",
+        "dk_sid": f"dk_{team}", "fd_sid": f"fd_{team}",
+        "dk_link": f"https://sportsbook.draftkings.com/?outcomes=dk_{team}",
+        "fd_link": f"https://sportsbook.fanduel.com/addToBetslip?marketId=1&selectionId=fd_{team}",
+    }
+
+
+def _spread_bk(team, opp, event_id, dk=-110, fd=-115, edge=8.0):
+    """Spread value candidate WITH per-book DK/FD prices + links/sids."""
+    return {
+        "is_value": True, "edge_pct": edge, "games_sampled": 10, "team": team,
+        "opponent": opp, "home_away": "HOME", "spread": -3.5, "price": max(dk, fd),
+        "cover_rate": 55.0, "implied_prob": 50.0, "event_id": event_id,
+        "dk_price": dk, "fd_price": fd, "dk_book": "DraftKings" if dk >= fd else "FanDuel",
+        "dk_sid": f"dk_s_{team}", "fd_sid": f"fd_s_{team}",
+        "dk_link": f"https://sportsbook.draftkings.com/?outcomes=dk_s_{team}",
+        "fd_link": f"https://sportsbook.fanduel.com/addToBetslip?marketId=1&selectionId=fd_s_{team}",
+    }
+
+
+def _total_bk(event_id, matchup, side="OVER", dk=-110, fd=-115):
+    """Total value candidate WITH per-book DK/FD side prices + links/sids. The winning
+    side is ~60% (so the leg is +value regardless of which side is bet)."""
+    over_hit = 60.0 if side == "OVER" else 40.0
+    return {
+        "matchup": matchup, "event_id": event_id, "line": 45.5,
+        "is_over_value": side == "OVER", "is_under_value": side == "UNDER",
+        "over_hit_rate": over_hit, "over_edge_pct": 8.0, "under_edge_pct": 8.0,
+        "over_price": max(dk, fd), "under_price": max(dk, fd),
+        "over_implied": 50.0, "under_implied": 50.0,
+        "dk_over_price": dk, "dk_under_price": dk, "fd_over_price": fd, "fd_under_price": fd,
+        "dk_over_sid": f"dk_o_{event_id}", "dk_under_sid": f"dk_u_{event_id}",
+        "fd_over_sid": f"fd_o_{event_id}", "fd_under_sid": f"fd_u_{event_id}",
+        "dk_over_link": f"https://dk/?outcomes=dk_o_{event_id}",
+        "dk_under_link": f"https://dk/?outcomes=dk_u_{event_id}",
+        "fd_over_link": f"https://fd/?marketId=1&selectionId=fd_o_{event_id}",
+        "fd_under_link": f"https://fd/?marketId=1&selectionId=fd_u_{event_id}",
+        "over_book": "DraftKings" if dk >= fd else "FanDuel",
+        "under_book": "DraftKings" if dk >= fd else "FanDuel",
+    }
+
+
 class BookIsolationParlayTests(unittest.TestCase):
     """generate_parlays(book=...) builds a SINGLE-book ticket: every leg priced at that
     book, the other book's link/sid stripped, and legs a book doesn't post excluded. Team
-    legs (no per-book price yet) are excluded from isolated parlays."""
+    legs (ML/spread/total) join isolated parlays when they carry per-book prices; a team
+    leg WITHOUT a per-book price for that book is excluded."""
 
     def _props(self):
         return [_prop_bk("A", "e1"), _prop_bk("B", "e2"), _prop_bk("C", "e3")]
@@ -238,7 +338,9 @@ class BookIsolationParlayTests(unittest.TestCase):
                                       mode="value", book="draftkings")
         self.assertNotIn(3, res)                          # only 2 DK-priced legs remain
 
-    def test_team_legs_excluded_when_isolated(self):
+    def test_team_legs_without_per_book_price_excluded(self):
+        # Legacy team candidates (only an unattributed `price`, no dk_/fd_ fields) can't
+        # be book-isolated → still excluded from an isolated ticket.
         spread = {"is_value": True, "edge_pct": 8.0, "games_sampled": 10, "team": "NYG",
                   "opponent": "DAL", "home_away": "HOME", "spread": -3.5, "price": -110,
                   "cover_rate": 55.0, "implied_prob": 50.0, "event_id": "s1"}
@@ -248,6 +350,54 @@ class BookIsolationParlayTests(unittest.TestCase):
         for p in res.values():
             for leg in p["legs"]:
                 self.assertTrue(leg["bet_type"].startswith("player_prop"))  # no team legs
+
+    def test_team_ml_leg_priced_at_book_and_isolated(self):
+        # A DK ticket built from team ML legs: priced at DK, DK sid kept, FD stripped.
+        ml = [_ml_bk("A", "a", "g1"), _ml_bk("B", "b", "g2"), _ml_bk("C", "c", "g3")]
+        res = parlay.generate_parlays(ml, [], [], [], "americanfootball_nfl",
+                                      mode="value", book="draftkings")
+        self.assertIn(3, res)
+        for leg in res[3]["legs"]:
+            self.assertEqual(leg["bet_type"], "moneyline")
+            self.assertEqual(leg["odds_price"], -110)      # DK price, not FD/best
+            self.assertTrue(leg["dk_sid"])
+            self.assertIsNone(leg["fd_sid"])
+            self.assertIsNone(leg["fd_link"])
+
+    def test_team_spread_and_total_legs_join_isolated_parlay(self):
+        # Mixed DK ticket: spread + total + prop, all priced at DK with DK ids.
+        res = parlay.generate_parlays(
+            [], [_spread_bk("A", "a", "g1")], [_total_bk("g2", "X @ Y", side="OVER")],
+            [_prop_bk("C", "g3")], "americanfootball_nfl", mode="value", book="draftkings")
+        self.assertIn(3, res)
+        bts = {leg["bet_type"] for leg in res[3]["legs"]}
+        self.assertEqual(bts, {"spread", "total_over", "player_prop_over"})
+        for leg in res[3]["legs"]:
+            self.assertTrue(leg["dk_sid"])
+            self.assertIsNone(leg["fd_sid"])
+
+    def test_team_total_leg_priced_at_fd(self):
+        res = parlay.generate_parlays(
+            [_ml_bk("A", "a", "g1")], [_spread_bk("B", "b", "g2")],
+            [_total_bk("g3", "X @ Y", side="UNDER")], [], "americanfootball_nfl",
+            mode="value", book="fanduel")
+        self.assertIn(3, res)
+        prices = {leg["bet_type"]: leg["odds_price"] for leg in res[3]["legs"]}
+        self.assertEqual(prices["moneyline"], -120)        # FD ML price
+        self.assertEqual(prices["spread"], -115)           # FD spread price
+        self.assertEqual(prices["total_under"], -115)      # FD total price
+        for leg in res[3]["legs"]:
+            self.assertIsNone(leg["dk_sid"])
+            self.assertTrue(leg["fd_sid"])
+
+    def test_team_leg_absent_at_book_excluded(self):
+        # DK doesn't post this ML → it drops out, leaving only 2 DK-priced legs → no 3-leg.
+        ml = [_ml_bk("A", "a", "g1"), _ml_bk("B", "b", "g2")]
+        ml.append(_ml_bk("C", "c", "g3", dk=-110))
+        ml[2]["dk_price"] = None
+        res = parlay.generate_parlays(ml, [], [], [], "americanfootball_nfl",
+                                      mode="value", book="draftkings")
+        self.assertNotIn(3, res)
 
 
 class ParlayRuleAlignmentTests(unittest.TestCase):

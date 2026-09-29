@@ -156,6 +156,30 @@ def _book_isolate_ok(cand_book, book):
     return (book == "draftkings" and "draft" in cb) or (book == "fanduel" and "fan" in cb)
 
 
+def _book_exec(c, book, over=None):
+    """(price, link, sid) for a TEAM candidate at ``book`` (Odds-API per-book fields set by
+    analysis._exec_book_fields). ``over``: True=over / False=under for totals; None for
+    single-sided ML/spread. Returns (None, None, None) when book is None or the book
+    doesn't post this side/line (→ leg excluded from that book's isolated parlay)."""
+    pre = "dk" if book == "draftkings" else "fd" if book == "fanduel" else None
+    if pre is None:
+        return None, None, None
+    if over is None:
+        return c.get(f"{pre}_price"), c.get(f"{pre}_link"), c.get(f"{pre}_sid")
+    side = "over" if over else "under"
+    return (c.get(f"{pre}_{side}_price"),
+            c.get(f"{pre}_{side}_link"), c.get(f"{pre}_{side}_sid"))
+
+
+def _leg_ids(link, sid, book):
+    """Book-isolated betslip fields for a team leg — keep only the requested book's
+    link/sid (all None when book is None / not deep-linkable)."""
+    return {"dk_link": link if book == "draftkings" else None,
+            "fd_link": link if book == "fanduel" else None,
+            "dk_sid": sid if book == "draftkings" else None,
+            "fd_sid": sid if book == "fanduel" else None}
+
+
 def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, book=None):
     """
     Convert all analysis results into a uniform leg format for parlay building.
@@ -183,8 +207,14 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, 
     for c in all_ml:
         if not c.get("is_value") or c["edge_pct"] <= 0:
             continue
-        if book and not _book_isolate_ok(c.get("best_book"), book):
-            continue  # book isolation: ML is priced at its best book; skip for others
+        # Book isolation: price the ML at the requested book (DK/FD) and carry only that
+        # book's link/sid; skip if it doesn't post it. book=None → legacy all-book best.
+        px, lk, sd = _book_exec(c, book)
+        if book:
+            if px is None:
+                continue
+        else:
+            px = c.get("best_price")
         matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         game_key = c.get("event_id") or matchup
         legs.append({
@@ -195,10 +225,11 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, 
             "player": None,
             "prop_key": None,
             "edge_pct": c.get("best_edge_pct", c["edge_pct"]),
-            "odds_price": c.get("best_price"),
+            "odds_price": px,
             "hist_prob": c.get("blended_prob", c["hist_prob"]) / 100.0,
             "implied_prob": c.get("best_book_implied_prob", c["book_implied_prob"]) / 100.0,
             "_rec": _rec_view(c, "moneyline", None, game_key),
+            **_leg_ids(lk, sd, book),
         })
     
     for c in all_spreads:
@@ -206,8 +237,14 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, 
         if (not c.get("is_value") or c["edge_pct"] <= 0
                 or c.get("games_sampled", 0) < 5):
             continue
+        # Book isolation: price the spread at the requested book (DK/FD) at its posted
+        # line; skip if that book doesn't post it. book=None → legacy median price.
+        px, lk, sd = _book_exec(c, book)
         if book:
-            continue  # spread has no per-book price yet -> can't book-isolate; exclude
+            if px is None:
+                continue
+        else:
+            px = c.get("price")
         matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         game_key = c.get("event_id") or matchup
         legs.append({
@@ -218,44 +255,54 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, 
             "player": None,
             "prop_key": None,
             "edge_pct": c["edge_pct"],
-            "odds_price": c.get("price"),
+            "odds_price": px,
             "hist_prob": c["cover_rate"] / 100.0,
             "implied_prob": c.get("implied_prob", 50.0) / 100.0,
             "_rec": _rec_view(c, "spread", None, game_key),
+            **_leg_ids(lk, sd, book),
         })
     
     for c in all_totals:
-        if book:
-            continue  # totals have no per-book price yet -> can't book-isolate; exclude
         game_key = c.get("event_id") or c["matchup"]
         if c.get("is_over_value"):
-            legs.append({
-                "game_key": game_key,
-                "team": None,
-                "bet_type": "total_over",
-                "label": f"OVER {c['line']} ({c['matchup']})",
-                "player": None,
-                "prop_key": None,
-                "edge_pct": c.get("over_edge_pct", c["over_hit_rate"] - 50.0),
-                "odds_price": c.get("over_price"),
-                "hist_prob": c["over_hit_rate"] / 100.0,
-                "implied_prob": c.get("over_implied", 50.0) / 100.0,
-                "_rec": _rec_view(c, "total", "OVER", game_key),
-            })
+            # Book isolation: price the OVER at the requested book; skip if absent.
+            px, lk, sd = _book_exec(c, book, over=True)
+            if not book:
+                px = c.get("over_price")
+            if not (book and px is None):
+                legs.append({
+                    "game_key": game_key,
+                    "team": None,
+                    "bet_type": "total_over",
+                    "label": f"OVER {c['line']} ({c['matchup']})",
+                    "player": None,
+                    "prop_key": None,
+                    "edge_pct": c.get("over_edge_pct", c["over_hit_rate"] - 50.0),
+                    "odds_price": px,
+                    "hist_prob": c["over_hit_rate"] / 100.0,
+                    "implied_prob": c.get("over_implied", 50.0) / 100.0,
+                    "_rec": _rec_view(c, "total", "OVER", game_key),
+                    **_leg_ids(lk, sd, book),
+                })
         if c.get("is_under_value"):
-            legs.append({
-                "game_key": game_key,
-                "team": None,
-                "bet_type": "total_under",
-                "label": f"UNDER {c['line']} ({c['matchup']})",
-                "player": None,
-                "prop_key": None,
-                "edge_pct": c.get("under_edge_pct", (100.0 - c["over_hit_rate"]) - 50.0),
-                "odds_price": c.get("under_price"),
-                "hist_prob": (100.0 - c["over_hit_rate"]) / 100.0,
-                "implied_prob": c.get("under_implied", 50.0) / 100.0,
-                "_rec": _rec_view(c, "total", "UNDER", game_key),
-            })
+            px, lk, sd = _book_exec(c, book, over=False)
+            if not book:
+                px = c.get("under_price")
+            if not (book and px is None):
+                legs.append({
+                    "game_key": game_key,
+                    "team": None,
+                    "bet_type": "total_under",
+                    "label": f"UNDER {c['line']} ({c['matchup']})",
+                    "player": None,
+                    "prop_key": None,
+                    "edge_pct": c.get("under_edge_pct", (100.0 - c["over_hit_rate"]) - 50.0),
+                    "odds_price": px,
+                    "hist_prob": (100.0 - c["over_hit_rate"]) / 100.0,
+                    "implied_prob": c.get("under_implied", 50.0) / 100.0,
+                    "_rec": _rec_view(c, "total", "UNDER", game_key),
+                    **_leg_ids(lk, sd, book),
+                })
     
     for c in all_props:
         if (not c.get("is_value") or c.get("no_history")

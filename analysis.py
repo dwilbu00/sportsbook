@@ -45,6 +45,58 @@ from calibration_loader import load_expected_runs_challenger
 _EXPECTED_RUNS_CACHE = {}
 
 
+def _exec_book_fields(items, line=None, line_key=None):
+    """Per-EXECUTABLE-book (DraftKings/FanDuel only) price + betslip identity for one
+    side's parsed offers (from odds_client.parse_game_odds — moneyline/spreads/totals).
+
+    Doug bets DK+FD only; analysis-only books (Pinnacle etc.) never carry a link/sid and
+    are ignored here — the multi-book consensus that the EDGE is measured against is a
+    SEPARATE, analysis-only quantity (unchanged). This adds only the EXECUTION surface:
+    the price + Odds-API deep link/sid to place the bet at each book, plus the best of
+    {DK, FD} (higher American payout) as the recommended single.
+
+    ``line``/``line_key`` restrict to offers at that line (spreads: 'spread'; totals:
+    'line'); omit for moneyline (no line). A book that doesn't post the exact line is
+    treated as absent (its fields are None) — we never deep-link a different number.
+    Returns a flat dict of dk_/fd_ price+link+sid + best_exec_* (None where a book is
+    absent)."""
+    def _pick(sub):
+        best = None
+        for o in items or []:
+            bk = str(o.get("book_key") or o.get("book") or "").lower()
+            if sub not in bk:
+                continue
+            if line is not None and line_key is not None and o.get(line_key) != line:
+                continue
+            p = o.get("price")
+            if not isinstance(p, (int, float)) or isinstance(p, bool):
+                continue
+            if best is None or p > best["price"]:   # higher American = better payout
+                best = o
+        return best
+
+    dk, fd = _pick("draft"), _pick("fan")
+    fields = {
+        "dk_price": dk["price"] if dk else None,
+        "dk_link": dk.get("link") if dk else None,
+        "dk_sid": dk.get("sid") if dk else None,
+        "fd_price": fd["price"] if fd else None,
+        "fd_link": fd.get("link") if fd else None,
+        "fd_sid": fd.get("sid") if fd else None,
+    }
+    execs = [(fields["dk_price"], "DraftKings", fields["dk_link"], fields["dk_sid"]),
+             (fields["fd_price"], "FanDuel", fields["fd_link"], fields["fd_sid"])]
+    execs = [e for e in execs if e[0] is not None]
+    if execs:
+        bp, bb, bl, bs = max(execs, key=lambda e: e[0])
+        fields.update(best_exec_price=bp, best_exec_book=bb,
+                      best_exec_link=bl, best_exec_sid=bs)
+    else:
+        fields.update(best_exec_price=None, best_exec_book=None,
+                      best_exec_link=None, best_exec_sid=None)
+    return fields
+
+
 def _apply_starter_logit(p, edge, weight):
     """Shift probability p in logit space by weight*edge, bounded to [.02,.98].
     edge>0 favors the team; weight is the (calibratable) logit multiplier."""
@@ -508,6 +560,11 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
         best_edge = final_prob - best_book_prob
         expected_roi = _expected_roi(final_prob, best_offer["price"])
 
+        # Executable surface (DK/FD only): per-book price + betslip link/sid for THIS
+        # team's ML, for one-tap slips + book-isolated parlays. Additive — the edge/EV
+        # above (all-book consensus) is unchanged. dk_book = best of DK/FD for _render_bet_links.
+        _ex = _exec_book_fields(ml_odds)
+
         result = {
             "type": "moneyline",
             "team": team_name,
@@ -532,6 +589,11 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                                   if expected_roi is not None else None),
             "is_value": (not _market_suppressed(sport_key, "moneyline"))
                         and _prop_is_value(edge, threshold, expected_roi),
+            # Executable per-book (DK/FD) price + betslip link/sid (single side = this team).
+            "dk_price": _ex["dk_price"], "fd_price": _ex["fd_price"],
+            "dk_link": _ex["dk_link"], "fd_link": _ex["fd_link"],
+            "dk_sid": _ex["dk_sid"], "fd_sid": _ex["fd_sid"],
+            "dk_book": _ex["best_exec_book"],   # best of DK/FD → _render_bet_links button
         }
         candidates.append(result)
 
@@ -678,6 +740,11 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     # Prices for the consensus line, picked from each side's odds list.
     over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
     under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
+    # Executable surface (DK/FD only) for each side at the consensus line — one-tap
+    # slips + book-isolated parlay legs. Additive; the median over/under_price above
+    # (which feeds the unchanged edge/EV) is untouched.
+    _ex_over = _exec_book_fields(over_odds, line=consensus_line, line_key="line")
+    _ex_under = _exec_book_fields(under_odds, line=consensus_line, line_key="line")
 
     # Blend the model over-rate toward the de-vigged market over probability
     # using the offline-fitted weight (w=1.0 → pure model = original).
@@ -741,6 +808,15 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         # instead of showing the placeholder-derived edge.
         "over_price_missing": over_price is None,
         "under_price_missing": under_price is None,
+        # Executable per-book (DK/FD) prices + betslip link/sid, per side.
+        "dk_over_price": _ex_over["dk_price"], "dk_under_price": _ex_under["dk_price"],
+        "fd_over_price": _ex_over["fd_price"], "fd_under_price": _ex_under["fd_price"],
+        "dk_over_link": _ex_over["dk_link"], "dk_under_link": _ex_under["dk_link"],
+        "fd_over_link": _ex_over["fd_link"], "fd_under_link": _ex_under["fd_link"],
+        "dk_over_sid": _ex_over["dk_sid"], "dk_under_sid": _ex_under["dk_sid"],
+        "fd_over_sid": _ex_over["fd_sid"], "fd_under_sid": _ex_under["fd_sid"],
+        "over_book": _ex_over["best_exec_book"],     # best of DK/FD per side (betslip button)
+        "under_book": _ex_under["best_exec_book"],
     })
 
     return candidates
@@ -861,6 +937,11 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             fair_implied = raw_implied
         edge = cover_prob - fair_implied
         roi = _expected_roi(cover_prob, price) if price is not None else None
+        # Executable surface (DK/FD only) for this team's spread at its consensus line —
+        # one-tap slips + book-isolated parlay legs. Additive; the median `price` above
+        # (which feeds the unchanged edge/EV) is untouched.
+        _ex = _exec_book_fields(game_odds["spreads"].get(team_name, []),
+                                line=spread, line_key="spread")
         candidates.append({
             "type": "spread",
             "team": team_name,
@@ -884,6 +965,11 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
             # (not a market number). The value gate already blocks surfacing
             # (roi is None without a price); this flag is display metadata.
             "price_missing": price is None,
+            # Executable per-book (DK/FD) price + betslip link/sid (single side = this team).
+            "dk_price": _ex["dk_price"], "fd_price": _ex["fd_price"],
+            "dk_link": _ex["dk_link"], "fd_link": _ex["fd_link"],
+            "dk_sid": _ex["dk_sid"], "fd_sid": _ex["fd_sid"],
+            "dk_book": _ex["best_exec_book"],   # best of DK/FD → _render_bet_links button
             "model_source": ("expected_runs_ensemble" if expected_runs
                              else "current_margin_model"),
         })
