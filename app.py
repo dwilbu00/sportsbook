@@ -3686,7 +3686,16 @@ if (parlay_clicked or safe_clicked) and "analysis_results" in st.session_state:
     p_totals = ar["all_totals"] if "totals" in market_keys else []
     p_props = ar["all_props"] if selected_props else []
     mode = "safe" if safe_clicked else "value"
-    parlays = generate_parlays(p_ml, p_spreads, p_totals, p_props, ar["sport_key"], mode)
+    # Book isolation: a parlay is one ticket at one book, so build all-DK and all-FD
+    # tickets separately (each leg priced at that book) and keep the better combined payout
+    # per size. No cross-book leg mixing — the displayed odds are placeable as shown.
+    _by_book = [generate_parlays(p_ml, p_spreads, p_totals, p_props, ar["sport_key"], mode,
+                                 book=b) for b in ("draftkings", "fanduel")]
+    parlays = {}
+    for _size in (3, 4, 5):
+        _cands = [bp[_size] for bp in _by_book if _size in bp]
+        if _cands:
+            parlays[_size] = max(_cands, key=lambda p: p.get("payout_per_10", 0) or 0)
     st.session_state["parlay_results"] = parlays
     st.session_state["parlay_mode"] = mode
 
@@ -3751,8 +3760,9 @@ if "parlay_results" in st.session_state:
                         f"Expected ROI: {p.get('expected_roi_pct', 0):+.2f}%  |  "
                         f"DK Payout: {payout_label_str}")
 
+            _bk_tag = {"draftkings": "🟢 DK ", "fanduel": "🔵 FD "}.get(p.get("book"), "")
             with st.expander(
-                f"{'⭐' * size}  Best {size}-Leg Parlay  —  {headline}",
+                f"{'⭐' * size}  {_bk_tag}Best {size}-Leg Parlay  —  {headline}",
                 expanded=(size == 3),
             ):
                 for i, leg in enumerate(p["legs"], 1):

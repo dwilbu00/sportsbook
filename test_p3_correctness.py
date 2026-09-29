@@ -187,6 +187,69 @@ def _total_cand(event_id, matchup, side="OVER", price=-110, over_hit=60.0):
     }
 
 
+def _prop_bk(player, event_id, dk=-110, fd=-120):
+    """Prop value candidate WITH per-book DK/FD prices + sids/links (for book isolation)."""
+    best = max(dk, fd)
+    return {
+        "is_value": True, "no_history": False, "edge_pct": 8.0, "games_sampled": 20,
+        "direction": "OVER", "prop": "player_receptions", "player": player,
+        "matchup": "NYG @ DAL", "team": "NYG", "event_id": event_id,
+        "prop_label": "Receptions", "line": 4.5, "over_rate": 65.0,
+        "over_implied": 50.0, "under_implied": 50.0,
+        "best_price": best, "over_price": best, "under_price": best, "batting_order": 1,
+        "dk_over_price": dk, "dk_under_price": dk, "fd_over_price": fd, "fd_under_price": fd,
+        "dk_sid": f"dk_{player}", "fd_sid": f"fd_{player}",
+        "dk_link": f"https://sportsbook.draftkings.com/?outcomes=dk_{player}",
+        "fd_link": f"https://sportsbook.fanduel.com/addToBetslip?marketId=1&selectionId=fd_{player}",
+    }
+
+
+class BookIsolationParlayTests(unittest.TestCase):
+    """generate_parlays(book=...) builds a SINGLE-book ticket: every leg priced at that
+    book, the other book's link/sid stripped, and legs a book doesn't post excluded. Team
+    legs (no per-book price yet) are excluded from isolated parlays."""
+
+    def _props(self):
+        return [_prop_bk("A", "e1"), _prop_bk("B", "e2"), _prop_bk("C", "e3")]
+
+    def test_dk_parlay_prices_at_dk_and_strips_fd(self):
+        res = parlay.generate_parlays([], [], [], self._props(), "americanfootball_nfl",
+                                      mode="value", book="draftkings")
+        self.assertIn(3, res)
+        self.assertEqual(res[3]["book"], "draftkings")
+        for leg in res[3]["legs"]:
+            self.assertEqual(leg["odds_price"], -110)    # DK price, not best/FD
+            self.assertTrue(leg["dk_sid"])
+            self.assertIsNone(leg["fd_sid"])             # FD stripped in a DK ticket
+            self.assertIsNone(leg["fd_link"])
+
+    def test_fd_parlay_prices_at_fd(self):
+        res = parlay.generate_parlays([], [], [], self._props(), "americanfootball_nfl",
+                                      mode="value", book="fanduel")
+        self.assertIn(3, res)
+        for leg in res[3]["legs"]:
+            self.assertEqual(leg["odds_price"], -120)    # FD price
+            self.assertIsNone(leg["dk_sid"])
+
+    def test_leg_absent_at_book_excluded(self):
+        props = self._props()
+        props[0]["dk_over_price"] = None                 # DK doesn't post this prop
+        res = parlay.generate_parlays([], [], [], props, "americanfootball_nfl",
+                                      mode="value", book="draftkings")
+        self.assertNotIn(3, res)                          # only 2 DK-priced legs remain
+
+    def test_team_legs_excluded_when_isolated(self):
+        spread = {"is_value": True, "edge_pct": 8.0, "games_sampled": 10, "team": "NYG",
+                  "opponent": "DAL", "home_away": "HOME", "spread": -3.5, "price": -110,
+                  "cover_rate": 55.0, "implied_prob": 50.0, "event_id": "s1"}
+        res = parlay.generate_parlays([], [spread], [_total_cand("t1", "X @ Y")],
+                                      self._props(), "americanfootball_nfl",
+                                      mode="value", book="draftkings")
+        for p in res.values():
+            for leg in p["legs"]:
+                self.assertTrue(leg["bet_type"].startswith("player_prop"))  # no team legs
+
+
 class ParlayRuleAlignmentTests(unittest.TestCase):
     """The parlay generator must obey the SAME cross-bet rules as the single-bet
     auto-pick (bet_selector): L2 anti-correlation, L3 MLB contradictions, the

@@ -149,7 +149,14 @@ def _rec_view(cand, raw_bt, side, game_key):
     return {"bet_type": raw_bt, "side": side, "cand": cand, "leg": leg}
 
 
-def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
+def _book_isolate_ok(cand_book, book):
+    """True if a candidate whose executable book is ``cand_book`` belongs in ``book``'s
+    isolated parlay. ``book`` is 'draftkings'/'fanduel'; cand_book is the display title."""
+    cb = str(cand_book or "").lower()
+    return (book == "draftkings" and "draft" in cb) or (book == "fanduel" and "fan" in cb)
+
+
+def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None, book=None):
     """
     Convert all analysis results into a uniform leg format for parlay building.
     Only include legs that passed their analyzer's value recommendation filter,
@@ -176,6 +183,8 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
     for c in all_ml:
         if not c.get("is_value") or c["edge_pct"] <= 0:
             continue
+        if book and not _book_isolate_ok(c.get("best_book"), book):
+            continue  # book isolation: ML is priced at its best book; skip for others
         matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         game_key = c.get("event_id") or matchup
         legs.append({
@@ -197,6 +206,8 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
         if (not c.get("is_value") or c["edge_pct"] <= 0
                 or c.get("games_sampled", 0) < 5):
             continue
+        if book:
+            continue  # spread has no per-book price yet -> can't book-isolate; exclude
         matchup = f"{c['opponent']} @ {c['team']}" if c["home_away"] == "HOME" else f"{c['team']} @ {c['opponent']}"
         game_key = c.get("event_id") or matchup
         legs.append({
@@ -214,6 +225,8 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
         })
     
     for c in all_totals:
+        if book:
+            continue  # totals have no per-book price yet -> can't book-isolate; exclude
         game_key = c.get("event_id") or c["matchup"]
         if c.get("is_over_value"):
             legs.append({
@@ -270,6 +283,21 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
             hp = (1.0 - c["over_rate"] / 100.0) if c.get("over_rate") is not None else 0.5
             ip = (c["under_implied"] / 100.0) if c.get("under_implied") is not None else 0.5
 
+        # Book isolation: when a book is given, price this prop leg at THAT book and keep
+        # only that book's deep link/sid. Non-safe props carry per-book prices; skip the leg
+        # if this book doesn't post it. (safe_mode alt legs keep their DK-fetched alt price.)
+        leg_dk_link, leg_fd_link = c.get("dk_link"), c.get("fd_link")
+        leg_dk_sid, leg_fd_sid = c.get("dk_sid"), c.get("fd_sid")
+        if book and not c.get("safe_mode"):
+            if book == "draftkings":
+                price = c.get("dk_over_price") if direction == "OVER" else c.get("dk_under_price")
+                leg_fd_link = leg_fd_sid = None
+            else:  # fanduel
+                price = c.get("fd_over_price") if direction == "OVER" else c.get("fd_under_price")
+                leg_dk_link = leg_dk_sid = None
+            if price is None:
+                continue  # this book doesn't post this prop -> exclude from its parlay
+
         game_key = c.get("event_id") or c["matchup"]
         rec = _rec_view(c, "player_prop", direction, game_key)
         # Per-leg single-bet rule: drop a batter_hits OVER when the confirmed
@@ -290,8 +318,9 @@ def _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key=None):
             "_rec": rec,
             # One-tap betslip: the recommended side's DK/FD deep link + source id, for
             # per-leg links AND combined parlay stacking (betslip.dk_parlay_link on sids).
-            "dk_link": c.get("dk_link"), "fd_link": c.get("fd_link"),
-            "dk_sid": c.get("dk_sid"), "fd_sid": c.get("fd_sid"),
+            # Book-isolated when `book` is set (only that book's link/sid survives).
+            "dk_link": leg_dk_link, "fd_link": leg_fd_link,
+            "dk_sid": leg_dk_sid, "fd_sid": leg_fd_sid,
         }
         if c.get("safe_mode"):
             # Extra fields used by the "value parlays in safe mode" ranker / UI.
@@ -613,7 +642,8 @@ def _score_parlay(legs, sport_key, mode="value"):
         return total_edge + correlation_score + usage_penalty + parlay_edge + sgp_penalty
 
 
-def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode="value"):
+def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode="value",
+                     book=None):
     """
     Generate the top recommended 3, 4, and 5 leg parlays.
     
@@ -631,7 +661,7 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
     from itertools import combinations
     import bet_selector  # lazy: cycle-safe (bet_selector imports parlay at load)
 
-    legs = _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key)
+    legs = _normalize_legs(all_ml, all_spreads, all_totals, all_props, sport_key, book=book)
 
     if len(legs) < 3:
         return {}
@@ -846,6 +876,7 @@ def generate_parlays(all_ml, all_spreads, all_totals, all_props, sport_key, mode
                 continue
 
             results[size] = {
+                "book": book,          # None (legacy) or the isolated book ('draftkings'/'fanduel')
                 "legs": best_parlay,
                 "score": best_score,
                 "mode": effective_mode,
