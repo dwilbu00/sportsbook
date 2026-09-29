@@ -207,6 +207,58 @@ class F07LegIdentityTests(unittest.TestCase):
         self.assertEqual(row["game_date"], c["game_date"])
 
 
+class BetslipThreadTests(unittest.TestCase):
+    """Optimizer legs must carry the CHOSEN side's per-book betslip identity (Odds API
+    includeLinks/includeSids) + game_key so the bonus page can one-tap a slip via
+    app._render_parlay_bet_links — book-isolated (only the leg's own book populated)."""
+
+    def _board_p(self):
+        return {"dk_over_link": "DOL", "dk_over_sid": "DOS",
+                "dk_under_link": "DUL", "dk_under_sid": "DUS",
+                "fd_over_link": "FOL", "fd_over_sid": "FOS",
+                "fd_under_link": "FUL", "fd_under_sid": "FUS"}
+
+    def test_board_fields_pick_chosen_side_and_book(self):
+        p = self._board_p()
+        # DK, favorite = over
+        self.assertEqual(opt._board_betslip_fields(p, "dk", True, "G"),
+                         {"dk_link": "DOL", "dk_sid": "DOS", "game_key": "G"})
+        # FD, favorite = under  → only FD keys, from the under side
+        self.assertEqual(opt._board_betslip_fields(p, "fd", False, "G2"),
+                         {"fd_link": "FUL", "fd_sid": "FUS", "game_key": "G2"})
+
+    def _mlb_cand(self, direction, over_implied, **extra):
+        c = dict(type="player_prop", prop="batter_hits", player="Fixture",
+                 event_id="e", line=.5, batting_order=1, lineup_status="in",
+                 over_implied=over_implied, direction=direction,
+                 dk_link="LINK", dk_sid="SID",
+                 commence_time="2026-09-20T00:10:00Z", game_date="2026-09-19", team="A")
+        c.update(extra)
+        return c
+
+    def test_candidate_links_attached_when_direction_matches(self):
+        from unittest.mock import patch
+        c = self._mlb_cand("OVER", 70., dk_over_price=-150)   # fav_over → leg side OVER
+        with patch("book_calibration.load_maps", return_value={}):
+            legs = opt.legs_from_candidates([c], "draftkings")
+        self.assertEqual(legs[0]["side"], "OVER")
+        self.assertEqual(legs[0]["dk_link"], "LINK")
+        self.assertEqual(legs[0]["dk_sid"], "SID")
+        self.assertEqual(legs[0]["game_key"], "e")
+
+    def test_candidate_links_skipped_when_direction_mismatches(self):
+        from unittest.mock import patch
+        # de-vig favorite is the UNDER, but the recommended candidate direction is OVER →
+        # its stored link is for the wrong side → not deep-linkable (but still game_key'd).
+        c = self._mlb_cand("OVER", 30., dk_under_price=-150)
+        with patch("book_calibration.load_maps", return_value={}):
+            legs = opt.legs_from_candidates([c], "draftkings")
+        self.assertEqual(legs[0]["side"], "UNDER")
+        self.assertNotIn("dk_link", legs[0])
+        self.assertNotIn("dk_sid", legs[0])
+        self.assertEqual(legs[0]["game_key"], "e")
+
+
 class MinOddsOverallSgpTests(unittest.TestCase):
     """SGP must respect the promo's min TOTAL odds (min_odds_overall): (a) do NOT suggest a
     stack whose achievable combined can't reach it — the bug Doug hit (min_overall +1000

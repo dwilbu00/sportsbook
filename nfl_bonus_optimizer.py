@@ -111,6 +111,19 @@ def _season_of(commence_time):
         return None
 
 
+def _board_betslip_fields(p, pxkey, fav_over, gid):
+    """Per-book betslip identity (Odds API includeLinks/includeSids) for the CHOSEN side of
+    a board prop dict, keyed for app._render_parlay_bet_links (dk_/fd_ link+sid + game_key).
+    Book-isolated by construction: only the leg's own book (`pxkey` = 'dk'|'fd') is populated,
+    so a DK bonus play offers only the DK slip and an FD play only the FD slip. `game_key`
+    (the game id) drives same-game (SGP) detection in the render layer. Purely additive —
+    leg_to_store/grading/pricing don't read these fields."""
+    tag = "over" if fav_over else "under"
+    return {f"{pxkey}_link": p.get(f"{pxkey}_{tag}_link"),
+            f"{pxkey}_sid": p.get(f"{pxkey}_{tag}_sid"),
+            "game_key": gid}
+
+
 def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
     """LIVE leg source: map the app's parsed prop board(s) → optimizer leg dicts, applying the
     opportunity gate (§serving feed) and using MARKET de-vig P + the book's own price.
@@ -152,7 +165,8 @@ def legs_from_board(parsed_boards, book, season=None, week=_CUR_SLATE_WEEK):
                     "line": line, "side": "OVER" if fav_over else "UNDER",
                     "P": fair if fav_over else 1.0 - fair, "fair_over": fav_over,
                     "t_over": sgp._ppf(1.0 - fair), "odds": price,
-                    "commence_time": commence, "game_date": gdate})
+                    "commence_time": commence, "game_date": gdate,
+                    **_board_betslip_fields(p, pxkey, fav_over, gid)})
     return legs
 
 
@@ -237,16 +251,24 @@ def legs_from_candidates(candidates, book):
         price = c.get(f"{pxk}_{'over' if fav_over else 'under'}_price")
         if price is None:
             continue
-        legs.append({"gid": c.get("event_id"), "prop": prop, "player": c.get("player"),
-                     "team": c.get("team"), "opp": None, "line": c.get("line"),
-                     "side": "OVER" if fav_over else "UNDER",
-                     "P": fo if fav_over else 1.0 - fo, "fair_over": fav_over, "odds": price,
-                     # Carry settlement identity so a logged MLB parlay leg is gradable
-                     # (leg_to_store persists these; the grader keys on player + date +
-                     # commence). The fuller immutable envelope (game_pk, canonical
-                     # player id) is the deferred T07 identity hardening. [F07]
-                     "commence_time": c.get("commence_time"),
-                     "game_date": c.get("game_date")})
+        leg = {"gid": c.get("event_id"), "prop": prop, "player": c.get("player"),
+               "team": c.get("team"), "opp": None, "line": c.get("line"),
+               "side": "OVER" if fav_over else "UNDER",
+               "P": fo if fav_over else 1.0 - fo, "fair_over": fav_over, "odds": price,
+               # Carry settlement identity so a logged MLB parlay leg is gradable
+               # (leg_to_store persists these; the grader keys on player + date +
+               # commence). The fuller immutable envelope (game_pk, canonical
+               # player id) is the deferred T07 identity hardening. [F07]
+               "commence_time": c.get("commence_time"),
+               "game_date": c.get("game_date"), "game_key": c.get("event_id")}
+        # Betslip identity: the analysis candidate stores link/sid for the RECOMMENDED
+        # direction only, so attach it only when that matches this leg's chosen side
+        # (otherwise the leg simply isn't deep-linkable — the render layer degrades to
+        # per-leg links / a "not deep-linkable" note).
+        if str(c.get("direction", "")).upper() == leg["side"]:
+            leg[f"{pxk}_link"] = c.get(f"{pxk}_link")
+            leg[f"{pxk}_sid"] = c.get(f"{pxk}_sid")
+        legs.append(leg)
     return legs
 
 
@@ -304,7 +326,8 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
                     "line": line, "side": "OVER" if use_over else "UNDER",
                     "P": fair if use_over else 1.0 - fair, "fair_over": use_over,
                     "t_over": sgp._ppf(1.0 - fair), "odds": price,
-                    "commence_time": commence, "game_date": gdate})
+                    "commence_time": commence, "game_date": gdate,
+                    **_board_betslip_fields(p, pxkey, use_over, gid)})
     return legs
 
 

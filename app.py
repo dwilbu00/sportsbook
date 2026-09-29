@@ -458,11 +458,15 @@ def _render_parlay_bet_links(legs):
     if not dk_all and not fd_all:
         return
     n = len(legs)
+    # Deep-linkable count is per the PRESENTED book — a book-isolated ticket only carries
+    # its own book's ids (DK sids or FD links), so counting DK sids alone would misreport
+    # an FD-only ticket as "0/n".
+    n_linkable = max(len(dk_sids), len(fd_links))
     # Same-game parlay = 2+ legs share a game. DK's APP blocks one-tap SGP assembly (the
     # website still allows it); cross-game one-taps everywhere.
     game_keys = [l.get("game_key") for l in legs if l.get("game_key")]
     is_sgp = len(set(game_keys)) < len(game_keys)
-    st.markdown(f"**🎟️ Add this parlay to a slip** ({len(dk_sids)}/{n} legs deep-linkable):")
+    st.markdown(f"**🎟️ Add this parlay to a slip** ({n_linkable}/{n} legs deep-linkable):")
     cols = st.columns([2, 2, 3])
     if dk_all:
         cols[0].link_button("🟢 DK — all legs", dk_all,
@@ -499,8 +503,8 @@ def _render_parlay_bet_links(legs):
                     png = _qr_png_cached(_leg_link)
                     if png:
                         st.image(png, width=160)
-    if len(dk_sids) < n:
-        st.caption(f"⚠️ {n - len(dk_sids)} leg(s) aren't deep-linkable yet (team markets).")
+    if n_linkable < n:
+        st.caption(f"⚠️ {n - n_linkable} leg(s) aren't deep-linkable yet (team markets).")
 
 
 def _select_bet_checkbox(candidate, bet_type, side=None):
@@ -2703,6 +2707,10 @@ def render_bonuses():
                         f"Logged {len(combo)}-leg parlay → 🎰 Parlays. "
                         f"Bonus '{r['label']}' consumed & removed.")
                     st.rerun()
+                # One-tap betslip for the parlay currently selected above (book-isolated
+                # to r['book']; legs carry that book's Odds-API link/sid).
+                _render_parlay_bet_links(
+                    [{**l, "label": _leglabel(l)} for l in pick[3]])
         if r["sgp"]:
             st.caption("SGP stacks — build in the book's SGP builder, then enter its combined "
                        "price for the exact boosted EV (independence-vetted for correlation):")
@@ -2711,6 +2719,10 @@ def render_bonuses():
                                  f"need ≥ {int(need):+d}  ·  {combo[0]['gid']}"):
                     for l in combo:
                         st.write(f"• {_leglabel(l)}  ({l['team']})")
+                    # One-tap betslip: same-game, so DK's app needs leg-by-leg adds —
+                    # _render_parlay_bet_links surfaces the per-leg links + SGP guidance.
+                    _render_parlay_bet_links(
+                        [{**l, "label": _leglabel(l)} for l in combo])
                     price = st.number_input(
                         "Book's SGP combined price (American)", -100000, 100000, int(need),
                         step=10, key=f"sgp_{r['bonus_id']}_{i}")
