@@ -283,6 +283,25 @@ def _payout_label(candidate, side=None, suffix=""):
     return f"{book + ' ' if book else ''}Payout{suffix}"
 
 
+def _exec_price(candidate, side=None):
+    """Price at the recommended executable book (for the payout metric) — the book's own-line
+    price. Totals carry per-side dk_/fd_ prices; ML/props carry best_price/dk_price; spreads
+    carry dk_price/fd_price. Falls back to the median/best price when the book is unknown."""
+    book = _rec_book_label(candidate, side)
+    s = str(side or "").lower()
+    if s in ("over", "under"):
+        if book == "DraftKings":
+            return candidate.get(f"dk_{s}_price")
+        if book == "FanDuel":
+            return candidate.get(f"fd_{s}_price")
+        return candidate.get(f"{s}_price")
+    if book == "DraftKings":
+        return candidate.get("dk_price", candidate.get("best_price"))
+    if book == "FanDuel":
+        return candidate.get("fd_price", candidate.get("best_price"))
+    return candidate.get("best_price", candidate.get("price"))
+
+
 def _market_offer_text(comparison, peer=False, market_key="h2h", side=None):
     prefix = "peer_median_" if peer else "primary_"
     price = comparison.get(f"{prefix}price")
@@ -4785,9 +4804,12 @@ if "analysis_results" in st.session_state:
                     cols[3].metric("Edge", f"{c['edge_pct']:+.2f}%")
                     cols[4].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
                     cols[5].metric("Projected Margin", f"{c['pred_game_margin']:+.2f}")
-                    p_val, p_delta = _dk_payout_strs(c.get("price"))
-                    cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
-                                   help="American odds and profit on a $10 bet at DraftKings.")
+                    _sbook = _rec_book_label(c)
+                    p_val, p_delta = _dk_payout_strs(_exec_price(c) if _sbook
+                                                     else c.get("price"))
+                    cols[6].metric(_payout_label(c), p_val, delta=p_delta, delta_color="off",
+                                   help=f"American odds and profit on a $10 bet at "
+                                        f"{_sbook or 'the recommended book'}.")
                     _render_market_comparison(
                         c.get("market_comparison"), ar["sport_key"],
                         market_key="spreads")
@@ -4873,20 +4895,20 @@ if "analysis_results" in st.session_state:
                 # to OVER if neither, so the metric is informative).
                 if c.get("is_under_value"):
                     side = "UNDER"
-                    payout_price = c.get("under_price")
-                    payout_label = "DK Payout (UNDER)"
                     model_probability = 100.0 - c["over_hit_rate"]
                     implied_probability = c.get("under_implied", 50.0)
                     edge_pct = c.get("under_edge_pct", model_probability - implied_probability)
                     expected_roi = c.get("under_expected_roi_pct")
                 else:
                     side = "OVER"
-                    payout_price = c.get("over_price")
-                    payout_label = "DK Payout (OVER)"
                     model_probability = c["over_hit_rate"]
                     implied_probability = c.get("over_implied", 50.0)
                     edge_pct = c.get("over_edge_pct", model_probability - implied_probability)
                     expected_roi = c.get("over_expected_roi_pct")
+                _tbook = _rec_book_label(c, side)
+                payout_price = (_exec_price(c, side) if _tbook
+                                else c.get(f"{side.lower()}_price"))
+                payout_label = _payout_label(c, side=side, suffix=f" ({side})")
                 if c.get("is_over_value") or c.get("is_under_value"):
                     _select_bet_checkbox(c, "total", side=side)
                 p_val, p_delta = _dk_payout_strs(payout_price)
@@ -4899,7 +4921,8 @@ if "analysis_results" in st.session_state:
                 cols[5].metric("Expected ROI", (f"{expected_roi:+.2f}%"
                                                  if expected_roi is not None else "n/a"))
                 cols[6].metric(payout_label, p_val, delta=p_delta, delta_color="off",
-                               help="American odds and profit on a $10 bet at DraftKings.")
+                               help=f"American odds and profit on a $10 bet at "
+                                    f"{_tbook or 'the recommended book'}.")
                 st.caption(f"Projected total minus book line: {c['diff_from_line']:+.2f}")
                 _render_market_comparison(
                     (c.get("market_comparisons") or {}).get(side.title()),

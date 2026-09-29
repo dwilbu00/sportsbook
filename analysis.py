@@ -97,6 +97,78 @@ def _exec_book_fields(items, line=None, line_key=None):
     return fields
 
 
+def _book_own_offer(items, sub):
+    """The single featured offer a book (matched by `sub` in book_key/book) actually posts
+    for one side: (line, price, link, sid), or None. `line` reads 'line' (totals) else
+    'spread'. Best (highest American) if a book somehow lists more than one — normally one."""
+    best = None
+    for o in items or []:
+        bk = str(o.get("book_key") or o.get("book") or "").lower()
+        if sub not in bk:
+            continue
+        p = o.get("price")
+        if not isinstance(p, (int, float)) or isinstance(p, bool):
+            continue
+        if best is None or p > best[1]:
+            ln = o.get("line", o.get("spread"))
+            best = (ln, p, o.get("link"), o.get("sid"))
+    return best
+
+
+def _book_total(over_odds, under_odds, sub):
+    """A book's posted TOTAL (its featured line + both sides), or None. Over defines the
+    line; under must match it (else its price is dropped)."""
+    ov = _book_own_offer(over_odds, sub)
+    if ov is None or ov[0] is None:
+        return None
+    line = ov[0]
+    un = _book_own_offer(under_odds, sub)
+    if un is not None and un[0] is not None and abs(un[0] - line) > 1e-9:
+        un = None                                   # under at a different line → unusable
+    return {"book": "FanDuel" if "fan" in sub else "DraftKings", "line": line,
+            "over_price": ov[1], "over_link": ov[2], "over_sid": ov[3],
+            "under_price": un[1] if un else None,
+            "under_link": un[2] if un else None,
+            "under_sid": un[3] if un else None}
+
+
+def _total_line_value(bt, median, sigma):
+    """Line-value bet on a book's TOTAL vs the market median (owner 2026-09-29). The median
+    is the sharp true total; a book line BELOW it → OVER value, ABOVE → UNDER value; AT it →
+    no value. Probability from a Normal centered at the median with the model's outcome σ,
+    EV at the book's own price. Returns {side, book, line, price, P, ev, link, sid} or None."""
+    if not bt or not sigma or sigma <= 0 or bt.get("line") is None:
+        return None
+    L = bt["line"]
+    if L < median - 1e-9:
+        side, P = "OVER", 1.0 - _norm_cdf((L - median) / sigma)
+        price, link, sid = bt["over_price"], bt["over_link"], bt["over_sid"]
+    elif L > median + 1e-9:
+        side, P = "UNDER", _norm_cdf((L - median) / sigma)
+        price, link, sid = bt["under_price"], bt["under_link"], bt["under_sid"]
+    else:
+        return None                                 # book sits on the median → no line value
+    if price is None:
+        return None
+    return {"side": side, "book": bt["book"], "line": L, "price": price, "P": P,
+            "ev": _expected_roi(P, price), "link": link, "sid": sid}
+
+
+def _spread_line_value(book_offer, median_spread, sigma):
+    """Line-value bet on a team's SPREAD: only a bet when the book's line is a BETTER number
+    than the median (numerically greater — more points / laying fewer). P(cover at that line)
+    from a margin Normal centered so the median line is a coin flip. Returns
+    {line, price, P, ev, link, sid} or None (worse-or-equal number / no σ / no price)."""
+    if not book_offer or not sigma or sigma <= 0:
+        return None
+    L, price, link, sid = book_offer
+    if L is None or price is None or median_spread is None or L <= median_spread + 1e-9:
+        return None
+    P = 1.0 - _norm_cdf((median_spread - L) / sigma)
+    return {"line": L, "price": price, "P": P, "ev": _expected_roi(P, price),
+            "link": link, "sid": sid}
+
+
 def _apply_starter_logit(p, edge, weight):
     """Shift probability p in logit space by weight*edge, bounded to [.02,.98].
     edge>0 favors the team; weight is the (calibratable) logit multiplier."""
@@ -746,28 +818,10 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
     diff = projected_total - consensus_line
 
-    # Prices for the consensus line, picked from each side's odds list.
+    # Prices at the consensus (median) line — the de-vig baseline the EDGE is measured
+    # against + the display price. (Side + EV come from LINE VALUE below, not these.)
     over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
     under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
-    # Executable surface (DK/FD only) for each side at the consensus line — one-tap
-    # slips + book-isolated parlay legs + EV. The edge is measured vs the consensus
-    # de-vig (over_implied below); price/EV/value use the best DK/FD offer.
-    _ex_over = _exec_book_fields(over_odds, line=consensus_line, line_key="line")
-    _ex_under = _exec_book_fields(under_odds, line=consensus_line, line_key="line")
-
-    # Blend the model over-rate toward the de-vigged market over probability
-    # using the offline-fitted weight (w=1.0 → pure model = original).
-    # Calibrated overconfidence correction: pull the model probability toward
-    # 0.5 before any market blend (no-op when no shrink is configured).
-    over_hit_rate = _apply_shrink(model_over_hit_rate, sport_key, "totals")
-    blend_w = _blend_weight(sport_key, "totals")
-    if blend_w < 1.0 and over_price is not None and under_price is not None:
-        fair_over, _ = devig_two_way(american_to_implied_prob(over_price),
-                                     american_to_implied_prob(under_price))
-        over_hit_rate = blend_w * over_hit_rate + (1.0 - blend_w) * fair_over
-
-    # Edge vs the DE-VIGGED fair probability (comparable across markets); fall
-    # back to raw implied when a side has no price, or 0.5 when both are missing.
     raw_over_implied = (american_to_implied_prob(over_price)
                         if over_price is not None else None)
     raw_under_implied = (american_to_implied_prob(under_price)
@@ -778,15 +832,45 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     under_implied = _devig_fair(raw_under_implied, raw_over_implied)
     if under_implied is None:
         under_implied = 0.50
-    over_edge = over_hit_rate - over_implied
+
+    # ── LINE-VALUE selection (owner 2026-09-29) ──────────────────────────────────
+    # The market median is the sharp true total; a DK/FD line OFF it is free value.
+    # Bet the beneficial side (book line < median → OVER, > median → UNDER), pricing
+    # P from a Normal centered at the median with the model's outcome σ (total_std),
+    # EV at the book's OWN price. The model's projection has no team edge (see
+    # team-market-audit) so it's display-only. A book on the median → no bet.
+    dk_tot = _book_total(over_odds, under_odds, "draft")
+    fd_tot = _book_total(over_odds, under_odds, "fan")
+    _lvs = [x for x in (_total_line_value(dk_tot, consensus_line, total_std),
+                        _total_line_value(fd_tot, consensus_line, total_std))
+            if x and x["ev"] is not None]
+    lv = max(_lvs, key=lambda x: x["ev"], default=None)
+
+    if lv is not None:
+        # over_hit_rate stays "prob of the OVER" (display + parlay hist_prob); the
+        # recommended side is lv["side"] and its EV is lv["ev"].
+        over_hit_rate = lv["P"] if lv["side"] == "OVER" else 1.0 - lv["P"]
+        bet_line = lv["line"]
+        over_roi = lv["ev"] if lv["side"] == "OVER" else None
+        under_roi = lv["ev"] if lv["side"] == "UNDER" else None
+    else:
+        # No off-median DK/FD line → no line-value bet. Keep the (shrunk) model
+        # projection for display only; value flags stay off.
+        over_hit_rate = _apply_shrink(model_over_hit_rate, sport_key, "totals")
+        bet_line = consensus_line
+        over_roi = under_roi = None
+
     under_hit_rate = 1.0 - over_hit_rate
+    over_edge = over_hit_rate - over_implied
     under_edge = under_hit_rate - under_implied
-    # EV/value at the best EXECUTABLE (DK/FD) price for each side; None → can't bet it
-    # at DK/FD (e.g. neither posts the consensus line) → not flagged value.
-    over_roi = (_expected_roi(over_hit_rate, _ex_over["best_exec_price"])
-                if _ex_over["best_exec_price"] is not None else None)
-    under_roi = (_expected_roi(under_hit_rate, _ex_under["best_exec_price"])
-                 if _ex_under["best_exec_price"] is not None else None)
+    suppressed = _market_suppressed(sport_key, "totals")
+    # Line-value gate = positive EV at the executable price. The median is a reliable
+    # true-line proxy, so a small line edge is real (not held to the model-edge
+    # threshold that guards our overconfident point estimates). Only the value side flags.
+    is_over_value = (not suppressed and lv is not None and lv["side"] == "OVER"
+                     and over_roi is not None and over_roi > 0)
+    is_under_value = (not suppressed and lv is not None and lv["side"] == "UNDER"
+                      and under_roi is not None and under_roi > 0)
 
     candidates.append({
         "type": "total_over",
@@ -795,7 +879,9 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
         # (which matches home+away strictly) without re-parsing the matchup string.
         "home_team": home_team,
         "away_team": away_team,
-        "line": consensus_line,
+        "line": bet_line,                            # the line we'd actually bet
+        "consensus_line": consensus_line,            # the market median (line-value ref)
+        "line_value": lv is not None,                # this recommendation is a line-value play
         "projected_total": round(projected_total, 2),
         "diff_from_line": round(diff, 2),
         "model_over_hit_rate": round(model_over_hit_rate * 100, 2),
@@ -810,28 +896,28 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
                                     if under_roi is not None else None),
         "home_avg_scored": round(home_avg_scored, 2),
         "away_avg_scored": round(away_avg_scored, 2),
-        "is_over_value": (not _market_suppressed(sport_key, "totals"))
-                         and diff > 0 and _prop_is_value(over_edge, threshold, over_roi),
-        "is_under_value": (not _market_suppressed(sport_key, "totals"))
-                          and diff < 0 and _prop_is_value(under_edge, threshold, under_roi),
+        "is_over_value": is_over_value,
+        "is_under_value": is_under_value,
         "over_price": over_price,
         "under_price": under_price,
-        # When a side has no consensus price, its over_implied/over_edge_pct are
-        # a 0.50-devig placeholder, not a real market number. The value gate
-        # already blocks surfacing (over_roi/under_roi is None without a price),
-        # so these flags are display metadata: the UI can mark the side unpriced
-        # instead of showing the placeholder-derived edge.
         "over_price_missing": over_price is None,
         "under_price_missing": under_price is None,
-        # Executable per-book (DK/FD) prices + betslip link/sid, per side.
-        "dk_over_price": _ex_over["dk_price"], "dk_under_price": _ex_under["dk_price"],
-        "fd_over_price": _ex_over["fd_price"], "fd_under_price": _ex_under["fd_price"],
-        "dk_over_link": _ex_over["dk_link"], "dk_under_link": _ex_under["dk_link"],
-        "fd_over_link": _ex_over["fd_link"], "fd_under_link": _ex_under["fd_link"],
-        "dk_over_sid": _ex_over["dk_sid"], "dk_under_sid": _ex_under["dk_sid"],
-        "fd_over_sid": _ex_over["fd_sid"], "fd_under_sid": _ex_under["fd_sid"],
-        "over_book": _ex_over["best_exec_book"],     # best of DK/FD per side (betslip button)
-        "under_book": _ex_under["best_exec_book"],
+        # Executable per-book (DK/FD) prices + betslip link/sid at each book's OWN line.
+        "dk_over_price": dk_tot["over_price"] if dk_tot else None,
+        "dk_under_price": dk_tot["under_price"] if dk_tot else None,
+        "fd_over_price": fd_tot["over_price"] if fd_tot else None,
+        "fd_under_price": fd_tot["under_price"] if fd_tot else None,
+        "dk_over_link": dk_tot["over_link"] if dk_tot else None,
+        "dk_under_link": dk_tot["under_link"] if dk_tot else None,
+        "fd_over_link": fd_tot["over_link"] if fd_tot else None,
+        "fd_under_link": fd_tot["under_link"] if fd_tot else None,
+        "dk_over_sid": dk_tot["over_sid"] if dk_tot else None,
+        "dk_under_sid": dk_tot["under_sid"] if dk_tot else None,
+        "fd_over_sid": fd_tot["over_sid"] if fd_tot else None,
+        "fd_under_sid": fd_tot["under_sid"] if fd_tot else None,
+        # Recommended book per side (the line-value bet's book) → betslip button.
+        "over_book": lv["book"] if (lv and lv["side"] == "OVER") else None,
+        "under_book": lv["book"] if (lv and lv["side"] == "UNDER") else None,
     })
 
     return candidates
@@ -946,47 +1032,66 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
                        current_cover, expected_cover, fair_implied):
         raw_implied = (american_to_implied_prob(price)
                        if price is not None else 0.50)
-        # Edge vs the de-vigged fair cover prob; fall back to raw implied when
-        # the market is one-sided. Value additionally requires +EV at the price.
         if fair_implied is None:
             fair_implied = raw_implied
-        edge = cover_prob - fair_implied
-        # Executable surface (DK/FD only) for this team's spread at its consensus line —
-        # one-tap slips + book-isolated parlay legs + EV. Edge stays vs the consensus
-        # de-vig (fair_implied); price/EV/value use the best DK/FD offer at that line
-        # (None → not posted at DK/FD for this line → not flagged value).
-        _ex = _exec_book_fields(game_odds["spreads"].get(team_name, []),
-                                line=spread, line_key="spread")
-        roi = (_expected_roi(cover_prob, _ex["best_exec_price"])
-               if _ex["best_exec_price"] is not None else None)
+        # ── LINE-VALUE (owner 2026-09-29) ──────────────────────────────────────
+        # Bet this team's spread only when a book posts a BETTER number than the
+        # median (book line > median → more points / laying fewer). P(cover at that
+        # line) from a margin Normal centered so the median line is a coin flip
+        # (σ = pred_std), EV at the book's own price. The model cover_prob is kept
+        # for display; line value drives side + EV (the model has no team edge).
+        dk_sp = _book_own_offer(game_odds["spreads"].get(team_name, []), "draft")
+        fd_sp = _book_own_offer(game_odds["spreads"].get(team_name, []), "fan")
+
+        def _tlv(offer, book_name):
+            r = _spread_line_value(offer, spread, pred_std)
+            if r:
+                r["book"] = book_name
+            return r
+        _svs = [x for x in (_tlv(dk_sp, "DraftKings"), _tlv(fd_sp, "FanDuel"))
+                if x and x["ev"] is not None]
+        slv = max(_svs, key=lambda x: x["ev"], default=None)
+
+        if slv is not None:
+            disp_cover, roi, bet_line = slv["P"], slv["ev"], slv["line"]
+            edge = slv["P"] - fair_implied
+        else:
+            disp_cover, roi, bet_line = cover_prob, None, spread
+            edge = cover_prob - fair_implied
+        # Line-value gate = positive EV at the executable price (see totals note).
+        is_value = ((not _market_suppressed(sport_key, "spreads"))
+                    and slv is not None and roi is not None and roi > 0)
         candidates.append({
             "type": "spread",
             "team": team_name,
             "opponent": opponent,
             "home_away": "HOME" if is_home else "AWAY",
-            "spread": spread,
+            "spread": bet_line,                     # the line we'd actually bet
+            "consensus_spread": spread,             # the market median (line-value ref)
+            "line_value": slv is not None,
             "avg_margin": round(team_avg_margin, 2),
             "model_cover_rate": round(model_cover * 100, 2),
-            "cover_rate": round(cover_prob * 100, 2),
+            "cover_rate": round(disp_cover * 100, 2),
             "implied_prob": round(fair_implied * 100, 2),
             "games_sampled": games_sampled,
             "edge_pct": round(edge * 100, 2),
             "expected_roi_pct": (round(roi * 100, 2)
                                   if roi is not None else None),
-            "is_value": (not _market_suppressed(sport_key, "spreads"))
-                        and _prop_is_value(edge, threshold, roi),
+            "is_value": is_value,
             "pred_game_margin": round(pred_margin, 2),
             "pred_game_std": round(pred_std, 2),
             "price": price,
             # When price is missing, implied_prob/edge_pct are a 0.50 placeholder
-            # (not a market number). The value gate already blocks surfacing
-            # (roi is None without a price); this flag is display metadata.
+            # (not a market number). This flag is display metadata.
             "price_missing": price is None,
-            # Executable per-book (DK/FD) price + betslip link/sid (single side = this team).
-            "dk_price": _ex["dk_price"], "fd_price": _ex["fd_price"],
-            "dk_link": _ex["dk_link"], "fd_link": _ex["fd_link"],
-            "dk_sid": _ex["dk_sid"], "fd_sid": _ex["fd_sid"],
-            "dk_book": _ex["best_exec_book"],   # best of DK/FD → _render_bet_links button
+            # Executable per-book (DK/FD) price + betslip link/sid at each book's OWN line.
+            "dk_price": dk_sp[1] if dk_sp else None,
+            "fd_price": fd_sp[1] if fd_sp else None,
+            "dk_link": dk_sp[2] if dk_sp else None,
+            "fd_link": fd_sp[2] if fd_sp else None,
+            "dk_sid": dk_sp[3] if dk_sp else None,
+            "fd_sid": fd_sp[3] if fd_sp else None,
+            "dk_book": slv["book"] if slv else None,   # the line-value book → betslip button
             "model_source": ("expected_runs_ensemble" if expected_runs
                              else "current_margin_model"),
         })

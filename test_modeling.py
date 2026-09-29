@@ -973,23 +973,35 @@ class TeamMarketSuppressTests(unittest.TestCase):
         self.assertFalse(pricing_common._market_suppressed("baseball_mlb", ""))
 
     def test_suppressed_totals_never_flags_value(self):
-        # Force the underlying value gate True so the ONLY thing that can zero the
-        # flag is the suppression guard; additive-on gives a clean over (diff>0).
+        # Line-value OVER: DraftKings posts 7.5 while the market median is 8.5, so the
+        # OVER at the lower line is +EV. Suppression must still zero the flag.
+        def _books(line, price=-110, tag=None):
+            o = {"book": tag or "Peer", "book_key": (tag or "peer").lower(),
+                 "line": line, "price": price}
+            if tag == "DraftKings":
+                o.update(link=f"dk{line}", sid=f"dk{line}")
+            return o
+        go = {
+            "home_team": "Home", "away_team": "Away",
+            "totals": {
+                "Over": [_books(7.5, tag="DraftKings"), _books(8.5, tag="PeerA"),
+                         _books(8.5, tag="PeerB")],
+                "Under": [_books(7.5, tag="DraftKings"), _books(8.5, tag="PeerA"),
+                          _books(8.5, tag="PeerB")],
+            },
+        }
+
         def _over():
-            with patch("analysis._prop_is_value", return_value=True), \
-                    patch.object(mlb_starters, "_mlb_additive_totals_enabled",
-                                 return_value=True), \
-                    patch.object(mlb_starters, "live_additive_runs",
-                                 return_value=(7.25, 6.75)):  # 14.0 > 8.5 line
-                cands = analysis.analyze_totals_value(
-                    AdditiveTotalsTests._game_odds(),
-                    *AdditiveTotalsTests._team_stats(),
-                    sport_key="baseball_mlb",
-                    matchup_features=AdditiveTotalsTests._matchup_features())
+            cands = analysis.analyze_totals_value(
+                go, *AdditiveTotalsTests._team_stats(), sport_key="baseball_mlb",
+                matchup_features=AdditiveTotalsTests._matchup_features())
             return next(c for c in cands if c["type"] == "total_over")
 
-        self._seed([])                       # not suppressed -> flag CAN be True
-        self.assertTrue(_over()["is_over_value"])
+        self._seed([])                       # not suppressed -> line-value flag CAN be True
+        c = _over()
+        self.assertTrue(c["is_over_value"])
+        self.assertTrue(c["line_value"])
+        self.assertEqual(c["line"], 7.5)     # bet the DK line, not the 8.5 median
         self._seed(["totals"])               # suppressed -> forced False
         self.assertFalse(_over()["is_over_value"])
         self.assertFalse(_over()["is_under_value"])
@@ -3422,6 +3434,103 @@ class ExecutableBookTeamMarketTests(unittest.TestCase):
         self.assertIsNone(c["under_expected_roi_pct"])
         self.assertFalse(c["is_over_value"])
         self.assertFalse(c["is_under_value"])
+
+
+class LineValueTeamMarketTests(unittest.TestCase):
+    """Team spreads/totals are LINE-VALUE plays (owner 2026-09-29): a DK/FD line off the
+    market median → bet the beneficial side (total lower→OVER / higher→UNDER; spread = the
+    better number), priced via the model's σ, at the book's OWN line. On the median → no bet."""
+
+    @staticmethod
+    def _stats():
+        games = [
+            {"home_team": "Home", "away_team": "Away", "home_score": 24, "away_score": 20, "total_score": 44},
+            {"home_team": "Away", "away_team": "Home", "home_score": 13, "away_score": 30, "total_score": 43},
+            {"home_team": "Home", "away_team": "Away", "home_score": 27, "away_score": 17, "total_score": 44},
+            {"home_team": "Away", "away_team": "Home", "home_score": 24, "away_score": 21, "total_score": 45},
+            {"home_team": "Home", "away_team": "Away", "home_score": 20, "away_score": 23, "total_score": 43},
+            {"home_team": "Away", "away_team": "Home", "home_score": 19, "away_score": 26, "total_score": 45},
+        ]
+        base = {"season": {"win_pct": 0.5, "runs_scored": None, "runs_allowed": None},
+                "recent": {"win_pct": 0.5, "avg_scored": 22.0, "avg_allowed": 21.0},
+                "recent_games": games}
+        return dict(base), dict(base)
+
+    def _totals_go(self, dk_line):
+        def side():
+            return [{"book": "DraftKings", "book_key": "draftkings", "line": dk_line,
+                     "price": -110, "link": "dk", "sid": "dk"},
+                    {"book": "PeerA", "book_key": "peera", "line": 45.5, "price": -110},
+                    {"book": "PeerB", "book_key": "peerb", "line": 45.5, "price": -110}]
+        return {"home_team": "Home", "away_team": "Away",
+                "totals": {"Over": side(), "Under": side()}}
+
+    def _total(self, dk_line):
+        cands = analysis.analyze_totals_value(
+            self._totals_go(dk_line), *self._stats(),
+            sport_key="americanfootball_nfl")
+        return cands[0]
+
+    def test_total_line_below_median_bets_over(self):
+        c = self._total(44.5)                     # DK 44.5 < median 45.5
+        self.assertTrue(c["is_over_value"])
+        self.assertFalse(c["is_under_value"])
+        self.assertTrue(c["line_value"])
+        self.assertEqual(c["line"], 44.5)         # bet the DK line, not the median
+        self.assertEqual(c["over_book"], "DraftKings")
+
+    def test_total_line_above_median_bets_under(self):
+        c = self._total(46.5)                     # DK 46.5 > median 45.5
+        self.assertTrue(c["is_under_value"])
+        self.assertFalse(c["is_over_value"])
+        self.assertEqual(c["line"], 46.5)
+        self.assertEqual(c["under_book"], "DraftKings")
+
+    def test_total_on_median_no_bet(self):
+        c = self._total(45.5)                     # DK == median → no line value
+        self.assertFalse(c["is_over_value"])
+        self.assertFalse(c["is_under_value"])
+        self.assertFalse(c["line_value"])
+
+    def _spreads_go(self, dk_home):
+        def team(dk_sp, peer_sp):
+            return [{"book": "DraftKings", "book_key": "draftkings", "spread": dk_sp,
+                     "price": -110, "link": "dk", "sid": "dk"},
+                    {"book": "PeerA", "book_key": "peera", "spread": peer_sp, "price": -110},
+                    {"book": "PeerB", "book_key": "peerb", "spread": peer_sp, "price": -110}]
+        return {"home_team": "Home", "away_team": "Away",
+                "spreads": {"Home": team(dk_home, -3.5), "Away": team(-dk_home, 3.5)}}
+
+    def _spreads(self, dk_home):
+        cands = analysis.analyze_spreads_value(
+            self._spreads_go(dk_home), *self._stats(),
+            sport_key="americanfootball_nfl")
+        return {c["team"]: c for c in cands}
+
+    def test_spread_better_number_is_value(self):
+        by = self._spreads(-1.5)                  # DK home -1.5 vs median -3.5 (better)
+        self.assertTrue(by["Home"]["is_value"])
+        self.assertEqual(by["Home"]["spread"], -1.5)   # bet the DK line
+        self.assertEqual(by["Home"]["dk_book"], "DraftKings")
+        self.assertFalse(by["Away"]["is_value"])       # away's +1.5 < median +3.5 (worse)
+
+    def test_spread_on_median_no_bet(self):
+        by = self._spreads(-3.5)                  # DK == median for both sides
+        self.assertFalse(by["Home"]["is_value"])
+        self.assertFalse(by["Away"]["is_value"])
+
+    def test_line_value_helpers(self):
+        bt = {"book": "DraftKings", "line": 44.5, "over_price": -110, "over_link": "o",
+              "over_sid": "os", "under_price": -110, "under_link": "u", "under_sid": "us"}
+        lv = analysis._total_line_value(bt, 45.5, 3.0)   # below median → over
+        self.assertEqual(lv["side"], "OVER")
+        self.assertGreater(lv["P"], 0.5)
+        self.assertEqual(lv["price"], -110)
+        self.assertIsNone(analysis._total_line_value({**bt, "line": 45.5}, 45.5, 3.0))  # on median
+        self.assertIsNone(analysis._total_line_value(bt, 45.5, 0.0))  # no sigma
+        sv = analysis._spread_line_value((-2.5, -110, "l", "s"), -3.5, 13.0)  # better number
+        self.assertGreater(sv["P"], 0.5)
+        self.assertIsNone(analysis._spread_line_value((-4.5, -110, "l", "s"), -3.5, 13.0))  # worse
 
 
 if __name__ == "__main__":
