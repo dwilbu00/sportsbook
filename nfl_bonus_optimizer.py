@@ -47,6 +47,11 @@ TOP_K = 8            # plays to surface per bonus
 # most players are <50% to score). ALWAYS priced on the OVER regardless of side arg.
 _OCC = {"player_anytime_td", "batter_home_runs"}
 
+# Team bonus markets: pseudo-"prop" keys for the team leg universe (moneyline/spread/total).
+# Cross-game only — same-game team correlation isn't in the copula, so they're excluded from
+# SGP stacks; a 'team' bonus market scope expands to this set.
+TEAM_MARKETS = {"moneyline", "spread", "total"}
+
 
 def collect_week_legs(train_seasons, season, week, books):
     """{book: [leg]} for one slate. leg carries the FAVORITE side + that side's price + de-vig P
@@ -191,6 +196,8 @@ def _scope_legs(legs, markets):
     mset = {m for m in (markets or ()) if m}
     if not mset:
         return legs
+    if "team" in mset:                     # a 'team' scope = all team markets (ML/spread/total)
+        mset |= TEAM_MARKETS
     return [l for l in legs if l.get("prop") in mset]
 
 
@@ -331,6 +338,72 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     return legs
 
 
+def legs_from_team_candidates(team_cands, book, min_p=0.5):
+    """Bonus legs from the app's analyzed TEAM candidates (moneyline / spread / total).
+
+    Leg P = the de-vigged consensus fair prob of the FAVORITE side (book-agnostic, exactly
+    like the prop legs); odds + betslip link/sid = the requested book (DK/FD); the leg is
+    excluded when P < ``min_p`` (bonus legs are favorites) or that book doesn't post the
+    side/line. Team legs are CROSS-GAME only — tagged ``is_team`` so the SGP builders skip
+    them (same-game team correlation isn't in the copula, independence would overstate the
+    joint). Grading identity travels in EXISTING fields — no schema change: ML/spread carry
+    side='home'/'away' + team/opp; totals carry team=home, opp=away + side='over'/'under';
+    parlay_store grades them via game_results.final_score + grade_team_bet.
+
+    ``team_cands``: {"moneyline": [...], "spreads": [...], "totals": [...]} (the analyzed
+    all_ml / all_spreads / all_totals, enriched with commence_time/game_date)."""
+    pre = "dk" if book == "draftkings" else "fd" if book == "fanduel" else None
+    if pre is None:
+        return []
+    legs = []
+
+    def _add(gid, prop, player, side, P, price, link, sid, team, opp, point, label,
+             commence, gdate):
+        if gid is None or P is None or P < min_p or price is None:
+            return
+        legs.append({
+            "gid": gid, "prop": prop, "player": player, "team": team, "opp": opp,
+            "line": point, "side": side, "P": P, "fair_over": True, "t_over": 0.0,
+            "odds": price, "commence_time": commence, "game_date": gdate,
+            "game_key": gid, "is_team": True, "label": label,
+            f"{pre}_link": link, f"{pre}_sid": sid})
+
+    for c in team_cands.get("moneyline", []) or []:
+        _add(c.get("event_id"), "moneyline", f"{c.get('team')} ML",
+             "home" if c.get("home_away") == "HOME" else "away",
+             (c.get("fair_prob") or 0.0) / 100.0,
+             c.get(f"{pre}_price"), c.get(f"{pre}_link"), c.get(f"{pre}_sid"),
+             c.get("team"), c.get("opponent"), None, f"{c.get('team')} ML",
+             c.get("commence_time"), c.get("game_date"))
+
+    for c in team_cands.get("spreads", []) or []:
+        sp = c.get("spread")
+        lbl = f"{c.get('team')} {sp:+g}" if sp is not None else str(c.get("team"))
+        _add(c.get("event_id"), "spread", lbl,
+             "home" if c.get("home_away") == "HOME" else "away",
+             (c.get("implied_prob") or 0.0) / 100.0,
+             c.get(f"{pre}_price"), c.get(f"{pre}_link"), c.get(f"{pre}_sid"),
+             c.get("team"), c.get("opponent"), sp, lbl,
+             c.get("commence_time"), c.get("game_date"))
+
+    for c in team_cands.get("totals", []) or []:
+        over_p = (c.get("over_implied") or 0.0) / 100.0
+        under_p = (c.get("under_implied") or 0.0) / 100.0
+        use_over = over_p >= under_p
+        side = "over" if use_over else "under"
+        line = c.get("line")
+        lbl = f"{'Over' if use_over else 'Under'} {line}"
+        _add(c.get("event_id"), "total", lbl, side,
+             over_p if use_over else under_p,
+             c.get(f"{pre}_over_price") if use_over else c.get(f"{pre}_under_price"),
+             c.get(f"{pre}_over_link") if use_over else c.get(f"{pre}_under_link"),
+             c.get(f"{pre}_over_sid") if use_over else c.get(f"{pre}_under_sid"),
+             c.get("home_team"), c.get("away_team"), line, lbl,
+             c.get("commence_time"), c.get("game_date"))
+
+    return legs
+
+
 # ── Deterministic SGP leg-conflict detection (F12) ─────────────────────────────
 # Independence pricing multiplies marginals, which assigns a nonzero joint P to a
 # LOGICALLY IMPOSSIBLE same-player combination (e.g. OVER 1.5 hits AND UNDER 0.5
@@ -450,8 +523,8 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
     min_overall_dec = bonuslib._min_dec(bonus.min_odds_overall)   # achievability floor
     bygame = defaultdict(list)
     for l in legs:
-        if _leg_ok(l, bonus) and l["P"] >= min_leg_p:
-            bygame[l["gid"]].append(l)
+        if not l.get("is_team") and _leg_ok(l, bonus) and l["P"] >= min_leg_p:
+            bygame[l["gid"]].append(l)   # team legs are cross-game only (no SGP)
     out = []
     for gid, gl in bygame.items():
         if len(gl) < need:
@@ -477,6 +550,8 @@ def sgp_stacks_indep(legs, bonus, bankroll, leg_count=None, min_leg_p=0.0):
 
 
 def _label(lg):
+    if lg.get("is_team") or lg["prop"] in TEAM_MARKETS:
+        return f"{(lg.get('label') or lg.get('player') or '')[:24]:<24} @{lg['odds']:>+5.0f}"
     return f"{lg['player'][:18]:<18} {PROP_ABBR[lg['prop']]}{lg['side'][0]} {lg['line']:>4.1f} @{lg['odds']:>+5.0f}"
 
 
@@ -576,8 +651,8 @@ def sgp_stacks(legs, bonus, rho, bankroll, leg_count=None):
     min_overall_dec = bonuslib._min_dec(bonus.min_odds_overall)   # achievability floor
     bygame = defaultdict(list)
     for l in legs:
-        if _leg_ok(l, bonus):
-            bygame[l["gid"]].append(l)
+        if not l.get("is_team") and _leg_ok(l, bonus):
+            bygame[l["gid"]].append(l)   # team legs are cross-game only (no SGP)
     rng = np.random.default_rng(0)
     out = []
     for gid, gl in bygame.items():

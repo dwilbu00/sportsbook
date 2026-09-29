@@ -2605,6 +2605,16 @@ def render_bonuses():
                                 board["parsed"], bk, None, board_sport, side="favorite")
                             for bk in ("draftkings", "fanduel")}
 
+        # Team-market legs (ML/spread/total) from the analyzed board — cross-game only,
+        # book-isolated, priced off market de-vig like the prop legs. Present only on the
+        # main analyzed board (scoped bonus runs are props-only). Per-bonus market scope
+        # (incl. a 'team' scope) is applied inside evaluate_slate.
+        _team_cands = board.get("team_candidates")
+        if _team_cands:
+            for _bk in ("draftkings", "fanduel"):
+                legs_by_book[_bk] = ((legs_by_book.get(_bk) or [])
+                                     + opt.legs_from_team_candidates(_team_cands, _bk))
+
         # INDEPENDENCE joint for every SGP: the leg universe is now broad (yardages/
         # TDs/HR), which the copula has no rho for, and independence was already the
         # validated "adequate, slightly conservative" base joint. (Frozen NFL rho stays
@@ -2665,6 +2675,8 @@ def render_bonuses():
                     "stacks can still appear below; add more games for cross-game parlays.")
 
     def _leglabel(l):
+        if l.get("is_team"):          # ML/spread/total: a ready-made label, no line/side glyph
+            return f"{l.get('label') or l.get('player', '')} @{l['odds']:+.0f}"
         return (f"{l['player']} {pabbr.get(l['prop'], l['prop'])} {l['side'][0]} "
                 f"{l['line']} @{l['odds']:+.0f}")
 
@@ -4553,6 +4565,24 @@ if analyze_clicked and selected_game_labels:
     try:
         if isinstance(st.session_state.get("bonus_board"), dict):
             st.session_state["bonus_board"]["candidates"] = all_props
+            # Team candidates for the 💰 Bonuses page (ML/spread/total legs). Enrich each
+            # with commence_time/game_date from the events map so a logged team leg is
+            # gradable (analysis stamps only event_id; times live in the events map).
+            _ev_meta = st.session_state["analysis_results"].get("events", {})
+
+            def _with_time(cands):
+                out = []
+                for c in cands or []:
+                    m = _ev_meta.get(c.get("event_id"), {})
+                    out.append({**c,
+                                "commence_time": c.get("commence_time") or m.get("commence_time"),
+                                "game_date": c.get("game_date") or m.get("game_date")})
+                return out
+            st.session_state["bonus_board"]["team_candidates"] = {
+                "moneyline": _with_time(all_ml),
+                "spreads": _with_time(all_spreads),
+                "totals": _with_time(all_totals),
+            }
     except Exception:
         pass
     # Forward-track the model's team-market picks (moneyline/spread/total),

@@ -209,5 +209,62 @@ class ManualTicketRoundTripTests(_ParlayStoreTest):
                          {"Amon-Ra St. Brown", "Jahmyr Gibbs"})
 
 
+class TeamLegGradingTests(unittest.TestCase):
+    """parlay_store grades team parlay legs (ML/spread/total) via game_results, using the
+    orientation encoded in the leg's OWN fields — no schema change. (Patches game_results,
+    so no DB needed.)"""
+
+    def _leg(self, **kw):
+        base = dict(sport_key="americanfootball_nfl", game_date="2026-09-20",
+                    commence_time="2026-09-20T17:00:00Z")
+        base.update(kw)
+        return base
+
+    def test_moneyline_home_win(self):
+        lg = self._leg(prop_key="moneyline", side="home", team="DAL", opp="NYG", line=None)
+        with patch("game_results.final_score", return_value=(27, 20)) as fs, \
+             patch("game_results.grade_team_bet", return_value="won"):
+            actual, result = parlay_store._grade_leg(lg)
+        self.assertEqual(fs.call_args.args[2:4], ("DAL", "NYG"))   # home=team, away=opp
+        self.assertEqual((actual, result), ("27-20", 1))
+
+    def test_moneyline_away_orientation(self):
+        # bet team is AWAY → home/away reconstructed as (opp, team)
+        lg = self._leg(prop_key="moneyline", side="away", team="NYG", opp="DAL", line=None)
+        with patch("game_results.final_score", return_value=(20, 27)) as fs, \
+             patch("game_results.grade_team_bet", return_value="won"):
+            parlay_store._grade_leg(lg)
+        self.assertEqual(fs.call_args.args[2:4], ("DAL", "NYG"))   # home=DAL, away=NYG
+
+    def test_total_uses_team_as_home_and_point(self):
+        lg = self._leg(prop_key="total", side="over", team="BUF", opp="MIA", line=48.5)
+        with patch("game_results.final_score", return_value=(30, 24)) as fs, \
+             patch("game_results.grade_team_bet", return_value="lost") as gb:
+            actual, result = parlay_store._grade_leg(lg)
+        self.assertEqual(fs.call_args.args[2:4], ("BUF", "MIA"))   # team=home, opp=away
+        self.assertEqual(gb.call_args.args[0:3], ("total", "over", 48.5))
+        self.assertEqual((actual, result), ("30-24", 0))
+
+    def test_not_final_stays_pending(self):
+        lg = self._leg(prop_key="moneyline", side="home", team="DAL", opp="NYG", line=None)
+        with patch("game_results.final_score", return_value=None):
+            self.assertEqual(parlay_store._grade_leg(lg), (None, None))
+
+    def test_push_returns_none_result(self):
+        lg = self._leg(prop_key="spread", side="home", team="DAL", opp="NYG", line=-3.0)
+        with patch("game_results.final_score", return_value=(23, 20)), \
+             patch("game_results.grade_team_bet", return_value="push"):
+            actual, result = parlay_store._grade_leg(lg)
+        self.assertEqual((actual, result), ("23-20", None))
+
+    def test_prop_leg_still_uses_prop_resolver(self):
+        # A normal prop leg must NOT hit the team path (prop_key isn't a team market).
+        lg = self._leg(prop_key="player_receptions", player="X", side="OVER", line=4.5)
+        with patch("recalibration.resolve_one_prop", return_value=6.0) as rp:
+            actual, result = parlay_store._grade_leg(lg)
+        rp.assert_called_once()
+        self.assertEqual((actual, result), (6.0, 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

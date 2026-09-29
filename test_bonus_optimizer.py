@@ -259,6 +259,97 @@ class BetslipThreadTests(unittest.TestCase):
         self.assertEqual(legs[0]["game_key"], "e")
 
 
+class TeamLegTests(unittest.TestCase):
+    """Team markets (ML/spread/total) join the bonus leg universe as CROSS-GAME legs:
+    favorite side only, book-isolated price+link/sid, tagged is_team so SGP builders skip
+    them. Grading identity is carried in existing fields (side=home/away or over/under)."""
+
+    def _cands(self):
+        return {
+            "moneyline": [
+                {"event_id": "g1", "team": "DAL", "opponent": "NYG", "home_away": "HOME",
+                 "fair_prob": 68.0, "dk_price": -180, "fd_price": -175,
+                 "dk_link": "DKml", "dk_sid": "dk_ml", "fd_link": "FDml", "fd_sid": "fd_ml",
+                 "commence_time": "2026-09-20T17:00:00Z", "game_date": "2026-09-20"},
+                {"event_id": "g1", "team": "NYG", "opponent": "DAL", "home_away": "AWAY",
+                 "fair_prob": 32.0, "dk_price": +160, "fd_price": +155,   # underdog → excluded
+                 "dk_link": "x", "dk_sid": "x", "commence_time": "", "game_date": ""},
+            ],
+            "spreads": [
+                {"event_id": "g2", "team": "KC", "opponent": "DEN", "home_away": "HOME",
+                 "spread": -6.5, "implied_prob": 52.0, "dk_price": -110, "fd_price": -112,
+                 "dk_link": "DKsp", "dk_sid": "dk_sp", "fd_link": "FDsp", "fd_sid": "fd_sp",
+                 "commence_time": "2026-09-20T20:00:00Z", "game_date": "2026-09-20"},
+            ],
+            "totals": [
+                {"event_id": "g3", "home_team": "BUF", "away_team": "MIA", "line": 48.5,
+                 "over_implied": 60.0, "under_implied": 40.0,
+                 "dk_over_price": -120, "dk_under_price": +100,
+                 "fd_over_price": -125, "fd_under_price": +102,
+                 "dk_over_link": "DKov", "dk_over_sid": "dk_ov",
+                 "dk_under_link": "DKun", "dk_under_sid": "dk_un",
+                 "fd_over_link": "FDov", "fd_over_sid": "fd_ov",
+                 "fd_under_link": "FDun", "fd_under_sid": "fd_un",
+                 "commence_time": "2026-09-20T20:00:00Z", "game_date": "2026-09-20"},
+            ],
+        }
+
+    def test_dk_team_legs_favorite_side_and_book_isolated(self):
+        legs = opt.legs_from_team_candidates(self._cands(), "draftkings")
+        by = {l["prop"]: l for l in legs}
+        self.assertEqual(set(by), {"moneyline", "spread", "total"})   # 3 favorites
+        ml = by["moneyline"]
+        self.assertEqual(ml["team"], "DAL")            # underdog NYG excluded
+        self.assertEqual(ml["side"], "home")
+        self.assertAlmostEqual(ml["P"], 0.68)
+        self.assertEqual(ml["odds"], -180)             # DK price
+        self.assertEqual(ml["dk_sid"], "dk_ml")
+        self.assertIsNone(ml.get("fd_sid"))            # FD stripped in a DK build
+        self.assertTrue(ml["is_team"])
+        tot = by["total"]                              # favorite side = OVER (60 > 40)
+        self.assertEqual(tot["side"], "over")
+        self.assertEqual(tot["team"], "BUF")           # team=home, opp=away for grading
+        self.assertEqual(tot["opp"], "MIA")
+        self.assertEqual(tot["odds"], -120)            # DK over price
+        self.assertEqual(tot["dk_sid"], "dk_ov")
+
+    def test_fd_team_legs_priced_at_fd(self):
+        legs = opt.legs_from_team_candidates(self._cands(), "fanduel")
+        by = {l["prop"]: l for l in legs}
+        self.assertEqual(by["moneyline"]["odds"], -175)
+        self.assertEqual(by["total"]["odds"], -125)    # FD over price
+        for l in legs:
+            self.assertIsNone(l.get("dk_sid"))
+            self.assertTrue(l.get("fd_sid"))
+
+    def test_book_without_price_excludes_leg(self):
+        cands = self._cands()
+        cands["moneyline"][0]["dk_price"] = None       # DK doesn't post this ML
+        legs = opt.legs_from_team_candidates(cands, "draftkings")
+        self.assertNotIn("moneyline", {l["prop"] for l in legs})
+
+    def test_team_legs_excluded_from_sgp(self):
+        # A team leg + two props share a game; the SGP builder must skip the team leg.
+        team = opt.legs_from_team_candidates(
+            {"moneyline": [{"event_id": "gX", "team": "DAL", "opponent": "NYG",
+                            "home_away": "HOME", "fair_prob": 70.0, "dk_price": -200,
+                            "dk_link": "L", "dk_sid": "S", "commence_time": "",
+                            "game_date": ""}]}, "draftkings")
+        props = [_leg("gX", "player_receptions", "A", .7, -150),
+                 _leg("gX", "player_receptions", "B", .7, -150)]
+        b = Bonus("sgp", .5, min_legs=2)
+        out = opt.sgp_stacks_indep(team + props, b, 1000., leg_count=2)
+        for _jp, _mx, combo, _need in out:
+            for l in combo:
+                self.assertFalse(l.get("is_team"))     # no team legs in any SGP stack
+
+    def test_team_scope_expands_to_team_markets(self):
+        ml = {"prop": "moneyline", "is_team": True}
+        rec = {"prop": "player_receptions"}
+        self.assertEqual(opt._scope_legs([ml, rec], ("team",)), [ml])
+        self.assertEqual(opt._scope_legs([ml, rec], ("player_receptions",)), [rec])
+
+
 class MinOddsOverallSgpTests(unittest.TestCase):
     """SGP must respect the promo's min TOTAL odds (min_odds_overall): (a) do NOT suggest a
     stack whose achievable combined can't reach it — the bug Doug hit (min_overall +1000

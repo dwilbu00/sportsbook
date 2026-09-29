@@ -156,9 +156,51 @@ def load_parlays():
     return out
 
 
+def _grade_team_leg(lg, bet_type):
+    """(actual_score_str, result) for a TEAM parlay leg (moneyline/spread/total), or
+    (None, None) if not yet resolvable. Grades via game_results.final_score + grade_team_bet
+    using the orientation encoded in the leg's OWN fields (no schema change): ML/spread carry
+    side='home'/'away' + team/opp; totals carry team=home, opp=away + side='over'/'under'.
+    result: 1 win, 0 loss, None push."""
+    try:
+        import game_results
+    except Exception:
+        return None, None
+    side = (lg.get("side") or "").lower()
+    team, opp = lg.get("team"), lg.get("opp")
+    if bet_type == "total":
+        home, away, grade_side = team, opp, side       # team=home, opp=away by construction
+    elif side == "home":
+        home, away, grade_side = team, opp, "home"
+    elif side == "away":
+        home, away, grade_side = opp, team, "away"
+    else:
+        return None, None
+    point = None
+    if bet_type in ("spread", "total"):
+        try:
+            point = float(lg.get("line"))
+        except (TypeError, ValueError):
+            return None, None
+    score = game_results.final_score(
+        lg.get("sport_key"), (lg.get("game_date") or "")[:10], home, away,
+        lg.get("commence_time"))
+    if not score:
+        return None, None
+    home_score, away_score = score
+    status = game_results.grade_team_bet(bet_type, grade_side, point, home_score, away_score)
+    if status is None:
+        return None, None
+    return f"{home_score:g}-{away_score:g}", (1 if status == "won"
+                                              else 0 if status == "lost" else None)
+
+
 def _grade_leg(lg):
     """(actual, result) for one leg, or (None, None) if not yet resolvable.
     result: 1 win, 0 loss, None push."""
+    pk = (lg.get("prop_key") or "").lower()
+    if pk in ("moneyline", "spread", "total"):
+        return _grade_team_leg(lg, pk)
     actual = recalibration.resolve_one_prop(
         lg.get("sport_key"), lg.get("player"), lg.get("prop_key"), lg.get("line"),
         (lg.get("game_date") or "")[:10], lg.get("commence_time"))

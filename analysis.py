@@ -589,6 +589,9 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
                                   if expected_roi is not None else None),
             "is_value": (not _market_suppressed(sport_key, "moneyline"))
                         and _prop_is_value(edge, threshold, expected_roi),
+            # De-vigged consensus fair win prob for this team — the bonus-leg P
+            # (calibrated favorite; the bonus engine prices legs off market de-vig).
+            "fair_prob": round(fair_implied * 100, 2),
             # Executable per-book (DK/FD) price + betslip link/sid (single side = this team).
             "dk_price": _ex["dk_price"], "fd_price": _ex["fd_price"],
             "dk_link": _ex["dk_link"], "fd_link": _ex["fd_link"],
@@ -780,6 +783,10 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     candidates.append({
         "type": "total_over",
         "matchup": f"{game_odds['away_team']} @ {game_odds['home_team']}",
+        # Explicit home/away so a bonus total leg can be graded by final_score
+        # (which matches home+away strictly) without re-parsing the matchup string.
+        "home_team": home_team,
+        "away_team": away_team,
         "line": consensus_line,
         "projected_total": round(projected_total, 2),
         "diff_from_line": round(diff, 2),
