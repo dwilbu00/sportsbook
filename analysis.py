@@ -555,15 +555,21 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             fair_implied = avg_implied
         edge = final_prob - fair_implied
 
-        best_offer = min(ml_odds, key=lambda o: o["implied_prob"])
-        best_book_prob = best_offer["implied_prob"]
-        best_edge = final_prob - best_book_prob
-        expected_roi = _expected_roi(final_prob, best_offer["price"])
-
-        # Executable surface (DK/FD only): per-book price + betslip link/sid for THIS
-        # team's ML, for one-tap slips + book-isolated parlays. Additive — the edge/EV
-        # above (all-book consensus) is unchanged. dk_book = best of DK/FD for _render_bet_links.
+        # Best EXECUTABLE offer — DraftKings/FanDuel ONLY (Doug bets DK+FD; other books
+        # are analysis-only, never sized off or displayed). The edge is still measured
+        # against the all-book de-vig consensus (analysis baseline); price/EV/value use
+        # the best DK/FD offer. No DK/FD price → not bettable → expected_roi None → never
+        # flagged value. _ex also carries per-book price + betslip link/sid for slips/parlays.
         _ex = _exec_book_fields(ml_odds)
+        best_price = _ex["best_exec_price"]
+        best_book = _ex["best_exec_book"]
+        if best_price is not None:
+            best_book_prob = american_to_implied_prob(best_price)
+            expected_roi = _expected_roi(final_prob, best_price)
+        else:
+            best_book_prob = avg_implied     # display fallback (consensus) when no DK/FD offer
+            expected_roi = None
+        best_edge = final_prob - best_book_prob
 
         result = {
             "type": "moneyline",
@@ -583,8 +589,8 @@ def analyze_moneyline_value(game_odds, home_team_stats, away_team_stats, thresho
             "edge_pct": round(edge * 100, 2),
             "best_edge_pct": round(best_edge * 100, 2),
             "best_book_implied_prob": round(best_book_prob * 100, 2),
-            "best_book": best_offer["book"],
-            "best_price": best_offer["price"],
+            "best_book": best_book,
+            "best_price": best_price,
             "expected_roi_pct": (round(expected_roi * 100, 2)
                                   if expected_roi is not None else None),
             "is_value": (not _market_suppressed(sport_key, "moneyline"))
@@ -744,8 +750,8 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     over_price = _consensus_price_for_line(over_odds, consensus_line, "line")
     under_price = _consensus_price_for_line(under_odds, consensus_line, "line")
     # Executable surface (DK/FD only) for each side at the consensus line — one-tap
-    # slips + book-isolated parlay legs. Additive; the median over/under_price above
-    # (which feeds the unchanged edge/EV) is untouched.
+    # slips + book-isolated parlay legs + EV. The edge is measured vs the consensus
+    # de-vig (over_implied below); price/EV/value use the best DK/FD offer.
     _ex_over = _exec_book_fields(over_odds, line=consensus_line, line_key="line")
     _ex_under = _exec_book_fields(under_odds, line=consensus_line, line_key="line")
 
@@ -775,10 +781,12 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
     over_edge = over_hit_rate - over_implied
     under_hit_rate = 1.0 - over_hit_rate
     under_edge = under_hit_rate - under_implied
-    over_roi = (_expected_roi(over_hit_rate, over_price)
-                if over_price is not None else None)
-    under_roi = (_expected_roi(under_hit_rate, under_price)
-                 if under_price is not None else None)
+    # EV/value at the best EXECUTABLE (DK/FD) price for each side; None → can't bet it
+    # at DK/FD (e.g. neither posts the consensus line) → not flagged value.
+    over_roi = (_expected_roi(over_hit_rate, _ex_over["best_exec_price"])
+                if _ex_over["best_exec_price"] is not None else None)
+    under_roi = (_expected_roi(under_hit_rate, _ex_under["best_exec_price"])
+                 if _ex_under["best_exec_price"] is not None else None)
 
     candidates.append({
         "type": "total_over",
@@ -943,12 +951,14 @@ def analyze_spreads_value(game_odds, home_team_stats, away_team_stats, threshold
         if fair_implied is None:
             fair_implied = raw_implied
         edge = cover_prob - fair_implied
-        roi = _expected_roi(cover_prob, price) if price is not None else None
         # Executable surface (DK/FD only) for this team's spread at its consensus line —
-        # one-tap slips + book-isolated parlay legs. Additive; the median `price` above
-        # (which feeds the unchanged edge/EV) is untouched.
+        # one-tap slips + book-isolated parlay legs + EV. Edge stays vs the consensus
+        # de-vig (fair_implied); price/EV/value use the best DK/FD offer at that line
+        # (None → not posted at DK/FD for this line → not flagged value).
         _ex = _exec_book_fields(game_odds["spreads"].get(team_name, []),
                                 line=spread, line_key="spread")
+        roi = (_expected_roi(cover_prob, _ex["best_exec_price"])
+               if _ex["best_exec_price"] is not None else None)
         candidates.append({
             "type": "spread",
             "team": team_name,

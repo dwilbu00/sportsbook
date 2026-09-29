@@ -3361,5 +3361,68 @@ class F21SecretRedactionTests(unittest.TestCase):
         self.assertIsInstance(odds_client.redact_secrets(ValueError("apiKey=x")), str)
 
 
+class ExecutableBookTeamMarketTests(unittest.TestCase):
+    """Team-market price/EV/value must use the best EXECUTABLE (DK/FD) offer only — never
+    a non-DK/FD book — while the edge stays measured vs the all-book de-vig consensus."""
+
+    @staticmethod
+    def _stats(wp=0.5):
+        return {"season": {"win_pct": wp, "runs_scored": None, "runs_allowed": None},
+                "recent": {"win_pct": wp, "avg_scored": 4.5, "avg_allowed": 4.5},
+                "recent_games": []}
+
+    @staticmethod
+    def _ml_offer(book_key, price):
+        return {"book": book_key.title(), "book_key": book_key, "price": price,
+                "implied_prob": odds_client.american_to_implied_prob(price),
+                "link": f"{book_key}L", "sid": f"{book_key}S"}
+
+    def test_ml_best_is_dk_fd_not_a_sharper_offbook(self):
+        # Pinnacle posts the BEST price (-130) but isn't executable; FD (-145) beats DK (-150).
+        go = {"home_team": "Home", "away_team": "Away", "spreads": {}, "totals": {},
+              "moneyline": {
+                  "Home": [self._ml_offer("draftkings", -150),
+                           self._ml_offer("fanduel", -145),
+                           self._ml_offer("pinnacle", -130)],
+                  "Away": [self._ml_offer("draftkings", +140),
+                           self._ml_offer("fanduel", +138),
+                           self._ml_offer("pinnacle", +150)]}}
+        cands = analysis.analyze_moneyline_value(go, self._stats(0.62), self._stats(0.38),
+                                                 threshold_pct=5.0, sport_key="americanfootball_nfl")
+        home = next(c for c in cands if c["team"] == "Home")
+        self.assertIn(home["best_book"], ("DraftKings", "FanDuel"))
+        self.assertEqual(home["best_book"], "FanDuel")     # -145 > -150 (better payout)
+        self.assertEqual(home["best_price"], -145)
+        # per-book fields still exposed for betslip/parlay
+        self.assertEqual(home["dk_price"], -150)
+        self.assertEqual(home["fd_price"], -145)
+
+    def test_ml_no_dk_fd_offer_not_value(self):
+        go = {"home_team": "Home", "away_team": "Away", "spreads": {}, "totals": {},
+              "moneyline": {"Home": [self._ml_offer("pinnacle", -130)],
+                            "Away": [self._ml_offer("pinnacle", +150)]}}
+        cands = analysis.analyze_moneyline_value(go, self._stats(0.7), self._stats(0.3),
+                                                 threshold_pct=1.0, sport_key="americanfootball_nfl")
+        home = next(c for c in cands if c["team"] == "Home")
+        self.assertIsNone(home["best_price"])
+        self.assertIsNone(home["expected_roi_pct"])
+        self.assertFalse(home["is_value"])                 # can't bet at DK/FD → not value
+
+    def test_total_ev_needs_dk_fd_price(self):
+        def _tot(book_key, side, price):
+            return {"book": book_key.title(), "book_key": book_key, "line": 44.5,
+                    "price": price, "link": f"{book_key}{side[0]}", "sid": f"{book_key}{side[0]}s"}
+        # Only Pinnacle posts the total → no executable price → not value + None ROI.
+        go = {"home_team": "Home", "away_team": "Away", "moneyline": {}, "spreads": {},
+              "totals": {"Over": [_tot("pinnacle", "Over", -110)],
+                         "Under": [_tot("pinnacle", "Under", -110)]}}
+        c = analysis.analyze_totals_value(go, self._stats(), self._stats(),
+                                          threshold_pct=1.0, sport_key="americanfootball_nfl")[0]
+        self.assertIsNone(c["over_expected_roi_pct"])
+        self.assertIsNone(c["under_expected_roi_pct"])
+        self.assertFalse(c["is_over_value"])
+        self.assertFalse(c["is_under_value"])
+
+
 if __name__ == "__main__":
     unittest.main()
