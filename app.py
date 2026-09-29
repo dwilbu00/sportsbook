@@ -251,7 +251,7 @@ def _prop_prob_fn(candidate, direction="over"):
 
 
 def _dk_payout_strs(american_price, stake=10):
-    """Return (value_str, delta_str) for a single-bet DK Payout metric.
+    """Return (value_str, delta_str) for a single-bet payout metric.
     Value is the total payout in the box (e.g. '$11.82'); delta below the
     box is the stake context ('on $10 (+118)')."""
     if american_price is None:
@@ -259,6 +259,28 @@ def _dk_payout_strs(american_price, stake=10):
     dec = american_to_decimal(american_price)
     total_payout = dec * stake
     return f"${total_payout:.2f}", f"on ${stake:.0f} ({american_price:+d})"
+
+
+def _rec_book_label(candidate, side=None):
+    """Recommended EXECUTABLE book for a candidate's bet ('DraftKings' | 'FanDuel' | ''),
+    so the payout/checkbox/betslip all name the book we actually size off (best of DK/FD).
+    Totals carry a side-specific book (over_book/under_book); everything else uses
+    best_book (team markets) / dk_book (props, = best-exec)."""
+    s = str(side or "").lower()
+    b = candidate.get(f"{s}_book") if s in ("over", "under") else None
+    bl = str(b or candidate.get("best_book") or candidate.get("dk_book") or "").lower()
+    if "fan" in bl:
+        return "FanDuel"
+    if "draft" in bl:
+        return "DraftKings"
+    return ""
+
+
+def _payout_label(candidate, side=None, suffix=""):
+    """Book-aware payout metric label: 'FanDuel Payout' / 'DraftKings Payout' / 'Payout'
+    (unknown book). `suffix` appends e.g. ' (OVER)'."""
+    book = _rec_book_label(candidate, side)
+    return f"{book + ' ' if book else ''}Payout{suffix}"
 
 
 def _market_offer_text(comparison, peer=False, market_key="h2h", side=None):
@@ -519,8 +541,9 @@ def _render_parlay_bet_links(legs):
 
 def _select_bet_checkbox(candidate, bet_type, side=None):
     entry = make_bet_checklist_entry(candidate, bet_type, side=side)
+    _book = _rec_book_label(candidate, side)
     st.checkbox(
-        "Add to DraftKings bet list",
+        f"Add to {_book} bet list" if _book else "Add to bet list",
         key=entry["selection_key"],
         help=(
             "Adds only the bet instruction and matchup/team context to the "
@@ -4716,8 +4739,10 @@ if "analysis_results" in st.session_state:
                     cols[4].metric("Season Win%", f"{c['season_win_pct']}%")
                     cols[5].metric("Recent Win%", f"{c['recent_win_pct']}%")
                     p_val, p_delta = _dk_payout_strs(c.get("best_price"))
-                    cols[6].metric("DK Payout", p_val, delta=p_delta, delta_color="off",
-                                   help="American odds and profit on a $10 bet at DraftKings.")
+                    _book = _rec_book_label(c)
+                    cols[6].metric(_payout_label(c), p_val, delta=p_delta, delta_color="off",
+                                   help=f"American odds and profit on a $10 bet at "
+                                        f"{_book or 'the recommended book'}.")
                     _render_market_comparison(
                         c.get("market_comparison"), ar["sport_key"])
 
@@ -5010,11 +5035,14 @@ if "analysis_results" in st.session_state:
                         cols[5].metric("Expected ROI", f"{c['expected_roi_pct']:+.2f}%")
                         cols[6].metric("Direction", c["direction"])
                         p_val, p_delta = _dk_payout_strs(dk_bet_price)
+                        _pbook = _rec_book_label(c)
                         cols[7].metric(
-                            f"DK Payout ({c['direction']})", p_val, delta=p_delta, delta_color="off",
-                            help=(f"DraftKings price for the {c['direction']} at the book "
-                                  "line. Edge is measured vs the de-vigged consensus of "
-                                  "all U.S. books; Expected ROI is at this DK price."),
+                            _payout_label(c, suffix=f" ({c['direction']})"), p_val,
+                            delta=p_delta, delta_color="off",
+                            help=(f"{_pbook or 'Recommended-book'} price for the "
+                                  f"{c['direction']} at the book line. Edge is measured vs "
+                                  "the de-vigged consensus of all U.S. books; Expected ROI "
+                                  "is at this price."),
                         )
                         line_gap = c["avg_stat"] - c["line"]
                         badge = _lineup_badge(c)
