@@ -416,28 +416,28 @@ def _qr_png_cached(url):
 
 
 def _render_bet_links(candidate, bet_type=None, side=None):
-    """One-tap 'Bet on DK/FD' link buttons + a QR (desktop→phone) for a value bet, built
-    from the pick's ready-made betslip links (Odds API includeLinks). No-op when the pick
-    carries no DK/FD link (e.g. team markets, not yet threaded, or a book that omitted
-    one). The link only PRE-FILLS the slip — you tap Submit inside DK/FD; nothing is
-    auto-placed."""
+    """One-tap 'Bet' link + QR for the RECOMMENDED book only. We size off the best of DK/FD,
+    so the button matches that book (`dk_book` = the best-executable book) rather than
+    showing both. Built from the pick's ready-made betslip link (Odds API includeLinks);
+    no-op when the pick carries no DK/FD link. Only PRE-FILLS the slip — you tap Submit."""
     dk = candidate.get("dk_link")
     fd = candidate.get("fd_link")
     if not dk and not fd:
         return
-    cols = st.columns([1, 1, 1, 3])
-    if dk:
-        cols[0].link_button("🟢 DK", dk, help="Open the pre-filled DraftKings betslip")
-    if fd:
-        cols[1].link_button("🔵 FD", fd, help="Open the pre-filled FanDuel betslip")
-    with cols[2].popover("📱 QR"):
-        st.caption("Scan to open the slip on your phone (tap Submit in the app).")
-        for label, link in (("DraftKings", dk), ("FanDuel", fd)):
-            if link:
-                png = _qr_png_cached(link)
-                if png:
-                    st.caption(label)
-                    st.image(png, width=170)
+    book = str(candidate.get("dk_book") or "").lower()   # best-executable book (DK or FD)
+    if "fan" in book and fd:
+        link, label = fd, "🔵 Bet FanDuel"
+    elif "draft" in book and dk:
+        link, label = dk, "🟢 Bet DraftKings"
+    else:                                                 # book unknown/link missing → what we have
+        link, label = (dk, "🟢 Bet DraftKings") if dk else (fd, "🔵 Bet FanDuel")
+    cols = st.columns([1, 1, 3])
+    cols[0].link_button(label, link, help="Opens the pre-filled slip at the recommended book.")
+    png = _qr_png_cached(link)
+    if png:
+        with cols[1].popover("📱 QR"):
+            st.caption("Scan to open the slip on your phone, then tap Submit.")
+            st.image(png, width=170)
 
 
 def _render_parlay_bet_links(legs):
