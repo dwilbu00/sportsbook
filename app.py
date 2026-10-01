@@ -1352,6 +1352,19 @@ def _resolve_team_dim(sport_key, name, espn_teams):
                 return wh
         except Exception:
             pass
+    if sport_key == "americanfootball_nfl":
+        # NFL: a lightweight dim off the nflverse abbreviation (no ESPN). None on an
+        # unmappable name → the matchup is skipped (never silently mis-joined); the
+        # stats come from nfl_team_stats, not this dim.
+        try:
+            import nfl_epa
+            ab = nfl_epa._abbr(name)
+            if ab:
+                return {"id": ab, "display_name": name, "record": None,
+                        "wins": None, "losses": None, "win_pct": None}
+        except Exception:
+            pass
+        return None
     return find_team(espn_teams, name)
 
 
@@ -1372,6 +1385,8 @@ def _fetch_team_schedule(sport_key, team, espn_sport, espn_league):
                 season=mlb_warehouse._current_season()) or []
         except Exception:
             return []
+    if sport_key == "americanfootball_nfl":
+        return []   # NFL recent form is built from nfl_team_stats (self-contained), no ESPN schedule
     return get_team_schedule(espn_sport, espn_league, team["id"])
 
 
@@ -4027,11 +4042,11 @@ if analyze_clicked and selected_game_labels:
 
     progress = st.progress(0, text="Starting analysis...")
 
-    # Team data. MLB (P6): team resolution is warehouse-only (parity-verified 30/30,
-    # full-slate 9/9), so skip the ESPN get_all_teams fetch entirely — the last
-    # ungated ESPN team call for MLB. NBA/NFL/NHL still fetch from ESPN.
+    # Team data. MLB (P6, warehouse) and NFL (nflverse games spine) resolve + build team
+    # stats without ESPN, so skip the ESPN get_all_teams fetch for both. NBA/NHL still
+    # fetch from ESPN (until their own data layers land).
     progress.progress(5, text="Loading team data...")
-    if sport["key"] == "baseball_mlb":
+    if sport["key"] in ("baseball_mlb", "americanfootball_nfl"):
         espn_teams = {}
     else:
         try:
@@ -4437,6 +4452,12 @@ if analyze_clicked and selected_game_labels:
                 # mixed warehouse/ESPN; any miss → the ESPN build for both.
                 wh_home = mlb_warehouse_team_stats(sport["espn_sport"], home, recent_n)
                 wh_away = mlb_warehouse_team_stats(sport["espn_sport"], away, recent_n)
+                # NFL: {season,recent,recent_games} from the nflverse games spine (no ESPN),
+                # same shape as the MLB warehouse path. Require BOTH sides (never mix).
+                if not (wh_home and wh_away) and sport["key"] == "americanfootball_nfl":
+                    import nfl_team_stats
+                    wh_home = nfl_team_stats.team_stats(home, recent_n)
+                    wh_away = nfl_team_stats.team_stats(away, recent_n)
                 if wh_home and wh_away:
                     home_stats, away_stats = wh_home, wh_away
                 else:
