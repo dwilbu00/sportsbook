@@ -31,10 +31,11 @@ standings dataset is a v2 enrichment).
 from __future__ import annotations
 
 import datetime
+import time
 
 from sqlalchemy import (
     Boolean, Column, Float, Index, Integer, MetaData, String, Table,
-    UniqueConstraint,
+    UniqueConstraint, select,
 )
 
 import db_store
@@ -94,7 +95,8 @@ nba_player = Table(
 # ── Per-player-game stat fact — supersedes the ESPN nba_gamelog cache ───────────
 # Grain: one row per (player, game). Natural key UNIQUE(athlete_id, game_id) (MLB-style,
 # game-centric). team/opponent/game refs are attributes (no FK — see module docstring).
-# `played` = active AND not DNP AND minutes>0 (the DNP/void signal, like NFL snaps).
+# `played` = minutes>0 (the DNP/void signal, like NFL snaps). MINUTES is null exactly for
+# did_not_play rows; the ESPN `active` flag is unreliable so it is stored but not the signal.
 _BOX_STATS = ("minutes", "points", "field_goals_made", "field_goals_attempted",
               "three_point_field_goals_made", "three_point_field_goals_attempted",
               "free_throws_made", "free_throws_attempted", "offensive_rebounds",
@@ -116,8 +118,8 @@ nba_player_game = Table(
     *[Column(c, Float) for c in _BOX_STATS],
     Column("starter", Boolean),
     Column("did_not_play", Boolean),
-    Column("active", Boolean),
-    Column("played", Boolean),                            # active & !DNP & minutes>0 (void signal)
+    Column("active", Boolean),                           # ESPN flag (unreliable; stored, not used)
+    Column("played", Boolean),                            # minutes>0 (DNP/null-minutes = void)
     Column("fetched_at", Float),
     UniqueConstraint("athlete_id", "game_id", name="uq_nba_player_game"),
     Index("ix_nba_player_game_athlete", "athlete_id", "season"),
@@ -212,7 +214,248 @@ def _b(v):
     return bool(v)
 
 
+def _date(v):
+    """A YYYY-MM-DD string from a pandas Timestamp / date / ISO string (None on NaT/empty)."""
+    try:
+        import pandas as pd
+        if v is None or pd.isna(v):
+            return None
+    except (TypeError, ValueError, ImportError):
+        if v is None:
+            return None
+    s = str(v).strip()
+    return s[:10] if len(s) >= 10 else (s or None)
+
+
 def _current_season():
     """NBA season-ENDING year for today (Aug-rollover; 2024 = 2023-24)."""
     d = datetime.datetime.now(datetime.timezone.utc).date()
     return d.year + 1 if d.month >= 8 else d.year
+
+
+# ──────────────────────────────────────────────────── ingest (dep-free, Cloud-safe)
+def ingest_games(seasons):
+    """Upsert nba_game (the spine) from sportsdataverse ESPN schedules (dep-free HTTP).
+    Per-season scoped (bounded read). Idempotent. ``season`` here is the season-ENDING
+    year (2024 = 2023-24). Returns (n_insert, n_update)."""
+    import nba_source as src
+    n_ins = n_upd = 0
+    now = time.time()
+    for end_year in seasons:
+        df = src.load_schedule(int(end_year), ttl=0)     # ingest always reads fresh
+        if df is None or getattr(df, "empty", True):
+            continue
+        rows = []
+        for r in df.to_dict("records"):
+            gid = _s(r.get("game_id")) or _s(r.get("id"))
+            if not gid:
+                continue
+            rows.append({
+                "game_id": gid, "season": int(end_year),
+                "season_type": _i(r.get("season_type")),
+                "game_date": _date(r.get("game_date")),
+                "game_date_time": _s(r.get("game_date_time")),
+                "home_team_id": _s(r.get("home_id")),
+                "away_team_id": _s(r.get("away_id")),
+                "home_abbr": _s(r.get("home_abbreviation")),
+                "away_abbr": _s(r.get("away_abbreviation")),
+                "home_score": _f(r.get("home_score")),
+                "away_score": _f(r.get("away_score")),
+                "completed": _b(r.get("status_type_completed")),
+                "neutral_site": _b(r.get("neutral_site")),
+                "venue_id": _s(r.get("venue_id")), "fetched_at": now,
+            })
+        if not rows:
+            continue
+        with db_store.get_engine().begin() as conn:
+            i, u = db_store.upsert_bulk(conn, nba_game, rows, ("game_id",),
+                                        scope={"season": int(end_year)},
+                                        ignore_cols=("fetched_at",))
+        n_ins += i
+        n_upd += u
+    return (n_ins, n_upd)
+
+
+def _team_row(rec, now):
+    """A nba_team dim row from a player-box record (richest source: id/abbr/name/location),
+    enriched with best-effort conference/division from the static abbr map."""
+    tid = _s(rec.get("team_id"))
+    if not tid:
+        return None
+    abbr = _s(rec.get("team_abbreviation"))
+    conf, div = _CONF_DIV.get(abbr, (None, None)) if abbr else (None, None)
+    name = _s(rec.get("team_display_name")) or _s(rec.get("team_name"))
+    return {"team_id": tid, "name": name,
+            "name_norm": db_store.normalize_name(name) if name else None,
+            "abbreviation": abbr, "location": _s(rec.get("team_location")),
+            "conference": conf, "division": div, "fetched_at": now}
+
+
+def ingest_player_games(season, since_date=None):
+    """Fetch one season's ESPN player box, upsert nba_player_game and bootstrap the
+    nba_player + nba_team dims — all dep-free HTTP (Cloud-safe). ``season`` = ending year.
+    ``since_date`` (YYYY-MM-DD) limits to games on/after it (maintenance bound). Facts are
+    upserted per-game (scope={game_id}) under per-DATE transactions (bounded reads, fewer
+    commits). Idempotent. Returns (n_insert, n_update) for the fact."""
+    import nba_source as src
+    end_year = int(season)
+    df = src.load_player_box(end_year, ttl=0)            # ingest always reads fresh
+    if df is None or getattr(df, "empty", True):
+        return (0, 0)
+    now = time.time()
+    by_date = {}                                         # game_date -> {game_id -> [rows]}
+    players = {}                                         # athlete_id -> dim row
+    teams = {}                                           # team_id -> dim row
+    for rec in df.to_dict("records"):
+        aid = _s(rec.get("athlete_id"))
+        gid = _s(rec.get("game_id"))
+        if not aid or not gid:
+            continue
+        gdate = _date(rec.get("game_date"))
+        if since_date and (gdate is None or gdate < since_date):
+            continue
+        name = _s(rec.get("athlete_display_name"))
+        minutes = _f(rec.get("minutes"))
+        active = _b(rec.get("active"))
+        dnp = _b(rec.get("did_not_play"))
+        # played = the DNP/void signal. MINUTES is the ground truth (it's null exactly for
+        # did_not_play rows; >0 for players who logged time). The ESPN `active` flag is
+        # UNRELIABLE (False even for a 37-min, 70-pt game) so it is stored but NOT used here.
+        played = None
+        if minutes is not None:
+            played = minutes > 0                      # 0 min (dressed, no time) = void
+        elif dnp is not None:
+            played = not dnp
+        row = {"athlete_id": aid, "game_id": gid, "season": end_year,
+               "game_date": gdate, "team_id": _s(rec.get("team_id")),
+               "opponent_team_id": _s(rec.get("opponent_team_id")),
+               "home_away": _s(rec.get("home_away")),
+               "team_score": _f(rec.get("team_score")),
+               "opponent_team_score": _f(rec.get("opponent_team_score")),
+               "starter": _b(rec.get("starter")), "did_not_play": dnp,
+               "active": active, "played": played, "fetched_at": now}
+        for c in _BOX_STATS:
+            row[c] = _f(rec.get(c))
+        by_date.setdefault(gdate, {}).setdefault(gid, []).append(row)
+        if aid not in players:
+            players[aid] = {
+                "athlete_id": aid, "full_name": name,
+                "name_norm": db_store.normalize_name(name) if name else None,
+                "short_name": _s(rec.get("athlete_short_name")),
+                "position": _s(rec.get("athlete_position_abbreviation")),
+                "jersey": _s(rec.get("athlete_jersey")),
+                "team_id": _s(rec.get("team_id")), "fetched_at": now}
+        tid = _s(rec.get("team_id"))
+        if tid and tid not in teams:
+            tr = _team_row(rec, now)
+            if tr:
+                teams[tid] = tr
+    n_ins = n_upd = 0
+    for gdate in sorted(by_date, key=lambda d: (d is None, d or "")):
+        with db_store.get_engine().begin() as conn:
+            for gid, rows in by_date[gdate].items():
+                i, u = db_store.upsert_bulk(conn, nba_player_game, rows,
+                                            ("athlete_id", "game_id"),
+                                            scope={"game_id": gid},
+                                            ignore_cols=("fetched_at",))
+                n_ins += i
+                n_upd += u
+    tlist = list(teams.values())
+    if tlist:
+        with db_store.get_engine().begin() as conn:
+            db_store.upsert_bulk(conn, nba_team, tlist, ("team_id",),
+                                 ignore_cols=("fetched_at",))
+    # Player dim: single-col identity → chunk so the IN stays well under the ~2100 cap.
+    plist = list(players.values())
+    for i in range(0, len(plist), 500):
+        with db_store.get_engine().begin() as conn:
+            db_store.upsert_bulk(conn, nba_player, plist[i:i + 500], ("athlete_id",),
+                                 ignore_cols=("fetched_at",))
+    return (n_ins, n_upd)
+
+
+def ingest_maintenance(recent_days=14):
+    """Lazy warehouse maintenance (Cloud, dep-free): upsert the CURRENT season's games +
+    the last ``recent_days`` of player-games from sportsdataverse HTTP. Idempotent +
+    fail-open per step (a warehouse hiccup must never block grading/refit). Mirrors
+    mlb/nfl_warehouse.ingest_maintenance; called from recalibration.maintain_sport. Bulk
+    history is the offline backfill (the CLI below). Teams/players bootstrap in-line."""
+    if not enabled():
+        return
+    cur = _current_season()
+    try:
+        ingest_games([cur])
+    except Exception:
+        pass
+    try:
+        since = (datetime.datetime.now(datetime.timezone.utc).date()
+                 - datetime.timedelta(days=int(recent_days))).isoformat()
+        ingest_player_games(cur, since_date=since)
+    except Exception:
+        pass
+
+
+# ───────────────────────────────────────────────── gold reads (grading, Phase 4)
+# Columns grading needs — the full box stat set, named EXACTLY as the ESPN player box
+# (and nba_source) emit them, plus ``player_norm`` + ``game_date`` — so the warehouse
+# frame is a drop-in for a live player-box read in recalibration._resolve_nba_actual.
+_FRAME_STATS = ("points", "rebounds", "assists", "steals", "blocks", "turnovers",
+                "three_point_field_goals_made", "field_goals_made",
+                "field_goals_attempted", "free_throws_made", "free_throws_attempted",
+                "offensive_rebounds", "defensive_rebounds", "minutes")
+_FRAME_TTL = 1800                                    # 30 min memo (warehouse is durable)
+_FRAME_CACHE = {}                                   # season(int) -> (ts, DataFrame|None)
+
+
+def player_game_frame(season, ttl=_FRAME_TTL):
+    """A DataFrame of one season's player-games — ``player_norm``, ``game_date`` + the
+    grading stat columns + ``played`` — read from the warehouse, or None when the warehouse
+    is disabled/empty for that season. The durable, frozen-record grading source (MLB/NFL
+    parity: grade from the DB); a short per-process memo avoids re-querying per prop. Never
+    raises — a failure returns None so the caller falls back to the live feed."""
+    if not enabled():
+        return None
+    s = int(season)
+    hit = _FRAME_CACHE.get(s)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    try:
+        import pandas as pd
+        pg, pl = nba_player_game, nba_player
+        stmt = (select(pl.c.name_norm.label("player_norm"), pg.c.game_date, pg.c.played,
+                       *[pg.c[c] for c in _FRAME_STATS])
+                .select_from(pg.join(pl, pg.c.athlete_id == pl.c.athlete_id))
+                .where(pg.c.season == s))
+        with db_store.get_engine().connect() as conn:
+            rows = [dict(r._mapping) for r in conn.execute(stmt)]
+        df = pd.DataFrame(rows) if rows else None
+        _FRAME_CACHE[s] = (time.time(), df)
+        return df
+    except Exception:
+        return hit[1] if hit is not None else None
+
+
+def _backfill_cli():                                 # pragma: no cover - offline owner tool
+    """Offline backfill: `python nba_warehouse.py --seasons 2002-2026`. Run on the dev box
+    (set SQL_DRIVER=pyodbc for fast_executemany). Loads games + ALL player-games per season."""
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seasons", required=True,
+                    help="season-ENDING years, e.g. 2002-2026 or 2024,2025,2026")
+    args = ap.parse_args()
+    db_store.promote_secrets_from_toml()
+    if not enabled():
+        raise SystemExit("DB not enabled (no secrets.toml?)")
+    spec = args.seasons.strip()
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        seasons = list(range(int(a), int(b) + 1))
+    else:
+        seasons = [int(x) for x in spec.split(",") if x.strip()]
+    print(f"ingest_games({seasons}): {ingest_games(seasons)}")
+    for s in seasons:
+        print(f"ingest_player_games({s}): {ingest_player_games(s)}")
+
+
+if __name__ == "__main__":                           # pragma: no cover
+    _backfill_cli()

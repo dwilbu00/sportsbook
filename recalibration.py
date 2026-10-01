@@ -2610,6 +2610,16 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
             nfl_warehouse.ingest_maintenance()
         except Exception:               # pragma: no cover - never block maintenance
             pass
+    elif sport_key == "basketball_nba":
+        # NBA sportsdataverse warehouse: keep the durable nba_* tables current from the
+        # dep-free ESPN-family parquet (schedule + player box). Fail-open — a warehouse
+        # hiccup must never block resolution/refit. Bulk history = the offline backfill
+        # (nba_warehouse CLI). This supersedes the ephemeral ESPN nba_gamelog cache.
+        try:
+            import nba_warehouse
+            nba_warehouse.ingest_maintenance()
+        except Exception:               # pragma: no cover - never block maintenance
+            pass
     newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
     # Team-market forecasts resolve alongside props but are kept OUT of the
     # newly_resolved count (that gates the prop Platt refit; team markets have no

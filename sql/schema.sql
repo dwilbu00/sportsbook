@@ -1603,8 +1603,8 @@ GO
 
 ------------------------------------------------------------------- nba_player_game
 -- Per-player-game stat FACT. Natural key UNIQUE(athlete_id, game_id). game_id is an
--- attribute that joins the spine (no FK — see header). played = active & !DNP & minutes>0
--- (the DNP/void signal, like NFL snaps). Supersedes the ESPN nba_gamelog cache.
+-- attribute that joins the spine (no FK — see header). played = minutes>0 (the DNP/void
+-- signal, like NFL snaps; the ESPN active flag is unreliable). Supersedes the nba_gamelog cache.
 IF OBJECT_ID('dbo.nba_player_game', 'U') IS NULL
 CREATE TABLE dbo.nba_player_game (
     id                  INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
