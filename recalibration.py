@@ -1544,28 +1544,17 @@ def _nfl_grade_from_nflverse():
     return _NFL_GRADE_FROM_NFLVERSE_DEFAULT
 
 
-# prop_key -> nba_warehouse / sportsdataverse player-box column(s); a tuple is SUMMED
-# (combo props: PRA, P+R, etc.). Every column here is kept by nba_warehouse._FRAME_STATS
-# (and present on the live sportsdataverse player box). Double/triple-double are NOT simple
-# sums (category-count props) so they are intentionally absent → ESPN fallback / pending.
-_NBA_PROP_COL = {
-    "player_points": "points",
-    "player_rebounds": "rebounds",
-    "player_assists": "assists",
-    "player_threes": "three_point_field_goals_made",
-    "player_steals": "steals",
-    "player_blocks": "blocks",
-    "player_turnovers": "turnovers",
-    "player_field_goals": "field_goals_made",
-    "player_frees_made": "free_throws_made",
-    "player_frees_attempts": "free_throws_attempted",
-    "player_points_rebounds_assists": ("points", "rebounds", "assists"),
-    "player_points_rebounds": ("points", "rebounds"),
-    "player_points_assists": ("points", "assists"),
-    "player_rebounds_assists": ("rebounds", "assists"),
-    "player_blocks_steals": ("blocks", "steals"),
-    "player_steals_blocks": ("steals", "blocks"),
-}
+# NBA prop -> stat column(s): the single source of truth is nba_source.PROP_STAT_COLS
+# (shared by grading here, warehouse history, and the live history path). A tuple is SUMMED.
+
+
+def _nba_prop_cols(prop_key):
+    try:
+        import nba_source
+        return nba_source.PROP_STAT_COLS.get(prop_key)
+    except Exception:
+        return None
+
 
 # NBA grading cutover gate. ON by default: the sportsdataverse warehouse is the PRIMARY NBA
 # grader (per-player-game box, validated live) with the ESPN gamelog as fallback-on-miss.
@@ -1684,7 +1673,7 @@ def _resolve_nba_actual(prop_key, player, game_date, commence=None):
     for combo props), or None when the prop is unmapped, the season/row can't be resolved, or
     the player DID NOT PLAY (minutes 0/null → never grade a phantom 0; the caller stays
     pending and the stale-DNP sweep voids it). Never raises — a miss falls through to ESPN."""
-    cols = _NBA_PROP_COL.get(prop_key)
+    cols = _nba_prop_cols(prop_key)
     if cols is None:
         return None
     cols = cols if isinstance(cols, tuple) else (cols,)
@@ -1733,7 +1722,7 @@ def _nba_is_dnp(prop_key, player, game_date, commence):
     """NBA confirmed-DNP for the stale-void path: True iff this is a graded NBA prop, its
     game is >= STALE_DNP_HOURS old, and the box shows the player in the game with no minutes
     (inactive/DNP) — so the bet voids instead of grading a phantom 0-loss. Never raises."""
-    if prop_key not in _NBA_PROP_COL:
+    if _nba_prop_cols(prop_key) is None:
         return False
     try:
         commence_dt = _parse_dt(commence)

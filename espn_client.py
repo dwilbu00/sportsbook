@@ -952,6 +952,43 @@ def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None,
         return None
 
 
+def _nba_warehouse_history(player_name, prop_key, n, team_ids=None):
+    """Warehouse-first NBA player history (the Phase-4 live cutover): return the
+    get_player_stat_history contract dict from the sportsdataverse per-player-game facts, or
+    None so the caller falls open to the ESPN path. Gated on nba_source.live_from_sdv() +
+    SQL enabled + a mapped prop; DNP games are excluded (a bet voids on a DNP, never a 0).
+    Never raises."""
+    try:
+        import nba_source
+        if not nba_source.live_from_sdv():
+            return None
+        cols = nba_source.PROP_STAT_COLS.get(prop_key)
+        if cols is None:
+            return None
+        if db_store is None or not db_store.enabled():
+            return None
+        import nba_warehouse
+        rows = nba_warehouse.player_history(player_name, cols, n=n, team_ids=team_ids)
+        if not rows:
+            return None
+        return {
+            "player": player_name,
+            "athlete_id": rows[0].get("athlete_id"),
+            "stat_label": prop_key,
+            "values": [r["value"] for r in rows],
+            "opponents": [r.get("opponent") for r in rows],
+            "home_aways": [r.get("home_away") for r in rows],
+            "game_dates": [r.get("game_date") for r in rows],
+            "plate_appearances": [None] * len(rows),
+            "at_bats": [None] * len(rows),
+            "team_id": rows[0].get("team_id"),
+            "found": True,
+            "source": "nba_warehouse",
+        }
+    except Exception:
+        return None
+
+
 # P4 team-market flag (independent of the player-history flag). MLB team-market
 # inputs — season block, recent form, recent_games, team defense — are served from
 # the StatsAPI warehouse with ESPN as the fail-open fallback. Cutover COMPLETE →
@@ -1096,6 +1133,15 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
                                     probable_starters=probable_starters)
         if wh is not None:
             return wh
+
+    # NBA live-input cutover (gated via nba_source.live_from_sdv, fail-open): serve the
+    # recent-game history from the sportsdataverse WAREHOUSE (per-player-game box) when
+    # enabled + resolvable, else fall through to the ESPN path below unchanged. Mirrors the
+    # MLB flip; stamps source="nba_warehouse" for per-prediction auditability.
+    if allow_warehouse and sport == "basketball":
+        nba = _nba_warehouse_history(player_name, prop_key, n, team_ids=team_ids)
+        if nba is not None:
+            return nba
 
     # batter_total_bases / batter_rbis are WAREHOUSE-ONLY (fact-served above via
     # _mlb_warehouse_history when ODI_MLB_WAREHOUSE_HIST is on). The live ESPN gamelog

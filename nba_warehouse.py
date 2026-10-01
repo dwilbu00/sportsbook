@@ -435,6 +435,75 @@ def player_game_frame(season, ttl=_FRAME_TTL):
         return hit[1] if hit is not None else None
 
 
+def _disambiguate_athlete(conn, aids, team_ids):
+    """Pick ONE athlete_id from same-normalized-name candidates: prefer whose most-recent game
+    is with a team in ``team_ids`` (ESPN ids == warehouse team_id), else the athlete with the
+    overall most-recent game. (NBA namesakes are rare; this keeps a live lookup from
+    interleaving two players' games.)"""
+    rows = conn.execute(
+        select(nba_player_game.c.athlete_id, nba_player_game.c.team_id)
+        .where(nba_player_game.c.athlete_id.in_(aids))
+        .order_by(nba_player_game.c.game_date.desc()))
+    seen = {}
+    for r in rows:
+        if r.athlete_id not in seen:                 # first seen == most-recent game (desc)
+            seen[r.athlete_id] = r.team_id
+    if team_ids:
+        want = {str(t) for t in team_ids}
+        for a, tid in seen.items():
+            if str(tid) in want:
+                return a
+    return next(iter(seen), aids[0])
+
+
+def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
+    """Recent per-game stat history for one player from the warehouse, most-recent-first,
+    PLAYED games only (DNP rows excluded — a prop voids on a DNP, never counts a phantom 0).
+    ``cols`` is a stat column or a tuple SUMMED per game (combo props). Returns a list of
+    {value, game_date, opponent, home_away, athlete_id, team_id}, or [] when disabled / the
+    player has no played games. ``as_of_date`` (YYYY-MM-DD) caps to games strictly before it
+    (as-of/backtest); ``team_ids`` disambiguates a namesake. Never raises."""
+    if not enabled():
+        return []
+    cols = cols if isinstance(cols, tuple) else (cols,)
+    try:
+        nn = db_store.normalize_name(player_name)
+        if not nn:
+            return []
+        pg, pl = nba_player_game, nba_player
+        present = [c for c in cols if c in pg.c]
+        if not present:
+            return []
+        with db_store.get_engine().connect() as conn:
+            aids = [r[0] for r in conn.execute(
+                select(pl.c.athlete_id).where(pl.c.name_norm == nn))]
+            if not aids:
+                return []
+            aid = aids[0] if len(aids) == 1 else _disambiguate_athlete(conn, aids, team_ids)
+            stmt = (select(pg.c.athlete_id, pg.c.game_date, pg.c.opponent_team_id,
+                           pg.c.home_away, pg.c.team_id, pg.c.played,
+                           *[pg.c[c] for c in present])
+                    .where(pg.c.athlete_id == aid))
+            if as_of_date:
+                stmt = stmt.where(pg.c.game_date < str(as_of_date)[:10])
+            stmt = stmt.order_by(pg.c.game_date.desc())
+            rows = [dict(r._mapping) for r in conn.execute(stmt)]
+        out = []
+        for r in rows:
+            if not r.get("played"):                  # DNP → excluded (void, not a 0)
+                continue
+            out.append({"value": sum(float(r.get(c) or 0.0) for c in present),
+                        "game_date": r.get("game_date"),
+                        "opponent": r.get("opponent_team_id"),
+                        "home_away": r.get("home_away"),
+                        "athlete_id": r.get("athlete_id"), "team_id": r.get("team_id")})
+            if len(out) >= n:
+                break
+        return out
+    except Exception:
+        return []
+
+
 def _backfill_cli():                                 # pragma: no cover - offline owner tool
     """Offline backfill: `python nba_warehouse.py --seasons 2002-2026`. Run on the dev box
     (set SQL_DRIVER=pyodbc for fast_executemany). Loads games + ALL player-games per season."""
