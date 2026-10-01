@@ -2584,6 +2584,16 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
             _statcast_maintenance()
         except Exception:               # pragma: no cover - never block maintenance
             pass
+    elif sport_key == "americanfootball_nfl":
+        # NFL nflverse warehouse: keep the durable nfl_* tables current from the dep-free
+        # HTTP feeds (games.csv + stats_player_week + snaps). Fail-open — a warehouse
+        # hiccup must never block resolution/refit. Bulk history = the offline backfill
+        # (nfl_warehouse CLI). Live analysis keeps its own fast live-HTTP path.
+        try:
+            import nfl_warehouse
+            nfl_warehouse.ingest_maintenance()
+        except Exception:               # pragma: no cover - never block maintenance
+            pass
     newly_resolved = resolve_pending_outcomes(sport_key, max_to_resolve=max_resolve)
     # Team-market forecasts resolve alongside props but are kept OUT of the
     # newly_resolved count (that gates the prop Platt refit; team markets have no

@@ -7,6 +7,10 @@
 import os
 import re
 import unittest
+from unittest.mock import patch
+
+import pandas as pd
+from sqlalchemy import select
 
 import db_store
 import nfl_warehouse as nw
@@ -75,6 +79,108 @@ class CreateAllTests(unittest.TestCase):
                 self.assertIn(t, names)
         finally:
             db_store.configure_engine(None)
+
+
+class IngestTests(unittest.TestCase):
+    """Phase 2 ingest against a SQLite warehouse (fetchers mocked — no network)."""
+
+    def setUp(self):
+        db_store.configure_engine("sqlite://")
+        nw.create_all()
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+
+    def _rows(self, table):
+        with db_store.get_engine().connect() as c:
+            return [dict(r._mapping) for r in c.execute(select(table))]
+
+    def test_seed_teams(self):
+        n_ins, _ = nw.seed_teams()
+        rows = self._rows(nw.nfl_team)
+        self.assertEqual(n_ins, 32)
+        self.assertEqual(len(rows), 32)
+        kc = next(r for r in rows if r["team_abbr"] == "KC")
+        self.assertEqual(kc["name"], "Kansas City Chiefs")
+        self.assertEqual(kc["conference"], "AFC")
+        # idempotent: a second pass inserts nothing.
+        self.assertEqual(nw.seed_teams(), (0, 0))
+
+    def test_ingest_games(self):
+        games = [
+            {"game_id": "2026_01_NYG_DAL", "season": "2026", "week": "1",
+             "game_type": "REG", "gameday": "2026-09-07", "gametime": "16:25",
+             "home_team": "DAL", "away_team": "NYG", "home_score": 24, "away_score": 20,
+             "location": "Home", "result": 4, "total": 44, "espn": "401"},
+            {"game_id": "2026_02_DAL_PHI", "season": "2026", "week": "2",
+             "game_type": "REG", "gameday": "2026-09-14", "gametime": "20:20",
+             "home_team": "PHI", "away_team": "DAL", "home_score": None,
+             "away_score": None, "location": "Home", "result": None, "total": None,
+             "espn": "402"},
+        ]
+        with patch("nfl_schedule.load_games", return_value=games):
+            self.assertEqual(nw.ingest_games(["2026"]), (2, 0))
+            # idempotent re-ingest
+            self.assertEqual(nw.ingest_games(["2026"]), (0, 0))
+        rows = {r["game_id"]: r for r in self._rows(nw.nfl_game)}
+        self.assertEqual(rows["2026_01_NYG_DAL"]["home_score"], 24.0)
+        self.assertEqual(rows["2026_01_NYG_DAL"]["week"], 1)
+        self.assertIsNone(rows["2026_02_DAL_PHI"]["home_score"])   # unplayed
+
+    def _pw_df(self):
+        return pd.DataFrame([
+            {"player_id": "00-1", "player_display_name": "Dak Prescott", "season": 2026,
+             "week": 1, "team": "DAL", "opponent_team": "NYG", "position": "QB",
+             "position_group": "QB", "season_type": "REG", "attempts": 30.0,
+             "completions": 22.0, "passing_yards": 290.0, "passing_tds": 2.0,
+             "carries": 2.0, "rushing_yards": 5.0, "rushing_tds": 0.0, "receptions": 0.0,
+             "targets": 0.0, "receiving_yards": 0.0, "receiving_tds": 0.0,
+             "special_teams_tds": 0.0},
+            {"player_id": "00-2", "player_display_name": "CeeDee Lamb", "season": 2026,
+             "week": 1, "team": "DAL", "opponent_team": "NYG", "position": "WR",
+             "position_group": "WR", "season_type": "REG", "receptions": 8.0,
+             "targets": 11.0, "receiving_yards": 120.0, "receiving_tds": 1.0,
+             "carries": 0.0, "rushing_yards": 0.0, "passing_yards": 0.0},
+        ])
+
+    def _snaps_df(self):
+        import nfl_props_scan as scan
+        return pd.DataFrame([
+            {"player_norm": scan._norm("Dak Prescott"), "week": 1,
+             "offense_snaps": 65.0, "offense_pct": 1.0, "defense_snaps": 0.0,
+             "defense_pct": 0.0, "st_snaps": 0.0, "st_pct": 0.0},
+        ])
+
+    def test_ingest_player_weeks(self):
+        snaps = self._snaps_df()
+        with patch("pandas.read_parquet", return_value=self._pw_df()), \
+             patch("nfl_opportunity_serving._load_snaps", return_value=snaps):
+            self.assertEqual(nw.ingest_player_weeks(2026), (2, 0))
+            # idempotent
+            self.assertEqual(nw.ingest_player_weeks(2026), (0, 0))
+        pw = {r["player_id"]: r for r in self._rows(nw.nfl_player_week)}
+        self.assertEqual(pw["00-1"]["passing_yards"], 290.0)
+        self.assertEqual(pw["00-1"]["played"], 1)           # snap row present (True)
+        self.assertEqual(pw["00-1"]["offense_snaps"], 65.0)
+        self.assertEqual(pw["00-2"]["receiving_yards"], 120.0)
+        self.assertEqual(pw["00-2"]["played"], 0)           # posted week, no snap row → DNP
+        # player dim bootstrapped
+        players = {r["player_id"]: r for r in self._rows(nw.nfl_player)}
+        self.assertEqual(players["00-2"]["position"], "WR")
+        self.assertEqual(players["00-2"]["name_norm"], "ceedee lamb")
+
+    def test_player_weeks_week_filter(self):
+        df = self._pw_df()
+        df.loc[len(df)] = {**{c: 0.0 for c in df.columns}, "player_id": "00-3",
+                           "player_display_name": "Week2 Guy", "season": 2026, "week": 2,
+                           "team": "DAL", "position": "RB", "position_group": "RB",
+                           "season_type": "REG"}
+        with patch("pandas.read_parquet", return_value=df), \
+             patch("nfl_opportunity_serving._load_snaps", return_value=None):
+            nw.ingest_player_weeks(2026, weeks=[2])          # only week 2
+        pw = self._rows(nw.nfl_player_week)
+        self.assertEqual({r["week"] for r in pw}, {2})
+        self.assertEqual({r["player_id"] for r in pw}, {"00-3"})
 
 
 if __name__ == "__main__":
