@@ -30,7 +30,7 @@ import time
 
 from sqlalchemy import (
     Boolean, Column, Float, Index, Integer, MetaData, String, Table,
-    UniqueConstraint,
+    UniqueConstraint, select,
 )
 
 import db_store
@@ -355,6 +355,45 @@ def ingest_maintenance(recent_weeks=3):
         ingest_player_weeks(cur, weeks=recent)
     except Exception:
         pass
+
+
+# ───────────────────────────────────────────────── gold reads (grading, Phase 4)
+# Columns grading needs, named EXACTLY as nfl_opportunity_serving._load emits them, so
+# the warehouse frame is a drop-in for the live feed in recalibration._resolve_nfl_actual
+# (same _canonical_norm nickname resolver + column extraction).
+_FRAME_STATS = ("passing_yards", "rushing_yards", "receiving_yards", "receptions",
+                "attempts", "carries", "completions", "passing_tds", "rushing_tds",
+                "receiving_tds", "special_teams_tds")
+_FRAME_TTL = 1800                                     # 30 min memo (warehouse is durable)
+_FRAME_CACHE = {}                                    # season(int) -> (ts, DataFrame|None)
+
+
+def player_week_frame(season, ttl=_FRAME_TTL):
+    """A DataFrame shaped like nfl_opportunity_serving._load — ``player_norm``, ``week`` +
+    the grading stat columns — read from the warehouse for ``season``, or None when the
+    warehouse is disabled/empty for that season. The durable, frozen-record grading source
+    (MLB-parity: grade from the DB); a short per-process memo avoids re-querying per prop.
+    Never raises — a failure returns None so the caller falls back to the live feed."""
+    if not enabled():
+        return None
+    s = int(season)
+    hit = _FRAME_CACHE.get(s)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    try:
+        import pandas as pd
+        pw, pl = nfl_player_week, nfl_player
+        stmt = (select(pl.c.name_norm.label("player_norm"), pw.c.week,
+                       *[pw.c[c] for c in _FRAME_STATS])
+                .select_from(pw.join(pl, pw.c.player_id == pl.c.player_id))
+                .where(pw.c.season == s))
+        with db_store.get_engine().connect() as conn:
+            rows = [dict(r._mapping) for r in conn.execute(stmt)]
+        df = pd.DataFrame(rows) if rows else None
+        _FRAME_CACHE[s] = (time.time(), df)
+        return df
+    except Exception:
+        return hit[1] if hit is not None else None
 
 
 def _backfill_cli():                                  # pragma: no cover - offline owner tool

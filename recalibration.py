@@ -1542,14 +1542,25 @@ def _nfl_grade_from_nflverse():
     return _NFL_GRADE_FROM_NFLVERSE_DEFAULT
 
 
+def _nfl_player_week_frame(season):
+    """The NFL warehouse's player-week frame for grading (nfl_warehouse.player_week_frame),
+    shaped like nfl_opportunity_serving._load, or None when the warehouse is empty/disabled."""
+    try:
+        import nfl_warehouse
+        return nfl_warehouse.player_week_frame(season)
+    except Exception:
+        return None
+
+
 def _resolve_nfl_actual(prop_key, player, game_date, commence=None):
-    """NFL player-prop actual from the LIVE nflverse player-week feed
-    (nfl_opportunity_serving._load) — one bulk, dep-free, credit-free fetch for the
-    whole slate, keyed by (normalized name, week). A player's week row existing ==
-    official final (nflverse posts weekly, post-game). Returns a float, or None
-    (leave PENDING) when the prop is unmapped, the game's (season, week) can't be
-    resolved yet, or the player has no row for that week (DNP / not yet posted).
-    Never raises -- a miss falls through to the ESPN gamelog path in resolve_one_prop."""
+    """NFL player-prop actual, keyed by (normalized name, week). Reads the durable nflverse
+    WAREHOUSE first (nfl_warehouse.player_week_frame — the frozen record, MLB-parity grading
+    from the DB) and falls back to the LIVE nflverse player-week feed
+    (nfl_opportunity_serving._load, one bulk dep-free fetch) for weeks not yet ingested. A
+    player's week row existing == official final (nflverse posts weekly, post-game). Returns
+    a float, or None (leave PENDING) when the prop is unmapped, (season,week) can't be
+    resolved, or the player has no row in EITHER source. Never raises -- a miss then falls
+    through to the ESPN gamelog path in resolve_one_prop."""
     spec = _NFLVERSE_PROP_COL.get(prop_key)
     if spec is None:
         return None
@@ -1561,19 +1572,24 @@ def _resolve_nfl_actual(prop_key, player, game_date, commence=None):
         if sw is None:
             return None
         season, week = sw
-        df = _nos._load(season)
-        canon = _nos._canonical_norm(df, _scan._norm(player))   # exact, else nickname fallback
-        if canon is None:
-            return None
-        sub = df[(df["player_norm"] == canon) & (df["week"] == int(week))]
-        if sub is None or len(sub) == 0:
-            return None
-        row = sub.iloc[0]
+        pnorm = _scan._norm(player)
         cols = spec if isinstance(spec, tuple) else (spec,)
-        present = [c for c in cols if c in sub.columns]
-        if not present:
-            return None            # column absent from feed -> pending, never a wrong 0
-        return float(sum(float(row.get(c) or 0.0) for c in present))
+        # Warehouse (durable, frozen) first; live feed for not-yet-ingested weeks.
+        for df in (_nfl_player_week_frame(season), _nos._load(season)):
+            if df is None:
+                continue
+            canon = _nos._canonical_norm(df, pnorm)     # exact, else nickname fallback
+            if canon is None:
+                continue
+            sub = df[(df["player_norm"] == canon) & (df["week"] == int(week))]
+            if sub is None or len(sub) == 0:
+                continue
+            present = [c for c in cols if c in sub.columns]
+            if not present:
+                continue           # column absent from this source -> try the next
+            row = sub.iloc[0]
+            return float(sum(float(row.get(c) or 0.0) for c in present))
+        return None
     except Exception:
         return None
 

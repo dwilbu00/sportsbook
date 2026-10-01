@@ -87,9 +87,11 @@ class IngestTests(unittest.TestCase):
     def setUp(self):
         db_store.configure_engine("sqlite://")
         nw.create_all()
+        nw._FRAME_CACHE.clear()
 
     def tearDown(self):
         db_store.configure_engine(None)
+        nw._FRAME_CACHE.clear()
 
     def _rows(self, table):
         with db_store.get_engine().connect() as c:
@@ -169,6 +171,21 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(players["00-2"]["position"], "WR")
         self.assertEqual(players["00-2"]["name_norm"], "ceedee lamb")
 
+    def test_player_week_frame(self):
+        import nfl_props_scan as scan
+        with patch("pandas.read_parquet", return_value=self._pw_df()), \
+             patch("nfl_opportunity_serving._load_snaps", return_value=self._snaps_df()):
+            nw.ingest_player_weeks(2026)
+        nw._FRAME_CACHE.clear()
+        df = nw.player_week_frame(2026)
+        self.assertIsNotNone(df)
+        self.assertIn("player_norm", df.columns)
+        self.assertIn("passing_yards", df.columns)
+        row = df[(df["player_norm"] == scan._norm("Dak Prescott"))
+                 & (df["week"] == 1)].iloc[0]
+        self.assertEqual(float(row["passing_yards"]), 290.0)
+        self.assertIsNone(nw.player_week_frame(2099))     # empty season -> None
+
     def test_player_weeks_week_filter(self):
         df = self._pw_df()
         df.loc[len(df)] = {**{c: 0.0 for c in df.columns}, "player_id": "00-3",
@@ -181,6 +198,41 @@ class IngestTests(unittest.TestCase):
         pw = self._rows(nw.nfl_player_week)
         self.assertEqual({r["week"] for r in pw}, {2})
         self.assertEqual({r["player_id"] for r in pw}, {"00-3"})
+
+
+class ResolveNflActualWarehouseTests(unittest.TestCase):
+    """recalibration._resolve_nfl_actual grades from the warehouse frame FIRST, falling
+    back to the live nflverse feed for weeks the warehouse hasn't ingested."""
+
+    def _frame(self, pnorm, week, **stats):
+        row = {"player_norm": pnorm, "week": week}
+        row.update(stats)
+        return pd.DataFrame([row])
+
+    def _resolve(self, prop, name, wh, live, sw=(2026, 3)):
+        import recalibration as rc
+        with patch("recalibration._nfl_player_week_frame", return_value=wh), \
+             patch("nfl_opportunity_serving._load", return_value=live), \
+             patch("nfl_schedule.season_week_for_date", return_value=sw):
+            return rc._resolve_nfl_actual(prop, name, "2026-09-21")
+
+    def test_warehouse_used_when_present(self):
+        wh = self._frame("dak prescott", 3, passing_yards=312.0)
+        self.assertEqual(self._resolve("player_pass_yds", "Dak Prescott", wh, None), 312.0)
+
+    def test_falls_back_to_live_when_warehouse_none(self):
+        live = self._frame("dak prescott", 3, passing_yards=280.0)
+        self.assertEqual(self._resolve("player_pass_yds", "Dak Prescott", None, live), 280.0)
+
+    def test_warehouse_missing_week_falls_to_live(self):
+        wh = self._frame("dak prescott", 2, passing_yards=999.0)      # wrong week only
+        live = self._frame("dak prescott", 3, passing_yards=280.0)
+        self.assertEqual(self._resolve("player_pass_yds", "Dak Prescott", wh, live), 280.0)
+
+    def test_anytime_td_sums_components(self):
+        wh = self._frame("ceedee lamb", 3, rushing_tds=0.0, receiving_tds=2.0,
+                         special_teams_tds=1.0)
+        self.assertEqual(self._resolve("player_anytime_td", "CeeDee Lamb", wh, None), 3.0)
 
 
 if __name__ == "__main__":
