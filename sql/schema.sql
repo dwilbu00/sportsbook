@@ -1368,3 +1368,145 @@ CREATE INDEX ix_mlb_pitcher_game_gamepk
     ON dbo.mlb_pitcher_game (game_pk, season_bucket)
     INCLUDE (athlete_id, IP, K, ER, BB, BF, HR, HBP, GS);
 GO
+
+-- ==========================================================================
+-- NFL nflverse warehouse (v1 core) — mirrors the MLB warehouse (the storage standard).
+-- Source = nflverse: games.csv (spine) + stats_player_week + snap_counts, all dep-free
+-- over HTTP → the warehouse self-maintains on Cloud like MLB. SUPERSEDES the ESPN
+-- nfl_gamelog cache. SQLAlchemy mirror: nfl_warehouse.py (_META), guarded by
+-- test_nfl_warehouse.SchemaParityTests. DEVIATION from MLB: nflverse abbrs drift across
+-- seasons (OAK->LV, SD->LAC, STL->LA), so game/player facts carry the abbr as a plain
+-- indexed ATTRIBUTE, NOT an FK to nfl_team (a current-32 dim would reject historical rows).
+-- ==========================================================================
+-------------------------------------------------------------------------- nfl_team
+IF OBJECT_ID('dbo.nfl_team', 'U') IS NULL
+CREATE TABLE dbo.nfl_team (
+    team_abbr   NVARCHAR(8)  NOT NULL PRIMARY KEY,   -- nflverse abbr
+    name        NVARCHAR(64),
+    name_norm   NVARCHAR(64),
+    conference  NVARCHAR(4),                          -- AFC|NFC
+    division    NVARCHAR(8),                          -- e.g. "AFC West"
+    fetched_at  FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_team_name' AND object_id = OBJECT_ID('dbo.nfl_team'))
+CREATE INDEX ix_nfl_team_name ON dbo.nfl_team (name_norm);
+GO
+
+-------------------------------------------------------------------------- nfl_game
+-- Games dim = the spine. game_id ({season}_{wk}_{AWAY}_{HOME}) is the natural PK.
+-- home/away_team are abbr ATTRIBUTES (not FKs — abbr drift). Facts rejoin on game_id.
+IF OBJECT_ID('dbo.nfl_game', 'U') IS NULL
+CREATE TABLE dbo.nfl_game (
+    game_id    NVARCHAR(32) NOT NULL PRIMARY KEY,
+    season     INT,
+    week       INT,
+    game_type  NVARCHAR(4),                           -- REG|WC|DIV|CON|SB
+    gameday    NVARCHAR(10),                          -- YYYY-MM-DD
+    gametime   NVARCHAR(8),                           -- kickoff ET HH:MM
+    home_team  NVARCHAR(8),                           -- abbr (attribute, not FK)
+    away_team  NVARCHAR(8),
+    home_score FLOAT,                                 -- NULL until played
+    away_score FLOAT,
+    location   NVARCHAR(16),                          -- Home|Neutral
+    result     FLOAT,                                 -- home margin
+    total      FLOAT,                                 -- combined points
+    espn       NVARCHAR(32),                          -- ESPN game id cross-ref
+    fetched_at FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_game_gameday' AND object_id = OBJECT_ID('dbo.nfl_game'))
+CREATE INDEX ix_nfl_game_gameday ON dbo.nfl_game (gameday);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_game_season_week' AND object_id = OBJECT_ID('dbo.nfl_game'))
+CREATE INDEX ix_nfl_game_season_week ON dbo.nfl_game (season, week);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_game_teams' AND object_id = OBJECT_ID('dbo.nfl_game'))
+CREATE INDEX ix_nfl_game_teams ON dbo.nfl_game (season, home_team, away_team);
+GO
+
+------------------------------------------------------------------------ nfl_player
+-- Player dim keyed on gsis_id. Cloud bootstrap fills player_id/name/position/team from
+-- stats_player_week; jersey/years_exp/pfr_player_id backfill offline from rosters (v2),
+-- same post-hoc pattern as MLB's populate_handedness.
+IF OBJECT_ID('dbo.nfl_player', 'U') IS NULL
+CREATE TABLE dbo.nfl_player (
+    player_id      NVARCHAR(16) NOT NULL PRIMARY KEY,  -- nflverse gsis_id
+    full_name      NVARCHAR(96),
+    name_norm      NVARCHAR(96),
+    display_name   NVARCHAR(96),
+    football_name  NVARCHAR(96),
+    position       NVARCHAR(8),
+    position_group NVARCHAR(8),
+    team_abbr      NVARCHAR(8),                         -- most-recent (attribute)
+    jersey_number  INT,
+    years_exp      INT,
+    pfr_player_id  NVARCHAR(16),                        -- snap-counts join key (offline)
+    fetched_at     FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_player_name' AND object_id = OBJECT_ID('dbo.nfl_player'))
+CREATE INDEX ix_nfl_player_name ON dbo.nfl_player (name_norm);
+GO
+
+------------------------------------------------------------------- nfl_player_week
+-- Per-player-week stat FACT. Natural key UNIQUE(player_id, season, week). game_id is a
+-- nullable derived attribute (stats_player_week has no game_id), NOT an FK. Supersedes
+-- the ESPN nfl_gamelog cache (strict superset + snaps + played + spine-joinable).
+IF OBJECT_ID('dbo.nfl_player_week', 'U') IS NULL
+CREATE TABLE dbo.nfl_player_week (
+    id             INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    player_id      NVARCHAR(16) NOT NULL,              -- gsis (natural key part)
+    season         INT NOT NULL,
+    week           INT NOT NULL,
+    game_id        NVARCHAR(32),                        -- nullable derived attribute (no FK)
+    team           NVARCHAR(8),
+    opponent_team  NVARCHAR(8),
+    position       NVARCHAR(8),
+    position_group NVARCHAR(8),
+    season_type    NVARCHAR(4),                         -- REG|POST
+    -- passing
+    completions FLOAT, attempts FLOAT, passing_yards FLOAT, passing_tds FLOAT,
+    passing_interceptions FLOAT, sacks_suffered FLOAT, passing_air_yards FLOAT,
+    passing_yards_after_catch FLOAT, passing_first_downs FLOAT, passing_epa FLOAT,
+    passing_cpoe FLOAT,
+    -- rushing
+    carries FLOAT, rushing_yards FLOAT, rushing_tds FLOAT, rushing_first_downs FLOAT,
+    rushing_epa FLOAT,
+    -- receiving
+    receptions FLOAT, targets FLOAT, receiving_yards FLOAT, receiving_tds FLOAT,
+    receiving_air_yards FLOAT, receiving_yards_after_catch FLOAT,
+    receiving_first_downs FLOAT, receiving_epa FLOAT, target_share FLOAT,
+    air_yards_share FLOAT,
+    -- misc + snaps
+    special_teams_tds FLOAT,
+    offense_snaps FLOAT, offense_pct FLOAT, defense_snaps FLOAT, defense_pct FLOAT,
+    st_snaps FLOAT, st_pct FLOAT,
+    played BIT,
+    fetched_at FLOAT,
+    CONSTRAINT uq_nfl_player_week UNIQUE (player_id, season, week)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_player_week_player' AND object_id = OBJECT_ID('dbo.nfl_player_week'))
+CREATE INDEX ix_nfl_player_week_player ON dbo.nfl_player_week (player_id, season);
+GO
+-- (season, week) COVERING index (the uq is player_id-first). Add WITH (ONLINE = ON) where supported.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nfl_player_week_sw' AND object_id = OBJECT_ID('dbo.nfl_player_week'))
+CREATE INDEX ix_nfl_player_week_sw
+    ON dbo.nfl_player_week (season, week)
+    INCLUDE (player_id, completions, attempts, passing_yards, passing_tds,
+             passing_interceptions, sacks_suffered, passing_air_yards,
+             passing_yards_after_catch, passing_first_downs, passing_epa, passing_cpoe,
+             carries, rushing_yards, rushing_tds, rushing_first_downs, rushing_epa,
+             receptions, targets, receiving_yards, receiving_tds, receiving_air_yards,
+             receiving_yards_after_catch, receiving_first_downs, receiving_epa,
+             target_share, air_yards_share, special_teams_tds, offense_snaps,
+             offense_pct, defense_snaps, defense_pct, st_snaps, st_pct, played);
+GO
