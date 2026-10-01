@@ -1510,3 +1510,143 @@ CREATE INDEX ix_nfl_player_week_sw
              target_share, air_yards_share, special_teams_tds, offense_snaps,
              offense_pct, defense_snaps, defense_pct, st_snaps, st_pct, played);
 GO
+
+-- ==========================================================================
+-- NBA WAREHOUSE (sportsdataverse ESPN-family parquet) — team dim + games spine +
+-- player dim + per-player-game stat fact. Source = sportsdataverse-data GitHub release
+-- assets (player_box / nba_schedule), a dep-free public HTTPS GET → the warehouse
+-- self-maintains on Cloud like MLB/NFL. SUPERSEDES the ephemeral ESPN nba_gamelog cache.
+-- SQLAlchemy mirror: nba_warehouse.py (_META), guarded by test_nba_warehouse
+-- SchemaParityTests + DdlParityTests. DEVIATION from MLB: team/game refs are plain
+-- indexed ATTRIBUTES, NOT FKs — a 2002→ backfill crosses franchise moves (SEA->OKC,
+-- NJ->BKN, NOH->NOP) + occasional feed mismatches; attribute refs (the NFL precedent)
+-- never reject a historical/inconsistent row. Grain = per-(player, game),
+-- UNIQUE(athlete_id, game_id); season = season-ENDING year (2024 = 2023-24).
+-- ==========================================================================
+-------------------------------------------------------------------------- nba_team
+IF OBJECT_ID('dbo.nba_team', 'U') IS NULL
+CREATE TABLE dbo.nba_team (
+    team_id      NVARCHAR(16) NOT NULL PRIMARY KEY,  -- ESPN team id
+    name         NVARCHAR(64),                        -- team_display_name
+    name_norm    NVARCHAR(64),
+    abbreviation NVARCHAR(8),
+    location     NVARCHAR(48),                         -- e.g. "Los Angeles"
+    conference   NVARCHAR(4),                          -- East|West (static map, best-effort)
+    division     NVARCHAR(16),                         -- e.g. "Pacific" (static map)
+    fetched_at   FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_team_name' AND object_id = OBJECT_ID('dbo.nba_team'))
+CREATE INDEX ix_nba_team_name ON dbo.nba_team (name_norm);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_team_abbr' AND object_id = OBJECT_ID('dbo.nba_team'))
+CREATE INDEX ix_nba_team_abbr ON dbo.nba_team (abbreviation);
+GO
+
+-------------------------------------------------------------------------- nba_game
+-- Games dim = the spine. game_id (ESPN event id) is the natural PK. home/away_team_id and
+-- home/away_abbr are ATTRIBUTES (not FKs). The spine self-contains abbrs+ids+scores so
+-- team-market grading reads it without the team dim; facts rejoin on game_id.
+IF OBJECT_ID('dbo.nba_game', 'U') IS NULL
+CREATE TABLE dbo.nba_game (
+    game_id        NVARCHAR(16) NOT NULL PRIMARY KEY,
+    season         INT,                                 -- season-ENDING year
+    season_type    INT,                                 -- 1=pre 2=reg 3=post
+    game_date      NVARCHAR(10),                         -- YYYY-MM-DD (ET)
+    game_date_time NVARCHAR(32),                         -- ISO tip-off (ET)
+    home_team_id   NVARCHAR(16),                         -- id (attribute, not FK)
+    away_team_id   NVARCHAR(16),
+    home_abbr      NVARCHAR(8),                          -- point-in-time abbr (attribute)
+    away_abbr      NVARCHAR(8),
+    home_score     FLOAT,                                -- NULL until played
+    away_score     FLOAT,
+    completed      BIT,                                  -- status_type_completed
+    neutral_site   BIT,
+    venue_id       NVARCHAR(16),
+    fetched_at     FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_game_date' AND object_id = OBJECT_ID('dbo.nba_game'))
+CREATE INDEX ix_nba_game_date ON dbo.nba_game (game_date);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_game_season' AND object_id = OBJECT_ID('dbo.nba_game'))
+CREATE INDEX ix_nba_game_season ON dbo.nba_game (season, season_type);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_game_teams' AND object_id = OBJECT_ID('dbo.nba_game'))
+CREATE INDEX ix_nba_game_teams ON dbo.nba_game (season, home_team_id, away_team_id);
+GO
+
+------------------------------------------------------------------------ nba_player
+-- Player dim keyed on ESPN athlete_id. Cloud bootstrap fills id/name/position/jersey/team
+-- from the player box (no separate roster fetch needed for v1).
+IF OBJECT_ID('dbo.nba_player', 'U') IS NULL
+CREATE TABLE dbo.nba_player (
+    athlete_id NVARCHAR(16) NOT NULL PRIMARY KEY,       -- ESPN athlete id
+    full_name  NVARCHAR(96),                             -- athlete_display_name
+    name_norm  NVARCHAR(96),
+    short_name NVARCHAR(96),                             -- athlete_short_name
+    position   NVARCHAR(8),                              -- athlete_position_abbreviation
+    jersey     NVARCHAR(8),
+    team_id    NVARCHAR(16),                             -- most-recent (attribute)
+    fetched_at FLOAT
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_player_name' AND object_id = OBJECT_ID('dbo.nba_player'))
+CREATE INDEX ix_nba_player_name ON dbo.nba_player (name_norm);
+GO
+
+------------------------------------------------------------------- nba_player_game
+-- Per-player-game stat FACT. Natural key UNIQUE(athlete_id, game_id). game_id is an
+-- attribute that joins the spine (no FK — see header). played = active & !DNP & minutes>0
+-- (the DNP/void signal, like NFL snaps). Supersedes the ESPN nba_gamelog cache.
+IF OBJECT_ID('dbo.nba_player_game', 'U') IS NULL
+CREATE TABLE dbo.nba_player_game (
+    id                  INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    athlete_id          NVARCHAR(16) NOT NULL,           -- (natural key part)
+    game_id             NVARCHAR(16) NOT NULL,           -- (natural key part); joins spine
+    season              INT NOT NULL,                    -- season-ENDING year
+    game_date           NVARCHAR(10),                    -- YYYY-MM-DD (grading key)
+    team_id             NVARCHAR(16),
+    opponent_team_id    NVARCHAR(16),
+    home_away           NVARCHAR(8),                     -- home|away
+    team_score          FLOAT,
+    opponent_team_score FLOAT,
+    -- box stats
+    minutes FLOAT, points FLOAT, field_goals_made FLOAT, field_goals_attempted FLOAT,
+    three_point_field_goals_made FLOAT, three_point_field_goals_attempted FLOAT,
+    free_throws_made FLOAT, free_throws_attempted FLOAT, offensive_rebounds FLOAT,
+    defensive_rebounds FLOAT, rebounds FLOAT, assists FLOAT, steals FLOAT, blocks FLOAT,
+    turnovers FLOAT, fouls FLOAT, plus_minus FLOAT,
+    starter BIT,
+    did_not_play BIT,
+    active BIT,
+    played BIT,
+    fetched_at FLOAT,
+    CONSTRAINT uq_nba_player_game UNIQUE (athlete_id, game_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_player_game_athlete' AND object_id = OBJECT_ID('dbo.nba_player_game'))
+CREATE INDEX ix_nba_player_game_athlete ON dbo.nba_player_game (athlete_id, season);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_player_game_game' AND object_id = OBJECT_ID('dbo.nba_player_game'))
+CREATE INDEX ix_nba_player_game_game ON dbo.nba_player_game (game_id);
+GO
+-- (season, game_date) COVERING index (the uq is athlete-first). Add WITH (ONLINE = ON) where supported.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_player_game_season' AND object_id = OBJECT_ID('dbo.nba_player_game'))
+CREATE INDEX ix_nba_player_game_season
+    ON dbo.nba_player_game (season, game_date)
+    INCLUDE (athlete_id, home_away, opponent_team_id, minutes, points,
+             field_goals_made, field_goals_attempted, three_point_field_goals_made,
+             three_point_field_goals_attempted, free_throws_made, free_throws_attempted,
+             offensive_rebounds, defensive_rebounds, rebounds, assists, steals, blocks,
+             turnovers, fouls, plus_minus, played);
+GO
