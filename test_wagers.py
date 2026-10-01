@@ -980,5 +980,56 @@ class AttributionTests(unittest.TestCase):
         self.assertIn("thin", wagers._attribution_verdict({"n_decided": 5}))
 
 
+class NflFinalScoreTests(unittest.TestCase):
+    """NFL team-market grading reads the nflverse games spine (nflverse-primary, ESPN
+    fallback-on-miss, kill-switch ODI_NFL_TEAM_GRADE_NFLVERSE=0). final_score is the single
+    source all three team graders (resolve_pending_market_outcomes, wagers._grade_wager,
+    parlay_store._grade_team_leg) route through."""
+
+    def test_nflverse_scores_used(self):
+        with patch("nfl_schedule.resolve_event", return_value=("2026_04_NYG_DAL", "ok")), \
+             patch("nfl_schedule.team_scores_index",
+                   return_value={"2026_04_NYG_DAL": (27.0, 20.0)}):
+            sc = game_results.final_score(
+                "americanfootball_nfl", "2026-09-28", "Dallas Cowboys",
+                "New York Giants", "2026-09-28T17:00:00Z")
+        self.assertEqual(sc, (27.0, 20.0))
+
+    def test_not_final_stays_pending(self):
+        # resolved game but not yet completed → absent from team_scores_index → None.
+        with patch("nfl_schedule.resolve_event", return_value=("2026_04_NYG_DAL", "ok")), \
+             patch("nfl_schedule.team_scores_index", return_value={}), \
+             patch("game_results._scores_for_date", return_value=[]):
+            sc = game_results.final_score(
+                "americanfootball_nfl", "2026-09-28", "Dallas Cowboys",
+                "New York Giants", "2026-09-28T17:00:00Z")
+        self.assertIsNone(sc)
+
+    def test_falls_back_to_espn_on_nflverse_miss(self):
+        espn_slate = [{"home_team": "Dallas Cowboys", "away_team": "New York Giants",
+                       "home_score": 27, "away_score": 20,
+                       "commence_time": "2026-09-28T17:00:00Z"}]
+        with patch("nfl_schedule.resolve_event", return_value=(None, "no_match")), \
+             patch("game_results._scores_for_date", return_value=espn_slate):
+            sc = game_results.final_score(
+                "americanfootball_nfl", "2026-09-28", "Dallas Cowboys",
+                "New York Giants", "2026-09-28T17:00:00Z")
+        self.assertEqual(sc, (27, 20))
+
+    def test_kill_switch_uses_espn(self):
+        espn_slate = [{"home_team": "Dallas Cowboys", "away_team": "New York Giants",
+                       "home_score": 30, "away_score": 10,
+                       "commence_time": "2026-09-28T17:00:00Z"}]
+        with patch.dict(os.environ, {"ODI_NFL_TEAM_GRADE_NFLVERSE": "0"}), \
+             patch("nfl_schedule.resolve_event",
+                   return_value=("2026_04_NYG_DAL", "ok")) as rv, \
+             patch("game_results._scores_for_date", return_value=espn_slate):
+            sc = game_results.final_score(
+                "americanfootball_nfl", "2026-09-28", "Dallas Cowboys",
+                "New York Giants", "2026-09-28T17:00:00Z")
+        self.assertEqual(sc, (30, 10))       # ESPN, not nflverse
+        rv.assert_not_called()               # nflverse path skipped under the kill-switch
+
+
 if __name__ == "__main__":
     unittest.main()

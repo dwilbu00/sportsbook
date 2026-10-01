@@ -404,14 +404,47 @@ def _scores_for_date(sport_key, game_date):
     return out
 
 
+def _nfl_team_grade_nflverse():
+    """NFL team-market scores come from the nflverse games spine by default; kill-switch
+    ODI_NFL_TEAM_GRADE_NFLVERSE=0 reverts to the ESPN scoreboard (mirrors the prop cutover's
+    ODI_NFL_GRADE_NFLVERSE)."""
+    return os.environ.get("ODI_NFL_TEAM_GRADE_NFLVERSE", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _nfl_final_score(home_team, away_team, commence_time):
+    """(home_score, away_score) for a completed NFL game from the nflverse games spine
+    (nfl_schedule.resolve_event → team_scores_index), or None (unresolved / not yet final →
+    caller stays pending, same fail-closed contract as the ESPN path). Orientation is the
+    nflverse game's home/away, which matches the odds home_team/away_team via resolve_event's
+    fail-closed name→abbr join; the season comes from the resolved game_id."""
+    try:
+        import nfl_schedule
+        gid, _reason = nfl_schedule.resolve_event(home_team, away_team, commence_time)
+        if not gid:
+            return None
+        season = str(gid).split("_", 1)[0]
+        return nfl_schedule.team_scores_index([season]).get(gid)
+    except Exception:
+        return None
+
+
 def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
     """(home_score, away_score) for a completed game, or None.
 
     Scans ``game_date`` ±1 day (UTC/local slippage), matches by normalized team
-    keys, and disambiguates same-day games by the start nearest commence_time."""
+    keys, and disambiguates same-day games by the start nearest commence_time.
+    NFL grades off the nflverse games spine (nflverse-primary, ESPN fallback-on-miss)."""
     if not sport_key or (sport_key != "baseball_mlb"
                          and sport_key not in _ESPN_MAP):
         return None
+    # NFL: nflverse games spine is the score source (covers all 3 team graders —
+    # resolve_pending_market_outcomes, wagers._grade_wager, parlay_store._grade_team_leg —
+    # since they all route here). Falls through to the ESPN scoreboard only on a miss.
+    if sport_key == "americanfootball_nfl" and _nfl_team_grade_nflverse():
+        sc = _nfl_final_score(home_team, away_team, commence_time)
+        if sc is not None:
+            return sc
     hk, ak = _team_key(home_team), _team_key(away_team)
     if not hk or not ak:
         return None
