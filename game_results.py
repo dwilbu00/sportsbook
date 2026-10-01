@@ -429,6 +429,80 @@ def _nfl_final_score(home_team, away_team, commence_time):
         return None
 
 
+def _num(v):
+    """float(v) or None (NaN-safe — a completed-game pandas score is never NaN, but a feed
+    hiccup can be)."""
+    try:
+        f = float(v)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _nba_team_grade_sdv():
+    """NBA team-market scores come from the sportsdataverse schedule spine by default;
+    kill-switch ODI_NBA_TEAM_GRADE_SDV=0 reverts to the ESPN scoreboard (mirrors the prop
+    cutover's ODI_NBA_GRADE_SDV and the NFL team switch)."""
+    return os.environ.get("ODI_NBA_TEAM_GRADE_SDV", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _nba_final_score(home_team, away_team, commence_time, game_date):
+    """(home_score, away_score) for a completed NBA game from the sportsdataverse schedule
+    spine (nba_source.load_schedule — dep-free HTTP, no Azure/ESPN), or None (unresolved / not
+    yet final / ambiguous → caller stays pending, same fail-closed contract as the ESPN path).
+    A season series repeats the same home/away orientation, so disambiguation is REQUIRED: by
+    commence (nearest tip-off, 20h gate) or by exact game_date (a team plays once a day)."""
+    try:
+        import pandas as pd
+        import nba_source
+        season = (nba_source.end_year_for_date(str(game_date)[:10]) if game_date
+                  else nba_source.current_end_year())
+        if season is None:
+            return None
+        df = nba_source.load_schedule(season)
+        if df is None or getattr(df, "empty", True):
+            return None
+        hk, ak = _team_key(home_team), _team_key(away_team)
+        if not hk or not ak:
+            return None
+        cands = []               # (game_date_time, home_score, away_score, game_date)
+        for r in df.to_dict("records"):
+            if not bool(r.get("status_type_completed")):
+                continue
+            hs, as_ = _num(r.get("home_score")), _num(r.get("away_score"))
+            if hs is None or as_ is None:
+                continue
+            if _team_key(r.get("home_display_name")) != hk:
+                continue
+            if _team_key(r.get("away_display_name")) != ak:
+                continue
+            cands.append((r.get("game_date_time"), hs, as_, r.get("game_date")))
+        if not cands:
+            return None
+        target = _parse_utc(commence_time)
+        if target is not None:
+            def _delta(item):
+                try:
+                    gc = pd.to_datetime(item[0], utc=True).to_pydatetime()
+                    return abs((gc - target).total_seconds())
+                except Exception:
+                    return float("inf")
+            cands.sort(key=_delta)
+            if _delta(cands[0]) > 20 * 3600:        # closest match is a different game
+                return None
+            pick = cands[0]
+        else:
+            gd = str(game_date)[:10] if game_date else None
+            exact = ([c for c in cands if str(c[3])[:10] == gd] if gd else cands)
+            if len(exact) != 1:                     # no commence to disambiguate a series
+                return None
+            pick = exact[0]
+        return (float(pick[1]), float(pick[2]))
+    except Exception:
+        return None
+
+
 def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
     """(home_score, away_score) for a completed game, or None.
 
@@ -443,6 +517,12 @@ def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
     # since they all route here). Falls through to the ESPN scoreboard only on a miss.
     if sport_key == "americanfootball_nfl" and _nfl_team_grade_nflverse():
         sc = _nfl_final_score(home_team, away_team, commence_time)
+        if sc is not None:
+            return sc
+    # NBA: sportsdataverse schedule spine is the score source (dep-free HTTP, no ESPN);
+    # covers all team graders that route here. Falls through to the ESPN scoreboard on a miss.
+    if sport_key == "basketball_nba" and _nba_team_grade_sdv():
+        sc = _nba_final_score(home_team, away_team, commence_time, game_date)
         if sc is not None:
             return sc
     hk, ak = _team_key(home_team), _team_key(away_team)

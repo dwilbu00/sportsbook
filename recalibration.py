@@ -1446,6 +1446,8 @@ def _is_stale_dnp(sport_key, prop_key, player, game_date, commence):
     posted regular-season week == did not play). Never raises."""
     if sport_key == "americanfootball_nfl":
         return _nfl_is_dnp(prop_key, player, game_date, commence)
+    if sport_key == "basketball_nba":
+        return _nba_is_dnp(prop_key, player, game_date, commence)
     if sport_key != "baseball_mlb":
         return False
     spec = _mlb_stat_spec(prop_key)
@@ -1542,6 +1544,42 @@ def _nfl_grade_from_nflverse():
     return _NFL_GRADE_FROM_NFLVERSE_DEFAULT
 
 
+# prop_key -> nba_warehouse / sportsdataverse player-box column(s); a tuple is SUMMED
+# (combo props: PRA, P+R, etc.). Every column here is kept by nba_warehouse._FRAME_STATS
+# (and present on the live sportsdataverse player box). Double/triple-double are NOT simple
+# sums (category-count props) so they are intentionally absent → ESPN fallback / pending.
+_NBA_PROP_COL = {
+    "player_points": "points",
+    "player_rebounds": "rebounds",
+    "player_assists": "assists",
+    "player_threes": "three_point_field_goals_made",
+    "player_steals": "steals",
+    "player_blocks": "blocks",
+    "player_turnovers": "turnovers",
+    "player_field_goals": "field_goals_made",
+    "player_frees_made": "free_throws_made",
+    "player_frees_attempts": "free_throws_attempted",
+    "player_points_rebounds_assists": ("points", "rebounds", "assists"),
+    "player_points_rebounds": ("points", "rebounds"),
+    "player_points_assists": ("points", "assists"),
+    "player_rebounds_assists": ("rebounds", "assists"),
+    "player_blocks_steals": ("blocks", "steals"),
+    "player_steals_blocks": ("steals", "blocks"),
+}
+
+# NBA grading cutover gate. ON by default: the sportsdataverse warehouse is the PRIMARY NBA
+# grader (per-player-game box, validated live) with the ESPN gamelog as fallback-on-miss.
+# Kill-switch ODI_NBA_GRADE_SDV=0 reverts to ESPN-primary (mirrors ODI_NFL_GRADE_NFLVERSE).
+_NBA_GRADE_FROM_WAREHOUSE_DEFAULT = True
+
+
+def _nba_grade_from_warehouse():
+    v = os.environ.get("ODI_NBA_GRADE_SDV")
+    if v is not None:
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return _NBA_GRADE_FROM_WAREHOUSE_DEFAULT
+
+
 def _nfl_player_week_frame(season):
     """The NFL warehouse's player-week frame for grading (nfl_warehouse.player_week_frame),
     shaped like nfl_opportunity_serving._load, or None when the warehouse is empty/disabled."""
@@ -1592,6 +1630,121 @@ def _resolve_nfl_actual(prop_key, player, game_date, commence=None):
         return None
     except Exception:
         return None
+
+
+def _nba_player_game_frame(season):
+    """The NBA warehouse's player-game frame for grading (nba_warehouse.player_game_frame —
+    player_norm + game_date + box stats + played), or None when it's empty/disabled."""
+    try:
+        import nba_warehouse
+        return nba_warehouse.player_game_frame(season)
+    except Exception:
+        return None
+
+
+def _row_played(row):
+    """played bit for a warehouse/live player-game row: True / False / None (unknown). The
+    warehouse frame carries an explicit ``played``; the live sportsdataverse box has null
+    MINUTES exactly for did-not-play rows (so null/0 minutes == DNP)."""
+    try:
+        import pandas as pd
+        p = row.get("played")
+        if p is not None and not pd.isna(p):
+            return bool(p)
+        m = row.get("minutes")
+        if m is None:
+            return None
+        if pd.isna(m):                              # null minutes present == DNP
+            return False
+        return float(m) > 0
+    except Exception:
+        return None
+
+
+def _nba_frame_match(df, pnorm, game_date):
+    """The single (player_norm, game_date) row in a warehouse/live NBA frame, or None. A
+    player appears at most once per date, so an exact date match never grabs a back-to-back
+    (NO ±1-day tolerance — that would settle the wrong night of a two-games-in-three-days)."""
+    if df is None or "player_norm" not in getattr(df, "columns", []) \
+            or "game_date" not in getattr(df, "columns", []):
+        return None
+    by_name = df[df["player_norm"] == pnorm]
+    if len(by_name) == 0:
+        return None
+    gdser = by_name["game_date"].astype(str).str.slice(0, 10)
+    sub = by_name[gdser.values == str(game_date)[:10]]
+    return sub.iloc[0] if len(sub) else None
+
+
+def _resolve_nba_actual(prop_key, player, game_date, commence=None):
+    """NBA player-prop actual, keyed by (normalized name, game_date). Reads the durable
+    sportsdataverse WAREHOUSE first (nba_warehouse.player_game_frame — the frozen record,
+    MLB/NFL-parity grading from the DB) and falls back to the LIVE sportsdataverse player box
+    (nba_source.load_player_box) for games not yet ingested. Returns the float stat (summed
+    for combo props), or None when the prop is unmapped, the season/row can't be resolved, or
+    the player DID NOT PLAY (minutes 0/null → never grade a phantom 0; the caller stays
+    pending and the stale-DNP sweep voids it). Never raises — a miss falls through to ESPN."""
+    cols = _NBA_PROP_COL.get(prop_key)
+    if cols is None:
+        return None
+    cols = cols if isinstance(cols, tuple) else (cols,)
+    try:
+        import nba_source as _src
+        season = _src.end_year_for_date(str(game_date)[:10])
+        if season is None:
+            return None
+        pnorm = _src._norm(player)
+        for df in (_nba_player_game_frame(season), _src.load_player_box(season)):
+            row = _nba_frame_match(df, pnorm, game_date)
+            if row is None:
+                continue
+            if _row_played(row) is False:           # confirmed DNP → don't grade a phantom 0
+                return None
+            present = [c for c in cols if c in df.columns]
+            if not present:
+                continue
+            return float(sum(float(row.get(c) or 0.0) for c in present))
+        return None
+    except Exception:
+        return None
+
+
+def _nba_dnp_row(player, game_date):
+    """True = the warehouse/live box has a (player, date) row but the player did NOT play
+    (confirmed DNP → void, never grade 0); False = played; None = no row (unknown, keep
+    retrying). Shared by resolve_one_prop (skip the ESPN phantom-0) and the stale-DNP void."""
+    try:
+        import nba_source as _src
+        season = _src.end_year_for_date(str(game_date)[:10])
+        if season is None:
+            return None
+        pnorm = _src._norm(player)
+        for df in (_nba_player_game_frame(season), _src.load_player_box(season)):
+            row = _nba_frame_match(df, pnorm, game_date)
+            if row is None:
+                continue
+            return _row_played(row) is False
+        return None
+    except Exception:
+        return None
+
+
+def _nba_is_dnp(prop_key, player, game_date, commence):
+    """NBA confirmed-DNP for the stale-void path: True iff this is a graded NBA prop, its
+    game is >= STALE_DNP_HOURS old, and the box shows the player in the game with no minutes
+    (inactive/DNP) — so the bet voids instead of grading a phantom 0-loss. Never raises."""
+    if prop_key not in _NBA_PROP_COL:
+        return False
+    try:
+        commence_dt = _parse_dt(commence)
+        if commence_dt is None:
+            return False
+        age_hours = (datetime.now(timezone.utc) - commence_dt).total_seconds() / 3600.0
+        if age_hours < STALE_DNP_HOURS:
+            return False
+        return _nba_dnp_row(player, game_date) is True
+    except Exception:
+        return False
 
 
 def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
@@ -1659,6 +1812,17 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
             v = _resolve_nfl_actual(prop_key, player, game_date, commence)
             if v is not None:
                 return float(v)
+        # NBA: grade from the sportsdataverse WAREHOUSE first (frozen per-player-game box),
+        # live sportsdataverse parquet second; any miss falls to the ESPN gamelog below.
+        # A confirmed DNP (player in the box with 0/null minutes) stays PENDING here rather
+        # than grading a phantom 0-loss via ESPN — the stale-DNP sweep voids it later.
+        # Kill-switch ODI_NBA_GRADE_SDV=0 reverts to ESPN-primary.
+        if sport_key == "basketball_nba" and _nba_grade_from_warehouse():
+            v = _resolve_nba_actual(prop_key, player, game_date, commence)
+            if v is not None:
+                return float(v)
+            if _nba_dnp_row(player, game_date) is True:
+                return None
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
             return None
