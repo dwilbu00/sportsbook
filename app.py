@@ -680,6 +680,9 @@ def _selected_kelly_rows(ar, valid_keys=None):
             "bankroll": bankroll,
             "kelly_fraction": fraction,
             "kelly_cap": cap_pct / 100.0,
+            # Profit-boost token applied to each submitted straight (bonus polish).
+            # Single slate-wide input; adjust per-bet afterward in My Bets.
+            "boost_pct": (_safe_float(st.session_state.get("submit_boost_pct")) or 0.0) / 100.0,
         })
         try:
             row = wagers.build_wager_row(bet_type, side, candidate, meta)
@@ -900,6 +903,14 @@ def _render_selected_bet_checklist(entries, ar):
                 help="Record the checked bets to your actual-bets ledger at the "
                      "previewed Kelly stakes.",
                 on_click=_submit_selected_picks, args=(ar, valid_keys))
+        st.number_input(
+            "Profit boost % (applies to each submitted bet)",
+            min_value=0.0, max_value=100.0, value=0.0, step=5.0, format="%.0f",
+            key="submit_boost_pct",
+            help="A DraftKings/FanDuel profit-boost token to apply to the straight(s) you "
+                 "submit now — a win then grades stake·(dec−1)·(1+boost). Leave 0 if not "
+                 "using one; a token is single-use, so set this only when submitting the "
+                 "boosted bet (you can still adjust it per-bet later in 🧾 My Bets).")
         with st.expander("⚙️ Sizing settings (Kelly)"):
             st.number_input(
                 "Kelly fraction", min_value=0.0, max_value=1.0,
@@ -2296,10 +2307,11 @@ def render_my_bets():
     if settled:
         st.subheader("Settled bets")
         st.caption(
-            "Settled bets can't be edited. Tick **Re-grade** to reset a bet to "
-            "pending and re-grade it on refresh (fixes bets graded while the "
-            "game was still live), or tick **Delete** to remove one. Then click "
-            "**Apply**."
+            "Settled bets can't be edited, EXCEPT **Boost %** — set/raise it to apply a "
+            "profit boost retroactively (the bet re-settles with the boosted payout on "
+            "Apply). Tick **Re-grade** to reset a bet to pending and re-grade it on refresh "
+            "(fixes bets graded while the game was still live), or **Delete** to remove one. "
+            "Then click **Apply**."
         )
         settled_df = pd.DataFrame([
             {
@@ -2316,6 +2328,7 @@ def render_my_bets():
                 "Price": r.get("executed_price"),
                 "Result": (r.get("status") or "").upper(),
                 "P/L": f"${_safe_float(r.get('profit')):+.2f}",
+                "Boost %": (_safe_float(r.get("boost_pct")) or 0.0) * 100,
                 "CLV": (f"{r.get('clv_pct'):+.1f}%"
                         if r.get("clv_pct") is not None else "—"),
             } for r in sorted(settled, key=lambda r: r.get("placed_at") or "",
@@ -2335,6 +2348,10 @@ def render_my_bets():
                     "Re-grade": st.column_config.CheckboxColumn(
                         "Re-grade", default=False,
                         help="Reset to pending and re-grade on the next refresh."),
+                    "Boost %": st.column_config.NumberColumn(
+                        "Boost %", help="Apply a profit boost RETROACTIVELY — the bet "
+                        "re-settles with stake·(dec−1)·(1+boost) on Apply.",
+                        min_value=0.0, max_value=100.0, step=5.0, format="%.0f"),
                 },
             )
             submit_settled = st.form_submit_button("💾 Apply")
@@ -3153,19 +3170,24 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
             if patch:
                 edits[wid] = patch
 
-    # Boost % is editable (pending table): mark a bet boosted BEFORE it settles and the
-    # grader pays stake·(dec−1)·(1+boost) on a win. Stored as a fraction. Merge onto any
-    # existing patch for the row; gated on the column so tables without it are unaffected.
+    # Boost % is editable in BOTH tables: pending = mark a bet boosted before it settles;
+    # settled = apply a boost RETROACTIVELY. Stored as a fraction; merge onto any existing
+    # patch. Gated on the column so tables without it are unaffected.
+    boost_changed = []
     if "Boost %" in edited_df.columns:
         for wid in survivors:
             new = _coerce_pct_fraction(edited_df.loc[wid].get("Boost %"))
             old = _coerce_pct_fraction(original_df.loc[wid].get("Boost %"))
             if new is not None and new != old:
                 edits.setdefault(wid, {})["boost_pct"] = new
+                boost_changed.append(wid)
 
     regrades = []
     if regradable:
         regrades = [wid for wid in survivors if _checked(wid, "Re-grade")]
+        # A boost change on a SETTLED bet must re-settle it so the stored profit reflects
+        # the (retroactive) boost — reuse the regrade path (reset→pending→re-grade).
+        regrades = sorted(set(regrades) | set(boost_changed))
 
     voided = []
     if editable:
@@ -3181,12 +3203,15 @@ def _apply_wager_edits(original_df, edited_df, editable=False, regradable=False)
     n_edit = n_regrade = n_void = n_del = 0
     committed = []
     try:
-        if edits:
-            n_edit = wagers.update_wagers(edits)
-            committed.append(f"{n_edit} edited")
+        # Regrades BEFORE edits: resetting a settled bet to pending lets a boost_pct edit
+        # on it land (update_wagers only touches pending rows), so a RETROACTIVE boost on a
+        # settled bet re-settles with the boosted payout on the next grading pass.
         if regrades:
             n_regrade = wagers.regrade_wagers(regrades)
             committed.append(f"{n_regrade} reset to pending")
+        if edits:
+            n_edit = wagers.update_wagers(edits)
+            committed.append(f"{n_edit} edited")
         if voided:
             n_void = wagers.void_wagers(voided)
             committed.append(f"{n_void} voided")

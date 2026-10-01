@@ -110,6 +110,23 @@ class BoostEditTests(unittest.TestCase):
         wagers.update_wagers.assert_not_called()
         self.assertIn("No changes", st.info.call_args[0][0])
 
+    def test_settled_boost_change_patches_and_regrades(self):
+        # Retroactive boost on a SETTLED bet: patch boost_pct AND regrade so it re-settles
+        # with the boosted payout (regrade resets to pending so the patch can land).
+        ns = _extract()
+        original = pd.DataFrame([
+            {"Delete": False, "Re-grade": False, "Boost %": 0.0},
+        ], index=["a"])
+        edited = original.copy()
+        edited.loc["a", "Boost %"] = 50.0
+        wagers = MagicMock()
+        wagers.update_wagers.return_value = 1
+        wagers.regrade_wagers.return_value = 1
+        with patch.dict(sys.modules, {"wagers": wagers}):
+            ns["_apply_wager_edits"](original, edited, regradable=True)
+        wagers.update_wagers.assert_called_once_with({"a": {"boost_pct": 0.50}})
+        wagers.regrade_wagers.assert_called_once_with(["a"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

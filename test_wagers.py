@@ -164,6 +164,40 @@ class BuildWagerRowTests(unittest.TestCase):
         row = wagers.build_wager_row("total", "OVER", cand, _meta())
         self.assertEqual(row["book"], "DraftKings")
 
+    def test_spread_records_line_value_exec_price_and_book(self):
+        # Line-value spread: record the recommended book's own-line price + book + bet line,
+        # NOT the median `price` (which is now display-only).
+        cand = {"team": "A", "opponent": "B", "home_away": "HOME", "spread": -2.5,
+                "price": -108, "cover_rate": 58.0, "edge_pct": 6.0, "event_id": "E1",
+                "dk_book": "FanDuel", "dk_price": -105, "fd_price": -102}
+        row = wagers.build_wager_row("spread", None, cand, _meta())
+        self.assertEqual(row["book"], "FanDuel")
+        self.assertEqual(row["executed_price"], -102)      # FD's own-line price, not -108
+        self.assertEqual(row["point"], -2.5)               # the bet line
+        self.assertEqual(row["line"], -2.5)
+
+    def test_total_records_line_value_exec_side_price_and_book(self):
+        cand = {"matchup": "B @ A", "line": 44.5, "over_price": -110,
+                "under_price": -110, "over_hit_rate": 62.0, "over_edge_pct": 7.0,
+                "event_id": "E1", "over_book": "DraftKings",
+                "dk_over_price": -108, "fd_over_price": -115}
+        row = wagers.build_wager_row("total", "OVER", cand, _meta())
+        self.assertEqual(row["book"], "DraftKings")
+        self.assertEqual(row["executed_price"], -108)      # DK over price at the bet line
+        self.assertEqual(row["point"], 44.5)
+
+    def test_boost_pct_captured_from_meta(self):
+        cand = {"team": "A", "opponent": "B", "home_away": "HOME", "best_price": 120,
+                "best_book": "DK", "blended_prob": 58.0, "best_edge_pct": 6.0,
+                "event_id": "E1"}
+        meta = _meta()
+        meta["boost_pct"] = 0.30
+        row = wagers.build_wager_row("moneyline", None, cand, meta)
+        self.assertEqual(row["boost_pct"], 0.30)
+        # No boost in meta → boost_pct not set (byte-identical to before).
+        self.assertNotIn("boost_pct", wagers.build_wager_row(
+            "moneyline", None, cand, _meta()))
+
     def test_blank_row_derives_et_local_game_date(self):
         # 02:30 UTC on 7/21 is 10:30 PM ET on 7/20 -> official game date is 7/20,
         # NOT the raw UTC 7/21. Meta omits game_date so the fallback is exercised.

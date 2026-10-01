@@ -161,6 +161,33 @@ def _enrich_ids(row):
     return row
 
 
+def _exec_price_book(candidate):
+    """(price, book) at the recommended EXECUTABLE book for a single-sided team candidate
+    (spread). analysis._exec_book_fields / line-value store the per-book price at the book's
+    own line + dk_book = the recommended book. Falls back to best_price/price when unknown."""
+    bl = str(candidate.get("dk_book") or candidate.get("best_book") or "").lower()
+    if "draft" in bl:
+        return candidate.get("dk_price", candidate.get("best_price")), "DraftKings"
+    if "fan" in bl:
+        return candidate.get("fd_price", candidate.get("best_price")), "FanDuel"
+    # Legacy candidate (no per-book fields): keep its stored price + book as-is.
+    return (candidate.get("best_price", candidate.get("price")),
+            candidate.get("dk_book") or candidate.get("best_book")
+            or candidate.get("book"))
+
+
+def _exec_price_book_side(candidate, side):
+    """(price, book) at the recommended executable book for a total's chosen side
+    ('OVER'|'UNDER') — per-side book (over_book/under_book) + per-book side price."""
+    s = side.lower()
+    bl = str(candidate.get(f"{s}_book") or "").lower()
+    if "draft" in bl:
+        return candidate.get(f"dk_{s}_price"), "DraftKings"
+    if "fan" in bl:
+        return candidate.get(f"fd_{s}_price"), "FanDuel"
+    return candidate.get(f"{s}_price"), candidate.get(f"{s}_book")
+
+
 def build_wager_row(bet_type, side, candidate, meta):
     """Build one ledger row from an analysis candidate. Returns None on failure.
 
@@ -191,8 +218,14 @@ def build_wager_row(bet_type, side, candidate, meta):
             # Coherence run-line grades identically to a spread (run-line cover); the
             # distinct bet_type is retained in the ledger so its record stays separable.
             home_away = candidate.get("home_away")
-            price = candidate.get("price")
             spread = candidate.get("spread")
+            if bet_type == "spread":
+                # Line-value: record the EXECUTABLE price/book at the bet line (spread =
+                # the bet line, cover_rate = line-value P). [F01]
+                price, book = _exec_price_book(candidate)
+            else:  # coherence RL: a single unattributed price (no per-book split)
+                price = candidate.get("price")
+                book = candidate.get("book") or candidate.get("best_book")
             row.update({
                 "team": candidate.get("team"),
                 "opponent": candidate.get("opponent"),
@@ -201,15 +234,15 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "side": "home" if (home_away or "").upper() == "HOME" else "away",
                 "point": spread, "line": spread,
                 "executed_price": price, "model_price": price,
-                "book": candidate.get("book") or candidate.get("best_book"),  # [F01]
+                "book": book,
                 "model_prob": _pct(candidate.get("cover_rate")),
                 "model_edge": candidate.get("edge_pct"),
             })
         elif bet_type == "total":
             sd = (side or "OVER").upper()
             line = candidate.get("line")
-            price = (candidate.get("over_price") if sd == "OVER"
-                     else candidate.get("under_price"))
+            # Line-value: the EXECUTABLE price/book for the chosen side at the bet line.
+            price, book = _exec_price_book_side(candidate, sd)
             over_hit = candidate.get("over_hit_rate")
             model_prob = (_pct(over_hit) if sd == "OVER"
                           else (None if over_hit is None else _pct(100.0 - over_hit)))
@@ -221,7 +254,7 @@ def build_wager_row(bet_type, side, candidate, meta):
                 "side": sd.lower(), "direction": sd,
                 "point": line, "line": line,
                 "executed_price": price, "model_price": price,
-                "book": candidate.get("book") or candidate.get("best_book"),  # [F01]
+                "book": book or candidate.get("book") or candidate.get("best_book"),  # [F01]
                 "model_prob": model_prob, "model_edge": edge,
             })
         elif bet_type == "player_prop":
@@ -268,6 +301,12 @@ def build_wager_row(bet_type, side, candidate, meta):
             })
         else:
             return None
+        # Profit-boost token captured at submit (bonus polish): grading pays
+        # stake·(dec−1)·(1+boost) on a win. Stored as a fraction; editable per-bet
+        # afterward in My Bets. 0/None = no boost (byte-identical to before).
+        _boost = meta.get("boost_pct")
+        if _boost:
+            row["boost_pct"] = float(_boost)
         # Fractional-Kelly stake (P-Kelly): size from the already-shrunk model
         # probability (row['model_prob'] is a 0-1 fraction via _pct) at the DK
         # executed price (row['executed_price']). Sizing here keeps the stake
@@ -347,7 +386,10 @@ def submit_wagers(rows):
 # Fields the user may correct on a PENDING bet when the number changed between
 # running the analysis and actually placing the bet. Editing the line also syncs
 # ``point`` (see update_wagers) so grading stays consistent across bet types.
-_EDITABLE_FIELDS = ("executed_price", "line", "stake")
+# ``boost_pct`` lets the My Bets editor set/adjust a profit-boost token (as a
+# fraction) so a win grades the boosted payout; a settled bet is reset to pending
+# first (regrade) so this patch can land and re-settle it (retroactive boost).
+_EDITABLE_FIELDS = ("executed_price", "line", "stake", "boost_pct")
 
 
 def delete_wagers(wager_ids):
