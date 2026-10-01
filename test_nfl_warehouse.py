@@ -120,8 +120,10 @@ class IngestTests(unittest.TestCase):
              "away_score": None, "location": "Home", "result": None, "total": None,
              "espn": "402"},
         ]
-        with patch("nfl_schedule.load_games", return_value=games):
+        with patch("nfl_schedule.load_games", return_value=games) as lg:
             self.assertEqual(nw.ingest_games(["2026"]), (2, 0))
+            # reads the authoritative all-seasons games.csv, NOT a partial local mirror
+            lg.assert_called_with(["2026"], prefer_mirror=False)
             # idempotent re-ingest
             self.assertEqual(nw.ingest_games(["2026"]), (0, 0))
         rows = {r["game_id"]: r for r in self._rows(nw.nfl_game)}

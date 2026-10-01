@@ -214,13 +214,16 @@ def seed_teams():
 
 
 def ingest_games(seasons):
-    """Upsert nfl_game from the nflverse games spine (nfl_schedule.load_games — dep-free
-    games.csv over HTTP on Cloud). Per-season scoped (bounded read). Idempotent."""
+    """Upsert nfl_game from the authoritative nflverse games.csv (ALL seasons; dep-free HTTP).
+    Per-season scoped (bounded read). Idempotent. ``prefer_mirror=False`` so ingest always
+    reads games.csv, never a possibly-partial LOCAL mirror parquet (which would silently drop
+    seasons absent from the mirror — the backfill-box games gap); on Cloud the mirror is a
+    stub so this already resolves to games.csv."""
     import nfl_schedule
     n_ins = n_upd = 0
     now = time.time()
     for s in seasons:
-        recs = nfl_schedule.load_games([str(s)]) or []
+        recs = nfl_schedule.load_games([str(s)], prefer_mirror=False) or []
         rows = [{
             "game_id": _s(r.get("game_id")), "season": _i(r.get("season")),
             "week": _i(r.get("week")), "game_type": _s(r.get("game_type")),
