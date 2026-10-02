@@ -3,6 +3,9 @@
   * book_line_calibration._nba_grade_book_lines / join_book_lines_to_actuals dispatch.
 SQLite warehouse; no network.
 """
+import os
+import shutil
+import tempfile
 import unittest
 
 import db_store
@@ -101,6 +104,43 @@ class CalibJoinTests(unittest.TestCase):
                 [_line("Shooter Guy", "player_points", "2024-01-23")]))
         finally:
             db_store.configure_engine("sqlite://")       # restore for tearDown
+
+
+class MirrorTests(unittest.TestCase):
+    """export_mirror -> parquet; calib_gamelogs_bulk reads it MIRROR-FIRST at 0 DTU (even with
+    Azure off), NaN-safe (a null stat stays None through parquet, never becomes 0)."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        os.environ["ODI_MIRROR_DIR"] = self._dir
+        db_store.configure_engine("sqlite://")
+        nw.create_all()
+        with db_store.get_engine().begin() as c:
+            c.execute(nw.nba_player.insert().values(
+                athlete_id="30", name_norm="mirror guy", full_name="Mirror Guy"))
+            c.execute(nw.nba_player_game.insert().values(
+                athlete_id="30", game_id="m1", season=2024, game_date="2024-02-01",
+                team_id="13", home_away="home", opponent_team_id="99", played=True,
+                minutes=28.0, points=18.0, rebounds=5.0, assists=3.0, plus_minus=None))
+
+    def tearDown(self):
+        db_store.configure_engine(None)
+        os.environ.pop("ODI_MIRROR_DIR", None)
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def test_export_then_read_mirror_first_without_azure(self):
+        written = nw.export_mirror([2024], verbose=False)
+        self.assertEqual(written[2024], 1)
+        self.assertTrue(os.path.exists(nw._mirror_file(2024)))
+        db_store.configure_engine(None)                  # Azure OFF — must serve from parquet
+        bulk = nw.calib_gamelogs_bulk([2024])
+        self.assertIn("mirror guy", bulk)
+        g = bulk["mirror guy"][0]
+        self.assertEqual(g["points"], 18.0)
+        self.assertEqual(g["team_id"], "13")
+        self.assertTrue(g["is_home"])
+        self.assertTrue(g["played"])
+        self.assertIsNone(g["plus_minus"])               # None survives parquet (not NaN/0)
 
 
 if __name__ == "__main__":

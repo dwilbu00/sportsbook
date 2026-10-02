@@ -31,6 +31,7 @@ standings dataset is a v2 enrichment).
 from __future__ import annotations
 
 import datetime
+import os
 import time
 
 from sqlalchemy import (
@@ -504,43 +505,124 @@ def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
         return []
 
 
+# ── Local parquet MIRROR of the player-game actuals (0-DTU calib/sweep reads) ──────
+# The offline calibration + backtest-engine sweeps read a player's whole history MANY
+# times (per worker, per season); hitting Azure for each is slow + burns DTU on the
+# 20-DTU tier. Mirror the facts to parquet once (export_mirror) and read them at 0 DTU,
+# exactly like warehouse_mirror does for MLB. Completed seasons are static, so the mirror
+# is valid until the next backfill/maintenance (re-export to refresh the current season).
+_MIRROR_COLS = ("name_norm", "season", "game_date", "game_id", "team_id", "home_away",
+                "opponent_team_id", "played", *_BOX_STATS)
+
+
+def _mirror_dir():
+    return os.environ.get(
+        "ODI_MIRROR_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "warehouse_mirror_data"))
+
+
+def _mirror_file(season):
+    return os.path.join(_mirror_dir(),
+                        f"nba_player_game__basketball_nba__{int(season)}.parquet")
+
+
+def _nn(v):
+    """NaN/NA -> None (parquet reloads None floats as NaN; the Azure path already yields
+    None). Keeps a real 0 distinct from 'no data' so a DNP's null stat never becomes 0."""
+    try:
+        if v is None:
+            return None
+        if isinstance(v, float) and v != v:
+            return None
+        import pandas as pd
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError, ImportError):
+        pass
+    return v
+
+
+def _row_to_game(m):
+    """A sweep/calib game dict from a mirror OR Azure record (shared shape; NaN-safe)."""
+    g = {"season": _nn(m.get("season")), "game_date": m.get("game_date"),
+         "game_pk": m.get("game_id"), "team_id": m.get("team_id"),
+         "is_home": (m.get("home_away") == "home"),
+         "opponent": m.get("opponent_team_id"),
+         "MIN": _nn(m.get("minutes")), "played": _nn(m.get("played"))}
+    for c in _BOX_STATS:
+        g[c] = _nn(m.get(c))
+    return g
+
+
+def _query_player_games(seasons):
+    """Raw per-game records (dicts) for ``seasons`` from Azure — the mirror source + the
+    Azure fallback for any un-mirrored season. []/raises-safe handled by callers."""
+    pg, pl = nba_player_game, nba_player
+    stmt = (select(pl.c.name_norm.label("name_norm"), pg.c.season, pg.c.game_date,
+                   pg.c.game_id, pg.c.team_id, pg.c.home_away, pg.c.opponent_team_id,
+                   pg.c.played, *[pg.c[c] for c in _BOX_STATS])
+            .select_from(pg.join(pl, pg.c.athlete_id == pl.c.athlete_id))
+            .where(pg.c.season.in_([int(s) for s in seasons])))
+    with db_store.get_engine().connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(stmt)]
+
+
+def export_mirror(seasons, verbose=True):                # pragma: no cover - offline owner tool
+    """Dump nba_player_game (+ name_norm) per season from Azure to the local parquet mirror so
+    calib_gamelogs_bulk reads actuals at 0 DTU (the NBA analog of warehouse_mirror for MLB).
+    Run once after a backfill; completed seasons are static. Returns rows written per season."""
+    if not enabled():
+        raise SystemExit("DB not enabled (no secrets.toml?) — can't export the mirror.")
+    import pandas as pd
+    os.makedirs(_mirror_dir(), exist_ok=True)
+    written = {}
+    for s in seasons:
+        rows = _query_player_games([int(s)])
+        df = pd.DataFrame(rows, columns=list(_MIRROR_COLS)) if rows else pd.DataFrame(
+            columns=list(_MIRROR_COLS))
+        df.to_parquet(_mirror_file(s), index=False)
+        written[int(s)] = len(df)
+        if verbose:
+            print(f"  nba_player_game mirror {s}: {len(df):,} rows -> {_mirror_file(s)}")
+    return written
+
+
 def calib_gamelogs_bulk(seasons):
     """{name_norm: [per-game dict, most-recent-first]} across ``seasons`` (ending years), for
-    the OFFLINE calibration + opportunity join (book_line_calibration._nba_grade_book_lines).
-    Each game dict carries season, game_date, game_pk, MIN, is_home, opponent, played + EVERY
+    the OFFLINE calibration + opportunity join AND the backtest-engine NBA sweep. Each game
+    dict carries season, game_date, game_pk, team_id, MIN, is_home, opponent, played + EVERY
     box stat column — so the projection reads the prop stat and the opportunity gate reads the
-    attempt stat (FGA/3PA/FTA) from the SAME rows. Warehouse-only; {} when disabled or on any
-    error. One bulk query over the requested seasons (the join passes only the seasons its book
-    lines cover, not all 25)."""
-    if not enabled():
-        return {}
-    try:
-        from collections import defaultdict
-        pg, pl = nba_player_game, nba_player
-        stmt = (select(pl.c.name_norm.label("name_norm"), pg.c.season, pg.c.game_date,
-                       pg.c.game_id, pg.c.team_id, pg.c.home_away, pg.c.opponent_team_id,
-                       pg.c.played, *[pg.c[c] for c in _BOX_STATS])
-                .select_from(pg.join(pl, pg.c.athlete_id == pl.c.athlete_id))
-                .where(pg.c.season.in_([int(s) for s in seasons]))
-                .order_by(pg.c.game_date.desc()))
-        out = defaultdict(list)
-        with db_store.get_engine().connect() as conn:
-            for r in conn.execute(stmt):
-                m = dict(r._mapping)
-                nm = m.get("name_norm")
-                if not nm:
-                    continue
-                g = {"season": m.get("season"), "game_date": m.get("game_date"),
-                     "game_pk": m.get("game_id"), "team_id": m.get("team_id"),
-                     "is_home": (m.get("home_away") == "home"),
-                     "opponent": m.get("opponent_team_id"),
-                     "MIN": m.get("minutes"), "played": m.get("played")}
-                for c in _BOX_STATS:
-                    g[c] = m.get(c)
-                out[nm].append(g)
-        return dict(out)
-    except Exception:
-        return {}
+    attempt stat (FGA/3PA/FTA) from the SAME rows. **MIRROR-FIRST (0 DTU): reads the local
+    parquet per season when present, Azure only for un-mirrored seasons.** {} when neither is
+    available. Never raises."""
+    from collections import defaultdict
+    out = defaultdict(list)
+
+    def _add(records):
+        for m in records:
+            nm = m.get("name_norm")
+            if nm:
+                out[nm].append(_row_to_game(m))
+
+    azure_seasons = []
+    for s in seasons:
+        f = _mirror_file(s)
+        if os.path.exists(f):
+            try:
+                import pandas as pd
+                _add(pd.read_parquet(f).to_dict("records"))
+                continue
+            except Exception:
+                pass                                     # fall through to Azure for this season
+        azure_seasons.append(int(s))
+    if azure_seasons and enabled():
+        try:
+            _add(_query_player_games(azure_seasons))
+        except Exception:
+            pass
+    for nm in out:                                       # most-recent-first (both sources merged)
+        out[nm].sort(key=lambda g: g.get("game_date") or "", reverse=True)
+    return dict(out)
 
 
 def _backfill_cli():                                 # pragma: no cover - offline owner tool
@@ -550,6 +632,9 @@ def _backfill_cli():                                 # pragma: no cover - offlin
     ap = argparse.ArgumentParser()
     ap.add_argument("--seasons", required=True,
                     help="season-ENDING years, e.g. 2002-2026 or 2024,2025,2026")
+    ap.add_argument("--export-mirror", action="store_true",
+                    help="Dump nba_player_game to the local parquet mirror (0-DTU calib/sweep "
+                         "reads) for these seasons instead of ingesting. Run after a backfill.")
     args = ap.parse_args()
     db_store.promote_secrets_from_toml()
     if not enabled():
@@ -560,6 +645,10 @@ def _backfill_cli():                                 # pragma: no cover - offlin
         seasons = list(range(int(a), int(b) + 1))
     else:
         seasons = [int(x) for x in spec.split(",") if x.strip()]
+    if args.export_mirror:
+        print(f"export_mirror({seasons}):")
+        export_mirror(seasons)
+        return
     print(f"ingest_games({seasons}): {ingest_games(seasons)}")
     for s in seasons:
         print(f"ingest_player_games({s}): {ingest_player_games(s)}")
