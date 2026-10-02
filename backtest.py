@@ -3757,7 +3757,13 @@ DEFAULT_STARTERS = {
 }
 
 DEFAULT_PROPS = {
-    "nba": ["player_points", "player_rebounds", "player_assists"],
+    # The bonus-relevant NBA props the warehouse_mirror odds corpus actually carries volume
+    # for (was just points/rebounds/assists — the 2026-07 synthetic 3-prop fit). The combos
+    # (PRA/P+R/P+A) + threes/steals/blocks/turnovers now grade off nba_warehouse actuals.
+    "nba": ["player_points", "player_rebounds", "player_assists", "player_threes",
+            "player_steals", "player_blocks", "player_turnovers",
+            "player_points_rebounds", "player_points_assists",
+            "player_points_rebounds_assists"],
     "mlb": ["batter_hits", "batter_strikeouts", "pitcher_strikeouts",
             "pitcher_outs", "pitcher_earned_runs"],
     "nfl": ["player_pass_yds", "player_rush_yds", "player_anytime_td"],

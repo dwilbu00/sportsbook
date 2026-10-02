@@ -629,6 +629,86 @@ def _nfl_grade_book_lines(book_lines):
     return enriched
 
 
+def _nba_grade_book_lines(book_lines):
+    """Grade NBA prop book lines against the nba_warehouse per-player-game actuals (all 16
+    props incl. combos, real outcomes) instead of the 3-prop ESPN gamelog. Attaches
+    ``actual`` + ``stat_label`` + ``prior_games`` (same-season earlier PLAYED games,
+    most-recent-first, >=10) — the as-of window the residual/recency methods AND the NBA
+    opportunity gate consume (each prior carries every box column, so the gate can read
+    FGA/3PA/FTA). Returns the enriched list, or None when the warehouse is unavailable so the
+    caller falls back to the legacy ESPN path. Leakage-safe: only the obs's OWN season, only
+    games strictly before it; match is EXACT game_date (a player plays once/day, so no +/-1 that
+    could borrow a back-to-back). Never raises."""
+    import db_store
+    try:
+        import nba_source
+        import nba_warehouse
+    except Exception:
+        return None
+    if not db_store.enabled():
+        return None
+    prop_cols = nba_source.PROP_STAT_COLS
+    seasons = sorted({nba_source.end_year_for_date((r.get("game_date") or "")[:10])
+                      for r in book_lines if r.get("game_date")} - {None})
+    if not seasons:
+        return []
+    bulk = nba_warehouse.calib_gamelogs_bulk(seasons)        # {name_norm: [games desc]}
+
+    def _sum(g, cols):
+        return float(sum(float(g.get(c) or 0.0) for c in cols))
+
+    by_player = defaultdict(list)
+    for row in book_lines:
+        by_player[row.get("player") or ""].append(row)
+
+    enriched = []
+    n_no_player = n_no_cols = n_date = n_low = n_prior = 0
+    for name, rows in by_player.items():
+        games = bulk.get(nba_source._norm(name))
+        if not games:
+            n_no_player += len(rows)
+            continue
+        by_date = {}                                         # exact date -> game index (first wins)
+        for i, g in enumerate(games):
+            d = str(g.get("game_date") or "")[:10]
+            if d and d not in by_date:
+                by_date[d] = i
+        for row in rows:
+            cols = prop_cols.get(row.get("prop_key"))
+            if cols is None:
+                n_no_cols += 1
+                continue
+            cols = cols if isinstance(cols, tuple) else (cols,)
+            idx = by_date.get((row.get("game_date") or "")[:10])
+            if idx is None:
+                n_date += 1
+                continue
+            tg = games[idx]
+            minutes = tg.get("MIN")
+            if not tg.get("played") or minutes is None or float(minutes) < 10.0:
+                n_low += 1
+                continue
+            season = tg.get("season")
+            priors = [g for g in games[idx + 1:]
+                      if g.get("season") == season and g.get("played")
+                      and g.get("MIN") is not None and float(g.get("MIN")) > 0]
+            if len(priors) < 10:
+                n_prior += 1
+                continue
+            if len(cols) == 1:
+                stat_label = cols[0]                         # single prop: raw column present
+                pg_out = priors
+            else:
+                stat_label = row.get("prop_key")             # combo: inject the per-game sum
+                pg_out = [{**g, stat_label: _sum(g, cols)} for g in priors]
+            enriched.append({**row, "stat_label": stat_label, "actual": _sum(tg, cols),
+                             "test_game": tg, "prior_games": pg_out})
+    print(f"  Matched {len(enriched):,} NBA book lines to nba_warehouse actuals; dropped "
+          f"{n_no_player:,} (player not found), {n_date:,} (date/DNP), {n_low:,} "
+          f"(low-min test game), {n_prior:,} (<10 priors), {n_no_cols:,} (unmapped prop).")
+    return enriched
+
+
 def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
     For each book line, resolve the player, pull their gamelog, locate the game on
@@ -651,6 +731,13 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     """
     if espn_sport == "football":
         return _nfl_grade_book_lines(book_lines)
+    # NBA: grade off the nba_warehouse actuals (16 props incl. combos) instead of the 3-prop
+    # ESPN gamelog. Returns None only when the warehouse is unavailable → fall through to the
+    # legacy ESPN path below (which still grades the 3 ESPN-mapped props).
+    if espn_sport == "basketball":
+        nba = _nba_grade_book_lines(book_lines)
+        if nba is not None:
+            return nba
     # Group by canonical id (falling back to name) so spelling variants of one
     # player pool together.
     by_player = defaultdict(list)

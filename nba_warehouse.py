@@ -504,6 +504,45 @@ def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
         return []
 
 
+def calib_gamelogs_bulk(seasons):
+    """{name_norm: [per-game dict, most-recent-first]} across ``seasons`` (ending years), for
+    the OFFLINE calibration + opportunity join (book_line_calibration._nba_grade_book_lines).
+    Each game dict carries season, game_date, game_pk, MIN, is_home, opponent, played + EVERY
+    box stat column — so the projection reads the prop stat and the opportunity gate reads the
+    attempt stat (FGA/3PA/FTA) from the SAME rows. Warehouse-only; {} when disabled or on any
+    error. One bulk query over the requested seasons (the join passes only the seasons its book
+    lines cover, not all 25)."""
+    if not enabled():
+        return {}
+    try:
+        from collections import defaultdict
+        pg, pl = nba_player_game, nba_player
+        stmt = (select(pl.c.name_norm.label("name_norm"), pg.c.season, pg.c.game_date,
+                       pg.c.game_id, pg.c.home_away, pg.c.opponent_team_id, pg.c.played,
+                       *[pg.c[c] for c in _BOX_STATS])
+                .select_from(pg.join(pl, pg.c.athlete_id == pl.c.athlete_id))
+                .where(pg.c.season.in_([int(s) for s in seasons]))
+                .order_by(pg.c.game_date.desc()))
+        out = defaultdict(list)
+        with db_store.get_engine().connect() as conn:
+            for r in conn.execute(stmt):
+                m = dict(r._mapping)
+                nm = m.get("name_norm")
+                if not nm:
+                    continue
+                g = {"season": m.get("season"), "game_date": m.get("game_date"),
+                     "game_pk": m.get("game_id"),
+                     "is_home": (m.get("home_away") == "home"),
+                     "opponent": m.get("opponent_team_id"),
+                     "MIN": m.get("minutes"), "played": m.get("played")}
+                for c in _BOX_STATS:
+                    g[c] = m.get(c)
+                out[nm].append(g)
+        return dict(out)
+    except Exception:
+        return {}
+
+
 def _backfill_cli():                                 # pragma: no cover - offline owner tool
     """Offline backfill: `python nba_warehouse.py --seasons 2002-2026`. Run on the dev box
     (set SQL_DRIVER=pyodbc for fast_executemany). Loads games + ALL player-games per season."""
