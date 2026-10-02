@@ -518,8 +518,8 @@ def calib_gamelogs_bulk(seasons):
         from collections import defaultdict
         pg, pl = nba_player_game, nba_player
         stmt = (select(pl.c.name_norm.label("name_norm"), pg.c.season, pg.c.game_date,
-                       pg.c.game_id, pg.c.home_away, pg.c.opponent_team_id, pg.c.played,
-                       *[pg.c[c] for c in _BOX_STATS])
+                       pg.c.game_id, pg.c.team_id, pg.c.home_away, pg.c.opponent_team_id,
+                       pg.c.played, *[pg.c[c] for c in _BOX_STATS])
                 .select_from(pg.join(pl, pg.c.athlete_id == pl.c.athlete_id))
                 .where(pg.c.season.in_([int(s) for s in seasons]))
                 .order_by(pg.c.game_date.desc()))
@@ -531,7 +531,7 @@ def calib_gamelogs_bulk(seasons):
                 if not nm:
                     continue
                 g = {"season": m.get("season"), "game_date": m.get("game_date"),
-                     "game_pk": m.get("game_id"),
+                     "game_pk": m.get("game_id"), "team_id": m.get("team_id"),
                      "is_home": (m.get("home_away") == "home"),
                      "opponent": m.get("opponent_team_id"),
                      "MIN": m.get("minutes"), "played": m.get("played")}

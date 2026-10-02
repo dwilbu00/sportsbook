@@ -3857,8 +3857,22 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=
     (ESPN was fully removed for MLB in P4.)"""
     data = {}
     _bulk_by_role = {}
+    _nba_bulk = {}
     _n_ok = 0
     _skips = {}
+    nba_wh = _nba_sweep_mode(espn_sport)
+
+    def _nba_bulk_for():
+        # One warehouse query for the whole season's player-games, served per player from
+        # memory (mirrors _bulk_for for MLB). Keyed by name_norm (== nba_source._norm).
+        if not _nba_bulk:
+            try:
+                import nba_warehouse
+                yrs = [season_year] if season_year else [nba_warehouse._current_season()]
+                _nba_bulk["d"] = nba_warehouse.calib_gamelogs_bulk(yrs)
+            except Exception:
+                _nba_bulk["d"] = {}
+        return _nba_bulk["d"]
 
     def _bulk_for(role):
         # Lazily pull the WHOLE season's gamelogs for a role once (one query), then
@@ -3907,6 +3921,18 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=
             data[key] = gamelog
             _n_ok += 1
             continue
+        if nba_wh:
+            # NBA warehouse sweep: per-player games (all box stats) from nba_warehouse,
+            # served from the one-shot bulk index. All 10/16 props + combos grade off this.
+            import nba_source
+            gl = _nba_bulk_for().get(nba_source._norm(name))
+            if not gl:
+                _skips["no_warehouse_gamelog"] = _skips.get("no_warehouse_gamelog", 0) + 1
+                continue
+            gl = sorted(list(gl), key=lambda g: g.get("game_date") or "", reverse=True)
+            data[name] = gl
+            _n_ok += 1
+            continue
         aid = cached_athlete_id(espn_sport, espn_league, name)
         if not aid:
             _skips["athlete_not_found"] = _skips.get("athlete_not_found", 0) + 1
@@ -3934,6 +3960,42 @@ def _stat_label_for(prop_key, gamelog):
         if any(label in g for g in gamelog):
             return label
     return None
+
+
+def _nba_sweep_mode(espn_sport):
+    """True when the NBA player-props sweep should grade off nba_warehouse (all 16 props,
+    real actuals) instead of ESPN (3 props). Auto-on when basketball + the warehouse is
+    enabled; kill-switch ODI_NBA_SWEEP_SDV=0 (mirrors recalibration._nba_grade_from_warehouse).
+    Gating on enabled() keeps the ESPN path when SQL is off (tests)."""
+    if espn_sport != "basketball":
+        return False
+    try:
+        import nba_warehouse
+        if not nba_warehouse.enabled():
+            return False
+    except Exception:
+        return False
+    return os.environ.get("ODI_NBA_SWEEP_SDV", "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _nba_sweep_stat_label(prop_key, gamelog):
+    """stat_label for an NBA warehouse gamelog (lowercase box columns, not ESPN labels),
+    via nba_source.PROP_STAT_COLS. A single-column prop uses the column directly (already on
+    each row; None on a DNP). A combo prop (tuple) injects the per-game SUM under the prop_key
+    label — None on a DNP so the obs is skipped (never a phantom 0-loss), mirroring
+    book_line_calibration._nba_grade_book_lines. Returns the label, or None for an unmapped prop."""
+    import nba_source
+    cols = nba_source.PROP_STAT_COLS.get(prop_key)
+    if cols is None:
+        return None
+    if not isinstance(cols, tuple):
+        return cols
+    for g in gamelog:
+        if prop_key not in g:
+            g[prop_key] = (None if not g.get("played")
+                           else float(sum(float(g.get(c) or 0.0) for c in cols)))
+    return prop_key
 
 
 def _prop_role(prop_key):
@@ -4161,8 +4223,11 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     # P3/P4/P6: MLB sweep inputs (player gamelogs + team apparatus) come from the
     # StatsAPI warehouse; NBA/NFL stay on ESPN. (ESPN fully removed for MLB in P4.)
     use_warehouse = espn_sport == "baseball"
+    nba_wh_mode = _nba_sweep_mode(espn_sport)     # NBA: grade all 16 props off nba_warehouse
     if use_warehouse:
         _log("=== MLB sweep inputs: StatsAPI warehouse (ESPN bypassed) ===")
+    elif nba_wh_mode:
+        _log("=== NBA sweep inputs: sportsdataverse warehouse (ESPN bypassed) ===")
     # Sweep mode + cushion-sweep mode always use the fine-grained offsets so
     # the cushion-for-target metric is well-resolved. Coarse offsets only
     # apply for a non-sweep, plain --safe-mode invocation.
@@ -4359,7 +4424,8 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
             role = _prop_role(prop_key)
             if role is not None and (role == "pitching") != is_pitcher_log:
                 continue
-            stat_label = _stat_label_for(prop_key, gamelog)
+            stat_label = (_nba_sweep_stat_label(prop_key, gamelog) if nba_wh_mode
+                          else _stat_label_for(prop_key, gamelog))
             if not stat_label:
                 continue
 
