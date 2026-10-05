@@ -97,6 +97,50 @@ class FetchPlayerDataNbaTests(unittest.TestCase):
         self.assertEqual(data, {})
 
 
+class NbaDefenseTests(unittest.TestCase):
+    """Per-prop, id-keyed, ESPN-free opponent-defense from the warehouse corpus."""
+
+    def _corpus(self):
+        # team "13" allowed (g1): pts 30+20=50, 3pm 5+3=8; team "1" allowed (g2): pts 10, 3pm 1
+        return {
+            "player a": [{"opponent": "13", "game_pk": "g1", "game_date": "2024-01-01",
+                          "points": 30.0, "three_point_field_goals_made": 5.0}],
+            "player b": [{"opponent": "13", "game_pk": "g1", "game_date": "2024-01-01",
+                          "points": 20.0, "three_point_field_goals_made": 3.0}],
+            "player c": [{"opponent": "1", "game_pk": "g2", "game_date": "2024-01-02",
+                          "points": 10.0, "three_point_field_goals_made": 1.0}],
+        }
+
+    def _agg(self):
+        from unittest.mock import patch
+        with patch("nba_warehouse.calib_gamelogs_bulk", return_value=self._corpus()):
+            return backtest._nba_warehouse_opp_allowed_agg([2024])
+
+    def test_opp_allowed_aggregation(self):
+        agg = self._agg()
+        self.assertEqual(set(agg), {"13", "1"})
+        d13 = dict(agg["13"][0][1])
+        self.assertEqual(d13["points"], 50.0)                 # opposing players summed = allowed
+        self.assertEqual(d13["three_point_field_goals_made"], 8.0)
+
+    def test_per_prop_slice_single_and_combo(self):
+        agg = self._agg()
+        avg_p, series_p, league_p = backtest._nba_def_for_prop(agg, "points")
+        self.assertEqual(avg_p["13"], 50.0)
+        self.assertEqual(avg_p["1"], 10.0)
+        self.assertEqual(league_p, 30.0)                      # (50+10)/2
+        avg_c, _, _ = backtest._nba_def_for_prop(
+            agg, ("points", "three_point_field_goals_made"))
+        self.assertEqual(avg_c["13"], 58.0)                   # 50 + 8 per-game combo sum
+
+    def test_id_exact_match_no_substring_collision(self):
+        # "1" is a substring of "13"; exact match must win (resolve "1" -> team 1, not 13).
+        from backtest import _resolve_opp_pts_allowed
+        avg_p, _, _ = backtest._nba_def_for_prop(self._agg(), "points")
+        self.assertEqual(_resolve_opp_pts_allowed("1", avg_p), 10.0)
+        self.assertEqual(_resolve_opp_pts_allowed("13", avg_p), 50.0)
+
+
 class HalfLifeGridTests(unittest.TestCase):
     """The half-life axis is overridable (fan recency out both ways) without touching the
     per-sport default [None, 5, 10, 15]."""

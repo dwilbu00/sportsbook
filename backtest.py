@@ -4190,6 +4190,63 @@ def _resolve_opp_pa_asof(opp_name, test_date, team_series, window=None):
 _resolve_opp_pts_allowed = _resolve_team_defense
 
 
+def _nba_warehouse_opp_allowed_agg(seasons):
+    """Per-(opponent_team_id, game) opposing-player box-stat TOTALS from the nba_warehouse
+    corpus (mirror-first, 0 DTU) — i.e. what each team ALLOWED per game. A player row's
+    opponent_team_id == the team that player faced, so summing all rows with opponent==X in a
+    game == X's opponents' box lines == what X conceded. Returns {team_id(str): [(game_date,
+    {box_col: total}), ...] desc}, the source of the per-prop, id-keyed, as-of opponent-defense
+    lookup (ESPN-free, no team_box needed). Never raises -> {} on failure."""
+    try:
+        from collections import defaultdict
+        import nba_warehouse
+        import nba_source
+        need = set()
+        for v in nba_source.PROP_STAT_COLS.values():
+            need.update(v if isinstance(v, tuple) else (v,))
+        bulk = nba_warehouse.calib_gamelogs_bulk(seasons)     # {name_norm: [game,...]} full corpus
+        per_game = {}                        # (opp_id, game_id) -> {"date":.., "stats": {col:sum}}
+        for games in bulk.values():
+            for g in games:
+                opp, gid = g.get("opponent"), g.get("game_pk")
+                if not opp or not gid:
+                    continue
+                cell = per_game.get((opp, gid))
+                if cell is None:
+                    cell = {"date": g.get("game_date"), "stats": defaultdict(float)}
+                    per_game[(opp, gid)] = cell
+                for c in need:
+                    val = g.get(c)
+                    if val is not None:
+                        cell["stats"][c] += float(val)
+        agg = defaultdict(list)
+        for (opp, _gid), cell in per_game.items():
+            agg[str(opp)].append((cell["date"], dict(cell["stats"])))
+        for opp in agg:
+            agg[opp].sort(key=lambda r: r[0] or "", reverse=True)
+        return dict(agg)
+    except Exception:
+        return {}
+
+
+def _nba_def_for_prop(agg, cols):
+    """Slice the opp-allowed aggregate into the (avg_lookup, series_lookup, league_avg) triple
+    the sweep's defense sites already consume, for ONE prop. ``cols`` str or tuple (a combo ->
+    per-game SUM of its components). Keyed by team_id (== the warehouse opponent id carried on
+    each gamelog row), so _resolve_* resolves by EXACT match (every team is present -> the
+    substring fallback never fires). League avg is per-stat, so the bounded ratio scales right
+    across props (points ~112 vs threes ~13)."""
+    cols = (cols,) if isinstance(cols, str) else tuple(cols)
+    avg, series = {}, {}
+    for tid, rows in agg.items():
+        vals = [(d, sum(stats.get(c, 0.0) for c in cols)) for d, stats in rows]
+        if vals:
+            series[tid] = vals                                # already desc
+            avg[tid] = sum(v for _, v in vals) / len(vals)
+    league = (sum(avg.values()) / len(avg)) if avg else None
+    return avg, series, league
+
+
 def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                               players, props, games_per_player, min_sample,
                               variants, sweep=False, season_year=None,
@@ -4293,11 +4350,23 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     # Build team-defense lookup if any variant uses defense weighting OR
     # the output-side defense adjustment.
     team_defense, team_defense_series, league_avg_def = {}, {}, None
+    nba_def_by_prop = {}                    # NBA: per-prop (avg, series, league) keyed by team_id
     needs_defense = any(
         p.get("opp_defense_strength", 0.0) > 0 or p.get("def_adj", 0.0) > 0
         for p in variants.values()
     )
-    if needs_defense:
+    if needs_defense and nba_wh_mode:
+        # NBA: ESPN-free, PER-PROP opponent-allowed from the warehouse (threes-allowed for
+        # player_threes, etc.). Built once; each prop's triple is selected in the loop below.
+        import nba_warehouse
+        import nba_source
+        agg = _nba_warehouse_opp_allowed_agg(
+            [season_year] if season_year else [nba_warehouse._current_season()])
+        nba_def_by_prop = {pk: _nba_def_for_prop(agg, nba_source.PROP_STAT_COLS[pk])
+                           for pk in props if pk in nba_source.PROP_STAT_COLS}
+        print(f"Built per-prop NBA opponent-defense (warehouse): "
+              f"{len(nba_def_by_prop)} props over {len(agg)} teams.")
+    elif needs_defense:
         print("\n=== Fetching team schedules for defense lookup ===")
         if use_warehouse:
             team_defense, team_defense_series, league_avg_def = (
@@ -4434,6 +4503,11 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                           else _stat_label_for(prop_key, gamelog))
             if not stat_label:
                 continue
+            if nba_wh_mode:
+                # Select this prop's opponent-defense (threes-allowed for threes, etc.) into the
+                # locals the weight-side + output-side defense sites below already read.
+                team_defense, team_defense_series, league_avg_def = \
+                    nba_def_by_prop.get(prop_key, ({}, {}, None))
 
             for i, test_game in enumerate(test_slice):
                 # An in-progress game (real pitcher logs mark today's live start
