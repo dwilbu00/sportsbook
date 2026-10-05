@@ -32,6 +32,39 @@ CACHE_TTL = 6 * 3600         # 6h; a season's parquet refreshes at most ~daily (
 _CACHE = {}                  # (kind, season) -> (fetch_ts, DataFrame|None)
 
 
+# prop_key -> canonical warehouse stat column(s); a tuple is SUMMED (combo props: PRA, P+R, …).
+# The single source of truth for NBA prop<->stat mapping, shared by grading, warehouse history,
+# the calib join, and the sweep. Columns are the CANONICAL warehouse names (the ingest maps
+# stats.nba.com source names to these), so this is unchanged across the ESPN->stats.nba.com
+# migration. Double/triple-double are category-counts (not simple sums) -> intentionally absent.
+PROP_STAT_COLS = {
+    "player_points": "points",
+    "player_rebounds": "rebounds",
+    "player_assists": "assists",
+    "player_threes": "three_point_field_goals_made",
+    "player_steals": "steals",
+    "player_blocks": "blocks",
+    "player_turnovers": "turnovers",
+    "player_field_goals": "field_goals_made",
+    "player_frees_made": "free_throws_made",
+    "player_frees_attempts": "free_throws_attempted",
+    "player_points_rebounds_assists": ("points", "rebounds", "assists"),
+    "player_points_rebounds": ("points", "rebounds"),
+    "player_points_assists": ("points", "assists"),
+    "player_rebounds_assists": ("rebounds", "assists"),
+    "player_blocks_steals": ("blocks", "steals"),
+    "player_steals_blocks": ("steals", "blocks"),
+}
+
+
+def live_from_sdv():
+    """NBA live analysis (player history + team form) is served from the warehouse/sportsdataverse
+    by default; kill-switch ODI_NBA_LIVE_SDV=0 reverts to the ESPN path (burn-in safety,
+    independent of the grading switch ODI_NBA_GRADE_SDV)."""
+    import os
+    return os.environ.get("ODI_NBA_LIVE_SDV", "1").strip().lower() not in ("0", "false", "no")
+
+
 def _norm(name):
     return db_store.normalize_name(name)
 

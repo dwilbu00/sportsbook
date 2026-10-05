@@ -3930,7 +3930,7 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=
         if nba_wh:
             # NBA warehouse sweep: per-player games (all box stats) from nba_warehouse,
             # served from the one-shot bulk index. All 10/16 props + combos grade off this.
-            import nba_source
+            import nba_stats_source as nba_source
             gl = _nba_bulk_for().get(nba_source._norm(name))
             if not gl:
                 _skips["no_warehouse_gamelog"] = _skips.get("no_warehouse_gamelog", 0) + 1
@@ -3991,7 +3991,7 @@ def _nba_sweep_stat_label(prop_key, gamelog):
     each row; None on a DNP). A combo prop (tuple) injects the per-game SUM under the prop_key
     label — None on a DNP so the obs is skipped (never a phantom 0-loss), mirroring
     book_line_calibration._nba_grade_book_lines. Returns the label, or None for an unmapped prop."""
-    import nba_source
+    import nba_stats_source as nba_source
     cols = nba_source.PROP_STAT_COLS.get(prop_key)
     if cols is None:
         return None
@@ -4200,7 +4200,7 @@ def _nba_warehouse_opp_allowed_agg(seasons):
     try:
         from collections import defaultdict
         import nba_warehouse
-        import nba_source
+        import nba_stats_source as nba_source
         need = set()
         for v in nba_source.PROP_STAT_COLS.values():
             need.update(v if isinstance(v, tuple) else (v,))
@@ -4359,7 +4359,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
         # NBA: ESPN-free, PER-PROP opponent-allowed from the warehouse (threes-allowed for
         # player_threes, etc.). Built once; each prop's triple is selected in the loop below.
         import nba_warehouse
-        import nba_source
+        import nba_stats_source as nba_source
         agg = _nba_warehouse_opp_allowed_agg(
             [season_year] if season_year else [nba_warehouse._current_season()])
         nba_def_by_prop = {pk: _nba_def_for_prop(agg, nba_source.PROP_STAT_COLS[pk])

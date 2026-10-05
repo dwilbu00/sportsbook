@@ -4461,7 +4461,7 @@ if analyze_clicked and selected_game_labels:
                 # NBA: {season,recent,recent_games} from the sportsdataverse schedule spine
                 # (no ESPN), same shape. Gated by the live switch; require BOTH (never mix).
                 if (not (wh_home and wh_away) and sport["key"] == "basketball_nba"):
-                    import nba_source
+                    import nba_stats_source as nba_source
                     if nba_source.live_from_sdv():
                         import nba_team_stats
                         wh_home = nba_team_stats.team_stats(home, recent_n)

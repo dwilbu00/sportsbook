@@ -109,7 +109,7 @@ class NbaWarehouseHistoryContractTests(unittest.TestCase):
             espn_client._nba_warehouse_history("Star Guard", "player_double_double", 5))
 
     def test_kill_switch_disables(self):
-        with patch("nba_source.live_from_sdv", return_value=False):
+        with patch("nba_stats_source.live_from_sdv", return_value=False):
             self.assertIsNone(
                 espn_client._nba_warehouse_history("Star Guard", "player_points", 5))
 

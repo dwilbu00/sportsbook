@@ -482,6 +482,58 @@ def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
         return []
 
 
+# ───────────────────────────────────────── team-market grading (off the spine)
+def _resolve_team_id(conn, name):
+    """stats.nba.com team_id for an odds-feed team name via the nba_team dim: exact name_norm,
+    then a UNIQUE nickname (last token) match (odds 'LA Clippers' vs 'Los Angeles Clippers').
+    None if absent/ambiguous."""
+    nn = db_store.normalize_name(name)
+    if not nn:
+        return None
+    row = conn.execute(select(nba_team.c.team_id)
+                       .where(nba_team.c.name_norm == nn)).fetchone()
+    if row:
+        return row[0]
+    tok = nn.split()[-1]
+    rows = conn.execute(select(nba_team.c.team_id)
+                        .where(nba_team.c.name_norm.like("% " + tok))).fetchall()
+    return rows[0][0] if len(rows) == 1 else None
+
+
+def final_score(home_team, away_team, game_date, commence=None):
+    """(home_score, away_score) for a completed NBA game from the nba_game spine, resolving the
+    odds home/away names -> team_id (nba_team dim) and matching on game_date (exact, then ±1 for
+    UTC/ET slippage — safe: a team never hosts the same opponent on consecutive days). None when
+    disabled / unresolved / not yet final (caller stays pending, same fail-closed contract as the
+    ESPN path). Never raises."""
+    if not enabled():
+        return None
+    try:
+        with db_store.get_engine().connect() as conn:
+            hid = _resolve_team_id(conn, home_team)
+            aid = _resolve_team_id(conn, away_team)
+            if hid is None or aid is None:
+                return None
+            d0 = str(game_date)[:10]
+            dates = [d0]
+            try:
+                base = datetime.date.fromisoformat(d0)
+                dates += [(base + datetime.timedelta(days=k)).isoformat() for k in (-1, 1)]
+            except (TypeError, ValueError):
+                pass
+            for d in dates:
+                r = conn.execute(
+                    select(nba_game.c.home_score, nba_game.c.away_score)
+                    .where(nba_game.c.home_team_id == hid, nba_game.c.away_team_id == aid,
+                           nba_game.c.game_date == d, nba_game.c.home_score.isnot(None),
+                           nba_game.c.away_score.isnot(None))).fetchone()
+                if r is not None:
+                    return (float(r[0]), float(r[1]))
+        return None
+    except Exception:
+        return None
+
+
 # ── Local parquet MIRROR of the player-game actuals (0-DTU calib/sweep reads) ──────
 _MIRROR_COLS = ("name_norm", "season", "game_date", "game_id", "team_id", "home_away",
                 "opponent_team_id", "played", *_BOX_STATS)

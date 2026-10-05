@@ -25,36 +25,11 @@ import pandas as pd
 
 import db_store
 
-# prop_key -> player-box stat column(s); a tuple is SUMMED (combo props: PRA, P+R, ...).
-# The single source of truth for NBA prop<->stat mapping, shared by grading
-# (recalibration._resolve_nba_actual), warehouse history (nba_warehouse.player_history), and
-# the live history path (espn_client._nba_warehouse_history). Double/triple-double are NOT
-# simple sums (category-count props) so they are intentionally absent.
-PROP_STAT_COLS = {
-    "player_points": "points",
-    "player_rebounds": "rebounds",
-    "player_assists": "assists",
-    "player_threes": "three_point_field_goals_made",
-    "player_steals": "steals",
-    "player_blocks": "blocks",
-    "player_turnovers": "turnovers",
-    "player_field_goals": "field_goals_made",
-    "player_frees_made": "free_throws_made",
-    "player_frees_attempts": "free_throws_attempted",
-    "player_points_rebounds_assists": ("points", "rebounds", "assists"),
-    "player_points_rebounds": ("points", "rebounds"),
-    "player_points_assists": ("points", "assists"),
-    "player_rebounds_assists": ("rebounds", "assists"),
-    "player_blocks_steals": ("blocks", "steals"),
-    "player_steals_blocks": ("steals", "blocks"),
-}
-
-
-def live_from_sdv():
-    """NBA live analysis (player history + team form) is served from sportsdataverse by
-    default; kill-switch ODI_NBA_LIVE_SDV=0 reverts to the ESPN path (burn-in safety,
-    independent of the grading switch ODI_NBA_GRADE_SDV)."""
-    return os.environ.get("ODI_NBA_LIVE_SDV", "1").strip().lower() not in ("0", "false", "no")
+# The NBA prop<->stat map + the live kill-switch MOVED to nba_stats_source (the canonical
+# migration source); re-exported here so any lingering `nba_source.PROP_STAT_COLS` /
+# `nba_source.live_from_sdv` importer keeps working during the ESPN->stats.nba.com cutover.
+# One source of truth. (nba_source itself is retired in migration P6.)
+from nba_stats_source import PROP_STAT_COLS, live_from_sdv  # noqa: E402,F401
 
 BASE = "https://github.com/sportsdataverse/sportsdataverse-data/releases/download"
 PLAYER_BOX_URL = BASE + "/espn_nba_player_boxscores/player_box_{season}.parquet"

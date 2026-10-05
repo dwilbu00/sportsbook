@@ -1550,8 +1550,8 @@ def _nfl_grade_from_nflverse():
 
 def _nba_prop_cols(prop_key):
     try:
-        import nba_source
-        return nba_source.PROP_STAT_COLS.get(prop_key)
+        import nba_stats_source
+        return nba_stats_source.PROP_STAT_COLS.get(prop_key)
     except Exception:
         return None
 
@@ -1666,54 +1666,51 @@ def _nba_frame_match(df, pnorm, game_date):
 
 
 def _resolve_nba_actual(prop_key, player, game_date, commence=None):
-    """NBA player-prop actual, keyed by (normalized name, game_date). Reads the durable
-    sportsdataverse WAREHOUSE first (nba_warehouse.player_game_frame — the frozen record,
-    MLB/NFL-parity grading from the DB) and falls back to the LIVE sportsdataverse player box
-    (nba_source.load_player_box) for games not yet ingested. Returns the float stat (summed
-    for combo props), or None when the prop is unmapped, the season/row can't be resolved, or
-    the player DID NOT PLAY (minutes 0/null → never grade a phantom 0; the caller stays
-    pending and the stale-DNP sweep voids it). Never raises — a miss falls through to ESPN."""
+    """NBA player-prop actual, keyed by (normalized name, game_date), from the durable
+    stats.nba.com WAREHOUSE frame (nba_warehouse.player_game_frame — the frozen, schedule-join-
+    enriched record carrying game_date; MLB/NFL-parity grading from the DB). WAREHOUSE-ONLY: the
+    live stats.nba.com player box is NOT self-contained (no game_date), so there is no live-box
+    fallback — a not-yet-ingested game stays pending until maintenance ingests it (then grades),
+    mirroring MLB. Returns the float stat (summed for combos), or None when the prop is unmapped,
+    the season/row can't be resolved, or the player DID NOT PLAY (never a phantom 0 — the caller
+    stays pending and the stale-DNP sweep voids it). Never raises — a miss falls through to the
+    kill-switched ESPN gamelog (burn-in) in resolve_one_prop."""
     cols = _nba_prop_cols(prop_key)
     if cols is None:
         return None
     cols = cols if isinstance(cols, tuple) else (cols,)
     try:
-        import nba_source as _src
+        import nba_stats_source as _src
         season = _src.end_year_for_date(str(game_date)[:10])
         if season is None:
             return None
-        pnorm = _src._norm(player)
-        for df in (_nba_player_game_frame(season), _src.load_player_box(season)):
-            row = _nba_frame_match(df, pnorm, game_date)
-            if row is None:
-                continue
-            if _row_played(row) is False:           # confirmed DNP → don't grade a phantom 0
-                return None
-            present = [c for c in cols if c in df.columns]
-            if not present:
-                continue
-            return float(sum(float(row.get(c) or 0.0) for c in present))
-        return None
+        df = _nba_player_game_frame(season)
+        row = _nba_frame_match(df, _src._norm(player), game_date)
+        if row is None:
+            return None
+        if _row_played(row) is False:               # confirmed DNP → don't grade a phantom 0
+            return None
+        present = [c for c in cols if c in df.columns]
+        if not present:
+            return None
+        return float(sum(float(row.get(c) or 0.0) for c in present))
     except Exception:
         return None
 
 
 def _nba_dnp_row(player, game_date):
-    """True = the warehouse/live box has a (player, date) row but the player did NOT play
-    (confirmed DNP → void, never grade 0); False = played; None = no row (unknown, keep
-    retrying). Shared by resolve_one_prop (skip the ESPN phantom-0) and the stale-DNP void."""
+    """True = the warehouse frame has a (player, date) row but the player did NOT play (confirmed
+    DNP → void, never grade 0); False = played; None = no row (unknown, keep retrying). Shared by
+    resolve_one_prop (skip the ESPN phantom-0) and the stale-DNP void."""
     try:
-        import nba_source as _src
+        import nba_stats_source as _src
         season = _src.end_year_for_date(str(game_date)[:10])
         if season is None:
             return None
-        pnorm = _src._norm(player)
-        for df in (_nba_player_game_frame(season), _src.load_player_box(season)):
-            row = _nba_frame_match(df, pnorm, game_date)
-            if row is None:
-                continue
-            return _row_played(row) is False
-        return None
+        row = _nba_frame_match(_nba_player_game_frame(season), _src._norm(player), game_date)
+        if row is None:
+            return None
+        return _row_played(row) is False
     except Exception:
         return None
 

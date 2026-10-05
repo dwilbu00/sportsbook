@@ -959,7 +959,7 @@ def _nba_warehouse_history(player_name, prop_key, n, team_ids=None):
     SQL enabled + a mapped prop; DNP games are excluded (a bet voids on a DNP, never a 0).
     Never raises."""
     try:
-        import nba_source
+        import nba_stats_source as nba_source
         if not nba_source.live_from_sdv():
             return None
         cols = nba_source.PROP_STAT_COLS.get(prop_key)
