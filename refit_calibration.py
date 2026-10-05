@@ -937,11 +937,25 @@ def _merge_props_results(acc, new):
     return acc
 
 
+def _parse_half_lives(spec):
+    """Parse --half-lives into a grid list, or None to keep the per-sport default
+    ([None,5,10,15]). 'none'/'null'/'off' -> None (equal weighting); others -> int."""
+    if not spec:
+        return None
+    out = []
+    for tok in str(spec).split(","):
+        t = tok.strip().lower()
+        if not t:
+            continue
+        out.append(None if t in ("none", "null", "off") else int(t))
+    return out or None
+
+
 def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
                 games_per_player=80, warmup_games=10, shrinkage_k_default=0,
                 mlb_max_batters=40, mlb_max_pitchers=30,
                 nba_max_players=150, nba_min_games=15, seasons=None,
-                focused_grid=False, workers=1, combined_sweep=False):
+                focused_grid=False, workers=1, combined_sweep=False, half_lifes=None):
     espn_sport, espn_league, sport_key = SPORT_MAP[sport]
     # Resolve the set of seasons to POOL for the main fit. `--seasons` pools
     # several seasons' residuals into ONE fit (triples the thin pitcher-prop
@@ -980,8 +994,8 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         print(f"No default players/props for {sport}; please pass --players/--props.")
         sys.exit(1)
 
-    variants = (_build_focused_props_grid() if focused_grid
-                else _build_props_sweep_grid())
+    variants = (_build_focused_props_grid(half_lifes=half_lifes) if focused_grid
+                else _build_props_sweep_grid(half_lifes=half_lifes))
     if focused_grid:
         print(f"[focused-grid] {len(variants)} variants (vs full 576) — full "
               f"resolution on half_life×venue×shrink, dead axes probed once. "
@@ -4713,6 +4727,11 @@ def main():
     p.add_argument("--nba-min-games", type=int, default=15,
                    help="Minimum games played for an NBA player to enter the "
                         "data-driven pool.")
+    p.add_argument("--half-lives", default=None,
+                   help="Override the sweep's half-life axis (default None,5,10,15). Comma "
+                        "list; 'none' = equal weighting. e.g. "
+                        "--half-lives none,3,4,5,6,7,8,10,12,15,20 to fan recency decay out "
+                        "both ways (NBA re-tune). Omit to keep the per-sport default.")
     p.add_argument("--real-lines", action="store_true",
                    help="Re-select each prop's calibration method at REAL book "
                         "lines from the durable historical_odds store (roadmap "
@@ -5094,7 +5113,8 @@ def main():
                 nba_max_players=args.nba_max_players,
                 nba_min_games=args.nba_min_games,
                 seasons=seasons, focused_grid=args.focused_grid,
-                workers=args.workers, combined_sweep=args.combined_sweep)
+                workers=args.workers, combined_sweep=args.combined_sweep,
+                half_lifes=_parse_half_lives(args.half_lives))
     _report_staging(args.sport, staging)
 
 

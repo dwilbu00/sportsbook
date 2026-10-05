@@ -3541,9 +3541,13 @@ def _build_sweep_grid():
     return variants
 
 
-def _build_props_sweep_grid():
+def _build_props_sweep_grid(half_lifes=None):
     """
     Cross-product for player-props sweep mode (P2.1b expanded, §2.6 rest axis).
+
+    ``half_lifes`` overrides the half-life axis (default [None, 5, 10, 15]); pass a
+    finer/wider set to fan the recency decay out both ways (e.g. NBA re-tune). Other
+    sports keep the default when the override is omitted.
 
     Sweeps knobs/features that each have a RUNTIME counterpart in
     props.analyze_player_props_value, so a knob the confirmation gate enables
@@ -3575,7 +3579,7 @@ def _build_props_sweep_grid():
     so an excluded prop can never persist rest_strength=1.0, and rest is adopted
     only where it strictly beats the gate.
     """
-    half_lifes = [None, 5, 10, 15]
+    half_lifes = [None, 5, 10, 15] if half_lifes is None else list(half_lifes)
     opp_defenses = [0.0, 0.5, 1.0]
     def_adjs = [0.0, 0.5, 1.0]
     shrink_ks = [0, 5, 10, 15]
@@ -3599,7 +3603,7 @@ def _build_props_sweep_grid():
     return variants
 
 
-def _build_focused_props_grid():
+def _build_focused_props_grid(half_lifes=None):
     """A FOCUSED subset of _build_props_sweep_grid for FAST refits (opt-in).
 
     Keeps FULL resolution on the axes that actually win for props — half_life ×
@@ -3614,10 +3618,12 @@ def _build_focused_props_grid():
     behave unchanged. The full grid stays the DEFAULT; this only runs under an
     explicit --focused-grid, so a refit that needs to explore knob INTERACTIONS
     (which this drops) can always use the full sweep. See _build_props_sweep_grid."""
-    full = _build_props_sweep_grid()
+    full = _build_props_sweep_grid(half_lifes=half_lifes)
+    hls = [None, 5, 10, 15] if half_lifes is None else list(half_lifes)
+    hl_labels = ["none" if hl is None else f"hl{hl}" for hl in hls]
     keep = set()
     # Full cross of the prop-relevant axes (dead axes held off).
-    for hl in ("none", "hl5", "hl10", "hl15"):
+    for hl in hl_labels:
         for vs in ("ven0.0", "ven0.25"):
             for sk in ("shrink0", "shrink5", "shrink10", "shrink15"):
                 keep.add(f"{hl}/opp0.0/defadj0.0/{sk}/{vs}/rest0.0")

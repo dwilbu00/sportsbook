@@ -20,6 +20,8 @@ def _line(player, prop, date, point=20.5):
 
 class CalibJoinTests(unittest.TestCase):
     def setUp(self):
+        self._mdir = tempfile.mkdtemp()                  # empty mirror -> grade off SQLite
+        os.environ["ODI_MIRROR_DIR"] = self._mdir
         db_store.configure_engine("sqlite://")
         nw.create_all()
         with db_store.get_engine().begin() as c:
@@ -41,6 +43,8 @@ class CalibJoinTests(unittest.TestCase):
 
     def tearDown(self):
         db_store.configure_engine(None)
+        os.environ.pop("ODI_MIRROR_DIR", None)
+        shutil.rmtree(self._mdir, ignore_errors=True)
 
     def test_bulk_reader_shape(self):
         bulk = nw.calib_gamelogs_bulk([2024])

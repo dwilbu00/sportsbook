@@ -3,6 +3,8 @@ recency sweep / eval_min_streak all route through run_player_props_backtest -> f
 grades NBA off nba_warehouse (all 16 props incl. combos) instead of ESPN's 3. SQLite; no network.
 """
 import os
+import shutil
+import tempfile
 import unittest
 
 import db_store
@@ -55,6 +57,8 @@ class SweepStatLabelTests(unittest.TestCase):
 
 class FetchPlayerDataNbaTests(unittest.TestCase):
     def setUp(self):
+        self._mdir = tempfile.mkdtemp()                  # empty mirror -> fall through to SQLite
+        os.environ["ODI_MIRROR_DIR"] = self._mdir
         db_store.configure_engine("sqlite://")
         nw.create_all()
         with db_store.get_engine().begin() as c:
@@ -70,6 +74,8 @@ class FetchPlayerDataNbaTests(unittest.TestCase):
 
     def tearDown(self):
         db_store.configure_engine(None)
+        os.environ.pop("ODI_MIRROR_DIR", None)
+        shutil.rmtree(self._mdir, ignore_errors=True)
 
     def test_fetch_routes_to_warehouse(self):
         data = backtest.fetch_player_data("basketball", "nba", ["Shooter Guy"],
@@ -89,6 +95,35 @@ class FetchPlayerDataNbaTests(unittest.TestCase):
         data = backtest.fetch_player_data("basketball", "nba", ["Nobody Here"],
                                           season_year=2024, quiet=True)
         self.assertEqual(data, {})
+
+
+class HalfLifeGridTests(unittest.TestCase):
+    """The half-life axis is overridable (fan recency out both ways) without touching the
+    per-sport default [None, 5, 10, 15]."""
+
+    def test_parse(self):
+        import refit_calibration as rc
+        self.assertEqual(rc._parse_half_lives("none,3,4,5,20"), [None, 3, 4, 5, 20])
+        self.assertIsNone(rc._parse_half_lives(None))
+        self.assertIsNone(rc._parse_half_lives(""))
+
+    def test_default_grid_unchanged(self):
+        keys = " ".join(backtest._build_focused_props_grid().keys())
+        self.assertIn("hl5/", keys)
+        self.assertIn("hl15/", keys)
+        self.assertNotIn("hl3/", keys)              # default has no 3
+
+    def test_focused_override_fans_out(self):
+        keys = " ".join(backtest._build_focused_props_grid(
+            half_lifes=[None, 3, 4, 5, 20]).keys())
+        self.assertIn("hl3/", keys)
+        self.assertIn("hl4/", keys)
+        self.assertIn("hl20/", keys)
+        self.assertNotIn("hl10/", keys)             # 10 not in the override
+
+    def test_full_grid_override(self):
+        keys = list(backtest._build_props_sweep_grid(half_lifes=[3]).keys())
+        self.assertTrue(keys and all(k.startswith("hl3/") for k in keys))
 
 
 if __name__ == "__main__":
