@@ -635,6 +635,8 @@ class SchemaParityTests(unittest.TestCase):
             {"id", "snapshot_id", "bet_type", "selection", "point", "player",
              "prop_key", "direction", "price", "implied_prob",
              "player_mlb_id", "team_code", "game_pk",
+             # NBA id-stamp (stats.nba.com) — pre-computed line<->actuals join
+             "nba_game_id", "nba_person_id",
              # per-book grain (multibook migration)
              "bookmaker", "region"})
 

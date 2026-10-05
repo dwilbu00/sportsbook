@@ -26,19 +26,19 @@ class CalibJoinTests(unittest.TestCase):
         nw.create_all()
         with db_store.get_engine().begin() as c:
             c.execute(nw.nba_player.insert().values(
-                athlete_id="20", name_norm="shooter guy", full_name="Shooter Guy"))
+                person_id=20, name_norm="shooter guy", full_name="Shooter Guy"))
             # 12 played games (2024-01-01, 03, ... 23) + 1 DNP (2024-01-25)
             for k in range(1, 13):
                 c.execute(nw.nba_player_game.insert().values(
-                    athlete_id="20", game_id=f"g{k}", season=2024,
-                    game_date=f"2024-01-{2 * k - 1:02d}", home_away="home",
-                    opponent_team_id="99", played=True, minutes=30.0,
+                    person_id=20, game_id=f"g{k}", season=2024,
+                    game_date=f"2024-01-{2 * k - 1:02d}", team_id=13, home_away="home",
+                    opponent_team_id=99, played=True, minutes=30.0,
                     points=float(20 + k), rebounds=5.0, assists=4.0,
                     three_point_field_goals_attempted=8.0, field_goals_attempted=18.0,
                     free_throws_attempted=6.0))
             c.execute(nw.nba_player_game.insert().values(
-                athlete_id="20", game_id="gdnp", season=2024, game_date="2024-01-25",
-                home_away="home", opponent_team_id="99", played=False, minutes=None,
+                person_id=20, game_id="gdnp", season=2024, game_date="2024-01-25",
+                team_id=13, home_away="home", opponent_team_id=99, played=False, minutes=None,
                 points=0.0, rebounds=0.0, assists=0.0))
 
     def tearDown(self):
@@ -121,10 +121,10 @@ class MirrorTests(unittest.TestCase):
         nw.create_all()
         with db_store.get_engine().begin() as c:
             c.execute(nw.nba_player.insert().values(
-                athlete_id="30", name_norm="mirror guy", full_name="Mirror Guy"))
+                person_id=30, name_norm="mirror guy", full_name="Mirror Guy"))
             c.execute(nw.nba_player_game.insert().values(
-                athlete_id="30", game_id="m1", season=2024, game_date="2024-02-01",
-                team_id="13", home_away="home", opponent_team_id="99", played=True,
+                person_id=30, game_id="m1", season=2024, game_date="2024-02-01",
+                team_id=13, home_away="home", opponent_team_id=99, played=True,
                 minutes=28.0, points=18.0, rebounds=5.0, assists=3.0, plus_minus=None))
 
     def tearDown(self):
@@ -141,7 +141,7 @@ class MirrorTests(unittest.TestCase):
         self.assertIn("mirror guy", bulk)
         g = bulk["mirror guy"][0]
         self.assertEqual(g["points"], 18.0)
-        self.assertEqual(g["team_id"], "13")
+        self.assertEqual(g["team_id"], 13)
         self.assertTrue(g["is_home"])
         self.assertTrue(g["played"])
         self.assertIsNone(g["plus_minus"])               # None survives parquet (not NaN/0)

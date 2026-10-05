@@ -11,13 +11,13 @@ import espn_client
 import nba_warehouse as nw
 
 
-def _player(aid, name_norm, team_id="13"):
-    return {"athlete_id": aid, "name_norm": name_norm, "full_name": name_norm.title(),
+def _player(pid, name_norm, team_id=13):
+    return {"person_id": pid, "name_norm": name_norm, "full_name": name_norm.title(),
             "team_id": team_id}
 
 
-def _game(aid, gid, date, played=True, team_id="13", opp="14", home_away="home", **stats):
-    row = {"athlete_id": aid, "game_id": gid, "season": 2024, "game_date": date,
+def _game(pid, gid, date, played=True, team_id=13, opp=14, home_away="home", **stats):
+    row = {"person_id": pid, "game_id": gid, "season": 2024, "game_date": date,
            "team_id": team_id, "opponent_team_id": opp, "home_away": home_away,
            "played": played}
     row.update(stats)
@@ -30,15 +30,15 @@ class PlayerHistoryTests(unittest.TestCase):
         nw.create_all()
         eng = db_store.get_engine()
         with eng.begin() as c:
-            for p in (_player("10", "star guard", "13"),
-                      _player("11", "star guard", "15")):   # namesake on another team
+            for p in (_player(10, "star guard", 13),
+                      _player(11, "star guard", 15)):   # namesake on another team
                 c.execute(nw.nba_player.insert().values(**p))
             rows = [
-                _game("10", "g1", "2024-01-05", points=10.0, assists=4.0),
-                _game("10", "g2", "2024-01-07", points=20.0, assists=6.0),
-                _game("10", "g3", "2024-01-09", points=30.0, assists=8.0),
-                _game("10", "g4", "2024-01-11", played=False, points=0.0, assists=0.0),  # DNP
-                _game("11", "g5", "2024-01-08", team_id="15", points=5.0, assists=1.0),  # namesake
+                _game(10, "g1", "2024-01-05", points=10.0, assists=4.0),
+                _game(10, "g2", "2024-01-07", points=20.0, assists=6.0),
+                _game(10, "g3", "2024-01-09", points=30.0, assists=8.0),
+                _game(10, "g4", "2024-01-11", played=False, points=0.0, assists=0.0),  # DNP
+                _game(11, "g5", "2024-01-08", team_id=15, points=5.0, assists=1.0),  # namesake
             ]
             for r in rows:
                 c.execute(nw.nba_player_game.insert().values(**r))
@@ -50,12 +50,12 @@ class PlayerHistoryTests(unittest.TestCase):
         h = nw.player_history("Star Guard", "points", n=5, team_ids=["13"])
         self.assertEqual([r["value"] for r in h], [30.0, 20.0, 10.0])   # DNP g4 excluded
         self.assertEqual(h[0]["game_date"], "2024-01-09")
-        self.assertEqual(h[0]["athlete_id"], "10")
+        self.assertEqual(h[0]["athlete_id"], 10)
 
     def test_namesake_disambiguation_by_team(self):
         h = nw.player_history("Star Guard", "points", n=5, team_ids=["15"])
         self.assertEqual([r["value"] for r in h], [5.0])
-        self.assertEqual(h[0]["athlete_id"], "11")
+        self.assertEqual(h[0]["athlete_id"], 11)
 
     def test_combo_prop_sums(self):
         h = nw.player_history("Star Guard", ("points", "assists"), n=5, team_ids=["13"])
@@ -79,9 +79,9 @@ class NbaWarehouseHistoryContractTests(unittest.TestCase):
         db_store.configure_engine("sqlite://")
         nw.create_all()
         with db_store.get_engine().begin() as c:
-            c.execute(nw.nba_player.insert().values(**_player("10", "star guard", "13")))
+            c.execute(nw.nba_player.insert().values(**_player(10, "star guard", 13)))
             c.execute(nw.nba_player_game.insert().values(
-                **_game("10", "g1", "2024-01-09", points=30.0, assists=8.0)))
+                **_game(10, "g1", "2024-01-09", points=30.0, assists=8.0)))
 
     def tearDown(self):
         db_store.configure_engine(None)
@@ -94,7 +94,7 @@ class NbaWarehouseHistoryContractTests(unittest.TestCase):
         self.assertTrue(d["found"])
         self.assertEqual(d["values"], [30.0])
         self.assertEqual(d["stat_label"], "player_points")
-        self.assertEqual(d["athlete_id"], "10")
+        self.assertEqual(d["athlete_id"], 10)
         for k in ("opponents", "home_aways", "game_dates", "plate_appearances", "at_bats"):
             self.assertEqual(len(d[k]), 1)
 

@@ -38,7 +38,7 @@ import time
 import unicodedata
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
+    BigInteger, Boolean, CheckConstraint, Column, Float, ForeignKey, Index, Integer,
     MetaData, PrimaryKeyConstraint, String, Table, Text, UniqueConstraint, and_,
     bindparam, create_engine, delete, event, func, insert, select, true, update,
 )
@@ -490,6 +490,11 @@ odds_line = Table(
     Column("player_mlb_id", String(32)),
     Column("team_code", String(16)),
     Column("game_pk", Integer),                        # P3: StatsAPI game (best-effort)
+    # NBA id-stamp (stats.nba.com) — pre-computed line<->actuals join (namesake/date-proof),
+    # stamped at capture + backfill. NULL for non-NBA / unstamped lines. game_id is the
+    # zero-padded string id; person_id is the int64 stats.nba.com id.
+    Column("nba_game_id", String(16)),
+    Column("nba_person_id", BigInteger),
     # Per-book grain (multibook migration): one row per (bookmaker, point) within a
     # snapshot. NULL on legacy DK-only rows (retro-set to 'draftkings'); the DK
     # readers filter bookmaker='draftkings'. region = us|eu (Pinnacle = eu).

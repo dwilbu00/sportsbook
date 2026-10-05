@@ -63,12 +63,12 @@ class FetchPlayerDataNbaTests(unittest.TestCase):
         nw.create_all()
         with db_store.get_engine().begin() as c:
             c.execute(nw.nba_player.insert().values(
-                athlete_id="20", name_norm="shooter guy", full_name="Shooter Guy"))
+                person_id=20, name_norm="shooter guy", full_name="Shooter Guy"))
             for k in range(1, 4):
                 c.execute(nw.nba_player_game.insert().values(
-                    athlete_id="20", game_id=f"g{k}", season=2024,
-                    game_date=f"2024-01-0{k}", team_id="13", home_away="home",
-                    opponent_team_id="99", played=True, minutes=30.0,
+                    person_id=20, game_id=f"g{k}", season=2024,
+                    game_date=f"2024-01-0{k}", team_id=13, home_away="home",
+                    opponent_team_id=99, played=True, minutes=30.0,
                     points=float(20 + k), rebounds=5.0, assists=4.0,
                     three_point_field_goals_attempted=8.0))
 
@@ -85,7 +85,7 @@ class FetchPlayerDataNbaTests(unittest.TestCase):
         self.assertEqual(len(gl), 3)
         self.assertEqual(gl[0]["game_date"], "2024-01-03")    # newest first
         self.assertEqual(gl[0]["points"], 23.0)
-        self.assertEqual(gl[0]["team_id"], "13")              # team_id present (layoff detect)
+        self.assertEqual(gl[0]["team_id"], 13)                # team_id present (layoff detect)
         self.assertIn("three_point_field_goals_attempted", gl[0])
         # the sweep's actual-extraction then resolves all props off these rows
         self.assertEqual(backtest._nba_sweep_stat_label("player_threes", gl),

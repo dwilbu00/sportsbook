@@ -1512,28 +1512,32 @@ CREATE INDEX ix_nfl_player_week_sw
 GO
 
 -- ==========================================================================
--- NBA WAREHOUSE (sportsdataverse ESPN-family parquet) — team dim + games spine +
--- player dim + per-player-game stat fact. Source = sportsdataverse-data GitHub release
--- assets (player_box / nba_schedule), a dep-free public HTTPS GET → the warehouse
--- self-maintains on Cloud like MLB/NFL. SUPERSEDES the ephemeral ESPN nba_gamelog cache.
--- SQLAlchemy mirror: nba_warehouse.py (_META), guarded by test_nba_warehouse
--- SchemaParityTests + DdlParityTests. DEVIATION from MLB: team/game refs are plain
--- indexed ATTRIBUTES, NOT FKs — a 2002→ backfill crosses franchise moves (SEA->OKC,
--- NJ->BKN, NOH->NOP) + occasional feed mismatches; attribute refs (the NFL precedent)
--- never reject a historical/inconsistent row. Grain = per-(player, game),
--- UNIQUE(athlete_id, game_id); season = season-ENDING year (2024 = 2023-24).
+-- NBA WAREHOUSE (stats.nba.com via sportsdataverse NBA-Stats family) — 2026-10 MIGRATION
+-- off the ESPN-family feed. team dim + games spine + player dim + per-player-game fact.
+-- Source = sportsdataverse-data nba_stats_* release parquet (dep-free HTTPS). SQLAlchemy
+-- mirror: nba_warehouse.py (_META), guarded by test_nba_warehouse SchemaParity + DdlParity.
+-- CLEAN REPLACE of the ESPN-id tables (data is re-derivable from the feed; no crosswalk) —
+-- DROP first, then CREATE. ids are stats.nba.com: person_id/team_id BIGINT (int64), game_id
+-- a zero-padded STRING (leading zeros are canonical). Grain = per-(player, game),
+-- UNIQUE(person_id, game_id); season = season-ENDING year (2025 = 2024-25). Team/game refs
+-- are indexed ATTRIBUTES (not FKs). The player box is NOT self-contained — ingest synthesizes
+-- game_date/opponent/home-away/scores via a game_id->schedule join and stores them here.
 -- ==========================================================================
+DROP TABLE IF EXISTS dbo.nba_player_game;
+DROP TABLE IF EXISTS dbo.nba_game;
+DROP TABLE IF EXISTS dbo.nba_player;
+DROP TABLE IF EXISTS dbo.nba_team;
+GO
 -------------------------------------------------------------------------- nba_team
-IF OBJECT_ID('dbo.nba_team', 'U') IS NULL
 CREATE TABLE dbo.nba_team (
-    team_id      NVARCHAR(16) NOT NULL PRIMARY KEY,  -- ESPN team id
-    name         NVARCHAR(64),                        -- team_display_name
-    name_norm    NVARCHAR(64),
-    abbreviation NVARCHAR(8),
-    location     NVARCHAR(48),                         -- e.g. "Los Angeles"
-    conference   NVARCHAR(4),                          -- East|West (static map, best-effort)
-    division     NVARCHAR(16),                         -- e.g. "Pacific" (static map)
-    fetched_at   FLOAT
+    team_id    BIGINT NOT NULL PRIMARY KEY,         -- stats.nba.com team id (int64)
+    name       NVARCHAR(64),                         -- city + " " + name
+    name_norm  NVARCHAR(64),
+    tricode    NVARCHAR(8),                          -- LAL / GSW / NOP
+    city       NVARCHAR(48),
+    conference NVARCHAR(4),                          -- East|West (real, from standings)
+    division   NVARCHAR(16),                         -- e.g. "Pacific" (real, from standings)
+    fetched_at FLOAT
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
@@ -1541,31 +1545,27 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
 CREATE INDEX ix_nba_team_name ON dbo.nba_team (name_norm);
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'ix_nba_team_abbr' AND object_id = OBJECT_ID('dbo.nba_team'))
-CREATE INDEX ix_nba_team_abbr ON dbo.nba_team (abbreviation);
+               WHERE name = 'ix_nba_team_tricode' AND object_id = OBJECT_ID('dbo.nba_team'))
+CREATE INDEX ix_nba_team_tricode ON dbo.nba_team (tricode);
 GO
 
 -------------------------------------------------------------------------- nba_game
--- Games dim = the spine. game_id (ESPN event id) is the natural PK. home/away_team_id and
--- home/away_abbr are ATTRIBUTES (not FKs). The spine self-contains abbrs+ids+scores so
--- team-market grading reads it without the team dim; facts rejoin on game_id.
-IF OBJECT_ID('dbo.nba_game', 'U') IS NULL
+-- Games dim = the spine (game_id = stats.nba.com id, zero-padded string PK). home/away_team_id
+-- are BIGINT attributes; the spine self-contains ids+tricodes+scores so team-market grading
+-- reads it without the team dim; facts rejoin on game_id.
 CREATE TABLE dbo.nba_game (
-    game_id        NVARCHAR(16) NOT NULL PRIMARY KEY,
-    season         INT,                                 -- season-ENDING year
-    season_type    INT,                                 -- 1=pre 2=reg 3=post
-    game_date      NVARCHAR(10),                         -- YYYY-MM-DD (ET)
-    game_date_time NVARCHAR(32),                         -- ISO tip-off (ET)
-    home_team_id   NVARCHAR(16),                         -- id (attribute, not FK)
-    away_team_id   NVARCHAR(16),
-    home_abbr      NVARCHAR(8),                          -- point-in-time abbr (attribute)
-    away_abbr      NVARCHAR(8),
-    home_score     FLOAT,                                -- NULL until played
-    away_score     FLOAT,
-    completed      BIT,                                  -- status_type_completed
-    neutral_site   BIT,
-    venue_id       NVARCHAR(16),
-    fetched_at     FLOAT
+    game_id       NVARCHAR(16) NOT NULL PRIMARY KEY,
+    season        INT,                                 -- season-ENDING year
+    season_type   NVARCHAR(16),                        -- regular-season|playoffs|play-in|nba-cup
+    game_date     NVARCHAR(10),                        -- YYYY-MM-DD
+    home_team_id  BIGINT,                              -- id (attribute, not FK)
+    away_team_id  BIGINT,
+    home_tricode  NVARCHAR(8),
+    away_tricode  NVARCHAR(8),
+    home_score    FLOAT,                               -- NULL until played
+    away_score    FLOAT,
+    completed     BIT,
+    fetched_at    FLOAT
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
@@ -1582,18 +1582,18 @@ CREATE INDEX ix_nba_game_teams ON dbo.nba_game (season, home_team_id, away_team_
 GO
 
 ------------------------------------------------------------------------ nba_player
--- Player dim keyed on ESPN athlete_id. Cloud bootstrap fills id/name/position/jersey/team
--- from the player box (no separate roster fetch needed for v1).
-IF OBJECT_ID('dbo.nba_player', 'U') IS NULL
+-- Player dim keyed on stats.nba.com person_id (int64). Cloud bootstrap fills name/slug/
+-- position/team from the player box.
 CREATE TABLE dbo.nba_player (
-    athlete_id NVARCHAR(16) NOT NULL PRIMARY KEY,       -- ESPN athlete id
-    full_name  NVARCHAR(96),                             -- athlete_display_name
-    name_norm  NVARCHAR(96),
-    short_name NVARCHAR(96),                             -- athlete_short_name
-    position   NVARCHAR(8),                              -- athlete_position_abbreviation
-    jersey     NVARCHAR(8),
-    team_id    NVARCHAR(16),                             -- most-recent (attribute)
-    fetched_at FLOAT
+    person_id   BIGINT NOT NULL PRIMARY KEY,          -- stats.nba.com person id (int64)
+    full_name   NVARCHAR(96),                          -- first_name + " " + family_name
+    name_norm   NVARCHAR(96),
+    first_name  NVARCHAR(48),
+    family_name NVARCHAR(48),
+    player_slug NVARCHAR(64),
+    position    NVARCHAR(8),
+    team_id     BIGINT,                                -- most-recent (attribute)
+    fetched_at  FLOAT
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
@@ -1602,51 +1602,59 @@ CREATE INDEX ix_nba_player_name ON dbo.nba_player (name_norm);
 GO
 
 ------------------------------------------------------------------- nba_player_game
--- Per-player-game stat FACT. Natural key UNIQUE(athlete_id, game_id). game_id is an
--- attribute that joins the spine (no FK — see header). played = minutes>0 (the DNP/void
--- signal, like NFL snaps; the ESPN active flag is unreliable). Supersedes the nba_gamelog cache.
-IF OBJECT_ID('dbo.nba_player_game', 'U') IS NULL
+-- Per-player-game stat FACT. Natural key UNIQUE(person_id, game_id). Stat columns use
+-- CANONICAL names (mapped from stats.nba.com source at ingest) so downstream + the prop map
+-- are unchanged. played = minutes>0 (DNP/void signal); dnp_reason = the stats.nba.com comment.
 CREATE TABLE dbo.nba_player_game (
     id                  INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-    athlete_id          NVARCHAR(16) NOT NULL,           -- (natural key part)
+    person_id           BIGINT NOT NULL,                 -- (natural key part)
     game_id             NVARCHAR(16) NOT NULL,           -- (natural key part); joins spine
     season              INT NOT NULL,                    -- season-ENDING year
     game_date           NVARCHAR(10),                    -- YYYY-MM-DD (grading key)
-    team_id             NVARCHAR(16),
-    opponent_team_id    NVARCHAR(16),
-    home_away           NVARCHAR(8),                     -- home|away
+    team_id             BIGINT,
+    opponent_team_id    BIGINT,
+    home_away           NVARCHAR(8),                     -- home|away (from `side`)
     team_score          FLOAT,
     opponent_team_score FLOAT,
-    -- box stats
+    -- box stats (canonical names)
     minutes FLOAT, points FLOAT, field_goals_made FLOAT, field_goals_attempted FLOAT,
     three_point_field_goals_made FLOAT, three_point_field_goals_attempted FLOAT,
     free_throws_made FLOAT, free_throws_attempted FLOAT, offensive_rebounds FLOAT,
     defensive_rebounds FLOAT, rebounds FLOAT, assists FLOAT, steals FLOAT, blocks FLOAT,
     turnovers FLOAT, fouls FLOAT, plus_minus FLOAT,
-    starter BIT,
-    did_not_play BIT,
-    active BIT,
     played BIT,
+    dnp_reason NVARCHAR(48),
     fetched_at FLOAT,
-    CONSTRAINT uq_nba_player_game UNIQUE (athlete_id, game_id)
+    CONSTRAINT uq_nba_player_game UNIQUE (person_id, game_id)
 );
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'ix_nba_player_game_athlete' AND object_id = OBJECT_ID('dbo.nba_player_game'))
-CREATE INDEX ix_nba_player_game_athlete ON dbo.nba_player_game (athlete_id, season);
+               WHERE name = 'ix_nba_player_game_person' AND object_id = OBJECT_ID('dbo.nba_player_game'))
+CREATE INDEX ix_nba_player_game_person ON dbo.nba_player_game (person_id, season);
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_nba_player_game_game' AND object_id = OBJECT_ID('dbo.nba_player_game'))
 CREATE INDEX ix_nba_player_game_game ON dbo.nba_player_game (game_id);
 GO
--- (season, game_date) COVERING index (the uq is athlete-first). Add WITH (ONLINE = ON) where supported.
+-- (season, game_date) COVERING index (the uq is person-first). Add WITH (ONLINE = ON) where supported.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'ix_nba_player_game_season' AND object_id = OBJECT_ID('dbo.nba_player_game'))
 CREATE INDEX ix_nba_player_game_season
     ON dbo.nba_player_game (season, game_date)
-    INCLUDE (athlete_id, home_away, opponent_team_id, minutes, points,
+    INCLUDE (person_id, home_away, opponent_team_id, minutes, points,
              field_goals_made, field_goals_attempted, three_point_field_goals_made,
              three_point_field_goals_attempted, free_throws_made, free_throws_attempted,
              offensive_rebounds, defensive_rebounds, rebounds, assists, steals, blocks,
              turnovers, fouls, plus_minus, played);
+GO
+
+-------------------------------------------------- odds_line: NBA id-stamp columns (P5b)
+-- Pre-computed line<->actuals join: stamp the stats.nba.com game_id (string) + person_id
+-- (bigint) on each NBA odds line at capture + backfill, so grading/calibration join by id
+-- (namesake/date-slippage-proof) instead of name+date. Null for non-NBA / unstamped lines.
+IF COL_LENGTH('dbo.odds_line', 'nba_game_id') IS NULL
+    ALTER TABLE dbo.odds_line ADD nba_game_id NVARCHAR(16) NULL;
+GO
+IF COL_LENGTH('dbo.odds_line', 'nba_person_id') IS NULL
+    ALTER TABLE dbo.odds_line ADD nba_person_id BIGINT NULL;
 GO
