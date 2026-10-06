@@ -4166,6 +4166,8 @@ def _resolve_opp_pa_asof(opp_name, test_date, team_series, window=None):
     # Tolerant team-name lookup (same logic as _resolve_opp_pts_allowed)
     rows = team_series.get(opp_name)
     if rows is None:
+        if not isinstance(opp_name, str):    # id-keyed (NBA team_id int): exact-only, no substring
+            return None
         lo = opp_name.lower()
         for k, v in team_series.items():
             kl = k.lower()
@@ -4221,9 +4223,9 @@ def _nba_warehouse_opp_allowed_agg(seasons):
                         cell["stats"][c] += float(val)
         agg = defaultdict(list)
         for (opp, _gid), cell in per_game.items():
-            agg[str(opp)].append((cell["date"], dict(cell["stats"])))
-        for opp in agg:
-            agg[opp].sort(key=lambda r: r[0] or "", reverse=True)
+            agg[opp].append((cell["date"], dict(cell["stats"])))   # native id (int) key —
+        for opp in agg:                                            # matches the gamelog opponent
+            agg[opp].sort(key=lambda r: r[0] or "", reverse=True)  # type for an EXACT resolve
         return dict(agg)
     except Exception:
         return {}

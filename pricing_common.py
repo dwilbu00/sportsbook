@@ -400,6 +400,8 @@ def _resolve_team_defense(opp_name, team_defense):
         return None
     if opp_name in team_defense:
         return team_defense[opp_name]
+    if not isinstance(opp_name, str):        # id-keyed (NBA team_id int): exact-only, no substring
+        return None
     lo = opp_name.lower()
     for k, v in team_defense.items():
         kl = k.lower()
