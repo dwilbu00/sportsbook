@@ -120,24 +120,41 @@ def _plan(conn):
     return groups, stats, diffs
 
 
-def _apply(eng, groups, chunk=1000):
+def _apply(eng, groups, chunk=1000, per_txn=400, verbose=True):
     """id-keyed UPDATE of (nba_person_id, nba_game_id), grouped by value (one UPDATE per distinct
-    (pid, gid) per chunk — DTU/log-friendly), under _LOCK with a bounded retry."""
+    (pid, gid), chunked at ``chunk`` ids). Commits ``per_txn`` UPDATE statements per transaction
+    — bounds the SQL log AND the transaction/round-trip count on the 20-DTU tier (vs one txn per
+    group) — under _LOCK with a bounded OperationalError retry. Single-threaded (no concurrency →
+    no DTU saturation). Idempotent, so an interrupted run resumes cleanly on re-run."""
     ol = db_store.odds_line
+    stmts = []                                            # [(pid, gid, [ids])] — one UPDATE each
     for (pid, gid), ids in groups.items():
         for i in range(0, len(ids), chunk):
-            batch = ids[i:i + chunk]
-            for attempt in range(3):
-                try:
-                    with _LOCK:
-                        with eng.begin() as conn:
-                            conn.execute(update(ol).where(ol.c.id.in_(batch))
+            stmts.append((pid, gid, ids[i:i + chunk]))
+    total_rows = sum(len(ids) for _, _, ids in stmts)
+
+    def _flush(batch):
+        for attempt in range(3):
+            try:
+                with _LOCK:
+                    with eng.begin() as conn:
+                        for pid, gid, bids in batch:
+                            conn.execute(update(ol).where(ol.c.id.in_(bids))
                                          .values(nba_person_id=pid, nba_game_id=gid))
-                    break
-                except OperationalError:
-                    if attempt == 2:
-                        raise
-                    time.sleep(1 + 2 * attempt)
+                return
+            except OperationalError:
+                if attempt == 2:
+                    raise
+                time.sleep(1 + 2 * attempt)
+
+    done = 0
+    for i in range(0, len(stmts), per_txn):
+        batch = stmts[i:i + per_txn]
+        _flush(batch)
+        done += sum(len(b[2]) for b in batch)
+        if verbose:
+            print(f"    stamped {done:,}/{total_rows:,} rows "
+                  f"({100.0 * done / total_rows:.0f}%)", flush=True)
 
 
 def stamp(dry_run=True):
