@@ -646,6 +646,42 @@ def calib_gamelogs_bulk(seasons):
     return dict(out)
 
 
+def prop_id_index(seasons):
+    """{(name_norm, 'YYYY-MM-DD'): set((person_id, game_id))} over ``seasons`` — the resolver
+    the P5b odds-line id stamp (nba_stamp_odds.py) uses to pre-compute the line->actuals join.
+    Keyed on the SAME ``db_store.normalize_name`` + EXACT ``game_date`` that the real-line
+    calibration join matches on (``book_line_calibration._nba_grade_book_lines``), so a stamped
+    (person_id, game_id) equals what that join resolves for the common (one-person-per-name)
+    case. Reads Azure directly (the stamp CLI writes Azure); never raises -> {}."""
+    from collections import defaultdict
+    idx = defaultdict(set)
+    pg, pl = nba_player_game, nba_player
+    stmt = (select(pl.c.name_norm, pg.c.game_date, pg.c.person_id, pg.c.game_id)
+            .select_from(pg.join(pl, pg.c.person_id == pl.c.person_id))
+            .where(pg.c.season.in_([int(s) for s in seasons])))
+    try:
+        with db_store.get_engine().connect() as conn:
+            for nn, gd, pid, gid in conn.execute(stmt):
+                if nn and gd and pid is not None and gid is not None:
+                    idx[(nn, str(gd)[:10])].add((int(pid), str(gid)))
+    except Exception:
+        return {}
+    return dict(idx)
+
+
+def resolve_prop_ids(index, player_name, et_date):
+    """(person_id, game_id) for a prop book line IFF (name_norm, ET-date) resolves to EXACTLY
+    one warehouse player-game; else (None, None). UNAMBIGUOUS-ONLY by design: a namesake
+    collision (two same-norm players who both have a game that date) or a no-match is left
+    unstamped for the name+date fallback — the stamp never guesses. ``index`` = ``prop_id_index``
+    output; ``et_date`` = US-Eastern date of the line's commence (``pricing_common.et_local_date``)."""
+    nn = db_store.normalize_name(player_name or "")
+    cands = index.get((nn, str(et_date or "")[:10]))
+    if cands and len(cands) == 1:
+        return next(iter(cands))
+    return None, None
+
+
 def _backfill_cli():                                 # pragma: no cover - offline owner tool
     """Offline backfill: `python nba_warehouse.py --seasons 1997-2026` (stats.nba.com; set
     SQL_DRIVER=pyodbc for fast_executemany). `--export-mirror` dumps the 0-DTU parquet mirror
