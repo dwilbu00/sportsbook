@@ -31,4 +31,4 @@ so any machine gets it via `git pull`). At the start of substantive work:
 - App is **Alpha** (single user, ship fast) — but the **never-destroy-irreplaceable-data**
   constraint is absolute (wagers, bankroll ledger, prediction/calibration corpus, learned
   fits → translate/re-key in place, never drop).
-- End commit messages with the `Co-Authored-By: Claude Opus 4.8 (1M context)` trailer.
+- End commit messages with the `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>` trailer.
