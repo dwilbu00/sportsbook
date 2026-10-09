@@ -295,7 +295,12 @@ def run(seasons_from, tune, test):
     seasons = list(range(seasons_from, max(test + tune) + 1))
     rows = nw.team_games(seasons)
     if not rows:
-        raise SystemExit("No team games — run the nba_team_game backfill + --export-mirror.")
+        where = ("the mirror has no nba_team_game files and Azure returned no rows"
+                 if nw.enabled() else
+                 "no mirror files and SQL isn't configured (no .streamlit/secrets.toml?)")
+        raise SystemExit(f"No team games for {seasons}: {where}. Run "
+                         "`python nba_warehouse.py --seasons 2021-2026 --team-games-only`, "
+                         "then `--export-mirror`.")
     games = TM.games_from_rows(rows)
     print("=" * 96)
     print("NBA TEAM-MODEL STUDY  (walk-forward; offsets fit on prior seasons only)")
@@ -385,6 +390,8 @@ def main():
     ap.add_argument("--tune", default="2022,2023,2024", help="seasons the knobs are chosen on")
     ap.add_argument("--test", default="2025,2026", help="seasons reported head-to-head")
     args = ap.parse_args()
+    import db_store
+    db_store.promote_secrets_from_toml()          # Azure fallback for un-mirrored seasons
     run(args.seasons_from, _parse_seasons(args.tune), _parse_seasons(args.test))
 
 
