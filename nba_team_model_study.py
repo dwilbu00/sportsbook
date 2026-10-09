@@ -27,10 +27,9 @@ Run (owner's machine, after the nba_team_game backfill + --export-mirror):
   # options: --tune 2022,2023,2024  --test 2025,2026  --seasons-from 2021
 """
 import argparse
-import itertools
 import math
 
-import nba_ratings as R
+import nba_team_model as TM
 import nba_warehouse as nw
 
 SPORT_KEY = "basketball_nba"
@@ -54,19 +53,6 @@ def _parse_seasons(spec):
 
 
 # ─────────────────────────────────────────────────────────────── games + odds join
-def _games(rows):
-    """[{game_id, season, season_type, date, home, away, hp, ap, rows(h,a)}] ascending."""
-    out = []
-    for date, season, gid, a, b in R._pair_games(rows):
-        h, aw = (a, b) if a.get("home_away") == "home" else (b, a)
-        if h.get("home_away") != "home":
-            continue
-        out.append({"game_id": gid, "season": season, "season_type": a.get("season_type"),
-                    "date": date, "home": h["team_id"], "away": aw["team_id"],
-                    "hp": float(h["points"]), "ap": float(aw["points"])})
-    return out
-
-
 def _team_name_index(seasons):
     """{normalized full name: team_id} + {nickname: {team_ids}} from the stats.nba.com team
     box (dep-free) — maps odds-feed names ("Los Angeles Clippers") to team ids."""
@@ -187,61 +173,6 @@ def _generic_total(analysis, hl, g, stats):
         wts += w
     proj = ((parts[0][0] + parts[1][0]) + (parts[0][1] + parts[1][1])) / 2.0
     return proj, analysis._weighted_std(tots, wts)
-
-
-# ───────────────────────────────────────────────────────────── efficiency model
-def _eff_raw(games, rows, params):
-    """{game_id: (raw_margin(no HCA), raw_total, b2b_diff)} from nba_ratings pre-game ratings."""
-    pre = R.pregame_ratings(rows, params)
-    out = {}
-    for g in games:
-        h, a = pre.get((g["game_id"], g["home"])), pre.get((g["game_id"], g["away"]))
-        if not h or not a:
-            continue
-        pj = R.project_matchup(h, a, hca=0.0)
-        b2b = (1 if h.get("rest_days") == 1 else 0) - (1 if a.get("rest_days") == 1 else 0)
-        out[g["game_id"]] = (pj["margin"], pj["total"], b2b)
-    return out
-
-
-def _fit_offsets(games, raw, seasons_before):
-    """Expanding-window fits from games in ``seasons_before``: HCA (mean margin residual),
-    total offset (mean total residual), rest coefficient (OLS of the remaining margin residual
-    on b2b_diff), and outcome sigmas. None when there's no prior data."""
-    res_m, res_t, b2b = [], [], []
-    for g in games:
-        if g["season"] not in seasons_before or g["game_id"] not in raw:
-            continue
-        m, t, b = raw[g["game_id"]]
-        res_m.append((g["hp"] - g["ap"]) - m)
-        res_t.append((g["hp"] + g["ap"]) - t)
-        b2b.append(b)
-    if len(res_m) < 200:
-        return None
-    hca = sum(res_m) / len(res_m)
-    tot_off = sum(res_t) / len(res_t)
-    resid = [r - hca for r in res_m]
-    sxx = sum(b * b for b in b2b)
-    beta = (sum(r * b for r, b in zip(resid, b2b)) / sxx) if sxx else 0.0
-    sig_m = math.sqrt(sum((r - beta * b) ** 2 for r, b in zip(resid, b2b)) / len(resid))
-    sig_t = math.sqrt(sum((r - tot_off) ** 2 for r in res_t) / len(res_t))
-    return {"hca": hca, "tot_off": tot_off, "beta_rest": beta, "sig_m": sig_m, "sig_t": sig_t}
-
-
-def _eff_predictions(games, rows, params, eval_seasons, use_rest):
-    """{game_id: (margin, sigma_m, total, sigma_t)} — offsets fit on seasons before each one."""
-    raw = _eff_raw(games, rows, params)
-    seasons = sorted({g["season"] for g in games})
-    fits = {s: _fit_offsets(games, raw, [x for x in seasons if x < s]) for s in eval_seasons}
-    out = {}
-    for g in games:
-        f = fits.get(g["season"])
-        if not f or g["game_id"] not in raw:
-            continue
-        m, t, b = raw[g["game_id"]]
-        margin = m + f["hca"] + (f["beta_rest"] * b if use_rest else 0.0)
-        out[g["game_id"]] = (margin, f["sig_m"], t + f["tot_off"], f["sig_t"])
-    return out, fits
 
 
 # ────────────────────────────────────────────────────────────────────── metrics
@@ -365,24 +296,22 @@ def run(seasons_from, tune, test):
     rows = nw.team_games(seasons)
     if not rows:
         raise SystemExit("No team games — run the nba_team_game backfill + --export-mirror.")
-    games = _games(rows)
+    games = TM.games_from_rows(rows)
     print("=" * 96)
     print("NBA TEAM-MODEL STUDY  (walk-forward; offsets fit on prior seasons only)")
     print("=" * 96)
     print(f"  seasons loaded {seasons}  games {len(games):,}  tune {tune}  test {test}")
 
     # (1) knob sweep on the tune seasons (no odds needed)
-    grid = list(itertools.product((10.0, 20.0, 40.0, 1e9), (True, False), (0.25, 0.5),
-                                  (5.0, 10.0, 20.0)))
     tune_ids = {g["game_id"] for g in games if g["season"] in tune}
     print(f"\n(1) EFFICIENCY KNOB SWEEP on tune seasons {tune} "
           f"(score = margin RMSE + total RMSE; lower is better)")
     print(f"  {'half_life':>9} {'opp_adj':>7} {'regress':>7} {'prior':>5}   "
           f"{'mRMSE':>7} {'tRMSE':>7} {'Brier':>7}")
     scored = []
-    for hl, oa, rg, pg in grid:
+    for hl, oa, rg, pg in TM.SWEEP_GRID:
         params = {"half_life": hl, "opp_adjust": oa, "regress": rg, "prior_games": pg}
-        preds, _f = _eff_predictions(games, rows, params, tune, use_rest=True)
+        preds, _f = TM.walk_forward_predictions(games, rows, params, tune, use_rest=True)
         m = _metrics(games, preds, tune_ids)
         if m:
             scored.append((m["m_rmse"] + m["t_rmse"], params, m))
@@ -403,8 +332,8 @@ def run(seasons_from, tune, test):
     print(f"\n(2) HEAD-TO-HEAD on test seasons {test}, games with a DK close: {len(ids):,} "
           f"of {len(test_games):,}")
     gen = _generic_predictions(games)
-    eff, fits = _eff_predictions(games, rows, best, test, use_rest=False)
-    effr, _ = _eff_predictions(games, rows, best, test, use_rest=True)
+    eff, fits = TM.walk_forward_predictions(games, rows, best, test, use_rest=False)
+    effr, _ = TM.walk_forward_predictions(games, rows, best, test, use_rest=True)
     print(_HDR)
     print(_row("generic (production)", _metrics(test_games, gen, ids)))
     print(_row("efficiency", _metrics(test_games, eff, ids)))

@@ -316,6 +316,19 @@ def _predict_margin(game_odds, home_team_stats, away_team_stats, sport_key,
         return (float(matchup_features["nfl_pred_margin"]), pstd,
                 home_stats or stub, away_stats or stub)
 
+    # NBA: the validated pace-adjusted efficiency model (nba_team_model: possessions x
+    # ORtg x opp DRtg + HCA + back-to-back) supplies pred_margin + a CALIBRATED pred_std
+    # (std(z) ~1.0 vs the DK line; the recency-margin std ran ~49% too wide), replacing the
+    # recency-weighted-raw-margin base. Fires only when build_matchup_features populated it
+    # (calibration has nba_team_model); same downstream path as NFL.
+    if sport_key == "basketball_nba" and matchup_features \
+            and matchup_features.get("nba_pred_margin") is not None \
+            and matchup_features.get("nba_pred_std"):
+        pstd = float(matchup_features["nba_pred_std"])
+        stub = {"mean": 0.0, "std": pstd / (2 ** 0.5), "margins": [], "weights": []}
+        return (float(matchup_features["nba_pred_margin"]), pstd,
+                home_stats or stub, away_stats or stub)
+
     if not home_stats or not away_stats:
         return None
 
@@ -810,6 +823,14 @@ def analyze_totals_value(game_odds, home_team_stats, away_team_stats, threshold_
 
     empirical_over_rate = (over_weight / total_weight) if total_weight > 0 else 0.5
     total_std = _weighted_std(historical_totals, historical_total_weights)
+
+    # NBA: the validated efficiency model's projected total + fitted total sigma replace the
+    # recency projection and the historical-totals spread (nba_team_model; inert unless fit).
+    if (sport_key == "basketball_nba" and matchup_features
+            and matchup_features.get("nba_pred_total") is not None
+            and matchup_features.get("nba_total_std")):
+        projected_total = float(matchup_features["nba_pred_total"])
+        total_std = float(matchup_features["nba_total_std"])
     if total_std > 0:
         z = (consensus_line - projected_total) / total_std
         model_over_hit_rate = 1.0 - _norm_cdf(z)

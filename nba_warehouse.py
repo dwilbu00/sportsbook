@@ -610,6 +610,41 @@ def _resolve_team_id(conn, name):
     return rows[0][0] if len(rows) == 1 else None
 
 
+_TEAM_ID_CACHE = {}                                   # normalized odds name -> team_id
+
+
+def resolve_team_id(name):
+    """Public, connection-owning ``_resolve_team_id`` (odds-feed name -> stats.nba.com
+    team_id), memoized per process (team names are stable). None when disabled/absent."""
+    nn = db_store.normalize_name(name or "")
+    if not nn:
+        return None
+    if nn in _TEAM_ID_CACHE:
+        return _TEAM_ID_CACHE[nn]
+    if not enabled():
+        return None
+    try:
+        with db_store.get_engine().connect() as conn:
+            tid = _resolve_team_id(conn, name)
+    except Exception:
+        return None
+    if tid is not None:
+        _TEAM_ID_CACHE[nn] = int(tid)
+    return int(tid) if tid is not None else None
+
+
+def team_names():
+    """{team_id: name} from the nba_team dim ({} when disabled / on error)."""
+    if not enabled():
+        return {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            return {int(r[0]): r[1] for r in conn.execute(
+                select(nba_team.c.team_id, nba_team.c.name))}
+    except Exception:
+        return {}
+
+
 def final_score(home_team, away_team, game_date, commence=None):
     """(home_score, away_score) for a completed NBA game from the nba_game spine, resolving the
     odds home/away names -> team_id (nba_team dim) and matching on game_date (exact, then ±1 for

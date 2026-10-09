@@ -1335,6 +1335,16 @@ def fetch_espn_teams(espn_sport, espn_league):
     return get_all_teams(espn_sport, espn_league)
 
 
+def _nba_live_warehouse():
+    """NBA live path is on the stats.nba.com warehouse (ODI_NBA_LIVE_SDV, default on). Off ->
+    the legacy ESPN team dim / schedules (burn-in fallback)."""
+    try:
+        import nba_stats_source
+        return nba_stats_source.live_from_sdv()
+    except Exception:
+        return False
+
+
 def _resolve_team_dim(sport_key, name, espn_teams):
     """Team dict {id, display_name, record, wins, losses, win_pct, ...} for a
     matchup team. MLB (P6 teardown): resolve off the StatsAPI warehouse
@@ -1365,6 +1375,19 @@ def _resolve_team_dim(sport_key, name, espn_teams):
         except Exception:
             pass
         return None
+    if sport_key == "basketball_nba" and _nba_live_warehouse():
+        # NBA: the stats.nba.com warehouse team dim (no ESPN). id = str(team_id), the same
+        # key the warehouse player history's team_id stringifies to, so team_schedules and
+        # the namesake team hint line up. None on an unresolvable name -> matchup skipped.
+        try:
+            import nba_warehouse
+            tid = nba_warehouse.resolve_team_id(name)
+            if tid is not None:
+                return {"id": str(tid), "display_name": name, "record": None,
+                        "wins": None, "losses": None, "win_pct": None}
+        except Exception:
+            pass
+        return None
     return find_team(espn_teams, name)
 
 
@@ -1387,6 +1410,15 @@ def _fetch_team_schedule(sport_key, team, espn_sport, espn_league):
             return []
     if sport_key == "americanfootball_nfl":
         return []   # NFL recent form is built from nfl_team_stats (self-contained), no ESPN schedule
+    if sport_key == "basketball_nba" and _nba_live_warehouse():
+        # NBA: recent games off the nba_game spine (newest-first dicts with 'date') — feeds
+        # the props layoff filter, keyed by the warehouse team id. No ESPN.
+        try:
+            import nba_team_stats
+            return (nba_team_stats.team_stats(team["display_name"], 10) or {}).get(
+                "recent_games") or []
+        except Exception:
+            return []
     return get_team_schedule(espn_sport, espn_league, team["id"])
 
 
@@ -4042,11 +4074,12 @@ if analyze_clicked and selected_game_labels:
 
     progress = st.progress(0, text="Starting analysis...")
 
-    # Team data. MLB (P6, warehouse) and NFL (nflverse games spine) resolve + build team
-    # stats without ESPN, so skip the ESPN get_all_teams fetch for both. NBA/NHL still
-    # fetch from ESPN (until their own data layers land).
+    # Team data. MLB (P6, warehouse), NFL (nflverse games spine) and NBA (stats.nba.com
+    # warehouse, unless ODI_NBA_LIVE_SDV=0) resolve + build team stats without ESPN, so skip
+    # the ESPN get_all_teams fetch for them. NHL still fetches from ESPN.
     progress.progress(5, text="Loading team data...")
-    if sport["key"] in ("baseball_mlb", "americanfootball_nfl"):
+    if sport["key"] in ("baseball_mlb", "americanfootball_nfl") or (
+            sport["key"] == "basketball_nba" and _nba_live_warehouse()):
         espn_teams = {}
     else:
         try:
@@ -4301,7 +4334,11 @@ if analyze_clicked and selected_game_labels:
                 except Exception:
                     mlb_probables = None
             else:
-                event_teams = [find_team(espn_teams, tn)
+                # NBA (warehouse path): stats.nba.com ids via the team dim, matching what
+                # nba_warehouse._disambiguate_person compares; ESPN ids for other sports.
+                event_teams = [_resolve_team_dim(sport["key"], tn, espn_teams)
+                               if sport["key"] == "basketball_nba"
+                               else find_team(espn_teams, tn)
                                for tn in (parsed.get("home_team"),
                                           parsed.get("away_team")) if tn]
                 event_team_ids = [str(t["id"]) for t in event_teams
@@ -4399,6 +4436,24 @@ if analyze_clicked and selected_game_labels:
                     home, away, game_date, season, team_ratings=ratings)
             except Exception as e:
                 warns.append(f"EPA features unavailable for {away} @ {home}: {e}")
+        elif sport["key"] == "basketball_nba":
+            # NBA pace-adjusted efficiency model (nba_team_model): margin, total and their
+            # calibrated sigmas for ML / spreads / totals. None until the calibration block
+            # is promoted (then the generic recency model is the fallback).
+            try:
+                import nba_team_model
+                game_date = event.get("commence_time", "")[:10]
+                try:
+                    commence = datetime.fromisoformat(
+                        event["commence_time"].replace("Z", "+00:00"))
+                    game_date = commence.astimezone(
+                        ZoneInfo("America/New_York")).date().isoformat()
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+                matchup_features = nba_team_model.build_matchup_features(
+                    home, away, game_date)
+            except Exception as e:
+                warns.append(f"NBA model features unavailable for {away} @ {home}: {e}")
 
         # Team market analysis
         if eid in odds_results:

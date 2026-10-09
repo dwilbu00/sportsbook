@@ -388,6 +388,55 @@ def _warehouse_team_schedules(seasons_list):
     return teams, schedules
 
 
+def _nba_warehouse_team_schedules(seasons_list, store=None):
+    """NBA warehouse analog of get_all_teams + build_schedules for the team-market odds
+    backtest (no ESPN). Returns (teams, schedules) in the same shapes as
+    _warehouse_team_schedules: teams = {name: {"id": team_id, "win_pct"}}, schedules =
+    {team_id: [{date, home_team, away_team, home_score, away_score, total_score}]} from
+    nba_warehouse.team_games (mirror-first). Team NAMES follow the odds feed's spelling
+    (resolved via nba_warehouse.resolve_team_id) so _build_odds_lookup's name join matches
+    exactly ("Los Angeles Clippers" vs stats.nba.com "LA Clippers"); a team absent from the
+    odds keeps its warehouse name. ``seasons_list`` = season-ENDING years (None = current)."""
+    import nba_warehouse
+    cur = nba_warehouse._current_season()
+    seasons = sorted({cur if sy is None else int(sy) for sy in seasons_list})
+    names = dict(nba_warehouse.team_names())
+    odds_named = set()                          # first odds-feed spelling per team wins
+    for e in (store or {}).get("games", {}).values():
+        for nm in (e.get("home_team"), e.get("away_team")):
+            tid = nba_warehouse.resolve_team_id(nm) if nm else None
+            if tid is not None and tid not in odds_named:
+                names[tid] = nm
+                odds_named.add(tid)
+    schedules = {}
+    by_game = {}
+    for r in nba_warehouse.team_games(seasons):
+        if r.get("points") is None or r.get("opponent_points") is None:
+            continue
+        by_game.setdefault(r.get("game_id"), []).append(r)
+    for gid, rs in by_game.items():
+        home = next((r for r in rs if r.get("home_away") == "home"), None)
+        if home is None or home.get("opponent_team_id") is None:
+            continue
+        hid, aid = int(home["team_id"]), int(home["opponent_team_id"])
+        hs, as_ = float(home["points"]), float(home["opponent_points"])
+        g = {"date": str(home.get("game_date"))[:10],
+             "home_team": names.get(hid, str(hid)), "away_team": names.get(aid, str(aid)),
+             "home_score": hs, "away_score": as_, "total_score": hs + as_}
+        schedules.setdefault(hid, []).append(g)
+        schedules.setdefault(aid, []).append(g)
+    teams = {}
+    for tid, rows in schedules.items():
+        rows.sort(key=lambda g: g["date"])
+        nm = names.get(tid, str(tid))
+        wins = sum(1 for g in rows if (
+            (g["home_team"] == nm and g["home_score"] > g["away_score"])
+            or (g["away_team"] == nm and g["away_score"] > g["home_score"])))
+        teams[nm] = {"id": tid, "win_pct": (wins / len(rows)) if rows else 0.5}
+    return teams, schedules
+
+
+
 def all_completed_games(schedules):
     """Flatten all schedules into a deduped list of (date, home, away, home_score, away_score)."""
     seen = set()
@@ -1251,6 +1300,36 @@ def _nfl_matchup_features(home, away, date, sport_key):
         return None
 
 
+_NBA_PREGAME = {}                                       # (season, params) -> pregame index
+
+
+def _nba_matchup_features(home, away, date, sport_key):
+    """NBA efficiency-model features for a historical game, leakage-safe: one walk-forward
+    nba_ratings pass per season (that season + 2 prior, the same window live_ratings serves)
+    yields each team's pre-game rating, fed to the SAME nba_team_model.build_matchup_features
+    production calls (fit == serve). None when the model isn't fit or a team is unresolved."""
+    if sport_key != "basketball_nba" or not (home and away and date):
+        return None
+    try:
+        import nba_stats_source
+        import nba_team_model
+        import nba_warehouse
+        m = nba_team_model.model()
+        if not m:
+            return None
+        season = nba_stats_source.end_year_for_date(str(date)[:10])
+        key = (season, tuple(sorted(m["params"].items())))
+        idx = _NBA_PREGAME.get(key)
+        if idx is None:
+            rows = nba_warehouse.team_games([season - 2, season - 1, season])
+            idx = nba_team_model.pregame_index(rows, m["params"])
+            _NBA_PREGAME[key] = idx
+        return nba_team_model.build_matchup_features(home, away, str(date)[:10],
+                                                     pregame=idx, m=m)
+    except Exception:
+        return None
+
+
 def _matchup_features_for(home, away, date, sport_key):
     """Dispatch to the per-sport historical matchup-feature builder used by the
     odds backtest's live engine, so it grades the same feature-enhanced model
@@ -1259,6 +1338,8 @@ def _matchup_features_for(home, away, date, sport_key):
         return _mlb_matchup_features(home, away, date, sport_key)
     if sport_key == "americanfootball_nfl":
         return _nfl_matchup_features(home, away, date, sport_key)
+    if sport_key == "basketball_nba":
+        return _nba_matchup_features(home, away, date, sport_key)
     return None
 
 
@@ -1428,10 +1509,12 @@ def _run_odds_backtest_impl(
         print(f"\n[store-label: {store_label}] grading ROI at the "
               f"{store.get('snapshot_time','labeled')} price, not the close.")
 
-    # P3b/P4/P6: MLB team schedules come from the StatsAPI warehouse; NBA/NFL stay on
-    # ESPN. The odds-store join below prefers SFBB team CODES, so the canonical
-    # warehouse names join fine. (ESPN was fully removed for MLB in P4.)
-    use_warehouse = espn_sport == "baseball"
+    # P3b/P4/P6: MLB team schedules come from the StatsAPI warehouse; NBA from the
+    # stats.nba.com warehouse (nba_team_game, odds-feed names); NFL stays on ESPN. The
+    # odds-store join below prefers SFBB team CODES, so the canonical warehouse names join
+    # fine. (ESPN was fully removed for MLB in P4.)
+    nba_warehouse_mode = sport_key == "basketball_nba"
+    use_warehouse = espn_sport == "baseball" or nba_warehouse_mode
     # season_year may be a single year (int/None) or an iterable of years. When
     # several years are given we pool each season's schedule so the fit can span
     # multiple seasons (e.g. NFL, whose ~200 games/season are too thin alone).
@@ -1444,7 +1527,7 @@ def _run_odds_backtest_impl(
     # already-active series_cache (2 queries) so grading's per-pitcher load_sp_series /
     # load_rp_series hit memory instead of ~1-2k remote round-trips. Byte-identical
     # results (same cache the per-entity loaders would fill) — purely a speedup.
-    if use_warehouse:
+    if use_warehouse and espn_sport == "baseball":
         try:
             import pitcher_asof
             ns, nr = pitcher_asof.prewarm_series_cache(seasons_list)
@@ -1474,7 +1557,10 @@ def _run_odds_backtest_impl(
                 pass
 
     print(f"\n=== Loading {sport_key} team list ===")
-    if use_warehouse:
+    if nba_warehouse_mode:
+        print("=== team-market inputs: stats.nba.com warehouse (ESPN bypassed) ===")
+        espn_teams, schedules = _nba_warehouse_team_schedules(seasons_list, store)
+    elif use_warehouse:
         print("=== team-market inputs: StatsAPI warehouse (ESPN bypassed) ===")
         espn_teams, schedules = _warehouse_team_schedules(seasons_list)
     else:
@@ -1594,10 +1680,14 @@ def _run_odds_backtest_impl(
             # As-of season run-differential for the Pythagorean blend (MLB only;
             # DEFAULT_PYTHAG_WEIGHT). Zero extra queries — summed from the already-
             # loaded schedules through the day before this game (leakage-safe).
+            # MLB ONLY: the Pythagorean blend uses a baseball exponent. Production NBA
+            # carries no runs (season block runs_scored=None -> blend skipped), so feeding
+            # NBA points here would grade a model production never serves (fit != serve).
+            _mlb_runs = use_warehouse and espn_sport == "baseball"
             home_sr = (_asof_season_runs(home, schedules, espn_teams, date)
-                       if use_warehouse else None)
+                       if _mlb_runs else None)
             away_sr = (_asof_season_runs(away, schedules, espn_teams, date)
-                       if use_warehouse else None)
+                       if _mlb_runs else None)
             mwin, mhc, mov, mpyth, mscomp = _live_spread_total_probs(
                 entry, home_prior, away_prior, threshold_pct, sport_key,
                 matchup_features=matchup_features,
