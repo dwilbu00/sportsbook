@@ -491,7 +491,8 @@ odds_line = Table(
     Column("team_code", String(16)),
     Column("game_pk", Integer),                        # P3: StatsAPI game (best-effort)
     # NBA id-stamp (stats.nba.com) — pre-computed line<->actuals join (namesake/date-proof),
-    # stamped at capture + backfill. NULL for non-NBA / unstamped lines. game_id is the
+    # stamped by nba_stamp_odds.py after a warehouse backfill (no capture-time stamp —
+    # actuals don't exist pre-game). NULL for non-NBA / unstamped lines. game_id is the
     # zero-padded string id; person_id is the int64 stats.nba.com id.
     Column("nba_game_id", String(16)),
     Column("nba_person_id", BigInteger),

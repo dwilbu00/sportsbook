@@ -137,6 +137,39 @@ nba_player_game = Table(
                          *_BOX_STATS, "played"]),
 )
 
+# ── Per-team-game fact (pace / efficiency inputs) ────────────────────────────────
+# Grain: one row per (team, game) from the stats.nba.com TEAM box (which carries team-level
+# rebounds/turnovers that player boxes don't attribute). Same canonical stat names as the
+# player fact. `possessions` = the Basketball-Reference estimate averaged over BOTH teams (so
+# both rows of a game carry the same value); validated 2024-25 vs official stats.nba.com
+# (pace corr 0.995, ORtg 0.998, DRtg 0.997 — a near-constant offset that cancels in
+# league-relative ratings). `game_minutes` = team minutes / 5 (48 regulation, 53 per OT).
+_TEAM_BOX_STATS = tuple(c for c in _BOX_STATS if c != "minutes")
+# stats.nba.com team-box season_type_id -> spine season_type (fallback when a game_id isn't in
+# the schedule map; preseason '1' / all-star '3' are deliberately absent -> excluded).
+_TEAM_SEASON_TYPE_IDS = {"2": "regular-season", "4": "playoffs", "5": "play-in",
+                         "6": "nba-cup"}
+
+nba_team_game = Table(
+    "nba_team_game", _META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("game_id", String(16), nullable=False),       # (natural key part); joins spine
+    Column("team_id", BigInteger, nullable=False),       # (natural key part)
+    Column("season", Integer, nullable=False),           # season-ENDING year
+    Column("season_type", String(16)),                   # regular-season|playoffs|play-in|nba-cup
+    Column("game_date", String(10)),                     # YYYY-MM-DD (from the schedule join)
+    Column("opponent_team_id", BigInteger),
+    Column("home_away", String(8)),                      # home|away (from `side`)
+    Column("game_minutes", Float),                       # 48 regulation, +5 per OT
+    *[Column(c, Float) for c in _TEAM_BOX_STATS],
+    Column("opponent_points", Float),
+    Column("possessions", Float),                        # BBRef estimate, both-team averaged
+    Column("fetched_at", Float),
+    UniqueConstraint("game_id", "team_id", name="uq_nba_team_game"),
+    Index("ix_nba_team_game_team", "team_id", "season"),
+    Index("ix_nba_team_game_season", "season", "game_date"),
+)
+
 # Column-name SPECs — SchemaParityTests asserts these equal the Table columns.
 _TEAM_COLS = ("team_id", "name", "name_norm", "tricode", "city", "conference",
               "division", "fetched_at")
@@ -149,6 +182,9 @@ _PLAYER_GAME_COLS = ("id", "person_id", "game_id", "season", "game_date", "team_
                      "opponent_team_id", "home_away", "team_score",
                      "opponent_team_score", *_BOX_STATS, "played", "dnp_reason",
                      "fetched_at")
+_TEAM_GAME_COLS = ("id", "game_id", "team_id", "season", "season_type", "game_date",
+                   "opponent_team_id", "home_away", "game_minutes", *_TEAM_BOX_STATS,
+                   "opponent_points", "possessions", "fetched_at")
 
 # season_type values kept in the spine (countable games; preseason/all-star excluded).
 _REAL_SEASON_TYPES = frozenset({"regular-season", "playoffs", "play-in", "nba-cup"})
@@ -359,10 +395,80 @@ def ingest_player_games(season, since_date=None):
     return (n_ins, n_upd)
 
 
+def estimate_possessions(tm, opp):
+    """Basketball-Reference possession estimate for one game, averaged over both teams:
+    ``FGA + 0.4·FTA − 1.07·ORB%·(FGA − FGM) + TOV`` per side, ORB% = ORB / (ORB + opp DRB).
+    ``tm``/``opp`` are canonical box dicts. None if any input is missing."""
+    keys = ("field_goals_attempted", "field_goals_made", "free_throws_attempted",
+            "offensive_rebounds", "defensive_rebounds", "turnovers")
+    if any(tm.get(k) is None or opp.get(k) is None for k in keys):
+        return None
+
+    def _side(a, b):
+        orb, odrb = a["offensive_rebounds"], b["defensive_rebounds"]
+        orb_pct = orb / (orb + odrb) if (orb + odrb) > 0 else 0.0
+        return (a["field_goals_attempted"] + 0.4 * a["free_throws_attempted"]
+                - 1.07 * orb_pct * (a["field_goals_attempted"] - a["field_goals_made"])
+                + a["turnovers"])
+
+    return 0.5 * (_side(tm, opp) + _side(opp, tm))
+
+
+def ingest_team_games(season, since_date=None):
+    """Fetch one season's stats.nba.com TEAM box, pair each game's two team rows, derive
+    possessions + opponent + points-allowed, enrich date/season_type via the schedule join, and
+    upsert nba_team_game. Excludes preseason/all-star (same rule as the spine) and any game
+    without exactly two team rows. ``season`` = ending year; ``since_date`` bounds maintenance.
+    One transaction per season. Idempotent. Returns (n_insert, n_update)."""
+    import nba_stats_source as src
+    end_year = int(season)
+    df = src.load_team_box(end_year, ttl=0)
+    if df is None or getattr(df, "empty", True):
+        return (0, 0)
+    gmap, _spine = _schedule_map(src, end_year)
+    now = time.time()
+    by_game = {}
+    for rec in df.to_dict("records"):
+        gid = _s(rec.get("game_id"))
+        if gid and _i(rec.get("team_id")) is not None:
+            by_game.setdefault(gid, []).append(rec)
+    rows = []
+    for gid, recs in by_game.items():
+        if len(recs) != 2:
+            continue
+        g = gmap.get(gid, {})
+        stype = g.get("season_type") or _TEAM_SEASON_TYPE_IDS.get(
+            _s(recs[0].get("season_type_id")))
+        if stype not in _REAL_SEASON_TYPES:
+            continue
+        gdate = g.get("game_date")
+        if since_date and (gdate is None or gdate < since_date):
+            continue
+        box = [{c: _f(r.get(_CANON_FROM_SRC[c])) for c in _TEAM_BOX_STATS} for r in recs]
+        poss = estimate_possessions(box[0], box[1])
+        for k in (0, 1):
+            r, o = recs[k], recs[1 - k]
+            tmin = src.minutes_to_float(r.get("minutes"))
+            rows.append({
+                "game_id": gid, "team_id": _i(r.get("team_id")), "season": end_year,
+                "season_type": stype, "game_date": gdate,
+                "opponent_team_id": _i(o.get("team_id")), "home_away": _s(r.get("side")),
+                "game_minutes": (tmin / 5.0) if tmin else None,
+                **box[k],
+                "opponent_points": box[1 - k]["points"], "possessions": poss,
+                "fetched_at": now})
+    if not rows:
+        return (0, 0)
+    with db_store.get_engine().begin() as conn:
+        return db_store.upsert_bulk(conn, nba_team_game, rows, ("game_id", "team_id"),
+                                    scope={"season": end_year},
+                                    ignore_cols=("fetched_at",))
+
+
 def ingest_maintenance(recent_days=14):
     """Lazy warehouse maintenance (Cloud, dep-free): upsert the CURRENT season's games + the
-    last ``recent_days`` of player-games from stats.nba.com HTTP. Idempotent + fail-open per
-    step. Mirrors mlb/nfl_warehouse; called from recalibration.maintain_sport."""
+    last ``recent_days`` of player-games and team-games from stats.nba.com HTTP. Idempotent +
+    fail-open per step. Mirrors mlb/nfl_warehouse; called from recalibration.maintain_sport."""
     if not enabled():
         return
     cur = _current_season()
@@ -370,10 +476,14 @@ def ingest_maintenance(recent_days=14):
         ingest_games([cur])
     except Exception:
         pass
+    since = (datetime.datetime.now(datetime.timezone.utc).date()
+             - datetime.timedelta(days=int(recent_days))).isoformat()
     try:
-        since = (datetime.datetime.now(datetime.timezone.utc).date()
-                 - datetime.timedelta(days=int(recent_days))).isoformat()
         ingest_player_games(cur, since_date=since)
+    except Exception:
+        pass
+    try:
+        ingest_team_games(cur, since_date=since)
     except Exception:
         pass
 
@@ -646,6 +756,104 @@ def calib_gamelogs_bulk(seasons):
     return dict(out)
 
 
+# ── Team-game MIRROR + reader (pace / efficiency ratings; 0-DTU offline reads) ──────────
+_TEAM_MIRROR_COLS = tuple(c for c in _TEAM_GAME_COLS if c not in ("id", "fetched_at"))
+
+
+def _team_mirror_file(season):
+    return os.path.join(_mirror_dir(),
+                        f"nba_team_game__basketball_nba__{int(season)}.parquet")
+
+
+def _query_team_games(seasons):
+    tg = nba_team_game
+    stmt = (select(*[tg.c[c] for c in _TEAM_MIRROR_COLS])
+            .where(tg.c.season.in_([int(s) for s in seasons])))
+    with db_store.get_engine().connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(stmt)]
+
+
+def export_team_mirror(seasons, verbose=True):           # pragma: no cover - offline owner tool
+    """Dump nba_team_game per season from Azure to the local parquet mirror (0-DTU reads for
+    the ratings module / team-model study). Run AFTER a backfill. Returns rows per season."""
+    if not enabled():
+        raise SystemExit("DB not enabled (no secrets.toml?) — can't export the mirror.")
+    import pandas as pd
+    os.makedirs(_mirror_dir(), exist_ok=True)
+    written = {}
+    for s in seasons:
+        rows = _query_team_games([int(s)])
+        df = pd.DataFrame(rows, columns=list(_TEAM_MIRROR_COLS))
+        df.to_parquet(_team_mirror_file(s), index=False)
+        written[int(s)] = len(df)
+        if verbose:
+            print(f"  nba_team_game mirror {s}: {len(df):,} rows -> {_team_mirror_file(s)}")
+    return written
+
+
+def team_games(seasons):
+    """Team-game dicts (``_TEAM_MIRROR_COLS``) across ``seasons``, ascending by
+    (game_date, game_id, team_id). MIRROR-FIRST (parquet per season), Azure for un-mirrored
+    seasons. NaN -> None. Never raises (returns what it could read)."""
+    out, azure_seasons = [], []
+    for s in seasons:
+        f = _team_mirror_file(s)
+        if os.path.exists(f):
+            try:
+                import pandas as pd
+                out.extend({k: _nn(v) for k, v in m.items()}
+                           for m in pd.read_parquet(f).to_dict("records"))
+                continue
+            except Exception:
+                pass
+        azure_seasons.append(int(s))
+    if azure_seasons and enabled():
+        try:
+            out.extend(_query_team_games(azure_seasons))
+        except Exception:
+            pass
+    out.sort(key=lambda r: (str(r.get("game_date") or ""), str(r.get("game_id") or ""),
+                            r.get("team_id") or 0))
+    return out
+
+
+def validate_team_games(season):
+    """Per-team REGULAR-SEASON pace / ORtg / DRtg derived from nba_team_game vs the official
+    stats.nba.com advanced season totals. Returns {n_teams, pace|off_rating|def_rating:
+    {corr, mean_err, mae}} or None when either side is unavailable. Read-only."""
+    try:
+        import numpy as np
+        import pandas as pd
+        import nba_stats_source as src
+    except Exception:
+        return None
+    rows = [r for r in team_games([season]) if r.get("season_type") == "regular-season"]
+    off = src.load_team_season_stats(int(season))
+    if not rows or off is None or getattr(off, "empty", True):
+        return None
+    df = pd.DataFrame(rows)
+    g = df.groupby("team_id").agg(poss=("possessions", "sum"), mins=("game_minutes", "sum"),
+                                  pts=("points", "sum"), opts=("opponent_points", "sum"))
+    g["pace"] = 48.0 * g["poss"] / g["mins"]
+    g["off_rating"] = 100.0 * g["pts"] / g["poss"]
+    g["def_rating"] = 100.0 * g["opts"] / g["poss"]
+    adv = off[(off["measure_type"] == "advanced") & (off["season_type"] == "regular-season")
+              & (off["per_mode"] == "totals")].copy()
+    adv["team_id"] = pd.to_numeric(adv["team_id"])
+    g.index = pd.to_numeric(g.index)
+    j = adv.merge(g, left_on="team_id", right_index=True, suffixes=("_off", ""))
+    if j.empty:
+        return None
+    res = {"n_teams": int(len(j))}
+    for k in ("pace", "off_rating", "def_rating"):
+        ours, theirs = j[k].astype(float), pd.to_numeric(j[k + "_off"])
+        d = ours - theirs
+        corr = (float(np.corrcoef(ours, theirs)[0, 1])
+                if ours.std() > 0 and theirs.std() > 0 else None)   # undefined w/o spread
+        res[k] = {"corr": corr, "mean_err": float(d.mean()), "mae": float(d.abs().mean())}
+    return res
+
+
 def prop_id_index(seasons):
     """{(name_norm, 'YYYY-MM-DD'): set((person_id, game_id))} over ``seasons`` — the resolver
     the P5b odds-line id stamp (nba_stamp_odds.py) uses to pre-compute the line->actuals join.
@@ -691,8 +899,14 @@ def _backfill_cli():                                 # pragma: no cover - offlin
     ap.add_argument("--seasons", required=True,
                     help="season-ENDING years, e.g. 1997-2026 or 2023,2024,2025,2026")
     ap.add_argument("--export-mirror", action="store_true",
-                    help="Dump nba_player_game to the local parquet mirror for these seasons "
-                         "instead of ingesting. Run after a backfill.")
+                    help="Dump nba_player_game AND nba_team_game to the local parquet mirror "
+                         "for these seasons instead of ingesting. Run after a backfill.")
+    ap.add_argument("--team-games-only", action="store_true",
+                    help="Ingest ONLY nba_team_game (team box + possessions) for these "
+                         "seasons — skips the heavy player-game re-ingest.")
+    ap.add_argument("--validate-team", action="store_true",
+                    help="Compare derived pace/ORtg/DRtg vs official stats.nba.com season "
+                         "stats for these seasons (read-only).")
     args = ap.parse_args()
     db_store.promote_secrets_from_toml()
     if not enabled():
@@ -706,10 +920,26 @@ def _backfill_cli():                                 # pragma: no cover - offlin
     if args.export_mirror:
         print(f"export_mirror({seasons}):")
         export_mirror(seasons)
+        export_team_mirror(seasons)
+        return
+    if args.validate_team:
+        for s in seasons:
+            v = validate_team_games(s)
+            if not v:
+                print(f"  {s}: unavailable (no team games or no official stats)")
+                continue
+            print(f"  {s}: {v['n_teams']} teams  " + "  ".join(
+                f"{k} corr {v[k]['corr'] if v[k]['corr'] is None else round(v[k]['corr'], 4)}"
+                f" err {v[k]['mean_err']:+.2f}" for k in ("pace", "off_rating", "def_rating")))
+        return
+    if args.team_games_only:
+        for s in seasons:
+            print(f"ingest_team_games({s}): {ingest_team_games(s)}")
         return
     print(f"ingest_games({seasons}): {ingest_games(seasons)}")
     for s in seasons:
         print(f"ingest_player_games({s}): {ingest_player_games(s)}")
+        print(f"ingest_team_games({s}): {ingest_team_games(s)}")
 
 
 if __name__ == "__main__":                           # pragma: no cover

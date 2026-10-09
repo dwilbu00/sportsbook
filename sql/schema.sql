@@ -1523,6 +1523,7 @@ GO
 -- are indexed ATTRIBUTES (not FKs). The player box is NOT self-contained — ingest synthesizes
 -- game_date/opponent/home-away/scores via a game_id->schedule join and stores them here.
 -- ==========================================================================
+DROP TABLE IF EXISTS dbo.nba_team_game;
 DROP TABLE IF EXISTS dbo.nba_player_game;
 DROP TABLE IF EXISTS dbo.nba_game;
 DROP TABLE IF EXISTS dbo.nba_player;
@@ -1648,10 +1649,48 @@ CREATE INDEX ix_nba_player_game_season
              turnovers, fouls, plus_minus, played);
 GO
 
+--------------------------------------------------------------------- nba_team_game
+-- Per-(team, game) fact from the stats.nba.com TEAM box (pace / efficiency inputs; added
+-- 2026-10-09). Same canonical stat names as nba_player_game. possessions = Basketball-
+-- Reference estimate averaged over BOTH teams (same value on both rows of a game);
+-- game_minutes = team minutes / 5 (48 regulation, +5 per OT). Re-derivable from the feed.
+-- ADDITIVE on an existing warehouse: run sql/add_nba_team_game.sql (do NOT re-run this
+-- whole NBA block — its DROPs would wipe the populated tables).
+CREATE TABLE dbo.nba_team_game (
+    id                  INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    game_id             NVARCHAR(16) NOT NULL,           -- (natural key part); joins spine
+    team_id             BIGINT NOT NULL,                 -- (natural key part)
+    season              INT NOT NULL,                    -- season-ENDING year
+    season_type         NVARCHAR(16),                    -- regular-season|playoffs|play-in|nba-cup
+    game_date           NVARCHAR(10),                    -- YYYY-MM-DD (schedule join)
+    opponent_team_id    BIGINT,
+    home_away           NVARCHAR(8),                     -- home|away (from `side`)
+    game_minutes        FLOAT,                           -- 48 regulation, +5 per OT
+    -- team box stats (canonical names)
+    points FLOAT, field_goals_made FLOAT, field_goals_attempted FLOAT,
+    three_point_field_goals_made FLOAT, three_point_field_goals_attempted FLOAT,
+    free_throws_made FLOAT, free_throws_attempted FLOAT, offensive_rebounds FLOAT,
+    defensive_rebounds FLOAT, rebounds FLOAT, assists FLOAT, steals FLOAT, blocks FLOAT,
+    turnovers FLOAT, fouls FLOAT, plus_minus FLOAT,
+    opponent_points     FLOAT,
+    possessions         FLOAT,                           -- BBRef estimate, both-team averaged
+    fetched_at          FLOAT,
+    CONSTRAINT uq_nba_team_game UNIQUE (game_id, team_id)
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_team_game_team' AND object_id = OBJECT_ID('dbo.nba_team_game'))
+CREATE INDEX ix_nba_team_game_team ON dbo.nba_team_game (team_id, season);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'ix_nba_team_game_season' AND object_id = OBJECT_ID('dbo.nba_team_game'))
+CREATE INDEX ix_nba_team_game_season ON dbo.nba_team_game (season, game_date);
+GO
+
 -------------------------------------------------- odds_line: NBA id-stamp columns (P5b)
--- Pre-computed line<->actuals join: stamp the stats.nba.com game_id (string) + person_id
--- (bigint) on each NBA odds line at capture + backfill, so grading/calibration join by id
--- (namesake/date-slippage-proof) instead of name+date. Null for non-NBA / unstamped lines.
+-- Pre-computed line<->actuals join: the stats.nba.com game_id (string) + person_id (bigint)
+-- of each NBA prop line, stamped by nba_stamp_odds.py --apply AFTER a warehouse backfill
+-- (no capture-time stamp: actuals don't exist pre-game). Null for non-NBA / unstamped lines.
 IF COL_LENGTH('dbo.odds_line', 'nba_game_id') IS NULL
     ALTER TABLE dbo.odds_line ADD nba_game_id NVARCHAR(16) NULL;
 GO
