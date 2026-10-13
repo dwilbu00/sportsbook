@@ -1,0 +1,98 @@
+{
+  "player_assists@draftkings": {
+    "a": 0.935821,
+    "b": -0.048072,
+    "kind": "platt",
+    "n": 34374
+  },
+  "player_assists@fanduel": {
+    "a": 0.922192,
+    "b": -0.031107,
+    "kind": "platt",
+    "n": 25611
+  },
+  "player_blocks@draftkings": {
+    "a": 0.890978,
+    "b": -0.076161,
+    "kind": "platt",
+    "n": 23142
+  },
+  "player_points@draftkings": {
+    "a": 1.120444,
+    "b": -0.055526,
+    "kind": "platt",
+    "n": 51831
+  },
+  "player_points@fanduel": {
+    "a": 0.928417,
+    "b": -0.033117,
+    "kind": "platt",
+    "n": 50195
+  },
+  "player_points_assists@draftkings": {
+    "a": 1.271977,
+    "b": -0.038937,
+    "kind": "platt",
+    "n": 37418
+  },
+  "player_points_assists@fanduel": {
+    "a": 0.969676,
+    "b": -0.034731,
+    "kind": "platt",
+    "n": 27272
+  },
+  "player_points_rebounds@draftkings": {
+    "a": 1.066449,
+    "b": -0.061263,
+    "kind": "platt",
+    "n": 46697
+  },
+  "player_points_rebounds@fanduel": {
+    "a": 0.87184,
+    "b": -0.051336,
+    "kind": "platt",
+    "n": 40045
+  },
+  "player_points_rebounds_assists@draftkings": {
+    "a": 1.08017,
+    "b": -0.054381,
+    "kind": "platt",
+    "n": 37817
+  },
+  "player_points_rebounds_assists@fanduel": {
+    "a": 0.471017,
+    "b": -0.052526,
+    "kind": "platt",
+    "n": 28733
+  },
+  "player_rebounds@draftkings": {
+    "a": 0.992704,
+    "b": -0.08053,
+    "kind": "platt",
+    "n": 50150
+  },
+  "player_steals@draftkings": {
+    "a": 1.004155,
+    "b": -0.115703,
+    "kind": "platt",
+    "n": 27518
+  },
+  "player_steals@fanduel": {
+    "a": 0.985697,
+    "b": -0.075803,
+    "kind": "platt",
+    "n": 13082
+  },
+  "player_threes@draftkings": {
+    "a": 0.946128,
+    "b": -0.068379,
+    "kind": "platt",
+    "n": 43979
+  },
+  "player_threes@fanduel": {
+    "a": 0.934583,
+    "b": -0.069247,
+    "kind": "platt",
+    "n": 33563
+  }
+}

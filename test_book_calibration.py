@@ -34,6 +34,21 @@ class ApplyTests(unittest.TestCase):
         maps = {"m": {"kind": "platt"}}              # missing a/b
         self.assertEqual(bc.apply("x", "m", 0.6, maps=maps), 0.6)
 
+    def test_book_specific_key_preferred(self):
+        maps = {"player_points": {"kind": "platt", "a": 1.0, "b": 0.0},          # identity
+                "player_points@draftkings": {"kind": "platt", "a": 1.0, "b": -0.2}}
+        dk = bc.apply("basketball_nba", "player_points", 0.55, maps=maps, book="draftkings")
+        self.assertLess(dk, 0.55)                                # the DK map fired
+        fd = bc.apply("basketball_nba", "player_points", 0.55, maps=maps, book="fanduel")
+        self.assertAlmostEqual(fd, 0.55)                         # falls back to the plain key
+        none = bc.apply("basketball_nba", "player_points", 0.55, maps=maps)
+        self.assertAlmostEqual(none, 0.55)                       # no book -> plain key
+
+    def test_book_key_without_plain_fallback(self):
+        maps = {"player_points@fanduel": {"kind": "platt", "a": 1.0, "b": -0.2}}
+        self.assertEqual(bc.apply("basketball_nba", "player_points", 0.55, maps=maps,
+                                  book="draftkings"), 0.55)      # identity for DK
+
     def test_clamped_to_unit(self):
         maps = {"m": {"kind": "platt", "a": 5.0, "b": 5.0}}
         p = bc.apply("x", "m", 0.99, maps=maps)

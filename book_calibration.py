@@ -11,6 +11,10 @@ Committed JSON per sport: calibration/book_calibration_<sport>.json =
   {market_key: {"kind": "isotonic", "kx": [..], "ky": [..], "n": ..}}
 Absent file / market = IDENTITY (trust the book P as-is; the measured markets so
 far are calibrated, so most markets have no entry — that's the correct default).
+
+A key may be BOOK-SPECIFIC, "<market>@<book>" (e.g. NBA "player_points@draftkings", fit by
+nba_book_calibration.py — the over-shading differs by book); apply(..., book=) prefers it and
+falls back to the plain "<market>" key.
 """
 import json
 import os
@@ -41,13 +45,15 @@ def save_map(sport_key, market, entry):
     return path
 
 
-def apply(sport_key, market, p, maps=None):
-    """Calibrated book probability for (sport, market). IDENTITY when no map exists
+def apply(sport_key, market, p, maps=None, book=None):
+    """Calibrated book probability for (sport, market[, book]). IDENTITY when no map exists
     (or on any error / bad input) — so an un-measured or already-calibrated market is
-    served unchanged. ``maps`` lets a caller load once and reuse across many legs."""
+    served unchanged. ``maps`` lets a caller load once and reuse across many legs. ``book``
+    (e.g. 'draftkings') selects a "<market>@<book>" map first, else the plain market map."""
     if p is None:
         return p
-    m = (maps if maps is not None else load_maps(sport_key)).get(market)
+    mp = maps if maps is not None else load_maps(sport_key)
+    m = (mp.get(f"{market}@{book}") if book else None) or mp.get(market)
     if not m:
         return p
     try:
