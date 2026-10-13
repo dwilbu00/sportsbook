@@ -1116,7 +1116,9 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         print(f"  [{prop_key}] method={cfg['method']} hl={cfg['half_life']} "
               f"opp={cfg['opp_defense_strength']} defadj={cfg['output_def_strength']} "
               f"shrink={cfg['shrinkage_k']} ven={cfg['venue_strength']} "
-              f"[{vconf}] brier={cfg.get('fit_brier')} n={cfg.get('n_obs')}")
+              + (f"npace={cfg.get('nba_pace_strength')} ndef={cfg.get('nba_def_strength')} "
+                 if (cfg.get('nba_pace_strength') or cfg.get('nba_def_strength')) else "")
+              + f"[{vconf}] brier={cfg.get('fit_brier')} n={cfg.get('n_obs')}")
         props_cfg[prop_key] = cfg
 
     meta = {
