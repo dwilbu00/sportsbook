@@ -137,15 +137,32 @@ def score(games, preds, ids):
 
 
 # ──────────────────────────────────────────────────────────────────────── serving
+_MODEL_CACHE = {}                                     # (serving path, mtime_ns) -> block
+
+
 def model():
-    """The fitted model block from calibration, or None (model inert until fit + promoted)."""
+    """The fitted model block from calibration, or None (model inert until fit + promoted).
+    Memoized on the serving file's (path, mtime): the calibration JSON is ~10 MB, and the prop
+    context / backtests ask for the knobs per observation (an uncached read is ~100 ms)."""
+    import os
+    try:
+        import calibration_loader
+        path = calibration_loader._serving_path(SPORT_KEY)
+        key = (path, os.stat(path).st_mtime_ns) if os.path.exists(path) else (path, None)
+    except Exception:
+        key = None
+    if key is not None and key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
     try:
         from calibration_loader import load_starter_adjustment
         m = (load_starter_adjustment(SPORT_KEY) or {}).get(MODEL_KEY)
     except Exception:
         return None
     if not isinstance(m, dict) or not all(k in m for k in _REQUIRED):
-        return None
+        m = None
+    if key is not None:
+        _MODEL_CACHE.clear()
+        _MODEL_CACHE[key] = m
     return m
 
 

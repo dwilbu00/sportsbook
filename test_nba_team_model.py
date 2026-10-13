@@ -81,12 +81,24 @@ class FeaturesTests(unittest.TestCase):
         self.assertEqual(f["nba_away"]["rest_days"], 1)
 
     def test_model_requires_all_keys(self):
+        TM._MODEL_CACHE.clear()
         with patch("calibration_loader.load_starter_adjustment",
                    return_value={"nba_team_model": {"hca": 2.0}}):
             self.assertIsNone(TM.model())
+        TM._MODEL_CACHE.clear()
         with patch("calibration_loader.load_starter_adjustment",
                    return_value={"nba_team_model": _BLOCK}):
             self.assertEqual(TM.model()["hca"], 2.0)
+        TM._MODEL_CACHE.clear()
+
+    def test_model_memoized_until_file_changes(self):
+        TM._MODEL_CACHE.clear()
+        with patch("calibration_loader.load_starter_adjustment",
+                   return_value={"nba_team_model": _BLOCK}) as load:
+            TM.model()
+            TM.model()
+        self.assertEqual(load.call_count, 1)                 # second call hit the cache
+        TM._MODEL_CACHE.clear()
 
 
 class WalkForwardTests(unittest.TestCase):
