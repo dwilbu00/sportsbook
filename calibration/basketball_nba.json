@@ -353088,6 +353088,86 @@
         "player_turnovers"
       ],
       "store_label": "default"
+    },
+    "starter_adjustment": {
+      "nba_team_model": "nba_team_model.py --fit --seasons 2021-2026"
+    },
+    "prob_shrink": {
+      "source": "odds backtest --engine live",
+      "fit_timestamp": "2026-10-09T17:55:57.639912Z"
+    },
+    "prob_shrink_holdout": {
+      "moneyline": {
+        "brier": 0.2076,
+        "raw_brier": 0.2076,
+        "n": 3825,
+        "n_warehouse": 3825,
+        "n_log": 0
+      },
+      "spreads": {
+        "brier": 0.25,
+        "raw_brier": 0.2595,
+        "n": 3788,
+        "n_warehouse": 3788,
+        "n_log": 0
+      },
+      "totals": {
+        "brier": 0.25,
+        "raw_brier": 0.2603,
+        "n": 3799,
+        "n_warehouse": 3799,
+        "n_log": 0
+      }
+    },
+    "market_blend": {
+      "variant": "live",
+      "on_shrunk_probs": true,
+      "fit_timestamp": "2026-10-09T17:55:58.110955Z"
+    }
+  },
+  "starter_adjustment": {
+    "nba_team_model": {
+      "params": {
+        "half_life": 20.0,
+        "prior_games": 10.0,
+        "regress": 0.5,
+        "opp_adjust": true,
+        "league_prior_games": 60.0
+      },
+      "hca": 2.1346,
+      "tot_off": 1.5198,
+      "beta_rest": -2.642,
+      "sigma_margin": 14.0229,
+      "sigma_total": 18.6752,
+      "fit_seasons": "2022-2026",
+      "n_games": 6605,
+      "walk_forward": {
+        "margin_rmse": 14.0362,
+        "total_rmse": 18.686,
+        "n": 6605
+      }
+    }
+  },
+  "prob_shrink": {
+    "spreads": 0.05,
+    "totals": 0.05
+  },
+  "market_blend": {
+    "moneyline": {
+      "w": 0.05,
+      "n": 3825,
+      "blend_brier": 0.19794,
+      "model_brier": 0.20758,
+      "market_brier": 0.19799,
+      "on_shrunk": true
+    },
+    "spreads": {
+      "w": 0.9,
+      "n": 3788,
+      "blend_brier": 0.25,
+      "model_brier": 0.25,
+      "market_brier": 0.25007,
+      "on_shrunk": true
     }
   }
 }
