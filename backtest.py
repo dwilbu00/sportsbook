@@ -3539,9 +3539,13 @@ def _preset(half_life, opp_strength=0.0, venue_strength=0.0,
             pace_adj=0.0, def_adj=0.0,
             shrink_k=0.0, rest_adj=0.0, def_window=None,
             park_strength=0.0, rest_strength=0.0, recent_n="__calib__",
-            weather_density_coef=0.0, weather_wind_coef=0.0, weather_strength=0.0):
+            weather_density_coef=0.0, weather_wind_coef=0.0, weather_strength=0.0,
+            nba_pace=0.0, nba_def=0.0):
     return {
         "half_life": half_life,
+        # NBA pace + defense context strengths (nba_prop_context; 0 = off = byte-identical).
+        "nba_pace": nba_pace,
+        "nba_def": nba_def,
         # recent_n: newest-N window BEFORE decay. "__calib__" (default) = resolve to the
         # prop's LOCKED live window in run_player_props_backtest (fit==serve); an
         # explicit int/None (recency sweep) overrides (None=full).
@@ -3631,7 +3635,28 @@ def _build_sweep_grid():
     return variants
 
 
-def _build_props_sweep_grid(half_lifes=None):
+# NBA pace + defense context combos (s_pace, s_def) swept on each half_life x shrink cell.
+# nba_prop_context_study: p1/d1 best for most props, p1/d0.5 for threes/steals/blocks/rebounds.
+NBA_CONTEXT_COMBOS = ((1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.5), (0.5, 0.5))
+
+
+def _nba_context_variants(half_lifes):
+    """NBA-only variants: each (half_life, shrink) cell x NBA_CONTEXT_COMBOS, every other knob
+    off. Label = the 6-part grid label + '/npace<p>/ndef<d>' (parsed back by
+    refit_calibration._parse_variant_name into nba_pace_strength / nba_def_strength)."""
+    hls = [None, 5, 10, 15] if half_lifes is None else list(half_lifes)
+    out = {}
+    for hl in hls:
+        hl_label = "none" if hl is None else f"hl{hl}"
+        for sk in (0, 5, 10, 15):
+            for sp, sd in NBA_CONTEXT_COMBOS:
+                name = (f"{hl_label}/opp0.0/defadj0.0/shrink{sk}/ven0.0/rest0.0/"
+                        f"npace{sp}/ndef{sd}")
+                out[name] = _preset(half_life=hl, shrink_k=sk, nba_pace=sp, nba_def=sd)
+    return out
+
+
+def _build_props_sweep_grid(half_lifes=None, nba_context=False):
     """
     Cross-product for player-props sweep mode (P2.1b expanded, §2.6 rest axis).
 
@@ -3690,10 +3715,12 @@ def _build_props_sweep_grid(half_lifes=None):
                                 half_life=hl, opp_defense_strength=opp,
                                 def_adj=da, shrink_k=sk, venue_strength=vs,
                                 rest_strength=rs)
+    if nba_context:
+        variants.update(_nba_context_variants(half_lifes))
     return variants
 
 
-def _build_focused_props_grid(half_lifes=None):
+def _build_focused_props_grid(half_lifes=None, nba_context=False):
     """A FOCUSED subset of _build_props_sweep_grid for FAST refits (opt-in).
 
     Keeps FULL resolution on the axes that actually win for props — half_life ×
@@ -3717,15 +3744,20 @@ def _build_focused_props_grid(half_lifes=None):
         for vs in ("ven0.0", "ven0.25"):
             for sk in ("shrink0", "shrink5", "shrink10", "shrink15"):
                 keep.add(f"{hl}/opp0.0/defadj0.0/{sk}/{vs}/rest0.0")
-    # Single-axis probes for the team/feature axes that don't win props.
-    keep.update({
-        "none/opp0.5/defadj0.0/shrink0/ven0.0/rest0.0",
-        "none/opp1.0/defadj0.0/shrink0/ven0.0/rest0.0",
-        "none/opp0.0/defadj0.5/shrink0/ven0.0/rest0.0",
-        "none/opp0.0/defadj1.0/shrink0/ven0.0/rest0.0",
-        "none/opp0.0/defadj0.0/shrink0/ven0.0/rest1.0",
-    })
-    return {k: full[k] for k in keep if k in full}
+    # Single-axis probes for the team/feature axes that don't win props. NBA drops the old
+    # opp/defadj probes (raw points-allowed: leaky full-season weight side, dead live) in
+    # favour of the pace + defense context axes, crossed with half_life x shrink.
+    probes = {"none/opp0.0/defadj0.0/shrink0/ven0.0/rest1.0"}
+    if not nba_context:
+        probes |= {"none/opp0.5/defadj0.0/shrink0/ven0.0/rest0.0",
+                   "none/opp1.0/defadj0.0/shrink0/ven0.0/rest0.0",
+                   "none/opp0.0/defadj0.5/shrink0/ven0.0/rest0.0",
+                   "none/opp0.0/defadj1.0/shrink0/ven0.0/rest0.0"}
+    keep.update(probes)
+    out = {k: full[k] for k in keep if k in full}
+    if nba_context:
+        out.update(_nba_context_variants(half_lifes))
+    return out
 
 
 def _build_recency_sweep_grid(recent_ns=None, half_lives=None):
@@ -4443,6 +4475,15 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     # the output-side defense adjustment.
     team_defense, team_defense_series, league_avg_def = {}, {}, None
     nba_def_by_prop = {}                    # NBA: per-prop (avg, series, league) keyed by team_id
+    # NBA pace + defense context (nba_prop_context): one walk-forward index of PRE-GAME
+    # contexts keyed (game_date, team_id), shared with the real-line selector + live pricing.
+    nba_ctx_index = {}
+    if nba_wh_mode and any(p.get("nba_pace") or p.get("nba_def") for p in variants.values()):
+        import nba_prop_context
+        import nba_warehouse
+        nba_ctx_index = nba_prop_context.index_for_seasons(
+            [season_year] if season_year else [nba_warehouse._current_season()])
+        print(f"Built NBA pace/defense context index: {len(nba_ctx_index):,} team-games.")
     needs_defense = any(
         p.get("opp_defense_strength", 0.0) > 0 or p.get("def_adj", 0.0) > 0
         for p in variants.values()
@@ -4600,6 +4641,10 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                 # locals the weight-side + output-side defense sites below already read.
                 team_defense, team_defense_series, league_avg_def = \
                     nba_def_by_prop.get(prop_key, ({}, {}, None))
+            nba_cols = None
+            if nba_ctx_index:
+                import nba_prop_context
+                nba_cols = nba_prop_context.stat_cols(prop_key)
 
             for i, test_game in enumerate(test_slice):
                 # An in-progress game (real pitcher logs mark today's live start
@@ -4710,6 +4755,15 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                         _rn = _locked_recent_n(prop_key)
                     _nw = min(_rn, len(prior_values)) if _rn else len(prior_values)
                     base_w = _recency_weights(_nw, hl)
+                    # NBA pace + defense: normalize each past value by its own game's
+                    # context and re-apply this game's (nba_prop_context). The synthetic
+                    # line stays the RAW season mean; strengths 0 -> pv is prior_values.
+                    pv = prior_values
+                    if nba_cols and (params.get("nba_pace") or params.get("nba_def")):
+                        pv = nba_prop_context.adjust_games(
+                            prior_values, prior_games, test_date, test_game.get("team_id"),
+                            nba_ctx_index, nba_cols, params.get("nba_pace", 0.0),
+                            params.get("nba_def", 0.0))
                     venue_s = params.get("venue_strength", 0.0)
                     def_s = params.get("opp_defense_strength", 0.0)
                     weights = []
@@ -4723,7 +4777,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     # ── Base projection ──
                     if params.get("use_minutes"):
                         # Rate-based: per-minute weighted mean × projected minutes.
-                        rates = [v / m for v, m in zip(prior_values, prior_minutes) if m and m > 0]
+                        rates = [v / m for v, m in zip(pv, prior_minutes) if m and m > 0]
                         rate_weights = [w for w, m in zip(weights, prior_minutes) if m and m > 0]
                         min_weights = weights
                         if rates and sum(rate_weights) > 0 and sum(min_weights) > 0:
@@ -4731,16 +4785,16 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                             proj_min = _weighted_mean(prior_minutes, min_weights)
                             projected = per_min_rate * proj_min
                         else:
-                            projected = _weighted_mean(prior_values, weights)
+                            projected = _weighted_mean(pv, weights)
                     else:
-                        projected = _weighted_mean(prior_values, weights)
+                        projected = _weighted_mean(pv, weights)
 
                     # ── Bayesian shrinkage toward unweighted prior mean ──
                     # Regularizes the recency-weighted projection toward the
                     # equal-weight (season-long) mean by `shrink_k` pseudo-obs.
                     shrink_k = params.get("shrink_k", 0.0) or 0.0
-                    if shrink_k > 0 and prior_values:
-                        unweighted_mean = sum(prior_values) / len(prior_values)
+                    if shrink_k > 0 and pv:
+                        unweighted_mean = sum(pv) / len(pv)
                         eff_n = sum(weights) if weights else 0.0
                         if eff_n + shrink_k > 0:
                             projected = ((eff_n * projected) + (shrink_k * unweighted_mean)) / (eff_n + shrink_k)
@@ -4887,7 +4941,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                             line_eff = (synthetic_line / _line_mult
                                         if _line_mult != 1.0 else synthetic_line)
                             empirical_over = _weighted_rate(
-                                prior_values, weights, lambda v: v > line_eff)
+                                pv, weights, lambda v: v > line_eff)
                         else:
                             empirical_over = 0.5
                         cell["calib_obs"].append(
@@ -4898,7 +4952,7 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
                     # to that player's own variance instead of a flat scalar.
                     if quantile_mode and cell["quantile"]:
                         for q, qtally in cell["quantile"].items():
-                            alt = _weighted_quantile(prior_values, weights, q)
+                            alt = _weighted_quantile(pv, weights, q)
                             if alt is None:
                                 continue
                             qtally["n"] += 1

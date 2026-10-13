@@ -982,6 +982,9 @@ def _nba_warehouse_history(player_name, prop_key, n, team_ids=None):
             "plate_appearances": [None] * len(rows),
             "at_bats": [None] * len(rows),
             "team_id": rows[0].get("team_id"),
+            # per-game team ids (a traded player's games carry each game's own team) —
+            # the NBA pace/defense context keys each past game by (date, team_id).
+            "team_ids": [r.get("team_id") for r in rows],
             "found": True,
             "source": "nba_warehouse",
         }

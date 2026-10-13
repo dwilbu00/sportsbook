@@ -1458,6 +1458,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
         weather_strength = _knob(prop_key, "weather_factor_strength", default_weather_strength)
         xstats_strength = _knob(prop_key, "xstats_strength", default_xstats_strength)
         rest_strength = _knob(prop_key, "rest_strength", default_rest_strength)
+        # NBA pace + defense context strengths (nba_prop_context; calibrated per prop,
+        # absent/0 = off -> the projection is byte-identical to the unadjusted one).
+        _is_nba = str(sport_key or "") == "basketball_nba"
+        nba_pace_s = (_knob(prop_key, "nba_pace_strength", 0.0) or 0.0) if _is_nba else 0.0
+        nba_def_s = (_knob(prop_key, "nba_def_strength", 0.0) or 0.0) if _is_nba else 0.0
         # History window: newest N prior games feeding the projection (calibration
         # recent_n=null → full season; absent → per-sport default). STEP-1 sweep.
         recent_n = _knob(prop_key, "recent_n", default_recent_n)
@@ -1556,6 +1561,7 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             hits_hist = history.get("hits") or [None] * len(values)
             home_runs_hist = history.get("home_runs") or [None] * len(values)
             player_team_id = history.get("team_id")
+            team_ids_hist = history.get("team_ids") or [player_team_id] * len(values)
             # Present only on warehouse-sourced (MLB flip) dicts — the player's team
             # DISPLAY NAME, since team_id is then MLBAM (not an ESPN id).
             player_team_name_wh = history.get("team_name")
@@ -1568,10 +1574,11 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # ramping up) or their last game had limited minutes.
             synthetic = [
                 {"game_date": gd, "MIN": m, "_value": v, "_opp": o,
-                 "_ha": ha, "_pa": pa, "_ab": ab, "_h": h, "_hr": hr}
-                for v, o, ha, m, gd, pa, ab, h, hr in zip(
+                 "_ha": ha, "_pa": pa, "_ab": ab, "_h": h, "_hr": hr, "_tid": tid}
+                for v, o, ha, m, gd, pa, ab, h, hr, tid in zip(
                     values, opponents, past_home_aways, minutes, game_dates,
-                    plate_appearances, at_bats, hits_hist, home_runs_hist)
+                    plate_appearances, at_bats, hits_hist, home_runs_hist,
+                    team_ids_hist)
             ]
             # STEP-1 recency window: keep the newest `recent_n` games BEFORE the
             # reliability filter (recent_n falsy → full season, no cap). `synthetic`
@@ -1637,6 +1644,20 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
             # emptied it, so downstream math has an input; the override replaces it. [F17]
             eligible = filt["eligible_games"] or (synthetic if _nfl_model_backed else [])
             values = [g["_value"] for g in eligible]
+            # NBA pace + defense context: normalize each past value by its own game's
+            # possessions / opponent defense and re-scale to tonight's game (the SAME
+            # nba_prop_context math the sweep + real-line selector fit). Fails open.
+            if nba_pace_s or nba_def_s:
+                try:
+                    import nba_prop_context
+                    values = nba_prop_context.live_adjust(
+                        values, [g.get("game_date") for g in eligible],
+                        [g.get("_tid") for g in eligible], player_team_id,
+                        home_team_name, away_team_name,
+                        et_local_date(commence_iso) if commence_iso else None,
+                        prop_key, nba_pace_s, nba_def_s)
+                except Exception:
+                    pass
             opponents = [g["_opp"] for g in eligible]
             past_home_aways = [g["_ha"] for g in eligible]
             plate_appearances = [g.get("_pa") for g in eligible]

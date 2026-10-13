@@ -1089,20 +1089,39 @@ def project_and_empirical(obs, params, sport_key,
     prior_home_aways = [g.get("is_home") for g in prior_games]
     prior_opponents = [g.get("opponent") for g in prior_games]
 
+    kept_games = list(prior_games)
     if any(prior_minutes):
         MIN_FLOOR = 10.0
-        kept = [(v, m, ha, opp) for v, m, ha, opp in zip(
+        kept = [(v, m, ha, opp, g) for v, m, ha, opp, g in zip(
                     prior_values, prior_minutes,
-                    prior_home_aways, prior_opponents)
+                    prior_home_aways, prior_opponents, prior_games)
                 if (m or 0) >= MIN_FLOOR]
         if kept:
-            prior_values = [v for v, _, _, _ in kept]
-            prior_minutes = [m for _, m, _, _ in kept]
-            prior_home_aways = [ha for _, _, ha, _ in kept]
-            prior_opponents = [opp for _, _, _, opp in kept]
+            prior_values = [k[0] for k in kept]
+            prior_minutes = [k[1] for k in kept]
+            prior_home_aways = [k[2] for k in kept]
+            prior_opponents = [k[3] for k in kept]
+            kept_games = [k[4] for k in kept]
 
     if not prior_values:
         return None, None
+
+    # NBA pace + defense context (nba_prop_context — the SAME adjustment the sweep and live
+    # pricing apply): each past value normalized by its own game's context and re-scaled to
+    # this obs's game. Strengths 0 (or non-NBA) -> unchanged.
+    _sp = params.get("nba_pace_strength", 0.0) or 0.0
+    _sd = params.get("nba_def_strength", 0.0) or 0.0
+    if (_sp or _sd) and str(sport_key or "").startswith("basketball"):
+        try:
+            import nba_prop_context
+            _season = test_game.get("season")
+            _idx = nba_prop_context.index_for_seasons([_season]) if _season else {}
+            prior_values = nba_prop_context.adjust_games(
+                prior_values, kept_games, test_game.get("game_date") or obs.get("game_date"),
+                test_game.get("team_id"), _idx, nba_prop_context.stat_cols(obs.get("prop_key")),
+                _sp, _sd)
+        except Exception:
+            pass                     # fail open — never let the context lookup break a refit
 
     upcoming_is_home = test_game.get("is_home")
 
@@ -1142,6 +1161,17 @@ def project_and_empirical(obs, params, sport_key,
             projected = _center_estimate(prior_values, weights, center)
     else:
         projected = _center_estimate(prior_values, weights, center)
+
+    # ── Bayesian shrinkage toward the unweighted mean (fit == serve) ──
+    # props.py shrinks every served projection by the prop's shrinkage_k; the real-line
+    # residuals must be measured against that SAME projection (this step was missing, so
+    # real-line fits used the unshrunk recency mean). Mean center only (median = diagnostic).
+    _shrink_k = params.get("shrinkage_k", 0) or 0
+    if _shrink_k > 0 and center == "mean" and prior_values:
+        _eff_n = sum(weights)
+        if _eff_n + _shrink_k > 0:
+            projected = ((_eff_n * projected + _shrink_k * (sum(prior_values) / len(prior_values)))
+                         / (_eff_n + _shrink_k))
 
     # ── Statcast xBA blend (P2.4a, leakage-safe as-of) ──
     # Shrink the projection toward the batter's own as-of xBA × recent AB/game,

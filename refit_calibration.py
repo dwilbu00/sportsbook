@@ -521,6 +521,18 @@ def _parse_variant_name(name):
             token is optional; 3/5-part labels get rest_strength 0.0 (off).
     """
     parts = name.split("/")
+    nba_ctx = None
+    # Optional trailing NBA context tokens '/npace<p>/ndef<d>' (nba_prop_context); only
+    # labels that carry them get the nba_* keys (older labels parse byte-identically).
+    if len(parts) == 8:
+        if not (parts[6].startswith("npace") and parts[7].startswith("ndef")):
+            return None
+        try:
+            nba_ctx = {"nba_pace_strength": float(parts[6][len("npace"):]),
+                       "nba_def_strength": float(parts[7][len("ndef"):])}
+        except ValueError:
+            return None
+        parts = parts[:6]
     if len(parts) not in (3, 5, 6):
         return None
     rest_s = 0.0
@@ -557,7 +569,7 @@ def _parse_variant_name(name):
         ven = float(ven_part[len("ven"):])
     except (ValueError, IndexError):
         return None
-    return {
+    out = {
         "half_life": hl,
         "opp_defense_strength": opp,
         "output_def_strength": da,
@@ -565,6 +577,9 @@ def _parse_variant_name(name):
         "venue_strength": ven,
         "rest_strength": rest_s,
     }
+    if nba_ctx:
+        out.update(nba_ctx)
+    return out
 
 
 def _fit_residuals(obs):
@@ -877,6 +892,9 @@ def _build_prop_cfg(winner, results, prop_key, shrinkage_k_default):
         "shrinkage_k": shrinkage_k,
         # §2.6 candidate-feature axis (0.0 = off; props.py reads this knob).
         "rest_strength": parsed.get("rest_strength", 0.0),
+        # NBA pace + defense context strengths (nba_prop_context; 0.0 = off).
+        "nba_pace_strength": parsed.get("nba_pace_strength", 0.0),
+        "nba_def_strength": parsed.get("nba_def_strength", 0.0),
         "variant_label": vname,
         "fit_brier": round(winner["brier"], 4),
         "fit_hit_pct": round(winner["hit"], 2) if winner["hit"] is not None else None,
@@ -994,8 +1012,10 @@ def refit_sport(sport, season=None, prior_season=None, players=None, props=None,
         print(f"No default players/props for {sport}; please pass --players/--props.")
         sys.exit(1)
 
-    variants = (_build_focused_props_grid(half_lifes=half_lifes) if focused_grid
-                else _build_props_sweep_grid(half_lifes=half_lifes))
+    _nba_ctx = (sport == "nba")                 # NBA pace + defense context axes
+    variants = (_build_focused_props_grid(half_lifes=half_lifes, nba_context=_nba_ctx)
+                if focused_grid
+                else _build_props_sweep_grid(half_lifes=half_lifes, nba_context=_nba_ctx))
     if focused_grid:
         print(f"[focused-grid] {len(variants)} variants (vs full 576) — full "
               f"resolution on half_life×venue×shrink, dead axes probed once. "
@@ -1283,6 +1303,12 @@ def refit_sport_real_lines(sport, store_label="", warmup_games=10,
             # re-selection scores the SAME (feature-adjusted) projection the
             # synthetic sweep chose. 0.0 (default) → byte-identical no-op.
             "rest_strength": cfg.get("rest_strength", 0.0),
+            # fit == serve: live applies the Bayesian shrinkage + (NBA) pace/defense
+            # context, so the real-line residuals must be measured against the same
+            # projection. shrinkage_k was previously not forwarded (and not applied).
+            "shrinkage_k": cfg.get("shrinkage_k", 0) or 0,
+            "nba_pace_strength": cfg.get("nba_pace_strength", 0.0),
+            "nba_def_strength": cfg.get("nba_def_strength", 0.0),
         }
         prop_xstats = (xstats_strength if (xba_index is not None
                        and prop_key in PROP_XSTATS_KIND) else 0.0)
