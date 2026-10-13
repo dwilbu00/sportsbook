@@ -629,7 +629,7 @@ def _nfl_grade_book_lines(book_lines):
     return enriched
 
 
-def _nba_grade_book_lines(book_lines):
+def _nba_grade_book_lines(book_lines, min_test_minutes=10.0, min_priors=10):
     """Grade NBA prop book lines against the nba_warehouse per-player-game actuals (all 16
     props incl. combos, real outcomes) instead of the 3-prop ESPN gamelog. Attaches
     ``actual`` + ``stat_label`` + ``prior_games`` (same-season earlier PLAYED games,
@@ -638,7 +638,10 @@ def _nba_grade_book_lines(book_lines):
     FGA/3PA/FTA). Returns the enriched list, or None when the warehouse is unavailable so the
     caller falls back to the legacy ESPN path. Leakage-safe: only the obs's OWN season, only
     games strictly before it; match is EXACT game_date (a player plays once/day, so no +/-1 that
-    could borrow a back-to-back). Never raises."""
+    could borrow a back-to-back). ``min_test_minutes`` (default 10) drops low-minute test games
+    for projection fitting; the bonus opportunity study passes 0 so every PLAYED game counts
+    (a bet settles on the box score once the player checks in — only a DNP voids). Never
+    raises."""
     import db_store
     try:
         import nba_source
@@ -685,14 +688,14 @@ def _nba_grade_book_lines(book_lines):
                 continue
             tg = games[idx]
             minutes = tg.get("MIN")
-            if not tg.get("played") or minutes is None or float(minutes) < 10.0:
+            if not tg.get("played") or minutes is None or float(minutes) < min_test_minutes:
                 n_low += 1
                 continue
             season = tg.get("season")
             priors = [g for g in games[idx + 1:]
                       if g.get("season") == season and g.get("played")
                       and g.get("MIN") is not None and float(g.get("MIN")) > 0]
-            if len(priors) < 10:
+            if len(priors) < min_priors:
                 n_prior += 1
                 continue
             if len(cols) == 1:
