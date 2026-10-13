@@ -2441,7 +2441,8 @@ def render_bonuses():
             if getattr(b, "bonus_id", "") != bonus_id]
         bonus_store.save_bonuses(st.session_state["bonuses_list"])
 
-    _SPORT_LABELS = {"americanfootball_nfl": "NFL", "baseball_mlb": "MLB"}
+    _SPORT_LABELS = {"americanfootball_nfl": "NFL", "baseball_mlb": "MLB",
+                     "basketball_nba": "NBA"}
     _SPORT_KEYS = {v: k for k, v in _SPORT_LABELS.items()}
     # Friendly label -> market/prop key for the bonus market-scope multiselect.
     _BONUS_MARKET_OPTIONS = {
@@ -2453,6 +2454,12 @@ def render_bonuses():
         "NFL: Pass Att": "player_pass_attempts", "NFL: Pass Yds": "player_pass_yds",
         "NFL: Rush Yds": "player_rush_yds", "NFL: Rec Yds": "player_reception_yds",
         "NFL: Pass TDs": "player_pass_tds", "NFL: Anytime TD": "player_anytime_td",
+        "NBA: Points": "player_points", "NBA: Rebounds": "player_rebounds",
+        "NBA: Assists": "player_assists", "NBA: Threes": "player_threes",
+        "NBA: Steals": "player_steals", "NBA: Blocks": "player_blocks",
+        "NBA: Turnovers": "player_turnovers", "NBA: Pts+Reb": "player_points_rebounds",
+        "NBA: Pts+Ast": "player_points_assists",
+        "NBA: Pts+Reb+Ast": "player_points_rebounds_assists",
         "Team markets (ML/spread/total)": "team"}
 
     # ── active-bonus manager ──
@@ -2624,9 +2631,9 @@ def render_bonuses():
         st.info(f"No active bonuses for the loaded {_SPORT_LABELS.get(board_sport, board_sport)} "
                 "slate — add one above (set its Sport to match).")
         return
-    if board_sport not in ("americanfootball_nfl", "baseball_mlb"):
-        st.warning("The bonus optimizer supports NFL and MLB. Load one of those in the Value "
-                   "Finder, then return here.")
+    if board_sport not in ("americanfootball_nfl", "baseball_mlb", "basketball_nba"):
+        st.warning("The bonus optimizer supports NFL, MLB and NBA. Load one of those in the "
+                   "Value Finder, then return here.")
         return
     import parlay_store
     # F11: never substitute a hidden $1,000 default. An unavailable / zero / negative
@@ -2647,6 +2654,7 @@ def render_bonuses():
     # leg labels: modeled abbrevs + fall back to the market key for non-modeled (HR/TD)
     pabbr = dict(opt.PROP_ABBR)
     pabbr.update(opt.MLB_ABBR)
+    pabbr.update(opt.NBA_ABBR)
 
     if scoped:
         leg_count = board.get("leg_count")
@@ -2704,9 +2712,10 @@ def render_bonuses():
             legs_by_book = {bk: opt.legs_from_candidates(cands, bk)
                             for bk in ("draftkings", "fanduel")}
         else:
-            # NFL reuse: build from the BROAD bonus universe (yardages/TDs incl.), not
-            # just the 3 modeled count props — bonuses price off book de-vig. Favorite
-            # side; per-bonus market scope is applied inside evaluate_slate.
+            # NFL / NBA: build from the BROAD bonus universe (NFL yardages/TDs incl.; NBA's
+            # 10 calibrated props — priced off the bonus book's OWN de-vig + its per-book
+            # over-bias map inside legs_from_scoped_board). Favorite side; per-bonus market
+            # scope is applied inside evaluate_slate.
             legs_by_book = {bk: opt.legs_from_scoped_board(
                                 board["parsed"], bk, None, board_sport, side="favorite")
                             for bk in ("draftkings", "fanduel")}

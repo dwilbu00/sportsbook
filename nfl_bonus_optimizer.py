@@ -220,10 +220,27 @@ MLB_BONUS_MARKETS = ("batter_hits", "batter_total_bases", "batter_rbis",
                      "batter_home_runs")
 
 
+# NBA: every calibrated prop. nba_opportunity_threshold: the de-vigged NBA price is calibrated at
+# every minutes level and from opening night (participation-only, like MLB); its one systematic
+# error — over-shading — is corrected per book by calibration/book_calibration_basketball_nba.json.
+NBA_BONUS_MARKETS = ("player_points", "player_rebounds", "player_assists", "player_threes",
+                     "player_steals", "player_blocks", "player_turnovers",
+                     "player_points_rebounds", "player_points_assists",
+                     "player_points_rebounds_assists")
+NBA_ABBR = {"player_points": "PTS", "player_rebounds": "REB", "player_assists": "AST",
+            "player_threes": "3PM", "player_steals": "STL", "player_blocks": "BLK",
+            "player_turnovers": "TOV", "player_points_rebounds": "P+R",
+            "player_points_assists": "P+A", "player_points_rebounds_assists": "PRA"}
+_NBA_SET = frozenset(NBA_BONUS_MARKETS)
+
+
 def bonus_markets(sport_key):
     """Default broad bonus market scope for a sport (used when a bonus sets none)."""
-    return (NFL_BONUS_MARKETS if sport_key == "americanfootball_nfl"
-            else MLB_BONUS_MARKETS)
+    if sport_key == "americanfootball_nfl":
+        return NFL_BONUS_MARKETS
+    if sport_key == "basketball_nba":
+        return NBA_BONUS_MARKETS
+    return MLB_BONUS_MARKETS
 
 
 def _mlb_gate_ok(c):
@@ -279,6 +296,24 @@ def legs_from_candidates(candidates, book):
     return legs
 
 
+def _nba_side_team(nba_teams, player, home, away):
+    """The odds-feed team name (home/away) an NBA player is on, via the warehouse player dim
+    (current team) and the event teams' stats.nba.com ids; None if unresolved."""
+    try:
+        import db_store
+        import nba_warehouse
+        tid = nba_teams.get(db_store.normalize_name(player or ""))
+        if tid is None:
+            return None
+        if tid == nba_warehouse.resolve_team_id(home):
+            return home
+        if tid == nba_warehouse.resolve_team_id(away):
+            return away
+    except Exception:
+        pass
+    return None
+
+
 def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
                            season=None, week=_CUR_SLATE_WEEK, side="favorite"):
     """Bonus legs from a freshly-fetched parsed board, scoped to a bonus's MARKETS —
@@ -296,7 +331,15 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     +EV filter downstream still drops any that the boost can't flip)."""
     pxkey = "dk" if book == "draftkings" else "fd"
     is_nfl = sport_key == "americanfootball_nfl"
+    is_nba = sport_key == "basketball_nba"
     modeled = set(TRUSTWORTHY) if is_nfl else set(MLB_TRUSTWORTHY)
+    nba_teams = {}
+    if is_nba:
+        try:
+            import nba_warehouse
+            nba_teams = nba_warehouse.player_teams()
+        except Exception:
+            nba_teams = {}
     # empty scope => the BROAD bonus universe (yardages/TDs/HR), not just modeled props
     scope = set(m for m in (markets or ()) if m) or set(bonus_markets(sport_key))
     scope.discard("team")                     # team-market legs = a separate builder
@@ -318,7 +361,22 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
                 line = p.get("line")
                 if fair is None or line is None:
                     continue
-                fair = book_calibration.apply(sport_key, prop, fair, maps=bcmaps)
+                if is_nba:
+                    # NBA: the bonus book's OWN two-way de-vig at this line + that book's
+                    # over-bias map — exactly what nba_book_calibration fit/validated (the
+                    # board's over_implied is an all-book consensus, a different number).
+                    op, up = p.get(f"{pxkey}_over_price"), p.get(f"{pxkey}_under_price")
+                    if op is None or up is None:
+                        continue
+                    try:
+                        fair = devig_two_way(american_to_implied_prob(op),
+                                             american_to_implied_prob(up))[0]
+                    except Exception:
+                        continue
+                    fair = book_calibration.apply(sport_key, prop, fair, maps=bcmaps,
+                                                  book=book)
+                else:
+                    fair = book_calibration.apply(sport_key, prop, fair, maps=bcmaps)
                 # Occurrence markets (anytime TD / home runs) are ONLY ever bet to
                 # HAPPEN — force the over/yes side even in 'favorite' mode (the No
                 # side is usually the favorite but you never bet a player NOT to score).
@@ -327,6 +385,8 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
                 if price is None:
                     continue
                 team = srv.player_team(scan._norm(player), seas) if gate_nfl else None
+                if is_nba and nba_teams:
+                    team = _nba_side_team(nba_teams, player, home, away)
                 opp = away if team == home else (home if team == away else None)
                 legs.append({
                     "gid": gid, "prop": prop, "player": player, "team": team, "opp": opp,
@@ -425,8 +485,24 @@ def _leg_bounds(l):
     return l["prop"], None, math.ceil(line) - 1
 
 
+def _nba_pair_excluded(a, b):
+    """NBA same-game pairs that independence MIS-prices (nba_bonus_backtest co-hit, with the
+    over-bias-corrected P): the SAME player on opposite sides co-hits 0.47-0.87x the product
+    (badly overstated), and TEAMMATES both OVER on the same stat co-hit 0.96-0.98x (they share
+    the shots). Same-player same-side stacks co-hit MORE (1.1-1.5x) -> the product is
+    conservative, so they stay allowed."""
+    if a.get("player") and a.get("player") == b.get("player"):
+        return a.get("side") != b.get("side")
+    return bool(a.get("team") and a.get("team") == b.get("team")
+                and a.get("prop") == b.get("prop")
+                and a.get("side") == b.get("side") == "OVER")
+
+
 def _pair_impossible(a, b):
-    """True if two SAME-PLAYER legs are deterministically contradictory."""
+    """True if two SAME-PLAYER legs are deterministically contradictory (or, for NBA, a pair
+    independence mis-prices — see _nba_pair_excluded)."""
+    if a.get("prop") in _NBA_SET and b.get("prop") in _NBA_SET and _nba_pair_excluded(a, b):
+        return True
     if not a.get("player") or a.get("player") != b.get("player"):
         return False
     sa, amin, amax = _leg_bounds(a)

@@ -633,6 +633,28 @@ def resolve_team_id(name):
     return int(tid) if tid is not None else None
 
 
+_PLAYER_TEAMS = {}                                    # {"ts": t, "map": {name_norm: team_id}}
+
+
+def player_teams(ttl=1800):
+    """{name_norm: current team_id} from the nba_player dim (most-recent team), cached — the
+    bonus optimizer's same-game teammate/opponent tagging. {} when disabled / on error."""
+    hit = _PLAYER_TEAMS.get("map")
+    if hit is not None and (time.time() - _PLAYER_TEAMS.get("ts", 0)) < ttl:
+        return hit
+    if not enabled():
+        return {}
+    try:
+        with db_store.get_engine().connect() as conn:
+            m = {r[0]: int(r[1]) for r in conn.execute(
+                select(nba_player.c.name_norm, nba_player.c.team_id))
+                if r[0] and r[1] is not None}
+    except Exception:
+        return {}
+    _PLAYER_TEAMS.update({"ts": time.time(), "map": m})
+    return m
+
+
 def team_names():
     """{team_id: name} from the nba_team dim ({} when disabled / on error)."""
     if not enabled():
