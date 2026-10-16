@@ -260,8 +260,9 @@ class WarehouseTeamSchedulesTests(unittest.TestCase):
 
 
 class TeamMarketWarehouseTests(unittest.TestCase):
-    """run_backtest / run_odds_backtest source MLB team schedules from the warehouse
-    (unconditionally post-P4); non-baseball stays on ESPN."""
+    """run_backtest / run_odds_backtest source MLB team schedules from the StatsAPI warehouse
+    (post-P4) and NBA from the stats.nba.com warehouse (ESPN retired 2026-10); NFL/NHL stay on
+    ESPN."""
 
     def test_run_backtest_baseball_uses_warehouse(self):
         wh = mock.Mock(return_value=({}, {}))   # empty → clean "No games" early return
@@ -273,15 +274,25 @@ class TeamMarketWarehouseTests(unittest.TestCase):
         wh.assert_called_once()
         gat.assert_not_called()
 
-    def test_run_backtest_nba_uses_espn(self):
-        with mock.patch.object(backtest, "_warehouse_team_schedules") as wh, \
-             mock.patch.object(backtest, "get_all_teams", return_value={}) as gat, \
-             mock.patch.object(backtest, "build_schedules", return_value={}):
+    def test_run_backtest_nba_uses_nba_warehouse(self):
+        nwh = mock.Mock(return_value=({}, {}))
+        with mock.patch.object(backtest, "_nba_warehouse_team_schedules", nwh), \
+             mock.patch.object(backtest, "_warehouse_team_schedules") as wh, \
+             mock.patch.object(backtest, "get_all_teams") as gat:
             backtest.run_backtest("basketball_nba", "basketball", "nba", limit=10,
                                   window=10, variants={"base": {"half_life": 10}},
                                   season_year=2025)
-        gat.assert_called_once()
+        nwh.assert_called_once()
+        gat.assert_not_called()             # no ESPN
         wh.assert_not_called()
+
+    def test_run_backtest_nfl_still_espn(self):
+        with mock.patch.object(backtest, "get_all_teams", return_value={}) as gat, \
+             mock.patch.object(backtest, "build_schedules", return_value={}):
+            backtest.run_backtest("americanfootball_nfl", "football", "nfl", limit=10,
+                                  window=10, variants={"base": {"half_life": 10}},
+                                  season_year=2025)
+        gat.assert_called_once()
 
     def test_run_odds_backtest_baseball_uses_warehouse(self):
         store = {"games": {"g1": {"commence_time": "2026-07-01T00:00:00Z",
@@ -307,7 +318,8 @@ class TeamMarketWarehouseTests(unittest.TestCase):
 
 class PlayerStatSeriesTests(unittest.TestCase):
     """run_props_odds_backtest's _player_stat_series sources MLB player logs from the
-    warehouse (role-verified id → get_calib_gamelog); NBA/NFL use ESPN."""
+    warehouse (role-verified id → get_calib_gamelog), NBA from the stats.nba.com corpus; NFL
+    uses ESPN."""
 
     def test_mlb_warehouse_path_role_verified(self):
         log = [{"H": 2.0, "game_date": "2026-07-20T18:00:00Z", "completed": True},
@@ -347,18 +359,38 @@ class PlayerStatSeriesTests(unittest.TestCase):
         self.assertEqual(ser, [])
         gcg.assert_not_called()
 
-    def test_non_baseball_uses_espn(self):
+    def test_nfl_uses_espn(self):
         with mock.patch.object(backtest, "cached_athlete_id",
                                return_value="e1") as caid, \
              mock.patch.object(backtest, "cached_gamelog",
-                               return_value=[{"PTS": 20.0, "game_date": "2026-01-01",
+                               return_value=[{"passingYards": 250.0,
+                                              "game_date": "2026-01-01",
                                               "completed": True}]), \
              mock.patch("mlb_warehouse.get_calib_gamelog") as gcg:
             ser = backtest._player_stat_series(
-                "basketball", "nba", "Star", "player_points")
+                "football", "nfl", "Star", "player_pass_yds")
         caid.assert_called_once()
         gcg.assert_not_called()
-        self.assertEqual(ser, [("2026-01-01", 20.0)])
+        self.assertEqual(ser, [("2026-01-01", 250.0)])
+
+    def test_nba_uses_warehouse_corpus(self):
+        backtest._NBA_SERIES.clear()
+        bulk = {"jimmy butler iii": [
+            {"game_date": "2025-01-03", "played": True, "points": 20.0, "rebounds": 5.0},
+            {"game_date": "2025-01-01", "played": True, "points": 30.0, "rebounds": 7.0},
+            {"game_date": "2025-01-02", "played": False, "points": 0.0, "rebounds": 0.0}]}
+        try:
+            with mock.patch("nba_warehouse.calib_gamelogs_bulk", return_value=bulk), \
+                 mock.patch.object(backtest, "cached_athlete_id") as caid:
+                pts = backtest._player_stat_series("basketball", "nba", "Jimmy Butler",
+                                                   "player_points")
+                pr = backtest._player_stat_series("basketball", "nba", "Jimmy Butler",
+                                                  "player_points_rebounds")
+            caid.assert_not_called()                     # no ESPN
+            self.assertEqual(pts, [("2025-01-01", 30.0), ("2025-01-03", 20.0)])  # DNP dropped
+            self.assertEqual(pr, [("2025-01-01", 37.0), ("2025-01-03", 25.0)])   # combo sum
+        finally:
+            backtest._NBA_SERIES.clear()
 
     def test_run_props_odds_mlb_uses_season_aware_bulk_index(self):
         # The MLB wiring: run_props_odds_backtest resolves each store player to an

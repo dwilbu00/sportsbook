@@ -491,6 +491,9 @@ def run_backtest(sport_key, espn_sport, espn_league, limit, window, variants,
     if use_warehouse:
         print("=== team-market inputs: StatsAPI warehouse (ESPN bypassed) ===")
         espn_teams, schedules = _warehouse_team_schedules([season_year])
+    elif espn_sport == "basketball":
+        print("=== team-market inputs: stats.nba.com warehouse (ESPN bypassed) ===")
+        espn_teams, schedules = _nba_warehouse_team_schedules([season_year])
     else:
         espn_teams = get_all_teams(espn_sport, espn_league)
         print(f"Loaded {len(espn_teams)} teams")
@@ -2182,6 +2185,36 @@ def _write_shares_calibration(sport_key, share_obs, min_n=MIN_SHRINK_N):
     return True
 
 
+_NBA_SERIES = {}                                        # {"bulk": .., "resolver": ..}
+
+
+def _nba_player_stat_series(name, prop_key):
+    """NBA dated per-game values for a prop from the stats.nba.com warehouse corpus (mirror-first;
+    the current + three prior seasons, the span of the stored NBA odds), PLAYED games only, combo
+    props summed. Odds-feed spellings resolve via nba_names. ESPN retired 2026-10."""
+    import nba_names
+    import nba_stats_source as nba_source
+    import nba_warehouse
+    cols = nba_source.PROP_STAT_COLS.get(prop_key)
+    if cols is None:
+        return []
+    cols = cols if isinstance(cols, tuple) else (cols,)
+    if "bulk" not in _NBA_SERIES:
+        cur = nba_warehouse._current_season()
+        _NBA_SERIES["bulk"] = nba_warehouse.calib_gamelogs_bulk([cur - 3, cur - 2, cur - 1, cur])
+        _NBA_SERIES["resolver"] = nba_names.Resolver(_NBA_SERIES["bulk"])
+    bulk = _NBA_SERIES["bulk"]
+    games = bulk.get(nba_source._norm(name)) or bulk.get(
+        _NBA_SERIES["resolver"].resolve(name) or "") or []
+    out = []
+    for g in games:
+        if not g.get("played") or not g.get("game_date"):
+            continue
+        out.append((str(g["game_date"])[:10], float(sum(float(g.get(c) or 0.0) for c in cols))))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _player_stat_series(espn_sport, espn_league, name, prop_key):
     """
     Return a player's dated per-game stat values for a prop as a sorted list of
@@ -2190,8 +2223,9 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
 
     For MLB (P3c/P6) the per-game log comes from the StatsAPI warehouse
     (mlb_warehouse.get_calib_gamelog, by the name resolved to a role-verified MLBAM id
-    via mlb_starters.resolve_mlbam_id), current-season scoped. NBA/NFL use the ESPN
-    path. (ESPN was fully removed for MLB in P4.)
+    via mlb_starters.resolve_mlbam_id), current-season scoped. NBA reads the stats.nba.com
+    warehouse (_nba_player_stat_series); NFL uses the ESPN path. (ESPN removed for MLB in P4,
+    for NBA 2026-10.)
     """
     if espn_sport == "baseball":
         import mlb_warehouse
@@ -2204,6 +2238,8 @@ def _player_stat_series(espn_sport, espn_league, name, prop_key):
             return []
         role = "pitcher" if str(prop_key).startswith("pitcher_") else "batter"
         gamelog = mlb_warehouse.get_calib_gamelog(str(resolved[0]), role) or []
+    elif espn_sport == "basketball":
+        return _nba_player_stat_series(name, prop_key)
     else:
         aid = cached_athlete_id(espn_sport, espn_league, name)
         if not aid:
@@ -2453,6 +2489,8 @@ def run_coherence_backtest(sport_key, espn_sport, espn_league, season_year=None,
                     if isinstance(season_year, (list, tuple, set)) else [season_year])
     if use_warehouse:
         espn_teams, schedules = _warehouse_team_schedules(seasons_list)
+    elif espn_sport == "basketball":
+        espn_teams, schedules = _nba_warehouse_team_schedules(seasons_list, store)
     else:
         espn_teams = get_all_teams(espn_sport, espn_league)
         schedules = {}
@@ -2568,11 +2606,13 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     all seasons pooled.
     """
     threshold = threshold_pct / 100.0
-    # P3c/P4/P6: MLB player gamelogs come from the StatsAPI warehouse; NBA/NFL stay on
-    # ESPN. (ESPN was fully removed for MLB in P4.)
+    # P3c/P4/P6: MLB player gamelogs come from the StatsAPI warehouse, NBA from the stats.nba.com
+    # warehouse (_player_stat_series); NFL stays on ESPN.
     use_warehouse = espn_sport == "baseball"
     if use_warehouse:
         print("=== props-odds player logs: StatsAPI warehouse (ESPN bypassed) ===")
+    elif espn_sport == "basketball":
+        print("=== props-odds player logs: stats.nba.com warehouse (ESPN bypassed) ===")
     store, source_used = _load_prop_store(sport_key, store_label, source, snapshot)
     print(f"\n[odds source: {source_used} ({snapshot})]")
     games = store.get("games", {})

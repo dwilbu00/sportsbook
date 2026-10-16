@@ -292,11 +292,14 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
         print("  No games to analyze.")
         return
 
-    # Team data. MLB (P6): team resolution is warehouse-only (no ESPN get_all_teams);
-    # NBA/NFL/NHL still fetch from ESPN.
+    # Team data. MLB (P6) and NBA (stats.nba.com, 2026-10): team resolution is warehouse-only
+    # (no ESPN get_all_teams); NFL/NHL still fetch from ESPN.
     if sport_key == "baseball_mlb":
         espn_teams = {}
         print("\n  MLB team resolution: StatsAPI warehouse (no ESPN).")
+    elif sport_key == "basketball_nba":
+        espn_teams = {}
+        print("\n  NBA team resolution: stats.nba.com warehouse (no ESPN).")
     else:
         print(f"\n  Fetching {espn_league.upper()} team data from ESPN...")
         try:
@@ -339,6 +342,19 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
             # env-gated); fall open to the ESPN build. Require both sides.
             wh_home = mlb_warehouse_team_stats(espn_sport, home, recent_n)
             wh_away = mlb_warehouse_team_stats(espn_sport, away, recent_n)
+            matchup_features = None
+            if sport_key == "basketball_nba":
+                # NBA: warehouse team form + the efficiency team model (same as the app);
+                # no ESPN fallback — a miss skips the game's team markets.
+                import nba_team_model
+                import nba_team_stats
+                wh_home = nba_team_stats.team_stats(home, recent_n)
+                wh_away = nba_team_stats.team_stats(away, recent_n)
+                if not (wh_home and wh_away):
+                    print("    WARNING: no warehouse team form. Skipping.")
+                    continue
+                matchup_features = nba_team_model.build_matchup_features(
+                    home, away, _et_game_date(raw_game.get("commence_time")))
             if wh_home and wh_away:
                 home_stats, away_stats = wh_home, wh_away
             else:
@@ -347,20 +363,22 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
                 away_stats = build_team_stats(away_espn, espn_sport, espn_league,
                                               recent_n, espn_teams, sport_key)
 
-            # Cache per-team avg_allowed for opponent-defense weighting on props.
-            team_defense[home_espn["display_name"]] = home_stats["recent"]["avg_allowed"]
-            team_defense[away_espn["display_name"]] = away_stats["recent"]["avg_allowed"]
+            # Cache per-team avg_allowed for opponent-defense weighting on props (not NBA:
+            # its raw points-allowed defense is retired — nba_prop_context replaces it).
+            if sport_key != "basketball_nba":
+                team_defense[home_espn["display_name"]] = home_stats["recent"]["avg_allowed"]
+                team_defense[away_espn["display_name"]] = away_stats["recent"]["avg_allowed"]
 
             if "h2h" in market_list:
-                ml_candidates = analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key)
+                ml_candidates = analyze_moneyline_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key, matchup_features=matchup_features)
                 all_ml_candidates.extend(ml_candidates)
 
             if "spreads" in market_list:
-                spread_candidates = analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key)
+                spread_candidates = analyze_spreads_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key, matchup_features=matchup_features)
                 all_spread_candidates.extend(spread_candidates)
 
             if "totals" in market_list:
-                totals_candidates = analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key)
+                totals_candidates = analyze_totals_value(game_odds, home_stats, away_stats, threshold, sport_key=sport_key, matchup_features=matchup_features)
                 all_totals_candidates.extend(totals_candidates)
 
     # Analyze player props
@@ -403,7 +421,10 @@ def run_analysis(sport_key, config, markets, prop_markets=None, fetch_all=False)
                 except Exception:
                     mlb_probables = None
             else:
-                event_teams = [find_team(espn_teams, tn)
+                # NBA: stats.nba.com ids via the warehouse team dim (what the namesake
+                # tie-break compares); ESPN ids for the other sports.
+                event_teams = [_resolve_team_dim(sport_key, tn, espn_teams)
+                               if sport_key == "basketball_nba" else find_team(espn_teams, tn)
                                for tn in (prop_data.get("home_team"),
                                           prop_data.get("away_team")) if tn]
                 event_team_ids = [str(t["id"]) for t in event_teams
@@ -472,7 +493,27 @@ def _resolve_team_dim(sport_key, name, espn_teams):
                 return wh
         except Exception:
             pass
+    if sport_key == "basketball_nba":
+        # NBA: the stats.nba.com team dim (id = str(team_id)); None -> the game is skipped.
+        try:
+            import nba_warehouse
+            tid = nba_warehouse.resolve_team_id(name)
+            if tid is not None:
+                return {"id": str(tid), "display_name": name, "record": None,
+                        "wins": None, "losses": None, "win_pct": None}
+        except Exception:
+            pass
+        return None
     return find_team(espn_teams, name)
+
+
+def _et_game_date(commence_time):
+    """US-Eastern calendar date of an event commence (the NBA team model's as-of date)."""
+    try:
+        from pricing_common import et_local_date
+        return et_local_date(commence_time) or str(commence_time or "")[:10]
+    except Exception:
+        return str(commence_time or "")[:10]
 
 
 def build_team_stats(team_info, espn_sport, espn_league, recent_n, espn_teams=None,
