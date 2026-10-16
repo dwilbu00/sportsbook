@@ -1335,16 +1335,6 @@ def fetch_espn_teams(espn_sport, espn_league):
     return get_all_teams(espn_sport, espn_league)
 
 
-def _nba_live_warehouse():
-    """NBA live path is on the stats.nba.com warehouse (ODI_NBA_LIVE_SDV, default on). Off ->
-    the legacy ESPN team dim / schedules (burn-in fallback)."""
-    try:
-        import nba_stats_source
-        return nba_stats_source.live_from_sdv()
-    except Exception:
-        return False
-
-
 def _resolve_team_dim(sport_key, name, espn_teams):
     """Team dict {id, display_name, record, wins, losses, win_pct, ...} for a
     matchup team. MLB (P6 teardown): resolve off the StatsAPI warehouse
@@ -1375,7 +1365,7 @@ def _resolve_team_dim(sport_key, name, espn_teams):
         except Exception:
             pass
         return None
-    if sport_key == "basketball_nba" and _nba_live_warehouse():
+    if sport_key == "basketball_nba":
         # NBA: the stats.nba.com warehouse team dim (no ESPN). id = str(team_id), the same
         # key the warehouse player history's team_id stringifies to, so team_schedules and
         # the namesake team hint line up. None on an unresolvable name -> matchup skipped.
@@ -1410,7 +1400,7 @@ def _fetch_team_schedule(sport_key, team, espn_sport, espn_league):
             return []
     if sport_key == "americanfootball_nfl":
         return []   # NFL recent form is built from nfl_team_stats (self-contained), no ESPN schedule
-    if sport_key == "basketball_nba" and _nba_live_warehouse():
+    if sport_key == "basketball_nba":
         # NBA: recent games off the nba_game spine (newest-first dicts with 'date') — feeds
         # the props layoff filter, keyed by the warehouse team id. No ESPN.
         try:
@@ -4084,11 +4074,10 @@ if analyze_clicked and selected_game_labels:
     progress = st.progress(0, text="Starting analysis...")
 
     # Team data. MLB (P6, warehouse), NFL (nflverse games spine) and NBA (stats.nba.com
-    # warehouse, unless ODI_NBA_LIVE_SDV=0) resolve + build team stats without ESPN, so skip
-    # the ESPN get_all_teams fetch for them. NHL still fetches from ESPN.
+    # warehouse) resolve + build team stats without ESPN, so skip the ESPN get_all_teams fetch
+    # for them. NHL still fetches from ESPN.
     progress.progress(5, text="Loading team data...")
-    if sport["key"] in ("baseball_mlb", "americanfootball_nfl") or (
-            sport["key"] == "basketball_nba" and _nba_live_warehouse()):
+    if sport["key"] in ("baseball_mlb", "americanfootball_nfl", "basketball_nba"):
         espn_teams = {}
     else:
         try:
@@ -4525,11 +4514,9 @@ if analyze_clicked and selected_game_labels:
                 # NBA: {season,recent,recent_games} from the sportsdataverse schedule spine
                 # (no ESPN), same shape. Gated by the live switch; require BOTH (never mix).
                 if (not (wh_home and wh_away) and sport["key"] == "basketball_nba"):
-                    import nba_stats_source as nba_source
-                    if nba_source.live_from_sdv():
-                        import nba_team_stats
-                        wh_home = nba_team_stats.team_stats(home, recent_n)
-                        wh_away = nba_team_stats.team_stats(away, recent_n)
+                    import nba_team_stats
+                    wh_home = nba_team_stats.team_stats(home, recent_n)
+                    wh_away = nba_team_stats.team_stats(away, recent_n)
                 if wh_home and wh_away:
                     home_stats, away_stats = wh_home, wh_away
                 else:

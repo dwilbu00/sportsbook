@@ -439,14 +439,6 @@ def _num(v):
         return None
 
 
-def _nba_team_grade_sdv():
-    """NBA team-market scores come from the stats.nba.com WAREHOUSE spine by default; kill-switch
-    ODI_NBA_TEAM_GRADE_SDV=0 reverts to the ESPN scoreboard (mirrors the prop cutover's
-    ODI_NBA_GRADE_SDV and the NFL team switch)."""
-    return os.environ.get("ODI_NBA_TEAM_GRADE_SDV", "1").strip().lower() \
-        not in ("0", "false", "no")
-
-
 def _nba_final_score(home_team, away_team, commence_time, game_date):
     """(home_score, away_score) for a completed NBA game from the stats.nba.com warehouse spine
     (nba_warehouse.final_score — resolves odds names -> team_id and matches on game_date, exact
@@ -476,10 +468,10 @@ def final_score(sport_key, game_date, home_team, away_team, commence_time=None):
             return sc
     # NBA: stats.nba.com warehouse spine is the score source (no ESPN); covers all team graders
     # that route here. Falls through to the ESPN scoreboard on a miss.
-    if sport_key == "basketball_nba" and _nba_team_grade_sdv():
-        sc = _nba_final_score(home_team, away_team, commence_time, game_date)
-        if sc is not None:
-            return sc
+    if sport_key == "basketball_nba":
+        # WAREHOUSE-ONLY (ESPN retired 2026-10): a miss stays pending until maintenance
+        # ingests the game.
+        return _nba_final_score(home_team, away_team, commence_time, game_date)
     hk, ak = _team_key(home_team), _team_key(away_team)
     if not hk or not ak:
         return None

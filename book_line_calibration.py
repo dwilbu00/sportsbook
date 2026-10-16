@@ -644,7 +644,7 @@ def _nba_grade_book_lines(book_lines, min_test_minutes=10.0, min_priors=10):
     raises."""
     import db_store
     try:
-        import nba_source
+        import nba_stats_source as nba_source
         import nba_warehouse
     except Exception:
         return None

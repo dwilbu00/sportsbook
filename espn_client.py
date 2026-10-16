@@ -953,15 +953,13 @@ def _mlb_warehouse_history(sport, player_name, prop_key, n, teams=None,
 
 
 def _nba_warehouse_history(player_name, prop_key, n, team_ids=None):
-    """Warehouse-first NBA player history (the Phase-4 live cutover): return the
-    get_player_stat_history contract dict from the sportsdataverse per-player-game facts, or
-    None so the caller falls open to the ESPN path. Gated on nba_source.live_from_sdv() +
-    SQL enabled + a mapped prop; DNP games are excluded (a bet voids on a DNP, never a 0).
-    Never raises."""
+    """NBA player history from the stats.nba.com WAREHOUSE (the only NBA source — ESPN retired
+    2026-10): the get_player_stat_history contract dict from the per-player-game facts, or None
+    (SQL off / unmapped prop / no played games) -> the caller fails closed. Odds-feed spellings
+    resolve via nba_names (inside player_history); DNP games are excluded (a bet voids on a DNP,
+    never a 0). Never raises."""
     try:
         import nba_stats_source as nba_source
-        if not nba_source.live_from_sdv():
-            return None
         cols = nba_source.PROP_STAT_COLS.get(prop_key)
         if cols is None:
             return None
@@ -1137,14 +1135,12 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
         if wh is not None:
             return wh
 
-    # NBA live-input cutover (gated via nba_source.live_from_sdv, fail-open): serve the
-    # recent-game history from the sportsdataverse WAREHOUSE (per-player-game box) when
-    # enabled + resolvable, else fall through to the ESPN path below unchanged. Mirrors the
-    # MLB flip; stamps source="nba_warehouse" for per-prediction auditability.
-    if allow_warehouse and sport == "basketball":
+    # NBA: WAREHOUSE-ONLY (ESPN retired 2026-10). A miss (unresolvable name even after the
+    # nba_names rules, SQL off, no played games) fails CLOSED — empty history drops the prop as
+    # no_history, never an ESPN-sourced value. Stamps source="nba_warehouse".
+    if sport == "basketball":
         nba = _nba_warehouse_history(player_name, prop_key, n, team_ids=team_ids)
-        if nba is not None:
-            return nba
+        return nba if nba is not None else result
 
     # batter_total_bases / batter_rbis are WAREHOUSE-ONLY (fact-served above via
     # _mlb_warehouse_history when ODI_MLB_WAREHOUSE_HIST is on). The live ESPN gamelog
@@ -1175,7 +1171,7 @@ def get_player_stat_history(sport, league, player_name, prop_key, n=20,
     # sport that has a fact table; other sports (e.g. NHL) keep the direct path
     # unchanged. (MLB never reaches here — it's warehouse-only / fails closed above.)
     use_sql = (db_store is not None and db_store.enabled()
-               and sport in ("basketball", "football"))
+               and sport == "football")
     if use_sql:
         import gamelog_store
         athlete = gamelog_store.get_athlete_id(sport, league, player_name,

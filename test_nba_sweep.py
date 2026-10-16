@@ -13,25 +13,19 @@ import nba_warehouse as nw
 
 
 class SweepModeTests(unittest.TestCase):
+    """ESPN retired for NBA: basketball always sweeps off the warehouse (mirror-first, so even
+    with SQL off); no kill switch."""
+
     def tearDown(self):
         db_store.configure_engine(None)
-        os.environ.pop("ODI_NBA_SWEEP_SDV", None)
 
-    def test_off_when_sql_disabled(self):
+    def test_basketball_always_warehouse(self):
         db_store.configure_engine(None)
-        self.assertFalse(backtest._nba_sweep_mode("basketball"))
-
-    def test_on_when_enabled(self):
+        self.assertTrue(backtest._nba_sweep_mode("basketball"))
         db_store.configure_engine("sqlite://")
         self.assertTrue(backtest._nba_sweep_mode("basketball"))
 
-    def test_kill_switch(self):
-        db_store.configure_engine("sqlite://")
-        os.environ["ODI_NBA_SWEEP_SDV"] = "0"
-        self.assertFalse(backtest._nba_sweep_mode("basketball"))
-
     def test_non_basketball_off(self):
-        db_store.configure_engine("sqlite://")
         self.assertFalse(backtest._nba_sweep_mode("baseball"))
         self.assertFalse(backtest._nba_sweep_mode("football"))
 

@@ -226,9 +226,9 @@ class MlbScoresExcludePostponedTests(unittest.TestCase):
 class EspnAdjacentGuardTests(unittest.TestCase):
     """resolve_one_prop's ±1-day ESPN fallback must not grade a postponed game
     against the prior night's DIFFERENT game (~24h away); genuine UTC/local date
-    slippage (same start time) still resolves. This is the NBA/NFL/NHL grading
-    path (MLB is warehouse+statsapi only in P6 and never reaches ESPN), so it's
-    exercised via basketball."""
+    slippage (same start time) still resolves. This is the NHL (and NFL-fallback) grading
+    path (MLB and NBA are warehouse-only and never reach ESPN), so it's exercised via
+    hockey."""
 
     def _resolve(self, gamelog, by_date, game_date, commence):
         with patch.object(recalibration, "_resolve_mlb_actual",
@@ -236,7 +236,7 @@ class EspnAdjacentGuardTests(unittest.TestCase):
              patch.object(recalibration, "_load_player_gamelog",
                           return_value=(gamelog, by_date)):
             return recalibration.resolve_one_prop(
-                "basketball_nba", "P1", "player_points", 0.5, game_date, commence)
+                "icehockey_nhl", "P1", "player_points", 0.5, game_date, commence)
 
     def test_adjacent_prior_night_not_graded(self):
         # Bet on a game postponed on 2025-07-02 (~23:10Z). ESPN has no row that

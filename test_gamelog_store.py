@@ -267,26 +267,27 @@ class DispatchTests(_Backend, unittest.TestCase):
         self.assertEqual(meta["player_type"], "nba")
 
     def test_get_player_stat_history_routes_to_sql(self):
-        # NBA still uses the durable SQL gamelog store (MLB is warehouse-only post-P4b).
-        rows = [_nba_row("2026-01-15T00:00:00.000+00:00", pts=25.0),
-                _nba_row("2026-01-13T00:00:00.000+00:00", pts=18.0)]
+        # NFL (the ESPN fallback path) uses the durable SQL gamelog store; MLB and NBA are
+        # warehouse-only.
+        rows = [_nfl_row("2026-01-15T00:00:00.000+00:00", yds=250.0),
+                _nfl_row("2026-01-13T00:00:00.000+00:00", yds=180.0)]
         athlete = {"id": "555", "name": "Star", "team_id": "10"}
         with patch.object(espn_client, "search_athlete", return_value=athlete), \
              patch.object(espn_client, "get_athlete_gamelog",
                           return_value=rows) as gl:
             hist = espn_client.get_player_stat_history(
-                "basketball", "nba", "Star", "player_points", n=20)
+                "football", "nfl", "Star", "player_pass_yds", n=20)
             after_first = gl.call_count
             # Second call serves from SQL — it must add NO new ESPN gamelog fetch.
             # (The first call may fetch >1 season under prior-season spill; the
             # contract this pins is caching, not the absolute first-call count.) [F26]
             espn_client.get_player_stat_history(
-                "basketball", "nba", "Star", "player_points", n=20)
+                "football", "nfl", "Star", "player_pass_yds", n=20)
             self.assertGreaterEqual(after_first, 1)
             self.assertEqual(gl.call_count, after_first,
                              "second call must serve from SQL (no new gamelog fetch)")
         self.assertTrue(hist["found"])
-        self.assertEqual(hist["values"], [25.0, 18.0])
+        self.assertEqual(hist["values"], [250.0, 180.0])
         self.assertEqual(hist["team_id"], "10")
 
     def test_seed_athlete_id_routes_to_sql(self):

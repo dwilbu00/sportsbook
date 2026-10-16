@@ -186,8 +186,8 @@ class GetPlayerStatHistoryBranchTests(unittest.TestCase):
         gg.assert_not_called()                 # ESPN gamelog never fetched
 
     def test_non_baseball_warehouse_miss_still_falls_open(self):
-        # Sport-scoping: the P2.5b fail-closed guard is baseball-only. A basketball
-        # miss still falls open to the ESPN path (other sports stay byte-identical).
+        # Sport-scoping: the P2.5b fail-closed guard is baseball-only. A football miss
+        # still falls open to the ESPN path (NBA is warehouse-only + fails closed too).
         with mock.patch.object(espn_client, "_mlb_warehouse_history",
                                return_value=None), \
              mock.patch.object(espn_client, "db_store",
@@ -195,9 +195,9 @@ class GetPlayerStatHistoryBranchTests(unittest.TestCase):
              mock.patch.object(espn_client, "search_athlete",
                                return_value=None) as sa:
             r = espn_client.get_player_stat_history(
-                "basketball", "nba", "X", "player_points", n=10)
+                "football", "nfl", "X", "player_pass_yds", n=10)
         self.assertFalse(r["found"])
-        sa.assert_called_once()                # non-baseball still consults ESPN
+        sa.assert_called_once()                # NFL still consults ESPN
 
 
 class PropsTeamBridgeTests(unittest.TestCase):

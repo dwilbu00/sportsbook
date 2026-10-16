@@ -1205,16 +1205,16 @@ class AsOfReliabilityTests(unittest.TestCase):
 class MarketParsingTests(unittest.TestCase):
     def test_player_history_keeps_current_team_when_gamelog_omits_it(self):
         with patch.object(espn_client, "search_athlete", return_value={
-                "id": "3934672", "name": "Jalen Brunson", "team_id": "18",
+                "id": "3916387", "name": "Josh Allen", "team_id": "2",
         }), patch.object(espn_client, "get_athlete_gamelog", return_value=[
-                {"PTS": 25.0, "opponent": "Indiana Pacers",
+                {"passingYards": 250.0, "opponent": "Miami Dolphins",
                  "is_home": False, "team_id": None},
         ]):
             history = espn_client.get_player_stat_history(
-                "basketball", "nba", "Jalen Brunson", "player_points")
+                "football", "nfl", "Josh Allen", "player_pass_yds")
 
         self.assertTrue(history["found"])
-        self.assertEqual(history["team_id"], "18")
+        self.assertEqual(history["team_id"], "2")
 
     def test_bet_checklist_entries_include_instructions_not_pricing(self):
         common = {"event_id": "game-1", "edge_pct": 8.5,
@@ -1644,12 +1644,12 @@ class RecalibrationTests(unittest.TestCase):
             "baseball_mlb", resolve_first=False, newly_resolved=25)
 
     def test_outcome_resolution_refreshes_recent_gamelogs(self):
-        # NBA/NFL/NHL grading refreshes the ESPN gamelog (ttl_hours=6). MLB is
-        # warehouse+statsapi only in P6 and never reaches this ESPN path, so the
-        # refresh behavior is exercised via basketball.
+        # NHL (and the NFL fallback) grading refreshes the ESPN gamelog (ttl_hours=6).
+        # MLB and NBA are warehouse-only and never reach this ESPN path, so the refresh
+        # behavior is exercised via hockey.
         rows = [{
             "ts": "2024-04-01T10:00:00Z",
-            "sport_key": "basketball_nba",
+            "sport_key": "icehockey_nhl",
             "prop_key": "player_points",
             "player": "Player One",
             "game_date": "2024-04-01",
@@ -1668,12 +1668,12 @@ class RecalibrationTests(unittest.TestCase):
         ) as gamelog, patch.object(
                 recalibration, "_stat_label", return_value="PTS"), patch.object(
                 recalibration, "mutate_prediction_log", side_effect=mutate):
-            resolved = recalibration.resolve_pending_outcomes("basketball_nba")
+            resolved = recalibration.resolve_pending_outcomes("icehockey_nhl")
 
         self.assertEqual(resolved, 1)
         self.assertTrue(rows[0]["resolved"])
         gamelog.assert_called_once_with(
-            "basketball", "nba", "123", ttl_hours=6)
+            "hockey", "nhl", "123", ttl_hours=6)
 
     def test_forced_odds_refresh_never_uses_expired_cache(self):
         response = requests.Response()

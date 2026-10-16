@@ -108,10 +108,35 @@ class NbaWarehouseHistoryContractTests(unittest.TestCase):
         self.assertIsNone(
             espn_client._nba_warehouse_history("Star Guard", "player_double_double", 5))
 
-    def test_kill_switch_disables(self):
-        with patch("nba_stats_source.live_from_sdv", return_value=False):
-            self.assertIsNone(
-                espn_client._nba_warehouse_history("Star Guard", "player_points", 5))
+
+
+class NbaFailsClosedTests(unittest.TestCase):
+    """ESPN retired for NBA (2026-10): a warehouse miss never reaches ESPN — live history,
+    prop grading and team-score grading all fail closed."""
+
+    def test_history_miss_returns_empty_without_espn(self):
+        with patch.object(espn_client, "_nba_warehouse_history", return_value=None),              patch.object(espn_client, "search_athlete") as sa,              patch.object(espn_client, "get_athlete_gamelog") as gl:
+            r = espn_client.get_player_stat_history("basketball", "nba", "Nobody",
+                                                    "player_points", 10)
+        self.assertFalse(r["found"])
+        sa.assert_not_called()
+        gl.assert_not_called()
+
+    def test_grading_miss_stays_pending_without_espn(self):
+        import recalibration
+        with patch.object(recalibration, "_resolve_nba_actual", return_value=None),              patch.object(recalibration, "_load_player_gamelog") as lg:
+            v = recalibration.resolve_one_prop("basketball_nba", "Nobody", "player_points",
+                                               20.5, "2025-01-10", "2025-01-11T00:30:00Z")
+        self.assertIsNone(v)
+        lg.assert_not_called()
+
+    def test_team_score_miss_stays_pending_without_espn(self):
+        import game_results
+        with patch.object(game_results, "_nba_final_score", return_value=None),              patch.object(game_results, "_scores_for_date") as espn:
+            sc = game_results.final_score("basketball_nba", "2025-01-10", "Home", "Away",
+                                          "2025-01-11T00:30:00Z")
+        self.assertIsNone(sc)
+        espn.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -57,14 +57,6 @@ PROP_STAT_COLS = {
 }
 
 
-def live_from_sdv():
-    """NBA live analysis (player history + team form) is served from the warehouse/sportsdataverse
-    by default; kill-switch ODI_NBA_LIVE_SDV=0 reverts to the ESPN path (burn-in safety,
-    independent of the grading switch ODI_NBA_GRADE_SDV)."""
-    import os
-    return os.environ.get("ODI_NBA_LIVE_SDV", "1").strip().lower() not in ("0", "false", "no")
-
-
 def _norm(name):
     return db_store.normalize_name(name)
 

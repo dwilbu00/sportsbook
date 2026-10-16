@@ -70,9 +70,10 @@ class FetchPlayerDataTests(unittest.TestCase):
         with mock.patch.object(backtest, "cached_athlete_id",
                                return_value="e1") as caid, \
              mock.patch.object(backtest, "cached_gamelog",
-                               return_value=[{"PTS": 20.0, "game_date": "2026-01-01"}]), \
+                               return_value=[{"passingYards": 250.0,
+                                              "game_date": "2026-01-01"}]), \
              mock.patch("mlb_warehouse.get_calib_gamelogs_bulk") as gcg:
-            backtest.fetch_player_data("basketball", "nba", ["Star"])
+            backtest.fetch_player_data("football", "nfl", ["Star"])
         caid.assert_called_once()          # ESPN path
         gcg.assert_not_called()
 

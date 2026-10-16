@@ -204,7 +204,7 @@ class GetPlayerStatHistoryForwardsHintTests(unittest.TestCase):
         search = Mock(return_value={"id": "", "name": "x", "team_id": None})
         with patch.object(espn_client, "search_athlete", search):
             espn_client.get_player_stat_history(
-                "basketball", "nba", "Some Player", "player_points",
+                "football", "nfl", "Some Player", "player_pass_yds",
                 team_ids=["1", "2"])
         search.assert_called_once()
         self.assertEqual(search.call_args.kwargs.get("team_ids"), ["1", "2"])

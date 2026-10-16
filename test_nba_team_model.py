@@ -207,30 +207,26 @@ def _app_funcs(*names):
 
 class AppHelperTests(unittest.TestCase):
     def setUp(self):
-        self.ns = _app_funcs("_nba_live_warehouse", "_resolve_team_dim",
-                             "_fetch_team_schedule")
+        self.ns = _app_funcs("_resolve_team_dim", "_fetch_team_schedule")
 
     def test_nba_dim_is_warehouse_str_id(self):
-        with patch("nba_stats_source.live_from_sdv", return_value=True), \
-             patch("nba_warehouse.resolve_team_id", return_value=1610612747):
+        with patch("nba_warehouse.resolve_team_id", return_value=1610612747):
             d = self.ns["_resolve_team_dim"]("basketball_nba", "Los Angeles Lakers", {})
         self.assertEqual(d["id"], "1610612747")
         self.assertEqual(d["display_name"], "Los Angeles Lakers")
 
-    def test_nba_kill_switch_falls_back_to_espn(self):
-        with patch("nba_stats_source.live_from_sdv", return_value=False):
-            d = self.ns["_resolve_team_dim"]("basketball_nba", "Los Angeles Lakers", {})
-        self.assertEqual(d["id"], "espn")
+    def test_nba_never_uses_espn(self):
+        # ESPN retired for NBA: the ESPN find_team stub is never consulted
+        with patch("nba_warehouse.resolve_team_id", return_value=None):
+            self.assertIsNone(self.ns["_resolve_team_dim"]("basketball_nba", "Lakers", {}))
 
     def test_nba_unresolved_team_skips(self):
-        with patch("nba_stats_source.live_from_sdv", return_value=True), \
-             patch("nba_warehouse.resolve_team_id", return_value=None):
+        with patch("nba_warehouse.resolve_team_id", return_value=None):
             self.assertIsNone(self.ns["_resolve_team_dim"]("basketball_nba", "Nope", {}))
 
     def test_nba_schedule_from_warehouse(self):
         team = {"id": "1610612747", "display_name": "Los Angeles Lakers"}
-        with patch("nba_stats_source.live_from_sdv", return_value=True), \
-             patch("nba_team_stats.team_stats",
+        with patch("nba_team_stats.team_stats",
                    return_value={"recent_games": [{"date": "2025-01-02"}]}):
             s = self.ns["_fetch_team_schedule"]("basketball_nba", team, "basketball", "nba")
         self.assertEqual(s, [{"date": "2025-01-02"}])

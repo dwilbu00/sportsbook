@@ -4091,20 +4091,9 @@ def _stat_label_for(prop_key, gamelog):
 
 
 def _nba_sweep_mode(espn_sport):
-    """True when the NBA player-props sweep should grade off nba_warehouse (all 16 props,
-    real actuals) instead of ESPN (3 props). Auto-on when basketball + the warehouse is
-    enabled; kill-switch ODI_NBA_SWEEP_SDV=0 (mirrors recalibration._nba_grade_from_warehouse).
-    Gating on enabled() keeps the ESPN path when SQL is off (tests)."""
-    if espn_sport != "basketball":
-        return False
-    try:
-        import nba_warehouse
-        if not nba_warehouse.enabled():
-            return False
-    except Exception:
-        return False
-    return os.environ.get("ODI_NBA_SWEEP_SDV", "1").strip().lower() \
-        not in ("0", "false", "off", "no")
+    """True for basketball: the NBA player-props sweep always grades off nba_warehouse (all 16
+    props, real actuals; mirror-first, so it works offline without SQL). ESPN retired 2026-10."""
+    return espn_sport == "basketball"
 
 
 def _nba_sweep_stat_label(prop_key, gamelog):

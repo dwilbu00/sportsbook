@@ -1556,19 +1556,6 @@ def _nba_prop_cols(prop_key):
         return None
 
 
-# NBA grading cutover gate. ON by default: the sportsdataverse warehouse is the PRIMARY NBA
-# grader (per-player-game box, validated live) with the ESPN gamelog as fallback-on-miss.
-# Kill-switch ODI_NBA_GRADE_SDV=0 reverts to ESPN-primary (mirrors ODI_NFL_GRADE_NFLVERSE).
-_NBA_GRADE_FROM_WAREHOUSE_DEFAULT = True
-
-
-def _nba_grade_from_warehouse():
-    v = os.environ.get("ODI_NBA_GRADE_SDV")
-    if v is not None:
-        return v.strip().lower() in ("1", "true", "yes", "on")
-    return _NBA_GRADE_FROM_WAREHOUSE_DEFAULT
-
-
 def _nfl_player_week_frame(season):
     """The NFL warehouse's player-week frame for grading (nfl_warehouse.player_week_frame),
     shaped like nfl_opportunity_serving._load, or None when the warehouse is empty/disabled."""
@@ -1818,17 +1805,12 @@ def resolve_one_prop(sport_key, player, prop_key, line, game_date, commence,
             v = _resolve_nfl_actual(prop_key, player, game_date, commence)
             if v is not None:
                 return float(v)
-        # NBA: grade from the sportsdataverse WAREHOUSE first (frozen per-player-game box),
-        # live sportsdataverse parquet second; any miss falls to the ESPN gamelog below.
-        # A confirmed DNP (player in the box with 0/null minutes) stays PENDING here rather
-        # than grading a phantom 0-loss via ESPN — the stale-DNP sweep voids it later.
-        # Kill-switch ODI_NBA_GRADE_SDV=0 reverts to ESPN-primary.
-        if sport_key == "basketball_nba" and _nba_grade_from_warehouse():
+        if sport_key == "basketball_nba":
+            # WAREHOUSE-ONLY (ESPN retired 2026-10): a miss — a not-yet-ingested game or a
+            # confirmed DNP — stays pending; maintenance ingests the game and a later pass
+            # grades it (a DNP voids via _nba_is_dnp in the stale-void path).
             v = _resolve_nba_actual(prop_key, player, game_date, commence)
-            if v is not None:
-                return float(v)
-            if _nba_dnp_row(player, game_date) is True:
-                return None
+            return float(v) if v is not None else None
         gamelog, by_date = _load_player_gamelog(espn_sport, espn_league, player)
         if not gamelog:
             return None
@@ -1939,7 +1921,7 @@ def resolve_pending_outcomes(sport_key, max_to_resolve=MAX_RESOLVE_PER_LAUNCH):
     # distinct players' gamelogs concurrently so the sequential loop hits a warm cache.
     # MLB is warehouse-resolved (DB reads) and skips this. Best-effort; the loop is correct
     # either way (a cold player just pays its fetch inline as before).
-    if sport_key != "baseball_mlb" and len(by_player) > 1:
+    if sport_key not in ("baseball_mlb", "basketball_nba") and len(by_player) > 1:
         espn_sport, espn_league = pair
         _players = list(by_player.keys())[:max_to_resolve]
         try:
