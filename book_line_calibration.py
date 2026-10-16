@@ -663,11 +663,13 @@ def _nba_grade_book_lines(book_lines, min_test_minutes=10.0, min_priors=10):
     by_player = defaultdict(list)
     for row in book_lines:
         by_player[row.get("player") or ""].append(row)
+    import nba_names
+    resolver = nba_names.Resolver(bulk)                     # odds spelling -> warehouse norm
 
     enriched = []
     n_no_player = n_no_cols = n_date = n_low = n_prior = 0
     for name, rows in by_player.items():
-        games = bulk.get(nba_source._norm(name))
+        games = bulk.get(resolver.resolve(name) or nba_source._norm(name))
         if not games:
             n_no_player += len(rows)
             continue

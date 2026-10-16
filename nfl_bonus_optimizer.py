@@ -302,7 +302,11 @@ def _nba_side_team(nba_teams, player, home, away):
     try:
         import db_store
         import nba_warehouse
-        tid = nba_teams.get(db_store.normalize_name(player or ""))
+        import nba_names
+        res = nba_teams.get("__resolver__")
+        nn = (res.resolve(player) if res is not None else None) \
+            or db_store.normalize_name(player or "")
+        tid = nba_teams.get(nn)
         if tid is None:
             return None
         if tid == nba_warehouse.resolve_team_id(home):
@@ -336,8 +340,11 @@ def legs_from_scoped_board(parsed_boards, book, markets, sport_key,
     nba_teams = {}
     if is_nba:
         try:
+            import nba_names
             import nba_warehouse
-            nba_teams = nba_warehouse.player_teams()
+            nba_teams = dict(nba_warehouse.player_teams())
+            if nba_teams:
+                nba_teams["__resolver__"] = nba_names.Resolver(nba_teams)
         except Exception:
             nba_teams = {}
     # empty scope => the BROAD bonus universe (yardages/TDs/HR), not just modeled props

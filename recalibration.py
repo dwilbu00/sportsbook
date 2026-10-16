@@ -1650,6 +1650,25 @@ def _row_played(row):
         return None
 
 
+_NBA_FRAME_RESOLVERS = {}                             # id(frame) -> (frame, Resolver)
+
+
+def _nba_canonical(df, player):
+    """The frame's player_norm for an odds-feed name (nba_names rules: suffixes, given-name
+    equivalents, aliases), else the plain normalized name. Resolver cached per frame object."""
+    import nba_stats_source as _src
+    plain = _src._norm(player)
+    if df is None or "player_norm" not in getattr(df, "columns", []):
+        return plain
+    hit = _NBA_FRAME_RESOLVERS.get(id(df))
+    if hit is None or hit[0] is not df:
+        import nba_names
+        hit = (df, nba_names.Resolver(set(df["player_norm"].dropna().astype(str))))
+        _NBA_FRAME_RESOLVERS.clear()
+        _NBA_FRAME_RESOLVERS[id(df)] = hit
+    return hit[1].resolve(player) or plain
+
+
 def _nba_frame_match(df, pnorm, game_date):
     """The single (player_norm, game_date) row in a warehouse/live NBA frame, or None. A
     player appears at most once per date, so an exact date match never grabs a back-to-back
@@ -1685,7 +1704,7 @@ def _resolve_nba_actual(prop_key, player, game_date, commence=None):
         if season is None:
             return None
         df = _nba_player_game_frame(season)
-        row = _nba_frame_match(df, _src._norm(player), game_date)
+        row = _nba_frame_match(df, _nba_canonical(df, player), game_date)
         if row is None:
             return None
         if _row_played(row) is False:               # confirmed DNP → don't grade a phantom 0
@@ -1707,7 +1726,8 @@ def _nba_dnp_row(player, game_date):
         season = _src.end_year_for_date(str(game_date)[:10])
         if season is None:
             return None
-        row = _nba_frame_match(_nba_player_game_frame(season), _src._norm(player), game_date)
+        _df = _nba_player_game_frame(season)
+        row = _nba_frame_match(_df, _nba_canonical(_df, player), game_date)
         if row is None:
             return None
         return _row_played(row) is False

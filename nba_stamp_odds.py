@@ -85,11 +85,14 @@ def _plan(conn):
     index = nba_warehouse.prop_id_index(seasons) if seasons else {}
 
     cache = {}                                           # (name_norm-input, et_date) -> (pid, gid)
+    import nba_names
+    resolver = nba_names.Resolver({nn for nn, _d in index})
 
     def _resolve(player, et_date):
         key = (player or "", et_date or "")
         if key not in cache:
-            cache[key] = nba_warehouse.resolve_prop_ids(index, player, et_date)
+            cache[key] = nba_warehouse.resolve_prop_ids(index, player, et_date,
+                                                        resolver=resolver)
         return cache[key]
 
     groups = defaultdict(list)

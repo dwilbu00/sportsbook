@@ -545,6 +545,28 @@ def _disambiguate_person(conn, pids, team_ids):
     return next(iter(seen), pids[0])
 
 
+_NAME_RESOLVER = {}                                   # {"ts": t, "r": nba_names.Resolver}
+
+
+def name_resolver(ttl=1800):
+    """nba_names.Resolver over every nba_player name_norm (cached) — maps odds-feed spellings
+    ("Jimmy Butler", "Nicolas Claxton") onto the warehouse's. None when disabled / on error."""
+    hit = _NAME_RESOLVER.get("r")
+    if hit is not None and (time.time() - _NAME_RESOLVER.get("ts", 0)) < ttl:
+        return hit
+    if not enabled():
+        return None
+    try:
+        import nba_names
+        with db_store.get_engine().connect() as conn:
+            known = [r[0] for r in conn.execute(select(nba_player.c.name_norm)) if r[0]]
+    except Exception:
+        return None
+    r = nba_names.Resolver(known)
+    _NAME_RESOLVER.update({"ts": time.time(), "r": r})
+    return r
+
+
 def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
     """Recent per-game stat history for one player, most-recent-first, PLAYED games only (DNP
     excluded). ``cols`` str or tuple (SUMMED per game). Returns [{value, game_date, opponent,
@@ -558,6 +580,8 @@ def player_history(player_name, cols, n=20, as_of_date=None, team_ids=None):
         nn = db_store.normalize_name(player_name)
         if not nn:
             return []
+        res = name_resolver()
+        nn = (res.resolve(player_name) if res is not None else None) or nn
         pg, pl = nba_player_game, nba_player
         present = [c for c in cols if c in pg.c]
         if not present:
@@ -934,13 +958,15 @@ def prop_id_index(seasons):
     return dict(idx)
 
 
-def resolve_prop_ids(index, player_name, et_date):
+def resolve_prop_ids(index, player_name, et_date, resolver=None):
     """(person_id, game_id) for a prop book line IFF (name_norm, ET-date) resolves to EXACTLY
     one warehouse player-game; else (None, None). UNAMBIGUOUS-ONLY by design: a namesake
     collision (two same-norm players who both have a game that date) or a no-match is left
     unstamped for the name+date fallback — the stamp never guesses. ``index`` = ``prop_id_index``
     output; ``et_date`` = US-Eastern date of the line's commence (``pricing_common.et_local_date``)."""
     nn = db_store.normalize_name(player_name or "")
+    if resolver is not None:                       # odds spelling -> warehouse name_norm
+        nn = resolver.resolve(player_name) or nn
     cands = index.get((nn, str(et_date or "")[:10]))
     if cands and len(cands) == 1:
         return next(iter(cands))
