@@ -155,76 +155,43 @@ class ListSeasonAthletesTests(unittest.TestCase):
 
 
 class NbaPlayerPoolTests(unittest.TestCase):
-    def _athletes(self):
-        # Deliberately NOT in minutes order (1400, 90, 2100, 0, 2400) so the
-        # top-N-by-minutes SORT is actually exercised: if the sort were dropped
-        # and ESPN's arbitrary order followed, the selection tests would fail.
-        return [
-            {"id": "3", "name": "Rotation C", "games": 55, "minutes": 1400,
-             "avg_minutes": 25.5},
-            {"id": "4", "name": "Cameo D", "games": 8, "minutes": 90,
-             "avg_minutes": 11.3},   # below min_games -> dropped
-            {"id": "2", "name": "Star B", "games": 65, "minutes": 2100,
-             "avg_minutes": 32.3},
-            {"id": "5", "name": "Zero E", "games": 30, "minutes": 0,
-             "avg_minutes": 0.0},    # zero minutes -> dropped
-            {"id": "1", "name": "Star A", "games": 70, "minutes": 2400,
-             "avg_minutes": 34.3},
-        ]
+    """The NBA calibration pool = top-N warehouse players by total PLAYED minutes among those
+    with >= min_games played games in the season (stats.nba.com; ESPN retired 2026-10)."""
+
+    def _bulk(self):
+        def games(n, mins, season=2024, played=True):
+            return [{"season": season, "played": played, "MIN": mins} for _ in range(n)]
+        # Deliberately NOT in minutes order so the sort is exercised.
+        return {
+            "rotation c": games(55, 25.5),                  # 1402.5 min
+            "cameo d": games(8, 11.3),                      # below min_games -> dropped
+            "star b": games(65, 32.3),                      # 2099.5
+            "zero e": games(30, 0.0),                       # zero minutes -> no played games
+            "star a": games(70, 34.3),                      # 2401
+            "dnp f": games(40, 30.0, played=False),         # never played -> dropped
+            "old g": games(70, 35.0, season=2023),          # other season -> dropped
+        }
+
+    def _pool(self, **kw):
+        with patch("nba_warehouse.calib_gamelogs_bulk", return_value=self._bulk()):
+            return refit_calibration._nba_player_pool(2024, **kw)
 
     def test_filters_sorts_limits(self):
-        with patch.object(refit_calibration, "list_season_athletes",
-                          return_value=self._athletes()), \
-                patch.object(refit_calibration, "seed_athlete_id"):
-            pool = refit_calibration._nba_player_pool(
-                2024, max_players=2, min_games=15)
-        # Cameo (8 g) and Zero-minute players excluded; sorted by minutes desc;
-        # capped at 2 -> the two highest-minute eligible players.
-        self.assertEqual(pool, ["Star A", "Star B"])
+        self.assertEqual(self._pool(max_players=2, min_games=15), ["Star A", "Star B"])
 
-    def test_min_games_and_zero_minutes_excluded(self):
-        with patch.object(refit_calibration, "list_season_athletes",
-                          return_value=self._athletes()), \
-                patch.object(refit_calibration, "seed_athlete_id"):
-            pool = refit_calibration._nba_player_pool(
-                2024, max_players=50, min_games=15)
+    def test_min_games_zero_minutes_dnp_and_season_excluded(self):
+        pool = self._pool(max_players=50, min_games=15)
         self.assertEqual(pool, ["Star A", "Star B", "Rotation C"])
-        self.assertNotIn("Cameo D", pool)
-        self.assertNotIn("Zero E", pool)
+        for gone in ("Cameo D", "Zero E", "Dnp F", "Old G"):
+            self.assertNotIn(gone, pool)
 
-    def test_dedupes_names_keeping_highest_minutes(self):
-        # Two rows share a display name; the HIGHER-minutes id must be the one
-        # pinned (it decides whose gamelog feeds the fit). Provided out of order
-        # so the sort has to place id "1" ahead of id "2".
-        dupes = [
-            {"id": "2", "name": "Same Name", "games": 60, "minutes": 1800},
-            {"id": "1", "name": "Same Name", "games": 70, "minutes": 2400},
-        ]
-        seed = Mock()
-        with patch.object(refit_calibration, "list_season_athletes",
-                          return_value=dupes), \
-                patch.object(refit_calibration, "seed_athlete_id", seed):
-            pool = refit_calibration._nba_player_pool(2024, min_games=15)
-        self.assertEqual(pool, ["Same Name"])
-        # Pinned exactly once, with the higher-minutes id.
-        seed.assert_called_once()
-        self.assertEqual(seed.call_args.args[2:], ("Same Name", "1"))
-
-    def test_pins_ids_for_kept_players(self):
-        seed = Mock()
-        with patch.object(refit_calibration, "list_season_athletes",
-                          return_value=self._athletes()), \
-                patch.object(refit_calibration, "seed_athlete_id", seed):
-            refit_calibration._nba_player_pool(2024, max_players=50,
-                                               min_games=15)
-        pinned = {call.args[2]: call.args[3] for call in seed.call_args_list}
-        self.assertEqual(pinned, {"Star A": "1", "Star B": "2",
-                                  "Rotation C": "3"})
+    def test_names_resolve_back_to_the_warehouse_key(self):
+        import db_store
+        for name in self._pool(max_players=50, min_games=15):
+            self.assertIn(db_store.normalize_name(name), self._bulk())
 
     def test_empty_source_returns_empty(self):
-        with patch.object(refit_calibration, "list_season_athletes",
-                          return_value=[]), \
-                patch.object(refit_calibration, "seed_athlete_id"):
+        with patch("nba_warehouse.calib_gamelogs_bulk", return_value={}):
             self.assertEqual(refit_calibration._nba_player_pool(2024), [])
 
 

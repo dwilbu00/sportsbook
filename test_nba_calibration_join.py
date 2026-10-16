@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import db_store
 import book_line_calibration as bkc
@@ -101,11 +102,16 @@ class CalibJoinTests(unittest.TestCase):
             [_line("Shooter Guy", "player_points", "2024-01-24")], "basketball", "nba")
         self.assertEqual(enr, [])                        # no game on the 24th; no +/-1 borrow
 
-    def test_warehouse_disabled_returns_none(self):
+    def test_no_sql_no_mirror_grades_nothing_and_never_espn(self):
+        # ESPN retired 2026-10: with SQL off and no mirror there's simply no data — an empty
+        # result, and the join never falls back to the ESPN gamelog.
         db_store.configure_engine(None)                  # warehouse off
         try:
-            self.assertIsNone(bkc._nba_grade_book_lines(
-                [_line("Shooter Guy", "player_points", "2024-01-23")]))
+            with patch("book_line_calibration.cached_gamelog") as espn:
+                out = bkc.join_book_lines_to_actuals(
+                    [_line("Shooter Guy", "player_points", "2024-01-23")], "basketball", "nba")
+            self.assertEqual(out, [])
+            espn.assert_not_called()
         finally:
             db_store.configure_engine("sqlite://")       # restore for tearDown
 

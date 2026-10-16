@@ -4053,7 +4053,13 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=
             # NBA warehouse sweep: per-player games (all box stats) from nba_warehouse,
             # served from the one-shot bulk index. All 10/16 props + combos grade off this.
             import nba_stats_source as nba_source
-            gl = _nba_bulk_for().get(nba_source._norm(name))
+            _bulk = _nba_bulk_for()
+            gl = _bulk.get(nba_source._norm(name))
+            if not gl and _bulk:
+                import nba_names
+                if "r" not in _nba_bulk:
+                    _nba_bulk["r"] = nba_names.Resolver(_bulk)
+                gl = _bulk.get(_nba_bulk["r"].resolve(name) or "")
             if not gl:
                 _skips["no_warehouse_gamelog"] = _skips.get("no_warehouse_gamelog", 0) + 1
                 continue
@@ -4443,9 +4449,21 @@ def run_player_props_backtest(sport, espn_sport, espn_league, sport_key,
     if unique_team_ids:
         print(f"\n=== Fetching team schedules for reliability filter "
               f"({len(unique_team_ids)} teams) ===")
+        nba_team_sched = None
+        if nba_wh_mode:
+            # NBA: the warehouse team-game rows (stats.nba.com team_id keys — what the
+            # gamelog rows carry); the filter reads only the game dates. No ESPN.
+            import nba_warehouse
+            nba_team_sched = {}
+            for r in nba_warehouse.team_games(
+                    [season_year or nba_warehouse._current_season()]):
+                nba_team_sched.setdefault(str(r.get("team_id")), []).append(
+                    {"date": r.get("game_date")})
         for tid in unique_team_ids:
             try:
-                if use_warehouse:
+                if nba_team_sched is not None:
+                    team_schedules_for_filter[tid] = nba_team_sched.get(tid, [])
+                elif use_warehouse:
                     # Warehouse rows carry MLBAM team_ids; the reliability filter reads
                     # only the schedule's game dates (_extract_schedule_dates), which
                     # _team_final_games supplies as 'date'.

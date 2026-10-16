@@ -648,8 +648,6 @@ def _nba_grade_book_lines(book_lines, min_test_minutes=10.0, min_priors=10):
         import nba_warehouse
     except Exception:
         return None
-    if not db_store.enabled():
-        return None
     prop_cols = nba_source.PROP_STAT_COLS
     seasons = sorted({nba_source.end_year_for_date((r.get("game_date") or "")[:10])
                       for r in book_lines if r.get("game_date")} - {None})
@@ -740,9 +738,8 @@ def join_book_lines_to_actuals(book_lines, espn_sport, espn_league):
     # ESPN gamelog. Returns None only when the warehouse is unavailable → fall through to the
     # legacy ESPN path below (which still grades the 3 ESPN-mapped props).
     if espn_sport == "basketball":
-        nba = _nba_grade_book_lines(book_lines)
-        if nba is not None:
-            return nba
+        # WAREHOUSE-ONLY (ESPN retired 2026-10): mirror-first actuals; [] when none.
+        return _nba_grade_book_lines(book_lines) or []
     # Group by canonical id (falling back to name) so spelling variants of one
     # player pool together.
     by_player = defaultdict(list)
@@ -2227,7 +2224,9 @@ def main():
     team_defense, league_avg_def = {}, None
     if any(v.get("opp_defense_strength", 0.0) > 0 for v in variants.values()):
         print("\n=== Building team-defense lookup for one variant ===")
-        team_defense, _, league_avg_def = _team_defense_lookup(espn_sport, espn_league)
+        team_defense, _, league_avg_def = (
+            ({}, {}, None) if espn_sport == "basketball"            # NBA: no ESPN (retired)
+            else _team_defense_lookup(espn_sport, espn_league))
 
     print("\n=== Evaluating forecasters at REAL book lines ===")
     print()
@@ -2290,7 +2289,9 @@ def main():
         sm_league_avg = league_avg_def
         if sm_params.get("output_def_strength", 0.0) > 0 and not sm_team_def:
             print("\n=== Building team-defense lookup for safe-mode sim ===")
-            sm_team_def, _, sm_league_avg = _team_defense_lookup(espn_sport, espn_league)
+            sm_team_def, _, sm_league_avg = (
+                ({}, {}, None) if espn_sport == "basketball"
+                else _team_defense_lookup(espn_sport, espn_league))
         print_safe_mode_report(enriched, sm_params, sport_key,
                                sm_team_def, sm_league_avg, targets=targets)
 

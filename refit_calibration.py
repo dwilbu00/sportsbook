@@ -33,8 +33,6 @@ from calibration_loader import (
     has_candidate, promote_calibration, discard_candidate, diff_calibration,
     candidate_path, load_calibration_for_refit, existing_candidate_notice,
 )
-from espn_cache import seed_athlete_id
-from espn_client import list_season_athletes
 
 
 def _defense_lookup(espn_sport, espn_league, season_year=None):
@@ -47,6 +45,10 @@ def _defense_lookup(espn_sport, espn_league, season_year=None):
     """
     if espn_sport == "baseball":
         return _mlb_warehouse_defense_lookup(season_year=season_year)
+    if espn_sport == "basketball":
+        # NBA: no ESPN (retired 2026-10); the raw points-allowed defense is retired for NBA
+        # (pace/defense context lives in nba_prop_context) -> an empty, inert lookup.
+        return {}, {}, None
     return _team_defense_lookup(espn_sport, espn_league, season_year=season_year)
 
 
@@ -455,37 +457,27 @@ def _nba_player_pool(season, max_players=150, min_games=15):
     books actually offer props on; `min_games` drops 10-day / deep-bench noise
     that isn't bet on while keeping rotation players who have real DNPs.
 
-    The authoritative ESPN ids from the listing are pinned into the id cache
-    (`seed_athlete_id`) so the broad name list resolves to the RIGHT players
-    instead of `search_athlete`'s first name match. Returns a de-duplicated list
-    of names, or [] on failure (refit_sport then aborts rather than fitting from
-    the 18-star fallback).
+    Source = the stats.nba.com warehouse player-game corpus (mirror-first; ESPN retired
+    2026-10). Names are returned in the warehouse's own spelling, so fetch_player_data's
+    name_norm lookup resolves them exactly. Returns a de-duplicated list of names, or [] on
+    failure (refit_sport then aborts rather than fitting from the 18-star fallback).
     """
-    if not season:
-        season = datetime.now(timezone.utc).year
     try:
-        athletes = list_season_athletes("basketball", "nba", season)
+        import nba_warehouse
+        if not season:
+            season = nba_warehouse._current_season()
+        bulk = nba_warehouse.calib_gamelogs_bulk([int(season)])
     except Exception as exc:
         print(f"  [warn] NBA player pool unavailable: {exc}")
         return []
-
-    eligible = [a for a in athletes
-                if (a.get("games") or 0) >= min_games
-                and (a.get("minutes") or 0) > 0]
-    eligible.sort(key=lambda a: a.get("minutes") or 0.0, reverse=True)
-
-    names, seen = [], set()
-    for a in eligible[:max_players]:
-        name = a.get("name")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        try:
-            seed_athlete_id("basketball", "nba", name, a.get("id"))
-        except OSError:
-            pass  # best effort; cached_athlete_id falls back to name search
-        names.append(name)
-    return names
+    ranked = []
+    for nn, games in bulk.items():
+        played = [g for g in games if g.get("season") == int(season) and g.get("played")
+                  and (g.get("MIN") or 0) > 0]
+        if len(played) >= min_games:
+            ranked.append((sum(float(g["MIN"]) for g in played), nn))
+    ranked.sort(reverse=True)
+    return [nn.title() for _mins, nn in ranked[:max_players]]
 
 
 def _nba_pool_union(seasons, max_players=150, min_games=15):
