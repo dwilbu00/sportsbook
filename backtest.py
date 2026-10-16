@@ -4032,7 +4032,7 @@ def fetch_player_data(espn_sport, espn_league, players, season_year=None, quiet=
 
     def _nba_bulk_for():
         # One warehouse query for the whole season's player-games, served per player from
-        # memory (mirrors _bulk_for for MLB). Keyed by name_norm (== nba_source._norm).
+        # memory (mirrors _bulk_for for MLB). Keyed by name_norm (== nba_stats_source._norm).
         if not _nba_bulk:
             try:
                 import nba_warehouse

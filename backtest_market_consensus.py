@@ -566,6 +566,12 @@ def _espn_results_cache_path(sport, season_year):
 
 
 def _load_espn_results(sport, league, season_year):
+    """ESPN completed-game results (with commence times) for the consensus backtest.
+
+    NBA EXCEPTION (owner 2026-10-16): NBA keeps this ESPN schedule on purpose — it needs TIP-OFF
+    TIMES, which the stats.nba.com mirror we ingest (sportsdataverse nba_stats_*) doesn't carry and
+    the official stats.nba.com / cdn.nba.com endpoints block from our network. Everything in NBA
+    pricing/grading/calibration is ESPN-free; only these research tools use ESPN for NBA times."""
     os.makedirs(RESULT_CACHE_DIR, exist_ok=True)
     path = _espn_results_cache_path(sport, season_year)
     if os.path.exists(path):

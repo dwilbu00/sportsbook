@@ -263,9 +263,9 @@ DEFAULT_PLAYER_PROP_VENUE_STRENGTH = None  # None = inherit from VENUE_MATCH_WEI
 # Tuned per backtest sweep on 18 NBA starters × 60 games:
 #   - NBA: 1.0 — best single-feature gain: MAE 3.774 → 3.751, Hit% +2.79pp,
 #     bias drops +0.086 → +0.060.
-PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = {
-    "basketball_nba": 1.0,
-}
+# (NBA's 1.0 entry retired 2026-10: raw points-allowed defense is dead for NBA — its pace/
+# defense context lives in nba_prop_context, calibrated per prop.)
+PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = {}
 DEFAULT_PLAYER_PROP_OUTPUT_DEFENSE_STRENGTH = 0.0  # off by default for unknown sports
 
 

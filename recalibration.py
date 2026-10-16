@@ -1544,7 +1544,7 @@ def _nfl_grade_from_nflverse():
     return _NFL_GRADE_FROM_NFLVERSE_DEFAULT
 
 
-# NBA prop -> stat column(s): the single source of truth is nba_source.PROP_STAT_COLS
+# NBA prop -> stat column(s): the single source of truth is nba_stats_source.PROP_STAT_COLS
 # (shared by grading here, warehouse history, and the live history path). A tuple is SUMMED.
 
 
@@ -2766,7 +2766,7 @@ def maintain_sport(sport_key, max_resolve=MAX_RESOLVE_PER_LAUNCH):
         # NBA sportsdataverse warehouse: keep the durable nba_* tables current from the
         # dep-free ESPN-family parquet (schedule + player box). Fail-open — a warehouse
         # hiccup must never block resolution/refit. Bulk history = the offline backfill
-        # (nba_warehouse CLI). This supersedes the ephemeral ESPN nba_gamelog cache.
+        # (nba_warehouse CLI). NBA is warehouse-only (the ESPN nba_gamelog cache was retired 2026-10).
         try:
             import nba_warehouse
             nba_warehouse.ingest_maintenance()

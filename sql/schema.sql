@@ -591,28 +591,6 @@ CREATE INDEX ix_mlb_pitcher_gamelog_athlete
     ON dbo.mlb_pitcher_gamelog (athlete_id, season_bucket);
 GO
 
---------------------------------------------------------------------- nba_gamelog
-IF OBJECT_ID('dbo.nba_gamelog', 'U') IS NULL
-CREATE TABLE dbo.nba_gamelog (
-    id            INT IDENTITY(1,1) PRIMARY KEY,
-    athlete_id    NVARCHAR(32) NOT NULL,
-    season_bucket INT NOT NULL,
-    game_key      NVARCHAR(220),
-    game_date     NVARCHAR(40),
-    opponent      NVARCHAR(160),
-    is_home       BIT,
-    team_id       NVARCHAR(32),
-    completed     BIT,
-    [MIN] FLOAT, [PTS] FLOAT, [REB] FLOAT, [AST] FLOAT
-);
-GO
-IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'ix_nba_gamelog_athlete'
-                 AND object_id = OBJECT_ID('dbo.nba_gamelog'))
-CREATE INDEX ix_nba_gamelog_athlete
-    ON dbo.nba_gamelog (athlete_id, season_bucket);
-GO
-
 --------------------------------------------------------------------- nfl_gamelog
 -- ONE position-dependent row per game. Stores the UNAMBIGUOUS ESPN machine-name stats
 -- every graded prop needs (NOT the collision-prone display labels YDS/TD). A position
@@ -652,7 +630,7 @@ CREATE TABLE dbo.gamelog_fetch_meta (
     league          NVARCHAR(32) NOT NULL,
     athlete_id      NVARCHAR(32) NOT NULL,
     season_bucket   INT NOT NULL,
-    player_type     NVARCHAR(16),                   -- batter|pitcher|nba
+    player_type     NVARCHAR(16),                   -- batter|pitcher|nfl (nba retired)
     last_fetched_at FLOAT,                           -- epoch seconds
     game_count      INT,
     CONSTRAINT uq_gamelog_fetch_meta

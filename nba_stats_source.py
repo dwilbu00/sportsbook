@@ -1,6 +1,6 @@
 """nba_stats_source.py — dep-free sportsdataverse NBA-Stats (stats.nba.com) data layer.
 
-The migration target replacing the ESPN-family nba_source.py (2026-10): OFFICIAL NBA stats —
+The 2026-10 migration target (the ESPN-family nba_source.py it replaced is deleted): OFFICIAL NBA stats —
 real person_id / team_id (int64) + game_id (zero-padded string), advanced team defense
 (def_rating/pace/opponent splits), and clean DNP reasons — published as per-season parquet
 GitHub release assets, read dep-free with pandas (the sportsdataverse package is NEVER imported

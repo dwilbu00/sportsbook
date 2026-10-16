@@ -118,7 +118,12 @@ def collect_completed_games(espn_sport, espn_league, season_years=None):
     ``season_years``: None = the CURRENT ESPN season only; a list of years = fetch
     each and merge (so a multi-season --start/--end range enumerates history — ESPN's
     per-team schedule returns one season at a time, so without this a 2023-2026 range
-    only ever saw the current season)."""
+    only ever saw the current season).
+
+    NBA EXCEPTION (owner 2026-10-16): NBA keeps this ESPN schedule on purpose — it needs TIP-OFF
+    TIMES, which the stats.nba.com mirror we ingest (sportsdataverse nba_stats_*) doesn't carry and
+    the official stats.nba.com / cdn.nba.com endpoints block from our network. Everything in NBA
+    pricing/grading/calibration is ESPN-free; only these research tools use ESPN for NBA times."""
     teams = get_all_teams(espn_sport, espn_league)
     if season_years is None:
         years = [None]                                   # current season

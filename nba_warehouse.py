@@ -92,7 +92,7 @@ nba_player = Table(
 # ── Per-player-game stat fact ───────────────────────────────────────────────────
 # Grain: one row per (player, game). Natural key UNIQUE(person_id, game_id). Stat columns use
 # CANONICAL warehouse names (mapped from stats.nba.com source names at ingest) so downstream
-# readers + nba_source.PROP_STAT_COLS are unchanged. `played` = minutes>0 (DNP/void signal);
+# readers + nba_stats_source.PROP_STAT_COLS are unchanged. `played` = minutes>0 (DNP/void signal);
 # `dnp_reason` carries the stats.nba.com `comment` for a non-played row.
 _BOX_STATS = ("minutes", "points", "field_goals_made", "field_goals_attempted",
               "three_point_field_goals_made", "three_point_field_goals_attempted",
