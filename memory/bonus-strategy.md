@@ -33,7 +33,7 @@ The backtest (`nfl_bonus_backtest.py`, 2023-25 DK+FD) proved our MODEL P is OVER
 ## MLB parity
 MLB bonus arc wired (legs/gate/SGP) through `2fa8b2c` — MLB uses `sgp_stacks_indep` (independence; step-3 verdict = MLB same-game correlations weak, copula doesn't beat independence). `sport` field on bonuses; opportunity + threshold scripts exist for MLB.
 
-## NBA (built 2026-10-13, `55adc11`..`ff0e5e6`; UNPUSHED until owner authorizes)
+## NBA (SHIPPED + LIVE + PUSHED 2026-10-16, `b3b768b..ffe8952`)
 - **Leg trust** (`nba_opportunity_threshold.py`, real DK+FD lines graded on EVERY played game — a bet settles once the player checks in, only a DNP voids): the de-vigged NBA prop price is calibrated at EVERY expected-minutes level (even <15 min) and from opening night (0 priors) → **no opportunity gate** (participation-only, like MLB). DK favorite-side ECE 0.002 over 328k lines.
 - ⚠ **The even-split de-vig OVER-SHADES**: favorite overs win ~1.5 pts below their de-vig P (DK −0.016, FD −0.015), unders above (+0.014 / +0.007), in EVERY prop — hidden by the pooled favorite check (the sides cancel). It also masqueraded as same-game correlation (raw opponent OO pairs 0.94×, UU 1.06×). Fix = per-(book, prop) Platt map on the de-vigged OVER P (`nba_book_calibration.py`; fit 2023-25, adopted only if it beats raw on held-out 2026 log-loss → 16 of 18; refit on all seasons) → `calibration/book_calibration_basketball_nba.json` keyed `<prop>@<book>`; `book_calibration.apply(..., book=)` (NFL/MLB maps unchanged).
 - **Leg P = the bonus book's OWN two-way de-vig at the line + its per-book map** (`legs_from_scoped_board` NBA branch) — NOT the board's `over_implied` (an all-book consensus at DK's line, a different number the maps weren't fit on).
