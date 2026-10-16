@@ -4301,6 +4301,24 @@ def _rc_run_bucket(name, method, brows, blc, min_cell_n):
                 resid, r["line"] - (r["projected"] + mu))
         print(f"     split: pool={len(pool)} (residual ECDF, mu={mu:+.3f})  "
               f"train={len(train)}  test={len(test)} (3-way)")
+    elif method == "B":
+        # Pooled-Gaussian (calibration_loader.calibrate_prob "B"): P(over) =
+        # Phi((projected + mu - line) / sigma), mu/sigma (population) fit on an OLDER pool
+        # — the same 3-way chronological split as C, so the recal map never sees its pool.
+        if n < 180:
+            print(f"     too thin (n={n} < 180) for a 3-way pool/train/test "
+                  f"split; skipped.")
+            return
+        t1, t2 = n // 3, 2 * n // 3
+        pool, train, test = brows[:t1], brows[t1:t2], brows[t2:]
+        resid = [r["actual"] - r["projected"] for r in pool]
+        mu = sum(resid) / len(resid)
+        sigma = math.sqrt(sum((x - mu) ** 2 for x in resid) / len(resid)) or 1e-6
+        for r in train + test:
+            z = ((r["projected"] + mu) - r["line"]) / sigma
+            r["p_raw"] = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        print(f"     split: pool={len(pool)} (pooled Gaussian, mu={mu:+.3f}, "
+              f"sigma={sigma:.3f})  train={len(train)}  test={len(test)} (3-way)")
     elif method == "D":
         drows = [r for r in brows if r.get("p_dist") is not None]
         if len(drows) < 120:
