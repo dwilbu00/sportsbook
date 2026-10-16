@@ -898,7 +898,12 @@ def consensus_odds(team_odds_list):
 
 
 PLAYER_PROPS_BY_SPORT = {
-    "basketball_nba": ["player_points", "player_assists", "player_rebounds"],
+    # NBA: every calibrated prop (= nfl_bonus_optimizer.NBA_BONUS_MARKETS). The Value Finder
+    # offers these in a multiselect — credits are spent only on the props ticked per run.
+    "basketball_nba": ["player_points", "player_assists", "player_rebounds", "player_threes",
+                       "player_steals", "player_blocks", "player_turnovers",
+                       "player_points_rebounds", "player_points_assists",
+                       "player_points_rebounds_assists"],
     "americanfootball_nfl": ["player_pass_yds", "player_pass_tds", "player_pass_attempts",
                              "player_pass_completions", "player_rush_yds", "player_rush_attempts",
                              "player_reception_yds", "player_receptions", "player_anytime_td"],

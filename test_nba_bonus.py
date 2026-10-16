@@ -34,6 +34,14 @@ class MarketsTests(unittest.TestCase):
         self.assertEqual(opt.bonus_markets("baseball_mlb"), opt.MLB_BONUS_MARKETS)
         self.assertEqual(set(opt.NBA_ABBR), set(opt.NBA_BONUS_MARKETS))
 
+    def test_value_finder_offers_every_bonus_market(self):
+        # owner 2026-10-16: the Value Finder offers all 10 calibrated NBA props, so a board
+        # built there can feed every NBA bonus market (credits only on props ticked per run)
+        import odds_client
+        self.assertEqual(set(odds_client.PLAYER_PROPS_BY_SPORT["basketball_nba"]),
+                         set(opt.NBA_BONUS_MARKETS))
+        self.assertTrue(all(p in odds_client.PROP_LABELS for p in opt.NBA_BONUS_MARKETS))
+
 
 class LegsTests(unittest.TestCase):
     def _legs(self, props, book, maps=None, teams=None, resolve=None):
