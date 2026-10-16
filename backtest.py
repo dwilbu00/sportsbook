@@ -2638,7 +2638,7 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
     # (props.py). The k-sweep must be tuned on that SAME post-Platt prob, or k is
     # inflated by overconfidence Platt already removes. (Lazy import avoids any
     # import-order coupling; recalibration is otherwise unused here.)
-    from recalibration import apply_platt, load_recalibration
+    from recalibration import apply_recal_cfg, load_recalibration
     import props as _props_recal   # for the LIVE line-conditional Platt resolver
     recal = load_recalibration(sport_key) or {}
     hl = half_life or _half_life_for(sport_key)
@@ -2825,11 +2825,8 @@ def run_props_odds_backtest(sport, espn_sport, espn_league, sport_key, props,
                 # the pre-Platt prob for backtest continuity.)
                 rcfg = _props_recal._resolve_recal_cfg(
                     recal, prop, line, calibration.get(prop))
-                p_final = p_model
-                if rcfg and rcfg.get("a") is not None:
-                    adj = apply_platt(p_model, rcfg.get("a"), rcfg.get("b"))
-                    if adj is not None:
-                        p_final = max(0.0, min(1.0, adj))
+                # Platt or a base-method isotonic seed (same helper serving uses).
+                p_final = apply_recal_cfg(p_model, rcfg)
                 results[prop]["prior_k"].append(
                     (p_final, fair_over, outcome, len(prior)))
                 results[prop]["ev_obs"].append(

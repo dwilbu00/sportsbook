@@ -4465,37 +4465,48 @@ def _stage_base_recal(sport_key, prop, res_by_method):
     """Stage a BASE-method prop's winning recal (no line_methods).
 
     Platt winner -> merge {a, b, n_fit, validated} into the recalibration SEED
-    (recalibration_<sport>.json), which serving applies for a bare prop via
-    props._resolve_recal_cfg -> apply_platt. The seed is a committed file, so this
-    is reviewed with `git diff` + commit (NOT the calibration --diff/--promote
-    candidate). Isotonic winner -> not yet wired for base-method props (serving
-    reads recal_iso only from a line_methods bucket)."""
+    (recalibration_<sport>.json); isotonic winner -> merge {kind: "isotonic", kx, ky,
+    n_fit, validated}. Serving applies either for a bare prop via
+    props._resolve_recal_cfg -> recalibration.apply_recal_cfg. The seed is a committed
+    file, so this is reviewed with `git diff` + commit (NOT the calibration
+    --diff/--promote candidate)."""
     res = next(iter(res_by_method.values()), None)   # one group for a base-method prop
     if not res or res.get("winner") == "raw":
         print(f"\n  (--save-recal: {prop} winner is raw/none — nothing to stage.)")
         return
+    src = "diagnose_recalibration --recal-prop"
     if res.get("winner") == "isotonic":
-        print(f"\n  (--save-recal: {prop} winner is ISOTONIC on a base-method prop; "
-              f"serving reads recal_iso only from line_methods buckets, so base-method "
-              f"isotonic staging is not yet wired.)")
-        return
-    platt = res.get("platt") or {}
-    a, b = platt.get("a"), platt.get("b")
-    if a is None or b is None:
-        print(f"\n  (--save-recal: {prop} platt map incomplete — nothing staged.)")
-        return
+        iso = res.get("iso") or {}
+        kx, ky = iso.get("kx"), iso.get("ky")
+        if not kx or not ky:
+            print(f"\n  (--save-recal: {prop} isotonic map incomplete — nothing staged.)")
+            return
+        entry = {"kind": "isotonic", "kx": [round(float(x), 6) for x in kx],
+                 "ky": [round(float(y), 6) for y in ky],
+                 "n_fit": int(iso.get("n") or 0), "validated": True, "source": src}
+        desc = f"isotonic ({len(kx)} knots, n={iso.get('n')})"
+    else:
+        platt = res.get("platt") or {}
+        a, b = platt.get("a"), platt.get("b")
+        if a is None or b is None:
+            print(f"\n  (--save-recal: {prop} platt map incomplete — nothing staged.)")
+            return
+        entry = {"a": round(float(a), 6), "b": round(float(b), 6),
+                 "n_fit": int(platt.get("n") or 0), "validated": True, "source": src}
+        desc = f"Platt (a={a:.3f}, b={b:+.3f}, n={platt.get('n')})"
+    import json
     import recalibration as rc
     _, seed = rc._read_local_recal(sport_key)
     props = dict(seed or {})
-    props[prop] = {"a": round(float(a), 6), "b": round(float(b), 6),
-                   "n_fit": int(platt.get("n") or 0), "validated": True,
-                   "source": "diagnose_recalibration --recal-prop"}
-    rc.save_recalibration(
-        sport_key, props,
-        meta={f"{prop}_recal": "diagnose_recalibration platt (base-method)"},
-        to_blob=False)
-    print(f"\n  [save] staged Platt recal for {prop} (a={a:.3f}, b={b:+.3f}, "
-          f"n={platt.get('n')}) into the recalibration seed "
+    props[prop] = entry
+    try:                       # keep the other props' provenance (save replaces meta)
+        with open(rc.recalibration_path(sport_key), encoding="utf-8") as f:
+            meta = dict(json.load(f).get("meta") or {})
+    except Exception:
+        meta = {}
+    meta[f"{prop}_recal"] = f"diagnose_recalibration {res.get('winner')} (base-method)"
+    rc.save_recalibration(sport_key, props, meta=meta, to_blob=False)
+    print(f"\n  [save] staged {desc} recal for {prop} into the recalibration seed "
           f"calibration/recalibration_{sport_key}.json — review with `git diff`, "
           f"then commit (this is a committed seed, not a --diff/--promote candidate).")
 
@@ -4511,8 +4522,9 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
     line_methods bucket(s) as ``recal_iso`` (candidate; live untouched). Serving
     applies it as the single calibration slot (props._apply_final_recalibration),
     taking precedence over Platt. A base-method prop (no line_methods, e.g.
-    pitcher_strikeouts) is MEASURE-ONLY for now — the number is reported but staging
-    for base-method props is not yet wired. Default (no save) = diagnostic only.
+    pitcher_strikeouts, every NBA prop) stages its Platt OR isotonic winner into the
+    committed recalibration seed instead (_stage_base_recal). Default (no save) =
+    diagnostic only.
 
     The raw probability reconstructs exactly what production emits per line bucket
     (method A: as-of empirical over-rate; method C: residual-ECDF tail on an older
@@ -4560,8 +4572,8 @@ def diagnose_recalibration(sport, store_label="", min_cell_n=50, save=False,
         return
 
     # Base-method prop (no line_methods, e.g. pitcher_strikeouts): stage the single
-    # method-group's winner. Platt -> the recalibration SEED (serving applies it via
-    # _resolve_recal_cfg); isotonic base-staging is not yet wired.
+    # method-group's winner (Platt or isotonic) -> the recalibration SEED (serving
+    # applies it via _resolve_recal_cfg -> apply_recal_cfg).
     if not line_methods:
         _stage_base_recal(sport_key, prop, res_by_method)
         return

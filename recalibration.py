@@ -2183,6 +2183,25 @@ def apply_isotonic(raw_prob, kx, ky):
     return y0 + (raw_prob - x0) / (x1 - x0) * (y1 - y0)
 
 
+def apply_recal_cfg(raw_prob, cfg):
+    """Apply ONE recal-map entry: a Platt fit ({"a", "b", ...}) or a base-method
+    ISOTONIC seed ({"kind": "isotonic", "kx", "ky", ...} — staged by refit_calibration
+    --recalibrate --save-recal when isotonic was the OOS winner for a prop without
+    line_methods, e.g. NBA PRA). Missing/empty cfg -> raw_prob unchanged; result
+    clamped to [0, 1]. [2026-10-16]"""
+    if raw_prob is None or not cfg:
+        return raw_prob
+    if cfg.get("kind") == "isotonic":
+        adj = apply_isotonic(raw_prob, cfg.get("kx"), cfg.get("ky"))
+    elif cfg.get("a") is not None:
+        adj = apply_platt(raw_prob, cfg.get("a"), cfg.get("b"))
+    else:
+        return raw_prob
+    if adj is None:
+        return raw_prob
+    return max(0.0, min(1.0, adj))
+
+
 def _probability_scores(probabilities, outcomes):
     """Return (Brier, log loss) for binary probability forecasts."""
     if not probabilities:
@@ -2454,6 +2473,11 @@ def _load_recal_cached(sport_key):
             merged = dict(seed_props)
             for key, loop_cfg in sql_props.items():
                 seed_cfg = seed_props.get(key)
+                if seed_cfg and seed_cfg.get("a") is None:
+                    # An ISOTONIC seed (the OOS winner over Platt on the book-line
+                    # corpus) has no a/b to blend a Platt loop fit toward — the seed
+                    # stands until it is re-staged.
+                    continue
                 merged[key] = _blend_recal(seed_cfg, loop_cfg) if seed_cfg else loop_cfg
             # fit_ts keys on the PRE-merge sql_props: `merged` is always non-empty
             # once a seed exists, so keying on it would mask "no SQL fit yet" from
@@ -2549,7 +2573,9 @@ def refit_sport(sport_key, resolve_first=True, max_resolve=MAX_RESOLVE_PER_LAUNC
     per_prop_params = {}
     for fit_key, records in by_prop_records.items():
         seed_cfg = seed_props.get(fit_key)
-        incumbent = (seed_cfg["a"], seed_cfg["b"]) if seed_cfg else None
+        # (an isotonic seed has no Platt incumbent; it outranks the loop fit at load)
+        incumbent = ((seed_cfg["a"], seed_cfg["b"])
+                     if seed_cfg and seed_cfg.get("a") is not None else None)
         result = fit_platt_chronological(records, incumbent=incumbent)
         if result is None:
             continue
@@ -3176,6 +3202,10 @@ def _main_cli():
         else:
             print(f"Current Platt params for {sport_key}:")
             for prop_key, cfg in sorted(params.items()):
+                if cfg.get("kind") == "isotonic":
+                    print(f"  {prop_key:<22} isotonic ({len(cfg.get('kx') or [])} knots)"
+                          f"  n_fit={cfg.get('n_fit')}")
+                    continue
                 print(f"  {prop_key:<22} a={cfg.get('a'):+.4f} "
                       f"b={cfg.get('b'):+.4f}  n_fit={cfg.get('n_fit')}")
 

@@ -1,0 +1,456 @@
+################ player_points
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_points ===
+  53578 book lines (53578 backfill store + 0 prediction log)
+  Matched 45,514 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 42 (date/DNP), 1,036 (low-min test game), 6,986 (<10 priors), 0 (unmapped prop).
+  n_total=45514  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 1.5-39.5: shipped method B, n=45514 ──
+     split: pool=15171 (pooled Gaussian, mu=+0.071, sigma=6.818)  train=15171  test=15172 (3-way)
+     Platt: a=0.042 (shrinks toward base), b=-0.026; train over-rate=0.494
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2616    0.7192  0.0891
+       platt        0.2498    0.6928  0.0093
+       isotonic     0.2500    0.6941  0.0049
+     winner (OOS log-loss): platt — improves raw (0.7192 -> 0.6928, ECE 0.0891 -> 0.0093)
+     vs de-vigged MARKET (priced n=15172): map brier 0.2498 vs market 0.2493, BSS -0.0021 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 1.5-39.5 raw (n=15172)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1         8   0.500      [0.215, 0.785]  [THIN]
+       0.1-0.2        84   0.429      [0.328, 0.535]        
+       0.2-0.3       436   0.472      [0.426, 0.519]        
+       0.3-0.4      1641   0.475      [0.451, 0.500]        
+       0.4-0.5      4013   0.490      [0.475, 0.506]        
+       0.5-0.6      5249   0.484      [0.471, 0.498]        
+       0.6-0.7      2876   0.510      [0.492, 0.528]        
+       0.7-0.8       730   0.538      [0.502, 0.574]        
+       0.8-0.9       120   0.525      [0.436, 0.612]        
+       0.9-1.0        15   0.733      [0.480, 0.891]  [THIN]
+     reliability AFTER (platt):
+     reliability — lines 1.5-39.5 platt (n=15172)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.4-0.5     13241   0.487      [0.478, 0.495]        
+       0.5-0.6      1931   0.531      [0.509, 0.554]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.093   10087     5806     1350   0.481  -6.2%(15172)
+       platt        0.018     143        1        0   0.104  -7.2%(15172)
+
+  [save] staged Platt (a=0.073, b=-0.033, n=30343) recal for player_points into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_rebounds
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_rebounds ===
+  51854 book lines (51854 backfill store + 0 prediction log)
+  Matched 44,066 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 44 (date/DNP), 989 (low-min test game), 6,755 (<10 priors), 0 (unmapped prop).
+  n_total=44066  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-16.5: shipped method B, n=44066 ──
+     split: pool=14688 (pooled Gaussian, mu=+0.034, sigma=2.723)  train=14689  test=14689 (3-way)
+     Platt: a=0.161 (shrinks toward base), b=-0.102; train over-rate=0.478
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2620    0.7212  0.0888
+       platt        0.2494    0.6920  0.0089
+       isotonic     0.2498    0.6927  0.0159
+     winner (OOS log-loss): platt — improves raw (0.7212 -> 0.6920, ECE 0.0888 -> 0.0089)
+     vs de-vigged MARKET (priced n=14689): map brier 0.2494 vs market 0.2481, BSS -0.0053 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-16.5 raw (n=14689)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1        19   0.316      [0.154, 0.540]  [THIN]
+       0.1-0.2        89   0.382      [0.288, 0.486]        
+       0.2-0.3       486   0.428      [0.385, 0.472]        
+       0.3-0.4      1750   0.469      [0.445, 0.492]        
+       0.4-0.5      3905   0.477      [0.461, 0.492]        
+       0.5-0.6      4507   0.494      [0.480, 0.509]        
+       0.6-0.7      2664   0.501      [0.482, 0.520]        
+       0.7-0.8      1008   0.533      [0.502, 0.563]        
+       0.8-0.9       236   0.508      [0.445, 0.572]        
+       0.9-1.0        25   0.560      [0.371, 0.733]        
+     reliability AFTER (platt):
+     reliability — lines 0.5-16.5 platt (n=14689)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.3-0.4        30   0.400      [0.246, 0.577]        
+       0.4-0.5     12411   0.482      [0.473, 0.490]        
+       0.5-0.6      2245   0.522      [0.502, 0.543]        
+       0.6-0.7         3   0.667      [0.208, 0.939]  [THIN]
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.099    9920     6004     1636   0.527  -6.2%(14689)
+       platt        0.044    5562      757        1   0.232  -4.9%(14689)
+
+  [save] staged Platt (a=0.159, b=-0.084, n=29378) recal for player_rebounds into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_assists
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_assists ===
+  35275 book lines (35275 backfill store + 0 prediction log)
+  Matched 30,304 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 34 (date/DNP), 414 (low-min test game), 4,523 (<10 priors), 0 (unmapped prop).
+  n_total=30304  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-13.5: shipped method B, n=30304 ──
+     split: pool=10101 (pooled Gaussian, mu=+0.017, sigma=2.430)  train=10101  test=10102 (3-way)
+     Platt: a=0.116 (shrinks toward base), b=-0.073; train over-rate=0.485
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2589    0.7146  0.0778
+       platt        0.2492    0.6915  0.0106
+       isotonic     0.2492    0.6927  0.0121
+     winner (OOS log-loss): platt — improves raw (0.7146 -> 0.6915, ECE 0.0778 -> 0.0106)
+     vs de-vigged MARKET (priced n=10102): map brier 0.2492 vs market 0.2460, BSS -0.0126 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-13.5 raw (n=10102)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1         8   0.625      [0.306, 0.863]  [THIN]
+       0.1-0.2        39   0.436      [0.293, 0.590]        
+       0.2-0.3       238   0.487      [0.425, 0.551]        
+       0.3-0.4      1015   0.438      [0.408, 0.469]        
+       0.4-0.5      2774   0.464      [0.445, 0.483]        
+       0.5-0.6      3277   0.484      [0.467, 0.501]        
+       0.6-0.7      1946   0.525      [0.503, 0.547]        
+       0.7-0.8       657   0.540      [0.502, 0.578]        
+       0.8-0.9       133   0.549      [0.464, 0.631]        
+       0.9-1.0        15   0.533      [0.301, 0.752]  [THIN]
+     reliability AFTER (platt):
+     reliability — lines 0.5-13.5 platt (n=10102)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.3-0.4         1   1.000      [0.207, 1.000]  [THIN]
+       0.4-0.5      8587   0.476      [0.465, 0.486]        
+       0.5-0.6      1514   0.548      [0.523, 0.573]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.093    6640     3778      949   0.501  -5.1%(10102)
+       platt        0.052    4871     1013        0   0.200  -7.4%(10102)
+
+  [save] staged Platt (a=0.171, b=-0.078, n=20203) recal for player_assists into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_threes
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_threes ===
+  45081 book lines (45081 backfill store + 0 prediction log)
+  Matched 38,298 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 35 (date/DNP), 867 (low-min test game), 5,881 (<10 priors), 0 (unmapped prop).
+  n_total=38298  shipped line_methods=C
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-5.5: shipped method C, n=38298 ──
+     split: pool=12766 (residual ECDF, mu=-0.003)  train=12766  test=12766 (3-way)
+     Platt: a=0.187 (shrinks toward base), b=-0.079; train over-rate=0.481
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2666    0.7387  0.1107
+       platt        0.2474    0.6879  0.0125
+       isotonic     0.2473    0.6905  0.0048
+     winner (OOS log-loss): platt — improves raw (0.7387 -> 0.6879, ECE 0.1107 -> 0.0125)
+     vs de-vigged MARKET (priced n=12766): map brier 0.2474 vs market 0.2436, BSS -0.0155 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-5.5 raw (n=12766)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1         6   0.000      [0.000, 0.390]  [THIN]
+       0.1-0.2       286   0.381      [0.327, 0.439]        
+       0.2-0.3      1412   0.398      [0.373, 0.424]        
+       0.3-0.4      2600   0.433      [0.414, 0.452]        
+       0.4-0.5      2755   0.467      [0.449, 0.486]        
+       0.5-0.6      2072   0.472      [0.451, 0.494]        
+       0.6-0.7      1641   0.528      [0.504, 0.552]        
+       0.7-0.8      1146   0.531      [0.502, 0.560]        
+       0.8-0.9       658   0.506      [0.468, 0.544]        
+       0.9-1.0       190   0.558      [0.487, 0.627]        
+     reliability AFTER (platt):
+     reliability — lines 0.5-5.5 platt (n=12766)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.3-0.4        56   0.304      [0.199, 0.433]        
+       0.4-0.5      9171   0.446      [0.436, 0.456]        
+       0.5-0.6      3455   0.527      [0.510, 0.543]        
+       0.6-0.7        84   0.548      [0.441, 0.650]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.131    9709     6987     2862   0.588  -4.3%(12766)
+       platt        0.069    7674     3228       68   0.287  -4.4%(12766)
+
+  [save] staged Platt (a=0.195, b=-0.105, n=25532) recal for player_threes into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_steals
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_steals ===
+  28406 book lines (28406 backfill store + 0 prediction log)
+  Matched 25,595 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 22 (date/DNP), 600 (low-min test game), 2,189 (<10 priors), 0 (unmapped prop).
+  n_total=25595  shipped line_methods=C
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-5.5: shipped method C, n=25595 ──
+     split: pool=8531 (residual ECDF, mu=-0.007)  train=8532  test=8532 (3-way)
+     Platt: a=0.372 (shrinks toward base), b=-0.052; train over-rate=0.484
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2565    0.7218  0.0728
+       platt        0.2449    0.6834  0.0257
+       isotonic     0.2441    0.6841  0.0175
+     winner (OOS log-loss): platt — improves raw (0.7218 -> 0.6834, ECE 0.0728 -> 0.0257)
+     vs de-vigged MARKET (priced n=8532): map brier 0.2449 vs market 0.2373, BSS -0.0322 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-5.5 raw (n=8532)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1         2   0.000      [0.000, 0.658]  [THIN]
+       0.1-0.2       260   0.331      [0.276, 0.390]        
+       0.2-0.3       939   0.358      [0.328, 0.389]        
+       0.3-0.4      1560   0.394      [0.370, 0.418]        
+       0.4-0.5      2156   0.455      [0.435, 0.477]        
+       0.5-0.6      1393   0.543      [0.517, 0.569]        
+       0.6-0.7       943   0.543      [0.511, 0.575]        
+       0.7-0.8       639   0.588      [0.550, 0.626]        
+       0.8-0.9       438   0.562      [0.515, 0.607]        
+       0.9-1.0       202   0.545      [0.476, 0.612]        
+     reliability AFTER (platt):
+     reliability — lines 0.5-5.5 platt (n=8532)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.1-0.2         1   0.000      [0.000, 0.793]  [THIN]
+       0.2-0.3         1   0.000      [0.000, 0.793]  [THIN]
+       0.3-0.4       962   0.342      [0.313, 0.373]        
+       0.4-0.5      4518   0.441      [0.426, 0.455]        
+       0.5-0.6      2280   0.558      [0.538, 0.579]        
+       0.6-0.7       633   0.561      [0.522, 0.599]        
+       0.7-0.8       121   0.545      [0.457, 0.631]        
+       0.8-0.9        15   0.333      [0.152, 0.583]  [THIN]
+       0.9-1.0         1   0.000      [0.000, 0.793]  [THIN]
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.112    6221     4055     1215   0.565   -5.8%(8532)
+       platt        0.078    5434     2675      179   0.382   -6.5%(8532)
+
+  [save] staged Platt (a=0.333, b=-0.086, n=17064) recal for player_steals into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_blocks
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_blocks ===
+  24049 book lines (24049 backfill store + 0 prediction log)
+  Matched 21,817 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 23 (date/DNP), 541 (low-min test game), 1,668 (<10 priors), 0 (unmapped prop).
+  n_total=21817  shipped line_methods=C
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-4.5: shipped method C, n=21817 ──
+     split: pool=7272 (residual ECDF, mu=+0.004)  train=7272  test=7273 (3-way)
+     Platt: a=0.409 (shrinks toward base), b=-0.460; train over-rate=0.362
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2636    0.7503  0.1218
+       platt        0.2407    0.6749  0.0463
+       isotonic     0.2396    0.6730  0.0411
+     winner (OOS log-loss): isotonic — improves raw (0.7503 -> 0.6730, ECE 0.1218 -> 0.0411)
+     vs de-vigged MARKET (priced n=7273): map brier 0.2396 vs market 0.2288, BSS -0.0472 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-4.5 raw (n=7273)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1        30   0.400      [0.246, 0.577]        
+       0.1-0.2       170   0.341      [0.274, 0.415]        
+       0.2-0.3      1556   0.308      [0.285, 0.331]        
+       0.3-0.4      1949   0.394      [0.372, 0.415]        
+       0.4-0.5       752   0.424      [0.389, 0.460]        
+       0.5-0.6       585   0.489      [0.449, 0.529]        
+       0.6-0.7       599   0.444      [0.405, 0.484]        
+       0.7-0.8       643   0.502      [0.464, 0.541]        
+       0.8-0.9       598   0.560      [0.520, 0.599]        
+       0.9-1.0       391   0.565      [0.516, 0.613]        
+     reliability AFTER (isotonic):
+     reliability — lines 0.5-4.5 isotonic (n=7273)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.2-0.3      1854   0.318      [0.297, 0.339]        
+       0.3-0.4      1956   0.393      [0.371, 0.414]        
+       0.4-0.5      2452   0.466      [0.446, 0.486]        
+       0.5-0.6       937   0.564      [0.532, 0.595]        
+       0.6-0.7        38   0.553      [0.397, 0.699]        
+       0.7-0.8        22   0.545      [0.347, 0.731]  [THIN]
+       0.8-0.9        13   0.385      [0.177, 0.645]  [THIN]
+       0.9-1.0         1   1.000      [0.207, 1.000]  [THIN]
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.146    5692     4158     1990   0.602   -8.3%(7273)
+       isotonic     0.094    4969     3001      588   0.522   -6.2%(7273)
+
+  [save] staged isotonic (26 knots, n=14545) recal for player_blocks into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_turnovers
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_turnovers ===
+  20286 book lines (20286 backfill store + 0 prediction log)
+  Matched 18,853 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 12 (date/DNP), 523 (low-min test game), 898 (<10 priors), 0 (unmapped prop).
+  n_total=18853  shipped line_methods=C
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 0.5-5.5: shipped method C, n=18853 ──
+     split: pool=6284 (residual ECDF, mu=-0.017)  train=6284  test=6285 (3-way)
+     Platt: a=0.264 (shrinks toward base), b=-0.036; train over-rate=0.485
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2604    0.7225  0.0932
+       platt        0.2473    0.6878  0.0073
+       isotonic     0.2476    0.6921  0.0160
+     winner (OOS log-loss): platt — improves raw (0.7225 -> 0.6878, ECE 0.0932 -> 0.0073)
+     vs de-vigged MARKET (priced n=6285): map brier 0.2473 vs market 0.2431, BSS -0.0174 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 0.5-5.5 raw (n=6285)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1         7   0.571      [0.250, 0.842]  [THIN]
+       0.1-0.2       156   0.365      [0.294, 0.443]        
+       0.2-0.3       777   0.411      [0.376, 0.446]        
+       0.3-0.4      1076   0.435      [0.406, 0.465]        
+       0.4-0.5      1579   0.487      [0.462, 0.512]        
+       0.5-0.6      1331   0.501      [0.474, 0.528]        
+       0.6-0.7       715   0.527      [0.491, 0.564]        
+       0.7-0.8       367   0.567      [0.516, 0.617]        
+       0.8-0.9       212   0.566      [0.499, 0.631]        
+       0.9-1.0        65   0.585      [0.463, 0.696]        
+     reliability AFTER (platt):
+     reliability — lines 0.5-5.5 platt (n=6285)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.3-0.4       158   0.373      [0.302, 0.451]        
+       0.4-0.5      4004   0.464      [0.449, 0.480]        
+       0.5-0.6      1965   0.517      [0.494, 0.539]        
+       0.6-0.7       154   0.597      [0.518, 0.672]        
+       0.7-0.8         4   0.500      [0.150, 0.850]  [THIN]
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.111    4478     2923      996   0.498   -5.1%(6283)
+       platt        0.062    3333     1252       22   0.248   -4.9%(6285)
+
+  [save] staged Platt (a=0.260, b=-0.046, n=12569) recal for player_turnovers into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_points_rebounds
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_points_rebounds ===
+  48313 book lines (48313 backfill store + 0 prediction log)
+  Matched 41,324 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 42 (date/DNP), 724 (low-min test game), 6,223 (<10 priors), 0 (unmapped prop).
+  n_total=41324  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 3.5-50.5: shipped method B, n=41324 ──
+     split: pool=13774 (pooled Gaussian, mu=+0.099, sigma=8.031)  train=13775  test=13775 (3-way)
+     Platt: a=-0.026 (INVERTS ordering — overfit, disqualified), b=-0.022; train over-rate=0.494
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2650    0.7272  0.1009
+       platt        0.2500    0.6931  0.0038
+       isotonic     0.2500    0.6931  0.0034
+     winner (OOS log-loss): isotonic — improves raw (0.7272 -> 0.6931, ECE 0.1009 -> 0.0034)
+     vs de-vigged MARKET (priced n=13775): map brier 0.2500 vs market 0.2498, BSS -0.0005 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 3.5-50.5 raw (n=13775)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1        11   0.364      [0.152, 0.646]  [THIN]
+       0.1-0.2       113   0.504      [0.414, 0.595]        
+       0.2-0.3       535   0.469      [0.427, 0.512]        
+       0.3-0.4      1780   0.483      [0.459, 0.506]        
+       0.4-0.5      3699   0.496      [0.479, 0.512]        
+       0.5-0.6      4199   0.481      [0.466, 0.496]        
+       0.6-0.7      2558   0.500      [0.481, 0.520]        
+       0.7-0.8       718   0.517      [0.480, 0.553]        
+       0.8-0.9       145   0.483      [0.403, 0.563]        
+       0.9-1.0        17   0.588      [0.360, 0.784]  [THIN]
+     reliability AFTER (isotonic):
+     reliability — lines 3.5-50.5 isotonic (n=13775)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.3-0.4        26   0.500      [0.321, 0.679]        
+       0.4-0.5     13455   0.490      [0.481, 0.498]        
+       0.5-0.6       294   0.507      [0.450, 0.563]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.100    9435     5843     1547   0.475  -6.7%(13775)
+       isotonic     0.020     522       26        0   0.143  -5.3%(13775)
+
+  [save] staged isotonic (14 knots, n=27550) recal for player_points_rebounds into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_points_assists
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_points_assists ===
+  38485 book lines (38485 backfill store + 0 prediction log)
+  Matched 33,175 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 33 (date/DNP), 377 (low-min test game), 4,900 (<10 priors), 0 (unmapped prop).
+  n_total=33175  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 3.5-50.5: shipped method B, n=33175 ──
+     split: pool=11058 (pooled Gaussian, mu=+0.154, sigma=7.565)  train=11058  test=11059 (3-way)
+     Platt: a=-0.042 (INVERTS ordering — overfit, disqualified), b=+0.024; train over-rate=0.505
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2637    0.7247  0.0941
+       platt        0.2503    0.6937  0.0220
+       isotonic     0.2503    0.6938  0.0175
+     winner (OOS log-loss): isotonic — improves raw (0.7247 -> 0.6938, ECE 0.0941 -> 0.0175)
+     vs de-vigged MARKET (priced n=11059): map brier 0.2503 vs market 0.2497, BSS -0.0024 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 3.5-50.5 raw (n=11059)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1        13   0.615      [0.355, 0.823]  [THIN]
+       0.1-0.2        86   0.512      [0.408, 0.614]        
+       0.2-0.3       389   0.481      [0.432, 0.530]        
+       0.3-0.4      1319   0.464      [0.437, 0.491]        
+       0.4-0.5      2958   0.490      [0.472, 0.508]        
+       0.5-0.6      3658   0.486      [0.469, 0.502]        
+       0.6-0.7      1986   0.498      [0.476, 0.520]        
+       0.7-0.8       534   0.498      [0.456, 0.540]        
+       0.8-0.9       102   0.520      [0.424, 0.614]        
+       0.9-1.0        14   0.429      [0.214, 0.674]  [THIN]
+     reliability AFTER (isotonic):
+     reliability — lines 3.5-50.5 isotonic (n=11059)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.2-0.3        10   0.700      [0.397, 0.892]  [THIN]
+       0.3-0.4        31   0.516      [0.348, 0.680]        
+       0.4-0.5       231   0.476      [0.413, 0.540]        
+       0.5-0.6     10787   0.487      [0.478, 0.497]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.096    7365     4390     1101   0.464  -5.8%(11059)
+       isotonic     0.016      82       37       10   0.242  -7.4%(11059)
+
+  [save] staged isotonic (8 knots, n=22117) recal for player_points_assists into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).
+################ player_points_rebounds_assists
+
+=== Recalibration (Platt shrinkage + isotonic): basketball_nba player_points_rebounds_assists ===
+  38966 book lines (38966 backfill store + 0 prediction log)
+  Matched 33,643 NBA book lines to nba_warehouse actuals; dropped 0 (player not found), 35 (date/DNP), 424 (low-min test game), 4,864 (<10 priors), 0 (unmapped prop).
+  n_total=33643  shipped line_methods=B
+  Raw p reconstructs the SHIPPED estimator per line bucket, OOS. Recal map fit on TRAIN; Brier/log-loss/ECE/reliability/edge on held-out TEST.
+  edge/ROI at CONSENSUS prices (incl. DK @ wt 1), NOT DK-executable.
+
+  ── lines 4.5-60.5: shipped method B, n=33643 ──
+     split: pool=11214 (pooled Gaussian, mu=+0.200, sigma=9.028)  train=11214  test=11215 (3-way)
+     Platt: a=-0.033 (INVERTS ordering — overfit, disqualified), b=+0.003; train over-rate=0.500
+     OOS test metrics (lower = better):
+       map           brier   logloss     ece
+       raw          0.2655    0.7287  0.1012
+       platt        0.2501    0.6933  0.0152
+       isotonic     0.2501    0.6934  0.0140
+     winner (OOS log-loss): isotonic — improves raw (0.7287 -> 0.6934, ECE 0.1012 -> 0.0140)
+     vs de-vigged MARKET (priced n=11215): map brier 0.2501 vs market 0.2494, BSS -0.0028 -> calibration-only -- does NOT beat the market; must not alter bet selection
+     reliability BEFORE (raw):
+     reliability — lines 4.5-60.5 raw (n=11215)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.0-0.1        17   0.588      [0.360, 0.784]  [THIN]
+       0.1-0.2        86   0.547      [0.442, 0.647]        
+       0.2-0.3       470   0.483      [0.438, 0.528]        
+       0.3-0.4      1439   0.466      [0.440, 0.491]        
+       0.4-0.5      3057   0.493      [0.476, 0.511]        
+       0.5-0.6      3456   0.480      [0.463, 0.497]        
+       0.6-0.7      2025   0.486      [0.465, 0.508]        
+       0.7-0.8       547   0.503      [0.461, 0.544]        
+       0.8-0.9       105   0.514      [0.420, 0.608]        
+       0.9-1.0        13   0.462      [0.232, 0.709]  [THIN]
+     reliability AFTER (isotonic):
+     reliability — lines 4.5-60.5 isotonic (n=11215)
+       p(over)bin      n     emp     95% CI (Wilson)    flag
+       0.2-0.3        10   0.500      [0.237, 0.763]  [THIN]
+       0.3-0.4         1   1.000      [0.207, 1.000]  [THIN]
+       0.4-0.5      7679   0.485      [0.474, 0.496]        
+       0.5-0.6      3525   0.485      [0.468, 0.501]        
+     edge vs consensus on priced test rows (fake-edge collapse):
+       map        mean|e|  |e|>5%  |e|>10%  |e|>20%  max|e|      ROI+-(n)
+       raw          0.099    7617     4718     1231   0.495  -7.2%(11215)
+       isotonic     0.015     114       14       10   0.272  -7.4%(11215)
+
+  [save] staged isotonic (10 knots, n=22429) recal for player_points_rebounds_assists into the recalibration seed calibration/recalibration_basketball_nba.json — review with `git diff`, then commit (this is a committed seed, not a --diff/--promote candidate).

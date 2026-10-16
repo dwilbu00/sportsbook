@@ -32,8 +32,8 @@ from pricing_common import (
 from prop_filter import filter_player_gamelog
 import prop_features  # §2.6 candidate-feature registry (rest/days-off, …)
 from recalibration import (
-    apply_platt,
     apply_isotonic,
+    apply_recal_cfg,
     load_recalibration,
     log_prediction,
     log_prediction_rows,
@@ -1998,16 +1998,10 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 if iso and iso.get("kx") and iso.get("ky"):
                     adj = apply_isotonic(probability, iso["kx"], iso["ky"])
                     return (max(0.0, min(1.0, adj)) if adj is not None else probability)
-                if not cfg or cfg.get("a") is None:
-                    return probability
-                adjusted = apply_platt(
-                    probability,
-                    cfg.get("a"),
-                    cfg.get("b"),
-                )
-                if adjusted is None:
-                    return probability
-                return max(0.0, min(1.0, adjusted))
+                # Recal-map entry: the online/seed Platt, or a base-method ISOTONIC
+                # seed (a prop without line_methods whose OOS winner was isotonic,
+                # e.g. NBA PRA). [2026-10-16]
+                return apply_recal_cfg(probability, cfg)
 
             over_rate = _apply_final_recalibration(over_rate, recal_cfg)
             recal_meta = None
@@ -2016,6 +2010,8 @@ def analyze_player_props_value(prop_data, player_histories, threshold_pct=5.0,
                 # adjustment — it applies independently of the Platt cfg. Guard the None.
                 _rc = recal_cfg or {}
                 recal_meta = {
+                    "kind": _rc.get("kind") or ("platt" if _rc.get("a") is not None
+                                                else "isotonic"),
                     "a": _rc.get("a"),
                     "b": _rc.get("b"),
                     "n_fit": _rc.get("n_fit"),

@@ -436012,6 +436012,10 @@
       "variant": "live",
       "on_shrunk_probs": true,
       "fit_timestamp": "2026-10-09T17:55:58.110955Z"
+    },
+    "value_gate": {
+      "source": "refit_calibration --recalibrate (2026-10-16; NBA method B + C props)",
+      "basis": "all 10 NBA props: OOS BSS vs de-vigged market < 0 even after the winning recal map (raw ECE 0.07-0.12; |e|>5% fake edges lost 4-8% on held-out rows). Suppress until a model beats the market; recal seed keeps the displayed P honest."
     }
   },
   "starter_adjustment": {
@@ -436058,5 +436062,19 @@
       "market_brier": 0.25007,
       "on_shrunk": true
     }
+  },
+  "value_gate": {
+    "suppress": [
+      "player_assists",
+      "player_blocks",
+      "player_points",
+      "player_points_assists",
+      "player_points_rebounds",
+      "player_points_rebounds_assists",
+      "player_rebounds",
+      "player_steals",
+      "player_threes",
+      "player_turnovers"
+    ]
   }
 }
